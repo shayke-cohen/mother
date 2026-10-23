@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Use for "/mother setup", "set up mother", "configure my agent", or to change an existing MOTHER config (add a team, a channel, a person, rename the agent). Creates or joins a workspace, discovers the manager's people, tools, channels and meetings, proposes a full config and writes nothing until the manager confirms; then runs the doctor and registers routines.
+description: Use for "/mother:setup", "mother setup", "set up mother", "configure my agent", or to change an existing MOTHER config (add a team, a channel, a person, rename the agent). Creates or joins a workspace, discovers the manager's people, tools, channels and meetings, proposes a full config and writes nothing until the manager confirms; then runs the doctor and registers routines.
 ---
 
 # Setup
@@ -155,7 +155,10 @@ In this order, reporting each step's result:
    and tools it reads, what it never stores (assessments, personal details), how to say "<name>, stop",
    and that it posts only in threads and signs every message. Posting it anywhere other than the manager's
    DM needs the manager's explicit yes — the guard will ask.
-7. Sync happens automatically at the end of the turn (`mother sync`). If the workspace has a remote and the
+7. **Shell command.** `mother link` puts `mother` on the manager's PATH (`~/.local/bin` by default) so
+   `mother join`, `mother home` and `mother status` work in their own terminal. Report what it printed,
+   including the "not on your PATH" note if there is one.
+8. Sync happens automatically at the end of the turn (`mother sync`). If the workspace has a remote and the
    sync reports a secret hit or conflict, surface it verbatim.
 
 ## Rules

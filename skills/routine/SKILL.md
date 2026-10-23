@@ -39,7 +39,7 @@ there is nowhere to log: print the error and stop.
 
 - `config.json` — the agent identity, people, teams, channels and `routines.<id>` options.
 - `capabilities.json` — if missing, or `checked_at` is older than 8 days, carry on but treat every
-  capability as unknown-unless-proven and say "capabilities stale — run /mother doctor" in the output.
+  capability as unknown-unless-proven and say "capabilities stale — run /mother:doctor" in the output.
 - The routine file: what it reads, what it produces, where it sends it.
 
 ## 3. Follow the routine — honestly

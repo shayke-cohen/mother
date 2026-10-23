@@ -15,7 +15,7 @@ mother plugin (shared, versioned)               ~/<manager>-workspace (private, 
 └─ rules/    outbound policy, privacy defaults
 ```
 
-### `/mother setup`: discover, then confirm
+### `/mother:setup`: discover, then confirm
 
 1. Who you are: email, calendar time zone, working days.
 2. Who you manage: from the org directory if one is connected, otherwise from calendar 1:1s, chat DMs and
@@ -26,7 +26,7 @@ mother plugin (shared, versioned)               ~/<manager>-workspace (private, 
 5. The agent: its name, emoji and how it refers to you, with a collision check against the roster.
 6. Show the whole plan, write nothing until you confirm, then run the doctor and register the routines.
 
-### `/mother doctor`: live capability matrix
+### `/mother:doctor`: live capability matrix
 
 For every connector, it makes a real read call. Write checks (create, comment and close a test item) run
 only when you opt in. It also records the token type (user or bot), scopes and gaps. The output is

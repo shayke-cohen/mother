@@ -1,6 +1,6 @@
 ---
 name: doctor
-description: Use for "/mother doctor", "check my connectors", "why didn't the brief see Slack", "is my tracker connected", or the weekly doctor routine. Live-tests every connector the agent depends on — one real read each, write checks only on explicit opt-in — and writes capabilities.json plus a table of fixes.
+description: Use for "/mother:doctor", "mother doctor", "check my connectors", "why didn't the brief see Slack", "is my tracker connected", or the weekly doctor routine. Live-tests every connector the agent depends on — one real read each, write checks only on explicit opt-in — and writes capabilities.json plus a table of fixes.
 ---
 
 # Doctor
@@ -119,7 +119,7 @@ Fixes by status:
   say a human must.
 - `missing_scope:<s>` → which scope, who can grant it, and which routine output is degraded meanwhile.
 - `denied` → which admin setting or role is missing.
-- `untested` → "run `/mother doctor` and accept write checks" — only if a routine needs that write.
+- `untested` → "run `/mother:doctor` and accept write checks" — only if a routine needs that write.
 
 End with one line on impact: which routines will run `partial` until each fix lands.
 

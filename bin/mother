@@ -11,6 +11,7 @@ Commands:
   status                       validate config.json and show workspace state; exit 1 if invalid
   register                     print the scheduled-task pointers for enabled routines (JSON)
   path                         print the active workspace path
+  link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
 
 The workspace is resolved from $MOTHER_WORKSPACE, else <state>/workspace, where <state> is
 $MOTHER_STATE_DIR or ~/.mother. Python 3.9 stdlib only (see docs/CONTRACT.md).
@@ -25,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -77,7 +78,7 @@ def hostname() -> str:
 def load_config(ws: Path) -> dict:
     p = ws / "config.json"
     if not p.is_file():
-        die(f"{p} not found — run /mother setup")
+        die(f"{p} not found — run /mother:setup")
     try:
         return json.loads(p.read_text())
     except json.JSONDecodeError as e:
@@ -260,7 +261,7 @@ def cmd_init(args):
             save_config(ws, cfg)
     set_pointer(ws)
     print(f"workspace ready at {ws.resolve()} ({len(created)} file(s) created)")
-    print("next: /mother setup to fill config.json, then /mother doctor")
+    print("next: /mother:setup to fill config.json, then /mother:doctor")
 
 
 def cmd_join(args):
@@ -281,7 +282,7 @@ def cmd_join(args):
     home = (cfg.get("workspace") or {}).get("home_machine")
     print(f"joined workspace at {dest.resolve()}")
     print(f"routines run on: {home or 'not set'} (this machine: {hostname()})")
-    print("next: connect your connectors here, then /mother doctor. Don't register routines on a second machine.")
+    print("next: connect your connectors here, then /mother:doctor. Don't register routines on a second machine.")
 
 # ---------------------------------------------------------------- sync
 
@@ -403,9 +404,9 @@ def cmd_status(args):
         try:
             print(f"doctor:      {json.loads(caps.read_text()).get('checked_at', '?')}")
         except json.JSONDecodeError:
-            print("doctor:      capabilities.json unreadable — run /mother doctor")
+            print("doctor:      capabilities.json unreadable — run /mother:doctor")
     else:
-        print("doctor:      never run — run /mother doctor")
+        print("doctor:      never run — run /mother:doctor")
     if (ws / "QUARANTINE.md").exists():
         print("WARNING:     QUARANTINE.md present — sync is blocked until it's resolved")
     if (ws / ".mother" / "PAUSED").exists():
@@ -470,10 +471,28 @@ def cmd_register(args):
                           "prompt": _pointer(ws, "meeting-recap", t["slug"])})
     print(json.dumps({"home_machine": (cfg.get("workspace") or {}).get("home_machine"), "tasks": tasks}, indent=2))
 
+# ---------------------------------------------------------------- link
+
+def cmd_link(args):
+    d = Path(os.path.expanduser(args[0] if args else "~/.local/bin"))
+    # The marketplace clone keeps one path across plugin updates; the versioned cache copy does not.
+    stable = Path.home() / ".claude/plugins/marketplaces/mother/bin/mother"
+    target = stable if stable.is_file() else Path(__file__).resolve()
+    link = d / "mother"
+    if link.exists() and not link.is_symlink():
+        die(f"{link} exists and is not a symlink; remove it or pass another dir")
+    d.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(target)
+    print(f"{link} -> {target}")
+    if str(d.resolve()) not in [str(Path(x).expanduser().resolve()) for x in os.environ.get("PATH", "").split(os.pathsep) if x]:
+        print(f"note: {d} is not on your PATH; add it to your shell profile", file=sys.stderr)
+
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register,
+            "status": cmd_status, "register": cmd_register, "link": cmd_link,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

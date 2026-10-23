@@ -47,6 +47,21 @@ class CliTest(unittest.TestCase):
         (self.ws / "config.json").write_text(json.dumps(cfg))
         return cfg
 
+    # -- link
+    def test_link_symlinks_cli_and_refuses_to_clobber_a_file(self):
+        env = dict(self.env, HOME=str(self.t / "home"))
+        bindir = self.t / "bin"
+        r = run(["link", str(bindir)], env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((bindir / "mother").resolve(), CLI.resolve())
+        self.assertEqual(run(["link", str(bindir)], env).returncode, 0)  # re-link is idempotent
+        (bindir / "mother").unlink()
+        (bindir / "mother").write_text("not ours")
+        r = run(["link", str(bindir)], env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not a symlink", r.stderr)
+        self.assertEqual((bindir / "mother").read_text(), "not ours")
+
     # -- init / pointer
     def test_init_creates_layout_and_pointer(self):
         self.init()

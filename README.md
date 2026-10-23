@@ -7,10 +7,10 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > Yes, it's named after the ship's computer in *Alien*. Unlike that one, this Mother never treats the crew as
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
-> **Status: v0, untested in the wild.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, and the meeting deck. 55 automated tests pass. Nothing has run against a real manager's workspace
-> yet. The first pilot is the reference deployment it was extracted from. See [docs/CONTRACT.md](docs/CONTRACT.md),
-> [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
+> routines and the meeting deck, covered by 60 automated tests. One manager's workspace has run on it since
+> 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
+> [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What it is
 
@@ -44,22 +44,95 @@ example "Agnes (AI) · on behalf of Dana". The agent:
 6. **People, not scores.** It reports work items, never assessments, never mood. The team should know the
    agent exists and what it reads.
 
+## Before you install
+
+- **Claude Code** (the desktop app if you want scheduled routines: they run only while the app is open,
+  and a missed run fires on the next launch).
+- **Python 3.9+** and **git** on your PATH. `gh` if you want GitHub in the brief.
+- **Connectors** for whatever you use: chat (Slack or Teams), mail, calendar, a tracker (Jira, Linear,
+  Monday, or none) and a code host (optional). MOTHER doesn't ship connectors. Setup finds the ones you have,
+  and the doctor tests them.
+- A **private** git repo for your workspace if you want backup or a second machine. Never a public one:
+  the workspace holds your notes about people and open loops.
+
+## What installing changes
+
+The approval guard is a hook, so it runs in **every** Claude Code session, not only in the workspace:
+
+- Any call that reaches another person (a chat post, an email send, a tracker write, a `gh` write) asks for
+  your confirmation, even in an unrelated repo. Outside the workspace's green list nothing is pre-approved.
+- Credential entry, payments and deletions are refused outright, including `gh … delete` and
+  `gh api -X DELETE` in any repo. Run those yourself in a terminal.
+- Calls that aren't outbound are untouched; your normal permission rules apply.
+
+The Stop hook runs `mother sync`, which only acts on your workspace. Before you have one, it does nothing.
+
 ## Install
+
+In Claude Code:
 
 ```
 /plugin marketplace add shayke-cohen/mother
 /plugin install mother@mother
-/mother setup
+/mother:setup
 ```
 
-Another computer, same workspace: install the plugin, then `mother join <your-private-repo-url>`. Only one
-machine (the *home* machine, `mother home set`) runs the scheduled routines.
+Setup asks where to put the workspace, discovers your people, teams, channels and meetings, shows you a
+draft config, and writes nothing until you confirm. Then it runs the doctor, sets this machine as the home
+machine, registers the routines, and runs `mother link` so the `mother` command works in your own terminal.
+To do that step by hand:
+
+```
+python3 ~/.claude/plugins/marketplaces/mother/bin/mother link
+```
+
+It symlinks `mother` into `~/.local/bin`. Pass another directory if that one isn't on your PATH.
+
+**Another computer, same workspace:** install the plugin, run `mother link` as above, then
+`mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines
+(`mother home show`), so don't register them on the second one.
+
+## Using it
+
+Day to day you mostly read what it sends you and answer in one line. The default schedule is set in
+`config.json` → `routines`, in your timezone:
+
+| Routine | When (default) | What you get |
+|---|---|---|
+| brief | 08:45 workdays | Today's calendar, what's waiting on you, overdue open loops |
+| digest | 09:00 workdays | Per team, opening with the decision queue |
+| dots | 13:00 workdays | Connections across threads, and suggested actions for you and for the agent |
+| reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
+| doctor | weekly | Re-tests connectors, so a broken one shows as "couldn't check" |
+| meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |
+
+You can also just ask: "brief me", "what's open", "remember that …", "add a todo …", "take notes on the
+design review", "set up a new project". Each one routes to a skill: `brief`, `todo`, `remember`,
+`meeting`, `project`, `team` and so on.
+
+Useful commands in your terminal:
+
+| Command | What |
+|---|---|
+| `mother status` | Validate `config.json` and show workspace, doctor and home-machine state |
+| `mother home show` | Which machine runs the routines |
+| `mother sync` | Commit and push the workspace now (also runs automatically at the end of each turn) |
+| `mother register` | Print the scheduled-task definitions for the enabled routines |
+
+### Pausing, stopping, uninstalling
+
+- **Kill switch:** `touch "$(mother path)/.mother/PAUSED"` blocks every outbound call until you delete the
+  file. Routines still read and still write to the workspace.
+- **Stop one routine:** remove it from `config.json` → `routines`, then ask `/mother:setup` to update the
+  scheduled tasks (it disables the task rather than deleting it).
+- **Uninstall:** disable the `Mother:` tasks in the scheduled tasks list, then
+  `/plugin uninstall mother@mother` and `rm ~/.local/bin/mother`. Your workspace folder is untouched.
 
 ## What's inside
 
 | Path | What |
 |---|---|
-| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register` (Python 3.9 stdlib) |
+| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `path`, `link` (Python 3.9 stdlib) |
 | `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
 | `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `meeting`, `reflect`, `todo`, `project`, `team`, `remember` |
 | `routines/` | What each scheduled run does |
