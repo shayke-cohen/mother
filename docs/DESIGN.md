@@ -6,7 +6,7 @@ Living document. Public version of the design used by the reference deployment.
 
 ```
 mother plugin (shared, versioned)               ~/<manager>-workspace (private, local; optional git remote)
-├─ skills/   setup · doctor · team · digest ·    ├─ config.yaml      agent, people, teams, projects,
+├─ skills/   setup · doctor · team · digest ·    ├─ config.json      agent, people, teams, projects,
 │            brief · weekly · dots · meeting ·    │                   channels, trackers, repos, meetings
 │            triage · todo · project · reflect    ├─ capabilities.json   written by the doctor
 ├─ routines/ templates (no IDs; read config)      ├─ teams/ projects/ people/ memory/ todos/ journal/
