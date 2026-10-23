@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""mother — workspace CLI for the MOTHER plugin.
+
+Commands:
+  init <path> [--remote URL]   create a workspace (layout, git, pointer)
+  join <git-url> [path]        clone an existing workspace on another machine
+  sync [--quiet]               scan, commit, rebase, push (always exits 0; used by hooks)
+  scan [files...]              secret-scan files (default: changed files in the workspace); exit 1 on a hit
+  home show|set [host]|check|move <host>
+                               which machine runs routines (check: 0 = here, 2 = elsewhere, 3 = unset)
+  status                       validate config.json and show workspace state; exit 1 if invalid
+  register                     print the scheduled-task pointers for enabled routines (JSON)
+  path                         print the active workspace path
+
+The workspace is resolved from $MOTHER_WORKSPACE, else <state>/workspace, where <state> is
+$MOTHER_STATE_DIR or ~/.mother. Python 3.9 stdlib only (see docs/CONTRACT.md).
+"""
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "0.0.1"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
+
+# ---------------------------------------------------------------- paths
+
+def state_dir() -> Path:
+    return Path(os.environ.get("MOTHER_STATE_DIR") or Path.home() / ".mother")
+
+
+def workspace(required: bool = True):
+    env = os.environ.get("MOTHER_WORKSPACE")
+    if env:
+        return Path(env).expanduser()
+    ptr = state_dir() / "workspace"
+    if ptr.is_file():
+        p = ptr.read_text().strip()
+        if p:
+            return Path(p).expanduser()
+    if required:
+        die("no workspace configured — run `mother init <path>` or `mother join <git-url>`")
+    return None
+
+
+def set_pointer(ws: Path) -> None:
+    sd = state_dir()
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "workspace").write_text(str(ws.resolve()) + "\n")
+
+
+def die(msg: str, code: int = 1):
+    print(f"mother: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def git(ws: Path, *args, check=False):
+    return subprocess.run(["git", "-C", str(ws), *args], capture_output=True, text=True, check=check)
+
+
+def hostname() -> str:
+    h = os.environ.get("MOTHER_HOSTNAME") or socket.gethostname()
+    return h.split(".")[0].lower()
+
+# ---------------------------------------------------------------- config
+
+def load_config(ws: Path) -> dict:
+    p = ws / "config.json"
+    if not p.is_file():
+        die(f"{p} not found — run /mother setup")
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        die(f"config.json is not valid JSON: {e}")
+
+
+def save_config(ws: Path, cfg: dict) -> None:
+    (ws / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+
+
+TOP_KEYS = {"version", "agent", "manager", "workspace", "connectors", "teams", "routines", "policy"}
+MODES = {"off", "watch", "mention", "draft", "auto"}
+TRIGGERS = {"manager", "team", "anyone"}
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def validate(cfg: dict) -> list:
+    errs = []
+    def need(obj, key, typ, where):
+        if not isinstance(obj, dict) or key not in obj:
+            errs.append(f"missing {where}.{key}")
+            return None
+        if typ and not isinstance(obj[key], typ):
+            errs.append(f"{where}.{key} should be {typ.__name__ if isinstance(typ, type) else typ}")
+        return obj[key]
+
+    if not isinstance(cfg, dict):
+        return ["config must be a JSON object"]
+    for k in cfg:
+        if k not in TOP_KEYS:
+            errs.append(f"unknown top-level key '{k}'")
+    if cfg.get("version") != 1:
+        errs.append("version must be 1")
+    agent = need(cfg, "agent", dict, "config") or {}
+    for k in ("name", "manager", "manager_short"):
+        need(agent, k, str, "agent")
+    mgr = need(cfg, "manager", dict, "config") or {}
+    for k in ("email", "timezone", "chat_dm"):
+        need(mgr, k, str, "manager")
+    wd = mgr.get("workdays", DAYS[:5])
+    if not isinstance(wd, list) or any(d not in DAYS for d in wd):
+        errs.append(f"manager.workdays must be a list of {DAYS}")
+    wsc = need(cfg, "workspace", dict, "config") or {}
+    for k in ("git_remote", "home_machine"):
+        if k in wsc and wsc[k] is not None and not isinstance(wsc[k], str):
+            errs.append(f"workspace.{k} must be a string or null")
+    for i, t in enumerate(cfg.get("teams") or []):
+        where = f"teams[{i}]"
+        need(t, "slug", str, where)
+        need(t, "name", str, where)
+        for j, ch in enumerate(t.get("channels") or []):
+            cw = f"{where}.channels[{j}]"
+            need(ch, "id", str, cw)
+            if ch.get("mode", "watch") not in MODES:
+                errs.append(f"{cw}.mode must be one of {sorted(MODES)}")
+            if ch.get("trigger", "manager") not in TRIGGERS:
+                errs.append(f"{cw}.trigger must be one of {sorted(TRIGGERS)}")
+            if ch.get("external") and ch.get("mode") == "auto":
+                errs.append(f"{cw}: external channels are capped at mention/draft")
+            if ch.get("external") and ch.get("mode") == "mention" and ch.get("trigger", "manager") != "manager":
+                errs.append(f"{cw}: external channels can only be triggered by the manager")
+    for rid, r in (cfg.get("routines") or {}).items():
+        if not isinstance(r, dict):
+            errs.append(f"routines.{rid} must be an object")
+        else:
+            if "at" in r and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(r["at"])):
+                errs.append(f"routines.{rid}.at must be HH:MM")
+            d = r.get("days")
+            ok = (d is None or d in ("workdays", "all") or (isinstance(d, str) and (d in DAYS or re.fullmatch(r"monthly:([1-9]|1\d|2[0-8])", d)))
+                  or (isinstance(d, list) and d and all(x in DAYS for x in d)))
+            if not ok:
+                errs.append(f"routines.{rid}.days must be workdays, all, a day, a list of days, or monthly:<1-28>")
+    return errs
+
+# ---------------------------------------------------------------- secret scan
+
+# Narrow on purpose: false positives train people to ignore the scanner.
+SECRET_PATTERNS = [
+    r"gh[pousr]_[A-Za-z0-9]{20,}",
+    r"github_pat_[A-Za-z0-9_]{20,}",
+    r"sk-[A-Za-z0-9_-]{20,}",
+    r"xox[baprs]-[A-Za-z0-9-]{10,}",
+    r"AKIA[0-9A-Z]{16}",
+    r"AIza[0-9A-Za-z_-]{30,}",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    r"(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|bearer)\s*[:=]\s*[\"']?[A-Za-z0-9_+/.=-]{16,}",
+]
+_SECRET_RE = [re.compile(p) for p in SECRET_PATTERNS]
+
+
+def scan_files(paths) -> list:
+    hits = []
+    for p in paths:
+        p = Path(p)
+        if not p.is_file():
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data[:8192]:
+            continue  # binary: cannot vouch for it
+        text = data.decode("utf-8", "replace")
+        for n, line in enumerate(text.splitlines(), 1):
+            for rx in _SECRET_RE:
+                if rx.search(line):
+                    hits.append(f"{p}:{n}: {line.strip()[:100]}")
+                    break
+    return hits
+
+
+def changed_files(ws: Path) -> list:
+    out = git(ws, "ls-files", "--others", "--exclude-standard", "--modified").stdout
+    return [ws / f for f in out.splitlines() if f]
+
+
+def cmd_scan(args):
+    ws = workspace()
+    files = [Path(a) for a in args] if args else changed_files(ws)
+    hits = scan_files(files)
+    for h in hits:
+        print(f"SECRET-SCAN: {h}", file=sys.stderr)
+    if hits:
+        print("Refusing to proceed. Remove the credential, then rotate it.", file=sys.stderr)
+        sys.exit(1)
+    print(f"clean ({len(files)} file(s) scanned)")
+
+# ---------------------------------------------------------------- init / join
+
+def cmd_init(args):
+    if not args:
+        die("usage: mother init <path> [--remote URL]")
+    remote = None
+    if "--remote" in args:
+        i = args.index("--remote")
+        remote = args[i + 1] if i + 1 < len(args) else die("--remote needs a URL")
+        args = args[:i] + args[i + 2:]
+    ws = Path(args[0]).expanduser()
+    if ws.exists() and any(ws.iterdir()) and not (ws / "config.json").exists() and not (ws / "AGENTS.md").exists():
+        die(f"{ws} exists, isn't empty, and doesn't look like a workspace — pick another path")
+    ws.mkdir(parents=True, exist_ok=True)
+    # Copy the template without overwriting anything that exists (safe to re-run, and safe to adopt
+    # an existing workspace such as a pre-mother agent repo).
+    created = []
+    for src in TEMPLATE.rglob("*"):
+        rel = src.relative_to(TEMPLATE)
+        if rel.name == "config.example.json":
+            continue
+        dst = ws / rel
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        elif not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            created.append(str(rel))
+    (ws / ".mother").mkdir(exist_ok=True)
+    if not (ws / ".git").exists():
+        git(ws, "init", "-q", "-b", "main")
+    if remote:
+        if git(ws, "remote", "get-url", "origin").returncode == 0:
+            git(ws, "remote", "set-url", "origin", remote)
+        else:
+            git(ws, "remote", "add", "origin", remote)
+        cfg_path = ws / "config.json"
+        if cfg_path.is_file():
+            cfg = json.loads(cfg_path.read_text())
+            cfg.setdefault("workspace", {})["git_remote"] = remote
+            save_config(ws, cfg)
+    set_pointer(ws)
+    print(f"workspace ready at {ws.resolve()} ({len(created)} file(s) created)")
+    print("next: /mother setup to fill config.json, then /mother doctor")
+
+
+def cmd_join(args):
+    if not args:
+        die("usage: mother join <git-url> [path]")
+    url = args[0]
+    dest = Path(args[1]).expanduser() if len(args) > 1 else Path.home() / Path(url.rstrip("/").split("/")[-1]).stem
+    if dest.exists() and any(dest.iterdir()):
+        if not (dest / ".git").exists():
+            die(f"{dest} exists and isn't a git checkout")
+    else:
+        r = subprocess.run(["git", "clone", "-q", url, str(dest)], capture_output=True, text=True)
+        if r.returncode:
+            die(f"clone failed: {r.stderr.strip()}")
+    (dest / ".mother").mkdir(exist_ok=True)
+    set_pointer(dest)
+    cfg = json.loads((dest / "config.json").read_text()) if (dest / "config.json").is_file() else {}
+    home = (cfg.get("workspace") or {}).get("home_machine")
+    print(f"joined workspace at {dest.resolve()}")
+    print(f"routines run on: {home or 'not set'} (this machine: {hostname()})")
+    print("next: connect your connectors here, then /mother doctor. Don't register routines on a second machine.")
+
+# ---------------------------------------------------------------- sync
+
+def cmd_sync(args):
+    quiet = "--quiet" in args
+    def say(m):
+        if not quiet:
+            print(f"mother sync: {m}")
+    def warn(m):
+        print(f"mother sync: {m}", file=sys.stderr)
+    try:
+        ws = workspace(required=False)
+        if not ws or not (ws / ".git").exists():
+            return
+        if git(ws, "symbolic-ref", "--quiet", "--short", "HEAD").returncode:
+            warn("detached HEAD, skipping")
+            return
+        gitdir = Path(git(ws, "rev-parse", "--absolute-git-dir").stdout.strip())
+        if (gitdir / "rebase-merge").exists() or (gitdir / "rebase-apply").exists() or (gitdir / "MERGE_HEAD").exists():
+            warn("rebase/merge in progress, skipping")
+            return
+        branch = git(ws, "symbolic-ref", "--short", "HEAD").stdout.strip()
+        if (ws / "QUARANTINE.md").exists():
+            warn("QUARANTINE.md present — not committing until it is resolved and deleted")
+            return
+        if git(ws, "status", "--porcelain").stdout.strip():
+            hits = scan_files(changed_files(ws))
+            if hits:
+                (ws / "QUARANTINE.md").write_text(
+                    "# QUARANTINE — nothing was committed\n\n"
+                    f"The secret scan matched credential-shaped content at {now_iso()}:\n\n```\n"
+                    + "\n".join(hits) + "\n```\n\nRemove the credential, rotate it, then delete this file.\n")
+                warn("ABORTED — credential-shaped content found; see QUARANTINE.md")
+                return
+            git(ws, "add", "-A")
+            if git(ws, "diff", "--cached", "--quiet").returncode:
+                n = len(git(ws, "diff", "--cached", "--name-only").stdout.splitlines())
+                r = git(ws, "commit", "--no-verify", "-q", "-m", f"chore(sync): {now_iso()} ({n} file(s))")
+                if r.returncode:
+                    warn(f"commit failed: {r.stderr.strip()}")
+                    return
+                say(f"committed {n} file(s)")
+        if git(ws, "rev-parse", "--verify", "--quiet", "@{upstream}").returncode:
+            if git(ws, "remote").stdout.strip():
+                if git(ws, "push", "-q", "-u", "origin", branch).returncode == 0:
+                    say("pushed (upstream set)")
+                else:
+                    warn("push failed; work is committed locally")
+            return
+        if not git(ws, "log", "--oneline", "@{upstream}..HEAD").stdout.strip():
+            return
+        for _ in range(3):
+            if git(ws, "push", "-q").returncode == 0:
+                say("pushed")
+                return
+            if git(ws, "fetch", "-q", "origin", branch).returncode:
+                warn("committed locally; fetch failed (offline?) — next sync carries it")
+                return
+            if git(ws, "rebase", "--autostash", "-q", f"origin/{branch}").returncode:
+                git(ws, "rebase", "--abort")
+                warn(f"cannot rebase onto origin/{branch} automatically (conflict). Work IS committed locally; run `git pull --rebase` in the workspace.")
+                return
+        warn("push still rejected after 3 tries; work is safe locally")
+    finally:
+        try:
+            if ws and (ws / ".mother").is_dir():
+                (ws / ".mother" / "last-sync").write_text(now_iso() + "\n")
+        except Exception:
+            pass
+
+# ---------------------------------------------------------------- home machine
+
+def cmd_home(args):
+    ws = workspace()
+    cfg = load_config(ws)
+    wsc = cfg.setdefault("workspace", {})
+    sub = args[0] if args else "show"
+    here = hostname()
+    if sub == "show":
+        print(f"home: {wsc.get('home_machine') or 'not set'}; this machine: {here}")
+    elif sub in ("set", "move"):
+        target = (args[1] if len(args) > 1 else here).lower()
+        old = wsc.get("home_machine")
+        if sub == "set" and old and old != target:
+            die(f"home is already {old}; use `mother home move {target}` to change it deliberately")
+        wsc["home_machine"] = target
+        save_config(ws, cfg)
+        print(f"home machine: {target}" + (f" (was {old})" if old and old != target else ""))
+        if old and old != target:
+            print(f"Remove the scheduled routines on {old}, then register them on {target}.")
+    elif sub == "check":
+        home = wsc.get("home_machine")
+        if not home:
+            print("home machine not set — routines refuse to run until `mother home set`", file=sys.stderr)
+            sys.exit(3)
+        if home != here:
+            print(f"not the home machine ({here}); routines run on {home}", file=sys.stderr)
+            sys.exit(2)
+        print(f"home machine: {here}")
+    else:
+        die("usage: mother home show|set [host]|check|move <host>")
+
+# ---------------------------------------------------------------- status / register
+
+def cmd_status(args):
+    ws = workspace()
+    cfg = load_config(ws)
+    errs = validate(cfg)
+    wsc = cfg.get("workspace") or {}
+    remote = git(ws, "remote", "get-url", "origin").stdout.strip() or None
+    last = (ws / ".mother" / "last-sync")
+    caps = ws / "capabilities.json"
+    print(f"workspace:   {ws}")
+    print(f"agent:       {(cfg.get('agent') or {}).get('name', '?')} on behalf of {(cfg.get('agent') or {}).get('manager_short', '?')}")
+    print(f"remote:      {remote or 'none (local only)'}")
+    print(f"home:        {wsc.get('home_machine') or 'not set'} (this machine: {hostname()})")
+    print(f"last sync:   {last.read_text().strip() if last.is_file() else 'never'}")
+    if caps.is_file():
+        try:
+            print(f"doctor:      {json.loads(caps.read_text()).get('checked_at', '?')}")
+        except json.JSONDecodeError:
+            print("doctor:      capabilities.json unreadable — run /mother doctor")
+    else:
+        print("doctor:      never run — run /mother doctor")
+    if (ws / "QUARANTINE.md").exists():
+        print("WARNING:     QUARANTINE.md present — sync is blocked until it's resolved")
+    if (ws / ".mother" / "PAUSED").exists():
+        print("PAUSED:      outbound actions are paused (.mother/PAUSED)")
+    if errs:
+        print("config:      INVALID")
+        for e in errs:
+            print(f"  - {e}")
+        sys.exit(1)
+    print("config:      valid")
+
+
+def _cron(at: str, days, workdays) -> str:
+    hh, mm = at.split(":")
+    if isinstance(days, str) and days.startswith("monthly:"):
+        return f"{int(mm)} {int(hh)} {int(days.split(':', 1)[1])} * *"
+    if days in (None, "workdays"):
+        days = workdays
+    elif days == "all":
+        days = DAYS
+    elif isinstance(days, str):
+        days = [days]
+    idx = sorted({(DAYS.index(d) + 1) % 7 for d in days})  # cron: Sun=0
+    dow = "*" if len(idx) == 7 else ",".join(str(i) for i in idx)
+    return f"{int(mm)} {int(hh)} * * {dow}"
+
+
+def _pointer(ws: Path, rid: str, team: str = None) -> str:
+    who = f" for team {team}" if team else ""
+    return (f'cd "{ws}" and run `git pull --rebase -q` if the workspace has a remote (on failure, continue with the '
+            f"local copy and say so). Then invoke the mother:routine skill with routine id `{rid}`{who}. "
+            "All behaviour lives in the mother plugin's routines/ files and the workspace config; this pointer "
+            "carries no other instructions. Always append a line to runs.md, including on failure.")
+
+
+def cmd_register(args):
+    ws = workspace()
+    cfg = load_config(ws)
+    errs = validate(cfg)
+    if errs:
+        die("config invalid — run `mother status`")
+    workdays = (cfg.get("manager") or {}).get("workdays") or DAYS[:5]
+    tasks = []
+    for rid, r in (cfg.get("routines") or {}).items():
+        if rid == "meeting" or not isinstance(r, dict) or "at" not in r:
+            continue
+        tasks.append({"taskId": f"mother-{rid}", "title": f"Mother: {rid} ({r['at']})",
+                      "cronExpression": _cron(r["at"], r.get("days"), workdays), "prompt": _pointer(ws, rid)})
+    if (cfg.get("routines") or {}).get("meeting"):
+        for t in cfg.get("teams") or []:
+            wk = (t.get("meetings") or {}).get("weekly")
+            if not wk or not wk.get("day") or not wk.get("time"):
+                continue
+            prep_day, prep_at = (wk.get("prep_at") or f"{wk['day']} 07:00").split()
+            tasks.append({"taskId": f"mother-meeting-prep-{t['slug']}", "title": f"Mother: {t['name']} meeting prep",
+                          "cronExpression": _cron(prep_at, prep_day, workdays),
+                          "prompt": _pointer(ws, "meeting-prep", t["slug"])})
+            hh, mm = wk["time"].split(":")
+            recap = f"{(int(hh) + 1) % 24:02d}:{mm}"
+            tasks.append({"taskId": f"mother-meeting-recap-{t['slug']}", "title": f"Mother: {t['name']} recap draft",
+                          "cronExpression": _cron(recap, wk["day"], workdays),
+                          "prompt": _pointer(ws, "meeting-recap", t["slug"])})
+    print(json.dumps({"home_machine": (cfg.get("workspace") or {}).get("home_machine"), "tasks": tasks}, indent=2))
+
+# ---------------------------------------------------------------- main
+
+COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
+            "status": cmd_status, "register": cmd_register,
+            "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd = COMMANDS.get(argv[0])
+    if not cmd:
+        die(f"unknown command '{argv[0]}' — see `mother help`")
+    if argv[0] == "sync":
+        try:
+            cmd(argv[1:])
+        except Exception as e:  # the sync hook must never fail a turn
+            print(f"mother sync: unexpected error: {e}", file=sys.stderr)
+        sys.exit(0)
+    cmd(argv[1:])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

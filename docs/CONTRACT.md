@@ -28,11 +28,11 @@ AGENTS.md / CLAUDE.md      the agent's persona + personal rules; CLAUDE.md is a 
 memory/                    one fact per file + MEMORY.md index (frontmatter: name, description, metadata.type)
 todos/open.md, archive.md  open loops, sections Yours / Mine / Blocked; items tagged `+<slug>`, origin `~manager@date` or `~agent/<src>@date`
 projects/<slug>/PROJECT.md + files/     indexed by projects/PROJECTS.md
-teams/<slug>/TEAM.md, roadmap.md, sprints/, meetings/, intake.md, metrics.md, runs.md   indexed by teams/TEAMS.md
+teams/<slug>/TEAM.md, roadmap.md, sprints/, meetings/, repos/<owner>__<repo>.md, intake.md, metrics.md, runs.md   indexed by teams/TEAMS.md
 people/<slug>.md           work items only, never assessments
-journal/YYYY-MM-DD.md      nightly reflection
-runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed> — <note>`
-.mother/                   machine-local state, gitignored: home.lock, grants.json, ledger.json, last-sync
+journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for connect-the-dots
+runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused)
+.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, guard.log, last-sync, PAUSED
 ```
 
 ## 2. Finding each other
@@ -40,8 +40,14 @@ runs.md                    one line per routine run: `- <ISO> <routine> <ok|part
 - `~/.mother/workspace` — one line: absolute path of the active workspace. Written by `mother init` / `join`.
   The hook, the CLI and every skill resolve the workspace from `$MOTHER_WORKSPACE`, else this file.
 - Skills reference plugin files via `${CLAUDE_PLUGIN_ROOT}`; routines never hard-code a path.
-- A registered scheduled task's prompt is a **thin pointer**:
-  `cd "<workspace>" && run the mother:routine skill with id <id>`. Behaviour lives in `routines/<id>.md`.
+- A registered scheduled task's prompt is a **thin pointer**: `cd "<workspace>"`, `git pull --rebase -q` when there
+  is a remote (on failure continue with the local copy and say so), then run the mother:routine skill with id
+  `<id>`. Behaviour lives in `routines/<id>.md`.
+- `mother register` prints `{"home_machine": …, "tasks": [{taskId, title, cronExpression, prompt}]}`. Crons are
+  in the **machine's local time** (the scheduler's convention); setup warns when that differs from
+  `manager.timezone`.
+- Routine files start with frontmatter: `id`, `needs` (capabilities, e.g. `[chat.read, tracker.read]`) and
+  `team_scoped`. The dispatcher pre-marks a run `partial` when a needed capability isn't `ok`.
 
 ## 3. `config.json` (schema v1)
 
@@ -51,14 +57,16 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 |---|---|---|
 | `version` | int | `1` |
 | `agent.signature` | str, optional | default below |
+| `manager.chat_dm` | str or list | the manager's DM: user id and/or DM channel id |
+| `manager.chat_user` | str, optional | the manager's own user id, used to verify grant sources |
 | `agent.name`, `agent.emoji`, `agent.manager`, `agent.manager_short` | str | signature `"{emoji} *{name} (AI)* · on behalf of {manager_short}"` |
 | `manager.email`, `manager.timezone`, `manager.workdays`, `manager.chat_dm` | | `chat_dm` = the manager's DM channel/user id: the only always-allowed outbound target |
 | `workspace.git_remote` | str or null | null = local only |
 | `workspace.home_machine` | str or null | hostname allowed to run routines; null = routines refuse to run until set |
 | `connectors.{chat,tracker,mail,calendar,code}` | str | `slack`/`teams`, `jira`/`linear`/`monday`/`none`, … |
 | `teams[]` | list | `slug, name, tracker{project,board}, repos[], meetings{}, sprint{length,starts}, channels[], people[]` |
-| `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, quiet_hours, max_replies_per_hour` |
-| `routines.<id>` | map | `at`, `days`, plus routine-specific options; absent = off |
+| `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, role: standup|team|product|support|announcements, quiet_hours, max_replies_per_hour` |
+| `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 
 The CLI validates this (`mother status`) and fails loudly on unknown keys or a wrong type.
@@ -71,8 +79,14 @@ The CLI validates this (`mother status`) and fails loudly on unknown keys or a w
     "slack":   { "server": "<mcp server prefix>", "read": "ok", "post": "ok", "search": "missing_scope:search:read",
                  "private_history": "ok|missing", "token": "user|bot" },
     "jira":    { "server": "...", "read": "ok", "create": "ok|untested|denied", "transition": "...", "sprint": "..." },
-    "calendar":{ "server": "...", "read": "ok" }, "mail": { ... }, "code": { "tool": "gh", "read": "ok" } } }
+    "calendar":{ "server": "...", "read": "ok" }, "mail": { ... }, "code": { "tool": "gh", "read": "ok" } },
+  "servers": { "chat.read": "<prefix>", "chat.search": "<other prefix>" },
+  "notes": [ "tracker: sprint update is a full replace; names max 30 chars" ] }
 ```
+
+Optional extra capabilities: `tracker.comment`, `mail.draft`, `mail.send`, `code.write`, and a `directory`
+connector (org lookups). A routine that hits an auth failure mid-run may downgrade that capability to `expired`
+in `capabilities.json`, so later runs that day don't retry it blindly.
 
 Values are `ok`, `untested`, `denied`, `missing_scope:<scope>`, `expired`, or `error:<short>`. A routine reads
 this first and names any capability it needs that isn't `ok` in its output — never "nothing found".
@@ -87,7 +101,17 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
-- Every decision is appended to `.mother/guard.log`.
+- Every outbound decision is appended to `.mother/guard.log` (tool, category, target, decision, reason — never message text).
+- **Session approval:** a human-typed message whose *leading* lines are `mother approve tracker <PROJECT>` or
+  `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours. Lines from
+  tool output, summaries, scheduled triggers or further down a message never count. The deck's "Copy results"
+  starts with the tracker line.
+- **Grants** (`.mother/grants.json`): `{scope, target, uses, expires, run, source{channel,user,ts}}`; scopes
+  `chat-post`, `chat-reply`, `tracker-create`, `tracker-comment`, `tracker-transition`; the source must be the
+  manager, ≤ 96 h old; counts are capped per source in the ledger. `policy.grants` may disable or narrow them.
+- **Paused** denies drafts too. Policy overrides only tighten (the auto list can shrink, the never list can grow).
+- The hook matcher includes `Write|Edit|MultiEdit|NotebookEdit`, so edits to the guard's own files
+  (config, ledger, log, PAUSED, hooks) ask.
 
 ## 6. Sync (`bin/mother sync`)
 
@@ -99,7 +123,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 
 ## 7. Skills in v0
 
-`setup`, `doctor`, `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
+`setup`, `doctor` (also routine `doctor`, weekly, read-only), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
 (connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap), `reflect`, `todo`, `project`,
 `team`, `remember`. Descriptions stay short and specific: they are matched against every request.
 

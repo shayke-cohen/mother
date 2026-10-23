@@ -7,9 +7,10 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > Yes, it's named after the ship's computer in *Alien*. Unlike that one, this Mother never treats the crew as
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
-> **Status: pre-alpha, design stage.** Nothing here runs yet. It is being extracted from a personal agent
-> that has been running daily for a real team since August 2026. See [docs/DESIGN.md](docs/DESIGN.md) and
-> [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: v0, untested in the wild.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
+> routines, and the meeting deck. 55 automated tests pass. Nothing has run against a real manager's workspace
+> yet. The first pilot is the reference deployment it was extracted from. See [docs/CONTRACT.md](docs/CONTRACT.md),
+> [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What it is
 
@@ -43,12 +44,33 @@ example "Agnes (AI) · on behalf of Dana". The agent:
 6. **People, not scores.** It reports work items, never assessments, never mood. The team should know the
    agent exists and what it reads.
 
-## Install (once there is something to install)
+## Install
 
 ```
 /plugin marketplace add shayke-cohen/mother
 /plugin install mother@mother
 /mother setup
+```
+
+Another computer, same workspace: install the plugin, then `mother join <your-private-repo-url>`. Only one
+machine (the *home* machine, `mother home set`) runs the scheduled routines.
+
+## What's inside
+
+| Path | What |
+|---|---|
+| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register` (Python 3.9 stdlib) |
+| `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
+| `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `meeting`, `reflect`, `todo`, `project`, `team`, `remember` |
+| `routines/` | What each scheduled run does |
+| `assets/deck/` | Weekly meeting deck with meeting mode |
+| `rules/` | Default policies: outbound, privacy, memory, todos, projects, teams |
+| `templates/workspace/` | A new workspace's skeleton |
+
+## Development
+
+```
+python3 -m unittest discover tests
 ```
 
 ## License

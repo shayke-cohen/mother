@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team weekly</title>
+<!--
+  MOTHER — weekly team-meeting deck template. Do not edit per meeting: the meeting-prep routine fills the JSON in
+  #deck-data via build.py and writes meetings/<date>-deck.html. Schema: see README.md next to this file.
+-->
+<style>
+:root{
+  --bg:#f6f5f1; --card:#ffffff; --ink:#1d1d1b; --muted:#6b6a64; --line:#e3e1d9;
+  --accent:#2f5bd3; --accent-soft:#e7edfb; --good:#1f8a5b; --good-soft:#e3f3ea;
+  --warn:#b26a00; --warn-soft:#fbefd9; --bad:#b4342d; --bad-soft:#f8e1df;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#141413; --card:#1e1e1c; --ink:#ecebe6; --muted:#a3a19a; --line:#33322e;
+    --accent:#7d9cf0; --accent-soft:#1f2a45; --good:#5cc497; --good-soft:#16302a;
+    --warn:#e6a64a; --warn-soft:#3a2c14; --bad:#ec7b73; --bad-soft:#3d1d1b;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#141413; --card:#1e1e1c; --ink:#ecebe6; --muted:#a3a19a; --line:#33322e;
+  --accent:#7d9cf0; --accent-soft:#1f2a45; --good:#5cc497; --good-soft:#16302a;
+  --warn:#e6a64a; --warn-soft:#3a2c14; --bad:#ec7b73; --bad-soft:#3d1d1b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+a{color:inherit}
+.deck{height:100vh;width:100vw;overflow:hidden;position:relative}
+.slide{position:absolute;inset:0;padding:48px 72px 84px;display:none;flex-direction:column;
+  max-width:1240px;margin:0 auto;overflow-y:auto}
+.slide.active{display:flex}
+h1{font-size:46px;line-height:1.08;margin:0 0 12px;letter-spacing:-.02em}
+h2{font-size:30px;margin:0 0 6px;letter-spacing:-.01em}
+.kicker{font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);font-weight:600;margin-bottom:10px}
+.sub{color:var(--muted);font-size:17px;margin:0 0 24px;max-width:860px}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:repeat(2,1fr)} .g3{grid-template-columns:repeat(3,1fr)} .g4{grid-template-columns:repeat(4,1fr)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.card h3{margin:0 0 6px;font-size:16.5px}
+.card p,.card li{color:var(--muted);font-size:14.5px;margin:0}
+.card ul{margin:6px 0 0;padding-left:18px}
+.card li{margin:4px 0}
+.card.t-bad{border-left:4px solid var(--bad)} .card.t-warn{border-left:4px solid var(--warn)}
+.card.t-good{border-left:4px solid var(--good)} .card.t-accent{border-left:4px solid var(--accent)}
+.key{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;background:var(--accent-soft);
+  color:var(--accent);padding:1px 6px;border-radius:6px;white-space:nowrap;text-decoration:none}
+.pill{display:inline-block;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:999px;margin-left:6px;vertical-align:2px;white-space:nowrap}
+.p-bad{background:var(--bad-soft);color:var(--bad)} .p-warn{background:var(--warn-soft);color:var(--warn)}
+.p-good{background:var(--good-soft);color:var(--good)} .p-accent{background:var(--accent-soft);color:var(--accent)}
+.stat{font-size:44px;font-weight:700;letter-spacing:-.03em;line-height:1;font-variant-numeric:tabular-nums}
+.stat.t-bad{color:var(--bad)} .stat.t-warn{color:var(--warn)} .stat.t-good{color:var(--good)}
+.stat-label{font-size:14px;font-weight:600;margin-top:8px}
+.stat-note{font-size:13px;color:var(--muted);margin-top:4px}
+.bar{display:flex;height:14px;border-radius:7px;overflow:hidden;background:var(--line);margin:8px 0 6px}
+.bar span{display:block;height:100%}
+.bar .b-done{background:var(--good)} .bar .b-prog{background:var(--accent)} .bar .b-todo{background:var(--line)}
+.legend{display:flex;gap:16px;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.note{margin-top:auto;padding-top:16px;font-size:12.5px;color:var(--muted)}
+.banner{background:var(--warn-soft);color:var(--warn);border-radius:10px;padding:10px 14px;font-size:14px;margin:0 0 18px;max-width:900px}
+.banner.info{background:var(--accent-soft);color:var(--accent)}
+table{border-collapse:collapse;width:100%;font-size:14.5px;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+td.owner{white-space:nowrap}
+td.owner .blank{display:inline-block;min-width:110px;border-bottom:1.5px dashed var(--line);color:var(--muted);font-size:12px}
+.why{color:var(--muted);font-size:12.5px;display:block}
+.agenda{list-style:none;padding:0;margin:0;counter-reset:a}
+.agenda li{display:flex;gap:14px;align-items:baseline;padding:10px 0;border-bottom:1px solid var(--line);font-size:17px;counter-increment:a}
+.agenda li::before{content:counter(a);font-weight:700;color:var(--accent);min-width:22px}
+.agenda .mins{margin-left:auto;color:var(--muted);font-size:14px;font-variant-numeric:tabular-nums}
+.decision{display:flex;gap:12px;align-items:flex-start}
+.decision .box{width:18px;height:18px;border:1.5px solid var(--muted);border-radius:4px;flex:none;margin-top:3px}
+.decision .box.done{background:var(--good);border-color:var(--good)}
+.outcome{color:var(--good);font-size:14px;margin-top:4px;font-weight:600}
+.nav{position:fixed;bottom:0;padding:10px 0;background:var(--bg);border-top:1px solid var(--line);left:0;right:0;display:flex;justify-content:center;align-items:center;gap:14px;
+  font-size:13px;color:var(--muted);pointer-events:none}
+.nav>*{pointer-events:auto}
+.nav button{background:var(--card);border:1px solid var(--line);color:var(--ink);border-radius:8px;
+  padding:6px 12px;font:inherit;cursor:pointer}
+.dots{display:flex;gap:6px}
+.dots i{width:8px;height:8px;border-radius:50%;background:var(--line);display:block;cursor:pointer}
+.dots i.on{background:var(--accent)}
+/* Meeting mode: owners, outcomes and new items are editable; results export as text for the agent. */
+.edit-only{display:none} body.editing .edit-only{display:revert} body.editing .view-only{display:none}
+select,input[type=text],textarea{font:inherit;font-size:14px;color:var(--ink);background:var(--card);
+  border:1px solid var(--line);border-radius:8px;padding:5px 8px;max-width:100%}
+select:focus,input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:1px}
+.mode{position:fixed;top:14px;right:16px;display:flex;gap:8px;align-items:center;z-index:5}
+.mode button,.btn{background:var(--card);border:1px solid var(--line);color:var(--ink);border-radius:8px;
+  padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.badge{font-size:12px;font-weight:600;color:var(--warn);background:var(--warn-soft);padding:3px 9px;border-radius:999px}
+.newrow{display:grid;grid-template-columns:2.4fr 1.2fr .7fr auto auto;gap:8px;align-items:center;margin:14px 0}
+.newrow label{font-size:13px;color:var(--muted);white-space:nowrap}
+.chk{font-size:12.5px;color:var(--muted);white-space:nowrap;display:block;margin-top:4px}
+.pick{margin:6px 0 18px}
+.pick input{width:100%}
+.pick-list{max-height:260px;overflow-y:auto;border:1px solid var(--line);border-radius:10px;margin-top:8px;background:var(--card)}
+.pick-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:10px;align-items:center;padding:7px 12px;border-bottom:1px solid var(--line);font-size:14px}
+.pick-row:last-child{border-bottom:0}
+.pick-row .meta{color:var(--muted);font-size:12.5px;white-space:nowrap}
+.sect{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:16px 0 4px}
+#results{width:100%;min-height:220px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;margin-top:12px}
+.empty{color:var(--muted);font-size:14px;padding:14px 0}
+@media (max-width:820px){
+  .newrow{grid-template-columns:1fr}
+  .mode{top:auto;bottom:58px;right:12px}
+  .slide{padding:24px 16px 96px}
+  .g2,.g3,.g4{grid-template-columns:1fr}
+  h1{font-size:32px} h2{font-size:24px} .stat{font-size:36px}
+  table{display:block;overflow-x:auto}
+}
+@media print{
+  .nav{display:none} .deck{height:auto;overflow:visible}
+  .slide{display:flex;position:relative;page-break-after:always;min-height:100vh}
+}
+</style>
+</head>
+<body>
+<div class="deck" id="deck"></div>
+<div class="mode"><span class="badge edit-only">Meeting mode — saved in this browser</span><button id="toggle-edit" title="Shortcut: E">Meeting mode</button></div>
+<div class="nav"><button id="prev" aria-label="Previous slide">←</button><div class="dots" id="dots"></div><span id="count"></span><button id="next" aria-label="Next slide">→</button></div>
+
+<script id="deck-data" type="application/json">/*DATA*/</script>
+<script>
+(function(){
+  var D = JSON.parse(document.getElementById('deck-data').textContent);
+  // Tracker links: meta.tracker_url is the browse prefix (e.g. https://tracker.example.com/browse/). Empty = no links.
+  var JIRA = (D.meta && D.meta.tracker_url) || '';
+  var AGENT = (D.meta && D.meta.agent) || 'the agent';
+  var PROJECT = (D.meta && D.meta.project) || '';
+  var MEETING = (D.meta && D.meta.meeting) || 'Team weekly';
+  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+  // Text fields may contain ABC-123 ticket keys; they become links when tracker_url is set. Everything else is escaped.
+  function rich(s){return JIRA?esc(s).replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g,'<a class="key" href="'+JIRA+'$1" target="_blank" rel="noopener">$1</a>'):esc(s)}
+  function key(k){return JIRA?'<a class="key" href="'+JIRA+esc(k)+'" target="_blank" rel="noopener">'+esc(k)+'</a>':'<span class="key">'+esc(k)+'</span>'}
+  function pill(t,tone){return t?'<span class="pill p-'+(tone||'accent')+'">'+esc(t)+'</span>':''}
+  function head(kicker,title,sub){return '<div class="kicker">'+esc(kicker)+'</div><h2>'+esc(title)+'</h2>'+(sub?'<p class="sub">'+rich(sub)+'</p>':'')}
+  function note(n){return n?'<div class="note">'+rich(n)+'</div>':''}
+  function items(list){return '<ul>'+(list||[]).map(function(i){return '<li>'+(i.key?key(i.key)+' ':'')+rich(i.text)+'</li>'}).join('')+'</ul>'}
+  var S = [];
+  var m = D.meta;
+
+  // Meeting-mode state, per meeting date, in this browser only. Seeded from the data's owner/outcome fields.
+  var SK = 'mother-deck-' + (m.team||'team') + '-' + m.date, ST = {owners:{}, sprint:{}, carry:{}, decisions:{}, added:[], sprintSetup:{}};
+  try { var saved = JSON.parse(localStorage.getItem(SK)); if (saved) ST = Object.assign(ST, saved); ST.sprintSetup = ST.sprintSetup || {}; } catch (e) {}
+  function save(){ try { localStorage.setItem(SK, JSON.stringify(ST)); } catch (e) {} }
+  var ROSTER = m.roster || [];
+  function ownerSelect(attr, val){
+    return '<select '+attr+'><option value="">—</option>'+ROSTER.map(function(n){return '<option'+(n===val?' selected':'')+'>'+esc(n)+'</option>'}).join('')+
+      '<option value="__later"'+(val==='__later'?' selected':'')+'>Not this week</option></select>';
+  }
+  var CARRY_OPTS = ['', 'Commit', 'Split', 'Mark done', 'Drop', 'Move out of our sprint', 'Keep as is'];
+  var ACTIONS = {assign:'Assign + sprint', done:'Mark done', comment:'Comment only'};
+
+  // 0 · Title + agenda
+  S.push('<div class="kicker">'+esc(MEETING)+' · '+esc(m.date)+'</div><h1>'+esc(m.title)+'</h1><p class="sub">'+rich(m.subtitle)+'</p>'+
+    (m.banner?'<div class="banner info">'+rich(m.banner)+'</div>':'')+
+    '<ol class="agenda">'+(m.agenda||[]).map(function(a){return '<li>'+esc(a.item)+'<span class="mins">'+esc(a.mins)+' min</span></li>'}).join('')+'</ol>'+
+    note((m.warnings&&m.warnings.length?'⚠ '+m.warnings.join(' · ')+' · ':'')+'Generated '+m.generated+' from '+m.sources));
+
+  // 1 · Pipeline
+  var P = D.pipeline;
+  S.push(head('1 · Pipeline','Where apps are waiting',P.sub)+
+    '<div class="grid g4">'+P.cards.map(function(c){return '<div class="card"><div class="stat t-'+(c.tone||'')+'">'+esc(c.value)+'</div><div class="stat-label">'+esc(c.label)+'</div><div class="stat-note">'+rich(c.note)+'</div></div>'}).join('')+'</div>'+
+    (P.trend&&P.trend.length>1?'<h3 style="margin:22px 0 8px;font-size:15px">Trend</h3><table><tr><th>week</th><th>total</th><th>stuck &gt;14d</th><th>&gt;30d</th><th>unassigned</th></tr>'+P.trend.map(function(r){return '<tr><td>'+esc(r.week)+'</td><td class="num">'+esc(r.total)+'</td><td class="num">'+esc(r.stuck)+'</td><td class="num">'+esc(r.over30)+'</td><td class="num">'+esc(r.unassigned)+'</td></tr>'}).join('')+'</table>':'')+
+    (P.breakdown?'<div class="grid g2" style="margin-top:16px">'+P.breakdown.map(function(b){return '<div class="card t-'+(b.tone||'accent')+'"><h3>'+esc(b.title)+'</h3><p>'+rich(b.text)+'</p></div>'}).join('')+'</div>':'')+
+    note(P.note));
+
+  // 2 · Last sprint
+  var L = D.sprint, c = L.counts, tot = c.done+c.inprog+c.todo;
+  function pct(n){return (100*n/tot).toFixed(1)+'%'}
+  S.push(head('2 · Sprint',L.name,L.sub)+
+    '<div class="bar"><span class="b-done" style="width:'+pct(c.done)+'"></span><span class="b-prog" style="width:'+pct(c.inprog)+'"></span><span class="b-todo" style="width:'+pct(c.todo)+'"></span></div>'+
+    '<div class="legend"><span><i style="background:var(--good)"></i>Done '+c.done+'</span><span><i style="background:var(--accent)"></i>In progress '+c.inprog+'</span><span><i style="background:var(--line);border:1px solid var(--muted)"></i>To do '+c.todo+'</span><span>· '+tot+' in sprint</span></div>'+
+    '<div class="grid g3" style="margin-top:18px">'+L.shipped.map(function(s){return '<div class="card t-good"><h3>'+esc(s.stream)+pill(s.tag,'good')+'</h3>'+items(s.items)+'</div>'}).join('')+'</div>'+
+    note(L.note));
+
+  // 3 · Voices from the field (support, ops, customer-facing peers) — label set by experts.title
+  var E = D.experts;
+  S.push(head('3 · '+(E.title||'From the field'),E.heading||'What customers hit this week',E.sub)+
+    '<div class="grid g2">'+E.themes.map(function(t){return '<div class="card t-'+(t.tone||'warn')+'"><h3>'+esc(t.title)+pill(t.count,t.tone||'warn')+'</h3><p>'+rich(t.detail)+'</p>'+(t.ask?'<p style="margin-top:8px;color:var(--ink)"><b>Ask:</b> '+rich(t.ask)+'</p>':'')+'</div>'}).join('')+'</div>'+
+    note(E.note));
+
+  // 4 · Unowned intake
+  var I = D.intake;
+  S.push(head('4 · Unowned intake','Assign owners in the room',I.sub)+
+    '<table><tr><th>#</th><th>issue</th><th>proposed owner</th><th>owner</th></tr>'+I.items.map(function(r){
+      var o = ST.owners[r.id] != null ? ST.owners[r.id] : (r.owner||'');
+      var sp = ST.sprint[r.id] != null ? ST.sprint[r.id] : true;
+      return '<tr><td class="num">'+esc(r.id)+'</td><td>'+rich(r.issue)+pill(r.priority,r.priority==='P0'?'bad':'warn')+'</td><td class="owner">'+esc(r.proposed)+'<span class="why">'+esc(r.why)+'</span></td>'+
+        '<td class="owner"><span class="view-only">'+(r.owner?'<b>'+esc(r.owner)+'</b>':'<span class="blank">&nbsp;</span>')+'</span>'+
+        '<span class="edit-only">'+ownerSelect('data-owner="'+esc(r.id)+'"',o)+'<label class="chk"><input type="checkbox" data-sprint="'+esc(r.id)+'"'+(sp?' checked':'')+'> in next sprint</label></span></td></tr>'}).join('')+'</table>'+
+    note(I.note));
+
+  // 5 · Carry-over
+  var C = D.carryover;
+  S.push(head('5 · Carry-over','Commit, split or drop',C.sub)+
+    '<table><tr><th>ticket</th><th>sprints</th><th>assignee</th><th>recommendation</th></tr>'+C.items.map(function(r){return '<tr><td>'+key(r.key)+' '+esc(r.text)+'</td><td class="num">'+esc(r.sprints)+'</td><td class="owner">'+esc(r.assignee)+'</td><td>'+rich(r.rec)+(r.outcome?'<div class="outcome view-only">→ '+esc(r.outcome)+'</div>':'')+
+      '<div class="edit-only" style="margin-top:6px"><select data-carry="'+esc(r.key)+'">'+CARRY_OPTS.map(function(x){var v=ST.carry[r.key]!=null?ST.carry[r.key]:(r.outcome||'');return '<option value="'+esc(x)+'"'+(x===v?' selected':'')+'>'+(x||'— decide —')+'</option>'}).join('')+'</select></div></td></tr>'}).join('')+'</table>'+
+    note(C.note));
+
+  // 6 · Next sprint
+  var N = D.next;
+  var SS = m.sprintSetup || {};
+  function sv(k,dflt){return ST.sprintSetup[k]!=null?ST.sprintSetup[k]:dflt}
+  S.push(head('6 · Next sprint',N.title,N.sub)+
+    '<div class="grid g2">'+N.goals.map(function(g,i){return '<div class="card t-accent"><h3>'+(i+1)+'. '+esc(g.title)+'</h3><p>'+rich(g.text)+'</p></div>'}).join('')+'</div>'+
+    (SS.next?'<div class="card edit-only" style="margin-top:16px"><h3>Sprint setup</h3><div class="newrow" style="grid-template-columns:1fr 1fr 1fr;margin:8px 0">'+
+      '<label>Name <input type="text" data-sprint-field="name" value="'+esc(sv('name',SS.next))+'"></label>'+
+      '<label>Start <input type="text" data-sprint-field="start" value="'+esc(sv('start',SS.start))+'"></label>'+
+      '<label>End <input type="text" data-sprint-field="end" value="'+esc(sv('end',SS.end))+'"></label></div>'+
+      '<input type="text" style="width:100%" placeholder="Sprint goal (goes into the tracker)" data-sprint-field="goal" value="'+esc(sv('goal',''))+'">'+
+      (SS.current?'<label class="chk" style="margin-top:8px"><input type="checkbox" data-sprint-field="closeCurrent"'+(sv('closeCurrent',true)?' checked':'')+'> close '+esc(SS.current)+' and move its unfinished items into the new sprint</label>':'')+
+      '<label class="chk"><input type="checkbox" data-sprint-field="startNow"'+(sv('startNow',true)?' checked':'')+'> start the new sprint now</label></div>':'')+
+    note(N.note));
+
+  // 7 · Roadmap pulse
+  var R = D.roadmap;
+  function col(t,tone,list){return '<div class="card t-'+tone+'"><h3>'+esc(t)+'</h3>'+items(list)+'</div>'}
+  S.push(head('7 · Roadmap pulse','What moved, what stalled',R.sub)+
+    '<div class="grid g3">'+col('Moving','good',R.moving)+col('Stalled','bad',R.stalled)+col('New, not on the roadmap','warn',R.new)+'</div>'+
+    note(R.note));
+
+  // 8 · Decisions
+  var X = D.decisions;
+  S.push(head('Decisions','What we need to leave the room with',X.sub)+
+    '<div class="grid g2">'+X.items.map(function(d,i){return '<div class="card decision"><div class="box'+(d.outcome?' done':'')+'"></div><div><h3>'+rich(d.q)+'</h3><p>Recommendation: '+rich(d.rec)+'</p>'+(d.outcome?'<div class="outcome view-only">→ '+esc(d.outcome)+'</div>':'')+
+      '<div class="edit-only" style="margin-top:8px"><input type="text" style="width:100%" placeholder="Decided… (blank = not settled)" data-decision="'+i+'" value="'+esc(ST.decisions[i]!=null?ST.decisions[i]:(d.outcome||''))+'"></div></div></div>'}).join('')+'</div>'+
+    note(X.note));
+
+  // + · Added in the meeting
+  S.push(head('Added in the meeting','Tickets from the room','Pick an existing '+esc(PROJECT)+' ticket to assign, mark done or comment on — or write a new one. '+esc(AGENT)+' applies it in the tracker after the meeting.')+
+    '<div class="edit-only"><div class="sect">Existing ticket</div><div class="pick"><input type="text" id="pick-q" placeholder="Search '+((D.backlog||[]).length)+' open '+esc(PROJECT)+' tickets by key, title or assignee…"><div class="pick-list" id="pick-list"></div></div>'+
+    '<div class="sect">New ticket</div><div class="newrow"><input type="text" id="new-title" placeholder="What needs doing"><span id="new-owner-wrap"></span>'+
+    '<select id="new-prio"><option>P1</option><option>P0</option><option>P2</option></select>'+
+    '<label><input type="checkbox" id="new-sprint" checked> next sprint</label><button class="btn primary" id="new-add">Add</button></div></div>'+
+    '<div id="added-list"></div>'+
+    note('Items added here are saved in this browser until you copy the results.'));
+
+  // + · Results for the agent
+  S.push(head('Results','Send these to '+esc(AGENT),'Copy and paste into a session with '+esc(AGENT)+'. It assigns owners, creates the new tickets and sets up the sprint in the tracker, then drafts the sprint list for your yes.')+
+    '<div class="edit-only"><button class="btn primary" id="copy-results">Copy results</button> <button class="btn" id="reset-results">Clear meeting mode</button>'+
+    '<textarea id="results" readonly></textarea></div>'+
+    '<div class="view-only empty">Open meeting mode (button at top right, or press E) to record owners and decisions.</div>');
+
+  var deck=document.getElementById('deck'), dots=document.getElementById('dots');
+  deck.innerHTML=S.map(function(h){return '<section class="slide">'+h+'</section>'}).join('');
+  var slides=deck.querySelectorAll('.slide'), cur=0;
+  dots.innerHTML=Array.prototype.map.call(slides,function(_,i){return '<i data-i="'+i+'" title="Slide '+(i+1)+'"></i>'}).join('');
+  function go(i){cur=Math.max(0,Math.min(slides.length-1,i));
+    slides.forEach(function(s,j){s.classList.toggle('active',j===cur)});
+    dots.querySelectorAll('i').forEach(function(d,j){d.classList.toggle('on',j===cur)});
+    document.getElementById('count').textContent=(cur+1)+' / '+slides.length;
+    try{history.replaceState(null,'','#'+(cur+1))}catch(e){}}
+  document.getElementById('prev').onclick=function(){go(cur-1)};
+  document.getElementById('next').onclick=function(){go(cur+1)};
+  dots.onclick=function(e){if(e.target.dataset.i)go(+e.target.dataset.i)};
+  document.addEventListener('keydown',function(e){
+    if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+    if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown'){e.preventDefault();go(cur+1)}
+    if(e.key==='ArrowLeft'||e.key==='PageUp'){e.preventDefault();go(cur-1)}});
+
+  // ---- meeting mode wiring ----
+  function results(){
+    var out={meeting:m.date, sprint:null, intake:[], carryover:[], decisions:[], added:[]};
+    I.items.forEach(function(r){var o=ST.owners[r.id]; if(o) out.intake.push({id:r.id, key:r.key||null, issue:r.issue, owner:o==='__later'?null:o, deferred:o==='__later', nextSprint:o!=='__later' && (ST.sprint[r.id]!=null?ST.sprint[r.id]:true)})});
+    C.items.forEach(function(r){var v=ST.carry[r.key]; if(v) out.carryover.push({key:r.key, outcome:v})});
+    X.items.forEach(function(d,i){var v=(ST.decisions[i]||'').trim(); if(v) out.decisions.push({q:d.q, decided:v})});
+    out.added=ST.added.map(function(a){var o=Object.assign({},a); if(!o.key){delete o.action} else {o.action=o.action||'assign'} return o});
+    if(SS.next){ out.sprint={current:SS.current||null, currentId:SS.currentId||null, nextId:SS.nextId||null,
+      name:sv('name',SS.next), start:sv('start',SS.start), end:sv('end',SS.end), goal:sv('goal',''),
+      closeCurrent:sv('closeCurrent',true), startNow:sv('startNow',true)}; }
+    // First line is read by the approval guard (hooks/guard.py): the manager pasting this is their yes for tracker writes in PROJECT.
+    return (PROJECT?'mother approve tracker '+PROJECT+'\n':'') + MEETING + ' ' + m.date + ' — meeting results (from the deck)\n' + JSON.stringify(out,null,2);
+  }
+  function renderAdded(){
+    var el=document.getElementById('added-list');
+    el.innerHTML = ST.added.length ? '<table><tr><th>item</th><th>owner</th><th>prio</th><th>sprint</th><th class="edit-only"></th></tr>'+ST.added.map(function(a,i){
+      return '<tr><td>'+(a.key?key(a.key)+' ':'<span class="pill p-accent" style="margin:0 6px 0 0">new</span>')+esc(a.title)+'</td><td><span class="view-only">'+esc(a.owner||'—')+'</span><span class="edit-only">'+ownerSelect('data-added-owner="'+i+'"',a.owner||'')+'</span>'+
+        (a.key?'<span class="edit-only" style="display:block;margin-top:4px"><select data-added-action="'+i+'">'+Object.keys(ACTIONS).map(function(k){return '<option value="'+k+'"'+((a.action||'assign')===k?' selected':'')+'>'+ACTIONS[k]+'</option>'}).join('')+'</select></span>':'')+
+        '<input type="text" class="edit-only" style="display:block;margin-top:4px;width:100%" placeholder="'+(a.key?'Comment (optional)':'Description (optional)')+'" data-added-comment="'+i+'" value="'+esc(a.comment||'')+'"></td><td>'+esc(a.priority)+'</td><td>'+(a.action==='done'?'mark done':a.action==='comment'?'comment':(a.nextSprint?'next':'backlog'))+'</td><td class="edit-only"><button class="btn" data-del="'+i+'">✕</button></td></tr>'}).join('')+'</table>'
+      : '<div class="empty">Nothing added yet.</div>';
+    var r=document.getElementById('results'); if(r) r.value=results();
+  }
+  var BL = D.backlog || [];
+  function renderPick(){
+    var q=(document.getElementById('pick-q').value||'').trim().toLowerCase(), el=document.getElementById('pick-list');
+    var taken={}; ST.added.forEach(function(a){if(a.key)taken[a.key]=1});
+    var hits=BL.filter(function(b){return !taken[b.key] && (!q || (b.key+' '+b.summary+' '+(b.assignee||'')).toLowerCase().indexOf(q)>=0)}).slice(0,q?40:12);
+    el.innerHTML = hits.length ? hits.map(function(b){return '<div class="pick-row">'+key(b.key)+'<span>'+esc(b.summary)+'</span><span class="meta">'+esc(b.status)+' · '+esc(b.assignee||'unassigned')+(b.priority?' · '+esc(b.priority):'')+'</span><button class="btn" data-pick="'+esc(b.key)+'">Add</button></div>'}).join('')
+      : '<div class="empty" style="padding:10px 12px">'+(BL.length?'No match.':'No backlog in this deck’s data.')+'</div>';
+  }
+  document.getElementById('pick-q').addEventListener('input',renderPick);
+  document.getElementById('pick-list').addEventListener('click',function(e){
+    var k=e.target.dataset&&e.target.dataset.pick; if(!k) return;
+    var b=BL.filter(function(x){return x.key===k})[0]; if(!b) return;
+    var o=document.getElementById('new-owner').value;
+    var owner=(o&&o!=='__later')?o:(ROSTER.indexOf(b.assignee)>=0?b.assignee:null);
+    ST.added.push({key:b.key, title:b.summary, action:'assign', comment:'', owner:owner, priority:document.getElementById('new-prio').value, nextSprint:document.getElementById('new-sprint').checked});
+    save(); renderAdded(); renderPick();
+  });
+  document.getElementById('new-owner-wrap').innerHTML = ownerSelect('id="new-owner"','');
+  document.getElementById('new-add').onclick=function(){
+    var t=document.getElementById('new-title'); if(!t.value.trim()) {t.focus(); return;}
+    var o=document.getElementById('new-owner').value;
+    ST.added.push({title:t.value.trim(), owner:(o&&o!=='__later')?o:null, priority:document.getElementById('new-prio').value, nextSprint:document.getElementById('new-sprint').checked});
+    t.value=''; save(); renderAdded(); t.focus();
+  };
+  document.getElementById('new-title').addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('new-add').click()});
+  deck.addEventListener('change',function(e){
+    var t=e.target, d=t.dataset;
+    if(d.owner!=null) ST.owners[d.owner]=t.value;
+    else if(d.sprint!=null) ST.sprint[d.sprint]=t.checked;
+    else if(d.carry!=null) ST.carry[d.carry]=t.value;
+    else if(d.decision!=null) ST.decisions[d.decision]=t.value;
+    else if(d.addedAction!=null) ST.added[+d.addedAction].action=t.value;
+    else if(d.addedComment!=null) ST.added[+d.addedComment].comment=t.value;
+    else if(d.sprintField!=null) ST.sprintSetup[d.sprintField]=(t.type==='checkbox'?t.checked:t.value);
+    else if(d.addedOwner!=null) ST.added[+d.addedOwner].owner=(t.value&&t.value!=='__later')?t.value:null;
+    else return;
+    save(); renderAdded();
+  });
+  deck.addEventListener('click',function(e){var i=e.target.dataset&&e.target.dataset.del; if(i!=null){ST.added.splice(+i,1); save(); renderAdded(); renderPick();}});
+  document.getElementById('copy-results').onclick=function(){
+    var r=document.getElementById('results'); r.value=results(); r.select();
+    var b=this; function ok(){b.textContent='Copied ✓'; setTimeout(function(){b.textContent='Copy results'},1800)}
+    if(navigator.clipboard) navigator.clipboard.writeText(r.value).then(ok,function(){document.execCommand('copy');ok()}); else {document.execCommand('copy');ok()}
+  };
+  document.getElementById('reset-results').onclick=function(){
+    if(!confirm('Clear all owners, decisions and added items recorded in this browser?')) return;
+    ST={owners:{}, sprint:{}, carry:{}, decisions:{}, added:[], sprintSetup:{}}; save(); location.reload();
+  };
+  function setEdit(on){document.body.classList.toggle('editing',on); document.getElementById('toggle-edit').textContent=on?'Done':'Meeting mode'; try{sessionStorage.setItem(SK+'-edit',on?'1':'')}catch(e){}}
+  document.getElementById('toggle-edit').onclick=function(){setEdit(!document.body.classList.contains('editing'))};
+  document.addEventListener('keydown',function(e){if((e.key==='e'||e.key==='E') && !/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) setEdit(!document.body.classList.contains('editing'))});
+  var startEdit=/[?&]edit\b/.test(location.search); try{startEdit=startEdit||sessionStorage.getItem(SK+'-edit')==='1'}catch(e){}
+  setEdit(startEdit);
+  renderAdded();
+  renderPick();
+  go((parseInt(location.hash.slice(1),10)||1)-1);
+})();
+</script>
+</body>
+</html>

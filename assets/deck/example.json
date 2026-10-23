@@ -1,0 +1,220 @@
+{
+  "meta": {
+    "title": "Platform weekly",
+    "date": "2026-11-02",
+    "meeting": "Platform weekly",
+    "team": "platform",
+    "agent": "Agnes",
+    "project": "PLAT",
+    "tracker_url": "https://example.atlassian.net/browse/",
+    "subtitle": "Start from what customers feel, assign owners in the room, agree the next sprint.",
+    "banner": "Owners are assigned in this meeting. The recap and this deck go to #platform afterwards, on Dana's yes.",
+    "agenda": [
+      {
+        "item": "Pipeline \u2014 where work is waiting",
+        "mins": 3
+      },
+      {
+        "item": "Sprint \u2014 shipped and slipped",
+        "mins": 5
+      },
+      {
+        "item": "From the field",
+        "mins": 5
+      },
+      {
+        "item": "Unowned intake \u2014 assign owners",
+        "mins": 10
+      },
+      {
+        "item": "Carry-over \u2014 commit, split or drop",
+        "mins": 5
+      },
+      {
+        "item": "Next sprint \u2014 goals",
+        "mins": 7
+      },
+      {
+        "item": "Roadmap pulse, decisions, new items",
+        "mins": 5
+      }
+    ],
+    "generated": "2026-11-02 07:00",
+    "sources": "tracker PLAT (board 1234), support queue, #platform-support",
+    "warnings": [],
+    "roster": [
+      "Dana Levi",
+      "Sam Roe",
+      "Kim Lee"
+    ],
+    "sprintSetup": {
+      "current": "Sprint 12",
+      "currentId": 101,
+      "next": "Sprint 13",
+      "nextId": 102,
+      "start": "2026-11-02",
+      "end": "2026-11-09"
+    }
+  },
+  "pipeline": {
+    "sub": "Support tickets waiting on the team.",
+    "cards": [
+      {
+        "value": "41",
+        "label": "Waiting",
+        "note": "open queue"
+      },
+      {
+        "value": "9",
+        "label": "Stuck > 14 days",
+        "note": "6 ours \u00b7 3 customer",
+        "tone": "warn"
+      },
+      {
+        "value": "2",
+        "label": "Stuck > 30 days",
+        "note": "oldest 2026-09-20",
+        "tone": "bad"
+      },
+      {
+        "value": "12",
+        "label": "No owner",
+        "note": "of 41",
+        "tone": "bad"
+      }
+    ],
+    "breakdown": [],
+    "trend": [],
+    "note": "Age = days since last update."
+  },
+  "sprint": {
+    "name": "Sprint 12 (2026-10-26 \u2192 11-02)",
+    "sub": "14 resolved in the last 7 days.",
+    "counts": {
+      "done": 14,
+      "inprog": 6,
+      "todo": 4
+    },
+    "shipped": [
+      {
+        "stream": "Billing reliability",
+        "items": [
+          {
+            "key": "PLAT-210",
+            "text": "Retry failed webhooks with backoff"
+          }
+        ]
+      },
+      {
+        "stream": "Onboarding",
+        "items": [
+          {
+            "key": "PLAT-215",
+            "text": "New-account checklist"
+          }
+        ]
+      }
+    ],
+    "note": ""
+  },
+  "experts": {
+    "title": "From support",
+    "heading": "What customers hit this week",
+    "sub": "Patterns from the support channel, counted as threads.",
+    "themes": [
+      {
+        "title": "Invoices emailed twice",
+        "count": "4 threads",
+        "tone": "bad",
+        "detail": "Duplicate invoice emails after retries.",
+        "ask": "Owner for PLAT-220."
+      }
+    ],
+    "note": ""
+  },
+  "intake": {
+    "sub": "Raised this week with nobody on them.",
+    "items": [
+      {
+        "id": 1,
+        "key": "PLAT-220",
+        "issue": "Duplicate invoice emails after webhook retries \u2014 PLAT-220",
+        "proposed": "Sam Roe",
+        "why": "built the retry path",
+        "priority": "P1"
+      },
+      {
+        "id": 2,
+        "issue": "Export to CSV times out for large accounts",
+        "proposed": "Kim Lee",
+        "why": "owns exports",
+        "priority": "P2"
+      }
+    ],
+    "note": ""
+  },
+  "carryover": {
+    "sub": "Open items in 3+ sprints.",
+    "items": [
+      {
+        "key": "PLAT-150",
+        "text": "Audit log retention",
+        "sprints": 4,
+        "assignee": "Kim Lee",
+        "rec": "Split into policy + job."
+      }
+    ],
+    "note": ""
+  },
+  "next": {
+    "title": "Proposed goals",
+    "sub": "A draft for the team to change.",
+    "goals": [
+      {
+        "title": "Stop duplicate invoices",
+        "text": "PLAT-220 fixed and verified."
+      }
+    ],
+    "note": ""
+  },
+  "roadmap": {
+    "sub": "Against the team roadmap.",
+    "moving": [
+      {
+        "text": "Billing reliability"
+      }
+    ],
+    "stalled": [
+      {
+        "text": "Audit log (PLAT-150)"
+      }
+    ],
+    "new": [],
+    "note": ""
+  },
+  "decisions": {
+    "sub": "Close each before we leave.",
+    "items": [
+      {
+        "q": "Owners for intake 1\u20132",
+        "rec": "as proposed"
+      }
+    ]
+  },
+  "backlog": [
+    {
+      "key": "PLAT-220",
+      "summary": "Duplicate invoice emails after webhook retries",
+      "status": "To Do",
+      "assignee": null,
+      "priority": "High"
+    },
+    {
+      "key": "PLAT-150",
+      "summary": "Audit log retention",
+      "status": "In Progress",
+      "assignee": "Kim Lee",
+      "priority": "Medium"
+    }
+  ]
+}
