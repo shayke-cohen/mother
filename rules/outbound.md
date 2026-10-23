@@ -115,6 +115,19 @@ and the call asks.
   `.mother/ledger.json`, so rewriting the grant can't reset the count. A corrupt ledger disables all grants.
 - **Signed.** Grant-backed chat posts, replies and tracker comments must carry the signature (above).
 
+**Answer grants** (`scope: "answer"`) are the one exception to "the source is the manager", and they exist for
+channel reply modes (`mother:channels`). `mother channels run` writes one per answer:
+`{"scope": "answer", "target": "<channel>", "thread": "<root ts>", "uses": 1, "run": "channels", …}`, citing the
+message that addressed the agent. The hook honours it only for **one signed reply in that one thread**, in a
+channel whose mode is `mention` or `auto`, not external, when the cited author may trigger it (`mention`: per
+the channel's `trigger` — `manager`, `team` = the team's `people[].chat` ids, or `anyone`; `auto`: anyone), and
+while that channel has had fewer than `max_replies_per_hour` (default 6) answers in the last hour. A forged
+answer grant gets one signed reply in a thread of a channel where the agent already answers people.
+
+The sessions that *write* those answers hold no grants and send nothing: with `MOTHER_CHANNEL_ROLE` set, the hook
+denies every outbound call, green ones included, and confines a teammate's session to work data (CONTRACT §5b).
+Only the loop posts, and only the text `mother channels` returned.
+
 `policy.grants` tightens this further: `{"enabled": false}` turns grants off;
 `{"scopes": {"tracker-create": {"max_uses_per_source": 1}}}` allows only the listed scopes, with lower caps;
 `{"max_age_hours": 24}` shortens the window.

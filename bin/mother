@@ -12,6 +12,7 @@ Commands:
   register                     print the scheduled-task pointers for enabled routines (JSON)
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
+  channels <cmd>               reply modes for team channels (`mother channels help`)
 
 The workspace is resolved from $MOTHER_WORKSPACE, else <state>/workspace, where <state> is
 $MOTHER_STATE_DIR or ~/.mother. Python 3.9 stdlib only (see docs/CONTRACT.md).
@@ -26,7 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.0.3"
+VERSION = "0.1.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -145,6 +146,15 @@ def validate(cfg: dict) -> list:
                 errs.append(f"{cw}: external channels are capped at mention/draft")
             if ch.get("external") and ch.get("mode") == "mention" and ch.get("trigger", "manager") != "manager":
                 errs.append(f"{cw}: external channels can only be triggered by the manager")
+            at = ch.get("auto_topics")
+            if at is not None and not (isinstance(at, list) and all(isinstance(x, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,60}", x) for x in at)):
+                errs.append(f"{cw}.auto_topics must be a list of lowercase-dashed topic slugs")
+            mr = ch.get("max_replies_per_hour")
+            if mr is not None and (not isinstance(mr, int) or isinstance(mr, bool) or mr < 1):
+                errs.append(f"{cw}.max_replies_per_hour must be a positive integer")
+            qh = ch.get("quiet_hours")
+            if qh is not None and not (isinstance(qh, str) and re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d", qh)):
+                errs.append(f"{cw}.quiet_hours must be HH:MM-HH:MM")
     for rid, r in (cfg.get("routines") or {}).items():
         if not isinstance(r, dict):
             errs.append(f"routines.{rid} must be an object")
@@ -293,6 +303,8 @@ def cmd_sync(args):
             print(f"mother sync: {m}")
     def warn(m):
         print(f"mother sync: {m}", file=sys.stderr)
+    if os.environ.get("MOTHER_NO_SYNC"):
+        return  # a channel reply session: the loop's own session syncs, and parallel syncs collide on git
     try:
         ws = workspace(required=False)
         if not ws or not (ws / ".git").exists():
@@ -489,10 +501,17 @@ def cmd_link(args):
     if str(d.resolve()) not in [str(Path(x).expanduser().resolve()) for x in os.environ.get("PATH", "").split(os.pathsep) if x]:
         print(f"note: {d} is not on your PATH; add it to your shell profile", file=sys.stderr)
 
+# ---------------------------------------------------------------- channels
+
+def cmd_channels(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import channels
+    channels.main(args)
+
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "link": cmd_link,
+            "status": cmd_status, "register": cmd_register, "link": cmd_link, "channels": cmd_channels,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

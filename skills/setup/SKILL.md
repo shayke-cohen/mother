@@ -155,10 +155,13 @@ In this order, reporting each step's result:
    and tools it reads, what it never stores (assessments, personal details), how to say "<name>, stop",
    and that it posts only in threads and signs every message. Posting it anywhere other than the manager's
    DM needs the manager's explicit yes — the guard will ask.
-7. **Shell command.** `mother link` puts `mother` on the manager's PATH (`~/.local/bin` by default) so
+7. **Channel replies (offer).** If any channel's mode is `mention`, `draft` or `auto`, tell the manager
+   replies need the loop running: `/loop /mother:channels` in a session on a cheap model, on the home
+   machine. Don't start it unasked.
+8. **Shell command.** `mother link` puts `mother` on the manager's PATH (`~/.local/bin` by default) so
    `mother join`, `mother home` and `mother status` work in their own terminal. Report what it printed,
    including the "not on your PATH" note if there is one.
-8. Sync happens automatically at the end of the turn (`mother sync`). If the workspace has a remote and the
+9. Sync happens automatically at the end of the turn (`mother sync`). If the workspace has a remote and the
    sync reports a secret hit or conflict, surface it verbatim.
 
 ## Rules

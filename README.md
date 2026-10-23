@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines and the meeting deck, covered by 60 automated tests. One manager's workspace has run on it since
+> routines and the meeting deck, covered by 100 automated tests. One manager's workspace has run on it since
 > 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -63,7 +63,8 @@ The approval guard is a hook, so it runs in **every** Claude Code session, not o
   your confirmation, even in an unrelated repo. Outside the workspace's green list nothing is pre-approved.
 - Credential entry, payments and deletions are refused outright, including `gh … delete` and
   `gh api -X DELETE` in any repo. Run those yourself in a terminal.
-- Calls that aren't outbound are untouched; your normal permission rules apply.
+- Calls that aren't outbound are untouched; your normal permission rules apply. (A second hook on reads exists
+  only for channel reply sessions and exits immediately everywhere else.)
 
 The Stop hook runs `mother sync`, which only acts on your workspace. Before you have one, it does nothing.
 
@@ -110,6 +111,24 @@ You can also just ask: "brief me", "what's open", "remember that …", "add a to
 design review", "set up a new project". Each one routes to a skill: `brief`, `todo`, `remember`,
 `meeting`, `project`, `team` and so on.
 
+### Replying in team channels
+
+Each channel in `config.json` has a reply mode: `off`, `watch` (read for digests only), `mention` (answers in
+the thread when someone addresses it by name, e.g. "Agnes, is the deploy green?"), `draft` (drafts replies to
+your DM; you answer `send`, `send: <edit>` or `no`) or `auto` (answers the topics you list in `auto_topics`
+itself and drafts the rest). Who may trigger a `mention` channel is its `trigger`: `manager`, `team` or
+`anyone`. Start the loop in a Claude Code session, on a cheap model:
+
+```
+/loop /mother:channels
+```
+
+Every reply is signed, stays in its thread, and is checked by the guard. When a teammate asks, the answer is
+written by a read-only session that can't see your mail, calendar, DMs or private notes. People in the channel
+can say `Agnes, mute` (this thread), `Agnes, stop` (this channel) or `Agnes, pause` (every channel), or 👎 a
+reply. Only you turn it back on. After 10 unedited drafts on one topic it proposes answering that topic itself;
+you decide by editing the config.
+
 Useful commands in your terminal:
 
 | Command | What |
@@ -118,6 +137,8 @@ Useful commands in your terminal:
 | `mother home show` | Which machine runs the routines |
 | `mother sync` | Commit and push the workspace now (also runs automatically at the end of each turn) |
 | `mother register` | Print the scheduled-task definitions for the enabled routines |
+| `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
+| `mother channels pause` / `resume` | Stop or restart replies in every channel |
 
 ### Pausing, stopping, uninstalling
 
@@ -134,7 +155,8 @@ Useful commands in your terminal:
 |---|---|
 | `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `path`, `link` (Python 3.9 stdlib) |
 | `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
-| `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `meeting`, `reflect`, `todo`, `project`, `team`, `remember` |
+| `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember` |
+| `lib/channels.py` | `mother channels`: the reply-mode engine behind `mother:channels` |
 | `routines/` | What each scheduled run does |
 | `assets/deck/` | Weekly meeting deck with meeting mode |
 | `rules/` | Default policies: outbound, privacy, memory, todos, projects, teams |

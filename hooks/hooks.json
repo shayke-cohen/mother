@@ -10,6 +10,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|LS|WebFetch|WebSearch|Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "[ -z \"$MOTHER_CHANNEL_ROLE\" ] || python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\""
+          }
+        ]
       }
     ],
     "Stop": [

@@ -82,11 +82,14 @@ class GuardCase(unittest.TestCase):
     def state(self, name):
         return os.path.join(self.ws, ".mother", name)
 
-    def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None):
+    def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None, env=None):
         payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp, "session_id": "t",
                    "cwd": cwd or self.tmp, "transcript_path": transcript}
+        extra = env or {}
         env = dict(os.environ, HOME=self.home)
         env.pop("MOTHER_WORKSPACE", None)
+        env.pop("MOTHER_CHANNEL_ROLE", None)
+        env.update(extra)
         if env_ws:
             env["MOTHER_WORKSPACE"] = self.ws
         p = subprocess.run([sys.executable, GUARD], input=raw if raw is not None else json.dumps(payload),
@@ -299,6 +302,56 @@ class TestNotOutbound(GuardCase):
         self.expect("none", "Read", {"file_path": "/etc/hosts"})
 
 
+class TestChannelSession(GuardCase):
+    """A headless channel reply session (MOTHER_CHANNEL_ROLE set by `mother channels run`)."""
+
+    def team(self, tool, inp, **kw):
+        return self.run_guard(tool, inp, env={"MOTHER_CHANNEL_ROLE": "team", "MOTHER_CHANNEL_SERVERS": "mcp__tracker__jira,mcp__gw__jira"},
+                              cwd=self.ws, **kw)[0]
+
+    def mgr(self, tool, inp):
+        return self.run_guard(tool, inp, env={"MOTHER_CHANNEL_ROLE": "manager"}, cwd=self.ws)[0]
+
+    def test_writes_nothing_outbound_even_green_or_granted(self):
+        self.grants(self.grant("chat-reply", TEAM))
+        for f in (self.team, self.mgr):
+            self.assertEqual(f(CHAT + "post_message", {"channel_id": DM, "text": "x"}), "deny")
+            self.assertEqual(f(CHAT + "reply_to_thread", {"channel_id": TEAM, "thread_ts": "1.2", "text": SIG}),
+                             "deny")
+            self.assertEqual(f(MAIL + "create-gmail-draft", {"to": "a@example.com"}), "deny")
+            self.assertEqual(f("Bash", {"command": "ls"}), "deny")
+            self.assertEqual(f("WebFetch", {"url": "https://example.com"}), "deny")
+
+    def test_teammate_reads_work_data_only(self):
+        os.makedirs(os.path.join(self.ws, "projects"))
+        self.assertEqual(self.team("Read", {"file_path": os.path.join(self.ws, "projects", "a.md")}), "none")
+        self.assertEqual(self.team(TRK + "get-issues", {"jql": "project = PLAT"}), "none")
+        for path in ("people/sam.md", "memory/MEMORY.md", "todos/open.md", ".mother/grants.json"):
+            self.assertEqual(self.team("Read", {"file_path": os.path.join(self.ws, path)}), "deny", path)
+        self.assertEqual(self.team("Read", {"file_path": os.path.join(self.home, ".claude", "x.jsonl")}), "deny")
+        self.assertEqual(self.team("Grep", {"pattern": "salary"}), "deny")            # the whole workspace
+        self.assertEqual(self.team("Grep", {"pattern": "x", "path": "projects"}), "none")
+        self.assertEqual(self.team(CHAT + "get_channel_history", {"channel_id": DM}), "deny")
+        self.assertEqual(self.team(MAIL + "list-emails", {}), "deny")
+        self.assertEqual(self.team("Write", {"file_path": os.path.join(self.ws, "projects", "a.md")}), "deny")
+        # one gateway server carrying several products: only the tracker's segment is open
+        self.assertEqual(self.team("mcp__gw__jira__get-issues", {"jql": "x"}), "none")
+        self.assertEqual(self.team("mcp__gw__gmail__read-email", {"id": "1"}), "deny")
+        self.assertEqual(self.team("mcp__gw__slack__get_channel_history", {"channel_id": DM}), "deny")
+        # a pattern can't climb out of its folder
+        self.assertEqual(self.team("Glob", {"path": "projects", "pattern": "../memory/**"}), "deny")
+        self.assertEqual(self.team("Glob", {"path": "projects", "pattern": "/etc/*"}), "deny")
+        self.assertEqual(self.team("Grep", {"path": "projects", "pattern": "x", "glob": "../people/*"}), "deny")
+
+    def test_manager_session_writes_notes_not_the_guard_state(self):
+        self.assertEqual(self.mgr("Write", {"file_path": os.path.join(self.ws, "todos", "open.md")}), "none")
+        self.assertEqual(self.mgr(CHAT + "get_channel_history", {"channel_id": DM}), "none")
+        for path in (".mother/grants.json", ".mother/channels.json", "config.json", "AGENTS.md", ".mcp.json",
+                     "skills/x/SKILL.md", "scripts/x.sh", "GEMINI.md", "todos/open.json"):
+            self.assertEqual(self.mgr("Write", {"file_path": os.path.join(self.ws, path)}), "deny", path)
+        self.assertEqual(self.mgr("Write", {"file_path": os.path.join(self.home, "x.txt")}), "deny")
+
+
 class TestSessionApproval(GuardCase):
     def setUp(self):
         super(TestSessionApproval, self).setUp()
@@ -440,6 +493,52 @@ class TestGrants(GuardCase):
         for ch in (EXT, ANNOUNCE):  # external and mode:off channels never take grants
             self.grants(self.grant("chat-post", ch, src_age=900))
             self.expect("ask", CHAT + "post_message", {"channel_id": ch, "text": SIG})
+
+    def test_answer_grant_covers_one_thread_per_trigger_rules(self):
+        cfg = config()
+        cfg["teams"][0]["people"] = [{"name": "Sam", "chat": "U00000001"}]
+        cfg["teams"][0]["channels"][0]["max_replies_per_hour"] = 2
+        self.write_config(cfg)
+        reply = lambda th, text=SIG + "\nanswer": (CHAT + "reply_to_thread",
+                                                    {"channel_id": TEAM, "thread_ts": th, "text": text})
+        # a teammate on the team, in a mention/team channel, cited in that channel: one signed reply in that thread
+        self.grants(self.grant("answer", TEAM, user="U00000001", channel=TEAM, thread="5.1", src_age=100))
+        self.expect("ask", *reply("5.1", "unsigned"))
+        self.expect("ask", *reply("9.9"))                     # another thread
+        self.expect("allow", *reply("5.1"))
+        self.expect("ask", *reply("5.1"))                     # single use
+        # not on the team / cited from another channel / draft channel / top-level post
+        for g in (self.grant("answer", TEAM, user="U00000077", channel=TEAM, thread="6.1", src_age=110),
+                  self.grant("answer", TEAM, user="U00000001", channel=DM, thread="6.1", src_age=120)):
+            self.grants(g)
+            self.expect("ask", *reply("6.1"))
+        self.grants(self.grant("answer", SUPPORT, user="U00000001", channel=SUPPORT, thread="6.1", src_age=130))
+        self.expect("ask", CHAT + "reply_to_thread", {"channel_id": SUPPORT, "thread_ts": "6.1", "text": SIG})
+        self.grants(self.grant("answer", TEAM, user="U00000001", channel=TEAM, thread="7.1", src_age=140))
+        self.expect("ask", CHAT + "post_message", {"channel_id": TEAM, "text": SIG})
+        # rate limit: max_replies_per_hour=2, one already used above
+        self.expect("allow", *reply("7.1"))
+        self.grants(self.grant("answer", TEAM, user="U00000001", channel=TEAM, thread="8.1", src_age=150))
+        self.expect("ask", *reply("8.1"))
+
+    def test_answer_grant_trigger_modes(self):
+        cfg = config()
+        chans = cfg["teams"][0]["channels"]
+        chans[0]["trigger"] = "manager"
+        self.write_config(cfg)
+        r = lambda th: (CHAT + "reply_to_thread", {"channel_id": TEAM, "thread_ts": th, "text": SIG})
+        self.grants(self.grant("answer", TEAM, user="U00000001", channel=TEAM, thread="1.1", src_age=100))
+        self.expect("ask", *r("1.1"))                         # trigger: manager, a teammate asked
+        self.grants(self.grant("answer", TEAM, user=ME, channel=TEAM, thread="2.1", src_age=110))
+        self.expect("allow", *r("2.1"))                       # the manager asked
+        chans[0]["trigger"] = "anyone"
+        self.write_config(cfg)
+        self.grants(self.grant("answer", TEAM, user="U00000055", channel=TEAM, thread="3.1", src_age=120))
+        self.expect("allow", *r("3.1"))
+        chans[0].update(mode="mention", trigger="anyone", external=True)
+        self.write_config(cfg)
+        self.grants(self.grant("answer", TEAM, user=ME, channel=TEAM, thread="4.1", src_age=130))
+        self.expect("ask", *r("4.1"))                         # external channels never take answer grants
 
     def test_tracker_comment_grant_needs_signature(self):
         self.grants(self.grant("tracker-comment", "PLAT", uses=3))

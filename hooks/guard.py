@@ -48,7 +48,7 @@ DEFAULT_NEEDS_YES = ["any_message_to_others", "tracker_writes", "calendar_with_g
 ALWAYS_NEVER = ["credentials", "deletions", "payments"]
 
 # Grant scopes an unattended run may hold, with the ceiling on uses per cited source message.
-GRANT_SCOPES = {"chat-post": 3, "chat-reply": 3, "tracker-create": 5, "tracker-comment": 5,
+GRANT_SCOPES = {"chat-post": 3, "chat-reply": 3, "answer": 1, "tracker-create": 5, "tracker-comment": 5,
                 "tracker-transition": 10}
 GRANT_MAX_AGE_HOURS = 96
 
@@ -642,6 +642,10 @@ def grant_scope_of(a):
 
 
 def allowed_targets(scope, cfg):
+    if scope == "answer":
+        dms = dm_ids(cfg)
+        return {cid for cid, ch in team_channels(cfg).items()
+                if ch.get("external") is not True and ch.get("mode") in ("mention", "auto") and cid not in dms}
     if scope.startswith("chat-"):
         dms = dm_ids(cfg)
         return {cid for cid, ch in team_channels(cfg).items()
@@ -688,10 +692,38 @@ class Ledger(object):
         os.replace(tmp, self.path)
 
 
-def valid_grant(g, scope, target, cfg, scopes, max_age, now):
+def team_people(cfg, channel):
+    """Chat ids of the people on the team(s) that own `channel`."""
+    ids = set()
+    for t in cfg.get("teams") or []:
+        if not isinstance(t, dict):
+            continue
+        if any(isinstance(c, dict) and str(c.get("id")) == str(channel) for c in t.get("channels") or []):
+            ids |= {str(p["chat"]) for p in t.get("people") or [] if isinstance(p, dict) and p.get("chat")}
+    return ids
+
+
+def may_trigger(cfg, channel, user):
+    """Whether `user` may make the agent answer in `channel` (CONTRACT §3 channels: mode + trigger)."""
+    ch = team_channels(cfg).get(str(channel)) or {}
+    if ch.get("external") is True:
+        return False
+    if str(user) == str(owner_id(cfg)):
+        return ch.get("mode") in ("mention", "auto")
+    if ch.get("mode") == "auto":
+        return True
+    if ch.get("mode") != "mention":
+        return False
+    trig = ch.get("trigger", "manager")
+    return trig == "anyone" or (trig == "team" and str(user) in team_people(cfg, channel))
+
+
+def valid_grant(g, scope, target, cfg, scopes, max_age, now, thread=None):
     """The grant's (source key, cap) if it is well-formed and covers (scope, target); else None."""
     if not isinstance(g, dict) or g.get("scope") != scope or str(g.get("target")) != str(target):
         return None
+    if (scope == "answer" or g.get("thread")) and (not thread or str(g.get("thread")) != str(thread)):
+        return None  # a thread-bound grant (every answer grant) covers that one thread
     src = g.get("source")
     if not isinstance(src, dict):
         return None
@@ -703,7 +735,10 @@ def valid_grant(g, scope, target, cfg, scopes, max_age, now):
         return None
     if not isinstance(uses, int) or isinstance(uses, bool) or uses < 1:
         return None
-    if str(user) != str(owner_id(cfg)):
+    if scope == "answer":
+        if str(channel) != str(target) or not may_trigger(cfg, target, user):
+            return None  # a teammate's message authorises only an answer in that channel, per its mode
+    elif str(user) != str(owner_id(cfg)):
         return None  # only the manager's own message can authorise a write
     if str(channel) not in dm_ids(cfg) | set(team_channels(cfg)):
         return None
@@ -719,11 +754,30 @@ def run_grant(a, ctx, now=None):
     sc = grant_scope_of(a)
     if not sc or not ctx.ws:
         return None
+    found = None
+    for cand in [sc] + ([("answer", sc[1], 1)] if sc[0] == "chat-reply" else []):
+        found = run_grant_scope(a, ctx, cand, now)
+        if found:
+            break
+    return found
+
+
+def answers_last_hour(book, target, now):
+    n = 0
+    for r in book["uses"]:
+        if isinstance(r, dict) and r.get("scope") == "answer" and r.get("target") == target:
+            t = parse_time(r.get("at"))
+            if t is not None and now - t < 3600:
+                n += 1
+    return n
+
+
+def run_grant_scope(a, ctx, sc, now=None):
     scope, target, n = sc
     scopes, max_age = grant_limits(ctx.cfg)
     if scope not in scopes or not target or target not in allowed_targets(scope, ctx.cfg):
         return None
-    if scope in ("chat-post", "chat-reply", "tracker-comment"):
+    if scope in ("chat-post", "chat-reply", "tracker-comment", "answer"):
         agent = ctx.cfg.get("agent") or {}
         marks = ["%s (AI)" % agent["name"]] if agent.get("name") else []
         if isinstance(agent.get("signature"), str) and agent["signature"].strip():
@@ -738,8 +792,13 @@ def run_grant(a, ctx, now=None):
         book = led.read()
         if book is None:
             return None
+        if scope == "answer":
+            ch = team_channels(ctx.cfg).get(str(target)) or {}
+            cap = ch.get("max_replies_per_hour", 6)
+            if not isinstance(cap, int) or isinstance(cap, bool) or answers_last_hour(book, target, now) >= cap:
+                return None  # rate limit, enforced here too in case the loop's own check is bypassed
         for g in data["grants"]:
-            v = valid_grant(g, scope, target, ctx.cfg, scopes, max_age, now)
+            v = valid_grant(g, scope, target, ctx.cfg, scopes, max_age, now, thread=a.get("thread"))
             if not v:
                 continue
             key, cap = v
@@ -752,8 +811,8 @@ def run_grant(a, ctx, now=None):
             book["uses"].append({"at": now_iso(), "scope": scope, "target": target, "source": key, "n": n,
                                  "run": g.get("run")})
             led.write(book)
-            return "run grant %s on %s citing the manager's message %s (%d/%d used)" % (
-                scope, target, key, used + n, cap)
+            whose = "the message" if scope == "answer" else "the manager's message"
+            return "run grant %s on %s citing %s %s (%d/%d used)" % (scope, target, whose, key, used + n, cap)
     return None
 
 
@@ -811,6 +870,72 @@ def log(ctx, tool, a, decision, reason):
         pass
 
 
+# ------------------------------------------------------------------ channel reply sessions
+
+CHANNEL_PRIVATE = ["people", "journal", "memory", "todos", ".mother", "bridge"]
+CHANNEL_NOTE_DIRS = ("todos", "memory", "projects", "teams", "people")
+CHANNEL_NO_TOOLS = {"Bash", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"}
+
+
+def inside(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def channel_session(tool, inp, cwd, ctx, role):
+    """`mother channels run` sets MOTHER_CHANNEL_ROLE on the headless session that writes one chat answer. Such
+    a session writes nothing outbound — the loop posts its reply — and a teammate's session reads only work data:
+    the workspace minus private folders, plus the servers in MOTHER_CHANNEL_SERVERS. Enforced here, so neither
+    the user's own allow rules nor a green-list entry can widen it. Returns (decision, reason) or None."""
+    who = "a channel session (asked by %s)" % ("the manager" if role == "manager" else "a teammate")
+    if not ctx.ws:
+        return "deny", "%s has no workspace: refusing %s." % (who, tool)
+    ws = os.path.realpath(ctx.ws)
+    plugin = os.path.realpath(os.path.dirname(HERE))
+    if tool in CHANNEL_NO_TOOLS:
+        return "deny", "%s can't use %s." % (who, tool)
+    if tool in ("Write", "Edit", "MultiEdit"):
+        fp = os.path.realpath(os.path.join(cwd or ws, os.path.expanduser(str(inp.get("file_path") or ""))))
+        if role != "manager":
+            return "deny", "%s can't change files." % who
+        rel = os.path.relpath(fp, ws) if inside(fp, ws) else None
+        # An allow-list, not a deny-list: anything else in a workspace (.mcp.json, skills/, scripts/, pointer
+        # files) is code or config that a later session would run.
+        if rel is None or rel.split(os.sep)[0] not in CHANNEL_NOTE_DIRS or not rel.endswith(".md"):
+            return "deny", "%s may write only notes (*.md under %s), not %s." % (
+                who, ", ".join(d + "/" for d in CHANNEL_NOTE_DIRS), fp)
+        return None
+    if tool in ("Read", "Grep", "Glob", "LS"):
+        raw = inp.get("file_path") or inp.get("path") or ""
+        fp = os.path.realpath(os.path.join(cwd or ws, os.path.expanduser(str(raw)))) if raw else os.path.realpath(
+            cwd or ws)
+        if inside(fp, plugin):
+            return None
+        if not inside(fp, ws):
+            return "deny", "%s reads only the workspace: %s is outside it." % (who, fp)
+        if role != "manager":
+            top = os.path.relpath(fp, ws).split(os.sep)[0]
+            if top in CHANNEL_PRIVATE:
+                return "deny", "%s can't read %s/: it holds the manager's private notes." % (who, top)
+            if tool in ("Grep", "Glob") and fp == ws:
+                return "deny", "%s searches a folder, not the whole workspace (private folders live there)." % who
+            pats = [str(inp.get(k) or "") for k in ("pattern", "glob")] if tool == "Glob" else [str(inp.get("glob") or "")]
+            if any(".." in x or x.startswith(("/", "~")) for x in pats):
+                return "deny", "%s: a search pattern can't leave its folder." % who
+        return None
+    if tool.startswith("mcp__"):
+        a = classify(tool, inp, cwd, ctx)
+        if a is not None:
+            return "deny", "%s writes nothing (%s): the loop posts the reply." % (who, a["what"])
+        if role != "manager":
+            # Prefixes, not server names: one gateway server can carry chat, mail and the tracker side by side
+            # (mcp__gw__jira__… next to mcp__gw__gmail__…), so the prefix includes the product segment.
+            ok = [p.strip() for p in os.environ.get("MOTHER_CHANNEL_SERVERS", "").split(",") if p.strip()]
+            if not any(tool.startswith(p + "__") for p in ok):
+                return "deny", "%s can't use %s: only the tracker and code-host tools." % (who, tool)
+        return None
+    return None
+
+
 def run(raw):
     """Returns (decision, reason) or None. Never raises."""
     try:
@@ -832,6 +957,13 @@ def run(raw):
             if tool == "Bash" or tool.startswith("mcp__"):
                 raise ValueError("tool_input is not an object")
             return None
+        role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
+        if role:
+            r = channel_session(tool, inp, payload.get("cwd"), ctx, role)
+            if r is None:
+                return None
+            log(ctx, tool, {"kind": "channel-session", "category": role}, r[0], r[1])
+            return r
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             return None

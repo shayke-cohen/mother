@@ -90,6 +90,12 @@ appear under the manager's name.
 - Kill switch: `<name>, stop` in a channel, and `<name>, pause` for every channel.
 - Every post is written to an audit log.
 
+**As built (v1, `mother:channels`):** a loop session polls the replying channels and hands every decision to
+`mother channels` (CONTRACT §5b); each answer is written by its own headless session, read-only and without
+mail or calendar when a teammate asked. Limits today: answers only — a channel session never writes to the
+tracker, even when the manager asked (it drafts the change in its reply instead); no status reactions;
+mentions inside other people's threads need `chat.search`; tested against Slack's message shape.
+
 **Earned autonomy:** a topic in a channel can move from `draft` to `auto` once 10 drafts in a row went out
 unedited. The agent proposes the move; the manager decides. A 👎 sends that topic back to `draft`.
 

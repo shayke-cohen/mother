@@ -65,7 +65,9 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `workspace.home_machine` | str or null | hostname allowed to run routines; null = routines refuse to run until set |
 | `connectors.{chat,tracker,mail,calendar,code}` | str | `slack`/`teams`, `jira`/`linear`/`monday`/`none`, … |
 | `teams[]` | list | `slug, name, tracker{project,board}, repos[], meetings{}, sprint{length,starts}, channels[], people[]` |
-| `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, role: standup|team|product|support|announcements, quiet_hours, max_replies_per_hour` |
+| `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, role: standup|team|product|support|announcements, quiet_hours ("HH:MM-HH:MM", default manager.quiet_hours), max_replies_per_hour (default 6), auto_topics: [slug] (auto mode)` |
+| `agent.aliases` | list, optional | other names that address the agent in a channel (e.g. `["mother"]`) |
+| `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 
@@ -109,9 +111,37 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **Grants** (`.mother/grants.json`): `{scope, target, uses, expires, run, source{channel,user,ts}}`; scopes
   `chat-post`, `chat-reply`, `tracker-create`, `tracker-comment`, `tracker-transition`; the source must be the
   manager, ≤ 96 h old; counts are capped per source in the ledger. `policy.grants` may disable or narrow them.
+  Plus `answer` (`+ thread`), written by `mother channels`: one signed reply in one thread of a `mention`/`auto`
+  channel, citing whoever addressed the agent if the channel's `trigger` allows them; rate-capped by
+  `max_replies_per_hour` in the ledger (`rules/outbound.md`).
 - **Paused** denies drafts too. Policy overrides only tighten (the auto list can shrink, the never list can grow).
 - The hook matcher includes `Write|Edit|MultiEdit|NotebookEdit`, so edits to the guard's own files
   (config, ledger, log, PAUSED, hooks) ask.
+
+## 5b. Channel reply loop (`lib/channels.py`, `mother channels`, skill `mother:channels`)
+
+- The skill does chat I/O only; the CLI decides. `plan` → what to poll; `triage` (stdin: one channel's new
+  messages + followed threads) → actions; `run --action` → one headless `claude -p` session per answer →
+  `answer` (grant written) | `draft` (to the manager's DM) | `skip`; `approvals` (stdin: replies in each draft's DM
+  thread) → `send` actions; `done` records each post.
+- Sessions run in the workspace with `--permission-mode default` and `MOTHER_CHANNEL_ROLE=manager|team|anyone`.
+  **The guard enforces the limits from that variable**, whatever the user's allow rules say: a channel session
+  makes no outbound call at all (not even green ones — the loop posts), no `Bash`/web/subagents, and reads only
+  the workspace and the plugin. A teammate's session also can't write, can't read `people/ journal/ memory/ todos/
+  .mother/ bridge/`, grep the workspace root or use `..`/absolute search patterns, and may call only tools under the
+  prefixes in `MOTHER_CHANNEL_SERVERS` — the tracker and code-host prefixes *with their product segment*
+  (`mcp__gw__jira`), so a gateway that also carries chat or mail stays shut; a prefix shared outright with chat,
+  mail or calendar is refused. The manager's session may write only notes: `*.md` under `todos/ memory/ projects/
+  teams/ people/` (an allow-list: `.mcp.json`, `skills/`, `scripts/` and pointer files are code a later session
+  would run). A second hook entry (`Read|Grep|Glob|LS|Web*|Task|Agent`) exits at once unless that variable is set.
+  The `--allowedTools`/`--disallowedTools` flags repeat the same limits as a first fence. One session per thread
+  and role (`--session-id`, then `--resume`); a teammate never joins a session the manager drove.
+  `MOTHER_NO_SYNC=1` makes `mother sync` a no-op inside them.
+- State: `.mother/channels.json` (cursors, threads, pending actions, drafts, streaks, demotions, stop/pause);
+  audit: `.mother/channels.log` (jsonl, one line per post, draft, skip, mute, stop, error). Both machine-local.
+- A first look at a channel only sets its cursor to now. Quiet hours and rate limits hold messages (the cursor
+  stops); stop/pause drop them. Earned autonomy: 10 unedited approvals on one channel+topic → one proposal to the
+  manager; a 👎 on a reply mutes the thread and demotes its topic.
 
 ## 6. Sync (`bin/mother sync`)
 
