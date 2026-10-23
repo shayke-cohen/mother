@@ -168,6 +168,12 @@ class TestAsk(GuardCase):
         self.expect("ask", CHAT + "set_channel_topic", {"channel_id": TEAM, "topic": "x"})
         self.expect("ask", CHAT2 + "slack_create_canvas", {"title": "x"})
 
+    def test_mail_trash_and_spam_ask(self):
+        # Bulk-trashing an inbox is how a real agent incident destroyed mail: confirm each one.
+        self.expect("ask", MAIL2 + "trash_thread", {"threadId": "t1"})
+        self.expect("ask", MAIL2 + "trash_message", {"messageId": "m1"})
+        self.expect("ask", MAIL2 + "mark_thread_spam", {"threadId": "t1"})
+
     def test_mail(self):
         self.expect("ask", MAIL + "send-gmail-message", {"to": "sam@example.com", "subject": "s", "body": "b"})
         self.expect("ask", MAIL2 + "send_message", {"to": "sam@example.com", "subject": "s", "body": "b"})

@@ -115,8 +115,13 @@ def validate(cfg: dict) -> list:
     for k in ("name", "manager", "manager_short"):
         need(agent, k, str, "agent")
     mgr = need(cfg, "manager", dict, "config") or {}
-    for k in ("email", "timezone", "chat_dm"):
+    for k in ("email", "timezone"):
         need(mgr, k, str, "manager")
+    dm = need(mgr, "chat_dm", None, "manager")
+    if dm is not None and not (isinstance(dm, str) or (isinstance(dm, list) and dm and all(isinstance(x, str) for x in dm))):
+        errs.append("manager.chat_dm must be a string or a non-empty list of strings")
+    if "chat_user" in mgr and not isinstance(mgr["chat_user"], str):
+        errs.append("manager.chat_user must be a string")
     wd = mgr.get("workdays", DAYS[:5])
     if not isinstance(wd, list) or any(d not in DAYS for d in wd):
         errs.append(f"manager.workdays must be a list of {DAYS}")
@@ -234,6 +239,13 @@ def cmd_init(args):
             shutil.copy2(src, dst)
             created.append(str(rel))
     (ws / ".mother").mkdir(exist_ok=True)
+    # An adopted workspace keeps its own .gitignore, but must still ignore mother's machine-local state.
+    gi = ws / ".gitignore"
+    have = set(gi.read_text().splitlines()) if gi.exists() else set()
+    need = [l for l in (TEMPLATE / ".gitignore").read_text().splitlines() if l and not l.startswith("#") and l not in have]
+    if need:
+        with gi.open("a") as f:
+            f.write(("\n" if have else "") + "# added by mother init\n" + "\n".join(need) + "\n")
     if not (ws / ".git").exists():
         git(ws, "init", "-q", "-b", "main")
     if remote:

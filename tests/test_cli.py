@@ -63,6 +63,19 @@ class CliTest(unittest.TestCase):
         self.init()
         self.assertEqual((self.ws / "AGENTS.md").read_text(), "mine")
 
+    def test_init_adopting_repo_extends_its_gitignore(self):
+        self.ws.mkdir()
+        (self.ws / "AGENTS.md").write_text("existing agent")
+        (self.ws / ".gitignore").write_text("node_modules/\n")
+        self.init()
+        gi = (self.ws / ".gitignore").read_text()
+        self.assertIn("node_modules/", gi)
+        self.assertIn(".mother/", gi)
+        self.init()  # idempotent: no duplicate lines
+        self.assertEqual((self.ws / ".gitignore").read_text().count(".mother/"), 1)
+        run(["sync"], self.env)
+        self.assertNotIn(".mother", git(self.ws, "ls-files").stdout)
+
     def test_init_refuses_unrelated_nonempty_dir(self):
         self.ws.mkdir()
         (self.ws / "random.txt").write_text("x")
@@ -154,6 +167,17 @@ class CliTest(unittest.TestCase):
         r = run(["status"], self.env)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("config:      valid", r.stdout)
+
+    def test_chat_dm_may_be_a_list(self):
+        self.init()
+        cfg = self.write_config()
+        cfg["manager"]["chat_dm"] = ["U00000000", "D00000000"]
+        cfg["manager"]["chat_user"] = "U00000000"
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertEqual(run(["status"], self.env).returncode, 0)
+        cfg["manager"]["chat_dm"] = []
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertEqual(run(["status"], self.env).returncode, 1)
 
     def test_status_rejects_bad_config(self):
         self.init()

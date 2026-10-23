@@ -44,7 +44,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 
 DEFAULT_AUTO = ["own_dm", "drafts", "own_calendar_no_guests"]
 DEFAULT_NEEDS_YES = ["any_message_to_others", "tracker_writes", "calendar_with_guests", "code_host_comments",
-                     "standing_rules", "docs_writes"]
+                     "standing_rules", "docs_writes", "mail_trash"]
 ALWAYS_NEVER = ["credentials", "deletions", "payments"]
 
 # Grant scopes an unattended run may hold, with the ceiling on uses per cited source message.
@@ -272,7 +272,8 @@ WRITE_VERBS = {"create", "post", "send", "reply", "schedule", "update", "edit", 
                "reopen", "archive", "change", "rank", "invite", "kick", "join", "leave", "rename", "pin",
                "unpin", "share", "upload", "complete", "merge", "approve", "publish", "forward", "respond",
                "rsvp", "insert", "quick", "cancel", "execute", "submit", "push", "fork", "lock", "unlock",
-               "transfer", "mark", "react", "convert", "start", "end", "invoke", "trigger", "run", "write"}
+               "transfer", "mark", "react", "convert", "start", "end", "invoke", "trigger", "run", "write",
+               "trash", "spam", "junk"}
 
 SECRET_RE = re.compile(
     r"xox[abposr]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}"
@@ -317,6 +318,8 @@ def domain_from_shape(inp):
         return "chat"
     if first(inp, "to", "recipients", "cc", "bcc") and first(inp, "subject", "body", "html", "raw"):
         return "mail"
+    if first(inp, "threadId", "thread_id", "messageId", "message_id", "messageIds", "draftId", "labelIds"):
+        return "mail"  # mail tools behind an opaque server prefix (e.g. trash_thread {threadId})
     if first(inp, "projectKey", "project_key", "issueKey", "issueIdOrKey", "issue_key", "issueUpdates", "board_id",
              "boardId", "sprintId"):
         return "tracker"
@@ -444,7 +447,11 @@ def classify_mcp(tool, inp):
         if lead in ("send", "reply", "forward", "submit") or "send" in verbs:
             return act("mail", "any_message_to_others", "sending mail to %s" % (first(inp, "to", "recipients")
                                                                                  or "?"), text=text_of(inp))
-        return None  # labels, archive, mark-as-read, trash: no one else sees them
+        if {"trash", "spam", "junk"} & verbs:
+            # Recoverable, so not a deletion — but bulk-trashing an inbox is exactly how a real agent incident
+            # destroyed a user's mail, so the manager confirms each one.
+            return act("mail-trash", "mail_trash", "moving mail to trash/spam (%s)" % short)
+        return None  # labels, archive, mark-as-read: reversible and no one else sees them
 
     if dom == "calendar":
         if "calendar" in verbs and "event" not in verbs and "events" not in verbs:
