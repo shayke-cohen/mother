@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "agent": {
+    "name": "Agnes",
+    "emoji": ":sparkles:",
+    "manager": "Dana Levi",
+    "manager_short": "Dana"
+  },
+  "manager": {
+    "email": "dana@example.com",
+    "timezone": "Europe/London",
+    "workdays": [
+      "Mon",
+      "Tue",
+      "Wed",
+      "Thu",
+      "Fri"
+    ],
+    "quiet_hours": "19:00-08:00",
+    "chat_dm": "U00000000"
+  },
+  "workspace": {
+    "git_remote": null,
+    "home_machine": null
+  },
+  "connectors": {
+    "chat": "slack",
+    "tracker": "jira",
+    "mail": "gmail",
+    "calendar": "google",
+    "code": "github"
+  },
+  "teams": [
+    {
+      "slug": "platform",
+      "name": "Platform team",
+      "tracker": {
+        "project": "PLAT",
+        "board": 1234
+      },
+      "repos": [
+        "example-org/platform-api",
+        "example-org/platform-web"
+      ],
+      "meetings": {
+        "weekly": {
+          "title": "Platform weekly",
+          "day": "Mon",
+          "time": "11:00",
+          "prep_at": "Mon 07:00"
+        }
+      },
+      "sprint": {
+        "length": "1w",
+        "starts": "Mon"
+      },
+      "channels": [
+        {
+          "id": "C00000001",
+          "name": "#platform",
+          "mode": "mention",
+          "trigger": "team"
+        },
+        {
+          "id": "C00000002",
+          "name": "#platform-support",
+          "mode": "draft"
+        },
+        {
+          "id": "C00000003",
+          "name": "#announcements",
+          "mode": "watch"
+        }
+      ],
+      "people": [
+        {
+          "name": "Sam Roe",
+          "email": "sam@example.com",
+          "chat": "U00000001",
+          "code": "samroe"
+        }
+      ]
+    }
+  ],
+  "routines": {
+    "brief": {
+      "at": "08:45",
+      "days": "workdays"
+    },
+    "digest": {
+      "at": "09:00",
+      "days": "workdays",
+      "decision_queue": 5
+    },
+    "dots": {
+      "at": "13:00",
+      "days": "workdays"
+    },
+    "meeting": {
+      "deck": true,
+      "meeting_mode": true
+    },
+    "reflect": {
+      "at": "21:30",
+      "days": "all"
+    },
+    "doctor": {
+      "at": "08:30",
+      "days": [
+        "Mon"
+      ]
+    }
+  },
+  "policy": {
+    "auto_without_asking": [
+      "own_dm",
+      "drafts",
+      "own_calendar_no_guests"
+    ],
+    "needs_yes": [
+      "any_message_to_others",
+      "tracker_writes",
+      "calendar_with_guests",
+      "code_host_comments"
+    ],
+    "never": [
+      "credentials",
+      "deletions",
+      "payments"
+    ]
+  }
+}

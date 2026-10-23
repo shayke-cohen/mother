@@ -1,0 +1,5 @@
+# Machine-local state: guard grants and ledger, home lock, last sync
+.mother/
+.DS_Store
+# Scratch space inside projects
+projects/*/files/tmp/

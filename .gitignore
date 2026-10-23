@@ -2,4 +2,4 @@
 node_modules/
 *.local.*
 # A workspace never lives inside the plugin repo
-workspace/
+/workspace/

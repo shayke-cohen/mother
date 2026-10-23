@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "agent": { "name": "", "emoji": ":sparkles:", "manager": "", "manager_short": "" },
+  "manager": { "email": "", "timezone": "", "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"], "quiet_hours": "19:00-08:00", "chat_dm": "" },
+  "workspace": { "git_remote": null, "home_machine": null },
+  "connectors": {},
+  "teams": [],
+  "routines": {},
+  "policy": {}
+}
