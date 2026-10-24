@@ -15,6 +15,8 @@ Commands:
   channels <cmd>               reply modes for team channels (`mother channels help`)
   speak [--in FILE] [--name N] [--voice V] [--rate WPM]
                                render a spoken script (stdin or FILE) to <workspace>/.mother/audio/<name>.m4a
+  tts setup [--from DIR] | tts status
+                               install the Kokoro neural voice into ~/.mother/tts (optional; English only)
 
 The workspace is resolved from $MOTHER_WORKSPACE, else <state>/workspace, where <state> is
 $MOTHER_STATE_DIR or ~/.mother. Python 3.9 stdlib only (see docs/CONTRACT.md).
@@ -29,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -170,10 +172,11 @@ def validate(cfg: dict) -> list:
                 errs.append(f"routines.{rid}.days must be workdays, all, a day, a list of days, or monthly:<1-28>")
             au = r.get("audio") if rid == "brief" else None
             if au is not None and not (au is True or au is False or (isinstance(au, dict) and all(
-                    k in ("voice", "voice_he", "rate", "language", "save_to") for k in au)
+                    k in ("voice", "voice_he", "rate", "language", "save_to", "engine", "kokoro_voice") for k in au)
+                    and au.get("engine", "say") in ("say", "kokoro")
                     and au.get("language", "en") in ("en", "he")
                     and (au.get("rate") is None or (isinstance(au["rate"], int) and 90 <= au["rate"] <= 360)))):
-                errs.append("routines.brief.audio must be true/false or {voice, voice_he, rate 90-360, language en|he, save_to}")
+                errs.append("routines.brief.audio must be true/false or {voice, voice_he, rate 90-360, language en|he, save_to, engine say|kokoro, kokoro_voice}")
     return errs
 
 # ---------------------------------------------------------------- secret scan
@@ -524,6 +527,84 @@ def _opt(args, name, default=None):
     return default
 
 
+KOKORO_FILES = {
+    "kokoro-v1.0.fp16.onnx": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.fp16.onnx",
+    "voices-v1.0.bin": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
+}
+KOKORO_PKGS = ["kokoro-onnx==0.6.1", "soundfile"]
+
+
+def tts_dir() -> Path:
+    return state_dir() / "tts"
+
+
+def kokoro_python():
+    py = tts_dir() / ".venv" / "bin" / "python"
+    ok = py.exists() and all((tts_dir() / f).is_file() for f in KOKORO_FILES)
+    return py if ok else None
+
+
+def cmd_tts(args):
+    sub = args[0] if args else "status"
+    d = tts_dir()
+    if sub == "status":
+        py = kokoro_python()
+        print(json.dumps({"kokoro": bool(py), "dir": str(d),
+                          "missing": [f for f in KOKORO_FILES if not (d / f).is_file()]
+                          + ([] if (d / ".venv/bin/python").exists() else [".venv"])}))
+        return
+    if sub != "setup":
+        die("usage: mother tts setup [--from DIR] | mother tts status")
+    d.mkdir(parents=True, exist_ok=True)
+    src = _opt(args, "--from")
+    for f, url in KOKORO_FILES.items():
+        if (d / f).is_file():
+            continue
+        if src and (Path(os.path.expanduser(src)) / f).is_file():
+            shutil.copyfile(Path(os.path.expanduser(src)) / f, d / f)
+            print(f"copied {f}")
+            continue
+        print(f"downloading {f} (~{'170' if f.endswith('onnx') else '28'} MB) …", flush=True)
+        r = subprocess.run(["curl", "-fL", "--retry", "2", "-o", str(d / (f + ".part")), url])
+        if r.returncode:
+            die(f"download failed: {url}")
+        os.replace(d / (f + ".part"), d / f)
+    venv = d / ".venv"
+    if not (venv / "bin/python").exists():
+        uv = shutil.which("uv")
+        r = (subprocess.run([uv, "venv", "-q", "--python", "3.12", str(venv)]) if uv
+             else subprocess.run([sys.executable, "-m", "venv", str(venv)]))
+        if r.returncode:
+            die("could not create the TTS virtualenv (install uv, or Python 3.10+)")
+    py = str(venv / "bin/python")
+    uv = shutil.which("uv")
+    r = (subprocess.run([uv, "pip", "install", "-q", "--python", py, *KOKORO_PKGS]) if uv
+         else subprocess.run([py, "-m", "pip", "install", "-q", *KOKORO_PKGS]))
+    if r.returncode:
+        die("installing kokoro-onnx failed")
+    print(json.dumps({"kokoro": bool(kokoro_python()), "dir": str(d)}))
+
+
+def render_kokoro(text_file: Path, out: Path, voice: str, speed: float):
+    """(ok, error). WAV from Kokoro, then AAC with the system's afconvert (or ffmpeg)."""
+    py = kokoro_python()
+    if not py:
+        return False, "Kokoro isn't installed (mother tts setup)"
+    wav = out.with_suffix(".wav")
+    r = subprocess.run([str(py), str(PLUGIN_ROOT / "lib" / "tts_kokoro.py"), str(tts_dir()), voice, str(speed),
+                        str(text_file), str(wav)], capture_output=True, text=True)
+    if r.returncode or not wav.exists():
+        return False, "kokoro: " + ((r.stderr or "").strip().splitlines() or ["failed"])[-1][:200]
+    conv = shutil.which("afconvert")
+    cmd = ([conv, "-f", "m4af", "-d", "aac", str(wav), str(out)] if conv else
+           [shutil.which("ffmpeg") or "ffmpeg", "-y", "-loglevel", "error", "-i", str(wav), "-c:a", "aac", str(out)])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    wav.unlink(missing_ok=True)
+    if r.returncode or not out.exists():
+        return False, "converting to m4a failed: " + (r.stderr or "").strip()[:200]
+    return True, None
+
+
 def cmd_speak(args):
     """Text to an .m4a with macOS `say`. Local only: nothing is sent anywhere; the routine shares the file."""
     ws = workspace()
@@ -539,21 +620,34 @@ def cmd_speak(args):
         "Carmit" if hebrew else "Samantha")
     rate = _opt(args, "--rate") or audio.get("rate")
     name = re.sub(r"[^A-Za-z0-9._-]", "-", _opt(args, "--name") or "brief-" + _dt.date.today().isoformat())
-    say = os.environ.get("MOTHER_SAY_BIN") or shutil.which("say")
-    if not say:
-        die("speak: macOS `say` not found — the spoken brief needs a Mac")
     out_dir = ws / ".mother" / "audio"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / (name + ".m4a")
     script = out_dir / (name + ".txt")
     script.write_text(text + "\n")
-    cmd = [say, "-v", str(voice), "-o", str(out), "--file-format=m4af", "--data-format=aac", "-f", str(script)]
-    if rate:
-        cmd[1:1] = ["-r", str(int(rate))]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode or not out.exists() or out.stat().st_size == 0:
-        die(f"speak: say failed ({(r.stderr or '').strip() or r.returncode}) — is voice '{voice}' installed? "
-            "List voices with `say -v '?'`")
+    engine, note = "say", None
+    # Kokoro (neural, local) for English when configured; Hebrew and any Kokoro failure fall back to `say`.
+    if (_opt(args, "--engine") or audio.get("engine")) == "kokoro" and not _opt(args, "--voice"):
+        if hebrew:
+            note = "kokoro has no Hebrew; used say"
+        else:
+            kvoice = audio.get("kokoro_voice") or "af_heart"
+            ok, err = render_kokoro(script, out, kvoice, (int(rate) / 175) if rate else 1.0)
+            if ok:
+                engine, voice = "kokoro", kvoice
+            else:
+                note = err + "; used say"
+    if engine == "say":
+        say = os.environ.get("MOTHER_SAY_BIN") or shutil.which("say")
+        if not say:
+            die("speak: macOS `say` not found — the spoken brief needs a Mac")
+        cmd = [say, "-v", str(voice), "-o", str(out), "--file-format=m4af", "--data-format=aac", "-f", str(script)]
+        if rate:
+            cmd[1:1] = ["-r", str(int(rate))]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode or not out.exists() or out.stat().st_size == 0:
+            die(f"speak: say failed ({(r.stderr or '').strip() or r.returncode}) — is voice '{voice}' installed? "
+                "List voices with `say -v '?'`")
     olds = sorted(out_dir.glob("*.m4a"), key=lambda f: f.stat().st_mtime)
     for f in olds[:-AUDIO_KEEP]:
         f.unlink()
@@ -573,8 +667,8 @@ def cmd_speak(args):
             print(f"speak: couldn't copy to {dest}: {e}", file=sys.stderr)
             shared = None
     words = len(text.split())
-    print(json.dumps({"path": str(out), "shared_path": str(shared) if shared else None,
-                      "bytes": out.stat().st_size, "voice": voice, "words": words,
+    print(json.dumps({"path": str(out), "shared_path": str(shared) if shared else None, "engine": engine,
+                      "note": note, "bytes": out.stat().st_size, "voice": voice, "words": words,
                       "approx_seconds": round(words / ((int(rate) if rate else 175) / 60))}))
 
 # ---------------------------------------------------------------- channels
@@ -587,7 +681,7 @@ def cmd_channels(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "link": cmd_link, "channels": cmd_channels, "speak": cmd_speak,
+            "status": cmd_status, "register": cmd_register, "link": cmd_link, "channels": cmd_channels, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

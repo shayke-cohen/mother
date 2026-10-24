@@ -1,5 +1,6 @@
 """Tests for bin/mother. Stdlib only: python3 -m unittest tests.test_cli -v"""
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -83,6 +84,40 @@ class CliTest(unittest.TestCase):
                            capture_output=True, text=True, env=env)
         self.assertEqual(len(list((self.ws / ".mother/audio").glob("*.m4a"))), 14)
 
+    def test_speak_kokoro_engine_and_fallbacks(self):
+        self.init()
+        self.write_config()
+        env = self.fake_say()
+        cfg = json.loads((self.ws / "config.json").read_text())
+        cfg["routines"]["brief"]["audio"] = {"engine": "kokoro"}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        speak = lambda text, name: json.loads(subprocess.run(
+            [sys.executable, str(CLI), "speak", "--name", name], input=text, capture_output=True, text=True,
+            env=env).stdout)
+        o = speak("Good morning.", "k1")                                  # not installed -> say, with a note
+        self.assertEqual(o["engine"], "say")
+        self.assertIn("mother tts setup", o["note"])
+        # a fake Kokoro install: model files + a "python" that writes a real (silent) wav
+        tts = self.t / "state" / "tts"
+        (tts / ".venv/bin").mkdir(parents=True)
+        for f in ("kokoro-v1.0.fp16.onnx", "voices-v1.0.bin"):
+            (tts / f).write_text("x")
+        py = tts / ".venv/bin/python"
+        py.write_text("#!" + sys.executable + "\nimport sys, wave\nw = wave.open(sys.argv[-1], 'wb')\n"
+                      "w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000); w.writeframes(b'\\0' * 48000)\n"
+                      "w.close()\n")
+        py.chmod(0o755)
+        self.assertTrue(json.loads(run(["tts", "status"], env).stdout)["kokoro"])
+        if not shutil.which("afconvert") and not shutil.which("ffmpeg"):
+            self.skipTest("no afconvert/ffmpeg to encode the wav")
+        o = speak("Good morning.", "k2")
+        self.assertEqual((o["engine"], o["voice"], o["note"]), ("kokoro", "af_heart", None))
+        self.assertGreater(o["bytes"], 0)
+        self.assertFalse((self.ws / ".mother/audio/k2.wav").exists())     # the wav is cleaned up
+        o = speak("בוקר טוב", "k3")                                       # Hebrew -> say
+        self.assertEqual((o["engine"], o["voice"]), ("say", "Carmit"))
+        self.assertIn("no Hebrew", o["note"])
+
     def test_speak_errors_are_clear(self):
         self.init()
         self.write_config()
@@ -102,7 +137,11 @@ class CliTest(unittest.TestCase):
         r = run(["status"], self.env)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("routines.brief.audio", r.stdout + r.stderr)
-        cfg["routines"]["brief"]["audio"] = {"language": "he", "rate": 180}
+        cfg["routines"]["brief"]["audio"] = {"engine": "elevenlabs"}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertNotEqual(run(["status"], self.env).returncode, 0)
+        cfg["routines"]["brief"]["audio"] = {"language": "he", "rate": 180, "engine": "kokoro",
+                                             "kokoro_voice": "bf_emma"}
         (self.ws / "config.json").write_text(json.dumps(cfg))
         self.assertEqual(run(["status"], self.env).returncode, 0)
 

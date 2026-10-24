@@ -41,7 +41,9 @@ dispatcher, do those first.
         couldn't be checked, say so in one sentence — a silent gap sounds like "all clear".
       - Nothing that isn't in the written brief. Same privacy rules.
    2. **Render:** pipe the script to `${CLAUDE_PLUGIN_ROOT}/bin/mother speak --name brief-<YYYY-MM-DD>` →
-      `{path, shared_path, bytes, voice, approx_seconds}`. Hebrew text picks a Hebrew voice on its own.
+      `{path, shared_path, engine, note, bytes, voice, approx_seconds}`. Hebrew text picks a Hebrew voice on its own;
+      `engine: kokoro` (a local neural voice) covers English only and falls back to `say` — put any `note` in the
+      runs note.
       `shared_path` is set when the file was also copied to a synced folder (`audio.save_to`, else iCloud
       Drive → `Mother/` when iCloud Drive is on): that already gets it to the phone.
    3. **Share it under the brief**, if `shared_path` is null and the chat connector has a file-upload flow that
