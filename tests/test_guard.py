@@ -208,7 +208,12 @@ class TestAsk(GuardCase):
     def test_code_host(self):
         for cmd in ["gh pr create --title x --body y", "cd x && gh issue comment 5 -b hi",
                     "gh api repos/o/r/issues -X POST -f title=x", "gh api repos/o/r/issues/1/comments -f body=x",
-                    "gh pr review 3 --approve", "glab mr create --title x", "glab mr note 4 -m hi"]:
+                    "gh pr review 3 --approve", "glab mr create --title x", "glab mr note 4 -m hi",
+                    "gh api graphql -f query='mutation{addComment(input:{subjectId:\"x\",body:\"hi\"}){clientMutationId}}'",
+                    "gh api graphql -f query='query{viewer{login}} mutation{x}'",
+                    "gh api graphql -f query=\"$Q\"", "gh api graphql -F query=@q.graphql",
+                    "gh api graphql --input q.json",
+                    "gh api graphql -f query='query{viewer{login}}' && gh api repos/o/r/issues/1/comments -f body=x"]:
             self.expect("ask", "Bash", {"command": cmd})
         self.expect("ask", CODE + "create_pull_request", {"owner": "o", "repo": "r", "title": "x"})
         self.expect("ask", CODE + "add_issue_comment", {"owner": "o", "repo": "r", "issue_number": 1, "body": "x"})
@@ -295,6 +300,11 @@ class TestNotOutbound(GuardCase):
         self.expect("none", "mcp__notes__create_note", {"title": "x"})
         self.expect("none", "Bash", {"command": "gh pr list --author @me"})
         self.expect("none", "Bash", {"command": "gh api repos/o/r/pulls"})
+        self.expect("none", "Bash", {"command": "gh api graphql -f query='query{repository(owner:\"o\",name:\"r\")"
+                                     "{pullRequest(number:1){reviewThreads(first:50){nodes{id isResolved}}}}}' "
+                                     "--jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved|not)'"})
+        self.expect("none", "Bash", {"command": "gh api graphql -F n=1 -f query='{viewer{login}}'"})
+        self.expect("none", "Bash", {"command": "glab api graphql -f query=\"query { currentUser { username } }\""})
         self.expect("none", "Bash", {"command": "cat %s" % self.state("guard.log")})
         self.expect("none", "Bash", {"command": "git push -q origin main"})
         self.expect("none", "Write", {"file_path": os.path.join(self.ws, "memory", "x.md")})

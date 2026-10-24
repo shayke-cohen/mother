@@ -295,6 +295,12 @@ API_RE = re.compile(r"\b(?:gh|glab)\s+api\b")
 API_WRITE_RE = re.compile(
     r"(?:-X|--method)\s*['\"]?(?:POST|PATCH|PUT|DELETE)\b|\s(?:-f|-F|--field|--raw-field|--input)[\s=]", re.I)
 API_DELETE_RE = re.compile(r"(?:-X|--method)\s*['\"]?DELETE\b", re.I)
+# A GraphQL call always sends -f, so API_WRITE_RE alone flags every read. Only an inline query literal that
+# opens with `query` or `{` is a read; a mutation, a query from a file or a variable stays a write.
+GRAPHQL_READ_RE = re.compile(
+    r"\b(?:gh|glab)\s+api\s+graphql\b.*?(?:-f|-F|--field|--raw-field)[\s=]+['\"]?query=['\"]?\s*(?:query\b|\{)")
+GRAPHQL_UNSAFE_RE = re.compile(r"\bmutation\b|--input\b|(?:-X|--method)\s*['\"]?(?:PATCH|PUT|DELETE)\b", re.I)
+CMD_SPLIT_RE = re.compile(r"&&|\|\||[;\n|]")
 SHELL_WRITE_RE = re.compile(r">|\b(?:rm|mv|cp|ln|tee|truncate|chmod|chown|unlink|touch|sed\s+-i|perl|python3?|"
                             r"node|ruby|jq|dd|install|rsync|git\s+(?:checkout|restore|reset|rm|mv|apply|stash))\b")
 
@@ -377,6 +383,20 @@ def protected_paths(ctx):
     return {os.path.realpath(p) for p in ps}
 
 
+def api_write(cmd):
+    """A `gh api` / `glab api` write anywhere in the command line. Read-only GraphQL queries pass."""
+    if not (API_RE.search(cmd) and API_WRITE_RE.search(cmd)):
+        return False
+    unsafe = GRAPHQL_UNSAFE_RE.search(cmd)
+    for seg in CMD_SPLIT_RE.split(cmd):
+        if not (API_RE.search(seg) and API_WRITE_RE.search(seg)):
+            continue
+        if not unsafe and GRAPHQL_READ_RE.search(seg):
+            continue
+        return True
+    return False
+
+
 def classify_bash(cmd, cwd, ctx):
     # Edits to the guard's own state through the shell. Reads (cat, grep) pass.
     if SHELL_WRITE_RE.search(cmd):
@@ -393,7 +413,7 @@ def classify_bash(cmd, cwd, ctx):
         return act("credential", "credentials", "storing a credential on the code host: " + short)
     if GH_DELETE_RE.search(cmd) or (API_RE.search(cmd) and API_DELETE_RE.search(cmd)):
         return act("deletion", "deletions", "a code-host deletion: " + short)
-    if GH_WRITE_RE.search(cmd) or (API_RE.search(cmd) and API_WRITE_RE.search(cmd)):
+    if GH_WRITE_RE.search(cmd) or api_write(cmd):
         return act("code", "code_host_comments", "a code-host write: " + short, text=cmd)
     return None
 
