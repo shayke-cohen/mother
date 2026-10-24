@@ -13,6 +13,8 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
+  speak [--in FILE] [--name N] [--voice V] [--rate WPM]
+                               render a spoken script (stdin or FILE) to <workspace>/.mother/audio/<name>.m4a
 
 The workspace is resolved from $MOTHER_WORKSPACE, else <state>/workspace, where <state> is
 $MOTHER_STATE_DIR or ~/.mother. Python 3.9 stdlib only (see docs/CONTRACT.md).
@@ -27,7 +29,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -166,6 +168,12 @@ def validate(cfg: dict) -> list:
                   or (isinstance(d, list) and d and all(x in DAYS for x in d)))
             if not ok:
                 errs.append(f"routines.{rid}.days must be workdays, all, a day, a list of days, or monthly:<1-28>")
+            au = r.get("audio") if rid == "brief" else None
+            if au is not None and not (au is True or au is False or (isinstance(au, dict) and all(
+                    k in ("voice", "voice_he", "rate", "language", "save_to") for k in au)
+                    and au.get("language", "en") in ("en", "he")
+                    and (au.get("rate") is None or (isinstance(au["rate"], int) and 90 <= au["rate"] <= 360)))):
+                errs.append("routines.brief.audio must be true/false or {voice, voice_he, rate 90-360, language en|he, save_to}")
     return errs
 
 # ---------------------------------------------------------------- secret scan
@@ -501,6 +509,74 @@ def cmd_link(args):
     if str(d.resolve()) not in [str(Path(x).expanduser().resolve()) for x in os.environ.get("PATH", "").split(os.pathsep) if x]:
         print(f"note: {d} is not on your PATH; add it to your shell profile", file=sys.stderr)
 
+# ---------------------------------------------------------------- speak
+
+HEBREW_RE = re.compile(r"[\u0590-\u05FF]")
+AUDIO_KEEP = 14
+
+
+def _opt(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        if i + 1 >= len(args):
+            die(f"missing value for {name}")
+        return args[i + 1]
+    return default
+
+
+def cmd_speak(args):
+    """Text to an .m4a with macOS `say`. Local only: nothing is sent anywhere; the routine shares the file."""
+    ws = workspace()
+    src = _opt(args, "--in")
+    text = (Path(src).read_text() if src else sys.stdin.read()).strip()
+    if not text:
+        die("speak: empty script")
+    cfg = load_config(ws)
+    audio = ((cfg.get("routines") or {}).get("brief") or {}).get("audio")
+    audio = audio if isinstance(audio, dict) else {}
+    hebrew = bool(HEBREW_RE.search(text))
+    voice = _opt(args, "--voice") or (audio.get("voice_he") if hebrew else audio.get("voice")) or (
+        "Carmit" if hebrew else "Samantha")
+    rate = _opt(args, "--rate") or audio.get("rate")
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", _opt(args, "--name") or "brief-" + _dt.date.today().isoformat())
+    say = os.environ.get("MOTHER_SAY_BIN") or shutil.which("say")
+    if not say:
+        die("speak: macOS `say` not found — the spoken brief needs a Mac")
+    out_dir = ws / ".mother" / "audio"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / (name + ".m4a")
+    script = out_dir / (name + ".txt")
+    script.write_text(text + "\n")
+    cmd = [say, "-v", str(voice), "-o", str(out), "--file-format=m4af", "--data-format=aac", "-f", str(script)]
+    if rate:
+        cmd[1:1] = ["-r", str(int(rate))]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode or not out.exists() or out.stat().st_size == 0:
+        die(f"speak: say failed ({(r.stderr or '').strip() or r.returncode}) — is voice '{voice}' installed? "
+            "List voices with `say -v '?'`")
+    olds = sorted(out_dir.glob("*.m4a"), key=lambda f: f.stat().st_mtime)
+    for f in olds[:-AUDIO_KEEP]:
+        f.unlink()
+        f.with_suffix(".txt").unlink(missing_ok=True)
+    # A synced folder gets the file to the phone with no upload and no tokens: audio.save_to, else iCloud
+    # Drive's Mother folder when iCloud Drive is on.
+    shared = None
+    icloud = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs"
+    dest = Path(os.path.expanduser(audio["save_to"])) if audio.get("save_to") else (
+        icloud / "Mother" if icloud.is_dir() else None)
+    if dest is not None:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            shared = dest / out.name
+            shutil.copyfile(out, shared)
+        except OSError as e:
+            print(f"speak: couldn't copy to {dest}: {e}", file=sys.stderr)
+            shared = None
+    words = len(text.split())
+    print(json.dumps({"path": str(out), "shared_path": str(shared) if shared else None,
+                      "bytes": out.stat().st_size, "voice": voice, "words": words,
+                      "approx_seconds": round(words / ((int(rate) if rate else 175) / 60))}))
+
 # ---------------------------------------------------------------- channels
 
 def cmd_channels(args):
@@ -511,7 +587,7 @@ def cmd_channels(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "link": cmd_link, "channels": cmd_channels,
+            "status": cmd_status, "register": cmd_register, "link": cmd_link, "channels": cmd_channels, "speak": cmd_speak,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

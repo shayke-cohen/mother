@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines and the meeting deck, covered by 100 automated tests. One manager's workspace has run on it since
+> routines and the meeting deck, covered by 103 automated tests. One manager's workspace has run on it since
 > 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -103,6 +103,7 @@ Day to day you mostly read what it sends you and answer in one line. The default
 | brief | 08:45 workdays | Today's calendar, what's waiting on you, overdue open loops |
 | digest | 09:00 workdays | Per team, opening with the decision queue |
 | dots | 13:00 workdays | Connections across threads, and suggested actions for you and for the agent |
+| brief, spoken | with the brief, if `routines.brief.audio` is on | A 60–90 second audio version in the brief's DM thread (macOS voices; `"language": "he"` for Hebrew) |
 | reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
 | doctor | weekly | Re-tests connectors, so a broken one shows as "couldn't check" |
 | meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |

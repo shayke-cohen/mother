@@ -47,6 +47,65 @@ class CliTest(unittest.TestCase):
         (self.ws / "config.json").write_text(json.dumps(cfg))
         return cfg
 
+    # -- speak
+    def fake_say(self):
+        f = self.t / "say"
+        f.write_text("#!/bin/sh\n"
+                     "out=''; while [ $# -gt 0 ]; do case \"$1\" in -o) out=\"$2\"; shift;; esac; shift; done\n"
+                     "echo \"$*\" > /dev/null; printf 'AUDIO' > \"$out\"\n"
+                     "echo \"$0 $@\" >> \"" + str(self.t / "say.log") + "\"\n")
+        f.chmod(0o755)
+        return dict(self.env, MOTHER_SAY_BIN=str(f), HOME=str(self.t / "home"))
+
+    def test_speak_renders_picks_voice_and_prunes(self):
+        self.init()
+        self.write_config()
+        env = self.fake_say()
+        r = subprocess.run([sys.executable, str(CLI), "speak", "--name", "brief-x"], input="Good morning, Dana.",
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        o = json.loads(r.stdout)
+        self.assertEqual((o["voice"], Path(o["path"]).name, o["bytes"]), ("Samantha", "brief-x.m4a", 5))
+        self.assertEqual((self.ws / ".mother/audio/brief-x.txt").read_text().strip(), "Good morning, Dana.")
+        self.assertIsNone(o["shared_path"])
+        cfg = json.loads((self.ws / "config.json").read_text())
+        cfg["routines"]["brief"]["audio"] = {"save_to": str(self.t / "synced")}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        r = subprocess.run([sys.executable, str(CLI), "speak", "--name", "brief-y"], input="Hi.",
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(json.loads(r.stdout)["shared_path"], str(self.t / "synced" / "brief-y.m4a"))
+        self.assertTrue((self.t / "synced" / "brief-y.m4a").exists())
+        r = subprocess.run([sys.executable, str(CLI), "speak", "--name", "brief-he"], input="בוקר טוב, דנה.",
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(json.loads(r.stdout)["voice"], "Carmit")
+        for i in range(20):
+            subprocess.run([sys.executable, str(CLI), "speak", "--name", "b%02d" % i], input="x",
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(len(list((self.ws / ".mother/audio").glob("*.m4a"))), 14)
+
+    def test_speak_errors_are_clear(self):
+        self.init()
+        self.write_config()
+        r = subprocess.run([sys.executable, str(CLI), "speak"], input="  ", capture_output=True, text=True,
+                           env=self.fake_say())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("empty script", r.stderr)
+        r = subprocess.run([sys.executable, str(CLI), "speak"], input="hi", capture_output=True, text=True,
+                           env=dict(self.env, MOTHER_SAY_BIN=str(self.t / "nope")))
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_brief_audio_config_validated(self):
+        self.init()
+        cfg = json.loads((ROOT / "templates/workspace/config.example.json").read_text())
+        cfg["routines"]["brief"]["audio"] = {"voice": "Samantha", "language": "fr", "rate": 900}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        r = run(["status"], self.env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("routines.brief.audio", r.stdout + r.stderr)
+        cfg["routines"]["brief"]["audio"] = {"language": "he", "rate": 180}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertEqual(run(["status"], self.env).returncode, 0)
+
     # -- link
     def test_link_symlinks_cli_and_refuses_to_clobber_a_file(self):
         env = dict(self.env, HOME=str(self.t / "home"))
