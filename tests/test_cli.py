@@ -380,10 +380,18 @@ class CliTest(unittest.TestCase):
             "gmail": {"servers": {"read": [M]}, "health": {M: {"_gateway": "x", "read": self.ent("ok")}}}}})
         self.assertIn("health:      ok\n", run(["status"], self.env).stdout)
 
+    def test_status_health_untested_is_not_open(self):
+        self.init()
+        self.write_config()
+        S = "mcp__chat_s"
+        self.write_caps({"connectors": {"slack": {
+            "servers": {"read": [S], "post": [S]},
+            "health": {S: {"read": self.ent("ok"), "post": self.ent("untested")}}}}})
+        self.assertIn("health:      ok\n", run(["status"], self.env).stdout)
+
     def test_status_health_caps_list_at_three(self):
         self.init()
         self.write_config()
-        health = {"mcp__s%d" % i: {"read": self.ent("denied", "denied")} for i in range(4)}
         self.write_caps({"connectors": {"gmail": {
             "servers": {"read%d" % i: ["mcp__s%d" % i] for i in range(4)},
             "health": {"mcp__s%d" % i: {"read%d" % i: self.ent("denied", "denied")} for i in range(4)}}}})

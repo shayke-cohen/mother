@@ -453,7 +453,7 @@ def health_status_line(ws, cfg) -> str:
                 continue
             for server, entries in sorted((conn.get("health") or {}).items()):
                 for cap, e in sorted((entries or {}).items()):
-                    if cap.startswith("_") or not isinstance(e, dict) or e.get("status") == "ok":
+                    if cap.startswith("_") or not isinstance(e, dict) or e.get("status") in ("ok", "untested"):
                         continue
                     if health.rollup(conn, cap) == "ok":
                         covered += 1
