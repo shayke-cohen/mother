@@ -46,6 +46,10 @@ the approved ones now, within what each action said:
   manager's DM) and say it needs their live yes.
 - If the guard refuses, say so; never work around it.
 
+Also apply this morning's **brief triage** answers if no session has yet: `journal/brief/<today>.md`,
+lines not yet marked, answered in the brief's DM thread by the manager — as in
+`${CLAUDE_PLUGIN_ROOT}/routines/brief.md` → Triage answers.
+
 Mark each one in the old file: `A1 — done <date>` / `A2 — declined` / `A3 — refused by guard: <why>`.
 Silence is not a yes: unanswered actions lapse after 3 days and are marked `lapsed`.
 

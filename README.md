@@ -100,7 +100,7 @@ Day to day you mostly read what it sends you and answer in one line. The default
 
 | Routine | When (default) | What you get |
 |---|---|---|
-| brief | 08:45 workdays | Today's calendar, what's waiting on you, overdue open loops |
+| brief | 08:45 workdays | Today's calendar, mail sorted into to-respond / FYI / noise, overdue open loops, and a numbered triage (`me` / `prep` / `you`) you hand back with "go 1 3". With `"draft_replies": true` it also leaves reply drafts in your mail |
 | digest | 09:00 workdays | Per team, opening with the decision queue |
 | dots | 13:00 workdays | Connections across threads, and suggested actions for you and for the agent |
 | brief, spoken | with the brief, if `routines.brief.audio` is on | A 60–90 second audio version (macOS voices, or the Kokoro neural voice with `"engine": "kokoro"` after `mother tts setup`; `"language": "he"` for Hebrew) |

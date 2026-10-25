@@ -37,7 +37,11 @@ is ready.
 
 **Mail** — unread and recent, narrowed with a query (skip newsletters, CI mail, automated digests). Mail
 reads can be very large; open bodies only for messages that plausibly need action, cap at ~8, and **say
-how many you opened and how many you left unopened.**
+how many you opened and how many you left unopened.** Sort what you read into three piles:
+- **To respond** — a person asked the manager something, or is waiting on a decision. These feed Triage.
+- **FYI** — worth knowing, no action: one line each, at most four, under FYI.
+- **Noise** — everything else: a count only ("31 noise: newsletters, notifications").
+Sorting is in the brief only: never label, archive or mark mail read.
 
 **Chat** — mentions and DMs if `chat.search` is `ok`. If search is missing a scope (common), read the
 manager's DM and the configured team channels (`teams[].channels[]` with `mode != off`) by id instead,
@@ -73,6 +77,19 @@ schedule with `runs.md`). Every `MISSED` or `FAILED` row goes under **Needs you*
 that silently stopped running is how "all quiet" turns into a lie. If `.mother/PAUSED` exists,
 say so first: everything outbound is denied until it's removed.
 
+**Triage** — after gathering, sort every actionable item (To-respond mail, chat asks, reviews, overdue
+loops, today's prep) into one bucket, so the manager can hand work back in one line:
+
+| Bucket | Meaning | Examples of what the agent may do on a yes |
+|---|---|---|
+| `me` | The agent can finish it, with only local writes | add or close a todo, queue a 1:1 topic, file a doc under a project, propose an intake item, refresh a person's work items |
+| `prep` | The agent drafts, the manager finishes | a reply **draft** in the manager's voice, a 1:1 agenda, a doc outline, a ticket draft |
+| `you` | Only the manager can do it | a judgement call, a conversation, anything the agent has no source for |
+
+Skip the rest silently. Number the items across buckets; at most eight. Each `me`/`prep` line says exactly
+what the agent would do, so a "go" approves that and nothing more. The brief itself still does nothing;
+the yes is applied afterwards (`routines/brief.md` → Triage answers).
+
 ## 2. Output
 
 Lead with what's time-critical. A quiet day gets a short brief; don't pad. Under ~25 lines.
@@ -96,6 +113,11 @@ Lead with what's time-critical. A quiet day gets a short brief; don't pad. Under
 
 ### Decide
 - <team>: <n> items waiting in the digest's decision queue, oldest <n> days     (omit if none)
+
+### Triage — reply "go 1 3", "go all", "no 2"
+1. [me] Add todo: send Sam the Q3 plan by Thu — <link>
+2. [prep] Draft reply to Alex re: rollout date — <link>
+3. [you] Decide the on-call swap — <link>
 
 ### Waiting on you (async)
 - Chat: <person> in <channel> — <one line> — <link>
@@ -125,4 +147,10 @@ Lead with what's time-critical. A quiet day gets a short brief; don't pad. Under
 - **Out loud:** if the manager asks to *hear* the brief ("read it to me", "audio brief"), write and render
   it as in `${CLAUDE_PLUGIN_ROOT}/routines/brief.md` step 3, and hand back the file path (sharing it to
   their DM is the routine's step, and green). The written brief stays the source of truth.
-- Offer the obvious next step in one line — "want me to draft replies to the two threads?" — and stop.
+- **Drafts in the manager's voice** (for `prep` items, or when `routines.brief.draft_replies` is on): read
+  the manager's last ~10 sent replies to that person or thread for tone, length and sign-off, and any
+  `feedback` memories about writing. Short, plain, no signature line (a mail draft goes out as the manager,
+  who reviews it). Facts only from the thread or a cited source; leave a `[?]` where you'd be guessing.
+- If the manager answers the triage in this conversation ("go 1 3"), apply it as in `routines/brief.md` →
+  Triage answers.
+- Otherwise offer the obvious next step in one line and stop.
