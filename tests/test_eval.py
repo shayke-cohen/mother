@@ -60,6 +60,9 @@ class TestScore(unittest.TestCase):
         s = evals.score_pair({"inline": INLINE, "readers": READERS})
         self.assertEqual(s["readers"]["recall"], 1.0)
         self.assertEqual(s["inline"]["recall"], 0.5)          # 2 of the 4 distinct citations
+        self.assertEqual(s["readers"]["coverage"], 1.0)
+        self.assertEqual(s["inline"]["coverage"], 0.5)        # mail and code of mail, chat, code, tracker
+        self.assertEqual(s["readers"]["per_source"], {"mail": 1, "chat": 1, "tracker": 1, "code": 1})
         self.assertEqual(s["inline"]["uncited"], 1)           # "Decide the on-call swap"
         self.assertEqual(s["readers"]["uncited"], 0)
         self.assertEqual(s["inline"]["couldnt"], ["chat"])
@@ -67,15 +70,32 @@ class TestScore(unittest.TestCase):
         self.assertEqual(s["inline"]["false_quiet"], ["tracker"])
         self.assertEqual(s["readers"]["false_quiet"], [])
 
+    def test_coverage_weighs_sources_not_link_counts(self):
+        # The first live pair: inline listed ten PRs but read only the DM; readers read mail and channels.
+        prs = ", ".join(["himalaya#%d" % n for n in range(4740, 4750)])
+        inline = "- Review: %s\n- DM: https://acme.slack.com/archives/D1/p1\n" % prs
+        readers = ("- Review: himalaya#4745, #4744, acme/web#9\n- Sagy — https://mail.google.com/mail/u/0/#inbox/a1\n"
+                   "- Chat — https://acme.slack.com/archives/C1/p1\n- Chat — https://acme.slack.com/archives/C2/p2\n"
+                   "- Chat — https://acme.slack.com/archives/C3/p3\n")
+        s = evals.score_pair({"inline": inline, "readers": readers})
+        self.assertGreater(s["inline"]["recall"], s["readers"]["recall"])      # link counting favours inline
+        self.assertEqual(s["inline"]["coverage"], 0.444)                       # (10/10 + 0/1 + 1/3) / 3
+        self.assertEqual(s["readers"]["coverage"], 0.767)                      # (3/10 + 1/1 + 3/3) / 3
+        self.assertEqual(s["readers"]["per_source"]["code"], 3)                # #4744 read as himalaya#4744
+
+    def test_same_pr_cited_two_ways_counts_once(self):
+        s = evals.score_pair({"inline": "- https://github.com/acme/web/pull/9\n", "readers": "- web#9\n"})
+        self.assertEqual((s["inline"]["recall"], s["readers"]["recall"]), (1.0, 1.0))
+
     def test_empty_pair(self):
         s = evals.score_pair({"inline": "", "readers": ""})
         self.assertEqual((s["inline"]["recall"], s["inline"]["cited"]), (1.0, 1.0))
 
 
-def pair(winner, r_recall=1.0, i_recall=0.8, r_cost=0.9, i_cost=0.4, r_uncited=0, i_uncited=1, error=None):
-    v = lambda rec, cost, unc, err=None: {"recall": rec, "uncited": unc, "false_quiet": [], "cost_usd": cost,
+def pair(winner, r_cov=1.0, i_cov=0.8, r_cost=0.9, i_cost=0.4, r_uncited=0, i_uncited=1, error=None):
+    v = lambda cov, cost, unc, err=None: {"coverage": cov, "uncited": unc, "false_quiet": [], "cost_usd": cost,
                                           "tokens": 100, "duration_ms": 1, "error": err}
-    return {"variants": {"inline": v(i_recall, i_cost, i_uncited), "readers": v(r_recall, r_cost, r_uncited, error)},
+    return {"variants": {"inline": v(i_cov, i_cost, i_uncited), "readers": v(r_cov, r_cost, r_uncited, error)},
             "verdict": {"winner": winner} if winner else None}
 
 
@@ -88,10 +108,10 @@ class TestShipRule(unittest.TestCase):
         self.assertEqual(r["decision"], "ship", r["reasons"])
         self.assertEqual(r["readers_or_same"], 0.8)
 
-    def test_hold_on_cost_or_preference_or_recall(self):
+    def test_hold_on_cost_or_preference_or_coverage(self):
         self.assertEqual(evals.report([pair("readers", r_cost=2.0)] * 10)["decision"], "hold")
         self.assertEqual(evals.report([pair("inline")] * 5 + [pair("readers")] * 5)["decision"], "hold")
-        self.assertEqual(evals.report([pair("readers", r_recall=0.5)] * 10)["decision"], "hold")
+        self.assertEqual(evals.report([pair("readers", r_cov=0.5)] * 10)["decision"], "hold")
         self.assertEqual(evals.report([pair("readers", r_uncited=3)] * 10)["decision"], "hold")
 
     def test_failed_runs_dont_count(self):
@@ -130,6 +150,7 @@ class TestCli(unittest.TestCase):
         out = json.loads(p.stdout)
         self.assertEqual(out["errors"], {})
         self.assertTrue(Path(out["X"]).read_text().startswith("## Today"))
+        self.assertEqual(sorted(Path(out[k]).name for k in ("X", "Y")), ["X.md", "Y.md"])   # names stay blind
         calls = self.calls()
         self.assertEqual([c["gather"] for c in calls], ["readers", "inline"])
         self.assertTrue(all(c["dry"] == "1" for c in calls))      # the guard denies every outbound call
@@ -151,6 +172,14 @@ class TestCli(unittest.TestCase):
         self.assertEqual((r["pairs"], r["judged"]), (1, 1))
         self.assertIn(r["decision"], ("ship", "hold"))
 
+    def test_plugin_dir_and_permissions_pass_through(self):
+        p = self.mother("brief", "--plugin-dir", ROOT, "--skip-permissions", MOTHER_NOW="1761379200")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        argv = self.calls()[0]["argv"]
+        self.assertEqual(argv[argv.index("--plugin-dir") + 1], ROOT)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertNotEqual(self.mother("brief", "--plugin-dir", self.tmp).returncode, 0)
+
     def test_order_alternates(self):
         self.mother("brief", MOTHER_NOW="1761379200")
         self.mother("brief", MOTHER_NOW="1761379260")
@@ -158,7 +187,8 @@ class TestCli(unittest.TestCase):
 
     def test_a_failed_variant_is_recorded(self):
         out = json.loads(self.mother("brief", MOTHER_NOW="1761379200", FAKE_FAIL="readers").stdout)
-        self.assertIn("readers", out["errors"])
+        self.assertEqual(len(out["errors"]), 1)
+        self.assertIn(list(out["errors"])[0], ("X", "Y"))                               # by label, not variant
         r = json.loads(self.mother("report").stdout)
         self.assertEqual((r["failed"], r["decision"]), (1, "not enough data"))
 

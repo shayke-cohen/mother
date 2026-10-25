@@ -6,17 +6,23 @@ same "as of" time, and MOTHER_DRY_RUN set so the guard denies every outbound cal
 same evidence. The manager then picks one blind, as "Brief X" or "Brief Y".
 
 Commands (JSON out):
-  brief [--first inline|readers] [--model M] [--timeout MIN] [--skip-permissions]
-                         run one pair -> {pair, X, Y, scores, cost}; order alternates unless --first
+  brief [--first inline|readers] [--model M] [--timeout MIN] [--skip-permissions] [--plugin-dir DIR]
+                         run one pair -> {pair, X, Y, scores, cost}; order alternates unless --first.
+                         --plugin-dir loads that checkout instead of the installed plugin (try a change unreleased)
   verdict PAIR x|y|same [--note TEXT]
                          record the manager's blind pick (appends .mother/eval/results.jsonl)
   report [--min-pairs N] the totals and the ship rule -> {decision: ship|hold|not enough data, reasons}
 
-Scores per variant:
-  recall         share of the pair's cited items (both briefs, deduped by link) this brief carries
+Scores per variant (citations deduped by `items.canon`, so a PR URL, owner/repo#N and repo#N count once):
+  coverage       per source, this brief's cited items over the larger of the two briefs' counts, averaged
+                 over the sources either brief cited. Each source weighs the same: one Slack link from the
+                 DM doesn't outweigh nine channels read, and a long PR list doesn't outweigh mail.
+  per_source     cited items per source (calendar, mail, chat, tracker, code)
+  recall         share of the pair's distinct citations this brief carries (shown, not used by the ship rule)
   cited          share of its list lines that carry a link; `uncited` counts the others
   false_quiet    sources the other brief cited items from, while this one neither cited nor flagged them
   cost           total_cost_usd, tokens (subagents included when the CLI reports modelUsage), wall time
+                 measured around the run
 Dead links aren't checked: that needs every connector, and a dry run reads them only through Claude.
 
 Pairs live in <workspace>/.mother/eval/<date>/<time>/ (machine-local, gitignored).
@@ -29,6 +35,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -103,25 +110,31 @@ def score(text):
     lines = [l for l in (text or "").splitlines() if LIST_LINE.match(l) and "⚠️" not in l
              and "couldn't check" not in l.lower()]
     cited = [l for l in lines if items.links_in(l)]
-    links = items.links_in(text)
-    return {"links": links, "lines": len(lines), "uncited": len(lines) - len(cited),
+    keys = {}
+    for l in items.links_in(text):
+        keys.setdefault(items.canon(l), items.source_of(l))
+    per = {src: sum(1 for x in keys.values() if x == src) for src in items.SOURCES}
+    return {"keys": set(keys), "lines": len(lines), "uncited": len(lines) - len(cited),
             "cited": round(len(cited) / len(lines), 3) if lines else 1.0,
             "couldnt": sorted(couldnt_sources(text)),
-            "sources": sorted({s for s in (items.source_of(l) for l in links) if s})}
+            "per_source": {k: n for k, n in per.items() if n},
+            "sources": sorted(k for k, n in per.items() if n)}
 
 
 def score_pair(texts):
-    """texts: {variant: markdown} -> {variant: scores}, with recall and false_quiet against the other."""
+    """texts: {variant: markdown} -> {variant: scores}, with coverage, recall and false_quiet against the other."""
     s = {v: score(t) for v, t in texts.items()}
-    union = set()
-    for v in s:
-        union.update(s[v]["links"])
+    union = set().union(*(s[v]["keys"] for v in s)) if s else set()
+    best = {src: max(s[v]["per_source"].get(src, 0) for v in s) for src in items.SOURCES}
+    srcs = [src for src in items.SOURCES if best[src]]
     for v in s:
         other = [o for o in s if o != v]
-        s[v]["recall"] = round(len(set(s[v]["links"]) & union) / len(union), 3) if union else 1.0
+        s[v]["coverage"] = (round(sum(s[v]["per_source"].get(src, 0) / best[src] for src in srcs) / len(srcs), 3)
+                            if srcs else 1.0)
+        s[v]["recall"] = round(len(s[v]["keys"] & union) / len(union), 3) if union else 1.0
         seen = set(s[v]["sources"]) | set(s[v]["couldnt"])
         s[v]["false_quiet"] = sorted({src for o in other for src in s[o]["sources"]} - seen)
-        s[v]["n_links"] = len(s[v].pop("links"))
+        s[v]["n_links"] = len(s[v].pop("keys"))
     return s
 
 
@@ -139,17 +152,19 @@ def tokens_of(res):
     return n
 
 
-def run_variant(ws, gather, as_of, path, model, timeout, skip_permissions):
+def run_variant(ws, gather, as_of, path, model, timeout, skip_permissions, plugin_dir=None):
     exe = os.environ.get("MOTHER_CLAUDE_BIN", "claude")
     cmd = [exe, "-p", "--output-format", "json"]
     if model:
         cmd += ["--model", model]
     if skip_permissions:
         cmd += ["--dangerously-skip-permissions"]
+    if plugin_dir:
+        cmd += ["--plugin-dir", plugin_dir]
     env = dict(os.environ, MOTHER_DRY_RUN="1", MOTHER_NO_SYNC="1", MOTHER_WORKSPACE=str(ws))
     env.pop("MOTHER_CHANNEL_ROLE", None)
     prompt = PROMPT.format(gather=gather, as_of=as_of, path=path)
-    started = now()
+    started = time.monotonic()
     try:
         p = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=str(ws), env=env,
                            timeout=timeout * 60)
@@ -167,8 +182,8 @@ def run_variant(ws, gather, as_of, path, model, timeout, skip_permissions):
         text = str(res["result"])
         path.write_text(text)
     rec = {"path": str(path), "cost_usd": res.get("total_cost_usd"), "tokens": tokens_of(res),
-           "duration_ms": res.get("duration_ms") or int((now() - started).total_seconds() * 1000),
-           "turns": res.get("num_turns"), "error": err[-300:] or (res.get("subtype") if res.get("is_error") else None)}
+           "duration_ms": int((time.monotonic() - started) * 1000),
+           "turns": res.get("num_turns"), "subagents": (res.get("subagent_stats") or {}).get("spawned"), "error": err[-300:] or (res.get("subtype") if res.get("is_error") else None)}
     if not text:
         rec["error"] = rec["error"] or "no brief written"
     return text, rec
@@ -198,18 +213,25 @@ def cmd_brief(ws, args):
     d.mkdir(parents=True, exist_ok=True)
     as_of = t.astimezone().isoformat(timespec="minutes")
     timeout = int(opt(args, "--timeout", "20"))
+    plugin_dir = opt(args, "--plugin-dir")
+    if plugin_dir:
+        plugin_dir = str(Path(plugin_dir).expanduser().resolve())
+        if not (Path(plugin_dir) / ".claude-plugin" / "plugin.json").is_file():
+            fail("--plugin-dir %s is not a plugin checkout" % plugin_dir)
+    # Labels first, so each brief is written as X.md / Y.md: the file name never says which variant it is.
+    labels = dict(zip(("X", "Y"), random.sample(VARIANTS, 2)))
+    label_of = {v: k for k, v in labels.items()}
     texts, runs = {}, {}
     for v in order:
-        texts[v], runs[v] = run_variant(ws, v, as_of, d / ("%s.md" % v), opt(args, "--model"), timeout,
-                                        "--skip-permissions" in args)
+        texts[v], runs[v] = run_variant(ws, v, as_of, d / ("%s.md" % label_of[v]), opt(args, "--model"), timeout,
+                                        "--skip-permissions" in args, plugin_dir)
     scores = score_pair(texts)
     for v in VARIANTS:
         runs[v].update(scores[v])
-    labels = dict(zip(("X", "Y"), random.sample(VARIANTS, 2)))
     pair = {"pair": pid, "as_of": as_of, "order": order, "labels": labels, "variants": runs, "verdict": None}
     (d / "pair.json").write_text(json.dumps(pair, indent=1, ensure_ascii=False))
     print(json.dumps({"pair": pid, "X": runs[labels["X"]]["path"], "Y": runs[labels["Y"]]["path"],
-                      "errors": {v: runs[v]["error"] for v in VARIANTS if runs[v]["error"]},
+                      "errors": {label_of[v]: runs[v]["error"] for v in VARIANTS if runs[v]["error"]},
                       "pairs_so_far": len(all_pairs(ws))}, indent=1))
 
 
@@ -234,8 +256,8 @@ def cmd_verdict(ws, args):
     rec = {"pair": pair["pair"], "winner": winner, "note": pair["verdict"]["note"], "at": pair["verdict"]["at"]}
     for v in VARIANTS:
         r = pair["variants"].get(v) or {}
-        rec[v] = {k: r.get(k) for k in ("recall", "cited", "uncited", "false_quiet", "cost_usd", "tokens",
-                                        "duration_ms", "error")}
+        rec[v] = {k: r.get(k) for k in ("coverage", "per_source", "recall", "cited", "uncited", "false_quiet",
+                                        "cost_usd", "tokens", "duration_ms", "error")}
     with open(eval_dir(ws) / "results.jsonl", "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(json.dumps({"pair": pair["pair"], "winner": winner}))
@@ -245,11 +267,12 @@ def cmd_verdict(ws, args):
 
 def report(pairs, min_pairs=SHIP["min_pairs"]):
     ok = [p for p in pairs if not any((p["variants"].get(v) or {}).get("error") for v in VARIANTS)]
-    tot = {v: {"recall": 0.0, "uncited": 0, "false_quiet": 0, "cost_usd": 0.0, "tokens": 0, "duration_ms": 0}
+    tot = {v: {"coverage": 0.0, "recall": 0.0, "uncited": 0, "false_quiet": 0, "cost_usd": 0.0, "tokens": 0, "duration_ms": 0}
            for v in VARIANTS}
     for p in ok:
         for v in VARIANTS:
             r = p["variants"][v]
+            tot[v]["coverage"] += r.get("coverage") or 0
             tot[v]["recall"] += r.get("recall") or 0
             tot[v]["uncited"] += r.get("uncited") or 0
             tot[v]["false_quiet"] += len(r.get("false_quiet") or [])
@@ -258,6 +281,7 @@ def report(pairs, min_pairs=SHIP["min_pairs"]):
             tot[v]["duration_ms"] += r.get("duration_ms") or 0
     n = len(ok)
     for v in VARIANTS:
+        tot[v]["coverage"] = round(tot[v]["coverage"] / n, 3) if n else None
         tot[v]["recall"] = round(tot[v]["recall"] / n, 3) if n else None
         tot[v]["cost_usd"] = round(tot[v]["cost_usd"], 4)
     judged = [p["verdict"]["winner"] for p in ok if p.get("verdict")]
@@ -274,7 +298,7 @@ def report(pairs, min_pairs=SHIP["min_pairs"]):
         return out
     r, i = tot["readers"], tot["inline"]
     checks = [
-        (r["recall"] >= i["recall"], "recall %s vs inline %s" % (r["recall"], i["recall"])),
+        (r["coverage"] >= i["coverage"], "coverage %s vs inline %s" % (r["coverage"], i["coverage"])),
         (r["uncited"] <= i["uncited"], "uncited lines %d vs inline %d" % (r["uncited"], i["uncited"])),
         (r["false_quiet"] <= i["false_quiet"], "false quiet %d vs inline %d" % (r["false_quiet"], i["false_quiet"])),
         (pref is not None and pref >= SHIP["min_preference"],

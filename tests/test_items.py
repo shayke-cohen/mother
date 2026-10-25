@@ -60,6 +60,19 @@ class TestCheck(unittest.TestCase):
         self.assertEqual(r["coverage"]["status"], "couldnt_check")
         self.assertIn("uncited", r["warning"])
 
+    def test_noise_count_with_a_query_is_a_count_not_a_failure(self):
+        # The live tracker reader found nothing recent and reported only a stale-backlog tally cited by its JQL.
+        jql = "project = MOBPUB AND assignee = currentUser() AND statusCategory != Done AND updated < -14d"
+        code, r = items.check(reply(source="tracker", its=[it(jql, title="16 assigned issues stale 14+ days",
+                                                               state="noise")]))
+        self.assertEqual((code, r["coverage"]["status"], r["warning"]), (0, "ok", None))
+        self.assertEqual(r["counts"], [{"title": "16 assigned issues stale 14+ days", "query": jql}])
+        self.assertEqual((r["items"], r["dropped"]), ([], 0))
+
+    def test_a_finding_is_not_a_count(self):
+        code, r = items.check(reply(its=[it("see the search", state="needs-reply")]))
+        self.assertEqual(r["coverage"]["status"], "couldnt_check")
+
     def test_quiet_ok_source_has_no_warning(self):
         code, r = items.check(reply(its=[]))
         self.assertEqual((code, r["coverage"]["status"], r["warning"]), (0, "ok", None))
@@ -96,10 +109,22 @@ class TestLinks(unittest.TestCase):
         self.assertEqual(items.links_in(md), ["https://acme.atlassian.net/browse/PLAT-12",
                                               "https://acme.slack.com/archives/C1/p2", "acme/web#412", "PLAT-12"])
 
+    def test_short_and_bare_pr_refs(self):
+        md = ("- Review (10): wix-private/himalaya#4745, #4744; app-smith-agent#712, #709\n"
+              "- Plugin PR #2 is blocked\n- Slack #platform-support stays out")
+        self.assertEqual(items.links_in(md), ["wix-private/himalaya#4745", "himalaya#4744", "app-smith-agent#712",
+                                              "app-smith-agent#709"])
+
+    def test_canon(self):
+        for v in ("https://github.com/acme/web/pull/412", "acme/web#412", "web#412", "Web#412"):
+            self.assertEqual(items.canon(v), "web#412", v)
+        self.assertEqual(items.canon("https://x.example.com/a/"), "https://x.example.com/a")
+
     def test_source_of(self):
         self.assertEqual(items.source_of("https://acme.slack.com/archives/C1/p2"), "chat")
         self.assertEqual(items.source_of("https://github.com/acme/web/pull/412"), "code")
         self.assertEqual(items.source_of("acme/web#412"), "code")
+        self.assertEqual(items.source_of("web#412"), "code")
         self.assertEqual(items.source_of("PLAT-12"), "tracker")
         self.assertEqual(items.source_of("https://mail.google.com/mail/u/0/#inbox/abc"), "mail")
         self.assertEqual(items.source_of("https://calendar.google.com/event?eid=1"), "calendar")

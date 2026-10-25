@@ -165,11 +165,11 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   limited to single `gh`/`glab`/`date` commands with no chaining. A critic gets no MCP tools. Other sub-agents
   (not MOTHER's) keep the normal rules.
 - `mother items check` turns a reader's reply into the only input a skill may use. Items without a link
-  (URL, ticket key, `owner/repo#N`, workspace path) are dropped. A reader whose items were all uncited
+  (URL, ticket key, `owner/repo#N`, workspace path) are dropped. A `state: noise` tally cited by the query that reproduces it is kept as a count, never a finding. A reader whose items were all uncited
   counts as `couldnt_check`, and so does unreadable output (exit 2). Never treat it as a quiet source.
 - `MOTHER_DRY_RUN=1` makes the guard deny every outbound call. `mother eval brief` sets it for both runs of
   an A/B pair. A new gather mode becomes the default only when `mother eval report` says `ship`: at least
-  10 judged pairs; recall and uncited lines no worse than baseline; no new false-quiet sources; the manager
+  10 judged pairs; per-source coverage and uncited lines no worse than baseline; no new false-quiet sources; the manager
   picked it or `same` in ≥ 60% of pairs; and cost ≤ 3× baseline.
 
 ## 6. Sync (`bin/mother sync`)

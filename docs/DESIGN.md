@@ -124,7 +124,7 @@ opposite job: reading something large and noisy in a fresh context, and handing 
   people-not-scores, privacy and voice. It is advisory: the guard and the manager stay the gates.
 - **No agent-to-agent chat and no nested agents.** Shared state is the workspace, and only MOTHER writes it.
 - **Proved before it ships.** The brief keeps `gather: inline` until `brief-ab` (blind A/B on the same inputs,
-  scored for recall, citations, false quiet and cost) says `ship`. Dots and digest follow only after that.
+  scored for per-source coverage, citations, false quiet and cost) says `ship`. Dots and digest follow only after that.
 
 ## Safety
 

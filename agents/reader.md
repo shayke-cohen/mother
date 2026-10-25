@@ -50,6 +50,14 @@ Exactly one JSON object, nothing before or after it:
             "note": "one line, facts only"}]}
 ```
 
-`opened` and `unopened` are for mail. For a noise pile, send a single item with `state: "noise"`, a count
-in `title` and a link to the search. MOTHER runs your reply through `mother items check`, which drops
-anything without a link.
+`opened` and `unopened` are for mail.
+
+**Counts.** For a pile you won't list (noise mail, a stale backlog), send one item with `state: "noise"`,
+the count in `title`, and the search that reproduces it in `query` (a mail query, a JQL). It needs no
+`link`. If you can name the items, put their keys in `note`.
+
+**Nothing to report is a valid answer:** `status: "ok"` with `items: []`. Don't invent an item to
+avoid an empty list.
+
+MOTHER runs your reply through `mother items check`. That check drops every item without a link, apart
+from the noise counts.
