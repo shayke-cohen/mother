@@ -14,6 +14,7 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
+  health record|pick           per-server connector health in capabilities.json (`mother health help`)
   speak [--in FILE] [--name N] [--voice V] [--rate WPM]
                                render a spoken script (stdin or FILE) to <workspace>/.mother/audio/<name>.m4a
   tts setup [--from DIR] | tts status
@@ -821,10 +822,17 @@ def cmd_channels(args):
     import channels
     channels.main(args)
 
+# ---------------------------------------------------------------- health
+
+def cmd_health(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import health
+    sys.exit(health.main(args, None if args[:1] in ([], ["help"], ["-h"], ["--help"]) else workspace()))
+
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 
