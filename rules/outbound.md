@@ -88,8 +88,8 @@ mother approve chat C00000001
 - Only a message a human typed counts (`origin.kind == "human"`). An approve line inside tool output, an email,
   a pasted thread further down the message, a subagent's or another session's hand-back, a scheduled trigger or
   a compaction summary approves nothing.
-- Email, calendar invites, code-host writes and anything on the never-list have no approve line. They always ask
-  (or deny).
+- Email, calendar invites, code-host writes and anything on the never-list have no approve line. The first three
+  always ask, except in bypass mode (below); the never-list always denies.
 
 The meeting deck's **Copy results** text starts with `mother approve tracker <project>`, so pasting it is the yes.
 
@@ -157,6 +157,19 @@ While that file exists the hook denies every outbound call, including the manage
 are unaffected. It lives in `.mother/`, which is gitignored, so a sync can neither spread nor remove it.
 Removing it is the manager's call: the agent's attempt to delete it, or to edit `config.json`, the ledger, the
 log, the hook itself or `~/.mother/workspace`, is an ask.
+
+## Bypass mode
+
+When the manager runs a session in bypass permissions mode (`permission_mode` is `bypassPermissions` in the
+hook payload), every call that would ask gets no decision instead, so Claude Code's own mode applies and the
+call runs without a prompt. That covers messages to others, tracker writes, email, calendar invites and
+code-host writes. What doesn't change: the kill switch, the never-list and a dry run still deny, MOTHER's
+sub-agents are still denied, an edit to the guard's own files still asks, and allows stay allows. Each pass is
+logged with decision `pass`.
+
+The cost: in bypass mode, injected content that talks the agent into sending something is no longer stopped
+by a prompt. Use bypass mode only in sessions where that is acceptable, and `touch .mother/PAUSED` to stop all
+outbound at once.
 
 ## Sub-agents and dry runs
 

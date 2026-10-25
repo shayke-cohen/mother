@@ -9,7 +9,8 @@ tool call that sends, posts or writes somewhere another person can see, the guar
   allow  a green action: a chat message to `manager.chat_dm`, a mail draft, a calendar event with no
          guests; a chat/tracker write covered by a `mother approve tracker|chat <target>` line at the top
          of a genuine user message in this session (12 h); or a valid run grant (.mother/grants.json)
-  ask    every other outbound call: the human confirms it in the UI
+  ask    every other outbound call: the human confirms it in the UI. In a session whose permission_mode is
+         bypassPermissions, these get no output instead (logged as "pass"); denies and the self-edit ask stay
 
 Calls that are not outbound get no output, so Claude Code's normal permission flow applies. The guard never
 answers "allow" for a call it does not recognise: an allow would skip the user's own permission rules.
@@ -1049,6 +1050,11 @@ def run(raw):
             r = "deny", "%s: dry run (%s is set), nothing leaves the machine." % (a["what"], DRY_RUN_ENV)
         else:
             r = decide(a, ctx, payload.get("transcript_path"))
+        # The manager chose bypass mode for this session: an ask becomes no decision, so Claude Code's own
+        # mode applies. Denies (PAUSED, the never-list, dry run) and the guard's self-edit check still hold.
+        if r[0] == "ask" and a["kind"] != "config" and payload.get("permission_mode") == "bypassPermissions":
+            log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])
+            return None
     except Exception as e:  # fail closed on anything that might be outbound
         r = "ask", "guard error (%s: %s): confirm %s manually." % (type(e).__name__, e, tool)
     log(ctx, tool, a, r[0], r[1])

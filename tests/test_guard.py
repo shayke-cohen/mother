@@ -82,11 +82,14 @@ class GuardCase(unittest.TestCase):
     def state(self, name):
         return os.path.join(self.ws, ".mother", name)
 
-    def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None, env=None, agent=None):
+    def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None, env=None, agent=None,
+                  mode=None):
         payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp, "session_id": "t",
                    "cwd": cwd or self.tmp, "transcript_path": transcript}
         if agent:
             payload.update(agent_id="a1", agent_type=agent)
+        if mode:
+            payload["permission_mode"] = mode
         extra = env or {}
         env = dict(os.environ, HOME=self.home)
         env.pop("MOTHER_WORKSPACE", None)
@@ -287,6 +290,52 @@ class TestDeny(GuardCase):
         self.expect("ask", "Bash", {"command": "rm %s" % self.state("PAUSED")})  # the human can still unpause
         os.remove(self.state("PAUSED"))
         self.expect("allow", CHAT + "post_message", {"channel_id": DM, "text": "x"})
+
+
+class TestBypassMode(GuardCase):
+    BY = "bypassPermissions"
+
+    def test_asks_pass_through(self):
+        self.expect("none", CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, mode=self.BY)
+        self.expect("none", TRK + "create-issue", {"projectKey": "PLAT", "summary": "x"}, mode=self.BY)
+        self.expect("none", MAIL + "send-gmail-message", {"to": "a@example.com", "subject": "s", "body": "b"},
+                    mode=self.BY)
+        self.expect("none", "Bash", {"command": "gh pr create --title x --body y"}, mode=self.BY)
+        self.write_config("{not json")  # no green list asks, so it passes too
+        self.expect("none", CHAT + "post_message", {"channel_id": DM, "text": "x"}, mode=self.BY)
+
+    def test_other_modes_still_ask(self):
+        for mode in (None, "default", "acceptEdits", "plan", "auto"):
+            self.expect("ask", CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, mode=mode)
+            self.expect("ask", "Bash", {"command": "gh pr create"}, mode=mode)
+
+    def test_allows_unchanged(self):
+        self.expect("allow", CHAT + "post_message", {"channel_id": DM, "text": "x"}, mode=self.BY)
+
+    def test_denies_and_self_edit_hold(self):
+        self.expect("ask", "Edit", {"file_path": os.path.join(self.ws, "config.json")}, mode=self.BY)
+        self.expect("ask", "Write", {"file_path": GUARD}, mode=self.BY)
+        cfg = config()
+        cfg["policy"]["never"] = ["credentials", "deletions", "payments", "tracker_writes"]
+        self.write_config(cfg)
+        self.expect("deny", TRK + "create-issue", {"projectKey": "PLAT", "summary": "x"}, mode=self.BY)
+        open(self.state("PAUSED"), "w").close()
+        self.expect("deny", CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, mode=self.BY)
+        self.expect("deny", "Bash", {"command": "gh pr create"}, mode=self.BY)
+        self.expect("ask", "Bash", {"command": "rm %s" % self.state("PAUSED")}, mode=self.BY)
+
+    def test_dry_run_and_subagents_still_deny(self):
+        self.expect("deny", CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, mode=self.BY,
+                    env={"MOTHER_DRY_RUN": "1"})
+        self.expect("deny", CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, mode=self.BY,
+                    agent="mother:reader")
+
+    def test_pass_is_logged(self):
+        self.expect("none", CHAT + "post_message", {"channel_id": TEAM, "text": "secret body"}, mode=self.BY)
+        with open(self.state("guard.log")) as f:
+            rec = json.loads(f.read().splitlines()[-1])
+        self.assertEqual(rec["decision"], "pass")
+        self.assertTrue(rec["reason"].startswith("bypassPermissions: "))
 
 
 class TestNotOutbound(GuardCase):
