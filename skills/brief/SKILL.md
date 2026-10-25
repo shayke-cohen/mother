@@ -49,6 +49,8 @@ With `readers`, the five external sources (Calendar, Mail, Chat, Tracker, Code) 
   (`<<'READER'`). Write no file for it. Build the brief only from the checked output:
   - Every `warning` goes under ⚠️ Couldn't check, word for word.
   - `dropped` items are gone. Don't go back and re-read the source to rescue them.
+  - `counts` are one-line tallies ("16 assigned items stale 14+ days, not reprinted"), never findings.
+  - A source with `status: ok` and no items is genuinely quiet. Say nothing, or one line if it matters.
   - Exit `2`, a reader that errored, or a reader that never answered all mean
     `⚠️ <source>: couldn't check — reader failed`. Never leave that source out.
 - If the Agent tool isn't available, gather inline and say `readers unavailable — gathered inline` in the
