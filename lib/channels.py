@@ -761,6 +761,17 @@ def signed(ctx, body):
     return "%s\n%s" % (ctx.signature(), clean.strip())
 
 
+def blocks_of(ctx, text):
+    """Slack blocks for a signed post: the body, then the signature as a small grey context line under it, the
+    way Slack shows an app's "Sent using" footer. `text` keeps the signature on its first line: it is the
+    notification fallback, and what the guard and is_own() read."""
+    sig = ctx.signature()
+    body = text[len(sig):].strip() if text.startswith(sig) else text.strip()
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": body[i:i + 3000]}}
+              for i in range(0, len(body), 3000)]
+    return blocks + [{"type": "context", "elements": [{"type": "mrkdwn", "text": sig}]}]
+
+
 def make_draft(ctx, a, body, topic, why):
     ch = ctx.channel(a["channel"]) or {}
     d_id = new_id(ctx, "d")
@@ -845,7 +856,8 @@ def cmd_run(ctx, args):
             res.update(kind="draft", draft=d_id, dm_text=dm, why=why)
         else:
             write_answer_grant(ctx, a)
-            res.update(kind="answer", text=signed(ctx, body))
+            text = signed(ctx, body)
+            res.update(kind="answer", text=text, blocks=blocks_of(ctx, text))
             if topic:
                 t.setdefault("pending_topic", {})[aid] = topic
     if res["kind"] == "draft":
@@ -948,7 +960,7 @@ def cmd_approvals(ctx, args):
                     write_reply_grant(ctx, d["channel"], d["thread"], guard.as_list(
                         (ctx.cfg.get("manager") or {}).get("chat_dm"))[0], m.get("ts"))
                     a = {"id": new_id(ctx, "s"), "kind": "send", "draft": d_id, "channel": d["channel"],
-                         "thread": d["thread"], "text": body, "edited": edited}
+                         "thread": d["thread"], "text": body, "blocks": blocks_of(ctx, body), "edited": edited}
                     ctx.state["pending"][a["id"]] = a
                     actions.append(a)
                 ctx.audit("approved", draft=d_id, edited=edited)

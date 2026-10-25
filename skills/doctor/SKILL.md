@@ -100,7 +100,9 @@ key in `notes` so the next run reuses it (comment + reopen/close) instead of cre
 ```
 
 Keys under `connectors` are the `config.json` connector values. `servers` maps a capability to a different
-server prefix when it isn't the main one. `capabilities.json` lives in the private workspace, so recording
+server prefix when it isn't the main one. When more than one server can write, record the one that adds no
+attribution of its own as `servers.post` and note the other's stamp, so sends carry only the agent's
+signature (rules/outbound.md, "One signature, not two"). `capabilities.json` lives in the private workspace, so recording
 local server prefixes there is fine; they never go into the plugin.
 
 ## 6. Report

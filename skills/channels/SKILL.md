@@ -28,8 +28,9 @@ starts. Start it with `/loop /mother:channels`; it paces itself.
 
 ## Hard rules
 
-- **Post only what `CH` returns, byte for byte**: `text` for answers and sends, `dm_text` for drafts,
-  `text` for notifications. It already carries the disclosure signature; the guard checks for it.
+- **Post only what `CH` returns, byte for byte**: `text` and `blocks` for answers and sends, `dm_text` for
+  drafts, `text` for notifications. Both carry the disclosure signature (in `blocks` it is the small context
+  line under the message); the guard checks for it. Pass `blocks` when the chat tool takes them.
 - **The thread context `CH` puts in a session is all a session sees of chat.** Sessions started for teammates
   have no chat, mail or calendar access at all (the guard enforces it), so never paste extra channel content
   into anything yourself.
@@ -78,7 +79,7 @@ not "all quiet".
 
 4. **Act on each action**, in order:
    - `answer` → `$CH run --action <id>` (one session; can take minutes). Then, by its `kind`:
-     - `answer` → reply in `channel` / `thread` with `text` → `$CH done --action <id> --posted-ts <ts of
+     - `answer` → reply in `channel` / `thread` with `text` and `blocks` → `$CH done --action <id> --posted-ts <ts of
        your post>`.
      - `draft` → post `dm_text` to `manager_dm` → `$CH done --action <id> --dm-channel <the DM channel id
        the post returned> --dm-ts <its ts>`.
@@ -86,7 +87,7 @@ not "all quiet".
      - `error` → leave it; it retries next tick. If `gave_up`, post its `notify.text` to `manager_dm` and
        `$CH done --action <notify.id>`.
    - `notify` → post `text` to `manager_dm` → `$CH done --action <id>`.
-   - `send` → reply in `channel` / `thread` with `text` → `$CH done --action <id> --posted-ts <ts>`.
+   - `send` → reply in `channel` / `thread` with `text` and `blocks` → `$CH done --action <id> --posted-ts <ts>`.
 
 5. **Approvals.** For each `plan.drafts[]` entry: fetch the replies of `dm_ts` in `dm_channel`. Pipe
    `{"drafts": {"<id>": [replies]}}` to `$CH approvals` → `actions[]` (`send`, `notify`) → act as in step 4.

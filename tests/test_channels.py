@@ -112,9 +112,12 @@ class Case(unittest.TestCase):
         r = self.triage(channel, [])
         self.assertTrue(r.get("initialised"))
 
-    def guard(self, channel, thread, text):
+    def guard(self, channel, thread, text, blocks=None):
+        inp = {"channel_id": channel, "thread_ts": thread, "text": text}
+        if blocks is not None:
+            inp["blocks"] = blocks
         payload = {"hook_event_name": "PreToolUse", "tool_name": POST, "session_id": "t", "cwd": self.tmp,
-                   "tool_input": {"channel_id": channel, "thread_ts": thread, "text": text}}
+                   "tool_input": inp}
         p = subprocess.run([sys.executable, GUARD], input=json.dumps(payload), capture_output=True, text=True,
                            env=dict(os.environ, MOTHER_WORKSPACE=self.ws, HOME=self.tmp))
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -277,6 +280,27 @@ class TestReviewFindings(Case):
         self.assertEqual(len(self.calls()), 1)
         grants = json.load(open(os.path.join(self.ws, ".mother", "grants.json")))["grants"]
         self.assertEqual(len(grants), 1)
+
+    def test_answer_blocks_put_the_signature_in_a_footer(self):
+        self.init(TEAM)
+        a = self.answers(self.triage(TEAM, [msg(10_001, SAM, "Agnes, status?")]))[0]
+        r = self.ch("run", "--action", a["id"])
+        self.assertTrue(r["text"].startswith(SIG))
+        self.assertEqual(r["blocks"][-1], {"type": "context", "elements": [{"type": "mrkdwn", "text": SIG}]})
+        self.assertEqual([b["type"] for b in r["blocks"][:-1]], ["section"])
+        self.assertNotIn("Agnes (AI)", r["blocks"][0]["text"]["text"])
+        unsigned = r["blocks"][:-1]
+        self.assertEqual(self.guard(TEAM, a["thread"], r["text"], unsigned), "ask")
+        self.assertEqual(self.guard(TEAM, a["thread"], r["text"], r["blocks"]), "allow")
+
+    def test_approved_send_carries_footer_blocks(self):
+        self.init(SUPPORT)
+        a = self.answers(self.triage(SUPPORT, [msg(10_001, OUT, "how do I rotate the key?")]))[0]
+        d = self.ch("run", "--action", a["id"])["draft"]
+        self.ch("done", "--action", a["id"], "--dm-channel", "D1", "--dm-ts", ts(10_002))
+        acts = self.ch("approvals", stdin={"drafts": {d: [msg(10_004, ME, "edit: use the rotate command")]}})["actions"]
+        self.assertEqual(acts[0]["blocks"][0]["text"]["text"], "use the rotate command")
+        self.assertEqual(acts[0]["blocks"][-1]["elements"][0]["text"], SIG)
 
     def test_failed_post_revokes_its_grant(self):
         self.init(TEAM)
