@@ -6,9 +6,12 @@ file by hand; they call these commands, which take a file lock and write atomica
 Commands (JSON out, one object per call):
   record --kind K --cap C --server S --status V [--class X] [--gateway H] [--fixed-by F]
                                store one server's result for one capability -> {previous, rollup}
+  classify --error TEXT        map an error message to a status and failure class -> {status, class}
+  summary [--days N]           failures and fixes from health.md, most frequent first (text lines)
   pick --kind K --cap C [--target dm|other] [--max-age-hours N]
                                the server to use now -> {server, status, fresh, fallback, stamped}
 
+`record` also appends one line per failure or fix to <workspace>/health.md (no ids, no content).
 Exit codes: 0 ok; 2 bad file or bad arguments; 3 `pick` found no usable server.
 $MOTHER_NOW (epoch seconds) pins the clock. Python 3.9 stdlib only.
 """
@@ -18,6 +21,7 @@ import datetime as _dt
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -185,7 +189,7 @@ def record(caps, vendor, cap, server, status, cls=None, gateway=None, now=None):
     old = health.get(cap)
     entry = {"status": status, "class": cls, "checked_at": now or iso()}
     if gateway:
-        entry["gateway"] = gateway
+        health["_gateway"] = gateway
     if old and status != "ok" and old.get("class") == cls:
         for k in ("alerted_at", "pending"):
             if k in old:
@@ -196,6 +200,102 @@ def record(caps, vendor, cap, server, status, cls=None, gateway=None, now=None):
         lst.append(server)
     conn[cap] = rollup(conn, cap)
     return old.get("status") if old else None
+
+
+# ---------------------------------------------------------------- classify and log
+
+_SCOPE = re.compile(r"[a-z]+:[a-z.:_]+")
+_RULES = (
+    ("invalidated", "expired", ("invalidated", "reconnect it from connector settings", "needs_auth",
+                                "needs authentication", "sign in", "token expired", "re-authenticate",
+                                "invalid_auth", r"\b401\b")),
+    ("denied", "denied", (r"\b403\b", "permission", "admin must enable", "not allowed")),
+    ("unreachable", "error:unreachable", ("econnrefused", "enotfound", "getaddrinfo", "timed out", "timeout",
+                                          "unreachable", "fetch failed", "connection refused", "network")),
+    ("dropped", "error:dropped", ("connection closed", "not connected", "disconnected", "transport closed",
+                                  "server failed")),
+)
+
+
+def scrub(text):
+    text = re.sub(r"\b(?=[0-9a-f]*\d)[0-9a-f]{8,}\b", "#", text, flags=re.I)
+    return re.sub(r"\d+", "#", text)
+
+
+def classify(error):
+    """Map an error message to (status, class); see the failure classes in CLASSES."""
+    low = error.lower()
+    if re.search(r"missing_scope|insufficient scope|not allowed", low):
+        m = _SCOPE.search(low.replace("missing_scope", ""))
+        if m:
+            return "missing_scope:" + m.group(0).rstrip(".:_"), "missing_scope"
+    for cls, status, pats in _RULES:
+        if any(re.search(p, low) for p in pats):
+            return status, cls
+    return "error:" + scrub(error.strip())[:40], "other"
+
+
+def server_short(prefix):
+    """Server name for the log: drop `mcp__`, shorten opaque id segments to their first 8 characters."""
+    name = prefix[5:] if prefix.startswith("mcp__") else prefix
+    parts = [p[:8] if re.fullmatch(r"[0-9a-fA-F-]{16,}", p) else p for p in name.split("__")]
+    return "__".join(parts)
+
+
+LOG_HEADER = "One line per connector failure or fix, appended by `mother health record`."
+
+
+def health_line(now, kind, cap, server, cls, fixed_by, gateway=None):
+    line = "- %s %s.%s %s %s \u2192 %s" % (now, kind, cap, server_short(server), cls, fixed_by or "open")
+    return line + (" @" + gateway if gateway else "")
+
+
+def append_log(ws, line):
+    p = Path(ws) / "health.md"
+    new = not p.is_file()
+    with open(str(p), "a") as f:
+        if new:
+            f.write(LOG_HEADER + "\n")
+        f.write(line + "\n")
+
+
+_LINE = re.compile(r"^- (\S+) \S+ (\S+) (\S+) \u2192 (\S+)(?: @(\S+))?$")
+
+
+def summary(ws, days=7, now=None):
+    """Lines for the last `days`: '<server> <class> \u00d7N (fixed: retry 1; open 1)', gateway failures folded."""
+    p = Path(ws) / "health.md"
+    if not p.is_file():
+        return []
+    cutoff = (_clock() if now is None else now) - days * 86400
+    rows = []  # (server, class, outcome, gateway)
+    for raw in p.read_text().splitlines():
+        m = _LINE.match(raw)
+        t = parse_iso(m.group(1)) if m else None
+        if t is not None and t >= cutoff:
+            rows.append((m.group(2), m.group(3), m.group(4), m.group(5)))
+    by_gw = {}
+    for srv, cls, _, gw in rows:
+        if gw and cls == "unreachable":
+            by_gw.setdefault(gw, set()).add(srv)
+    folded = {gw for gw, srvs in by_gw.items() if len(srvs) > 1}
+    groups = {}
+    for srv, cls, out, gw in rows:
+        key = ("gateway " + gw, cls) if gw in folded and cls == "unreachable" else (srv, cls)
+        groups.setdefault(key, []).append(out)
+    lines = []
+    for (name, cls), outs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        fixed = {}
+        for o in outs:
+            if o != "open":
+                fixed[o] = fixed.get(o, 0) + 1
+        parts = []
+        if fixed:
+            parts.append("fixed: " + ", ".join("%s %d" % kv for kv in sorted(fixed.items())))
+        if outs.count("open"):
+            parts.append("open %d" % outs.count("open"))
+        lines.append("%s %s \u00d7%d (%s)" % (name, cls, len(outs), "; ".join(parts)))
+    return lines
 
 
 def pick(caps, vendor, cap, target=None, max_age_h=None, now=None):
@@ -261,8 +361,18 @@ def cmd_record(ws, args):
     vendor = vendor_of(cfg, o["kind"])
     with locked(ws):
         caps = normalize(load(ws), cfg)
-        previous = record(caps, vendor, o["cap"], o["server"], o["status"], o.get("class"), o.get("gateway"))
+        old = (((caps["connectors"].get(vendor) or {}).get("health") or {}).get(o["server"]) or {}).get(o["cap"]) or {}
+        stamp = iso()
+        previous = record(caps, vendor, o["cap"], o["server"], o["status"], o.get("class"), o.get("gateway"), stamp)
         save(ws, caps)
+        gw = o.get("gateway") or (caps["connectors"][vendor]["health"][o["server"]].get("_gateway"))
+        if o["status"] != "ok":
+            cls = o.get("class") or "other"
+            if not (old.get("status") == o["status"] and old.get("class") == o.get("class")):
+                append_log(ws, health_line(stamp, o["kind"], o["cap"], o["server"], cls, None, gw))
+        elif previous not in (None, "ok") and o.get("fixed_by"):
+            append_log(ws, health_line(stamp, o["kind"], o["cap"], o["server"], old.get("class") or "other",
+                                       o["fixed_by"], gw))
     return 0, {"previous": previous, "rollup": caps["connectors"][vendor][o["cap"]]}
 
 
@@ -281,7 +391,25 @@ def cmd_pick(ws, args):
     return (0 if res["server"] else 3), res
 
 
-COMMANDS = {"record": cmd_record, "pick": cmd_pick}
+def cmd_classify(ws, args):
+    o = parse_args(args, ("--error",))
+    need(o, "error")
+    status, cls = classify(o["error"])
+    return 0, {"status": status, "class": cls}
+
+
+def cmd_summary(ws, args):
+    o = parse_args(args, ("--days",))
+    try:
+        days = float(o["days"]) if o.get("days") else 7
+    except ValueError:
+        raise HealthError("bad --days '%s'" % o["days"])
+    for line in summary(ws, days):
+        print(line)
+    return 0, None
+
+
+COMMANDS = {"record": cmd_record, "pick": cmd_pick, "classify": cmd_classify, "summary": cmd_summary}
 
 
 def main(argv, ws):
@@ -297,5 +425,6 @@ def main(argv, ws):
     except HealthError as e:
         print("mother health: %s" % e, file=sys.stderr)
         return 2
-    print(json.dumps(out, ensure_ascii=False))
+    if out is not None:
+        print(json.dumps(out, ensure_ascii=False))
     return code

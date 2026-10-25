@@ -197,6 +197,108 @@ class HealthTest(unittest.TestCase):
         for c in caps:
             self.assertIn(c, h)
 
+    # ---- Task 2: classify, health.md, summary
+
+    def health_md(self):
+        return (self.ws / "health.md").read_text()
+
+    def rec(self, status, server=W, cap="read", cls=None, *extra, now=None):
+        env = dict(self.env)
+        if now:
+            env["MOTHER_NOW"] = str(now)
+        args = ["record", "--kind", "chat", "--cap", cap, "--server", server, "--status", status]
+        if cls:
+            args += ["--class", cls]
+        r = subprocess.run([sys.executable, str(CLI), "health", *args, *extra], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_classify_table(self):
+        rows = [
+            ("The user's connection to this connector was invalidated. The user needs to reconnect it from connector settings.",
+             ("expired", "invalidated")),
+            ("missing_scope: search:read", ("missing_scope:search:read", "missing_scope")),
+            ("Insufficient scope: channels:history", ("missing_scope:channels:history", "missing_scope")),
+            ("fetch failed: ECONNREFUSED 10.0.0.1:443", ("error:unreachable", "unreachable")),
+            ("403 Forbidden", ("denied", "denied")),
+            ("not allowed", ("denied", "denied")),
+            ("HTTP 401", ("expired", "invalidated")),
+            ("MCP error: Connection closed", ("error:dropped", "dropped")),
+            ("weird 1234567890abcdef thing", ("error:weird # thing", "other")),
+        ]
+        sys.path.insert(0, str(ROOT / "lib"))
+        import health
+        for text, want in rows:
+            with self.subTest(text=text):
+                self.assertEqual(health.classify(text), want)
+        r = self.run_cli("classify", "--error", "403 Forbidden")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {"status": "denied", "class": "denied"})
+
+    def test_server_short(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        import health
+        self.assertEqual(health.server_short(W), "Willow_Slack__slack")
+        self.assertEqual(health.server_short("mcp__486bd9bf-5fd4-4917-848c-4f2ddfdfb82e"), "486bd9bf")
+
+    def test_health_line_format(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        import health
+        self.assertEqual(health.health_line(ISO_NOW, "chat", "read", W, "unreachable", None),
+                         "- 2023-11-14T22:13:20Z chat.read Willow_Slack__slack unreachable \u2192 open")
+        self.assertEqual(health.health_line(ISO_NOW, "chat", "read", W, "unreachable", "fallback"),
+                         "- 2023-11-14T22:13:20Z chat.read Willow_Slack__slack unreachable \u2192 fallback")
+
+    def test_record_logs_open_then_fixed_once(self):
+        self.rec("error:unreachable", W, "read", "unreachable")
+        self.rec("error:unreachable", W, "read", "unreachable")
+        self.rec("ok", W, "read", None, "--fixed-by", "fallback")
+        self.rec("ok", W, "read", None, "--fixed-by", "fallback")
+        lines = [l for l in self.health_md().splitlines() if l.startswith("- ")]
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[0].endswith("unreachable \u2192 open"), lines[0])
+        self.assertTrue(lines[1].endswith("unreachable \u2192 fallback"), lines[1])
+        self.assertTrue(self.health_md().startswith(
+            "One line per connector failure or fix, appended by `mother health record`.\n"))
+
+    def test_gateway_stored_under_server_not_capability(self):
+        self.rec("error:unreachable", W, "read", "unreachable", "--gateway", "mcp-s.example")
+        h = self.caps()["health"][W]
+        self.assertEqual(h["_gateway"], "mcp-s.example")
+        self.assertNotIn("gateway", h["read"])
+        self.assertTrue(self.health_md().rstrip().endswith("@mcp-s.example"))
+
+    def test_summary_folds_gateway(self):
+        for s in (W, C):
+            self.rec("error:unreachable", s, "read", "unreachable", "--gateway", "mcp-s.example")
+        r = self.run_cli("summary")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("gateway mcp-s.example unreachable \u00d72"), lines[0])
+
+    def test_summary_counts_and_window(self):
+        self.rec("error:dropped", W, "read", "dropped", now=NOW - 20 * 86400)
+        self.rec("error:dropped", W, "send", "dropped")
+        self.rec("ok", W, "send", None, "--fixed-by", "retry")
+        self.rec("error:unreachable", C, "read", "unreachable")
+        out = self.run_cli("summary").stdout.strip().splitlines()
+        self.assertIn("Willow_Slack__slack dropped \u00d72 (fixed: retry 1; open 1)", out)
+        self.assertIn("claudeai_slack unreachable \u00d71 (open 1)", out)
+        self.assertEqual(len(out), 2)
+
+    def test_summary_empty(self):
+        r = self.run_cli("summary")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_health_md_has_no_ids(self):
+        sid = "mcp__486bd9bf-5fd4-4917-848c-4f2ddfdfb82e"
+        self.rec("error:unreachable", sid, "read", "unreachable")
+        self.rec("ok", sid, "read", None, "--fixed-by", "you")
+        md = self.health_md()
+        self.assertIn("486bd9bf", md)
+        self.assertNotIn("486bd9bf-5fd4-4917-848c-4f2ddfdfb82e", md)
+
 
 if __name__ == "__main__":
     unittest.main()

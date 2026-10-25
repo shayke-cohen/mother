@@ -14,7 +14,7 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
-  health record|pick           per-server connector health in capabilities.json (`mother health help`)
+  health record|pick|classify|summary  per-server connector health in capabilities.json (`mother health help`)
   speak [--in FILE] [--name N] [--voice V] [--rate WPM]
                                render a spoken script (stdin or FILE) to <workspace>/.mother/audio/<name>.m4a
   tts setup [--from DIR] | tts status
