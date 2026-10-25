@@ -66,8 +66,9 @@ or **Hygiene**.
 
 **Memory** — `memory/MEMORY.md` for a commitment or deadline landing today.
 
-**Plumbing** — the last line per routine in `runs.md`: a routine whose last run is `failed`, or that
-hasn't run when its schedule says it should have, goes under **Needs you**. If `.mother/PAUSED` exists,
+**Plumbing** — run `${CLAUDE_PLUGIN_ROOT}/bin/mother runs` (the watchdog: it compares each routine's
+schedule with `runs.md`). Every `MISSED` or `FAILED` row goes under **Needs you**, with its note — a routine
+that silently stopped running is how "all quiet" turns into a lie. If `.mother/PAUSED` exists,
 say so first: everything outbound is denied until it's removed.
 
 ## 2. Output

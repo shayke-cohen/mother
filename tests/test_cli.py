@@ -314,6 +314,41 @@ class CliTest(unittest.TestCase):
         (self.ws / "config.json").write_text(json.dumps(cfg))
         self.assertEqual(run(["status"], self.env).returncode, 1)
 
+    # -- runs (watchdog)
+    def test_runs_flags_missed_and_failed_routines(self):
+        self.init()
+        self.write_config()
+        # Sun 2026-10-25 12:00 UTC: brief/digest last due Fri, reflect Sat 21:30, doctor Mon 2026-10-19, dots Fri
+        env = dict(self.env, TZ="UTC", MOTHER_NOW="2026-10-25T12:00:00Z")
+        (self.ws / "runs.md").write_text(
+            "- 2026-10-23T08:46:02Z brief ok — 4 sources, DM sent\n"
+            "- 2026-10-23T09:01:00Z digest failed — DM post expired\n"
+            "- 2026-10-24T21:31:00Z reflect partial — chat search missing_scope\n"
+            "- 2026-10-19T08:31:00Z doctor ok — 5 connectors\n"
+            "- 2026-10-19T08:00:00Z himalaya-weekly ok — not a configured routine\n"
+            "not a run line\n")
+        r = run(["runs", "--json"], env)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        state = {row["id"]: row["state"] for row in json.loads(r.stdout)}
+        self.assertEqual(state, {"brief": "ok", "digest": "failed", "dots": "missed", "reflect": "partial", "doctor": "ok"})
+        r = run(["status"], env)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("routines:    digest failed; dots missed", r.stdout)
+        # just after a slot, the previous slot is judged: reflect is due at 21:30 but has 2h grace
+        with open(self.ws / "runs.md", "a") as f:
+            f.write("- 2026-10-23T13:02Z dots ok — 3 links\n- 2026-10-23T09:30:00Z digest ok — rerun\n")
+        env["MOTHER_NOW"] = "2026-10-25T22:00:00Z"
+        r = run(["runs"], env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("all scheduled runs logged", run(["status"], env).stdout)
+        # a slot from before logging began (the earliest line, 19 Oct) is not a miss; one after it is
+        cfg = json.loads((self.ws / "config.json").read_text())
+        cfg["routines"]["monthly-refresh"] = {"at": "10:00", "days": "monthly:1"}
+        cfg["routines"]["weekly-snapshot"] = {"at": "16:00", "days": "Thu"}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        rows = {row["id"]: row["state"] for row in json.loads(run(["runs", "--json"], env).stdout)}
+        self.assertEqual((rows["monthly-refresh"], rows["weekly-snapshot"]), ("pending", "missed"))
+
     # -- register
     def test_register_crons_and_pointers(self):
         self.init()

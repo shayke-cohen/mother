@@ -123,5 +123,10 @@ Fixes by status:
 
 End with one line on impact: which routines will run `partial` until each fix lands.
 
+Then run `${CLAUDE_PLUGIN_ROOT}/bin/mother runs` and append its `MISSED` / `FAILED` rows under the table:
+a routine that never logged a run is a plumbing failure (the scheduled task is gone, disabled, or the app
+was closed for days), not a connector one. Fix: re-register it via `/mother:setup`, or open the app.
+
 When run as the weekly routine (unattended): read checks only, no write checks, send the table to the
-manager's DM only if something got worse since the previous `capabilities.json`.
+manager's DM only if something got worse since the previous `capabilities.json`, or `mother runs` reports
+a missed or failed routine.
