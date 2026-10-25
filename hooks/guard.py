@@ -456,7 +456,7 @@ def classify_mcp(tool, inp):
                 "reply" if (thread or lead == "reply") else "post"
             return act("chat", "any_message_to_others", "chat %s to %s" % (short, channel or "?"),
                        op=sub, channel=channel, thread=thread, broadcast=bool(inp.get("reply_broadcast")),
-                       text=text_of(inp))
+                       text=text_of(inp), blocks=json.dumps(inp["blocks"], ensure_ascii=False) if inp.get("blocks") else None)
         return act("chat", "any_message_to_others", "a chat change (%s)" % short, op="other", channel=channel,
                    thread=None)
 
@@ -804,6 +804,8 @@ def run_grant_scope(a, ctx, sc, now=None):
             marks.append(agent["signature"].strip())
         if not any(m in (a.get("text") or "") for m in marks):
             return None  # unattended writes must carry the disclosure signature
+        if a.get("blocks") and not any(m in a["blocks"] for m in marks):
+            return None  # and so must the blocks, which are what the reader actually sees
     data, ok = read_json(os.path.join(ctx.ws, ".mother", "grants.json"))
     if not ok or not isinstance(data, dict) or not isinstance(data.get("grants"), list):
         return None

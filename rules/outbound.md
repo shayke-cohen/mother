@@ -53,11 +53,21 @@ Everything the agent writes where someone other than the manager will read it is
 ```
 
 e.g. `:sparkles: *Agnes (AI)* · on behalf of Dana`, or `agent.signature` if the config sets one. Put it on
-the first or last line of chat messages, emails, tracker comments and code-host comments. Messages to the
+the first or last line of chat messages, emails, tracker comments and code-host comments. A chat post sent
+with blocks shows it as a small grey footer: the body in `section` blocks, then a `context` block whose one
+`mrkdwn` element is the signature, the way Slack shows an app's "Sent using" line. Its `text` still starts
+with the signature, since that is the notification fallback and what the hook reads. Messages to the
 manager's own DM don't need it. The hook checks the signature only on grant-backed writes (below): a
 grant-backed chat post, thread reply or tracker comment must contain `{name} (AI)` (or the full
-`agent.signature`), or it falls back to ask.
+`agent.signature`), in its `text` and in its `blocks` if it has any, or it falls back to ask.
 Everywhere else, signing is the skill's job.
+
+**One signature, not two.** Some connectors stamp their own attribution on every write (the claude.ai Slack
+connector adds "Sent using @Claude" under the message, and an edit can't remove it). Sent through one of
+those, a signed message carries two signatures. Send through the server `capabilities.json` records for that
+write (`connectors.<chat>.servers.post`, else `connectors.<chat>.server`), and use a stamping connector only
+for reads such as search. If the recorded server can't do the write, ask the manager rather than falling
+back to the stamping one.
 
 ## Approving in a session
 
