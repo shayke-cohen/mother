@@ -125,6 +125,12 @@ Fixes by status:
 
 End with one line on impact: which routines will run `partial` until each fix lands.
 
+Check the plugin itself: `${CLAUDE_PLUGIN_ROOT}/bin/mother status` prints `plugin: DISABLED` when
+`enabledPlugins["mother@mother"]` is false in the user's Claude Code settings. Then the approval guard and the
+sync hook don't load in any new session, so put it at the **top** of the report, above the connector table:
+the fix is `claude plugin enable mother@mother` (or the app's plugin settings) and a restart. Never flip the
+setting yourself; it's the manager's.
+
 Then run `${CLAUDE_PLUGIN_ROOT}/bin/mother runs` and append its `MISSED` / `FAILED` rows under the table:
 a routine that never logged a run is a plumbing failure (the scheduled task is gone, disabled, or the app
 was closed for days), not a connector one. Fix: re-register it via `/mother:setup`, or open the app.

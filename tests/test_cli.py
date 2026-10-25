@@ -338,6 +338,19 @@ class CliTest(unittest.TestCase):
         (self.ws / "config.json").write_text(json.dumps(cfg))
         self.assertEqual(run(["status"], self.env).returncode, 1)
 
+    def test_status_warns_when_plugin_disabled(self):
+        self.init()
+        self.write_config()
+        cdir = self.t / "claude"
+        cdir.mkdir()
+        env = dict(self.env, CLAUDE_CONFIG_DIR=str(cdir))
+        (cdir / "settings.json").write_text(json.dumps({"enabledPlugins": {"mother@mother": False}}))
+        r = run(["status"], env)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("plugin:      DISABLED", r.stdout)
+        (cdir / "settings.json").write_text(json.dumps({"enabledPlugins": {"mother@mother": True}}))
+        self.assertIn("plugin:      enabled", run(["status"], env).stdout)
+
     # -- runs (watchdog)
     def test_runs_flags_missed_and_failed_routines(self):
         self.init()

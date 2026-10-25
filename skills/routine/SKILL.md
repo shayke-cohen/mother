@@ -72,4 +72,8 @@ Unattended rules, in addition to whatever the routine file says:
 
 Write the `runs.md` line(s) last — even after an unexpected error, catch it and log `failed — <short>`.
 Note examples: `ok — 4 sources, DM sent`, `partial — chat search missing_scope; tracker ok; DM sent`,
-`failed — DM post expired`. Sync runs on its own at the end of the turn.
+`failed — DM post expired`.
+
+Then run `${CLAUDE_PLUGIN_ROOT}/bin/mother sync` yourself. The Stop hook also syncs, but only while the
+plugin is enabled; a run that relies on it alone leaves its work uncommitted on this machine whenever the
+hook doesn't load, and the next run then skips its pull. Sync is safe to run twice.

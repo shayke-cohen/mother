@@ -32,7 +32,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -429,6 +429,16 @@ def cmd_home(args):
 
 # ---------------------------------------------------------------- status / register
 
+def plugin_enabled():
+    """True/False from the user's Claude Code settings (enabledPlugins["mother@mother"]), None if unknown."""
+    cdir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    try:
+        v = (json.loads((cdir / "settings.json").read_text()).get("enabledPlugins") or {}).get("mother@mother")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return v if isinstance(v, bool) else None
+
+
 def cmd_status(args):
     ws = workspace()
     cfg = load_config(ws)
@@ -449,6 +459,11 @@ def cmd_status(args):
             print("doctor:      capabilities.json unreadable — run /mother:doctor")
     else:
         print("doctor:      never run — run /mother:doctor")
+    pe = plugin_enabled()
+    if pe is False:
+        print("plugin:      DISABLED — the approval guard and the sync hook don't run; `claude plugin enable mother@mother`")
+    elif pe:
+        print("plugin:      enabled")
     if (ws / "QUARANTINE.md").exists():
         print("WARNING:     QUARANTINE.md present — sync is blocked until it's resolved")
     if (ws / ".mother" / "PAUSED").exists():
