@@ -18,6 +18,7 @@ teams/
     runs.md                      one line per routine run that touched this team
     repos/<owner>__<repo>.md     optional: short note per repo (monthly-refresh)
 people/<slug>.md                 one per person across teams: areas and work items, never assessments
+one-on-ones/<slug>/              1:1 prep and notes (mother:one-on-one): topics and commitments only
 ```
 
 Templates: `${CLAUDE_PLUGIN_ROOT}/skills/team/templates/`.

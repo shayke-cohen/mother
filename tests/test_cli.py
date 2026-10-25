@@ -314,6 +314,15 @@ class CliTest(unittest.TestCase):
         self.assertIn("commitments.no_reply_days must be an integer 1-30", r.stdout)
         self.assertIn("commitments.draft_nudges must be true or false", r.stdout)
 
+    def test_one_on_one_person_options_validated(self):
+        self.init()
+        cfg = self.write_config()
+        cfg["teams"][0]["people"][0]["one_on_one"] = {"cadence_days": 1, "agenda_doc": "x"}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        r = run(["status"], self.env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("teams[0].people[0].one_on_one must be", r.stdout)
+
     def test_monthly_routine_and_bad_days(self):
         self.init()
         cfg = self.write_config()
@@ -341,13 +350,14 @@ class CliTest(unittest.TestCase):
         r = run(["runs", "--json"], env)
         self.assertEqual(r.returncode, 2, r.stderr)
         state = {row["id"]: row["state"] for row in json.loads(r.stdout)}
-        self.assertEqual(state, {"brief": "ok", "digest": "failed", "dots": "missed", "commitments": "missed", "reflect": "partial", "doctor": "ok"})
+        self.assertEqual(state, {"brief": "ok", "digest": "failed", "dots": "missed", "one-on-one": "missed", "commitments": "missed", "reflect": "partial", "doctor": "ok"})
         r = run(["status"], env)
         self.assertEqual(r.returncode, 0)
-        self.assertIn("routines:    digest failed; dots missed; commitments missed", r.stdout)
+        self.assertIn("routines:    digest failed; dots missed; one-on-one missed; commitments missed", r.stdout)
         # just after a slot, the previous slot is judged: reflect is due at 21:30 but has 2h grace
         with open(self.ws / "runs.md", "a") as f:
             f.write("- 2026-10-23T13:02Z dots ok — 3 links\n- 2026-10-23T09:30:00Z digest ok — rerun\n"
+                    "- 2026-10-23T07:31:00Z one-on-one ok — 1 prepped, 0 drifting; DM sent\n"
                     "- 2026-10-23T16:31:00Z commitments ok — 2 made, 1 owed, 0 no-reply; DM sent\n")
         env["MOTHER_NOW"] = "2026-10-25T22:00:00Z"
         r = run(["runs"], env)

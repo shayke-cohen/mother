@@ -30,6 +30,7 @@ todos/open.md, archive.md  open loops, sections Yours / Mine / Blocked; items ta
 projects/<slug>/PROJECT.md + files/     indexed by projects/PROJECTS.md
 teams/<slug>/TEAM.md, roadmap.md, sprints/, meetings/, repos/<owner>__<repo>.md, intake.md, metrics.md, runs.md   indexed by teams/TEAMS.md
 people/<slug>.md           work items only, never assessments
+one-on-ones/<slug>/        next.md (queued topics) + YYYY-MM-DD.md (prep, then notes: topics and commitments only)
 journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for connect-the-dots; journal/commitments/YYYY-MM-DD.md for the commitment tracker
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
 .mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, guard.log, last-sync, PAUSED
@@ -65,6 +66,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `workspace.home_machine` | str or null | hostname allowed to run routines; null = routines refuse to run until set |
 | `connectors.{chat,tracker,mail,calendar,code}` | str | `slack`/`teams`, `jira`/`linear`/`monday`/`none`, … |
 | `teams[]` | list | `slug, name, tracker{project,board}, repos[], meetings{}, sprint{length,starts}, channels[], people[]` |
+| `people[]` (per team) | | `name, email, chat, code`, optional `one_on_one {cadence_days (3-90, default 14), title}` for 1:1 prep and drift |
 | `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, role: standup|team|product|support|announcements, quiet_hours ("HH:MM-HH:MM", default manager.quiet_hours), max_replies_per_hour (default 6), auto_topics: [slug] (auto mode)` |
 | `agent.aliases` | list, optional | other names that address the agent in a channel (e.g. `["mother"]`) |
 | `routines.brief.audio` | bool or map, optional | spoken brief: `true`, or `{voice, voice_he, rate (90-360 wpm), language: en|he, save_to, engine: say|kokoro, kokoro_voice (default af_heart)}`; rendered by `mother speak` with macOS `say` or, for English with `engine: kokoro`, local Kokoro (`mother tts setup` → `~/.mother/tts`; falls back to `say` for Hebrew or when missing) into `.mother/audio/` (last 14 kept), copied to `save_to` or iCloud Drive `Mother/` when present |

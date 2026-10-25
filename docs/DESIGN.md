@@ -125,7 +125,7 @@ unedited. The agent proposes the move; the manager decides. A 👎 sends that to
 Ideas from prior art, with sources, to be pulled in after v0:
 - **Commitment tracker** ✅ `mother:commitments`: promises you made and messages that got no reply, as in
   Microsoft's daily-briefing research.
-- **Per-report 1:1 prep:** what changed since the last 1:1, with private prep kept apart from a shared agenda
+- **Per-report 1:1 prep** ✅ `mother:one-on-one`: what changed since the last 1:1, with private prep kept apart from a shared agenda
   (Fellow, tech-manager-os).
 - **Meeting mode:** only *accepted* action items reach the tracker.
 - **Working agreements:** alert only when one is broken (Swarmia).
