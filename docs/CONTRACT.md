@@ -8,11 +8,13 @@ Every part of v0 is built against this file. Change it first, then the code.
 
 ```
 .claude-plugin/plugin.json, marketplace.json
-bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register
+bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval
 hooks/hooks.json           PreToolUse → hooks/guard.py; Stop + SessionEnd → `mother sync --quiet`
 hooks/guard.py             approval guard (see §5)
 skills/<name>/SKILL.md     user- and routine-facing skills, invoked as `mother:<name>`
+agents/<name>.md           read-only sub-agents MOTHER dispatches: `mother:reader`, `mother:critic` (see §5c)
 routines/<id>.md           routine definitions: what a scheduled run does (reads config, calls skills)
+lib/                       channels.py (§5b), items.py (reader evidence check), evals.py (A/B harness)
 assets/deck/               meeting deck template.html + build.py
 rules/                     default policy text skills cite: outbound.md, privacy.md, memory.md, todos.md, projects.md, teams.md
 templates/workspace/       files `mother init` copies into a new workspace
@@ -33,7 +35,7 @@ people/<slug>.md           work items only, never assessments
 one-on-ones/<slug>/        next.md (queued topics) + YYYY-MM-DD.md (prep, then notes: topics and commitments only)
 journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for connect-the-dots; journal/commitments/YYYY-MM-DD.md for the commitment tracker; journal/brief/YYYY-MM-DD.md for the brief's triage list
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
-.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, guard.log, last-sync, PAUSED
+.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs)
 ```
 
 ## 2. Finding each other
@@ -147,6 +149,28 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - A first look at a channel only sets its cursor to now. Quiet hours and rate limits hold messages (the cursor
   stops); stop/pause drop them. Earned autonomy: 10 unedited approvals on one channel+topic → one proposal to the
   manager; a 👎 on a reply mutes the thread and demotes its topic.
+
+## 5c. Sub-agents (`agents/`, `mother items`, `mother eval`)
+
+- **One writer.** MOTHER (the routine or interactive session) judges, writes and posts. Sub-agents only read
+  and hand back. Agents never message each other, and a sub-agent's hand-back is data: it approves nothing
+  (§5, `rules/outbound.md`).
+- `mother:reader` reads one source (calendar, mail, chat, tracker, code) and returns one JSON object,
+  `{source, coverage{status ok|partial|couldnt_check, reason, opened, unopened}, items[{kind, title, who, when,
+  link, state, note}]}`. `mother:critic` reads one outbound draft and its cited items and returns `PASS` or
+  `FIX` + a numbered list. Neither may spawn agents (frontmatter `disallowedTools` / `tools`).
+- **The guard enforces read-only** from the hook payload's `agent_type` (`mother:reader` or `reader`, likewise
+  critic), because plugin agents can't carry their own hooks. Every classified write is denied, including
+  green ones. Write/Edit and web are denied, and so is any tool outside the agent's list. A reader's Bash is
+  limited to single `gh`/`glab`/`date` commands with no chaining. A critic gets no MCP tools. Other sub-agents
+  (not MOTHER's) keep the normal rules.
+- `mother items check` turns a reader's reply into the only input a skill may use. Items without a link
+  (URL, ticket key, `owner/repo#N`, workspace path) are dropped. A reader whose items were all uncited
+  counts as `couldnt_check`, and so does unreadable output (exit 2). Never treat it as a quiet source.
+- `MOTHER_DRY_RUN=1` makes the guard deny every outbound call. `mother eval brief` sets it for both runs of
+  an A/B pair. A new gather mode becomes the default only when `mother eval report` says `ship`: at least
+  10 judged pairs; recall and uncited lines no worse than baseline; no new false-quiet sources; the manager
+  picked it or `same` in ≥ 60% of pairs; and cost ≤ 3× baseline.
 
 ## 6. Sync (`bin/mother sync`)
 

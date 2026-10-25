@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME_DIRS = ["bin", "lib", "hooks", "skills", "routines", "rules", "assets", "templates", ".claude-plugin"]
+RUNTIME_DIRS = ["agents", "bin", "lib", "hooks", "skills", "routines", "rules", "assets", "templates", ".claude-plugin"]
 
 
 class PackagingTest(unittest.TestCase):
