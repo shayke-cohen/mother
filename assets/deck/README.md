@@ -23,6 +23,10 @@ Required top-level keys: `meta`, `pipeline`, `sprint`, `experts`, `intake`, `car
 | `sprintSetup` | `current`, `currentId`, `next`, `nextId` (null = create), `start`, `end` |
 | `generated`, `sources`, `warnings[]` | provenance, shown on the title slide |
 
+`pipeline.cards[]` take `value`, `label`, `note`, `tone`, plus optional `prev` (an earlier value), `prevLabel`
+(e.g. `vs 09-25`), `estimate` (true = the baseline is reconstructed; shown with `~`) and `higherIsBetter`. With
+`prev` the card shows the change as +/-% — red when it got worse, green when better (lower is better by default).
+
 Text fields turn `ABC-123` keys into links when `tracker_url` is set. Outcome fields filled after the meeting:
 `intake.items[].owner`, `carryover.items[].outcome`, `decisions.items[].outcome`.
 

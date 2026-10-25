@@ -93,7 +93,8 @@ td.owner .blank{display:inline-block;min-width:110px;border-bottom:1.5px dashed 
 select,input[type=text],textarea{font:inherit;font-size:14px;color:var(--ink);background:var(--card);
   border:1px solid var(--line);border-radius:8px;padding:5px 8px;max-width:100%}
 select:focus,input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:1px}
-.mode{position:fixed;top:14px;right:16px;display:flex;gap:8px;align-items:center;z-index:5}
+/* Bottom-right, above the nav: hosts like Stash overlay their own toolbar on the top edge. */
+.mode{position:fixed;bottom:58px;right:16px;display:flex;gap:8px;align-items:center;z-index:5}
 .mode button,.btn{background:var(--card);border:1px solid var(--line);color:var(--ink);border-radius:8px;
   padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -112,7 +113,7 @@ select:focus,input:focus,textarea:focus{outline:2px solid var(--accent);outline-
 .empty{color:var(--muted);font-size:14px;padding:14px 0}
 @media (max-width:820px){
   .newrow{grid-template-columns:1fr}
-  .mode{top:auto;bottom:58px;right:12px}
+  .mode{right:12px}
   .slide{padding:24px 16px 96px}
   .g2,.g3,.g4{grid-template-columns:1fr}
   h1{font-size:32px} h2{font-size:24px} .stat{font-size:36px}
@@ -143,6 +144,15 @@ select:focus,input:focus,textarea:focus{outline:2px solid var(--accent);outline-
   function rich(s){return JIRA?esc(s).replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g,'<a class="key" href="'+JIRA+'$1" target="_blank" rel="noopener">$1</a>'):esc(s)}
   function key(k){return JIRA?'<a class="key" href="'+JIRA+esc(k)+'" target="_blank" rel="noopener">'+esc(k)+'</a>':'<span class="key">'+esc(k)+'</span>'}
   function pill(t,tone){return t?'<span class="pill p-'+(tone||'accent')+'">'+esc(t)+'</span>':''}
+  // Change vs an earlier value: +12% red when up, green when down (flip with higherIsBetter). "~" marks an estimated baseline.
+  function delta(c){
+    var now=parseFloat(c.value),was=parseFloat(c.prev);
+    if(c.prev==null||isNaN(now)||isNaN(was))return {pill:'',note:''};
+    var d=now-was,pct=was?Math.round(d/was*100):null;
+    var txt=(d>0?'+':d<0?'−':'±')+(pct==null?Math.abs(d):Math.abs(pct)+'%');
+    var good=c.higherIsBetter?d>0:d<0;
+    return {pill:'<span class="pill p-'+(d===0?'accent':good?'good':'bad')+'">'+txt+'</span>',
+      note:'<div class="stat-note">'+(c.estimate?'~':'')+esc(c.prev)+' '+esc(c.prevLabel||'before')+'</div>'}}
   function head(kicker,title,sub){return '<div class="kicker">'+esc(kicker)+'</div><h2>'+esc(title)+'</h2>'+(sub?'<p class="sub">'+rich(sub)+'</p>':'')}
   function note(n){return n?'<div class="note">'+rich(n)+'</div>':''}
   function items(list){return '<ul>'+(list||[]).map(function(i){return '<li>'+(i.key?key(i.key)+' ':'')+rich(i.text)+'</li>'}).join('')+'</ul>'}
@@ -170,7 +180,7 @@ select:focus,input:focus,textarea:focus{outline:2px solid var(--accent);outline-
   // 1 · Pipeline
   var P = D.pipeline;
   S.push(head('1 · Pipeline','Where apps are waiting',P.sub)+
-    '<div class="grid g4">'+P.cards.map(function(c){return '<div class="card"><div class="stat t-'+(c.tone||'')+'">'+esc(c.value)+'</div><div class="stat-label">'+esc(c.label)+'</div><div class="stat-note">'+rich(c.note)+'</div></div>'}).join('')+'</div>'+
+    '<div class="grid g4">'+P.cards.map(function(c){var dl=delta(c);return '<div class="card"><div style="display:flex;align-items:center;gap:10px"><div class="stat t-'+(c.tone||'')+'">'+esc(c.value)+'</div>'+dl.pill+'</div>'+dl.note+'<div class="stat-label">'+esc(c.label)+'</div><div class="stat-note">'+rich(c.note)+'</div></div>'}).join('')+'</div>'+
     (P.trend&&P.trend.length>1?'<h3 style="margin:22px 0 8px;font-size:15px">Trend</h3><table><tr><th>week</th><th>total</th><th>stuck &gt;14d</th><th>&gt;30d</th><th>unassigned</th></tr>'+P.trend.map(function(r){return '<tr><td>'+esc(r.week)+'</td><td class="num">'+esc(r.total)+'</td><td class="num">'+esc(r.stuck)+'</td><td class="num">'+esc(r.over30)+'</td><td class="num">'+esc(r.unassigned)+'</td></tr>'}).join('')+'</table>':'')+
     (P.breakdown?'<div class="grid g2" style="margin-top:16px">'+P.breakdown.map(function(b){return '<div class="card t-'+(b.tone||'accent')+'"><h3>'+esc(b.title)+'</h3><p>'+rich(b.text)+'</p></div>'}).join('')+'</div>':'')+
     note(P.note));
