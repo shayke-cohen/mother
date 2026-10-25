@@ -111,6 +111,14 @@ class HealthTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["server"], "mcp__X")
 
+    def test_pick_legacy_string_token(self):
+        self.caps_path.write_text(json.dumps({"checked_at": iso_ago(2), "connectors": {"slack": {
+            "server": W, "read": "ok", "token": "user", "servers": {"read": "mcp__X"}}}}))
+        r, out = self.pick("--target", "other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(out, {"server": "mcp__X", "status": "ok", "fresh": True, "fallback": False,
+                               "stamped": False})
+
     def test_pick_legacy_top_level_servers(self):
         self.caps_path.write_text(json.dumps({"checked_at": iso_ago(2), "servers": {"chat.search": "mcp__X"},
                                               "connectors": {"slack": {"server": W, "read": "ok", "search": "ok"}}}))

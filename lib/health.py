@@ -138,6 +138,8 @@ def normalize(caps, cfg):
     for conn in conns.values():
         if not isinstance(conn, dict):
             continue
+        if isinstance(conn.get("token"), str):  # legacy: one identity, the main server's
+            conn["token"] = {conn["server"]: conn["token"]} if conn.get("server") else {}
         servers = conn.setdefault("servers", {})
         health = conn.setdefault("health", {})
         for cap in cap_names(conn):
