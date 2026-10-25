@@ -10,7 +10,13 @@ Commands (JSON out, one object per call):
   summary [--days N]           failures and fixes from health.md, most frequent first (text lines)
   pick --kind K --cap C [--target dm|other] [--max-age-hours N]
                                the server to use now -> {server, status, fresh, fallback, stamped}
+  merge --file F               merge the doctor's fresh capabilities JSON in -> {changed: [kind.cap, ...]}
+  alert --kind K --cap C --server S [--urgent] [--sent]
+                               once-a-day alert decision -> {action: send|pending|skip}; --sent records it
+  pending                      held alerts now outside quiet hours -> [{kind, cap, server, status, class}]
 
+Alerts: at most one per (server, capability) per manager-local day; held (`pending`) during
+manager.quiet_hours unless --urgent.
 `record` also appends one line per failure or fix to <workspace>/health.md (no ids, no content).
 Exit codes: 0 ok; 2 bad file or bad arguments; 3 `pick` found no usable server.
 $MOTHER_NOW (epoch seconds) pins the clock. Python 3.9 stdlib only.
@@ -25,6 +31,8 @@ import re
 import sys
 import time
 from pathlib import Path
+
+import channels  # one-way: channels never imports health
 
 CLASSES = ("unreachable", "dropped", "invalidated", "missing_scope", "denied", "other")
 FIXED_BY = ("retry", "reconnect", "fallback", "you", "—")
@@ -105,7 +113,7 @@ def locked(ws):
 def save(ws, caps):
     p = caps_path(ws)
     tmp = p.with_name(p.name + ".tmp.%d" % os.getpid())
-    tmp.write_text(json.dumps(caps, indent=2, ensure_ascii=False) + "\n")
+    tmp.write_text(json.dumps(caps, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(str(tmp), str(p))
 
 
@@ -202,6 +210,83 @@ def record(caps, vendor, cap, server, status, cls=None, gateway=None, now=None):
     return old.get("status") if old else None
 
 
+def merge(old, new):
+    """The doctor's fresh capabilities `new` over the stored `old` (both normalized).
+
+    `new` wins for statuses, stamps, tokens and the top-level checked_at/host. Server order: old order for
+    servers in both, new ones appended, absent ones dropped. `alerted_at`/`pending` survive while the
+    entry is not ok and its class is unchanged.
+    """
+    out = copy.deepcopy(new)
+    for vendor, conn in (out.get("connectors") or {}).items():
+        oc = (old.get("connectors") or {}).get(vendor)
+        if not isinstance(conn, dict) or not isinstance(oc, dict):
+            continue
+        for cap, fresh in list((conn.get("servers") or {}).items()):
+            prior = (oc.get("servers") or {}).get(cap) or []
+            conn["servers"][cap] = [s for s in prior if s in fresh] + [s for s in fresh if s not in prior]
+        for server, caps_ in (conn.get("health") or {}).items():
+            for cap, e in caps_.items():
+                o = (((oc.get("health") or {}).get(server) or {}).get(cap)) if not cap.startswith("_") else None
+                if isinstance(e, dict) and o and e.get("status") != "ok" and o.get("class") == e.get("class"):
+                    for k in ("alerted_at", "pending"):
+                        if k in o:
+                            e[k] = o[k]
+    return out
+
+
+def _local_date(t, cfg):
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo((cfg.get("manager") or {}).get("timezone") or "UTC")
+    except Exception:
+        tz = _dt.timezone.utc
+    return _dt.datetime.fromtimestamp(t, tz).date()
+
+
+def _entry(caps, vendor, cap, server):
+    e = ((((caps.get("connectors") or {}).get(vendor) or {}).get("health") or {}).get(server) or {}).get(cap)
+    return e if isinstance(e, dict) else None
+
+
+def alert_action(caps, cfg, vendor, cap, server, urgent=False, now=None):
+    """`send`, `pending` or `skip` for one failing entry (`now`: epoch seconds); `pending` is recorded."""
+    t = _clock() if now is None else now
+    e = _entry(caps, vendor, cap, server)
+    if not e or e.get("status") == "ok":
+        return "skip"
+    last = parse_iso(e.get("alerted_at"))
+    if last is not None and _local_date(last, cfg) == _local_date(t, cfg):
+        return "skip"
+    if not urgent and channels.quiet_now(cfg, now=t):
+        e["pending"] = True
+        return "pending"
+    return "send"
+
+
+def mark_alerted(caps, vendor, cap, server, now=None):
+    e = _entry(caps, vendor, cap, server)
+    if e is not None:
+        e["alerted_at"] = iso(now)
+        e.pop("pending", None)
+
+
+def due_pending(caps, cfg, now=None):
+    """Held alerts, once quiet hours are over: [{kind, cap, server, status, class}]."""
+    t = _clock() if now is None else now
+    if channels.quiet_now(cfg, now=t):
+        return []
+    kinds = {v: k for k, v in (cfg.get("connectors") or {}).items() if isinstance(v, str)}
+    out = []
+    for vendor, conn in (caps.get("connectors") or {}).items():
+        for server, caps_ in ((conn or {}).get("health") or {}).items():
+            for cap, e in caps_.items():
+                if isinstance(e, dict) and e.get("pending") and e.get("status") != "ok":
+                    out.append({"kind": kinds.get(vendor, vendor), "cap": cap, "server": server,
+                                "status": e.get("status"), "class": e.get("class")})
+    return out
+
+
 # ---------------------------------------------------------------- classify and log
 
 _SCOPE = re.compile(r"[a-z]+:[a-z.:_]+")
@@ -253,7 +338,7 @@ def health_line(now, kind, cap, server, cls, fixed_by, gateway=None):
 def append_log(ws, line):
     p = Path(ws) / "health.md"
     new = not p.is_file()
-    with open(str(p), "a") as f:
+    with open(str(p), "a", encoding="utf-8") as f:
         if new:
             f.write(LOG_HEADER + "\n")
         f.write(line + "\n")
@@ -269,7 +354,7 @@ def summary(ws, days=7, now=None):
         return []
     cutoff = (_clock() if now is None else now) - days * 86400
     rows = []  # (server, class, outcome, gateway)
-    for raw in p.read_text().splitlines():
+    for raw in p.read_text(encoding="utf-8").splitlines():
         m = _LINE.match(raw)
         t = parse_iso(m.group(1)) if m else None
         if t is not None and t >= cutoff:
@@ -409,7 +494,58 @@ def cmd_summary(ws, args):
     return 0, None
 
 
-COMMANDS = {"record": cmd_record, "pick": cmd_pick, "classify": cmd_classify, "summary": cmd_summary}
+def rollups(caps):
+    return {(v, c): rollup(conn, c) for v, conn in caps["connectors"].items() if isinstance(conn, dict)
+            for c in cap_names(conn)}
+
+
+def cmd_merge(ws, args):
+    o = parse_args(args, ("--file",))
+    need(o, "file")
+    try:
+        fresh = json.loads(Path(o["file"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise HealthError("cannot read --file (%s)" % e)
+    if not isinstance(fresh, dict) or not isinstance(fresh.get("connectors", {}), dict):
+        raise HealthError("--file has an unexpected shape")
+    cfg = load_config(ws)
+    with locked(ws):
+        old = normalize(load(ws), cfg)
+        new = normalize(fresh, cfg)
+        merged = merge(old, new)
+        before, after = rollups(old), rollups(merged)
+        save(ws, merged)
+    kinds = {v: k for k, v in (cfg.get("connectors") or {}).items() if isinstance(v, str)}
+    changed = ["%s.%s" % (kinds.get(v, v), c) for (v, c), r in after.items()
+               if r != "ok" and before.get((v, c), "untested") == "ok"]
+    return 0, {"changed": changed}
+
+
+def cmd_alert(ws, args):
+    o = parse_args([a for a in args if a not in ("--urgent", "--sent")], ("--kind", "--cap", "--server"))
+    need(o, "kind", "cap", "server")
+    urgent, sent = "--urgent" in args, "--sent" in args
+    cfg = load_config(ws)
+    vendor = vendor_of(cfg, o["kind"])
+    with locked(ws):
+        caps = normalize(load(ws), cfg)
+        if sent:
+            mark_alerted(caps, vendor, o["cap"], o["server"])
+            action = "sent"
+        else:
+            action = alert_action(caps, cfg, vendor, o["cap"], o["server"], urgent)
+        save(ws, caps)
+    return 0, {"action": action}
+
+
+def cmd_pending(ws, args):
+    parse_args(args, ())
+    cfg = load_config(ws)
+    return 0, due_pending(normalize(load(ws), cfg), cfg)
+
+
+COMMANDS = {"record": cmd_record, "pick": cmd_pick, "classify": cmd_classify, "summary": cmd_summary,
+            "merge": cmd_merge, "alert": cmd_alert, "pending": cmd_pending}
 
 
 def main(argv, ws):

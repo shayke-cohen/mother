@@ -57,6 +57,8 @@ def now():
     return float(v) if v else time.time()
 
 
+_clock = now  # quiet_now() shadows `now` with a parameter
+
 def iso(t=None):
     return _dt.datetime.fromtimestamp(now() if t is None else t, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -220,8 +222,11 @@ def load_ctx():
 
 # ---------------------------------------------------------------- time rules
 
-def in_quiet_hours(ctx, ch):
-    q = ch.get("quiet_hours") or (ctx.cfg.get("manager") or {}).get("quiet_hours")
+def quiet_now(cfg, q=None, now=None):
+    """True when `now` (epoch seconds, default the clock) is inside quiet hours "HH:MM-HH:MM" in
+    manager.timezone; `q` defaults to manager.quiet_hours."""
+    mgr = cfg.get("manager") or {}
+    q = q or mgr.get("quiet_hours")
     if not q:
         return False
     m = re.fullmatch(r"\s*([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)\s*", str(q))
@@ -229,14 +234,18 @@ def in_quiet_hours(ctx, ch):
         return False
     try:
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo((ctx.cfg.get("manager") or {}).get("timezone") or "UTC")
+        tz = ZoneInfo(mgr.get("timezone") or "UTC")
     except Exception:
         tz = _dt.timezone.utc
-    t = _dt.datetime.fromtimestamp(now(), tz)
+    t = _dt.datetime.fromtimestamp(_clock() if now is None else now, tz)
     cur = t.hour * 60 + t.minute
     a = int(m.group(1)) * 60 + int(m.group(2))
     b = int(m.group(3)) * 60 + int(m.group(4))
     return (a <= cur < b) if a <= b else (cur >= a or cur < b)
+
+
+def in_quiet_hours(ctx, ch):
+    return quiet_now(ctx.cfg, ch.get("quiet_hours"))
 
 
 def posts_last_hour(ctx, cid):

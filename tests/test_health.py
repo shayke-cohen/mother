@@ -299,6 +299,109 @@ class HealthTest(unittest.TestCase):
         self.assertIn("486bd9bf", md)
         self.assertNotIn("486bd9bf-5fd4-4917-848c-4f2ddfdfb82e", md)
 
+    def entry(self, status="expired", cls="invalidated", **extra):
+        e = {"status": status, "class": cls, "checked_at": iso_ago(1)}
+        e.update(extra)
+        return e
+
+    def conn(self, order, health):
+        return {"server": order[0], "read": "ok", "servers": {"read": order},
+                "health": {s: {"read": e} for s, e in health.items()}}
+
+    def merge(self, fresh):
+        f = Path(self.tmp.name) / "fresh.json"
+        f.write_text(json.dumps({"checked_at": ISO_NOW, "host": "h2", "connectors": {"slack": fresh}}))
+        r = self.run_cli("merge", "--file", str(f))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def set_cfg(self, tz="Asia/Jerusalem", quiet="22:00-07:00"):
+        cfg = json.loads((self.ws / "config.json").read_text())
+        cfg["manager"]["timezone"] = tz
+        cfg["manager"]["quiet_hours"] = quiet
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+
+    def at(self, h, m=0, day=14):
+        """Epoch seconds for day-of-Nov-2023 h:m in Asia/Jerusalem (UTC+2)."""
+        import datetime as dt
+        return int(dt.datetime(2023, 11, day, h - 2, m, tzinfo=dt.timezone.utc).timestamp())
+
+    def alert(self, now, *args):
+        self.env["MOTHER_NOW"] = str(now)
+        r = self.run_cli("alert", "--kind", "chat", "--cap", "read", "--server", C, *args)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["action"]
+
+    def test_merge_keeps_order_and_alert(self):
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry(alerted_at=iso_ago(2))}))
+        self.merge(self.conn([C, W, "N"], {W: self.entry("ok", None), C: self.entry(), "N": self.entry("ok", None)}))
+        c = self.caps()
+        self.assertEqual(c["servers"]["read"], [W, C, "N"])
+        self.assertEqual(c["health"][C]["read"]["alerted_at"], iso_ago(2))
+
+    def test_merge_drops_alert_when_class_changes(self):
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry(alerted_at=iso_ago(2), pending=True)}))
+        self.merge(self.conn([W, C], {W: self.entry("ok", None), C: self.entry("error:unreachable", "unreachable")}))
+        e = self.caps()["health"][C]["read"]
+        self.assertNotIn("alerted_at", e)
+        self.assertNotIn("pending", e)
+
+    def test_merge_drops_absent_servers_and_takes_new_values(self):
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry()}))
+        self.merge(self.conn([W], {W: self.entry("ok", None, checked_at=ISO_NOW)}))
+        c = self.caps()
+        self.assertEqual(c["servers"]["read"], [W])
+        self.assertNotIn(C, c["health"])
+        self.assertEqual(c["health"][W]["read"]["checked_at"], ISO_NOW)
+        self.assertEqual(json.loads(self.caps_path.read_text())["host"], "h2")
+
+    def test_merge_reports_newly_broken(self):
+        self.write_caps(self.conn([W], {W: self.entry("ok", None)}))
+        out = self.merge(self.conn([W], {W: self.entry()}))
+        self.assertEqual(out, {"changed": ["chat.read"]})
+        out = self.merge(self.conn([W], {W: self.entry()}))
+        self.assertEqual(out, {"changed": []})
+
+    def test_alert_once_per_day(self):
+        self.set_cfg(quiet="01:00-02:00")
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry()}))
+        t = self.at(12)
+        self.assertEqual(self.alert(t), "send")
+        self.assertEqual(self.alert(t, "--sent"), "sent")
+        self.assertEqual(self.alert(t + 3600), "skip")
+        self.assertEqual(self.alert(self.at(12, day=15)), "send")
+
+    def test_alert_skips_ok(self):
+        self.set_cfg()
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry("ok", None)}))
+        self.assertEqual(self.alert(self.at(12)), "skip")
+
+    def test_alert_quiet_hours_cross_midnight(self):
+        self.set_cfg()
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry()}))
+        self.assertEqual(self.alert(self.at(23, 30)), "pending")
+        self.assertTrue(self.caps()["health"][C]["read"]["pending"])
+        self.assertEqual(self.alert(self.at(23, 30), "--urgent"), "send")
+        self.assertEqual(self.alert(self.at(6, 59, day=15)), "pending")
+        self.env["MOTHER_NOW"] = str(self.at(7, 1, day=15))
+        r = self.run_cli("pending")
+        self.assertEqual(json.loads(r.stdout), [{"kind": "chat", "cap": "read", "server": C,
+                                                 "status": "expired", "class": "invalidated"}])
+
+    def test_pending_empty_during_quiet_hours(self):
+        self.set_cfg()
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry(pending=True)}))
+        self.env["MOTHER_NOW"] = str(self.at(2, day=15))
+        self.assertEqual(json.loads(self.run_cli("pending").stdout), [])
+
+    def test_sent_clears_pending(self):
+        self.set_cfg()
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry(pending=True)}))
+        self.assertEqual(self.alert(self.at(8), "--sent"), "sent")
+        e = self.caps()["health"][C]["read"]
+        self.assertNotIn("pending", e)
+        self.assertIn("alerted_at", e)
+
 
 if __name__ == "__main__":
     unittest.main()
