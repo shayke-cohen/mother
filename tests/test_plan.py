@@ -69,7 +69,7 @@ class PlanTest(unittest.TestCase):
     def test_template_is_vendor_and_company_neutral(self):
         for f in ("template.html", "example.json", "build.py", "README.md"):
             t = (PLAN / f).read_text().lower()
-            for word in ("atlassian.net", "mobpub", "wix"):
+            for word in ("atlassian.net", "mobpub", "wix", "stash", "jira"):
                 self.assertNotIn(word, t, f)
 
 

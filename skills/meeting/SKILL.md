@@ -43,8 +43,8 @@ Content rules (the page is shown to the team): no customer names or identifiers,
 number names its source and time (`meta.sources`, `meta.generated`). Put `teams/<slug>/meetings/<date>-meeting.md`
 next to it with the goals and decisions in text.
 
-Then **publish** it where `teams[].meetings.weekly.publish` says (`file` = just the path; `stash` = a Stash
-page, slug `<team-slug>-<sprint-slug>-plan`, unlisted, overwrite the same slug on later runs) and DM the
+Then **publish** it where `teams[].meetings.weekly.publish` says (`file` = just the path; any other value = the page-hosting connector of that name the manager set up;
+publish under a stable slug such as `<team-slug>-<sprint-slug>-plan`, unlisted, and overwrite it on later runs) and DM the
 manager:
 
 1. the link and the 5 lines that matter most;

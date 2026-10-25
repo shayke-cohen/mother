@@ -3,7 +3,7 @@
 
 Usage: python3 build.py <plan.json> <out.html>
 
-A static page: no script, so it renders anywhere (Stash, a file preview, a phone). The design lives in
+A static page: no script, so it renders anywhere (a page host, a file preview, a phone). The design lives in
 template.html; only the JSON changes per week. Validates the top-level keys so a half-written data file
 fails loudly instead of rendering an empty section.
 """
@@ -128,7 +128,7 @@ def render(d):
     goal_text = m.get("goal") or "; ".join(g["title"] for g in nx["goals"])
     nav = (link(board, "Board ↗") if board else "") + "".join(
         f'<a href="#{a}">{t}</a>' for a, t in [("context", "Apps"), ("feedback", "Customers"), ("last", "Last sprint"),
-                                                ("next", "Next sprint"), ("decide", "Decisions"), ("jira", "Jira changes")])
+                                                ("next", "Next sprint"), ("decide", "Decisions"), ("tracker", "Tracker changes")])
     body = f"""<nav>{nav}</nav>
 <div class="kicker">{e(m["team"])} · {e(m["sprint"])} · {e(m["start"])} → {e(m["end"])}</div>
 <h1>{e(m["title"])}</h1>
@@ -160,7 +160,7 @@ def render(d):
 <div class="kicker" id="decide">3 · Decisions</div><h2>Open questions</h2>
 <ol>{"".join(f"<li>{e(x)}</li>" for x in d["decisions"])}</ol>
 
-<div class="kicker" id="jira">4 · On approval</div><h2>What changes in the tracker</h2>
+<div class="kicker" id="tracker">4 · On approval</div><h2>What changes in the tracker</h2>
 <ol>
 <li>Write the goal into {e(m["sprint"])}: <i>{e(goal_text)}</i>.</li>
 <li>Create {n_create} issues (red above), assigned as shown.</li>
