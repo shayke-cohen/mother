@@ -105,12 +105,14 @@ Day to day you mostly read what it sends you and answer in one line. The default
 | dots | 13:00 workdays | Connections across threads, and suggested actions for you and for the agent |
 | brief, spoken | with the brief, if `routines.brief.audio` is on | A 60–90 second audio version (macOS voices, or the Kokoro neural voice with `"engine": "kokoro"` after `mother tts setup`; `"language": "he"` for Hebrew) |
 | commitments | 16:30 workdays | What you promised, what you're waiting on, and asks with no reply after 3 days; answer `nudge 3` for a draft follow-up |
+| one-on-one | 07:30 workdays | Prep for each of today's 1:1s (a shareable agenda kept apart from private prep) and a note when a report's 1:1s have lapsed |
 | reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
 | doctor | weekly | Re-tests connectors, so a broken one shows as "couldn't check" |
 | meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |
 
 You can also just ask: "brief me", "what's open", "remember that …", "add a todo …", "take notes on the
-design review", "set up a new project". Each one routes to a skill: `brief`, `todo`, `remember`,
+design review", "prep my 1:1 with Sam", "what did I promise", "set up a new project". Each one routes to a
+skill: `brief`, `todo`, `remember`, `one-on-one`, `commitments`,
 `meeting`, `project`, `team` and so on.
 
 ### Replying in team channels

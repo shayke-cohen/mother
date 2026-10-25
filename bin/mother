@@ -140,6 +140,15 @@ def validate(cfg: dict) -> list:
         where = f"teams[{i}]"
         need(t, "slug", str, where)
         need(t, "name", str, where)
+        for j, pp in enumerate(t.get("people") or []):
+            oo = pp.get("one_on_one") if isinstance(pp, dict) else None
+            if oo is None:
+                continue
+            cd = oo.get("cadence_days") if isinstance(oo, dict) else None
+            if not isinstance(oo, dict) or any(k not in ("cadence_days", "title") for k in oo) \
+                    or (cd is not None and (not isinstance(cd, int) or isinstance(cd, bool) or not 3 <= cd <= 90)) \
+                    or not isinstance(oo.get("title", ""), str):
+                errs.append(f"{where}.people[{j}].one_on_one must be {{cadence_days: 3-90, title: str}}")
         for j, ch in enumerate(t.get("channels") or []):
             cw = f"{where}.channels[{j}]"
             need(ch, "id", str, cw)
