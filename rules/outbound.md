@@ -163,12 +163,22 @@ log, the hook itself or `~/.mother/workspace`, is an ask.
 When the manager runs a session in bypass permissions mode (`permission_mode` is `bypassPermissions` in the
 hook payload), every call that would ask gets no decision instead, so Claude Code's own mode applies and the
 call runs without a prompt. That covers messages to others, tracker writes, email, calendar invites and
-code-host writes. What doesn't change: the kill switch and the never-list still deny, an edit to the guard's
-own files still asks, and allows stay allows. Each pass is logged with decision `pass`.
+code-host writes. What doesn't change: the kill switch, the never-list and a dry run still deny, MOTHER's
+sub-agents are still denied, an edit to the guard's own files still asks, and allows stay allows. Each pass is
+logged with decision `pass`.
 
 The cost: in bypass mode, injected content that talks the agent into sending something is no longer stopped
 by a prompt. Use bypass mode only in sessions where that is acceptable, and `touch .mother/PAUSED` to stop all
 outbound at once.
+
+## Sub-agents and dry runs
+
+MOTHER's own sub-agents (`mother:reader`, `mother:critic`) write nothing. The hook knows them by the
+payload's `agent_type` and denies every outbound call they make, including the manager's own DM, drafts,
+granted and session-approved writes. It also denies Write/Edit, web tools, and any Bash except single
+`gh`/`glab` read commands. Only MOTHER posts what a sub-agent found, after `mother items check`.
+
+`MOTHER_DRY_RUN=1` (set by `mother eval`) denies every outbound call in that session and its sub-agents.
 
 ## Fail closed
 

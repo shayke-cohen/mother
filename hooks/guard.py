@@ -959,6 +959,55 @@ def channel_session(tool, inp, cwd, ctx, role):
     return None
 
 
+# ------------------------------------------------------------------ MOTHER's own sub-agents
+
+# agents/*.md. Plugin agents can't carry their own hooks, so this is where their limits live. Hooks run inside
+# sub-agents, and the payload names the agent in `agent_type`, scoped ("mother:reader") or bare.
+SUBAGENT_TOOLS = {"reader": {"Read", "Grep", "Glob", "LS", "Bash"}, "critic": {"Read", "Grep", "Glob", "LS"}}
+READER_BASH = {"gh", "glab", "date"}
+DRY_RUN_ENV = "MOTHER_DRY_RUN"
+
+
+def mother_subagent(payload):
+    t = str(payload.get("agent_type") or "").strip()
+    if not t:
+        return None
+    if t.startswith("mother:"):
+        t = t[len("mother:"):]
+    return t if t in SUBAGENT_TOOLS else None
+
+
+def unquoted(cmd):
+    return re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", "''", cmd)
+
+
+def subagent_session(kind, tool, inp, cwd, ctx):
+    """A `mother:reader` gathers one source and hands back JSON; a `mother:critic` reads a draft and answers
+    PASS or fixes. Both are read-only: MOTHER is the single writer. Every classified write is denied — the
+    manager's own DM and drafts included — and so is any tool outside the agent's list. Returns
+    (decision, reason) or None (not outbound: normal permissions)."""
+    who = "the %s sub-agent" % kind
+    if tool.startswith("mcp__"):
+        if kind == "critic":
+            return "deny", "%s reads only the files it is given, not %s." % (who, tool)
+        a = classify(tool, inp, cwd, ctx)
+        if a is not None:
+            return "deny", "%s writes nothing (%s): only MOTHER posts, drafts or files." % (who, a["what"])
+        return None
+    if tool not in SUBAGENT_TOOLS[kind]:
+        return "deny", "%s can't use %s: it is read-only." % (who, tool)
+    if tool == "Bash":
+        cmd = str(inp.get("command") or "").strip()
+        bare = unquoted(cmd)
+        first = os.path.basename(bare.split()[0]) if bare.split() else ""
+        if first not in READER_BASH or re.search(r"[;&|`<>]|\$\(", bare):
+            return "deny", "%s runs only single gh/glab read commands, not: %s" % (who, cmd[:120])
+        a = classify_bash(cmd, cwd, ctx)
+        if a is not None:
+            return "deny", "%s writes nothing (%s)." % (who, a["what"])
+    return None
+
+
 def run(raw):
     """Returns (decision, reason) or None. Never raises."""
     try:
@@ -987,12 +1036,22 @@ def run(raw):
                 return None
             log(ctx, tool, {"kind": "channel-session", "category": role}, r[0], r[1])
             return r
+        sub = mother_subagent(payload)
+        if sub:
+            r = subagent_session(sub, tool, inp, payload.get("cwd"), ctx)
+            if r is None:
+                return None
+            log(ctx, tool, {"kind": "subagent", "category": sub}, r[0], r[1])
+            return r
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             return None
-        r = decide(a, ctx, payload.get("transcript_path"))
+        if os.environ.get(DRY_RUN_ENV, "").strip():
+            r = "deny", "%s: dry run (%s is set), nothing leaves the machine." % (a["what"], DRY_RUN_ENV)
+        else:
+            r = decide(a, ctx, payload.get("transcript_path"))
         # The manager chose bypass mode for this session: an ask becomes no decision, so Claude Code's own
-        # mode applies. Denies (PAUSED, the never-list) and the guard's self-edit check still hold.
+        # mode applies. Denies (PAUSED, the never-list, dry run) and the guard's self-edit check still hold.
         if r[0] == "ask" and a["kind"] != "config" and payload.get("permission_mode") == "bypassPermissions":
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])
             return None

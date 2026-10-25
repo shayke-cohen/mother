@@ -82,9 +82,12 @@ class GuardCase(unittest.TestCase):
     def state(self, name):
         return os.path.join(self.ws, ".mother", name)
 
-    def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None, env=None, mode=None):
+    def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None, env=None, agent=None,
+                  mode=None):
         payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp, "session_id": "t",
                    "cwd": cwd or self.tmp, "transcript_path": transcript}
+        if agent:
+            payload.update(agent_id="a1", agent_type=agent)
         if mode:
             payload["permission_mode"] = mode
         extra = env or {}
@@ -321,6 +324,12 @@ class TestBypassMode(GuardCase):
         self.expect("deny", "Bash", {"command": "gh pr create"}, mode=self.BY)
         self.expect("ask", "Bash", {"command": "rm %s" % self.state("PAUSED")}, mode=self.BY)
 
+    def test_dry_run_and_subagents_still_deny(self):
+        self.expect("deny", CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, mode=self.BY,
+                    env={"MOTHER_DRY_RUN": "1"})
+        self.expect("deny", CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, mode=self.BY,
+                    agent="mother:reader")
+
     def test_pass_is_logged(self):
         self.expect("none", CHAT + "post_message", {"channel_id": TEAM, "text": "secret body"}, mode=self.BY)
         with open(self.state("guard.log")) as f:
@@ -402,6 +411,65 @@ class TestChannelSession(GuardCase):
                      "skills/x/SKILL.md", "scripts/x.sh", "GEMINI.md", "todos/open.json"):
             self.assertEqual(self.mgr("Write", {"file_path": os.path.join(self.ws, path)}), "deny", path)
         self.assertEqual(self.mgr("Write", {"file_path": os.path.join(self.home, "x.txt")}), "deny")
+
+
+class TestSubagent(GuardCase):
+    """MOTHER's own sub-agents (agents/*.md): the hook payload names them in agent_type."""
+
+    def reader(self, tool, inp, agent="mother:reader"):
+        return self.run_guard(tool, inp, agent=agent, cwd=self.ws)[0]
+
+    def test_reader_reads(self):
+        for agent in ("mother:reader", "reader"):
+            self.assertEqual(self.reader(CHAT + "get_channel_history", {"channel_id": TEAM}, agent), "none")
+        self.assertEqual(self.reader(TRK + "get-issues", {"jql": "x"}), "none")
+        self.assertEqual(self.reader(MAIL + "read-email", {"id": "1"}), "none")
+        self.assertEqual(self.reader("Read", {"file_path": os.path.join(self.ws, "todos", "open.md")}), "none")
+        self.assertEqual(self.reader("Bash", {"command": "gh search prs --review-requested=@me --state=open "
+                                                         "--json number,title --jq '.[] | .title'"}), "none")
+
+    def test_reader_writes_nothing_even_green_or_granted(self):
+        self.grants(self.grant("chat-reply", TEAM))
+        ok = self.transcript(self.user("mother approve chat %s" % TEAM))
+        self.assertEqual(self.reader(CHAT + "post_message", {"channel_id": DM, "text": "x"}), "deny")
+        self.assertEqual(self.run_guard(CHAT + "reply_to_thread", {"channel_id": TEAM, "thread_ts": "1.2",
+                                                                   "text": SIG}, transcript=ok,
+                                        agent="mother:reader")[0], "deny")
+        self.assertEqual(self.reader(MAIL + "create-gmail-draft", {"to": "a@example.com"}), "deny")
+        self.assertEqual(self.reader(CAL + "create-event", {"summary": "focus"}), "deny")
+        self.assertEqual(self.reader("Bash", {"command": "gh pr comment 3 -b hi"}), "deny")
+
+    def test_reader_tools_are_closed(self):
+        self.assertEqual(self.reader("Write", {"file_path": os.path.join(self.ws, "todos", "open.md")}), "deny")
+        self.assertEqual(self.reader("Edit", {"file_path": os.path.join(self.ws, "memory", "x.md")}), "deny")
+        self.assertEqual(self.reader("WebFetch", {"url": "https://example.com"}), "deny")
+        for cmd in ("curl -X POST https://example.com", "ls", "gh pr list; rm -rf ~", "gh pr list | sh",
+                    "gh api repos/o/r/pulls $(cat x)", "python3 -c 'print(1)'"):
+            self.assertEqual(self.reader("Bash", {"command": cmd}), "deny", cmd)
+
+    def test_critic_reads_files_only(self):
+        self.assertEqual(self.reader("Read", {"file_path": os.path.join(self.ws, "memory", "x.md")},
+                                     "mother:critic"), "none")
+        self.assertEqual(self.reader(CHAT + "get_channel_history", {"channel_id": TEAM}, "mother:critic"), "deny")
+        self.assertEqual(self.reader("Bash", {"command": "gh pr list"}, "mother:critic"), "deny")
+        self.assertEqual(self.reader("Write", {"file_path": os.path.join(self.ws, "x.md")}, "mother:critic"),
+                         "deny")
+
+    def test_other_subagents_keep_the_normal_rules(self):
+        self.assertEqual(self.reader(CHAT + "post_message", {"channel_id": DM, "text": "x"}, "Explore"), "allow")
+        self.assertEqual(self.reader(CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, "general-purpose"),
+                         "ask")
+        self.assertEqual(self.reader("Bash", {"command": "ls"}, "other:reader"), "none")
+
+
+class TestDryRun(GuardCase):
+    def test_dry_run_denies_every_outbound_call(self):
+        env = {"MOTHER_DRY_RUN": "1"}
+        self.expect("deny", CHAT + "post_message", {"channel_id": DM, "text": "x"}, env=env)
+        self.expect("deny", MAIL + "create-gmail-draft", {"to": "a@example.com", "subject": "s", "body": "b"},
+                    env=env)
+        self.expect("none", CHAT + "get_channel_history", {"channel_id": TEAM}, env=env)
+        self.expect("none", "Write", {"file_path": os.path.join(self.ws, ".mother", "eval", "a.md")}, env=env)
 
 
 class TestSessionApproval(GuardCase):
