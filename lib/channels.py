@@ -529,16 +529,26 @@ def servers_by_kind(ctx):
         caps = json.loads((ctx.ws / "capabilities.json").read_text())
     except (OSError, ValueError):
         caps = {}
-    conns = caps.get("connectors") or {}
+    conns = caps.get("connectors")
+    conns = conns if isinstance(conns, dict) else {}
     out = {}
+
+    def add(kind, v):  # a bare prefix or an ordered list of them; anything else is skipped, never raised on
+        for x in v if isinstance(v, list) else [v]:
+            if isinstance(x, str) and x:
+                out.setdefault(str(kind), set()).add(server_prefix(x))
+
     for kind, vendor in (ctx.cfg.get("connectors") or {}).items():
         for key in {str(kind), str(vendor)}:
             c = conns.get(key)
-            if isinstance(c, dict) and c.get("server"):
-                out.setdefault(str(kind), set()).add(server_prefix(c["server"]))
-    for k, v in (caps.get("servers") or {}).items():
-        if isinstance(v, str):
-            out.setdefault(str(k).split(".")[0], set()).add(server_prefix(v))
+            if isinstance(c, dict):
+                add(kind, c.get("server"))
+                if isinstance(c.get("servers"), dict):
+                    for v in c["servers"].values():
+                        add(kind, v)
+    top = caps.get("servers")
+    for k, v in (top.items() if isinstance(top, dict) else ()):
+        add(str(k).split(".")[0], v)
     return {k: {x for x in v if x} for k, v in out.items()}
 
 
