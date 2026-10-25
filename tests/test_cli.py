@@ -325,6 +325,7 @@ class CliTest(unittest.TestCase):
             "- 2026-10-23T09:01:00Z digest failed — DM post expired\n"
             "- 2026-10-24T21:31:00Z reflect partial — chat search missing_scope\n"
             "- 2026-10-19T08:31:00Z doctor ok — 5 connectors\n"
+            "- 2026-10-19T08:00:00Z himalaya-weekly ok — not a configured routine\n"
             "not a run line\n")
         r = run(["runs", "--json"], env)
         self.assertEqual(r.returncode, 2, r.stderr)
@@ -340,6 +341,13 @@ class CliTest(unittest.TestCase):
         r = run(["runs"], env)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("all scheduled runs logged", run(["status"], env).stdout)
+        # a slot from before logging began (the earliest line, 19 Oct) is not a miss; one after it is
+        cfg = json.loads((self.ws / "config.json").read_text())
+        cfg["routines"]["monthly-refresh"] = {"at": "10:00", "days": "monthly:1"}
+        cfg["routines"]["weekly-snapshot"] = {"at": "16:00", "days": "Thu"}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        rows = {row["id"]: row["state"] for row in json.loads(run(["runs", "--json"], env).stdout)}
+        self.assertEqual((rows["monthly-refresh"], rows["weekly-snapshot"]), ("pending", "missed"))
 
     # -- register
     def test_register_crons_and_pointers(self):
