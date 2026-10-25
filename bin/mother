@@ -10,6 +10,7 @@ Commands:
                                which machine runs routines (check: 0 = here, 2 = elsewhere, 3 = unset)
   status                       validate config.json and show workspace state; exit 1 if invalid
   register                     print the scheduled-task pointers for enabled routines (JSON)
+  runs [--json]                watchdog: did each scheduled routine log a run since its last slot? exit 2 if any missed/failed
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
@@ -440,6 +441,8 @@ def cmd_status(args):
             print(f"  - {e}")
         sys.exit(1)
     print("config:      valid")
+    bad = [f"{r['id']} {r['state']}" for r in routine_health(ws, cfg) if r["state"] in ("missed", "failed")]
+    print(f"routines:    {'; '.join(bad) + ' — see `mother runs`' if bad else 'all scheduled runs logged'}")
 
 
 def _cron(at: str, days, workdays) -> str:
@@ -493,6 +496,99 @@ def cmd_register(args):
                           "cronExpression": _cron(recap, wk["day"], workdays),
                           "prompt": _pointer(ws, "meeting-recap", t["slug"])})
     print(json.dumps({"home_machine": (cfg.get("workspace") or {}).get("home_machine"), "tasks": tasks}, indent=2))
+
+# ---------------------------------------------------------------- runs (watchdog)
+
+RUN_LINE = re.compile(r"^- (\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?Z) (\S+) (ok|partial|failed|skipped)\b(?:\s*[—-]+\s*(.*))?")
+MISSED_GRACE = _dt.timedelta(hours=2)  # a missed desktop run fires on the next launch; give it time
+
+
+def _now() -> _dt.datetime:
+    env = os.environ.get("MOTHER_NOW")  # tests pin the clock
+    if env:
+        return _dt.datetime.strptime(env, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _last_slot(at: str, days, workdays, now: _dt.datetime):
+    """Most recent scheduled time at or before `now`, in the machine's local time (the scheduler's convention)."""
+    hh, mm = (int(x) for x in at.split(":"))
+    local = now.astimezone()
+    for back in range(0, 40):
+        d = (local - _dt.timedelta(days=back)).date()
+        if isinstance(days, str) and days.startswith("monthly:"):
+            due = d.day == int(days.split(":", 1)[1])
+        else:
+            want = workdays if days in (None, "workdays") else DAYS if days == "all" else [days] if isinstance(days, str) else days
+            due = DAYS[d.weekday()] in want
+        if due:
+            slot = _dt.datetime(d.year, d.month, d.day, hh, mm).astimezone()
+            if slot <= local:
+                return slot.astimezone(_dt.timezone.utc)
+    return None
+
+
+def read_runs(ws: Path) -> dict:
+    """{routine id: [(utc datetime, status, note), ...]} oldest first, from runs.md."""
+    out = {}
+    p = ws / "runs.md"
+    if not p.is_file():
+        return out
+    for line in p.read_text(errors="replace").splitlines():
+        m = RUN_LINE.match(line.strip())
+        if not m:
+            continue
+        ts = m.group(1) if m.group(1).count(":") == 2 else m.group(1)[:-1] + ":00Z"
+        when = _dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+        out.setdefault(m.group(2), []).append((when, m.group(3), (m.group(4) or "").strip()))
+    return out
+
+
+def routine_health(ws: Path, cfg: dict) -> list:
+    """One row per scheduled routine: {id, state, expected, last, note}. state: ok|partial|failed|missed|pending."""
+    now = _now()
+    workdays = (cfg.get("manager") or {}).get("workdays") or DAYS[:5]
+    runs = read_runs(ws)
+    rows = []
+    for rid, r in (cfg.get("routines") or {}).items():
+        if not isinstance(r, dict) or "at" not in r:
+            continue
+        slot = _last_slot(r["at"], r.get("days"), workdays, now)
+        if slot and now - slot < MISSED_GRACE:  # just due: judge the slot before it
+            slot = _last_slot(r["at"], r.get("days"), workdays, slot - _dt.timedelta(minutes=1))
+        hist = runs.get(rid) or []
+        last = hist[-1] if hist else None
+        since = [h for h in hist if slot and h[0] >= slot - _dt.timedelta(minutes=5)]
+        if slot is None:
+            state = "pending"
+        elif not since:
+            state = "missed"
+        else:
+            st = since[-1][1]
+            state = "ok" if st in ("ok", "skipped") else st
+            last = since[-1]
+        rows.append({"id": rid, "state": state, "expected": slot.strftime("%Y-%m-%dT%H:%MZ") if slot else None,
+                     "last": last[0].strftime("%Y-%m-%dT%H:%MZ") if last else None,
+                     "last_status": last[1] if last else None, "note": last[2] if last else ""})
+    return rows
+
+
+def cmd_runs(args):
+    ws = workspace()
+    cfg = load_config(ws)
+    rows = routine_health(ws, cfg)
+    if "--json" in args:
+        print(json.dumps(rows, indent=2))
+    else:
+        for r in rows:
+            if r["state"] == "missed":
+                detail = f"no run since {r['expected']}" + (f" (last {r['last']} {r['last_status']})" if r["last"] else " (never ran)")
+            elif r["state"] == "pending":
+                detail = "not due yet"
+            else:
+                detail = f"{r['last']}" + (f" — {r['note']}" if r["note"] else "")
+            print(f"{r['id']:<16} {r['state'].upper() if r['state'] in ('missed', 'failed') else r['state']:<8} {detail}")
+    sys.exit(2 if any(r["state"] in ("missed", "failed") for r in rows) else 0)
 
 # ---------------------------------------------------------------- link
 
@@ -681,7 +777,7 @@ def cmd_channels(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "link": cmd_link, "channels": cmd_channels, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

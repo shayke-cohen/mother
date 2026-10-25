@@ -138,6 +138,7 @@ Useful commands in your terminal:
 | `mother home show` | Which machine runs the routines |
 | `mother sync` | Commit and push the workspace now (also runs automatically at the end of each turn) |
 | `mother register` | Print the scheduled-task definitions for the enabled routines |
+| `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
 | `mother channels pause` / `resume` | Stop or restart replies in every channel |
