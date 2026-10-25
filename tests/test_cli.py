@@ -303,6 +303,17 @@ class CliTest(unittest.TestCase):
         for frag in ("unknown top-level key 'bogus'", "external channels are capped", "brief.at must be HH:MM"):
             self.assertIn(frag, r.stdout)
 
+    def test_commitments_options_validated(self):
+        self.init()
+        cfg = self.write_config()
+        self.assertEqual(run(["status"], self.env).returncode, 0)
+        cfg["routines"]["commitments"].update(no_reply_days=0, draft_nudges="yes")
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        r = run(["status"], self.env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("commitments.no_reply_days must be an integer 1-30", r.stdout)
+        self.assertIn("commitments.draft_nudges must be true or false", r.stdout)
+
     def test_monthly_routine_and_bad_days(self):
         self.init()
         cfg = self.write_config()
@@ -330,13 +341,14 @@ class CliTest(unittest.TestCase):
         r = run(["runs", "--json"], env)
         self.assertEqual(r.returncode, 2, r.stderr)
         state = {row["id"]: row["state"] for row in json.loads(r.stdout)}
-        self.assertEqual(state, {"brief": "ok", "digest": "failed", "dots": "missed", "reflect": "partial", "doctor": "ok"})
+        self.assertEqual(state, {"brief": "ok", "digest": "failed", "dots": "missed", "commitments": "missed", "reflect": "partial", "doctor": "ok"})
         r = run(["status"], env)
         self.assertEqual(r.returncode, 0)
-        self.assertIn("routines:    digest failed; dots missed", r.stdout)
+        self.assertIn("routines:    digest failed; dots missed; commitments missed", r.stdout)
         # just after a slot, the previous slot is judged: reflect is due at 21:30 but has 2h grace
         with open(self.ws / "runs.md", "a") as f:
-            f.write("- 2026-10-23T13:02Z dots ok — 3 links\n- 2026-10-23T09:30:00Z digest ok — rerun\n")
+            f.write("- 2026-10-23T13:02Z dots ok — 3 links\n- 2026-10-23T09:30:00Z digest ok — rerun\n"
+                    "- 2026-10-23T16:31:00Z commitments ok — 2 made, 1 owed, 0 no-reply; DM sent\n")
         env["MOTHER_NOW"] = "2026-10-25T22:00:00Z"
         r = run(["runs"], env)
         self.assertEqual(r.returncode, 0, r.stdout)
@@ -360,6 +372,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(by_id["mother-meeting-prep-platform"]["cronExpression"], "0 7 * * 1")
         self.assertEqual(by_id["mother-meeting-recap-platform"]["cronExpression"], "0 12 * * 1")
         self.assertEqual(by_id["mother-doctor"]["cronExpression"], "30 8 * * 1")
+        self.assertEqual(by_id["mother-commitments"]["cronExpression"], "30 16 * * 1,2,3,4,5")
         for t in out["tasks"]:
             self.assertIn("mother:routine", t["prompt"])
             self.assertIn(str(self.ws.resolve()), t["prompt"])

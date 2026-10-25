@@ -104,6 +104,7 @@ Day to day you mostly read what it sends you and answer in one line. The default
 | digest | 09:00 workdays | Per team, opening with the decision queue |
 | dots | 13:00 workdays | Connections across threads, and suggested actions for you and for the agent |
 | brief, spoken | with the brief, if `routines.brief.audio` is on | A 60–90 second audio version (macOS voices, or the Kokoro neural voice with `"engine": "kokoro"` after `mother tts setup`; `"language": "he"` for Hebrew) |
+| commitments | 16:30 workdays | What you promised, what you're waiting on, and asks with no reply after 3 days; answer `nudge 3` for a draft follow-up |
 | reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
 | doctor | weekly | Re-tests connectors, so a broken one shows as "couldn't check" |
 | meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |

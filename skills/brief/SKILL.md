@@ -54,6 +54,8 @@ category rather than "unresolved". A long-stale assigned backlog gets a count, n
 **Open loops** — `todos/open.md`. Local, free, always accurate. In this order: `due:` in the past
 (**overdue**), `due:` today, then `~manager` items added 21+ days ago (**aging** — they never expire, so
 they rot silently). `~agent/*` items expire on their own; mention one only if it looks genuinely live.
+**Blocked** items written by `mother:commitments` (`Waiting:` / `No reply:`) whose `due:` has passed go
+under **Waiting on others** — one line each, with the link.
 
 **Decision queues** — for each team, the count of `proposed` items in `teams/<slug>/intake.md`, and the
 oldest one's age. One line; the digest carries the detail.
@@ -90,6 +92,7 @@ Lead with what's time-critical. A quiet day gets a short brief; don't pad. Under
 ### Open loops
 - **Overdue:** <text> — due <date>        (omit the line if none)
 - <aging item> — open since <date>
+- **Waiting on others:** <what> ← <person>, due <date> — <link>     (omit if none)
 
 ### Decide
 - <team>: <n> items waiting in the digest's decision queue, oldest <n> days     (omit if none)

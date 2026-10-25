@@ -178,6 +178,13 @@ def validate(cfg: dict) -> list:
                     and au.get("language", "en") in ("en", "he")
                     and (au.get("rate") is None or (isinstance(au["rate"], int) and 90 <= au["rate"] <= 360)))):
                 errs.append("routines.brief.audio must be true/false or {voice, voice_he, rate 90-360, language en|he, save_to, engine say|kokoro, kokoro_voice}")
+            if rid == "commitments":
+                for k, lo, hi in (("no_reply_days", 1, 30), ("lookback_days", 1, 60)):
+                    v = r.get(k)
+                    if v is not None and (not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi):
+                        errs.append(f"routines.commitments.{k} must be an integer {lo}-{hi}")
+                if "draft_nudges" in r and not isinstance(r["draft_nudges"], bool):
+                    errs.append("routines.commitments.draft_nudges must be true or false")
     return errs
 
 # ---------------------------------------------------------------- secret scan

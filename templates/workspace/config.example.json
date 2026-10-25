@@ -96,6 +96,11 @@
       "at": "13:00",
       "days": "workdays"
     },
+    "commitments": {
+      "at": "16:30",
+      "days": "workdays",
+      "no_reply_days": 3
+    },
     "meeting": {
       "deck": true,
       "meeting_mode": true
