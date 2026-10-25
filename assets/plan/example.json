@@ -1,0 +1,80 @@
+{
+ "meta": {
+  "team": "Platform team",
+  "title": "Sprint 12 plan",
+  "sprint": "Sprint 12",
+  "sprintId": 1012,
+  "start": "2026-11-01",
+  "end": "2026-11-08",
+  "project": "PLAT",
+  "tracker_url": "https://tracker.example.com/browse/",
+  "board_url": "https://tracker.example.com/boards/7/backlog",
+  "label": "proposed",
+  "generated": "2026-11-01 05:00 (meeting-prep routine)",
+  "banner": "Proposed — nothing is in the tracker yet. Reply apply to the prep DM to write it.",
+  "sources": "Tracker PLAT (live), support queue, #platform-support."
+ },
+ "context": {
+  "sub": "Support queue read 11-01 03:00 UTC; \"10-25\" is last week's snapshot.",
+  "groups": [
+   {"title": "Support queue", "cards": [
+    {"value": "41", "label": "Tickets waiting", "note": "open support queue — fewer is better", "prev": [{"value": "36", "label": "10-25"}], "higherIsBetter": false},
+    {"value": "9", "label": "Stuck > 14 days", "note": "6 ours · 3 customer", "prev": [{"value": "12", "label": "10-25"}], "higherIsBetter": false},
+    {"value": "12", "label": "No owner", "note": "of 41", "prev": [{"value": "12", "label": "10-25"}], "higherIsBetter": false}
+   ]}
+  ],
+  "breakdown": [
+   {"title": "Biggest bucket is on our side", "text": "6 of the 9 stuck tickets wait for a fix from us, not the customer.", "tone": "warn"}
+  ]
+ },
+ "feedback": {
+  "sub": "#platform-support, 10-25 → 11-01, counted as threads. No customer details.",
+  "themes": [
+   {"title": "Exports time out on large accounts", "count": "4 threads", "tone": "bad", "detail": "Exports over ~50k rows fail after 60 s.", "goal": "Goal 1"},
+   {"title": "Docs for the new API version", "count": "2 threads", "tone": "accent", "detail": "Asked twice, no page yet.", "goal": null}
+  ]
+ },
+ "last": {
+  "title": "Sprint 11: what shipped, what didn't",
+  "sub": "14 done · 5 in progress · 3 to do.",
+  "leadtime": {
+   "cards": [
+    {"value": "4.1", "label": "Median days, created → done", "note": "last 30 days", "prev": [{"value": "6.0", "label": "the month before"}], "higherIsBetter": false},
+    {"value": "22", "label": "Tickets done", "note": "last 30 days", "prev": [{"value": "18", "label": "the month before"}], "higherIsBetter": true}
+   ],
+   "note": "Done tickets except epics and tickets closed within an hour of being created."
+  },
+  "streams": [
+   {"title": "Exports", "items": [
+    {"key": "PLAT-101", "text": "Stream exports instead of building them in memory", "state": "done"},
+    {"key": "PLAT-104", "text": "Retry failed export chunks", "state": "carry"}
+   ]},
+   {"title": "Long-running", "items": [
+    {"key": "PLAT-77", "text": "Audit-log retention — 6 sprints", "state": "decide"}
+   ]}
+  ]
+ },
+ "next": {
+  "inSprint": 9,
+  "sub": "Sprint 12 already holds 9 issues. Each goal shows what is in it, what is done, and what this plan adds or creates.",
+  "goals": [
+   {"title": "Exports never time out", "done": "Exports of 200k rows finish under 60 s.", "items": [
+    {"key": "PLAT-104", "summary": "Retry failed export chunks", "owner": "Dana", "status": "In Progress", "change": "in"},
+    {"key": "PLAT-110", "summary": "Paginate the export API", "owner": "Lee", "status": "To Do", "change": "add"},
+    {"key": null, "summary": "Alert when an export runs over 60 s", "owner": "Lee", "status": "new", "change": "create"}
+   ]},
+   {"title": "Stuck tickets get an owner", "done": "Every ticket stuck > 14 days on our side has an owner.", "items": [
+    {"key": "PLAT-95", "summary": "Auto-assign stuck tickets by area", "owner": "Sam", "status": "To Do", "change": "assign", "from": "Alex"},
+    {"key": "PLAT-90", "summary": "Stuck-ticket report", "owner": "Sam", "status": "Done", "change": "done"}
+   ]}
+  ],
+  "other": [
+   {"key": "PLAT-77", "summary": "Audit-log retention — 6 sprints", "owner": "Alex", "status": "In Progress"}
+  ],
+  "notNow": "Not in Sprint 12 (stays in backlog): PLAT-120 API docs page."
+ },
+ "decisions": [
+  "PLAT-77 has ridden 6 sprints: split it or close it?",
+  "Who writes the API docs page?"
+ ]
+}

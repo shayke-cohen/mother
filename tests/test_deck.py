@@ -32,6 +32,14 @@ class DeckTest(unittest.TestCase):
         self.assertIn("<title>Platform weekly — 2026-11-02</title>", html)
         self.assertNotIn("/*DATA*/", html)
 
+    def test_card_delta_renders(self):
+        self.data["pipeline"]["cards"][0].update({"prev": "50", "prevLabel": "vs last month", "estimate": True})
+        r = build(self.data, self.out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        html = self.out.read_text()
+        self.assertIn("function delta(c)", html)
+        self.assertIn('"prevLabel": "vs last month"', html)
+
     def test_missing_section_fails(self):
         del self.data["carryover"]
         r = build(self.data, self.out)
