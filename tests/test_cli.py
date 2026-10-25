@@ -313,6 +313,10 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("commitments.no_reply_days must be an integer 1-30", r.stdout)
         self.assertIn("commitments.draft_nudges must be true or false", r.stdout)
+        cfg["routines"]["commitments"] = {"at": "16:30"}
+        cfg["routines"]["brief"]["draft_replies"] = "on"
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertIn("brief.draft_replies must be true or false", run(["status"], self.env).stdout)
 
     def test_one_on_one_person_options_validated(self):
         self.init()
