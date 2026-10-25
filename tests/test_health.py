@@ -169,7 +169,7 @@ class HealthTest(unittest.TestCase):
         self.record("read", W, "ok")
         e = self.caps()["health"][W]["read"]
         self.assertEqual(e["status"], "ok")
-        self.assertNotIn("alerted_at", e)
+        self.assertEqual(e["alerted_at"], iso_ago(1))
         self.assertNotIn("pending", e)
 
     def test_record_rejects_bad_arguments(self):
@@ -324,7 +324,7 @@ class HealthTest(unittest.TestCase):
     def at(self, h, m=0, day=14):
         """Epoch seconds for day-of-Nov-2023 h:m in Asia/Jerusalem (UTC+2)."""
         import datetime as dt
-        return int(dt.datetime(2023, 11, day, h - 2, m, tzinfo=dt.timezone.utc).timestamp())
+        return int((dt.datetime(2023, 11, day, tzinfo=dt.timezone.utc) + dt.timedelta(hours=h - 2, minutes=m)).timestamp())
 
     def alert(self, now, *args):
         self.env["MOTHER_NOW"] = str(now)
@@ -370,6 +370,42 @@ class HealthTest(unittest.TestCase):
         self.assertEqual(self.alert(t, "--sent"), "sent")
         self.assertEqual(self.alert(t + 3600), "skip")
         self.assertEqual(self.alert(self.at(12, day=15)), "send")
+
+    def test_alert_flap_same_day_no_repeat(self):
+        self.set_cfg(quiet="01:00-02:00")
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry()}))
+        t = self.at(12)
+        self.assertEqual(self.alert(t, "--sent"), "sent")
+        self.env["MOTHER_NOW"] = str(t + 600)
+        self.assertEqual(self.record("read", C, "ok").returncode, 0)
+        self.env["MOTHER_NOW"] = str(t + 1200)
+        self.assertEqual(self.record("read", C, "expired", "--class", "invalidated").returncode, 0)
+        self.assertEqual(self.alert(t + 1200), "skip")
+        # a different class is a new issue
+        self.assertEqual(self.record("read", C, "error:unreachable", "--class", "unreachable").returncode, 0)
+        self.assertEqual(self.alert(t + 1300), "send")
+
+    def test_alert_local_date_not_utc(self):
+        self.set_cfg(quiet="03:00-04:00")
+        self.write_caps(self.conn([W, C], {W: self.entry("ok", None), C: self.entry()}))
+        # 23:30 local on the 14th and 00:30 local on the 15th share a UTC date (21:30Z / 22:30Z on the 14th)
+        self.assertEqual(self.alert(self.at(23, 30), "--sent"), "sent")
+        self.assertEqual(self.alert(self.at(0, 30, day=15)), "send")
+        # 00:30 local and 23:30 local the same day fall on different UTC dates
+        self.assertEqual(self.alert(self.at(0, 30, day=16), "--sent"), "sent")
+        self.assertEqual(self.alert(self.at(23, 30, day=16)), "skip")
+
+    def test_merge_recomputes_rollup_and_server_for_merged_order(self):
+        old = self.conn([W, C], {W: self.entry("error:unreachable", "unreachable"), C: self.entry()})
+        self.write_caps(old)
+        fresh = self.conn([C, W], {W: self.entry("error:unreachable", "unreachable"), C: self.entry()})
+        fresh["read"] = "expired"  # the doctor's rollup, computed against [C, W]
+        out = self.merge(fresh)
+        c = self.caps()
+        self.assertEqual(c["servers"]["read"], [W, C])
+        self.assertEqual(c["read"], "error:unreachable")
+        self.assertEqual(c["server"], W)
+        self.assertEqual(out, {"changed": []})
 
     def test_alert_skips_ok(self):
         self.set_cfg()

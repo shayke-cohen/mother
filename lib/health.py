@@ -190,6 +190,25 @@ def rollup(conn, cap):
     return status_of(conn, servers[0], cap)
 
 
+def carry_alert(old, entry):
+    """Copy alert state from the previous entry onto the new one.
+
+    `alerted_at` (with the `alerted_class` it was sent for) survives an `ok` and a repeat of the same
+    class, so a flap cannot alert twice in a day; a different class is a new issue and drops it.
+    `pending` survives only while the entry keeps failing with the same class.
+    """
+    if not old:
+        return
+    was = old.get("alerted_class", old.get("class"))
+    ok = entry["status"] == "ok"
+    if "alerted_at" in old and (ok or was == entry["class"]):
+        entry["alerted_at"] = old["alerted_at"]
+        if was is not None:
+            entry["alerted_class"] = was
+    if old.get("pending") and not ok and old.get("class") == entry["class"]:
+        entry["pending"] = old["pending"]
+
+
 def record(caps, vendor, cap, server, status, cls=None, gateway=None, now=None):
     """Set health[server][cap] (`now`: ISO stamp, default the clock); return the previous status (None if new)."""
     conn = caps.setdefault("connectors", {}).setdefault(vendor, {})
@@ -198,10 +217,7 @@ def record(caps, vendor, cap, server, status, cls=None, gateway=None, now=None):
     entry = {"status": status, "class": cls, "checked_at": now or iso()}
     if gateway:
         health["_gateway"] = gateway
-    if old and status != "ok" and old.get("class") == cls:
-        for k in ("alerted_at", "pending"):
-            if k in old:
-                entry[k] = old[k]
+    carry_alert(old, entry)
     health[cap] = entry
     lst = conn.setdefault("servers", {}).setdefault(cap, [])
     if server not in lst:
@@ -214,8 +230,8 @@ def merge(old, new):
     """The doctor's fresh capabilities `new` over the stored `old` (both normalized).
 
     `new` wins for statuses, stamps, tokens and the top-level checked_at/host. Server order: old order for
-    servers in both, new ones appended, absent ones dropped. `alerted_at`/`pending` survive while the
-    entry is not ok and its class is unchanged.
+    servers in both, new ones appended, absent ones dropped; the rollups and the primary `server` are
+    recomputed for that order. Alert state is carried as in `carry_alert`.
     """
     out = copy.deepcopy(new)
     for vendor, conn in (out.get("connectors") or {}).items():
@@ -228,10 +244,13 @@ def merge(old, new):
         for server, caps_ in (conn.get("health") or {}).items():
             for cap, e in caps_.items():
                 o = (((oc.get("health") or {}).get(server) or {}).get(cap)) if not cap.startswith("_") else None
-                if isinstance(e, dict) and o and e.get("status") != "ok" and o.get("class") == e.get("class"):
-                    for k in ("alerted_at", "pending"):
-                        if k in o:
-                            e[k] = o[k]
+                if isinstance(e, dict) and o:
+                    carry_alert(o, e)
+        for cap in conn.get("servers") or {}:
+            conn[cap] = rollup(conn, cap)  # the doctor computed it against its own order
+        names = [c for c in cap_names(conn) if conn["servers"].get(c)]
+        if conn.get("server") and names:
+            conn["server"] = conn["servers"][names[0]][0]
     return out
 
 
@@ -269,6 +288,10 @@ def mark_alerted(caps, vendor, cap, server, now=None):
     if e is not None:
         e["alerted_at"] = iso(now)
         e.pop("pending", None)
+        if e.get("class"):
+            e["alerted_class"] = e["class"]
+        else:
+            e.pop("alerted_class", None)
 
 
 def due_pending(caps, cfg, now=None):
