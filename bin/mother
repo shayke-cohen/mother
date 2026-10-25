@@ -440,6 +440,37 @@ def plugin_enabled():
     return v if isinstance(v, bool) else None
 
 
+def health_status_line(ws, cfg) -> str:
+    """Open connector-health issues for `mother status`; never raises."""
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import health
+    try:
+        caps = health.normalize(health.load(ws), cfg)
+        kinds = {v: k for k, v in (cfg.get("connectors") or {}).items() if isinstance(v, str)}
+        opened, covered = [], 0
+        for vendor, conn in sorted((caps.get("connectors") or {}).items()):
+            if not isinstance(conn, dict):
+                continue
+            for server, entries in sorted((conn.get("health") or {}).items()):
+                for cap, e in sorted((entries or {}).items()):
+                    if cap.startswith("_") or not isinstance(e, dict) or e.get("status") == "ok":
+                        continue
+                    if health.rollup(conn, cap) == "ok":
+                        covered += 1
+                    else:
+                        opened.append("%s.%s %s %s" % (kinds.get(vendor, vendor), cap, health.server_short(server),
+                                                       e.get("class") or "other"))
+    except (health.HealthError, AttributeError, TypeError):
+        return "capabilities.json unreadable — run /mother:doctor"
+    if not opened and not covered:
+        return "ok"
+    note = f" (+{covered} covered by fallback)" if covered else ""
+    if not opened:
+        return "ok" + note
+    shown = "; ".join(opened[:3]) + ("; …" if len(opened) > 3 else "")
+    return f"{len(opened)} open — {shown}{note}"
+
+
 def cmd_status(args):
     ws = workspace()
     cfg = load_config(ws)
@@ -460,6 +491,8 @@ def cmd_status(args):
             print("doctor:      capabilities.json unreadable — run /mother:doctor")
     else:
         print("doctor:      never run — run /mother:doctor")
+    if caps.is_file():
+        print("health:      " + health_status_line(ws, cfg))
     pe = plugin_enabled()
     if pe is False:
         print("plugin:      DISABLED — the approval guard and the sync hook don't run; `claude plugin enable mother@mother`")
