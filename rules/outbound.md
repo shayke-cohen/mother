@@ -158,6 +158,15 @@ are unaffected. It lives in `.mother/`, which is gitignored, so a sync can neith
 Removing it is the manager's call: the agent's attempt to delete it, or to edit `config.json`, the ledger, the
 log, the hook itself or `~/.mother/workspace`, is an ask.
 
+## Sub-agents and dry runs
+
+MOTHER's own sub-agents (`mother:reader`, `mother:critic`) write nothing. The hook knows them by the
+payload's `agent_type` and denies every outbound call they make, including the manager's own DM, drafts,
+granted and session-approved writes. It also denies Write/Edit, web tools, and any Bash except single
+`gh`/`glab` read commands. Only MOTHER posts what a sub-agent found, after `mother items check`.
+
+`MOTHER_DRY_RUN=1` (set by `mother eval`) denies every outbound call in that session and its sub-agents.
+
 ## Fail closed
 
 No workspace, or a `config.json` that isn't valid schema v1 with a `manager.chat_dm`: nothing is auto and no

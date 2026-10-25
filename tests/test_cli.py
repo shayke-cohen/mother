@@ -317,6 +317,12 @@ class CliTest(unittest.TestCase):
         cfg["routines"]["brief"]["draft_replies"] = "on"
         (self.ws / "config.json").write_text(json.dumps(cfg))
         self.assertIn("brief.draft_replies must be true or false", run(["status"], self.env).stdout)
+        cfg["routines"]["brief"] = {"at": "08:45", "gather": "agents"}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertIn("brief.gather must be inline or readers", run(["status"], self.env).stdout)
+        cfg["routines"]["brief"]["gather"] = "readers"
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertEqual(run(["status"], self.env).returncode, 0)
 
     def test_one_on_one_person_options_validated(self):
         self.init()
