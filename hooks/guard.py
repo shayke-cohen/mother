@@ -134,6 +134,7 @@ class Ctx(object):
         self.cfg = {}
         self.ok = False
         self.problem = "no workspace"
+        self.stamps = set()
 
 
 def resolve_workspace():
@@ -174,7 +175,25 @@ def load_ctx():
         c.problem = "config.json teams is not a list"
         return c
     c.cfg, c.ok, c.problem = cfg, True, None
+    c.stamps = load_stamps(c.ws)
     return c
+
+
+def load_stamps(ws):
+    """Server prefixes (capabilities.json -> connectors.<vendor>.stamps) of chat connectors that add their own
+    attribution. Anything missing or malformed gives an empty set: today's decisions stay as they are."""
+    stamps = set()
+    try:
+        caps, ok = read_json(os.path.join(ws, "capabilities.json"))
+        conns = caps.get("connectors") if ok and isinstance(caps, dict) else None
+        if isinstance(conns, dict):
+            for v in conns.values():
+                lst = v.get("stamps") if isinstance(v, dict) else None
+                if isinstance(lst, list):
+                    stamps |= {x.rstrip("_") for x in lst if isinstance(x, str) and x.rstrip("_")}
+    except Exception:
+        return set()
+    return stamps
 
 
 def dm_ids(cfg):
@@ -875,6 +894,28 @@ def decide(a, ctx, transcript=None):
         a["what"], a["category"])
 
 
+def _server_of(tool):
+    """The `__`-separated segments of an MCP tool name, without the tool's own last segment."""
+    return tool.split("__")[:-1]
+
+
+def stamp_block(tool, a, ctx):
+    """A chat write through a connector that stamps its own attribution may only go to the manager's DM.
+    Matches whole `__` segments (mcp__gw__slack matches mcp__gw__slack__post, not mcp__gw__slackbot__post).
+    An empty or unknown channel is denied: we can't show it is the DM. Returns (decision, reason) or None."""
+    if a.get("kind") != "chat" or a.get("op") not in ("post", "reply", "schedule", "edit"):
+        return None
+    server = _server_of(tool)
+    for prefix in sorted(getattr(ctx, "stamps", None) or ()):
+        segs = prefix.split("__")
+        if server[:len(segs)] == segs:
+            if a.get("channel") and str(a["channel"]) in dm_ids(ctx.cfg):
+                return None
+            return "deny", ("%s goes through a connector that adds its own stamp (%s). Send it through the "
+                            "preferred chat server, or ask the manager." % (a["what"], prefix))
+    return None
+
+
 def log(ctx, tool, a, decision, reason):
     if not ctx.ws:
         return
@@ -989,7 +1030,7 @@ def run(raw):
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             return None
-        r = decide(a, ctx, payload.get("transcript_path"))
+        r = stamp_block(tool, a, ctx) or decide(a, ctx, payload.get("transcript_path"))
     except Exception as e:  # fail closed on anything that might be outbound
         r = "ask", "guard error (%s: %s): confirm %s manually." % (type(e).__name__, e, tool)
     log(ctx, tool, a, r[0], r[1])

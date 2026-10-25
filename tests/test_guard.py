@@ -599,5 +599,46 @@ class TestFailClosed(GuardCase):
         self.assertNotIn("secret body", raw)
 
 
+class StampRule(GuardCase):
+    """A connector that stamps its own attribution may only write to the manager's DM."""
+
+    def setUp(self):
+        super().setUp()
+        self.caps({"connectors": {"slack": {"server": "mcp__chat__slack", "stamps": ["mcp__0a1b2c3d"]}}})
+
+    def caps(self, data):
+        with open(os.path.join(self.ws, "capabilities.json"), "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_stamping_server_to_dm_allowed(self):
+        self.expect("allow", CHAT2 + "slack_send_message", {"channel_id": DM, "text": SIG})
+
+    def test_stamping_server_to_team_denied(self):
+        why = self.expect("deny", CHAT2 + "slack_send_message", {"channel_id": TEAM, "text": SIG})
+        self.assertIn("adds its own stamp", why)
+
+    def test_stamping_server_unknown_channel_denied(self):
+        self.expect("deny", CHAT2 + "slack_send_message", {"text": SIG})
+
+    def test_non_stamping_server_unchanged(self):
+        self.expect("ask", CHAT + "post_message", {"channel_id": TEAM, "text": SIG})
+
+    def test_stamping_server_reads_unchanged(self):
+        self.expect("none", CHAT2 + "slack_read_channel", {"channel_id": TEAM})
+
+    def test_stamp_rule_matches_segment_not_gateway(self):
+        self.caps({"connectors": {"slack": {"stamps": ["mcp__gw__slack"]}}})
+        self.expect("ask", "mcp__gw__jira__create_issue", {"projectKey": "PLAT", "summary": "x"})
+        self.expect("ask", "mcp__gw__slackbot__post_message", {"channel_id": TEAM, "text": SIG})
+        self.expect("deny", "mcp__gw__slack__post_message", {"channel_id": TEAM, "text": SIG})
+
+    def test_bad_capabilities_file_ignored(self):
+        self.caps('"nope"')
+        self.expect("allow", CHAT2 + "slack_send_message", {"channel_id": DM, "text": SIG})
+        self.expect("ask", CHAT2 + "slack_send_message", {"channel_id": TEAM, "text": SIG})
+        self.caps({"connectors": {"slack": {"stamps": "mcp__0a1b2c3d"}}})
+        self.expect("ask", CHAT2 + "slack_send_message", {"channel_id": TEAM, "text": SIG})
+
+
 if __name__ == "__main__":
     unittest.main()
