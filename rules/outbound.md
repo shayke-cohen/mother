@@ -68,7 +68,8 @@ those, a signed message carries two signatures. Get the send server from `mother
 manager's own DM, `other` for anyone else); use a stamping connector only for reads such as search.
 Falling back to a stamping server is allowed only for the manager's own DM (the manager decided this
 2026-10-25: the extra stamp there is fine). Any other write falls back only to a server with no stamp and the
-same token identity; if there is none, queue it and ask the manager. The guard enforces the stamp part: a
+same token identity, both known; if there is none, queue it and ask the manager. A `pick` answer of
+`untested` (`"verified": false`) is usable: write checks are opt-in, so most post servers stay untested. The guard enforces the stamp part: a
 chat write through a server in `stamps` to anything but `manager.chat_dm` is denied.
 
 ## Approving in a session

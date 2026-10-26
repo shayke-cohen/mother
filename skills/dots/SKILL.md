@@ -21,10 +21,12 @@ Policy: `${CLAUDE_PLUGIN_ROOT}/rules/privacy.md`, `rules/outbound.md`, `rules/to
 W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
 ```
 
-Read `config.json` and `capabilities.json`. A source whose read capability isn't `ok` is listed as
-`⚠️ <source>: couldn't check` and excluded — and you must then **not** report "no link" for a pattern
-that needed it. Window: the last working day (since the previous dots run, if `runs.md` shows one, capped
-at 3 days).
+Read `config.json` and `capabilities.json`. A source whose read capability isn't `ok` is listed as `⚠️
+<source>: couldn't check` and excluded — and you must then **not** report "no link" for a pattern that needed
+it. Get each source's server from `${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind K --cap C [--target
+dm|other]`: `server` is the tool prefix to call; a tool-based connector (code) answers `server: null` and its
+`tool` (`gh`); exit 3 means no usable server. Window: the last working day (since the previous dots run, if
+`runs.md` shows one, capped at 3 days).
 
 Read the previous `journal/dots/*.md` so you don't repeat yesterday's links unless something changed;
 a repeated link gets `(again, day <n>)`, which is itself a signal.

@@ -126,10 +126,11 @@ Build the fresh result as JSON in a temp file (not in the workspace), then `moth
                                  "stamps": ["<server that appends its own signature>"],
                                  "token": { "<a>": "user", "<b>": "user" },
                                  "health": { "<a>": { "_gateway": "<host, if grouped>",
-                                                      "read": { "status": "error:unreachable", "class": "unreachable" },
-                                                      "post": { "status": "error:unreachable", "class": "unreachable" } },
-                                             "<b>": { "read": { "status": "ok" }, "post": { "status": "ok" },
-                                                      "search": { "status": "ok" } } },
+                                                      "read": { "status": "error:unreachable", "class": "unreachable",
+                                                                "checked_at": "<UTC ISO>" },
+                                                      "post": { "status": "untested", "checked_at": "<UTC ISO>" } },
+                                             "<b>": { "read": { "status": "ok", "checked_at": "<UTC ISO>" },
+                                                      "search": { "status": "ok", "checked_at": "<UTC ISO>" } } },
                                  "notes": ["…"] },
     "<connectors.tracker value>": { "server": "…", "read": "ok", "create": "untested", "comment": "untested",
                                     "transition": "untested", "sprint": "untested" },
@@ -137,8 +138,9 @@ Build the fresh result as JSON in a temp file (not in the workspace), then `moth
     "<connectors.code value>": { "tool": "gh", "read": "ok", "write": "untested" } } }
 ```
 
-**Per-server results go in `health`** (CONTRACT §4): one entry per server per capability, with `status`
-and `class`, plus `_gateway` for a grouped server. Without it merge cannot tell backups from the preferred
+**Per-server results go in `health`** (CONTRACT §4): one entry per server per capability, with `status`,
+`class` and `checked_at` (merge fills a missing one from the top-level `checked_at`), plus `_gateway` for a
+grouped server. The code connector is tool-based (`"tool": "gh"`, no `server`); keep its `tool` and `token`. Without it merge cannot tell backups from the preferred
 server. The top-level rollups (`"read": "ok"`) are recomputed from `health` by merge; keep them consistent
 but don't rely on them. **Order: merge first, then the ladder's `record` calls.**
 
@@ -192,7 +194,7 @@ A table, worst first:
 |---|---|---|---|---|
 | chat | search | missing_scope:search:read | — | Ask the chat workspace admin to add the scope, or use the other server that can search |
 | mail | read | expired | you | Signed in again — see §7 |
-| calendar | read | error (unreachable) | fallback | Covered by the other server; gateway down, probably VPN |
+| calendar | read | error:unreachable | fallback | Covered by the other server; gateway down, probably VPN |
 
 `Fixed by` is `retry`, `reconnect`, `fallback`, `you` or `—`.
 
@@ -223,9 +225,9 @@ was closed for days), not a connector one. Fix: re-register it via `/mother:setu
 Read checks only, ladder steps 1-3 only, no write checks, no sign-ins. Update the record with `mother
 health merge`/`record`. For each issue **not covered by a fallback**:
 
-**A gateway group is one alert.** `alert` works per (server, capability), so for a group call it once, for
-the first server and capability in the group, name the gateway in the message, and mark only that entry
-`--sent`.
+**A gateway group is one alert.** `alert` treats every entry on one `_gateway` with the same class as one
+issue: once any of them is marked `--sent`, the rest answer `skip` that day. Name the gateway in the
+message. `untested` never alerts.
 
 1. `mother health alert --kind K --cap C --server S [--urgent]` -> `{action: send|pending|skip}`.
 2. On `send`: PushNotification, if that tool is present in the run (check with ToolSearch; skip silently
@@ -237,4 +239,6 @@ the first server and capability in the group, name the gateway in the message, a
    If neither push nor DM was possible, do not mark it sent; it stays for the next check.
 3. On `pending` (quiet hours): do nothing now; a later routine's pre-flight sends it. On `skip`: nothing.
 
-A healthy day sends nothing. Also send the table if `mother runs` reports a missed or failed routine.
+A healthy day sends nothing. Put the `mother runs` missed/failed set in this run's `runs.md` note
+(`runs: brief missed, dots failed`, or `runs: none`), and send the table only when that set differs from
+the previous doctor run's note, so a long-missed routine is reported once, not every day.

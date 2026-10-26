@@ -21,8 +21,11 @@ W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
 ```
 
 Read `config.json` (`routines.commitments`: `no_reply_days`, default 3; `lookback_days`, default 14) and
-`capabilities.json`. A source whose read capability isn't `ok` is named under **Couldn't check** and
-excluded; never report "nothing waiting" for a source you couldn't read.
+`capabilities.json`. A source whose read capability isn't `ok` is named under **Couldn't check** and excluded;
+never report "nothing waiting" for a source you couldn't read. Get each source's server from
+`${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind K --cap C [--target dm|other]`: `server` is the tool
+prefix to call; a tool-based connector (code) answers `server: null` and its `tool` (`gh`); exit 3 means no
+usable server.
 
 Window: since the previous `journal/commitments/*.md`, capped at `lookback_days`. The no-reply check always
 looks back `lookback_days`, because an item becomes overdue days after it was sent.

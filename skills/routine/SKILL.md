@@ -60,8 +60,10 @@ run continues, and §4 still writes its one `runs.md` line.
    `write`) are **never probed**: run only `mother health pick --kind K --cap C --target T`, and apply
    only ladder step 3 (switch servers by recorded health). Mapping: `chat.post_dm` is `--kind chat --cap
    post --target dm`; any other write is `--target other`, unless the routine's recipient is the manager's
-   DM (`--target dm`). For **read** capabilities: `mother health pick --kind K --cap C --max-age-hours 6`. If the answer is `fresh` and `ok`, trust it
-   and use that server. Otherwise probe the picked server (or the preferred one in `servers.<cap>` when
+   DM (`--target dm`). A write `pick` may answer `untested` with `"verified": false`: that server is
+   usable, and nothing to heal or alert. For **read** capabilities: `mother health pick --kind K --cap C --max-age-hours 6`. If the answer is `fresh` and `ok`, trust it
+   and use that server (a tool-based connector, `code`, answers `server: null` and its `tool`, e.g. `gh`).
+   Otherwise probe the picked server (or the preferred one in `servers.<cap>` when
    none is ok) with the doctor's probe for that kind (doctor skill, section 2), classify and record it
    (`mother health classify`, `mother health record`), then run the doctor's ladder steps 1-3 (re-test,
    reconnect, switch server; doctor skill, section 6) and record each result. A capability still broken
@@ -72,11 +74,10 @@ run continues, and §4 still writes its one `runs.md` line.
 3. **Alert for what is still broken.** Per the doctor skill, section 9: `mother health alert --kind K
    --cap C --server S`, adding `--urgent` when this routine runs inside `manager.quiet_hours` and a
    capability it needs is broken, so the manager hears about it now rather than at the next check.
-- The routine file: what it reads, what it produces, where it sends it.
 
 ## 3. Follow the routine — honestly
 
-Before calling a source, look up its capability. If it isn't `ok`:
+Before calling a source, look up its capability. If it isn't `ok` (a write `pick` answered `untested` is usable):
 - **Don't call it and don't omit it.** Name it in the output: "Chat search: couldn't check
   (missing_scope:search:read)". A digest that silently skips a source reads as "nothing happened there".
 - The run is at best `partial`.

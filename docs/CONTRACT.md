@@ -108,21 +108,23 @@ Per connector:
 
 | Key | Meaning |
 |---|---|
-| `server` | The main server prefix. |
+| `server` | The main server prefix. A **tool-based** connector (`code`: `"tool": "gh"`) has no `server` or `servers`; its capability values and string `token` are its own. `tool`, `notes` and `host` are not capabilities: only keys holding a status value are. |
 | `<cap>` (`read`, `post`, …) | The **rollup** for that capability: `ok` when any server in its list is `ok`, else the first (preferred) server's status. Routines that read only this keep working. |
-| `servers.<cap>` | Ordered list of server prefixes. First = preferred, rest = tested backups. The order is a preference, not a cache: setup and the doctor write it, preferring a server with no stamp and the manager's identity. A failure never reorders it; `mother health pick` takes the first server whose entry is `ok`, so a recovered server is used again. |
+| `servers.<cap>` | Ordered list of server prefixes. First = preferred, rest = tested backups. The order is a preference, not a cache: setup and the doctor write it, preferring a server with no stamp and the manager's identity. A failure never reorders it; `mother health pick` takes the first server whose entry is `ok`, so a recovered server is used again. For a **write** capability (`post`, `post_dm`, `create`, `comment`, `transition`, `sprint`, `draft`, `send`, `write`), which the doctor never probes unattended, it then takes the first `untested` one and says `"verified": false`; failing statuses are never picked. `pick` on a tool-based connector returns `{"server": null, "tool": "gh", "status": …}`. |
 | `health.<server>.<cap>` | One server's result: `status` (value list below), `class`, `checked_at` (ISO UTC), and when alerted `alerted_at`, `alerted_class`, `pending`. |
 | `health.<server>._gateway` | The gateway host the server shares with others (Willow). Keys starting `_` are metadata, not capabilities. Servers on one gateway that fail with a network error are one `unreachable` issue. |
 | `stamps` | Server prefixes that add their own attribution to chat writes. The guard reads this (§5). |
-| `token` | `{server: user\|bot}` — the identity each server writes as. |
+| `token` | `{server: user\|bot}` — the identity each server writes as. A write to anyone but the manager falls back (`pick --target other`) only to a server with no stamp whose token is known and equal to the preferred server's. |
 
 **Failure classes** (what fixes it): `unreachable` (network or timeout, a whole gateway at once; switch
 server), `dropped` (server `failed`, "connection closed"; reconnect), `invalidated` (401, `needs_auth`,
 "connection invalidated"; human sign-in), `missing_scope` and `denied` (no healing; use the server that has
 it), `other`. `mother health classify --error TEXT` maps an error message to a status and class.
 
-**Alerts.** At most one per (server, capability) per manager-local day, held during `manager.quiet_hours`
-unless urgent (`mother health alert`, `mother health pending`). `alerted_at` survives an `ok` record
+**Alerts.** At most one per issue per manager-local day, held during `manager.quiet_hours` unless urgent
+(`mother health alert`, `mother health pending`). An issue is one (server, capability), except that every
+entry on one `_gateway` with the same class is one outage: `alert --sent` stamps them all, and any of them
+alerted today makes the rest `skip`. `ok` and `untested` never alert. `alerted_at` survives an `ok` record
 (`pending` is cleared) and is dropped only when the entry fails again with a different class
 (`alerted_class` records which class was alerted).
 
@@ -135,7 +137,12 @@ One line per connector failure or fix, appended by `mother health record`.
 ```
 
 Routines and the doctor never edit the file by hand. The doctor's fresh result is merged in
-(`mother health merge`), keeping list order and every `alerted_at`.
+(`mother health merge`), keeping list order and every `alerted_at`. A connector the fresh result leaves out
+is kept as it was; the doctor's `server` stands while it is still listed (else `servers.read[0]`, else the
+first listed); an entry with no `checked_at` takes the fresh file's. Merge logs an `open` line for each entry
+that moved into a failing status or class, and its `changed` list names rollups that went from `ok` to a
+failing status (not to `untested`). `record --fixed-by fallback` on a backup logs the preferred server's
+class `→ fallback`, whatever the backup's own previous status.
 
 **Still read, no longer written:** a bare-string `servers` value; the top-level `servers` map
 (`"<kind>.<cap>": "<prefix>"`); a string `token` (read as `{server: value}` for the connector's main

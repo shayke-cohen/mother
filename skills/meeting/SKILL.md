@@ -10,7 +10,10 @@ One weekly meeting per team in `config.json` → `teams[].meetings.weekly`. Four
 
 Before anything: resolve the workspace (`${CLAUDE_PLUGIN_ROOT}/bin/mother path`), read `config.json` and
 `capabilities.json`. A capability that isn't `ok` is named in the output and in the deck's `meta.warnings`,
-never silently dropped. Outbound rules: the plugin's `rules/outbound.md`.
+never silently dropped. Get each source's server from `${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind K
+--cap C [--target dm|other]`: `server` is the tool prefix to call; a tool-based connector (code) answers
+`server: null` and its `tool` (`gh`); exit 3 means no usable server. Outbound rules: the plugin's
+`rules/outbound.md`.
 
 ## 1. Prep (routine `meeting-prep`, or on request)
 
