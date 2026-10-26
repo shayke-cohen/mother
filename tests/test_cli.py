@@ -554,6 +554,13 @@ class TestWhatsappConfig(unittest.TestCase):
             self.assertEqual(r.returncode, 1, key)
             self.assertIn(f"whatsapp.{key}", r.stdout)
 
+    def test_allow_not_a_list_rejected_without_crash(self):
+        for bad in (5, {}):
+            r = self.status_with(lambda b: b.update(allow=bad))
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("whatsapp.allow must be a list", r.stdout)
+            self.assertNotIn("Traceback", r.stderr)
+
     def test_allow_entry_shape_rejected(self):
         r = self.status_with(lambda b: b["allow"][1].update(extra=1))
         self.assertIn("whatsapp.allow[1].extra", r.stdout)

@@ -107,7 +107,8 @@ WA_KEYS = {"enabled", "self_jid", "allow", "approve_via", "max_per_day", "min_ga
            "max_prompts_per_day", "read", "send"}
 WA_APPROVE_VIA = ("slack_dm", "self_chat", "session")
 WA_MAX_PER_DAY_CEILING = 50
-WA_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us")
+WA_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us", re.ASCII)
+WA_USER_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net", re.ASCII)
 
 
 def validate(cfg: dict) -> list:
@@ -229,9 +230,13 @@ def validate_whatsapp(wa) -> list:
     if sj is None:
         if wa.get("enabled") is True:
             errs.append("missing whatsapp.self_jid (required when whatsapp.enabled is true)")
-    elif not (isinstance(sj, str) and re.fullmatch(r"\d{6,15}@s\.whatsapp\.net", sj)):
+    elif not (isinstance(sj, str) and WA_USER_JID_RE.fullmatch(sj)):
         errs.append("whatsapp.self_jid must be <digits>@s.whatsapp.net")
-    for i, a in enumerate(wa.get("allow") or []):
+    allow = wa.get("allow", [])
+    if not isinstance(allow, list):
+        errs.append("whatsapp.allow must be a list")
+        allow = []
+    for i, a in enumerate(allow):
         where = f"whatsapp.allow[{i}]"
         if not isinstance(a, dict):
             errs.append(f"{where} must be an object")
@@ -247,8 +252,6 @@ def validate_whatsapp(wa) -> list:
             errs.append(f"{where}.team must be a string")
         if "group" in a and not isinstance(a["group"], bool):
             errs.append(f"{where}.group must be true or false")
-    if "allow" in wa and not isinstance(wa["allow"], list):
-        errs.append("whatsapp.allow must be a list")
     av = wa.get("approve_via", list(WA_APPROVE_VIA))
     if not (isinstance(av, list) and av and all(x in WA_APPROVE_VIA for x in av)):
         errs.append(f"whatsapp.approve_via must be a non-empty list of {list(WA_APPROVE_VIA)}")

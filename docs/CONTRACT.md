@@ -76,7 +76,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.brief.draft_replies` | bool, optional | default false; true = the brief routine saves mail **drafts** for To-respond mail it triaged as `prep` (never sends) |
 | `routines.commitments` | map, optional | `at`, `days`, `no_reply_days` (1-30, default 3), `lookback_days` (1-60, default 14), `draft_nudges` (bool, default false: mail drafts for no-reply asks only on the manager's `nudge <n>`) |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
-| `whatsapp` | map, optional | WhatsApp read and send for allowlisted work chats (§5d). `enabled` (bool), `self_jid` (the manager's own JID; required when `enabled`), `allow[]` (`{jid, name, team?, group?}`; `jid` is `<digits>@s.whatsapp.net` or `<digits>@g.us`), `approve_via` (non-empty subset of `slack_dm`, `self_chat`, `session`; default all three), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `max_prompts_per_day` (default 10), `read`, `send` (bool). Unknown keys fail. JIDs are phone numbers: they live in `config.json` only, never in memory, journal or people files. Policy may tighten `approve_via` and the cap, never widen. |
+| `whatsapp` | map, optional | WhatsApp read and send for allowlisted work chats (§5d). `enabled` (bool), `self_jid` (the manager's own JID; required when `enabled`), `allow[]` (`{jid, name, team?, group?}`; `jid` is `<digits>@s.whatsapp.net` or `<digits>@g.us`), `approve_via` (non-empty subset of `slack_dm`, `self_chat`, `session`; default all three), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `max_prompts_per_day` (1-100, default 10), `read`, `send` (bool). Unknown keys fail. JIDs are phone numbers: they live in `config.json` only, never in memory, journal or people files. Policy may tighten `approve_via` and the cap, never widen. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 
@@ -194,10 +194,12 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `max_replies_per_hour` in the ledger (`rules/outbound.md`).
 - **WhatsApp (`whatsapp.send`, §5d)** is never `ask`: `mother whatsapp send <id>` is `allow` with a proven
   approval, else `deny`, in every permission mode (including `bypassPermissions`, where an ask would pass).
-  Any Bash command that touches the bridge socket or `~/.mother/whatsapp/` or `.mother/whatsapp/approved/`
+  Any Bash command that touches the bridge socket, `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`) or `.mother/whatsapp/approved/`
   is denied, and Edit/Write on those paths asks like the other protected files. Channel sessions
   (`MOTHER_CHANNEL_ROLE`) and sub-agents may run only `mother whatsapp read`; every other `mother whatsapp`
-  command is denied to them. `MOTHER_DRY_RUN=1` denies `send`.
+  command is denied to them. `MOTHER_DRY_RUN=1` denies `send`. `mother whatsapp read|chats|draft|list|status|pending|unlink`
+  pass the guard (not outbound; `unlink` only reduces); `prompt` is allowed only when every id is an open draft;
+  `send` is allow-with-proof or deny.
 - **Paused** denies drafts too. Policy overrides only tighten (the auto list can shrink, the never list can grow).
 - The hook matcher includes `Write|Edit|MultiEdit|NotebookEdit`, so edits to the guard's own files
   (config, ledger, log, PAUSED, hooks) ask.
@@ -288,7 +290,7 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   `mother whatsapp pending` (open drafts with a proven yes) and sends each.
 - **Limits.** `max_per_day` (default 20, ceiling 50) counts every send; `min_gap_seconds` (default 5, jittered)
   between sends; one recipient per call; no first message to a JID with no prior message in the local
-  database. Self-chat prompts go to the manager's own number: they don't count toward `max_per_day` but toward
+  database. Self-chat prompts go to the manager's own number: they do not count toward `max_per_day`; they count only toward
   `max_prompts_per_day` (default 10), are batched to one prompt per routine run per path, and are held during
   `manager.quiet_hours`.
 - **Machine-local state.** Bridge: `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`):
