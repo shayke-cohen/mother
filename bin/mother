@@ -14,7 +14,7 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
-  whatsapp <cmd>               read allowlisted WhatsApp chats (`mother whatsapp help`); home machine only
+  whatsapp <cmd>               read allowlisted WhatsApp chats, keep send drafts (`mother whatsapp help`); home machine only
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   eval brief|verdict|report    A/B the brief's gather mode on the same inputs (`mother eval help`)
@@ -927,7 +927,8 @@ def cmd_whatsapp(args):
     import whatsapp
     if args[:1] in ([], ["help"], ["-h"], ["--help"]):
         return whatsapp.main(args)
-    whatsapp.main(args, load_config(workspace()))
+    ws = workspace()
+    whatsapp.main(args, load_config(ws), ws)
 
 
 def cmd_items(args):

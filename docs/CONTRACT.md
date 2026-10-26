@@ -273,7 +273,12 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   writes `<ws>/.mother/whatsapp/drafts/<id>.json` (`id`, chat, text, text sha256, created, `run`). Ids are `w`
   plus 3 characters of `[a-z2-9]`. Drafts are machine-local, never synced, and expire after 72 hours. An edit is
   a new draft with its own yes. A draft may only target an allowlisted chat. Routines may draft; they never
-  send (frontmatter `sends: [whatsapp.draft]`).
+  send (frontmatter `sends: [whatsapp.draft]`). `draft` also refuses (exit 2) a chat with no history in the
+  database ("no cold contact"), prints the draft as JSON, and exits 1 on empty text. `mother whatsapp list [--json]`
+  shows open drafts (an expired one is deleted when read); `mother whatsapp drop <id>` deletes one (exit 1 if
+  none). `read` and `chats` exit 2 "whatsapp reading is off" when `whatsapp.enabled` or `whatsapp.read` is false;
+  `draft` exits 2 "whatsapp sending is off" when `enabled` or `send` is false. In a group, the sender is the
+  member's contact name, else first name, else "a member"; never a phone number.
 - **Three approval paths** (`whatsapp.approve_via`), each shown the same wording, `WhatsApp -> <chat name>:
   "<text>" - reply ok <id>`:
 

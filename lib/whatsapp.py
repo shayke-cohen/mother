@@ -5,13 +5,20 @@ Reader half of the WhatsApp feature (docs/CONTRACT.md §5d). Everything here is 
 Commands:
   read --since ISO [--chat JID]...   reader items (JSON) from the allowlisted chats since ISO
   chats                              recent chats, names and dates only (for setup's allowlist proposal)
+  draft --chat JID --text-file PATH [--run ID]
+                                     write a draft for an allowlisted chat with history (JSON)
+  list [--json]                      open drafts
+  drop ID                            delete a draft
 
 The database is opened read-only (`mode=ro`). The allowlist is applied in SQL, so rows from other chats are
 never fetched. Nothing is copied to disk. Python 3.9 stdlib only.
 """
 import datetime as _dt
+import hashlib
 import json
 import os
+import random
+import re
 import socket
 import sqlite3
 import sys
@@ -21,6 +28,9 @@ DEFAULT_DB = "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Chat
 CORE_EPOCH = 978307200  # Core Data counts seconds from 2001-01-01 UTC
 TEXT_TYPES = (0, 7)  # 0 = text, 7 = text with a link preview; every other type is media
 GROUP_SESSION = 1  # ZSESSIONTYPE: 0 = DM, 1 = group
+DRAFT_TTL_HOURS = 72
+ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz23456789"
+ID_RE = re.compile(r"^w[a-z2-9]{3}$")
 
 
 class ReaderError(Exception):
@@ -131,7 +141,7 @@ def read_messages(cfg: dict, since_iso: str, chats: list = None) -> dict:
         return {"status": "ok", "items": []}
     marks = ",".join("?" * len(jids))
     sql = ("SELECT s.ZCONTACTJID, s.ZPARTNERNAME, s.ZSESSIONTYPE, m.ZISFROMME, m.ZTEXT, m.ZMESSAGETYPE, "
-           "m.ZMESSAGEDATE, m.ZSTANZAID, g.ZCONTACTNAME "
+           "m.ZMESSAGEDATE, m.ZSTANZAID, COALESCE(g.ZCONTACTNAME, g.ZFIRSTNAME) "
            "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK "
            "LEFT JOIN ZWAGROUPMEMBER g ON m.ZGROUPMEMBER = g.Z_PK "
            "WHERE s.ZCONTACTJID IN (%s) AND m.ZMESSAGEDATE >= ? ORDER BY m.ZMESSAGEDATE, m.Z_PK" % marks)
@@ -191,6 +201,96 @@ def recent_chats(limit=30) -> list:
              "group": r[3] == GROUP_SESSION} for r in rows]
 
 
+# ---------------------------------------------------------------- drafts
+
+def _drafts_dir(ws: Path) -> Path:
+    return Path(ws) / ".mother" / "whatsapp" / "drafts"
+
+
+def _now() -> _dt.datetime:
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _fmt(t: _dt.datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _expired(d: dict) -> bool:
+    try:
+        made = _dt.datetime.strptime(d["created"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+    except (KeyError, ValueError, TypeError):
+        return True
+    return _now() - made > _dt.timedelta(hours=DRAFT_TTL_HOURS)
+
+
+def _new_id(ws: Path) -> str:
+    taken = set()
+    for sub in ("drafts", "approved"):
+        d = Path(ws) / ".mother" / "whatsapp" / sub
+        if d.is_dir():
+            taken.update(p.stem for p in d.glob("*.json"))
+    for _ in range(200):
+        i = "w" + "".join(random.SystemRandom().choice(ID_ALPHABET) for _ in range(3))
+        if i not in taken:
+            return i
+    _fail("could not find a free draft id; drop old drafts (`mother whatsapp list`)", 1)
+
+
+def new_draft(ws: Path, cfg: dict, chat: str, text: str, run: str = None) -> dict:
+    """Write a draft. Exit 2 for a chat that is not allowlisted or has no history (no cold contact)."""
+    allowed = _allowed(cfg)
+    if chat not in allowed:
+        _fail("%s is not in whatsapp.allow; drafts go only to allowlisted chats" % chat, 2)
+    if not has_history(cfg, chat):
+        _fail("no cold contact: %s has no history with you; start that chat yourself first" % allowed[chat], 2)
+    d = {"id": _new_id(ws), "chat": chat, "chat_name": allowed[chat], "text": text,
+         "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "created": _fmt(_now()),
+         "run": run, "status": "open"}
+    folder = _drafts_dir(ws)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (d["id"] + ".json")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(str(tmp), str(path))
+    return d
+
+
+def load_draft(ws: Path, draft_id: str):
+    """The draft, or None when missing, unreadable or older than 72 hours (an expired file is removed)."""
+    if not ID_RE.match(draft_id or ""):
+        return None
+    path = _drafts_dir(ws) / (draft_id + ".json")
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or _expired(d):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    return d
+
+
+def drop_draft(ws: Path, draft_id: str) -> bool:
+    if not ID_RE.match(draft_id or ""):
+        return False
+    try:
+        (_drafts_dir(ws) / (draft_id + ".json")).unlink()
+        return True
+    except OSError:
+        return False
+
+
+def list_drafts(ws: Path) -> list:
+    folder = _drafts_dir(ws)
+    if not folder.is_dir():
+        return []
+    out = [d for d in (load_draft(ws, p.stem) for p in sorted(folder.glob("*.json"))) if d]
+    return sorted(out, key=lambda d: d["created"])
+
+
 # ---------------------------------------------------------------- CLI
 
 def _fail(msg, code=1):
@@ -225,15 +325,72 @@ def cmd_chats(cfg, args):
         sys.exit(1)
 
 
-COMMANDS = {"read": cmd_read, "chats": cmd_chats}
+def cmd_draft(cfg, args, ws):
+    chat, text_file, run, i = None, None, None, 0
+    usage = "usage: mother whatsapp draft --chat JID --text-file PATH [--run ID]"
+    while i < len(args):
+        if args[i] == "--chat" and i + 1 < len(args):
+            chat, i = args[i + 1], i + 2
+        elif args[i] == "--text-file" and i + 1 < len(args):
+            text_file, i = args[i + 1], i + 2
+        elif args[i] == "--run" and i + 1 < len(args):
+            run, i = args[i + 1], i + 2
+        else:
+            _fail(usage)
+    if not chat or not text_file:
+        _fail(usage)
+    try:
+        text = Path(text_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        _fail("cannot read --text-file: %s" % e)
+    text = text.strip("\n")
+    if not text.strip():
+        _fail("the draft text is empty")
+    print(json.dumps(new_draft(ws, cfg, chat, text, run), indent=2, ensure_ascii=False))
 
 
-def main(argv, cfg=None):
+def cmd_list(cfg, args, ws):
+    if args not in ([], ["--json"]):
+        _fail("usage: mother whatsapp list [--json]")
+    drafts = list_drafts(ws)
+    if args:
+        print(json.dumps(drafts, indent=2, ensure_ascii=False))
+        return
+    if not drafts:
+        print("no open WhatsApp drafts")
+    for d in drafts:
+        one = d["text"].replace("\n", " ")
+        print('%s  %s  %s  "%s"' % (d["id"], d["created"], d["chat_name"], one if len(one) <= 60 else one[:57] + "..."))
+
+
+def cmd_drop(cfg, args, ws):
+    if len(args) != 1:
+        _fail("usage: mother whatsapp drop ID")
+    if not drop_draft(ws, args[0]):
+        _fail("no such draft: %s" % args[0])
+    print("dropped %s" % args[0])
+
+
+READ_COMMANDS = {"read": cmd_read, "chats": cmd_chats}
+DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop}
+
+
+def main(argv, cfg=None, ws=None):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return
-    cmd = COMMANDS.get(argv[0])
-    if not cmd:
+    cfg = cfg or {}
+    if argv[0] not in READ_COMMANDS and argv[0] not in DRAFT_COMMANDS:
         _fail("unknown whatsapp command '%s' — see `mother whatsapp help`" % argv[0])
-    require_home(cfg or {})
-    cmd(cfg or {}, argv[1:])
+    require_home(cfg)
+    wa = _wa(cfg)
+    if argv[0] in READ_COMMANDS and not (wa.get("enabled") and wa.get("read", True)):
+        _fail("whatsapp reading is off (whatsapp.enabled / whatsapp.read in config.json)", 2)
+    if argv[0] == "draft" and not (wa.get("enabled") and wa.get("send", True)):
+        _fail("whatsapp sending is off (whatsapp.enabled / whatsapp.send in config.json)", 2)
+    if argv[0] in READ_COMMANDS:
+        READ_COMMANDS[argv[0]](cfg, argv[1:])
+    else:
+        if ws is None:
+            _fail("no workspace")
+        DRAFT_COMMANDS[argv[0]](cfg, argv[1:], ws)

@@ -2,6 +2,8 @@
 
 Every test builds a fixture database with the real table and column names; the real WhatsApp database is
 never opened (MOTHER_WHATSAPP_DB points at the fixture)."""
+import datetime as _dt
+import hashlib
 import json
 import os
 import sqlite3
@@ -34,7 +36,8 @@ def fixture_db(path, chats, messages, drop=()):
     db.execute("CREATE TABLE ZWACHATSESSION (Z_PK INTEGER PRIMARY KEY, ZCONTACTJID TEXT, ZPARTNERNAME TEXT, "
                "ZSESSIONTYPE INTEGER, ZGROUPINFO INTEGER, ZLASTMESSAGEDATE REAL)")
     db.execute("CREATE TABLE ZWAMESSAGE (%s)" % ", ".join(cols))
-    db.execute("CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, ZMEMBERJID TEXT, ZCONTACTNAME TEXT)")
+    db.execute("CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, ZMEMBERJID TEXT, ZCONTACTNAME TEXT, "
+               "ZFIRSTNAME TEXT, ZCHATSESSION INTEGER)")
     for pk, jid, name, st in chats:
         last = max([m["date"] for m in messages if m["chat"] == pk] or [0])
         db.execute("INSERT INTO ZWACHATSESSION VALUES (?,?,?,?,?,?)", (pk, jid, name, st, None, last))
@@ -45,7 +48,9 @@ def fixture_db(path, chats, messages, drop=()):
         keys = [k for k in row if k not in drop]
         db.execute("INSERT INTO ZWAMESSAGE (%s) VALUES (%s)" % (",".join(keys), ",".join("?" * len(keys))),
                    [row[k] for k in keys])
-    db.execute("INSERT INTO ZWAGROUPMEMBER VALUES (1, ?, 'Dana')", (OTHER,))
+    db.execute("INSERT INTO ZWAGROUPMEMBER VALUES (1, ?, 'Dana', NULL, 2)", (OTHER,))
+    db.execute("INSERT INTO ZWAGROUPMEMBER VALUES (2, ?, NULL, 'Agnes', 2)", ("972500000003@s.whatsapp.net",))
+    db.execute("INSERT INTO ZWAGROUPMEMBER VALUES (3, ?, NULL, NULL, 2)", ("972500000004@s.whatsapp.net",))
     db.commit()
     db.close()
 
@@ -242,6 +247,14 @@ class TestReader(Base):
         out = whatsapp.read_messages(make_cfg(), SINCE, chats=[GROUP])
         self.assertEqual(out["items"][0]["sender"], "Dana")
 
+    def test_group_sender_first_name_and_never_a_number(self):
+        msgs = [{"chat": 2, "text": "a", "date": core("2026-10-26T09:00:00Z"), "stanza": "G1", "member": 2},
+                {"chat": 2, "text": "b", "date": core("2026-10-26T09:01:00Z"), "stanza": "G2", "member": 3}]
+        fixture_db(self.db, CHATS, msgs)
+        out = whatsapp.read_messages(make_cfg(), SINCE, chats=[GROUP])
+        self.assertEqual([i["sender"] for i in out["items"]], ["Agnes", "a member"])
+        self.assertNotIn("97250000000", json.dumps(out))
+
     def test_self_messages(self):
         self.build()
         got = whatsapp.self_messages(make_cfg(), SINCE)
@@ -275,6 +288,142 @@ class TestReader(Base):
         self.assertTrue(log)
         for sql, _ in log:
             self.assertNotIn("ZWAMESSAGE", sql)
+
+
+def cli(env, *args):
+    return subprocess.run([sys.executable, str(CLI), "whatsapp", *args], capture_output=True, text=True, env=env)
+
+
+class TestOffSwitch(Base):
+    def run_with(self, wa_patch, *args):
+        if not self.db.exists():
+            self.build()
+        ws = self.t / "ws"
+        ws.mkdir(exist_ok=True)
+        cfg = make_cfg()
+        cfg["whatsapp"].update(wa_patch)
+        (ws / "config.json").write_text(json.dumps(cfg))
+        return cli(dict(self.env, MOTHER_WORKSPACE=str(ws)), *args)
+
+    def test_reading_off(self):
+        for patch in ({"enabled": False}, {"read": False}):
+            for sub in (["read", "--since", SINCE], ["chats"]):
+                r = self.run_with(patch, *sub)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("whatsapp reading is off", r.stderr)
+                self.assertNotIn("hello", r.stdout)
+
+    def test_sending_off(self):
+        txt = self.t / "t.txt"
+        txt.write_text("hi")
+        for patch in ({"enabled": False}, {"send": False}):
+            r = self.run_with(patch, "draft", "--chat", DM, "--text-file", str(txt))
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("whatsapp sending is off", r.stderr)
+
+
+class TestDrafts(Base):
+    def setUp(self):
+        Base.setUp(self)
+        self.build()
+        self.ws = self.t / "ws"
+        self.ws.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.ws)], check=True)
+        (self.ws / ".gitignore").write_text(".mother/\n")
+        self.cfg = make_cfg()
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        self.wenv = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
+
+    def test_id_hash_and_shape(self):
+        d = whatsapp.new_draft(self.ws, self.cfg, DM, "héllo", run="brief-1")
+        self.assertRegex(d["id"], r"^w[a-z2-9]{3}$")
+        self.assertEqual(d["sha256"], hashlib.sha256("héllo".encode("utf-8")).hexdigest())
+        self.assertEqual((d["chat"], d["chat_name"], d["text"], d["run"], d["status"]),
+                         (DM, "Sam Roe", "héllo", "brief-1", "open"))
+        self.assertRegex(d["created"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(whatsapp.load_draft(self.ws, d["id"]), d)
+        self.assertTrue((self.ws / ".mother/whatsapp/drafts" / (d["id"] + ".json")).exists())
+
+    def test_unlisted_chat_refused(self):
+        with self.assertRaises(SystemExit) as c:
+            whatsapp.new_draft(self.ws, self.cfg, OTHER, "x")
+        self.assertEqual(c.exception.code, 2)
+
+    def test_cold_chat_refused(self):
+        cold = "972500000077@s.whatsapp.net"
+        self.cfg["whatsapp"]["allow"].append({"jid": cold, "name": "New"})
+        with self.assertRaises(SystemExit) as c:
+            whatsapp.new_draft(self.ws, self.cfg, cold, "x")
+        self.assertEqual(c.exception.code, 2)
+        self.assertEqual(list((self.ws / ".mother/whatsapp/drafts").glob("*")) if
+                         (self.ws / ".mother/whatsapp/drafts").exists() else [], [])
+
+    def test_expires_after_72h(self):
+        d = whatsapp.new_draft(self.ws, self.cfg, DM, "x")
+        p = self.ws / ".mother/whatsapp/drafts" / (d["id"] + ".json")
+        old = json.loads(p.read_text())
+        old["created"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=73)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        p.write_text(json.dumps(old))
+        self.assertIsNone(whatsapp.load_draft(self.ws, d["id"]))
+        self.assertFalse(p.exists())
+        d2 = whatsapp.new_draft(self.ws, self.cfg, DM, "y")
+        p2 = self.ws / ".mother/whatsapp/drafts" / (d2["id"] + ".json")
+        old = json.loads(p2.read_text())
+        old["created"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=71)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        p2.write_text(json.dumps(old))
+        self.assertIsNotNone(whatsapp.load_draft(self.ws, d2["id"]))
+
+    def test_ids_unique(self):
+        ids = {whatsapp.new_draft(self.ws, self.cfg, DM, "t%d" % i)["id"] for i in range(30)}
+        self.assertEqual(len(ids), 30)
+
+    def test_drop(self):
+        d = whatsapp.new_draft(self.ws, self.cfg, DM, "x")
+        self.assertTrue(whatsapp.drop_draft(self.ws, d["id"]))
+        self.assertIsNone(whatsapp.load_draft(self.ws, d["id"]))
+        self.assertFalse(whatsapp.drop_draft(self.ws, d["id"]))
+        self.assertFalse(whatsapp.drop_draft(self.ws, "../config"))
+
+    def test_text_stays_under_dot_mother(self):
+        whatsapp.new_draft(self.ws, self.cfg, DM, "private words")
+        st = subprocess.run(["git", "-C", str(self.ws), "status", "--porcelain"], capture_output=True, text=True)
+        self.assertNotIn("private words", st.stdout)
+        self.assertNotIn(".mother", st.stdout)
+        for p in self.ws.rglob("*"):
+            if p.is_file() and ".git" not in p.parts and ".mother" not in p.parts:
+                self.assertNotIn("private words", p.read_text())
+
+    def test_cli_draft_list_drop(self):
+        txt = self.t / "t.txt"
+        txt.write_text("see you at 3")
+        r = cli(self.wenv, "draft", "--chat", DM, "--text-file", str(txt), "--run", "r1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        d = json.loads(r.stdout)
+        self.assertEqual(d["text"], "see you at 3")
+        r = cli(self.wenv, "list", "--json")
+        self.assertEqual([x["id"] for x in json.loads(r.stdout)], [d["id"]])
+        r = cli(self.wenv, "list")
+        self.assertIn(d["id"], r.stdout)
+        self.assertIn("Sam Roe", r.stdout)
+        r = cli(self.wenv, "drop", d["id"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(cli(self.wenv, "list", "--json").stdout), [])
+        self.assertEqual(cli(self.wenv, "drop", d["id"]).returncode, 1)
+
+    def test_cli_draft_refusals(self):
+        txt = self.t / "t.txt"
+        txt.write_text("x")
+        r = cli(self.wenv, "draft", "--chat", OTHER, "--text-file", str(txt))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        r = cli(self.wenv, "draft", "--chat", DM, "--text-file", str(self.t / "missing.txt"))
+        self.assertNotEqual(r.returncode, 0)
+        txt.write_text("  \n")
+        self.assertEqual(cli(self.wenv, "draft", "--chat", DM, "--text-file", str(txt)).returncode, 1)
+
+    def test_cli_not_home(self):
+        cfg = make_cfg(home="elsewhere")
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertEqual(cli(self.wenv, "list").returncode, 2)
 
 
 if __name__ == "__main__":
