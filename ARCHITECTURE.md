@@ -35,6 +35,7 @@ holds code a later session would run.
 | `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval`, `health` to `lib/` |
 | `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
 | `lib/channels.py` | Reply-mode engine behind `mother:channels` | The skill does chat I/O; this decides who, when, and what. CONTRACT §5b |
+| `lib/whatsapp.py` | WhatsApp reader (later drafts, approval proof, send) behind `mother whatsapp` | Home machine only; allowlist applied in SQL. CONTRACT §5d |
 | `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |

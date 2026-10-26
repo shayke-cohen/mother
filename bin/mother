@@ -14,6 +14,7 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
+  whatsapp <cmd>               read allowlisted WhatsApp chats (`mother whatsapp help`); home machine only
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   eval brief|verdict|report    A/B the brief's gather mode on the same inputs (`mother eval help`)
@@ -921,6 +922,14 @@ def cmd_channels(args):
     channels.main(args)
 
 
+def cmd_whatsapp(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import whatsapp
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        return whatsapp.main(args)
+    whatsapp.main(args, load_config(workspace()))
+
+
 def cmd_items(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import items
@@ -943,7 +952,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "items": cmd_items, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

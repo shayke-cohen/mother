@@ -265,6 +265,10 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   locked database is retried once, then the source is `couldnt_check`; a missing table or column is
   `couldnt_check` with `schema_changed`. Never a partial list. Citation: `whatsapp://<chat-jid>/<stanza-id>`.
   Read-only, so the guard lets it through. No chat bodies are written to the workspace.
+  `mother whatsapp chats` lists recent chats (jid, name, last message date, group flag) from the session table
+  only, never a message; setup uses it to propose the allowlist. Both commands refuse off the home machine
+  (exit 2; exit 3 if no home is set) and print `couldnt_check` with a `reason` (`schema_changed`, `locked`,
+  `denied`, `missing`) instead of a partial answer. Text types are `ZMESSAGETYPE` 0 and 7 (7 = link preview).
 - **Drafts.** A send is always draft, then approved send. `mother whatsapp draft --chat <jid> --text-file <path>`
   writes `<ws>/.mother/whatsapp/drafts/<id>.json` (`id`, chat, text, text sha256, created, `run`). Ids are `w`
   plus 3 characters of `[a-z2-9]`. Drafts are machine-local, never synced, and expire after 72 hours. An edit is
