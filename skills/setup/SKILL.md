@@ -118,7 +118,10 @@ Present, in this order:
 2. The roster table with evidence per person.
 3. Channels with proposed modes.
 4. Routines with times in the manager's time zone (defaults from `templates/workspace/config.example.json`;
-   omit routines whose sources don't exist — no `digest` sprint section without a tracker, etc.).
+   omit routines whose sources don't exist — no `digest` sprint section without a tracker, etc.). The
+   `doctor` routine is `days: "all"` with `at` 30 minutes before the earliest `routines.*.at`, never before
+   05:00. In Edit mode on an existing install whose doctor is weekly or differently timed, show that as a
+   changed key — asked once, for the manager's yes like every other change.
 5. The full `config.json` draft, as JSON.
 6. What you could **not** discover and why (missing capability, no data).
 
@@ -145,6 +148,8 @@ In this order, reporting each step's result:
      new ids → `create_scheduled_task` with the printed `taskId`, `cronExpression`, `prompt` (verbatim)
      and a one-line `description`. A routine removed from config → `update_scheduled_task` with
      `enabled: false` (never delete).
+   - **The doctor runs daily** (see the proposal above): register it from the confirmed config, which
+     sets it to `days: "all"` ahead of the first routine. Never rewrite its schedule silently.
    - Cron runs in the **machine's** local time. If `manager.timezone` differs from the machine's, convert
      the times and say so.
    - `list_scheduled_tasks` again and confirm every routine is registered with the right schedule. A task
