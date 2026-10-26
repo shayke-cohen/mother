@@ -141,7 +141,8 @@ One line per connector failure or fix, appended by `mother health record`.
 Routines and the doctor never edit the file by hand. The doctor's fresh result is merged in
 (`mother health merge`), keeping list order and every `alerted_at`. A connector the fresh result leaves out
 is kept as it was; the doctor's `server` stands while it is still listed (else `servers.read[0]`, else the
-first listed); an entry with no `checked_at` takes the fresh file's. Merge logs an `open` line for each entry
+first listed); an entry with no `checked_at` takes the date of the run that wrote it (the fresh file's, or the old
+file's for a connector the run left out), and so does a tool connector's own `checked_at`. Merge logs an `open` line for each entry
 that moved into a failing status or class, and its `changed` list names rollups that went from `ok` to a
 failing status (not to `untested`). `record --fixed-by fallback` on a backup logs the preferred server's
 class `→ fallback`, whatever the backup's own previous status.

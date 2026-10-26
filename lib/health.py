@@ -43,7 +43,7 @@ CLASSES = ("unreachable", "dropped", "invalidated", "missing_scope", "denied", "
 FIXED_BY = ("retry", "reconnect", "fallback", "you", "—")
 TARGETS = ("dm", "other")
 # Keys of a connector that are not capabilities.
-RESERVED = ("server", "servers", "health", "stamps", "token", "tool", "notes", "host")
+RESERVED = ("server", "servers", "health", "stamps", "token", "tool", "notes", "host", "checked_at")
 STATUS_WORDS = ("ok", "untested", "denied", "expired")
 STATUS_PREFIXES = ("missing_scope:", "error:")
 # Capabilities that write. The doctor never probes them unattended, so `untested` is usable for these.
@@ -484,7 +484,7 @@ def pick(caps, vendor, cap, target=None, max_age_h=None, now=None):
     if not servers and conn.get("tool"):
         status = conn.get(cap) if valid_status(conn.get(cap)) else "untested"
         return {"server": None, "tool": conn["tool"], "status": status,
-                "fresh": fresh_at(conn.get("checked_at") or caps.get("checked_at")),
+                "fresh": fresh_at(conn.get("checked_at")),  # undated: not fresh, so pre-flight probes it
                 "fallback": False, "stamped": False, "verified": status == "ok"}
     result = {"server": None, "status": status_of(conn, servers[0], cap) if servers else "untested",
               "fresh": False, "fallback": False, "stamped": False, "verified": False}

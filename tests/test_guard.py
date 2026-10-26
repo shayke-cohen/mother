@@ -759,9 +759,22 @@ class StampRule(GuardCase):
         self.expect("deny", CHAT2 + "slack_send_message", {"channel_id": DM, "channel": TEAM, "text": SIG})
         self.expect("allow", CHAT + "post_message", {"channel_id": DM, "channel": DM, "text": SIG})
 
-    def test_stamping_server_canvas_to_team_denied(self):
-        self.expect("deny", CHAT2 + "slack_update_canvas", {"channel_id": TEAM, "content": "x"})
+    def test_stamping_server_topic_to_team_denied(self):
         self.expect("deny", CHAT2 + "slack_set_channel_topic", {"channel_id": TEAM, "topic": "x"})
+        self.expect("deny", CHAT2 + "slack_set_channel_purpose", {"channel_id": TEAM, "purpose": "x"})
+
+    def test_stamping_server_canvas_without_channel_is_asked(self):
+        # the real canvas tools take no channel; a canvas reaches no one until it is shared
+        self.expect("ask", CHAT2 + "slack_create_canvas", {"title": "t", "content": "x"})
+        self.expect("ask", CHAT2 + "slack_update_canvas", {"canvas_id": "F1", "content": "x"})
+
+    def test_all_targets_the_managers_own_is_the_dm(self):
+        cfg = config()
+        cfg["manager"]["chat_user"] = "U0MANAGER"
+        self.write_config(cfg)
+        self.expect("allow", CHAT2 + "slack_send_message", {"channel_id": DM, "user_id": "U0MANAGER", "text": SIG})
+        self.expect("allow", CHAT + "post_message", {"channels": [DM], "text": SIG})
+        self.expect("ask", CHAT + "post_message", {"channels": [DM, TEAM], "text": SIG})
 
     def test_stamping_server_reaction_unchanged(self):
         self.expect("ask", CHAT2 + "slack_add_reaction", {"channel_id": TEAM, "name": "eyes", "timestamp": "1.2"})

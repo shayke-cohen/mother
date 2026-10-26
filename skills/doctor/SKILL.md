@@ -139,7 +139,7 @@ Build the fresh result as JSON in a temp file (not in the workspace), then `moth
 ```
 
 **Per-server results go in `health`** (CONTRACT §4): one entry per server per capability, with `status`,
-`class` and `checked_at` (merge fills a missing one from the top-level `checked_at`), plus `_gateway` for a
+`class` and `checked_at` (merge fills a missing one from this run's top-level `checked_at`), plus `_gateway` for a
 grouped server. The code connector is tool-based (`"tool": "gh"`, no `server`); keep its `tool` and `token`. Without it merge cannot tell backups from the preferred
 server. The top-level rollups (`"read": "ok"`) are recomputed from `health` by merge; keep them consistent
 but don't rely on them. **Order: merge first, then the ladder's `record` calls.**
