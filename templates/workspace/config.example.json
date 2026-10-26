@@ -115,10 +115,8 @@
       "days": "all"
     },
     "doctor": {
-      "at": "08:30",
-      "days": [
-        "Mon"
-      ]
+      "at": "07:00",
+      "days": "all"
     }
   },
   "policy": {

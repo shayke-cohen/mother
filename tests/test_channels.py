@@ -387,6 +387,19 @@ class TestRun(Case):
             self.assertIn(t, denied)
         self.assertEqual(self.calls()[-1]["env_servers"], "mcp__tracker")
 
+    def test_list_valued_servers_reach_the_right_kind(self):
+        with open(os.path.join(self.ws, "capabilities.json"), "w") as f:
+            json.dump({"connectors": {"slack": {"server": "mcp__chat__", "servers": {"read": ["mcp__chat__", "mcp__chat2__"]}},
+                                      "jira": {"server": "tracker", "servers": {"read": ["mcp__tracker", "mcp__tracker2"],
+                                                                                "odd": 5, "worse": [None, 3]}}},
+                       "servers": ["not", "a", "dict"]}, f)
+        self.ch("run", "--action", self.queue()["id"])
+        c = self.calls()[-1]
+        denied = c["argv"][c["argv"].index("--disallowedTools") + 1].split(",")
+        self.assertEqual(c["env_servers"], "mcp__tracker,mcp__tracker2")
+        for t in ("mcp__chat", "mcp__chat2"):
+            self.assertIn(t, denied)
+
     def test_shared_gateway_opens_only_the_tracker_segment(self):
         with open(os.path.join(self.ws, "capabilities.json"), "w") as f:
             json.dump({"connectors": {"slack": {"server": "mcp__gw__slack__"}, "jira": {"server": "mcp__gw__jira__"},

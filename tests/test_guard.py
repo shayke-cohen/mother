@@ -709,5 +709,76 @@ class TestFailClosed(GuardCase):
         self.assertNotIn("secret body", raw)
 
 
+class StampRule(GuardCase):
+    """A connector that stamps its own attribution may only write to the manager's DM."""
+
+    def setUp(self):
+        super().setUp()
+        self.caps({"connectors": {"slack": {"server": "mcp__chat__slack", "stamps": ["mcp__0a1b2c3d"]}}})
+
+    def caps(self, data):
+        with open(os.path.join(self.ws, "capabilities.json"), "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_stamping_server_to_dm_allowed(self):
+        self.expect("allow", CHAT2 + "slack_send_message", {"channel_id": DM, "text": SIG})
+
+    def test_stamping_server_to_team_denied(self):
+        why = self.expect("deny", CHAT2 + "slack_send_message", {"channel_id": TEAM, "text": SIG})
+        self.assertIn("adds its own stamp", why)
+
+    def test_stamping_server_unknown_channel_denied(self):
+        self.expect("deny", CHAT2 + "slack_send_message", {"text": SIG})
+
+    def test_non_stamping_server_unchanged(self):
+        self.expect("ask", CHAT + "post_message", {"channel_id": TEAM, "text": SIG})
+
+    def test_stamping_server_reads_unchanged(self):
+        self.expect("none", CHAT2 + "slack_read_channel", {"channel_id": TEAM})
+
+    def test_stamp_rule_matches_segment_not_gateway(self):
+        self.caps({"connectors": {"slack": {"stamps": ["mcp__gw__slack"]}}})
+        self.expect("ask", "mcp__gw__jira__create_issue", {"projectKey": "PLAT", "summary": "x"})
+        self.expect("ask", "mcp__gw__slackbot__post_message", {"channel_id": TEAM, "text": SIG})
+        self.expect("deny", "mcp__gw__slack__post_message", {"channel_id": TEAM, "text": SIG})
+
+    def test_stamp_on_sibling_server_does_not_block(self):
+        self.caps({"connectors": {"jira": {"stamps": ["mcp__gw__jira"]}}})
+        self.expect("ask", "mcp__gw__slack__post_message", {"channel_id": TEAM, "text": SIG})
+
+    def test_bad_capabilities_file_ignored(self):
+        self.caps('"nope"')
+        self.expect("allow", CHAT2 + "slack_send_message", {"channel_id": DM, "text": SIG})
+        self.expect("ask", CHAT2 + "slack_send_message", {"channel_id": TEAM, "text": SIG})
+        self.caps({"connectors": {"slack": {"stamps": "mcp__0a1b2c3d"}}})
+        self.expect("ask", CHAT2 + "slack_send_message", {"channel_id": TEAM, "text": SIG})
+
+    def test_mixed_target_keys_are_not_the_dm(self):
+        # the DM in one key and a team channel in another: whichever the server routes on, it isn't proven DM
+        self.expect("ask", CHAT + "post_message", {"channel_id": DM, "channel": TEAM, "text": SIG})
+        self.expect("deny", CHAT2 + "slack_send_message", {"channel_id": DM, "channel": TEAM, "text": SIG})
+        self.expect("allow", CHAT + "post_message", {"channel_id": DM, "channel": DM, "text": SIG})
+
+    def test_stamping_server_topic_to_team_denied(self):
+        self.expect("deny", CHAT2 + "slack_set_channel_topic", {"channel_id": TEAM, "topic": "x"})
+        self.expect("deny", CHAT2 + "slack_set_channel_purpose", {"channel_id": TEAM, "purpose": "x"})
+
+    def test_stamping_server_canvas_without_channel_is_asked(self):
+        # the real canvas tools take no channel; a canvas reaches no one until it is shared
+        self.expect("ask", CHAT2 + "slack_create_canvas", {"title": "t", "content": "x"})
+        self.expect("ask", CHAT2 + "slack_update_canvas", {"canvas_id": "F1", "content": "x"})
+
+    def test_all_targets_the_managers_own_is_the_dm(self):
+        cfg = config()
+        cfg["manager"]["chat_user"] = "U0MANAGER"
+        self.write_config(cfg)
+        self.expect("allow", CHAT2 + "slack_send_message", {"channel_id": DM, "user_id": "U0MANAGER", "text": SIG})
+        self.expect("allow", CHAT + "post_message", {"channels": [DM], "text": SIG})
+        self.expect("ask", CHAT + "post_message", {"channels": [DM, TEAM], "text": SIG})
+
+    def test_stamping_server_reaction_unchanged(self):
+        self.expect("ask", CHAT2 + "slack_add_reaction", {"channel_id": TEAM, "name": "eyes", "timestamp": "1.2"})
+
+
 if __name__ == "__main__":
     unittest.main()

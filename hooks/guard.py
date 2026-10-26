@@ -135,6 +135,7 @@ class Ctx(object):
         self.cfg = {}
         self.ok = False
         self.problem = "no workspace"
+        self.stamps = set()
 
 
 def resolve_workspace():
@@ -175,7 +176,25 @@ def load_ctx():
         c.problem = "config.json teams is not a list"
         return c
     c.cfg, c.ok, c.problem = cfg, True, None
+    c.stamps = load_stamps(c.ws)
     return c
+
+
+def load_stamps(ws):
+    """Server prefixes (capabilities.json -> connectors.<vendor>.stamps) of chat connectors that add their own
+    attribution. Anything missing or malformed gives an empty set: today's decisions stay as they are."""
+    stamps = set()
+    try:
+        caps, ok = read_json(os.path.join(ws, "capabilities.json"))
+        conns = caps.get("connectors") if ok and isinstance(caps, dict) else None
+        if isinstance(conns, dict):
+            for v in conns.values():
+                lst = v.get("stamps") if isinstance(v, dict) else None
+                if isinstance(lst, list):
+                    stamps |= {x.rstrip("_") for x in lst if isinstance(x, str) and x.rstrip("_")}
+    except Exception:
+        return set()
+    return stamps
 
 
 def dm_ids(cfg):
@@ -444,21 +463,24 @@ def classify_mcp(tool, inp):
         return act("deletion", "deletions", "a deletion (%s)" % short)
 
     if dom == "chat":
-        channel = str(first(inp, "channel_id", "channelId", "channel", "chat_id", "chatId", "conversation_id",
-                            "user_id", "userId", "channels") or "")
+        keys = ("channel_id", "channelId", "channel", "chat_id", "chatId", "conversation_id", "user_id", "userId",
+                "channels")
+        # every target the call names (a list counts element by element): it reaches the DM only if all are
+        targets = sorted({str(x) for k in keys for x in as_list(inp.get(k)) if x not in (None, "", [], {})})
+        channel = ",".join(targets)
         thread = first(inp, "thread_ts", "threadTs", "thread_id", "reply_to_id", "parent_id")
         if "reaction" in verbs or "react" in verbs or "reactions" in verbs:
             return act("chat", "any_message_to_others", "a chat reaction in %s" % (channel or "?"),
-                       op="reaction", channel=channel, thread=thread)
+                       op="reaction", channel=channel, targets=targets, thread=thread)
         posting = lead in ("post", "send", "reply", "schedule", "update", "edit", "share", "upload", "complete",
                            "forward") and not ({"canvas", "topic", "purpose"} & verbs)
         if posting:
             sub = "schedule" if lead == "schedule" else "edit" if lead in ("update", "edit") else \
                 "reply" if (thread or lead == "reply") else "post"
             return act("chat", "any_message_to_others", "chat %s to %s" % (short, channel or "?"),
-                       op=sub, channel=channel, thread=thread, broadcast=bool(inp.get("reply_broadcast")),
+                       op=sub, channel=channel, targets=targets, thread=thread, broadcast=bool(inp.get("reply_broadcast")),
                        text=text_of(inp), blocks=json.dumps(inp["blocks"], ensure_ascii=False) if inp.get("blocks") else None)
-        return act("chat", "any_message_to_others", "a chat change (%s)" % short, op="other", channel=channel,
+        return act("chat", "any_message_to_others", "a chat change (%s)" % short, op="other", channel=channel, targets=targets,
                    thread=None)
 
     if dom == "mail":
@@ -554,8 +576,15 @@ def classify(tool, inp, cwd, ctx):
 # ------------------------------------------------------------------ green list
 
 
+def is_dm(a, cfg):
+    """Every target the call names is the manager's own (DM channel or user id); none named is not the DM."""
+    targets = a.get("targets") if a.get("targets") is not None else ([a["channel"]] if a.get("channel") else [])
+    ids = dm_ids(cfg)
+    return bool(targets) and all(str(t) in ids for t in targets)
+
+
 def green(a, ctx, auto):
-    if a["kind"] == "chat" and a.get("channel") and a["channel"] in dm_ids(ctx.cfg) and "own_dm" in auto:
+    if a["kind"] == "chat" and is_dm(a, ctx.cfg) and "own_dm" in auto:
         return "own_dm", "the manager's own DM"
     if a["kind"] == "draft" and "drafts" in auto:
         return "drafts", "a draft delivers nothing"
@@ -876,6 +905,32 @@ def decide(a, ctx, transcript=None):
         a["what"], a["category"])
 
 
+def _server_of(tool):
+    """The `__`-separated segments of an MCP tool name, without the tool's own last segment."""
+    return tool.split("__")[:-1]
+
+
+def stamp_block(tool, a, ctx):
+    """A chat write (a message, or a canvas/topic/purpose change) through a connector that stamps its own
+    attribution may only go to the manager's DM. Reactions carry no text, so no stamp, and are left to decide(); so
+    is a channel-less canvas edit.
+    Matches whole `__` segments (mcp__gw__slack matches mcp__gw__slack__post, not mcp__gw__slackbot__post).
+    An empty or unknown channel is denied: we can't show it is the DM. Returns (decision, reason) or None."""
+    if a.get("kind") != "chat" or a.get("op") not in ("post", "reply", "schedule", "edit", "other"):
+        return None
+    if a["op"] == "other" and not a.get("channel"):
+        return None  # a canvas made or edited without a channel reaches no one until it is shared
+    server = _server_of(tool)
+    for prefix in sorted(getattr(ctx, "stamps", None) or ()):
+        segs = prefix.split("__")
+        if server[:len(segs)] == segs:
+            if is_dm(a, ctx.cfg):
+                return None
+            return "deny", ("%s goes through a connector that adds its own stamp (%s). Send it through the "
+                            "preferred chat server, or ask the manager." % (a["what"], prefix))
+    return None
+
+
 def log(ctx, tool, a, decision, reason):
     if not ctx.ws:
         return
@@ -1049,7 +1104,7 @@ def run(raw):
         if os.environ.get(DRY_RUN_ENV, "").strip():
             r = "deny", "%s: dry run (%s is set), nothing leaves the machine." % (a["what"], DRY_RUN_ENV)
         else:
-            r = decide(a, ctx, payload.get("transcript_path"))
+            r = stamp_block(tool, a, ctx) or decide(a, ctx, payload.get("transcript_path"))
         # The manager chose bypass mode for this session: an ask becomes no decision, so Claude Code's own
         # mode applies. Denies (PAUSED, the never-list, dry run) and the guard's self-edit check still hold.
         if r[0] == "ask" and a["kind"] != "config" and payload.get("permission_mode") == "bypassPermissions":

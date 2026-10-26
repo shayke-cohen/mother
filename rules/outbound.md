@@ -64,10 +64,14 @@ Everywhere else, signing is the skill's job.
 
 **One signature, not two.** Some connectors stamp their own attribution on every write (the claude.ai Slack
 connector adds "Sent using @Claude" under the message, and an edit can't remove it). Sent through one of
-those, a signed message carries two signatures. Send through the server `capabilities.json` records for that
-write (`connectors.<chat>.servers.post`, else `connectors.<chat>.server`), and use a stamping connector only
-for reads such as search. If the recorded server can't do the write, ask the manager rather than falling
-back to the stamping one.
+those, a signed message carries two signatures. Get the send server from `mother health pick --kind chat --cap post --target dm|other` (`dm` for the
+manager's own DM, `other` for anyone else); use a stamping connector only for reads such as search.
+Falling back to a stamping server is allowed only for the manager's own DM (the manager decided this
+2026-10-25: the extra stamp there is fine). Any other write falls back only to a server with no stamp and the
+same token identity, both known; if there is none, queue it and ask the manager. A `pick` answer of
+`untested` (`"verified": false`) is usable: write checks are opt-in, so most post servers stay untested. The guard enforces the stamp part: a
+chat write (a message, or a canvas/topic/purpose change) through a server in `stamps` to anything but
+`manager.chat_dm` is denied, and so is a call naming two different targets.
 
 ## Approving in a session
 

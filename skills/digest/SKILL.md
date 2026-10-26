@@ -21,9 +21,11 @@ Policy: `${CLAUDE_PLUGIN_ROOT}/rules/teams.md` (intake lifecycle, privacy),
 W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
 ```
 
-Read `config.json` and `capabilities.json`. For each team you'll digest, read `teams/<slug>/TEAM.md`,
-`teams/<slug>/intake.md` (create it from `${CLAUDE_PLUGIN_ROOT}/skills/team/templates/intake.md` if
-missing), and `roadmap.md` if present.
+Read `config.json` and `capabilities.json`. Get each source's server from `${CLAUDE_PLUGIN_ROOT}/bin/mother
+health pick --kind K --cap C [--target dm|other]`: `server` is the tool prefix to call; a tool-based connector
+(code) answers `server: null` and its `tool` (`gh`); exit 3 means no usable server. For each team you'll
+digest, read `teams/<slug>/TEAM.md`, `teams/<slug>/intake.md` (create it from
+`${CLAUDE_PLUGIN_ROOT}/skills/team/templates/intake.md` if missing), and `roadmap.md` if present.
 
 - **Window** = since the start of the previous working day per `manager.workdays` (after a weekend it
   covers the weekend). Times in `manager.timezone`.

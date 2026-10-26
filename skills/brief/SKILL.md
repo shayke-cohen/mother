@@ -36,10 +36,10 @@ Before you write it, go through the five and ask what you did with each. A sourc
 `couldn't check — not reached`, never left off. A brief that omits a source is wrong, however good the
 rest is.
 
-How to reach a source: `config.connectors.<kind>` names the vendor; in `capabilities.json`,
-`servers["<kind>.<capability>"]` (when present) or else `connectors.<vendor>.server` names the tool prefix
-to use — one server may read while another searches. Code goes through `connectors.<code>.tool`
-(`gh`/`glab`). The `notes` list records verified quirks; read it.
+How to reach a source: get its server from `${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind K --cap C`
+— one server may read while another searches. `server` is the tool prefix to call; a tool-based connector
+(code) answers `server: null` and its `tool` (`gh`/`glab`); exit 3 means no usable server. The `notes`
+list records verified quirks; read it.
 
 ## 1. Gather — in parallel; the sources are independent
 

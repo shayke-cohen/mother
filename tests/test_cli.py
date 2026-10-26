@@ -357,6 +357,66 @@ class CliTest(unittest.TestCase):
         (cdir / "settings.json").write_text(json.dumps({"enabledPlugins": {"mother@mother": True}}))
         self.assertIn("plugin:      enabled", run(["status"], env).stdout)
 
+    # -- status: connector health
+    def write_caps(self, caps):
+        (self.ws / "capabilities.json").write_text(json.dumps(caps))
+
+    def ent(self, status, cls=None):
+        return {"status": status, "class": cls, "checked_at": "2026-10-25T06:00:00Z"}
+
+    def test_status_health_open_and_covered(self):
+        self.init()
+        self.write_config()
+        C, W, M = "mcp__cal_c", "mcp__cal_w", "mcp__mail_m"
+        self.write_caps({"checked_at": "2026-10-25T06:00:00Z", "connectors": {
+            "google": {"servers": {"read": [C, W]},
+                       "health": {C: {"read": self.ent("expired", "invalidated")}, W: {"read": self.ent("ok")}}},
+            "gmail": {"servers": {"read": [M]},
+                      "health": {M: {"read": self.ent("error:unreachable", "unreachable")}}}}})
+        r = run(["status"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("health:      1 open \u2014 mail.read", r.stdout)
+        self.assertIn("(+1 covered by fallback)", r.stdout)
+
+    def test_status_health_ok(self):
+        self.init()
+        self.write_config()
+        M = "mcp__mail_m"
+        self.write_caps({"checked_at": "2026-10-25T06:00:00Z", "connectors": {
+            "gmail": {"servers": {"read": [M]}, "health": {M: {"_gateway": "x", "read": self.ent("ok")}}}}})
+        self.assertIn("health:      ok\n", run(["status"], self.env).stdout)
+
+    def test_status_health_untested_is_not_open(self):
+        self.init()
+        self.write_config()
+        S = "mcp__chat_s"
+        self.write_caps({"connectors": {"slack": {
+            "servers": {"read": [S], "post": [S]},
+            "health": {S: {"read": self.ent("ok"), "post": self.ent("untested")}}}}})
+        self.assertIn("health:      ok\n", run(["status"], self.env).stdout)
+
+    def test_status_health_caps_list_at_three(self):
+        self.init()
+        self.write_config()
+        self.write_caps({"connectors": {"gmail": {
+            "servers": {"read%d" % i: ["mcp__s%d" % i] for i in range(4)},
+            "health": {"mcp__s%d" % i: {"read%d" % i: self.ent("denied", "denied")} for i in range(4)}}}})
+        out = run(["status"], self.env).stdout
+        self.assertIn("health:      4 open \u2014 ", out)
+        self.assertIn("\u2026", out)
+
+    def test_status_health_unreadable_does_not_crash(self):
+        self.init()
+        self.write_config()
+        (self.ws / "capabilities.json").write_text("{nope")
+        r = run(["status"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("health:      capabilities.json unreadable \u2014 run /mother:doctor", r.stdout)
+
+    def test_example_config_doctor_daily(self):
+        cfg = json.loads((ROOT / "templates/workspace/config.example.json").read_text())
+        self.assertEqual(cfg["routines"]["doctor"], {"at": "07:00", "days": "all"})
+
     # -- runs (watchdog)
     def test_runs_flags_missed_and_failed_routines(self):
         self.init()
@@ -368,6 +428,7 @@ class CliTest(unittest.TestCase):
             "- 2026-10-23T09:01:00Z digest failed — DM post expired\n"
             "- 2026-10-24T21:31:00Z reflect partial — chat search missing_scope\n"
             "- 2026-10-19T08:31:00Z doctor ok — 5 connectors\n"
+            "- 2026-10-25T07:01:00Z doctor ok — 5 connectors\n"
             "- 2026-10-19T08:00:00Z himalaya-weekly ok — not a configured routine\n"
             "not a run line\n")
         r = run(["runs", "--json"], env)
@@ -404,7 +465,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(by_id["mother-reflect"]["cronExpression"], "30 21 * * *")
         self.assertEqual(by_id["mother-meeting-prep-platform"]["cronExpression"], "0 7 * * 1")
         self.assertEqual(by_id["mother-meeting-recap-platform"]["cronExpression"], "0 12 * * 1")
-        self.assertEqual(by_id["mother-doctor"]["cronExpression"], "30 8 * * 1")
+        self.assertEqual(by_id["mother-doctor"]["cronExpression"], "0 7 * * *")
         self.assertEqual(by_id["mother-commitments"]["cronExpression"], "30 16 * * 1,2,3,4,5")
         for t in out["tasks"]:
             self.assertIn("mother:routine", t["prompt"])

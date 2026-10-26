@@ -57,6 +57,8 @@ def now():
     return float(v) if v else time.time()
 
 
+_clock = now  # quiet_now() shadows `now` with a parameter
+
 def iso(t=None):
     return _dt.datetime.fromtimestamp(now() if t is None else t, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -220,8 +222,11 @@ def load_ctx():
 
 # ---------------------------------------------------------------- time rules
 
-def in_quiet_hours(ctx, ch):
-    q = ch.get("quiet_hours") or (ctx.cfg.get("manager") or {}).get("quiet_hours")
+def quiet_now(cfg, q=None, now=None):
+    """True when `now` (epoch seconds, default the clock) is inside quiet hours "HH:MM-HH:MM" in
+    manager.timezone; `q` defaults to manager.quiet_hours."""
+    mgr = cfg.get("manager") or {}
+    q = q or mgr.get("quiet_hours")
     if not q:
         return False
     m = re.fullmatch(r"\s*([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)\s*", str(q))
@@ -229,14 +234,18 @@ def in_quiet_hours(ctx, ch):
         return False
     try:
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo((ctx.cfg.get("manager") or {}).get("timezone") or "UTC")
+        tz = ZoneInfo(mgr.get("timezone") or "UTC")
     except Exception:
         tz = _dt.timezone.utc
-    t = _dt.datetime.fromtimestamp(now(), tz)
+    t = _dt.datetime.fromtimestamp(_clock() if now is None else now, tz)
     cur = t.hour * 60 + t.minute
     a = int(m.group(1)) * 60 + int(m.group(2))
     b = int(m.group(3)) * 60 + int(m.group(4))
     return (a <= cur < b) if a <= b else (cur >= a or cur < b)
+
+
+def in_quiet_hours(ctx, ch):
+    return quiet_now(ctx.cfg, ch.get("quiet_hours"))
 
 
 def posts_last_hour(ctx, cid):
@@ -520,16 +529,26 @@ def servers_by_kind(ctx):
         caps = json.loads((ctx.ws / "capabilities.json").read_text())
     except (OSError, ValueError):
         caps = {}
-    conns = caps.get("connectors") or {}
+    conns = caps.get("connectors")
+    conns = conns if isinstance(conns, dict) else {}
     out = {}
+
+    def add(kind, v):  # a bare prefix or an ordered list of them; anything else is skipped, never raised on
+        for x in v if isinstance(v, list) else [v]:
+            if isinstance(x, str) and x:
+                out.setdefault(str(kind), set()).add(server_prefix(x))
+
     for kind, vendor in (ctx.cfg.get("connectors") or {}).items():
         for key in {str(kind), str(vendor)}:
             c = conns.get(key)
-            if isinstance(c, dict) and c.get("server"):
-                out.setdefault(str(kind), set()).add(server_prefix(c["server"]))
-    for k, v in (caps.get("servers") or {}).items():
-        if isinstance(v, str):
-            out.setdefault(str(k).split(".")[0], set()).add(server_prefix(v))
+            if isinstance(c, dict):
+                add(kind, c.get("server"))
+                if isinstance(c.get("servers"), dict):
+                    for v in c["servers"].values():
+                        add(kind, v)
+    top = caps.get("servers")
+    for k, v in (top.items() if isinstance(top, dict) else ()):
+        add(str(k).split(".")[0], v)
     return {k: {x for x in v if x} for k, v in out.items()}
 
 

@@ -25,7 +25,8 @@ tests/                     stdlib unittest; `python3 -m unittest discover tests`
 
 ```
 config.json                §3 (JSON: the hook and CLI run on stock Python 3.9, which has no YAML/TOML parser)
-capabilities.json          written by mother:doctor (§4)
+capabilities.json          written by mother:doctor and `mother health` (§4)
+health.md                  one line per connector failure or fix, appended by `mother health record` (no ids, no content)
 AGENTS.md / CLAUDE.md      the agent's persona + personal rules; CLAUDE.md is a pointer to AGENTS.md
 memory/                    one fact per file + MEMORY.md index (frontmatter: name, description, metadata.type)
 todos/open.md, archive.md  open loops, sections Yours / Mine / Blocked; items tagged `+<slug>`, origin `~manager@date` or `~agent/<src>@date`
@@ -35,7 +36,7 @@ people/<slug>.md           work items only, never assessments
 one-on-ones/<slug>/        next.md (queued topics) + YYYY-MM-DD.md (prep, then notes: topics and commitments only)
 journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for connect-the-dots; journal/commitments/YYYY-MM-DD.md for the commitment tracker; journal/brief/YYYY-MM-DD.md for the brief's triage list
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
-.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs)
+.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs)
 ```
 
 ## 2. Finding each other
@@ -85,20 +86,78 @@ The CLI validates this (`mother status`) and fails loudly on unknown keys or a w
 ```json
 { "checked_at": "2026-10-23T08:00:00Z", "host": "shays-mbp",
   "connectors": {
-    "slack":   { "server": "<mcp server prefix>", "read": "ok", "post": "ok", "search": "missing_scope:search:read",
-                 "private_history": "ok|missing", "token": "user|bot" },
+    "slack":   { "server": "mcp__Willow_Slack__slack",
+                 "read": "ok", "post": "ok", "search": "ok",
+                 "servers": { "read":   ["mcp__Willow_Slack__slack", "mcp__<claude.ai slack>"],
+                              "search": ["mcp__<claude.ai slack>"],
+                              "post":   ["mcp__Willow_Slack__slack", "mcp__<claude.ai slack>"] },
+                 "health":  { "mcp__Willow_Slack__slack": {
+                                "_gateway": "mcp-s.wewix.net",
+                                "read": {"status": "error:unreachable", "class": "unreachable",
+                                         "checked_at": "2026-10-25T07:30:00Z"},
+                                "search": {"status": "missing_scope:search:read", "class": "missing_scope",
+                                           "checked_at": "2026-10-25T07:30:00Z"} },
+                              "mcp__<claude.ai slack>": {
+                                "read": {"status": "ok", "checked_at": "2026-10-25T07:30:00Z"} } },
+                 "stamps":  ["mcp__<claude.ai slack>"],
+                 "token":   { "mcp__Willow_Slack__slack": "user", "mcp__<claude.ai slack>": "user" } },
     "jira":    { "server": "...", "read": "ok", "create": "ok|untested|denied", "transition": "...", "sprint": "..." },
     "calendar":{ "server": "...", "read": "ok" }, "mail": { ... }, "code": { "tool": "gh", "read": "ok" } },
-  "servers": { "chat.read": "<prefix>", "chat.search": "<other prefix>" },
   "notes": [ "tracker: sprint update is a full replace; names max 30 chars" ] }
 ```
 
+Per connector:
+
+| Key | Meaning |
+|---|---|
+| `server` | The main server prefix. A **tool-based** connector (`code`: `"tool": "gh"`) has no `server` or `servers`; its capability values and string `token` are its own. `tool`, `notes` and `host` are not capabilities: only keys holding a status value are. |
+| `<cap>` (`read`, `post`, …) | The **rollup** for that capability: `ok` when any server in its list is `ok`, else the first (preferred) server's status. Routines that read only this keep working. |
+| `servers.<cap>` | Ordered list of server prefixes. First = preferred, rest = tested backups. The order is a preference, not a cache: setup and the doctor write it, preferring a server with no stamp and the manager's identity. A failure never reorders it; `mother health pick` takes the first server whose entry is `ok`, so a recovered server is used again. For a **write** capability (`post`, `post_dm`, `create`, `comment`, `transition`, `sprint`, `draft`, `send`, `write`), which the doctor never probes unattended, it then takes the first `untested` one and says `"verified": false`; failing statuses are never picked. `pick` on a tool-based connector returns `{"server": null, "tool": "gh", "status": …}`. |
+| `health.<server>.<cap>` | One server's result: `status` (value list below), `class`, `checked_at` (ISO UTC), and when alerted `alerted_at`, `alerted_class`, `pending`. |
+| `health.<server>._gateway` | The gateway host the server shares with others (Willow). Keys starting `_` are metadata, not capabilities. Servers on one gateway that fail with a network error are one `unreachable` issue. |
+| `stamps` | Server prefixes that add their own attribution to chat writes. The guard reads this (§5). |
+| `token` | `{server: user\|bot}` — the identity each server writes as. A write to anyone but the manager falls back (`pick --target other`) only to a server with no stamp whose token is known and equal to the preferred server's. |
+
+**Failure classes** (what fixes it): `unreachable` (network or timeout, a whole gateway at once; switch
+server), `dropped` (server `failed`, "connection closed"; reconnect), `invalidated` (401, `needs_auth`,
+"connection invalidated"; human sign-in), `missing_scope` and `denied` (no healing; use the server that has
+it), `other`. `mother health classify --error TEXT` maps an error message to a status and class.
+
+**Alerts.** At most one per issue per manager-local day, held during `manager.quiet_hours` unless urgent
+(`mother health alert`, `mother health pending`). An issue is one (server, capability), except that every
+entry on one `_gateway` with the same class is one outage: `alert --sent` stamps them all, and any of them
+alerted today makes the rest `skip`. `ok` and `untested` never alert. `alerted_at` survives an `ok` record
+(`pending` is cleared) and is dropped only when the entry fails again with a different class
+(`alerted_class` records which class was alerted).
+
+**All runtime writes go through `mother health`** (`record`, `merge`, `alert`; `pick` and `summary` read).
+It takes `.mother/health.lock`, writes atomically, and appends a line to `health.md` for each failure or fix:
+
+```
+One line per connector failure or fix, appended by `mother health record`.
+- <ISO> <kind>.<cap> <server short name> <class> → <retry|reconnect|fallback|you|—|open> [@<gateway>]
+```
+
+Routines and the doctor never edit the file by hand. The doctor's fresh result is merged in
+(`mother health merge`), keeping list order and every `alerted_at`. A connector the fresh result leaves out
+is kept as it was; the doctor's `server` stands while it is still listed (else `servers.read[0]`, else the
+first listed); an entry with no `checked_at` takes the date of the run that wrote it (the fresh file's, or the old
+file's for a connector the run left out), and so does a tool connector's own `checked_at`. Merge logs an `open` line for each entry
+that moved into a failing status or class, and its `changed` list names rollups that went from `ok` to a
+failing status (not to `untested`). `record --fixed-by fallback` on a backup logs the preferred server's
+class `→ fallback`, whatever the backup's own previous status.
+
+**Still read, no longer written:** a bare-string `servers` value; the top-level `servers` map
+(`"<kind>.<cap>": "<prefix>"`); a string `token` (read as `{server: value}` for the connector's main
+server); a connector without `health` (seeded from its top-level capability values).
+
 Optional extra capabilities: `tracker.comment`, `mail.draft`, `mail.send`, `code.write`, and a `directory`
-connector (org lookups). A routine that hits an auth failure mid-run may downgrade that capability to `expired`
-in `capabilities.json`, so later runs that day don't retry it blindly.
+connector (org lookups). A routine that hits an auth failure mid-run records it with `mother health record`
+(status `expired`), so later runs that day don't retry it blindly.
 
 Values are `ok`, `untested`, `denied`, `missing_scope:<scope>`, `expired`, or `error:<short>`. A routine reads
 this first and names any capability it needs that isn't `ok` in its output — never "nothing found".
+`untested` is not an open health issue in `mother status`.
 
 ## 5. Approval guard (`hooks/guard.py`)
 
@@ -108,6 +167,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **allow**: posts to `manager.chat_dm`; mail drafts; calendar events without guests.
 - **ask**: everything else outbound (the human confirms). When the payload's `permission_mode` is
   `bypassPermissions`, an ask (other than a guard self-edit) gets no output and is logged as `pass`.
+- **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
+  server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
+  different targets in one call, is denied too (`rules/outbound.md`).
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
@@ -183,7 +245,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 
 ## 7. Skills in v0
 
-`setup`, `doctor` (also routine `doctor`, weekly, read-only), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
+`setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
 (connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap), `reflect`, `todo`, `project`,
 `team`, `remember`. Descriptions stay short and specific: they are matched against every request.
 
