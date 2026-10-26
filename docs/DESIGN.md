@@ -11,6 +11,7 @@ mother plugin (shared, versioned)               ~/<manager>-workspace (private, 
 │            triage · todo · project · reflect    ├─ capabilities.json   written by the doctor
 ├─ routines/ templates (no IDs; read config)      ├─ teams/ projects/ people/ memory/ todos/ journal/
 ├─ assets/   meeting deck, dashboards             └─ runs.md          every routine logs here
+├─ agents/   read-only sub-agents: reader, critic
 ├─ hooks/    approval guard (pre-tool)
 └─ rules/    outbound policy, privacy defaults
 ```
@@ -111,6 +112,21 @@ unedited. The agent proposes the move; the manager decides. A 👎 sends that to
 | External channel | `mention` (trigger: manager) |
 | Announcements | `watch` |
 | Anything else | `off` |
+
+## Sub-agents: a hub and read-only spokes
+
+MOTHER is the only agent that judges, writes or speaks. It doesn't run a "team" of persona agents (PM, dev,
+UX): the manager's real team already fills those roles. Studies of role-play multi-agent frameworks show
+they mostly fail on handoffs and lost context, not on model quality. What sub-agents are good at is the
+opposite job: reading something large and noisy in a fresh context, and handing back a short, cited result.
+- **Readers** gather one source each, in parallel, and return JSON items with links. Raw mail and chat never
+  enter MOTHER's context, only what survived `mother items check`. That is evidence-or-silence enforced in
+  code, and a failed reader shows up as "couldn't check", never as quiet.
+- **Critic**: one read-only review of a draft before anyone else sees it. It checks citations, the signature,
+  people-not-scores, privacy and voice. It is advisory: the guard and the manager stay the gates.
+- **No agent-to-agent chat and no nested agents.** Shared state is the workspace, and only MOTHER writes it.
+- **Proved before it ships.** The brief keeps `gather: inline` until `brief-ab` (blind A/B on the same inputs,
+  scored for per-source coverage, citations, false quiet and cost) says `ship`. Dots and digest follow only after that.
 
 ## Safety
 

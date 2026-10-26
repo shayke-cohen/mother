@@ -2,7 +2,7 @@
 id: brief
 team_scoped: false
 description: Workday-morning brief for the manager — calendar, mail and chat needing action, review queue, overdue todos — posted to their own DM.
-config: routines.brief            # at, days, audio, draft_replies (false); absent = off
+config: routines.brief            # at, days, audio, draft_replies (false), gather (inline|readers); absent = off
 default: { at: "08:45", days: workdays }
 audio: routines.brief.audio       # true, or {voice, voice_he, rate, language: en|he}; absent/false = no audio
 needs: [calendar.read, mail.read, chat.read, chat.post, tracker.read, code.read]
@@ -75,8 +75,8 @@ right away, otherwise the `dots` routine that afternoon (`mother:dots` step 1).
 Mark each line `— done <time>` / `— declined` / `— refused by guard: <why>` in the triage file. Unanswered
 items lapse at the end of the day. Anything beyond the named action needs a new yes.
 
-**Runs note:** `<n> items needing you; <n> triaged (<n> drafted); couldn't check: <sources or none>; DM sent|not sent; audio
-synced|sent|saved <path>|off|failed <why>`.
+**Runs note:** `<n> items needing you; <n> triaged (<n> drafted); sources: <the brief's Sources line, short>; DM sent|not sent; audio
+synced|sent|saved <path>|off|failed <why>; gather inline|readers <n ok>/<n dispatched>`.
 
 ## Hard rules
 

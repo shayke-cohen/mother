@@ -14,6 +14,9 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
+  items check [--file F] [--max N]
+                               evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
+  eval brief|verdict|report    A/B the brief's gather mode on the same inputs (`mother eval help`)
   health record|pick|classify|summary|merge|alert|pending  per-server connector health in capabilities.json (`mother health help`)
   speak [--in FILE] [--name N] [--voice V] [--rate WPM]
                                render a spoken script (stdin or FILE) to <workspace>/.mother/audio/<name>.m4a
@@ -33,7 +36,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.5.1"
+VERSION = "0.5.3"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -183,6 +186,8 @@ def validate(cfg: dict) -> list:
                 errs.append(f"routines.{rid}.days must be workdays, all, a day, a list of days, or monthly:<1-28>")
             if rid == "brief" and "draft_replies" in r and not isinstance(r["draft_replies"], bool):
                 errs.append("routines.brief.draft_replies must be true or false")
+            if rid == "brief" and r.get("gather", "inline") not in ("inline", "readers"):
+                errs.append("routines.brief.gather must be inline or readers")
             au = r.get("audio") if rid == "brief" else None
             if au is not None and not (au is True or au is False or (isinstance(au, dict) and all(
                     k in ("voice", "voice_he", "rate", "language", "save_to", "engine", "kokoro_voice") for k in au)
@@ -855,6 +860,19 @@ def cmd_channels(args):
     import channels
     channels.main(args)
 
+
+def cmd_items(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import items
+    items.main(args)
+
+
+def cmd_eval(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import evals
+    evals.main(args)
+
+
 # ---------------------------------------------------------------- health
 
 def cmd_health(args):
@@ -865,7 +883,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "items": cmd_items, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 
