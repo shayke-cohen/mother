@@ -210,7 +210,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 
 ## 7. Skills in v0
 
-`setup`, `doctor` (also routine `doctor`, weekly, read-only), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
+`setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
 (connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap), `reflect`, `todo`, `project`,
 `team`, `remember`. Descriptions stay short and specific: they are matched against every request.
 
