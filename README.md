@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck and the sprint plan, covered by 162 automated tests. One manager's workspace has
+> routines, the meeting deck and the sprint plan, covered by 241 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -20,8 +20,9 @@ example "Agnes (AI) · on behalf of Dana". The agent:
 - **Knows your world.** A setup interview *discovers* your people, teams, projects, channels, trackers, repos
   and recurring meetings from your connectors, then shows you a draft to confirm. You don't have to type it in.
 - **Proves its tools work.** A connector *doctor* makes live read and (opt-in) write calls, then records what
-  actually works. Routines check that record before they run, so a broken Slack connection shows up as
-  "couldn't check", never as "all quiet".
+  actually works, per server. When one breaks it retries, reconnects or switches to a backup server, and
+  walks you through a sign-in when only you can fix it. Routines check that record before they run, so a broken
+  Slack connection shows up as "couldn't check", never as "all quiet".
 - **Runs your routines.** A daily brief, a team digest that opens with a short *decision queue* you answer
   in one line, a weekly team-meeting deck with a **meeting mode** (owners, decisions, tickets from the room)
   that writes outcomes back to your tracker, a recap, and a daily *connect-the-dots* pass that suggests
@@ -107,7 +108,7 @@ Day to day you mostly read what it sends you and answer in one line. The default
 | commitments | 16:30 workdays | What you promised, what you're waiting on, and asks with no reply after 3 days; answer `nudge 3` for a draft follow-up |
 | one-on-one | 07:30 workdays | Prep for each of today's 1:1s (a shareable agenda kept apart from private prep) and a note when a report's 1:1s have lapsed |
 | reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
-| doctor | weekly | Re-tests connectors, so a broken one shows as "couldn't check" |
+| doctor | daily | Re-tests every connector, heals what it can (retry, reconnect, switch to a backup server) and alerts once per broken connector |
 | meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |
 
 You can also just ask: "brief me", "what's open", "remember that …", "add a todo …", "take notes on the
@@ -141,6 +142,7 @@ Useful commands in your terminal:
 | `mother home show` | Which machine runs the routines |
 | `mother sync` | Commit and push the workspace now (also runs automatically at the end of each turn) |
 | `mother register` | Print the scheduled-task definitions for the enabled routines |
+| `mother health` | Connector health: which server serves each capability, the failure log and a 7-day summary (`mother health help`) |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
