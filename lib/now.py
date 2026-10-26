@@ -10,9 +10,12 @@ This part: when the manager is "at work", and how long a signal may sit before i
 
 Python 3.9 stdlib only.
 """
+import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
@@ -111,3 +114,175 @@ def threshold_hours(signal: str, cfg: dict, s: Schedule) -> Optional[float]:
     if source != "workspace" and (cfg.get("connectors") or {}).get(source, "none") in ("none", None, ""):
         return None
     return _parse((tick.get("thresholds") or {}).get(signal, default), s)
+
+
+# ---------------------------------------------------------------- merge
+
+SECTIONS = ["on_you", "neglected", "suggestion"]
+SUGGESTION_LAPSE_DAYS = 3
+VERSION = 1
+
+
+def item_id(c: dict) -> str:
+    return "%s:%s:%s" % (c["kind"], c["link"], c["signal"])
+
+
+def _iso(d: datetime) -> str:
+    return d.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(v: str) -> datetime:
+    d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    return d if d.tzinfo else d.replace(tzinfo=ZoneInfo("UTC"))
+
+
+def _in_quiet(cfg: dict, now: datetime) -> bool:
+    mgr = cfg.get("manager") or {}
+    m = re.fullmatch(r"\s*(\d\d):(\d\d)\s*-\s*(\d\d):(\d\d)\s*", str(mgr.get("quiet_hours") or ""))
+    if not m:
+        return False
+    t = now.astimezone(ZoneInfo(mgr.get("timezone") or "UTC"))
+    cur = t.hour * 60 + t.minute
+    a, b = int(m.group(1)) * 60 + int(m.group(2)), int(m.group(3)) * 60 + int(m.group(4))
+    return (a <= cur < b) if a <= b else (cur >= a or cur < b)
+
+
+def next_slot(now: datetime, s: Schedule) -> datetime:
+    """First tick slot strictly after `now`: minute :05 of the active window, every s.every minutes,
+    on a workday, in s.tz."""
+    local = now.astimezone(s.tz)
+    day = local.date()
+    for _ in range(9):
+        if DAYS[day.weekday()] in s.workdays:
+            slot = datetime.combine(day, s.start, tzinfo=s.tz).replace(minute=5)
+            end = datetime.combine(day, s.end, tzinfo=s.tz)
+            while slot < end:
+                if slot > local:
+                    return slot
+                slot += timedelta(minutes=s.every)
+        day += timedelta(days=1)
+    return local + timedelta(minutes=s.every)
+
+
+def _coverage(inp: dict, prev: Optional[dict], cfg: dict, now: datetime) -> dict:
+    conns = cfg.get("connectors") or {}
+    prev_cov = (prev or {}).get("coverage") or {}
+    out = {}
+    for src, row in (inp.get("coverage") or {}).items():
+        if src != "workspace" and conns.get(src, "none") in ("none", None, ""):
+            continue
+        row = {"status": row} if isinstance(row, str) else dict(row)
+        if row.get("status") == "ok":
+            row.pop("since", None)
+        else:
+            was = prev_cov.get(src) or {}
+            row["since"] = was["since"] if was.get("status") not in (None, "ok") and was.get("since") else _iso(now)
+        out[src] = row
+    return out
+
+
+def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime) -> dict:
+    """Fold this tick's candidates into the previous now.json. `state` (manager done/snooze) is not
+    applied yet."""
+    s = Schedule.from_config(cfg)
+    coverage = _coverage(inp, prev, cfg, now)
+    checked = set(inp.get("checked_signals") or [])
+    prev_items = {i["id"]: i for i in (prev or {}).get("items") or []}
+    next_action = max(int((prev or {}).get("next_action") or 1), 1)
+    for pi in prev_items.values():
+        for a in pi.get("actions") or []:
+            m = re.fullmatch(r"S(\d+)", str(a.get("id")))
+            if m:
+                next_action = max(next_action, int(m.group(1)) + 1)
+    lapse = SUGGESTION_LAPSE_DAYS * day_hours(s)
+
+    items, seen = [], set()
+    for c in inp.get("candidates") or []:
+        sig = c["signal"]
+        if sig not in SIGNALS:
+            continue
+        th = threshold_hours(sig, cfg, s)
+        if th is None or working_hours(_parse_iso(c["since"]), now, s) < th:
+            continue
+        iid = item_id(c)
+        if iid in seen:
+            continue
+        seen.add(iid)
+        section = SIGNALS[sig][0]
+        if c.get("actions") and sig == "suggestion_waiting":
+            section = "suggestion"
+        old = prev_items.get(iid)
+        old_ids = {a["label"]: a["id"] for a in (old or {}).get("actions") or []}
+        actions = []
+        for a in c.get("actions") or []:
+            aid = old_ids.get(a["label"])
+            if aid is None:
+                aid = "S%d" % next_action
+                next_action += 1
+            actions.append({"id": aid, "label": a["label"], "prompt": "mother now do %s" % aid})
+        first_seen = old["first_seen"] if old else _iso(now)
+        if section == "suggestion" and working_hours(_parse_iso(first_seen), now, s) >= lapse:
+            continue
+        items.append({
+            "id": iid, "section": section, "signal": sig, "title": c["title"], "why": c.get("why", ""),
+            "link": c["link"], "also": list(c.get("also") or []), "team": c.get("team"),
+            "since": c["since"], "first_seen": first_seen, "last_seen": _iso(now),
+            "state": "open" if old else "new",
+            "snooze_until": (old or {}).get("snooze_until"), "actions": actions,
+        })
+
+    for iid, pi in prev_items.items():
+        if iid in seen:
+            continue
+        sig = pi.get("signal")
+        row = coverage.get(SIGNALS[sig][1]) if sig in SIGNALS else None
+        if sig in checked and row is not None and row["status"] == "ok":
+            continue                       # looked, and it is gone: closed
+        kept = dict(pi)
+        if kept.get("state") == "new":
+            kept["state"] = "open"
+        if sig in checked and row is not None:
+            kept.setdefault("unverified_since", _iso(now))
+        if kept["section"] == "suggestion" and working_hours(_parse_iso(kept["first_seen"]), now, s) >= lapse:
+            continue
+        items.append(kept)
+
+    items.sort(key=lambda i: (SECTIONS.index(i["section"]), _parse_iso(i["since"])))
+    statuses = [r["status"] for r in coverage.values()]
+    if not statuses or all(x == "ok" for x in statuses):
+        status = "ok"
+    elif all(x != "ok" for x in statuses):
+        status = "failed"
+    else:
+        status = "partial"
+    nxt = next_slot(now, s)
+    return {
+        "version": VERSION,
+        "generated_at": _iso(now),
+        "timezone": (cfg.get("manager") or {}).get("timezone"),
+        "quiet": _in_quiet(cfg, now),
+        "next_at": _iso(nxt),
+        "stale_after": _iso(nxt + timedelta(minutes=s.every)),
+        "status": status,
+        "coverage": coverage,
+        "routines": list(inp.get("routines") or []),
+        "counts": {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS},
+        "next_action": next_action,
+        "items": items,
+    }
+
+
+def write_now(ws: Path, doc: dict) -> None:
+    d = Path(ws) / ".mother"
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / ("now.json.%d.tmp" % os.getpid())
+    tmp.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n")
+    os.replace(str(tmp), str(d / "now.json"))
+
+
+def load_now(ws: Path) -> Optional[dict]:
+    try:
+        doc = json.loads((Path(ws) / ".mother" / "now.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) and doc.get("version") == VERSION else None
