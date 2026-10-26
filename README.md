@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck and the sprint plan, covered by 154 automated tests. One manager's workspace has
+> routines, the meeting deck and the sprint plan, covered by 162 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
