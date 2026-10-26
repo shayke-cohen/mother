@@ -85,7 +85,7 @@ Map each outcome to a CONTRACT §4 value from the error text, not from guesswork
 | `missing_scope` / `denied` | as above | no healing; use the server that has it |
 
 **Gateway grouping.** Two or more servers that share a URL host and are all `unreachable` are **one**
-issue, not several: record each with `--gateway <host>` so they collapse into one row and one alert.
+issue, not several: record each with `--gateway <host>` so they collapse into one row and one alert (§9).
 
 **Token type**, where knowable: a "who am I"/auth-test call that reports a bot or app user → `bot`;
 otherwise, if posts and reads resolve to the manager's own user → `user`. For `gh`, record the token kind
@@ -124,12 +124,23 @@ Build the fresh result as JSON in a temp file (not in the workspace), then `moth
                                  "search": "missing_scope:<scope>", "private_history": "ok",
                                  "servers": { "read": ["<a>", "<b>"], "post": ["<a>", "<b>"], "search": ["<b>"] },
                                  "stamps": ["<server that appends its own signature>"],
-                                 "token": { "<a>": "user", "<b>": "user" }, "notes": ["…"] },
+                                 "token": { "<a>": "user", "<b>": "user" },
+                                 "health": { "<a>": { "_gateway": "<host, if grouped>",
+                                                      "read": { "status": "error:unreachable", "class": "unreachable" },
+                                                      "post": { "status": "error:unreachable", "class": "unreachable" } },
+                                             "<b>": { "read": { "status": "ok" }, "post": { "status": "ok" },
+                                                      "search": { "status": "ok" } } },
+                                 "notes": ["…"] },
     "<connectors.tracker value>": { "server": "…", "read": "ok", "create": "untested", "comment": "untested",
                                     "transition": "untested", "sprint": "untested" },
     "<connectors.mail value>": { … }, "<connectors.calendar value>": { … },
     "<connectors.code value>": { "tool": "gh", "read": "ok", "write": "untested" } } }
 ```
+
+**Per-server results go in `health`** (CONTRACT §4): one entry per server per capability, with `status`
+and `class`, plus `_gateway` for a grouped server. Without it merge cannot tell backups from the preferred
+server. The top-level rollups (`"read": "ok"`) are recomputed from `health` by merge; keep them consistent
+but don't rely on them. **Order: merge first, then the ladder's `record` calls.**
 
 Keys under `connectors` are the `config.json` connector values. `servers.<capability>` is an **ordered
 list**: first is preferred, the rest are tested backups. Order it with a server that has **no stamp and
@@ -146,9 +157,12 @@ Run once per capability that is not `ok`, in order, and record each step with
 
 1. **Re-test** with the same probe. Brief network errors clear here (`retry`).
 2. **Reconnect**, if the server is a claude.ai connector in `failed`. Load `session_connectors_status` and
-   `reconnect_session_connector` with ToolSearch. Reconnect cannot fix `needs_auth` (that needs the
-   manager). It takes effect only **after the turn ends**: record `reconnect requested`, end the turn, and
-   re-test on resume (`reconnect`).
+   `reconnect_session_connector` with ToolSearch; if ToolSearch finds no reconnect tool, skip this step.
+   Reconnect cannot fix `needs_auth` (that needs the manager). It takes effect only **after the turn
+   ends**. Do not record it as a status (`reconnect requested` is not a valid one): write "reconnect
+   requested" in the report row's Fixed by cell. Interactive: end the turn and re-test on resume; record
+   the re-test result then, with `--fixed-by reconnect` if it became `ok`. Unattended: request it, do
+   **not** end the turn, go on to step 3, and let the next check re-test.
 3. **Switch server.** Test the next server in `servers.<cap>`; record its health. If it is `ok`, the
    capability is covered (`fallback`). Writes to others follow the stamp rule in §5.
 4. **Human step**: assisted sign-in (§7). Unattended: alert (§9).
@@ -209,11 +223,18 @@ was closed for days), not a connector one. Fix: re-register it via `/mother:setu
 Read checks only, ladder steps 1-3 only, no write checks, no sign-ins. Update the record with `mother
 health merge`/`record`. For each issue **not covered by a fallback**:
 
+**A gateway group is one alert.** `alert` works per (server, capability), so for a group call it once, for
+the first server and capability in the group, name the gateway in the message, and mark only that entry
+`--sent`.
+
 1. `mother health alert --kind K --cap C --server S [--urgent]` -> `{action: send|pending|skip}`.
 2. On `send`: PushNotification, if that tool is present in the run (check with ToolSearch; skip silently
    if absent), and a DM to the manager through the server from `mother health pick --kind chat --cap post
-   --target dm`. Name the connector, what is degraded, and the single step to take. Then
+   --target dm`. Name the connector (or gateway), what is degraded, and the single step to take. Then
    `mother health alert … --sent`.
+   **Chat itself broken:** if that `pick` exits 3, send the push only (if present), skip the DM, still
+   call `alert … --sent` when the push went out, and say "no chat route for the alert" in the run line.
+   If neither push nor DM was possible, do not mark it sent; it stays for the next check.
 3. On `pending` (quiet hours): do nothing now; a later routine's pre-flight sends it. On `skip`: nothing.
 
 A healthy day sends nothing. Also send the table if `mother runs` reports a missed or failed routine.
