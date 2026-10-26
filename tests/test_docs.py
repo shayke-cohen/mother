@@ -28,12 +28,13 @@ class DocsTest(unittest.TestCase):
                     missing.append(f"{doc}: {p}")
         self.assertEqual(missing, [], "docs name paths that don't exist")
 
-    def test_architecture_lists_every_skill_and_routine(self):
+    def test_architecture_lists_every_skill_routine_and_lib_module(self):
         text = (ROOT / "ARCHITECTURE.md").read_text()
         names = [p.name for p in (ROOT / "skills").iterdir() if (p / "SKILL.md").is_file()]
         names += [p.stem for p in (ROOT / "routines").glob("*.md")]
+        names += [f"lib/{p.name}" for p in (ROOT / "lib").glob("*.py")]
         unlisted = [n for n in sorted(set(names)) if f"`{n}`" not in text]
-        self.assertEqual(unlisted, [], "skills or routines missing from ARCHITECTURE.md")
+        self.assertEqual(unlisted, [], "skills, routines or lib modules missing from ARCHITECTURE.md")
 
     def test_claude_md_points_at_agents_md(self):
         self.assertIn("@AGENTS.md", (ROOT / "CLAUDE.md").read_text())

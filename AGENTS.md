@@ -15,7 +15,7 @@ Read next, in this order, as the task needs:
 ## Commands
 
 ```bash
-python3 -m unittest discover tests          # whole suite: ~160 tests, ~2 minutes (channels ~60 s, guard ~40 s, cli ~20 s)
+python3 -m unittest discover tests          # whole suite: ~240 tests, ~4-5 minutes (channels, guard, health, cli are the slow ones)
 python3 -m unittest tests.test_guard        # one module, while iterating
 python3 -m unittest tests.test_guard.TestGrants   # one class (or .TestGrants.test_name for one test)
 
@@ -44,6 +44,9 @@ To try an unreleased change end to end in Claude Code: `claude --plugin-dir /pat
   path the guard can't see. New outbound behaviour means a guard rule and a guard test.
 - **People, not scores.** Nothing that assesses, scores or reads the mood of a person. See ROADMAP's
   "Out of scope, on purpose" before proposing a feature in that area.
+- **`capabilities.json` is written only by `mother health`.** A skill or routine that learns something
+  about a connector calls `mother health record` / `merge`; it never edits the file, which other runs
+  read under a lock.
 - **Every runtime file is tracked.** `tests/test_packaging.py` fails if anything under `agents/ bin/ lib/
   hooks/ skills/ routines/ rules/ assets/ templates/ .claude-plugin/` isn't in git. `git add` new files.
 - **Skill descriptions are routing.** A `SKILL.md` `description` is matched against every user request in
@@ -75,6 +78,7 @@ To try an unreleased change end to end in Claude Code: `claude --plugin-dir /pat
 | Add a CLI command | `bin/mother` (or a `lib/` module it dispatches to) | docstring at top of `bin/mother`; `tests/test_cli.py`; README command table |
 | Change what may go out | `hooks/guard.py` | `rules/outbound.md`; CONTRACT §5; `tests/test_guard.py` |
 | Add a config key | `validate()` in `bin/mother` | CONTRACT §3; `templates/workspace/config.example.json` |
+| Change connector health, server choice or alerts | `lib/health.py` | CONTRACT §4; `tests/test_health.py`; the pre-flight in `skills/routine/SKILL.md` and `skills/doctor/SKILL.md` if callers change |
 | Add a sub-agent | `agents/<name>.md` | guard's `agent_type` handling; CONTRACT §5c |
 | Change a policy the agent cites | `rules/<name>.md` | the guard, if the rule is enforced there |
 
