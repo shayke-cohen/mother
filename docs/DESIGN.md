@@ -31,7 +31,9 @@ mother plugin (shared, versioned)               ~/<manager>-workspace (private, 
 For every connector, it makes a real read call. Write checks (create, comment and close a test item) run
 only when you opt in. It also records the token type (user or bot), scopes and gaps. The output is
 `capabilities.json`, which routines read first: a missing capability is reported as "couldn't check", never
-silently skipped. The doctor re-runs weekly, because sign-ins expire.
+silently skipped. The doctor runs daily and heals what it can without you: retry, reconnect, fall back to
+another server, and only then you (one step, with the agent doing the rest). Routines pre-flight the
+capabilities they need, and alert once a day when only you can fix something.
 
 ### Routines
 
