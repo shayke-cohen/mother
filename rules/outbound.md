@@ -70,7 +70,8 @@ Falling back to a stamping server is allowed only for the manager's own DM (the 
 2026-10-25: the extra stamp there is fine). Any other write falls back only to a server with no stamp and the
 same token identity, both known; if there is none, queue it and ask the manager. A `pick` answer of
 `untested` (`"verified": false`) is usable: write checks are opt-in, so most post servers stay untested. The guard enforces the stamp part: a
-chat write through a server in `stamps` to anything but `manager.chat_dm` is denied.
+chat write (a message, or a canvas/topic/purpose change) through a server in `stamps` to anything but
+`manager.chat_dm` is denied, and so is a call naming two different targets.
 
 ## Approving in a session
 

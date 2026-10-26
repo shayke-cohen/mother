@@ -261,10 +261,14 @@ def merge(old, new):
     for vendor, conn in conns.items():
         if not isinstance(conn, dict):
             continue
+        # an undated entry dates from the run that wrote it: this one, or the old file for a skipped connector
+        when = (new if vendor in (new.get("connectors") or {}) else old).get("checked_at")
+        if when and conn.get("tool") and not conn.get("checked_at"):
+            conn["checked_at"] = when
         for caps_ in (conn.get("health") or {}).values():
             for cap, e in caps_.items():
-                if isinstance(e, dict) and not e.get("checked_at") and new.get("checked_at"):
-                    e["checked_at"] = new["checked_at"]
+                if isinstance(e, dict) and not e.get("checked_at") and when:
+                    e["checked_at"] = when
         oc = (old.get("connectors") or {}).get(vendor)
         if not isinstance(oc, dict) or vendor not in (new.get("connectors") or {}):
             continue
@@ -479,7 +483,8 @@ def pick(caps, vendor, cap, target=None, max_age_h=None, now=None):
 
     if not servers and conn.get("tool"):
         status = conn.get(cap) if valid_status(conn.get(cap)) else "untested"
-        return {"server": None, "tool": conn["tool"], "status": status, "fresh": fresh_at(caps.get("checked_at")),
+        return {"server": None, "tool": conn["tool"], "status": status,
+                "fresh": fresh_at(conn.get("checked_at") or caps.get("checked_at")),
                 "fallback": False, "stamped": False, "verified": status == "ok"}
     result = {"server": None, "status": status_of(conn, servers[0], cap) if servers else "untested",
               "fresh": False, "fallback": False, "stamped": False, "verified": False}
@@ -543,7 +548,11 @@ def cmd_record(ws, args):
             if not (old.get("status") == o["status"] and old.get("class") == o.get("class")):
                 append_log(ws, health_line(stamp, o["kind"], o["cap"], o["server"], cls, None, gw))
         elif o.get("fixed_by") == "fallback" and pref and pref != o["server"]:
-            # the fix is for the preferred server's failure, whatever the backup's own previous status
+            # the fix is for the preferred server's failure, whatever the backup's own previous status;
+            # a backup that was failing too closes its own open line as well
+            if previous not in (None, "ok", "untested"):
+                append_log(ws, health_line(stamp, o["kind"], o["cap"], o["server"], old.get("class") or "other",
+                                           "fallback", gw))
             if pref_old.get("status") not in (None, "ok", "untested"):
                 pgw = (caps["connectors"][vendor]["health"].get(pref) or {}).get("_gateway")
                 append_log(ws, health_line(stamp, o["kind"], o["cap"], pref, pref_old.get("class") or "other",

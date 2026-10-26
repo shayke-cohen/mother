@@ -650,6 +650,24 @@ class HealthTest(unittest.TestCase):
         r, out = self.pick("--target", "other")
         self.assertEqual((r.returncode, out["server"]), (0, C))
 
+    def test_fallback_closes_the_backups_own_open_line(self):
+        self.two_servers(w="error:unreachable", c="error:unreachable")
+        self.rec("ok", C, "read", None, "--fixed-by", "fallback")
+        lines = [l for l in self.health_md().splitlines() if l.startswith("- ")]
+        self.assertEqual(sorted(l.split(" ", 3)[3] for l in lines),
+                         ["Willow_Slack__slack unreachable → fallback", "claudeai_slack unreachable → fallback"])
+
+    def test_merge_does_not_refresh_skipped_connectors(self):
+        old = self.real_shape()
+        old["checked_at"] = iso_ago(10)
+        self.caps_path.write_text(json.dumps(old))
+        f = Path(self.tmp.name) / "fresh.json"
+        f.write_text(json.dumps({"checked_at": ISO_NOW, "connectors": {"jira": old["connectors"]["jira"]}}))
+        self.assertEqual(self.run_cli("merge", "--file", str(f)).returncode, 0)
+        self.assertIs(self.pick_kind("code", "read", "--max-age-hours", "6")[1]["fresh"], False)
+        self.assertIs(self.pick_kind("chat", "read", "--max-age-hours", "6")[1]["fresh"], False)
+        self.assertIs(self.pick_kind("tracker", "read", "--max-age-hours", "6")[1]["fresh"], True)
+
     def test_merge_refuses_corrupt_file(self):
         self.caps_path.write_text("{nope")
         f = Path(self.tmp.name) / "fresh.json"

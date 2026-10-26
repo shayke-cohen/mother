@@ -463,8 +463,11 @@ def classify_mcp(tool, inp):
         return act("deletion", "deletions", "a deletion (%s)" % short)
 
     if dom == "chat":
-        channel = str(first(inp, "channel_id", "channelId", "channel", "chat_id", "chatId", "conversation_id",
-                            "user_id", "userId", "channels") or "")
+        keys = ("channel_id", "channelId", "channel", "chat_id", "chatId", "conversation_id", "user_id", "userId",
+                "channels")
+        # two different targets in one call: whichever the server routes on, it isn't provably one target
+        targets = sorted({str(inp[k]) for k in keys if inp.get(k) not in (None, "", [], {})})
+        channel = ",".join(targets)
         thread = first(inp, "thread_ts", "threadTs", "thread_id", "reply_to_id", "parent_id")
         if "reaction" in verbs or "react" in verbs or "reactions" in verbs:
             return act("chat", "any_message_to_others", "a chat reaction in %s" % (channel or "?"),
@@ -901,10 +904,11 @@ def _server_of(tool):
 
 
 def stamp_block(tool, a, ctx):
-    """A chat write through a connector that stamps its own attribution may only go to the manager's DM.
+    """A chat write (a message, or a canvas/topic/purpose change) through a connector that stamps its own
+    attribution may only go to the manager's DM. Reactions carry no text, so no stamp, and are left to decide().
     Matches whole `__` segments (mcp__gw__slack matches mcp__gw__slack__post, not mcp__gw__slackbot__post).
     An empty or unknown channel is denied: we can't show it is the DM. Returns (decision, reason) or None."""
-    if a.get("kind") != "chat" or a.get("op") not in ("post", "reply", "schedule", "edit"):
+    if a.get("kind") != "chat" or a.get("op") not in ("post", "reply", "schedule", "edit", "other"):
         return None
     server = _server_of(tool)
     for prefix in sorted(getattr(ctx, "stamps", None) or ()):

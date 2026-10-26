@@ -753,6 +753,19 @@ class StampRule(GuardCase):
         self.caps({"connectors": {"slack": {"stamps": "mcp__0a1b2c3d"}}})
         self.expect("ask", CHAT2 + "slack_send_message", {"channel_id": TEAM, "text": SIG})
 
+    def test_mixed_target_keys_are_not_the_dm(self):
+        # the DM in one key and a team channel in another: whichever the server routes on, it isn't proven DM
+        self.expect("ask", CHAT + "post_message", {"channel_id": DM, "channel": TEAM, "text": SIG})
+        self.expect("deny", CHAT2 + "slack_send_message", {"channel_id": DM, "channel": TEAM, "text": SIG})
+        self.expect("allow", CHAT + "post_message", {"channel_id": DM, "channel": DM, "text": SIG})
+
+    def test_stamping_server_canvas_to_team_denied(self):
+        self.expect("deny", CHAT2 + "slack_update_canvas", {"channel_id": TEAM, "content": "x"})
+        self.expect("deny", CHAT2 + "slack_set_channel_topic", {"channel_id": TEAM, "topic": "x"})
+
+    def test_stamping_server_reaction_unchanged(self):
+        self.expect("ask", CHAT2 + "slack_add_reaction", {"channel_id": TEAM, "name": "eyes", "timestamp": "1.2"})
+
 
 if __name__ == "__main__":
     unittest.main()

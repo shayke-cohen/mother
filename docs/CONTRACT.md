@@ -166,7 +166,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **allow**: posts to `manager.chat_dm`; mail drafts; calendar events without guests.
 - **ask**: everything else outbound (the human confirms). When the payload's `permission_mode` is
   `bypassPermissions`, an ask (other than a guard self-edit) gets no output and is logged as `pass`.
-- **deny**: a chat write (post/reply/schedule/edit) through a server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target is denied too (`rules/outbound.md`).
+- **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
+  server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
+  different targets in one call, is denied too (`rules/outbound.md`).
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
