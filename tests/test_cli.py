@@ -491,6 +491,8 @@ class CliTest(unittest.TestCase):
                          ({"thresholds": {"nope": "2h"}}, "routines.tick.thresholds.nope is not a known signal"),
                          ({"thresholds": {"review_requested": "soon"}}, "routines.tick.thresholds.review_requested must be Nh, Nd or 0"),
                          ({"signals": {"mail_needs_reply": "yes"}}, "routines.tick.signals.mail_needs_reply must be true or false"),
+                         ({"every": 60.0}, "routines.tick.every must be one of 30, 60, 120, 180, 240"),
+                         ({"days": "monthly:1"}, "routines.tick.days must be workdays, all, a day, or a list of days"),
                          ({"notify": "email"}, "routines.tick.notify must be none or dm"),
                          ({"slow_every": 7}, "routines.tick.slow_every must be an integer 1-6")):
             r = status_with(bad)
@@ -517,6 +519,18 @@ class CliTest(unittest.TestCase):
         (self.ws / "config.json").write_text(json.dumps(cfg))
         by_id = {t["taskId"]: t for t in json.loads(run(["register"], self.env).stdout)["tasks"]}
         self.assertEqual(by_id["mother-tick"]["cronExpression"], "5,35 6-21 * * 1,2,3,4,5")
+
+    def test_runs_tick_invalid_config_does_not_crash(self):
+        self.init()
+        cfg = self.write_config()
+        for bad in ({"active_hours": "garbage"}, {"every": 60.0}, {"days": "monthly:1"}):
+            cfg["routines"]["tick"] = dict(bad)
+            (self.ws / "config.json").write_text(json.dumps(cfg))
+            r = run(["runs", "--json"], dict(self.env, TZ="UTC", MOTHER_NOW="2026-10-26T10:30:00Z"))
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            row = [x for x in json.loads(r.stdout) if x["id"] == "tick"][0]
+            self.assertEqual((row["state"], row["note"]), ("failed", "invalid tick config — run mother status"))
 
     def test_runs_tick_missed_and_ok(self):
         self.init()

@@ -198,6 +198,8 @@ def validate(cfg: dict) -> list:
                   or (isinstance(d, list) and d and all(x in DAYS for x in d)))
             if not ok:
                 errs.append(f"routines.{rid}.days must be workdays, all, a day, a list of days, or monthly:<1-28>")
+            if rid == "tick" and isinstance(d, str) and d.startswith("monthly:"):
+                errs.append("routines.tick.days must be workdays, all, a day, or a list of days")
             if rid == "brief" and "draft_replies" in r and not isinstance(r["draft_replies"], bool):
                 errs.append("routines.brief.draft_replies must be true or false")
             if rid == "brief" and r.get("gather", "inline") not in ("inline", "readers"):
@@ -213,7 +215,7 @@ def validate(cfg: dict) -> list:
                 sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
                 import now as _now_mod
                 ev = r.get("every")
-                if ev is not None and (isinstance(ev, bool) or ev not in TICK_EVERY):
+                if ev is not None and (not isinstance(ev, int) or isinstance(ev, bool) or ev not in TICK_EVERY):
                     errs.append("routines.tick.every must be one of " + ", ".join(str(x) for x in TICK_EVERY))
                 ah = r.get("active_hours")
                 if ah is not None and _tick_hours(ah) is None:
@@ -690,9 +692,14 @@ def _log_start(ws: Path, runs: dict):
 def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime) -> dict:
     """Tick row. Missed only inside active hours on a scheduled day, 2x every after the day's first slot, with no run in 2x every."""
     every = r.get("every", 60)
-    a, b = _tick_hours(r.get("active_hours", "06:00-22:00"))
-    local = now.astimezone()
+    hours = _tick_hours(r.get("active_hours", "06:00-22:00"))
     days = r.get("days")
+    if (hours is None or not isinstance(every, int) or isinstance(every, bool) or every not in TICK_EVERY
+            or (isinstance(days, str) and days.startswith("monthly:"))):
+        return {"id": "tick", "state": "failed", "expected": None, "last": None, "last_status": None,
+                "note": "invalid tick config — run mother status"}
+    a, b = hours
+    local = now.astimezone()
     want = workdays if days in (None, "workdays") else DAYS if days == "all" else [days] if isinstance(days, str) else days
     mins = local.hour * 60 + local.minute
     window = _dt.timedelta(minutes=2 * every)
