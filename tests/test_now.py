@@ -262,5 +262,171 @@ class Merge(unittest.TestCase):
                 self.assertIsNone(now.load_now(ws))
 
 
+M = timedelta(minutes=1)
+MORNING = datetime(2026, 10, 27, 7, 0, tzinfo=UTC)
+ID = "pr:https://example.com/pr/1:review_requested"
+
+
+def t(title, item_id=None):
+    return {"title": title, "why": "w " + title, "link": "https://example.com/" + title, "item_id": item_id}
+
+
+def titles(doc):
+    return [x["title"] for x in doc["top"]]
+
+
+class ManagerState(unittest.TestCase):
+    def first(self):
+        return now.merge(inp(cand("review_requested", since=hours_ago(6))), None, {}, CFG, NOW)
+
+    def test_done_hides_and_new_request_resurfaces(self):
+        first = self.first()
+        st = {"items": {ID: {"state": "done", "at": iso(NOW), "until": None}}}
+        old = cand("review_requested", since=hours_ago(6))
+        self.assertEqual(now.merge(inp(old), first, st, CFG, NOW + H)["items"], [])
+        self.assertIn(ID, st["items"])
+        out = now.merge(inp(cand("review_requested", since=iso(NOW + 30 * M))), first, st, CFG, NOW + 6 * H)
+        self.assertEqual(out["items"][0]["state"], "new")
+        self.assertNotIn(ID, st["items"])
+
+    def test_done_also_hides_a_kept_item(self):
+        first = self.first()
+        st = {"items": {ID: {"state": "done", "at": iso(NOW), "until": None}}}
+        self.assertEqual(now.merge(inp(), first, st, CFG, NOW + H)["items"], [])
+
+    def test_snooze_hides_until_then_returns(self):
+        first = self.first()
+        c = cand("review_requested", since=hours_ago(6))
+        st = {"items": {ID: {"state": "snoozed", "until": iso(NOW + 2 * H), "at": iso(NOW)}}}
+        self.assertEqual(now.merge(inp(c), first, st, CFG, NOW + H)["items"], [])
+        out = now.merge(inp(c), first, st, CFG, NOW + 2 * H)
+        self.assertEqual((out["items"][0]["state"], out["items"][0]["id"]), ("open", ID))
+        self.assertEqual(st["items"], {})
+
+    def test_snooze_expiring_on_a_kept_item(self):
+        first = self.first()
+        st = {"items": {ID: {"state": "snoozed", "until": iso(NOW + H), "at": iso(NOW)}}}
+        out = now.merge(inp(), first, st, CFG, NOW + 2 * H)
+        self.assertEqual(out["items"][0]["state"], "open")
+        self.assertEqual(st["items"], {})
+
+    def test_snooze_words(self):
+        fri = datetime(2026, 10, 23, 14, 0, tzinfo=UTC)          # 15:00 London (BST)
+        mon = datetime(2026, 10, 26, 6, 0, tzinfo=S.tz)
+        self.assertEqual(now.snooze_until("1h", fri, S), fri + H)
+        self.assertEqual(now.snooze_until("tomorrow", fri, S), mon)
+        wed = datetime(2026, 10, 28, 15, 0, tzinfo=UTC)
+        self.assertEqual(now.snooze_until("tomorrow", wed, S), datetime(2026, 10, 29, 6, 0, tzinfo=S.tz))
+        self.assertEqual(now.snooze_until("next-week", wed, S), datetime(2026, 11, 2, 6, 0, tzinfo=S.tz))
+        self.assertEqual(now.snooze_until("next-week", fri, S), mon)
+        sun_mon = now.Schedule.from_config(
+            dict(CFG, manager=dict(CFG["manager"], workdays=["Tue", "Wed"])))
+        self.assertEqual(now.snooze_until("next-week", wed, sun_mon), datetime(2026, 11, 3, 6, 0, tzinfo=S.tz))
+        with self.assertRaises(ValueError):
+            now.snooze_until("soon", fri, S)
+
+    def test_state_roundtrip_under_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self.assertEqual(now.load_state(ws), {"items": {}, "top": None})
+            st = {"items": {ID: {"state": "done", "until": None, "at": iso(NOW)}},
+                  "top": {"date": "2026-10-27", "set_by": "manager", "entries": [t("A")]}}
+            now.save_state(ws, st)
+            self.assertEqual(now.load_state(ws), st)
+            self.assertEqual(glob.glob(os.path.join(d, ".mother", "*.tmp")), [])
+            self.assertTrue((ws / ".mother" / "now.lock").exists())
+            (ws / ".mother" / "now-state.json").write_text("{")
+            self.assertEqual(now.load_state(ws), {"items": {}, "top": None})
+
+    def test_apply_edit_hides_without_a_tick(self):
+        first = self.first()
+        st = {"items": {ID: {"state": "snoozed", "until": iso(NOW + H), "at": iso(NOW)}}}
+        out = now.apply_edit(first, st)
+        self.assertEqual((out["items"], out["counts"]["on_you"]), ([], 0))
+        self.assertEqual(len(first["items"]), 1)                     # input untouched
+
+    def test_apply_edit_applies_manager_top(self):
+        a = now.merge(inp(top=[t("A")], swap_hint="x"), None, {}, CFG, MORNING)
+        st = {"items": {}, "top": {"date": "2026-10-27", "set_by": "manager", "entries": [t("Z")]}}
+        out = now.apply_edit(a, st)
+        self.assertEqual((titles(out), out["top"][0]["set_by"], out["swap_hint"]), (["Z"], "manager", None))
+
+    def test_top_proposed_once_then_fixed(self):
+        a = now.merge(inp(top=[t("A"), t("B"), t("C"), t("D")]), None, {}, CFG, MORNING)
+        self.assertEqual(titles(a), ["A", "B", "C"])
+        self.assertEqual([x["rank"] for x in a["top"]], [1, 2, 3])
+        self.assertEqual({x["set_by"] for x in a["top"]}, {"agent"})
+        self.assertEqual(a["top_date"], "2026-10-27")
+        b = now.merge(inp(top=[t("X")]), a, {}, CFG, MORNING + H)
+        self.assertEqual(titles(b), ["A", "B", "C"])
+
+    def test_empty_first_proposal_can_be_filled_later(self):
+        a = now.merge(inp(), None, {}, CFG, MORNING)
+        self.assertEqual(a["top"], [])
+        b = now.merge(inp(top=[t("A")]), a, {}, CFG, MORNING + H)
+        self.assertEqual(titles(b), ["A"])
+
+    def test_top_resets_next_day(self):
+        a = now.merge(inp(top=[t("A")]), None, {}, CFG, MORNING)
+        b = now.merge(inp(top=[t("N")]), a, {}, CFG, MORNING + 24 * H)
+        self.assertEqual((titles(b), b["top_date"]), (["N"], "2026-10-28"))
+
+    def test_today_is_the_managers_local_date(self):
+        cfg = copy.deepcopy(CFG)
+        cfg["manager"]["timezone"] = "Asia/Tokyo"
+        late = datetime(2026, 10, 27, 16, 0, tzinfo=UTC)             # 01:00 Oct 28 in Tokyo
+        a = now.merge(inp(top=[t("A")]), None, {}, cfg, late)
+        self.assertEqual(a["top_date"], "2026-10-28")
+
+    def test_manager_top_wins_and_has_no_swap_hint(self):
+        st = {"items": {}, "top": {"date": "2026-10-27", "set_by": "manager", "entries": [t("M1"), t("M2")]}}
+        a = now.merge(inp(top=[t("A")], swap_hint="consider X"), None, st, CFG, MORNING)
+        self.assertEqual(titles(a), ["M1", "M2"])
+        self.assertEqual({x["set_by"] for x in a["top"]}, {"manager"})
+        self.assertIsNone(a["swap_hint"])
+        b = now.merge(inp(top=[t("A")], swap_hint="y"), a, st, CFG, MORNING + H)
+        self.assertEqual((titles(b), b["swap_hint"]), (["M1", "M2"], None))
+        stale = {"items": {}, "top": {"date": "2026-10-26", "set_by": "manager", "entries": [t("OLD")]}}
+        c = now.merge(inp(top=[t("A")]), None, stale, CFG, MORNING)
+        self.assertEqual(titles(c), ["A"])
+
+    def test_swap_hint_kept_only_for_agent_top(self):
+        a = now.merge(inp(top=[t("A")], swap_hint="consider X"), None, {}, CFG, MORNING)
+        self.assertEqual(a["swap_hint"], "consider X")
+        b = now.merge(inp(swap_hint="consider Y"), a, {}, CFG, MORNING + H)
+        self.assertEqual((titles(b), b["swap_hint"]), (["A"], "consider Y"))
+        c = now.merge(inp(), b, {}, CFG, MORNING + 2 * H)
+        self.assertIsNone(c["swap_hint"])
+
+    def test_top_entry_done_when_item_closes(self):
+        c = cand("ticket_stalled", since=days_ago(7), link="tk")
+        tid = "pr:tk:ticket_stalled"
+        a = now.merge(inp(c, top=[t("A", tid), t("B")]), None, {}, CFG, MORNING)
+        self.assertEqual([x["state"] for x in a["top"]], ["open", "open"])
+        b = now.merge(inp(checked=["ticket_stalled"], coverage={"tracker": "ok"}), a, {}, CFG, MORNING + H)
+        self.assertEqual([x["state"] for x in b["top"]], ["done", "open"])
+        self.assertEqual(titles(b), ["A", "B"])                      # done stays listed
+        again = now.merge(inp(c), b, {}, CFG, MORNING + 2 * H)
+        self.assertEqual(again["top"][0]["state"], "done")           # sticky
+
+    def test_top_entry_done_when_marked_done_but_not_when_unknown_or_snoozed(self):
+        a = now.merge(inp(cand("review_requested", since=hours_ago(6)), top=[t("A", ID), t("B", "nope")]),
+                      None, {}, CFG, NOW)
+        self.assertEqual([x["state"] for x in a["top"]], ["open", "open"])
+        st = {"items": {ID: {"state": "done", "at": iso(NOW), "until": None}}}
+        b = now.merge(inp(), a, st, CFG, NOW + H)
+        self.assertEqual([x["state"] for x in b["top"]], ["done", "open"])
+        sn = {"items": {ID: {"state": "snoozed", "at": iso(NOW), "until": iso(NOW + 3 * H)}}}
+        c = now.merge(inp(), a, sn, CFG, NOW + H)
+        self.assertEqual(c["top"][0]["state"], "open")
+
+    def test_kept_suggestion_lapses_from_since_not_first_seen(self):
+        c = cand("suggestion_waiting", kind="sug", since=hours_ago(30), actions=[{"label": "Do", "prompt": "x"}])
+        first = now.merge(inp(c), None, {}, CFG, NOW)              # 22 working hours old: kept
+        self.assertEqual(len(first["items"]), 1)
+        later = NOW + timedelta(hours=34)                            # Wed 22:00 = 48 from since, 26 from first_seen
+        self.assertEqual(now.merge(inp(), first, {}, CFG, later)["items"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

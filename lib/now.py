@@ -10,6 +10,8 @@ This part: when the manager is "at work", and how long a signal may sit before i
 
 Python 3.9 stdlib only.
 """
+import copy
+import fcntl
 import json
 import os
 import re
@@ -121,6 +123,7 @@ def threshold_hours(signal: str, cfg: dict, s: Schedule) -> Optional[float]:
 SECTIONS = ["on_you", "neglected", "suggestion"]
 SUGGESTION_LAPSE_DAYS = 3
 VERSION = 1
+TOP_MAX = 3
 
 
 def item_id(c: dict) -> str:
@@ -183,9 +186,59 @@ def _coverage(inp: dict, prev: Optional[dict], cfg: dict, now: datetime) -> dict
     return out
 
 
+def _state_effect(iid: str, since: Optional[datetime], st_items: dict, now: datetime) -> Optional[str]:
+    """What the manager's state does to one item: "hide", "new" (a done id re-requested after the
+    done), "open" (snooze ran out), or None. Resurfaced / expired entries are removed from `st_items`."""
+    e = st_items.get(iid)
+    if not isinstance(e, dict):
+        return None
+    try:
+        if e.get("state") == "done":
+            if since is not None and since > _parse_iso(e["at"]):
+                del st_items[iid]
+                return "new"
+            return "hide"
+        if e.get("state") == "snoozed":
+            if e.get("until") and _parse_iso(e["until"]) > now:
+                return "hide"
+            del st_items[iid]
+            return "open"
+    except (KeyError, ValueError, TypeError):
+        return "hide"
+    return None
+
+
+def _top_entries(raw, set_by: str) -> list:
+    out = []
+    for e in list(raw or [])[:TOP_MAX]:
+        if not isinstance(e, dict) or not e.get("title"):
+            continue
+        out.append({
+            "rank": len(out) + 1, "title": e["title"], "why": e.get("why", ""), "link": e.get("link"),
+            "item_id": e.get("item_id"), "set_by": e.get("set_by") or set_by,
+            "state": "done" if e.get("state") == "done" else "open",
+        })
+    return out
+
+
+def _mark_top_done(top: list, now_ids: set, prev_ids: set, st_items: dict) -> list:
+    """An entry tied to an item is done when the manager marked that id done, or the item was on the
+    list before and is gone now (closed). Done is sticky."""
+    for e in top:
+        iid = e.get("item_id")
+        if not iid or e["state"] == "done":
+            continue
+        marked = (st_items.get(iid) or {}).get("state") == "done"
+        snoozed = (st_items.get(iid) or {}).get("state") == "snoozed"
+        if marked or (iid in prev_ids and iid not in now_ids and not snoozed):
+            e["state"] = "done"
+    return top
+
+
 def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime) -> dict:
-    """Fold this tick's candidates into the previous now.json. `state` (manager done/snooze) is not
-    applied yet."""
+    """Fold this tick's candidates into the previous now.json and apply the manager's `state`
+    (done, snooze, Top 3). Expired snoozes and resurfaced done entries are removed from
+    `state["items"]` in place; the caller saves it."""
     s = Schedule.from_config(cfg)
     coverage = _coverage(inp, prev, cfg, now)
     checked = set(inp.get("checked_signals") or [])
@@ -197,6 +250,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
             if m:
                 next_action = max(next_action, int(m.group(1)) + 1)
     lapse = SUGGESTION_LAPSE_DAYS * day_hours(s)
+    st_items = state.setdefault("items", {})
 
     items, seen, dropped = [], set(), 0
     for c in inp.get("candidates") or []:
@@ -220,6 +274,9 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         section = SIGNALS[sig][0]
         if c.get("actions") and sig == "suggestion_waiting":
             section = "suggestion"
+        effect = _state_effect(iid, since, st_items, now)
+        if effect == "hide":
+            continue
         old = prev_items.get(iid)
         old_ids = {a["label"]: a["id"] for a in (old or {}).get("actions") or []}
         actions = []
@@ -239,8 +296,8 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
             "id": iid, "section": section, "signal": sig, "title": c["title"], "why": c.get("why", ""),
             "link": c["link"], "also": list(c.get("also") or []), "team": c.get("team"),
             "since": c["since"], "first_seen": first_seen, "last_seen": _iso(now),
-            "state": "open" if old else "new",
-            "snooze_until": (old or {}).get("snooze_until"), "actions": actions,
+            "state": effect or ("open" if old else "new"),
+            "snooze_until": None, "actions": actions,
         })
 
     for iid, pi in prev_items.items():
@@ -249,15 +306,19 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         sig = pi.get("signal")
         if sig not in SIGNALS or threshold_hours(sig, cfg, s) is None:
             continue                       # signal switched off or source gone
+        effect = _state_effect(iid, None, st_items, now)
+        if effect == "hide":
+            continue
         row = coverage.get(SIGNALS[sig][1]) if sig in SIGNALS else None
         if sig in checked and row is not None and row["status"] == "ok":
             continue                       # looked, and it is gone: closed
         kept = dict(pi)
-        if kept.get("state") == "new":
+        kept["snooze_until"] = None
+        if kept.get("state") == "new" or effect == "open":
             kept["state"] = "open"
         if sig in checked and row is not None:
             kept.setdefault("unverified_since", _iso(now))
-        if kept["section"] == "suggestion" and working_hours(_parse_iso(kept["first_seen"]), now, s) >= lapse:
+        if kept["section"] == "suggestion" and working_hours(_parse_iso(kept["since"]), now, s) >= lapse:
             continue
         items.append(kept)
 
@@ -270,6 +331,9 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
     else:
         status = "partial"
     nxt = next_slot(now, s)
+    today = now.astimezone(s.tz).date().isoformat()
+    top, top_date, hint = _pick_top(inp, prev, state, today)
+    _mark_top_done(top, {i["id"] for i in items}, set(prev_items), st_items)
     return {
         "version": VERSION,
         "generated_at": _iso(now),
@@ -283,8 +347,24 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         "counts": {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS},
         "next_action": next_action,
         "dropped": dropped,
+        "top": top,
+        "top_date": top_date,
+        "swap_hint": hint,
         "items": items,
     }
+
+
+def _pick_top(inp: dict, prev: Optional[dict], state: dict, today: str):
+    """Top 3 today: the manager's list for today wins; else the list already set today stays as it
+    is; else the first tick of the day takes the agent's proposal."""
+    st_top = state.get("top")
+    if isinstance(st_top, dict) and st_top.get("date") == today:
+        return _top_entries(st_top.get("entries"), "manager"), today, None
+    if prev and prev.get("top_date") == today and prev.get("top"):
+        top = copy.deepcopy(prev["top"])
+        agent = all(e.get("set_by") != "manager" for e in top)
+        return top, today, (inp.get("swap_hint") if agent else None)
+    return _top_entries(inp.get("top"), "agent"), today, inp.get("swap_hint")
 
 
 def write_now(ws: Path, doc: dict) -> None:
@@ -301,3 +381,82 @@ def load_now(ws: Path) -> Optional[dict]:
     except (OSError, ValueError):
         return None
     return doc if isinstance(doc, dict) and doc.get("version") == VERSION else None
+
+
+# ---------------------------------------------------------------- manager state
+
+def _empty_state() -> dict:
+    return {"items": {}, "top": None}
+
+
+def load_state(ws: Path) -> dict:
+    try:
+        st = json.loads((Path(ws) / ".mother" / "now-state.json").read_text())
+    except (OSError, ValueError):
+        return _empty_state()
+    if not isinstance(st, dict):
+        return _empty_state()
+    if not isinstance(st.get("items"), dict):
+        st["items"] = {}
+    if not isinstance(st.get("top"), dict):
+        st["top"] = None
+    return st
+
+
+def save_state(ws: Path, st: dict) -> None:
+    """Atomic write under an exclusive flock on .mother/now.lock."""
+    d = Path(ws) / ".mother"
+    d.mkdir(parents=True, exist_ok=True)
+    with open(str(d / "now.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            tmp = d / ("now-state.json.%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(st, indent=2) + "\n")
+            os.replace(str(tmp), str(d / "now-state.json"))
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def snooze_until(word: str, now: datetime, s: Schedule) -> datetime:
+    """`1h` = now + 1h; `tomorrow` = next scheduled workday at active start; `next-week` = first
+    workday of next week (weeks start Monday) at active start. Returned in s.tz."""
+    local = now.astimezone(s.tz)
+    if word == "1h":
+        return local + timedelta(hours=1)
+    if word == "tomorrow":
+        day = local.date() + timedelta(days=1)
+    elif word == "next-week":
+        day = local.date() + timedelta(days=7 - local.weekday())
+    else:
+        raise ValueError("bad snooze %r (use 1h, tomorrow or next-week)" % word)
+    for _ in range(8):
+        if DAYS[day.weekday()] in s.workdays:
+            break
+        day += timedelta(days=1)
+    return datetime.combine(day, s.start, tzinfo=s.tz)
+
+
+def apply_edit(doc: dict, st: dict) -> dict:
+    """Re-apply manager state to an existing now.json so a panel edit shows before the next tick.
+    Pure: returns a new doc."""
+    out = copy.deepcopy(doc)
+    st_items = copy.deepcopy((st or {}).get("items") or {})
+    try:
+        ref = _parse_iso(doc["generated_at"])
+    except (KeyError, ValueError, TypeError):
+        ref = datetime.now(ZoneInfo("UTC"))
+    before = {i["id"] for i in doc.get("items") or []}
+    items = []
+    for i in out.get("items") or []:
+        if _state_effect(i["id"], None, st_items, ref) == "hide":
+            continue
+        items.append(i)
+    out["items"] = items
+    out["counts"] = {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS}
+    top = (st or {}).get("top")
+    if isinstance(top, dict) and top.get("date") and top["date"] >= str(out.get("top_date") or ""):
+        out["top"] = _top_entries(top.get("entries"), "manager")
+        out["top_date"] = top["date"]
+        out["swap_hint"] = None
+    _mark_top_done(out.get("top") or [], {i["id"] for i in items}, before, (st or {}).get("items") or {})
+    return out
