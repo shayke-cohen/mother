@@ -161,11 +161,11 @@ Useful commands in your terminal:
 
 | Path | What |
 |---|---|
-| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `runs`, `path`, `link`, `speak`, `tts`, `channels`, `items`, `eval` (Python 3.9 stdlib) |
+| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `runs`, `path`, `link`, `speak`, `tts`, `channels`, `items`, `eval`, `health` (Python 3.9 stdlib) |
 | `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
 | `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `commitments`, `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember` |
 | `agents/` | Read-only sub-agents: `reader` (one source) and `critic` (one draft) |
-| `lib/` | `channels.py` (reply-mode engine), `items.py` (reader evidence check), `evals.py` (A/B harness) |
+| `lib/` | `channels.py` (reply-mode engine), `health.py` (per-server connector health, the only writer of `capabilities.json`), `items.py` (reader evidence check), `evals.py` (A/B harness) |
 | `routines/` | What each scheduled run does |
 | `assets/deck/`, `assets/plan/` | Weekly meeting deck with meeting mode; sprint plan page |
 | `rules/` | Default policies: outbound, privacy, memory, todos, projects, teams |

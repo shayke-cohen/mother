@@ -15,7 +15,7 @@ state and git, and small engines whose JSON answers the skills must use.
             plugin repo (shared, versioned)                    workspace (one per manager, private)
  ┌─────────────────────────────────────────────┐      ┌──────────────────────────────────────────┐
  │ Markdown the model follows                  │      │ config.json        who, teams, routines  │
- │   skills/   routines/   rules/   agents/    │ ───▶ │ capabilities.json  what the doctor proved│
+ │   skills/   routines/   rules/   agents/    │ ───▶ │ capabilities.json  per-server health     │
  │                                             │reads │ memory/ todos/ people/ teams/ projects/  │
  │ Python that holds regardless                │writes│ journal/ one-on-ones/  runs.md           │
  │   hooks/guard.py  bin/mother  lib/*.py      │      │ .mother/  machine-local state (gitignored)│
@@ -31,8 +31,9 @@ holds code a later session would run.
 |---|---|---|
 | `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
 | `hooks/hooks.json` | Wires the hooks | PreToolUse → guard; Stop and SessionEnd → `mother sync --quiet` |
-| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. CONTRACT §5 |
-| `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval` to `lib/` |
+| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
+| `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval`, `health` to `lib/` |
+| `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
 | `lib/channels.py` | Reply-mode engine behind `mother:channels` | The skill does chat I/O; this decides who, when, and what. CONTRACT §5b |
 | `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
@@ -58,9 +59,12 @@ Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `commitments`, `one-on-one`,
 Claude Code scheduler (desktop app, home machine only, local-time cron from `mother register`)
   └─ thin pointer prompt: cd <workspace>; git pull --rebase; run mother:routine with id <id>
       └─ skills/routine  ── mother home check · stop on .mother/PAUSED · mother status · day check
-          │                 load capabilities.json → any `needs` not ok = run is `partial`
+          ├─ pre-flight (~60 s, never fatal): send `mother health pending` alerts; for each `needs`
+          │     capability `mother health pick` → probe a stale read, heal (reconnect, backup server),
+          │     record and alert once a day; writes are never probed. Unhealed = "couldn't check", `partial`
           └─ routines/<id>.md  ── step list, calling skills (mother:brief, mother:todo, …)
               ├─ gather: connectors directly, or one mother:reader per source → `mother items check`
+              │     a call that fails mid-run: `health classify` + `record`, `pick` again, retry once there
               ├─ judge and write: workspace files (journal/, todos/, teams/…)
               ├─ check: mother:critic on any draft another person will see
               ├─ send: MCP / gh call ──▶ hooks/guard.py decides allow · ask · deny, logs to .mother/guard.log
@@ -69,6 +73,11 @@ Claude Code scheduler (desktop app, home machine only, local-time cron from `mot
 ```
 
 An interactive request ("brief me") enters at the skill and skips the dispatcher.
+
+The daily `doctor` routine runs before the first routine of the day: it re-tests every connector read-only,
+heals what it can without a human (re-test, reconnect, switch server), merges the result through
+`mother health merge`, and alerts the manager once per broken connector. Sign-ins and write checks happen
+only in an interactive `/mother:doctor`.
 
 ## How a channel reply flows
 
@@ -86,8 +95,11 @@ An interactive request ("brief me") enters at the skill and skips the dispatcher
 
 - **One writer.** Only MOTHER (the routine or interactive session) judges, writes and posts. Sub-agents and
   channel sessions read and hand back data; their output approves nothing.
-- **Capabilities before claims.** A routine reads `capabilities.json` first. A source it couldn't reach is
-  reported as "couldn't check", never as quiet.
+- **Capabilities before claims.** A routine checks each capability it needs before using it. A source it
+  couldn't reach is reported as "couldn't check", never as quiet.
+- **One writer for connector state.** Only `mother health` writes `capabilities.json` and `health.md`.
+  Skills and routines call it; they never edit the file. The server order in `servers.<cap>` is a
+  preference that a failure never reorders, so a recovered server is used again.
 - **Evidence or silence.** Anything shown to the manager cites a link; `lib/items.py` enforces this for
   readers.
 - **Fail closed.** No workspace, a bad config or a crash in the guard means *ask*, never *allow*. The guard
@@ -101,4 +113,6 @@ An interactive request ("brief me") enters at the skill and skips the dispatcher
 - The workspace path: `$MOTHER_WORKSPACE`, else `$MOTHER_STATE_DIR/workspace` (default `~/.mother/workspace`).
 - Plugin files from a skill: `${CLAUDE_PLUGIN_ROOT}/…`. Routines never hard-code a path.
 - Environment switches: `MOTHER_DRY_RUN` (guard denies all outbound), `MOTHER_NO_SYNC` (sync is a no-op),
-  `MOTHER_CHANNEL_ROLE` / `MOTHER_CHANNEL_SERVERS` (channel session limits), `MOTHER_HOSTNAME` (tests).
+  `MOTHER_CHANNEL_ROLE` / `MOTHER_CHANNEL_SERVERS` (channel session limits); for tests, `MOTHER_HOSTNAME`
+  (this machine's name), `MOTHER_NOW` (a fixed clock for `runs` and `health`) and `MOTHER_SAY_BIN` (the
+  speech binary).
