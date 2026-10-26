@@ -2,6 +2,7 @@
 Run: python3 -m unittest tests.test_now -v
 """
 import copy
+import fcntl
 import glob
 import json
 import os
@@ -325,7 +326,7 @@ class ManagerState(unittest.TestCase):
         with self.assertRaises(ValueError):
             now.snooze_until("soon", fri, S)
 
-    def test_state_roundtrip_under_lock(self):
+    def test_state_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d)
             self.assertEqual(now.load_state(ws), {"items": {}, "top": None})
@@ -334,7 +335,6 @@ class ManagerState(unittest.TestCase):
             now.save_state(ws, st)
             self.assertEqual(now.load_state(ws), st)
             self.assertEqual(glob.glob(os.path.join(d, ".mother", "*.tmp")), [])
-            self.assertTrue((ws / ".mother" / "now.lock").exists())
             (ws / ".mother" / "now-state.json").write_text("{")
             self.assertEqual(now.load_state(ws), {"items": {}, "top": None})
 
@@ -426,6 +426,33 @@ class ManagerState(unittest.TestCase):
         self.assertEqual(len(first["items"]), 1)
         later = NOW + timedelta(hours=34)                            # Wed 22:00 = 48 from since, 26 from first_seen
         self.assertEqual(now.merge(inp(), first, {}, CFG, later)["items"], [])
+
+    def test_manager_top_keeps_done_across_ticks_and_edits(self):
+        c = cand("ticket_stalled", since=days_ago(7), link="tk")
+        tid = "pr:tk:ticket_stalled"
+        st = {"items": {}, "top": {"date": "2026-10-27", "set_by": "manager",
+                                   "entries": [t("A", tid), t("B"), t("C", "nope")]}}
+        a = now.merge(inp(c), None, st, CFG, MORNING)
+        self.assertEqual([x["state"] for x in a["top"]], ["open"] * 3)
+        b = now.merge(inp(checked=["ticket_stalled"], coverage={"tracker": "ok"}), a, st, CFG, MORNING + H)
+        self.assertEqual([x["state"] for x in b["top"]], ["done", "open", "open"])
+        c3 = now.merge(inp(), b, st, CFG, MORNING + 2 * H)
+        self.assertEqual([x["state"] for x in c3["top"]], ["done", "open", "open"])
+        st["items"]["x"] = {"state": "snoozed", "until": iso(MORNING + 5 * H), "at": iso(MORNING)}
+        e = now.apply_edit(c3, st)
+        self.assertEqual([x["state"] for x in e["top"]], ["done", "open", "open"])
+
+    def test_lock_is_exclusive_and_save_works_inside(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            with now.locked(ws):
+                with open(str(ws / ".mother" / "now.lock"), "a") as other:
+                    with self.assertRaises(OSError):
+                        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                now.save_state(ws, {"items": {}, "top": None})
+            with open(str(ws / ".mother" / "now.lock"), "a") as other:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)      # released after the block
+            self.assertEqual(now.load_state(ws), {"items": {}, "top": None})
 
 
 if __name__ == "__main__":

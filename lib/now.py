@@ -15,6 +15,7 @@ import fcntl
 import json
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -221,6 +222,16 @@ def _top_entries(raw, set_by: str) -> list:
     return out
 
 
+def _carry_done(top: list, old: Optional[list]) -> list:
+    """Keep `done` from the previous list (match by item_id, else title) on a list rebuilt from state."""
+    done = [(e.get("item_id"), e.get("title")) for e in old or [] if e.get("state") == "done"]
+    for e in top:
+        if any((e.get("item_id") and e["item_id"] == i) or (not e.get("item_id") and e["title"] == t)
+               for i, t in done):
+            e["state"] = "done"
+    return top
+
+
 def _mark_top_done(top: list, now_ids: set, prev_ids: set, st_items: dict) -> list:
     """An entry tied to an item is done when the manager marked that id done, or the item was on the
     list before and is gone now (closed). Done is sticky."""
@@ -359,7 +370,10 @@ def _pick_top(inp: dict, prev: Optional[dict], state: dict, today: str):
     is; else the first tick of the day takes the agent's proposal."""
     st_top = state.get("top")
     if isinstance(st_top, dict) and st_top.get("date") == today:
-        return _top_entries(st_top.get("entries"), "manager"), today, None
+        top = _top_entries(st_top.get("entries"), "manager")
+        if prev and prev.get("top_date") == today:
+            _carry_done(top, prev.get("top"))
+        return top, today, None
     if prev and prev.get("top_date") == today and prev.get("top"):
         top = copy.deepcopy(prev["top"])
         agent = all(e.get("set_by") != "manager" for e in top)
@@ -403,18 +417,28 @@ def load_state(ws: Path) -> dict:
     return st
 
 
-def save_state(ws: Path, st: dict) -> None:
-    """Atomic write under an exclusive flock on .mother/now.lock."""
+@contextmanager
+def locked(ws: Path):
+    """Exclusive flock on .mother/now.lock for the with-block. Wrap every load_state -> change ->
+    save_state in it, so a tick and a panel edit cannot overwrite each other. Not re-entrant."""
     d = Path(ws) / ".mother"
     d.mkdir(parents=True, exist_ok=True)
     with open(str(d / "now.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            tmp = d / ("now-state.json.%d.tmp" % os.getpid())
-            tmp.write_text(json.dumps(st, indent=2) + "\n")
-            os.replace(str(tmp), str(d / "now-state.json"))
+            yield
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def save_state(ws: Path, st: dict) -> None:
+    """Atomic write (temp file + rename). Does not lock: the caller holds `locked(ws)` around its
+    load -> change -> save."""
+    d = Path(ws) / ".mother"
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / ("now-state.json.%d.tmp" % os.getpid())
+    tmp.write_text(json.dumps(st, indent=2) + "\n")
+    os.replace(str(tmp), str(d / "now-state.json"))
 
 
 def snooze_until(word: str, now: datetime, s: Schedule) -> datetime:
@@ -455,7 +479,7 @@ def apply_edit(doc: dict, st: dict) -> dict:
     out["counts"] = {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS}
     top = (st or {}).get("top")
     if isinstance(top, dict) and top.get("date") and top["date"] >= str(out.get("top_date") or ""):
-        out["top"] = _top_entries(top.get("entries"), "manager")
+        out["top"] = _carry_done(_top_entries(top.get("entries"), "manager"), doc.get("top"))
         out["top_date"] = top["date"]
         out["swap_hint"] = None
     _mark_top_done(out.get("top") or [], {i["id"] for i in items}, before, (st or {}).get("items") or {})
