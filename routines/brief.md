@@ -75,7 +75,7 @@ right away, otherwise the `dots` routine that afternoon (`mother:dots` step 1).
 Mark each line `— done <time>` / `— declined` / `— refused by guard: <why>` in the triage file. Unanswered
 items lapse at the end of the day. Anything beyond the named action needs a new yes.
 
-**Runs note:** `<n> items needing you; <n> triaged (<n> drafted); couldn't check: <sources or none>; DM sent|not sent; audio
+**Runs note:** `<n> items needing you; <n> triaged (<n> drafted); sources: <the brief's Sources line, short>; DM sent|not sent; audio
 synced|sent|saved <path>|off|failed <why>; gather inline|readers <n ok>/<n dispatched>`.
 
 ## Hard rules
