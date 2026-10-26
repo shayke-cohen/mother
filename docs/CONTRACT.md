@@ -76,6 +76,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.brief.draft_replies` | bool, optional | default false; true = the brief routine saves mail **drafts** for To-respond mail it triaged as `prep` (never sends) |
 | `routines.commitments` | map, optional | `at`, `days`, `no_reply_days` (1-30, default 3), `lookback_days` (1-60, default 14), `draft_nudges` (bool, default false: mail drafts for no-reply asks only on the manager's `nudge <n>`) |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
+| `whatsapp` | map, optional | WhatsApp read and send for allowlisted work chats (§5d). `enabled` (bool), `self_jid` (the manager's own JID; required when `enabled`), `allow[]` (`{jid, name, team?, group?}`; `jid` is `<digits>@s.whatsapp.net` or `<digits>@g.us`), `approve_via` (non-empty subset of `slack_dm`, `self_chat`, `session`; default all three), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `max_prompts_per_day` (default 10), `read`, `send` (bool). Unknown keys fail. JIDs are phone numbers: they live in `config.json` only, never in memory, journal or people files. Policy may tighten `approve_via` and the cap, never widen. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 
@@ -151,6 +152,13 @@ class `→ fallback`, whatever the backup's own previous status.
 (`"<kind>.<cap>": "<prefix>"`); a string `token` (read as `{server: value}` for the connector's main
 server); a connector without `health` (seeded from its top-level capability values).
 
+**`whatsapp`** is a tool-based connector with no MCP server: `{"tool": "mother whatsapp", "read": "ok",
+"send": "untested", "checked_at": "…"}`. The doctor tests `read` for real (opens the local WhatsApp database
+read-only, runs the schema check, counts the allowlisted chats; `error:schema` if the tables changed,
+`denied` without Full Disk Access). For `send` it only checks the bridge is running and linked
+(`untested` if linked, `error:unlinked` if not); it never sends a test message unprompted. A write capability,
+so `mother health pick` treats `send` like the others.
+
 Optional extra capabilities: `tracker.comment`, `mail.draft`, `mail.send`, `code.write`, and a `directory`
 connector (org lookups). A routine that hits an auth failure mid-run records it with `mother health record`
 (status `expired`), so later runs that day don't retry it blindly.
@@ -184,6 +192,12 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   Plus `answer` (`+ thread`), written by `mother channels`: one signed reply in one thread of a `mention`/`auto`
   channel, citing whoever addressed the agent if the channel's `trigger` allows them; rate-capped by
   `max_replies_per_hour` in the ledger (`rules/outbound.md`).
+- **WhatsApp (`whatsapp.send`, §5d)** is never `ask`: `mother whatsapp send <id>` is `allow` with a proven
+  approval, else `deny`, in every permission mode (including `bypassPermissions`, where an ask would pass).
+  Any Bash command that touches the bridge socket or `~/.mother/whatsapp/` or `.mother/whatsapp/approved/`
+  is denied, and Edit/Write on those paths asks like the other protected files. Channel sessions
+  (`MOTHER_CHANNEL_ROLE`) and sub-agents may run only `mother whatsapp read`; every other `mother whatsapp`
+  command is denied to them. `MOTHER_DRY_RUN=1` denies `send`.
 - **Paused** denies drafts too. Policy overrides only tighten (the auto list can shrink, the never list can grow).
 - The hook matcher includes `Write|Edit|MultiEdit|NotebookEdit`, so edits to the guard's own files
   (config, ledger, log, PAUSED, hooks) ask.
@@ -234,6 +248,56 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   an A/B pair. A new gather mode becomes the default only when `mother eval report` says `ship`: at least
   10 judged pairs; per-source coverage and uncited lines no worse than baseline; no new false-quiet sources; the manager
   picked it or `same` in ≥ 60% of pairs; and cost ≤ 3× baseline.
+
+## 5d. WhatsApp (`lib/whatsapp.py`, `mother whatsapp`, `bridge/whatsapp/`)
+
+Read and send for the chats in `whatsapp.allow`, from the manager's own number. Two independent parts: a
+read-only reader of the local WhatsApp database, and a send-only bridge (a linked device). Everything is
+home-machine-only: every `mother whatsapp` command except `status` refuses to run anywhere but
+`workspace.home_machine`.
+
+- **Read.** `mother whatsapp read --since <iso> [--chat <jid>]…` opens the macOS WhatsApp database
+  (`$MOTHER_WHATSAPP_DB`, else `~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite`)
+  with `mode=ro`, filters by the allowlisted JIDs (plus the self chat for approvals) in SQL, and prints reader
+  items (`mother items check` applies). Text messages only; anything else is `[media]` with no content. A
+  locked database is retried once, then the source is `couldnt_check`; a missing table or column is
+  `couldnt_check` with `schema_changed`. Never a partial list. Citation: `whatsapp://<chat-jid>/<stanza-id>`.
+  Read-only, so the guard lets it through. No chat bodies are written to the workspace.
+- **Drafts.** A send is always draft, then approved send. `mother whatsapp draft --chat <jid> --text-file <path>`
+  writes `<ws>/.mother/whatsapp/drafts/<id>.json` (`id`, chat, text, text sha256, created, `run`). Ids are `w`
+  plus 3 characters of `[a-z2-9]`. Drafts are machine-local, never synced, and expire after 72 hours. An edit is
+  a new draft with its own yes. A draft may only target an allowlisted chat. Routines may draft; they never
+  send (frontmatter `sends: [whatsapp.draft]`).
+- **Three approval paths** (`whatsapp.approve_via`), each shown the same wording, `WhatsApp -> <chat name>:
+  "<text>" - reply ok <id>`:
+
+  | Path | Manager says yes | Proof the guard checks |
+  |---|---|---|
+  | `slack_dm` | `ok <id>` in `manager.chat_dm` | a grant citing the manager's own message (channel, user = manager, ts), as for run grants |
+  | `self_chat` | `ok <id>` in "Message yourself" | the local database holds a `ZISFROMME` text `ok <id>` in the self chat after the draft was shown, whose stanza id is **not** in the bridge's `sent.jsonl` (MOTHER cannot approve itself) |
+  | `session` | `ok <id>` in the Claude session | the guard's `session_approvals` (genuine user messages only) |
+
+  Grammar: `ok <id> [<id>…]`, `ok all`, `no <id>`. One yes approves one draft: one exact text, one chat, once.
+  First valid yes wins. `no <id>` on any path drops the draft. A session may name explicit ids only; `ok all`
+  counts only on `self_chat` and `slack_dm`, where a batched prompt exists to resolve it.
+- **Send.** `mother whatsapp send <id>` goes through the guard, which loads the draft, checks the chat is
+  allowlisted and the draft unexpired, finds a proof by an enabled path, and writes
+  `<ws>/.mother/whatsapp/approved/<id>.json` (path that proved it, evidence key, text hash). The bridge checks
+  again: allowlist, approval file whose hash matches the draft, daily cap. The guard is the first lock, the
+  bridge the second. Unattended sends happen only in the `/mother:channels` poll, which runs
+  `mother whatsapp pending` (open drafts with a proven yes) and sends each.
+- **Limits.** `max_per_day` (default 20, ceiling 50) counts every send; `min_gap_seconds` (default 5, jittered)
+  between sends; one recipient per call; no first message to a JID with no prior message in the local
+  database. Self-chat prompts go to the manager's own number: they don't count toward `max_per_day` but toward
+  `max_prompts_per_day` (default 10), are batched to one prompt per routine run per path, and are held during
+  `manager.quiet_hours`.
+- **Machine-local state.** Bridge: `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`):
+  `session/` (device keys, 0600), `bridge.sock` (Unix socket, 0600, no TCP) and `sent.jsonl` (time, chat JID,
+  draft id, text hash, stanza id). Workspace, git-ignored: `.mother/whatsapp/drafts/`, `approved/`,
+  `prompts.jsonl`. `mother whatsapp link` shows the QR; `unlink` logs the device out and deletes the keys.
+  `.mother/PAUSED` stops all sends.
+- **Never.** Reading or storing a chat that is not on the allowlist; sending text the manager did not approve
+  word for word; sending by any path the guard cannot see; assessing a person from their messages.
 
 ## 6. Sync (`bin/mother sync`)
 
