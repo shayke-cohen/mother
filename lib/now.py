@@ -15,6 +15,7 @@ import fcntl
 import json
 import os
 import re
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
@@ -486,3 +487,174 @@ def apply_edit(doc: dict, st: dict) -> dict:
         out["swap_hint"] = None
     _mark_top_done(out.get("top") or [], {i["id"] for i in items}, before, (st or {}).get("items") or {})
     return out
+
+
+# ---------------------------------------------------------------- CLI
+
+USAGE = """mother now <verb>
+  merge                       stdin = merge input; writes now.json, prints the runs note
+  show [--json]               the list as text, or the raw now.json
+  done <id>                   hide an item (panel only)
+  snooze <id> <1h|tomorrow|next-week>
+  top set <item-id|text>...   set today's Top 3 (1-3 args)
+  top swap <rank> <item-id>   put an item at rank 1-3 (appends past the end)
+  top done <rank>             mark a Top 3 entry done
+  do <S-id>                   print the item and action JSON for the mother:now skill"""
+
+
+def _fail(msg: str):
+    print("mother: now: %s" % msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def _today(cfg: dict, at: datetime) -> str:
+    return at.astimezone(Schedule.from_config(cfg).tz).date().isoformat()
+
+
+def _find_item(doc: Optional[dict], iid: str) -> dict:
+    for i in (doc or {}).get("items") or []:
+        if i["id"] == iid:
+            return i
+    _fail("unknown item %r" % iid)
+
+
+def _note(doc: dict) -> str:
+    c = doc["counts"]
+    new = sum(1 for i in doc["items"] if i["section"] == "on_you" and i["state"] == "new")
+    bad = sorted(k for k, v in doc["coverage"].items() if v.get("status") != "ok")
+    return "%d on you (%d new), %d neglected, %d suggestions; couldn't check: %s" % (
+        c["on_you"], new, c["neglected"], c["suggestion"], ", ".join(bad) or "none")
+
+
+def _show(doc: dict) -> str:
+    out = ["Top 3 (%s)" % doc.get("top_date")]
+    for e in doc.get("top") or []:
+        out.append("  %d. [%s] %s%s" % (e["rank"], "x" if e["state"] == "done" else " ", e["title"],
+                                         " — " + e["why"] if e.get("why") else ""))
+    for sec, label in (("on_you", "On you"), ("neglected", "Neglected"), ("suggestion", "Suggestions")):
+        rows = [i for i in doc["items"] if i["section"] == sec]
+        out.append("%s (%d)" % (label, len(rows)))
+        for i in rows:
+            out.append("  %s%s — %s" % ("* " if i["state"] == "new" else "", i["title"], i["why"]))
+            out.append("    %s  [%s]" % (i["link"], i["id"]))
+            for a in i.get("actions") or []:
+                out.append("    %s: %s" % (a["id"], a["label"]))
+    if doc.get("status") != "ok":
+        bad = sorted(k for k, v in doc["coverage"].items() if v.get("status") != "ok")
+        out.append("Couldn't check: %s" % (", ".join(bad) or "none"))
+    return "\n".join(out)
+
+
+def _manager_top(doc: Optional[dict], st: dict, today: str) -> list:
+    """Entries of the manager's list for today, seeded from the current list when none is set yet."""
+    top = st.get("top")
+    if isinstance(top, dict) and top.get("date") == today:
+        return [dict(e) for e in top.get("entries") or []]
+    if doc and doc.get("top_date") == today:
+        return [{k: e.get(k) for k in ("title", "why", "link", "item_id", "state") if k in e}
+                for e in doc.get("top") or []]
+    return []
+
+
+def main(args, ws: Path, cfg: dict, at: datetime) -> None:
+    verb, rest = (args[0], args[1:]) if args else ("", [])
+    if verb in ("", "help", "-h", "--help"):
+        print(USAGE)
+        return
+    s = Schedule.from_config(cfg)
+    ws = Path(ws)
+    if verb == "show":
+        doc = load_now(ws)
+        if rest == ["--json"] and doc is not None:
+            print(json.dumps(doc, indent=2))
+        elif doc is None:
+            print("Tick hasn't run on this machine yet.")
+        else:
+            print(_show(doc))
+        return
+    if verb == "merge":
+        try:
+            inp = json.loads(sys.stdin.read())
+        except ValueError as e:
+            _fail("merge input is not JSON: %s" % e)
+        if not isinstance(inp, dict):
+            _fail("merge input must be a JSON object")
+        with locked(ws):
+            state = load_state(ws)
+            try:
+                doc = merge(inp, load_now(ws), state, cfg, at)
+            except (KeyError, ValueError, TypeError, AttributeError) as e:
+                _fail("merge input is unusable: %s" % e)
+            write_now(ws, doc)
+            save_state(ws, state)
+        print(_note(doc))
+        return
+    if verb == "do":
+        if len(rest) != 1:
+            _fail("usage: mother now do <S-id>")
+        doc = load_now(ws)
+        lapse = SUGGESTION_LAPSE_DAYS * day_hours(s)
+        for i in (doc or {}).get("items") or []:
+            for a in i.get("actions") or []:
+                if a["id"] == rest[0]:
+                    if i["section"] == "suggestion" and working_hours(_parse_iso(i["since"]), at, s) >= lapse:
+                        _fail("%s has lapsed" % rest[0])
+                    print(json.dumps({"item": i, "action": a}, indent=2))
+                    return
+        _fail("unknown action %r" % rest[0])
+    if verb in ("done", "snooze", "top"):
+        _edit(verb, rest, ws, cfg, at, s)
+        return
+    _fail("unknown verb %r — see `mother now help`" % verb)
+
+
+def _edit(verb: str, rest: list, ws: Path, cfg: dict, at: datetime, s: Schedule) -> None:
+    today = _today(cfg, at)
+    with locked(ws):
+        doc, st = load_now(ws), load_state(ws)
+        if doc is None:
+            _fail("no now.json yet — the tick has not run")
+        if verb == "done":
+            if len(rest) != 1:
+                _fail("usage: mother now done <id>")
+            _find_item(doc, rest[0])
+            st["items"][rest[0]] = {"state": "done", "until": None, "at": _iso(at)}
+        elif verb == "snooze":
+            if len(rest) != 2:
+                _fail("usage: mother now snooze <id> <1h|tomorrow|next-week>")
+            _find_item(doc, rest[0])
+            try:
+                until = snooze_until(rest[1], at, s)
+            except ValueError as e:
+                _fail(str(e))
+            st["items"][rest[0]] = {"state": "snoozed", "until": _iso(until), "at": _iso(at)}
+        else:
+            sub, rest = (rest[0], rest[1:]) if rest else ("", [])
+            entries = _manager_top(doc, st, today)
+            if sub == "set":
+                if not 1 <= len(rest) <= TOP_MAX:
+                    _fail("usage: mother now top set <item-id|text>... (1-%d)" % TOP_MAX)
+                entries = []
+                for a in rest:
+                    hit = next((i for i in doc["items"] if i["id"] == a), None)
+                    entries.append({"title": hit["title"], "why": hit["why"], "link": hit["link"], "item_id": hit["id"]}
+                                   if hit else {"title": a, "why": "", "link": None, "item_id": None})
+            elif sub == "swap":
+                if len(rest) != 2 or not rest[0].isdigit() or not 1 <= int(rest[0]) <= TOP_MAX:
+                    _fail("usage: mother now top swap <rank 1-%d> <item-id>" % TOP_MAX)
+                i = _find_item(doc, rest[1])
+                e = {"title": i["title"], "why": i["why"], "link": i["link"], "item_id": i["id"]}
+                r = int(rest[0])
+                if r <= len(entries):
+                    entries[r - 1] = e
+                else:
+                    entries.append(e)
+            elif sub == "done":
+                if len(rest) != 1 or not rest[0].isdigit() or not 1 <= int(rest[0]) <= len(entries):
+                    _fail("usage: mother now top done <rank> (an existing rank)")
+                entries[int(rest[0]) - 1]["state"] = "done"
+            else:
+                _fail("usage: mother now top set|swap|done ...")
+            st["top"] = {"date": today, "set_by": "manager", "entries": entries}
+        write_now(ws, apply_edit(doc, st))
+        save_state(ws, st)

@@ -463,5 +463,149 @@ class ManagerState(unittest.TestCase):
         self.assertEqual((e["top_date"], e["top"][0]["state"]), ("2026-10-27", "open"))
 
 
+import subprocess  # noqa: E402
+import shutil  # noqa: E402
+import tempfile as _tf  # noqa: E402
+
+CLI = os.path.join(ROOT, "bin", "mother")
+NOW_PIN = "2026-10-27T09:00:00Z"
+
+
+class NowCli(unittest.TestCase):
+    def setUp(self):
+        self._tmp = _tf.TemporaryDirectory()
+        self.ws = Path(self._tmp.name) / "ws"
+        self.ws.mkdir()
+        cfg = copy.deepcopy(CFG)
+        cfg.setdefault("connectors", {}).update({"code": "github", "chat": "slack", "tracker": "jira"})
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.env = dict(os.environ, MOTHER_WORKSPACE=str(self.ws), MOTHER_STATE_DIR=str(Path(self._tmp.name) / "st"),
+                        MOTHER_NOW=NOW_PIN)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_cli(self, *args, stdin=None):
+        return subprocess.run([sys.executable, CLI, "now", *args], capture_output=True, text=True,
+                              env=self.env, input=stdin)
+
+    def merge(self, *cands, **kw):
+        r = self.run_cli("merge", stdin=json.dumps(inp(*cands, **kw)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def doc(self):
+        r = self.run_cli("show", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def seed(self):
+        return self.merge(cand("review_requested", since="2026-10-26T07:00:00Z", link="https://example.com/pr/1",
+                               actions=[{"label": "Review it"}]),
+                          cand("pr_no_reviewer", since="2026-10-20T07:00:00Z", link="https://example.com/pr/2"),
+                          checked=["review_requested"], coverage={"code": "ok", "chat": "couldnt_check"})
+
+    def test_merge_writes_file_and_prints_note(self):
+        r = self.seed()
+        self.assertEqual(r.stdout.strip(), "1 on you (1 new), 1 neglected, 0 suggestions; couldn't check: chat")
+        self.assertTrue((self.ws / ".mother" / "now.json").is_file())
+        self.assertEqual(len(self.doc()["items"]), 2)
+
+    def test_merge_note_none(self):
+        r = self.merge(coverage={"code": "ok"})
+        self.assertTrue(r.stdout.strip().endswith("couldn't check: none"))
+
+    def test_merge_malformed_exits_2_and_keeps_file(self):
+        self.seed()
+        p = self.ws / ".mother" / "now.json"
+        before = p.read_bytes()
+        for bad in ("not json", "[1]"):
+            r = self.run_cli("merge", stdin=bad)
+            self.assertEqual(r.returncode, 2, bad)
+        self.assertEqual(p.read_bytes(), before)
+
+    def test_show_without_file(self):
+        r = self.run_cli("show")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Tick hasn't run on this machine yet.", r.stdout)
+
+    def test_show_text_lists_sections(self):
+        self.seed()
+        out = self.run_cli("show").stdout
+        self.assertIn("T review_requested", out)
+        self.assertLess(out.index("T review_requested"), out.index("T pr_no_reviewer"))
+
+    def test_done_hides_item_and_survives_merge(self):
+        self.seed()
+        iid = self.doc()["items"][0]["id"]
+        self.assertEqual(self.run_cli("done", iid).returncode, 0)
+        self.assertNotIn(iid, [i["id"] for i in self.doc()["items"]])
+        self.assertEqual(self.run_cli("done", "nope").returncode, 2)
+
+    def test_snooze(self):
+        self.seed()
+        iid = self.doc()["items"][0]["id"]
+        self.assertEqual(self.run_cli("snooze", iid, "tomorrow").returncode, 0)
+        self.assertNotIn(iid, [i["id"] for i in self.doc()["items"]])
+        st = json.loads((self.ws / ".mother" / "now-state.json").read_text())
+        self.assertEqual(st["items"][iid]["state"], "snoozed")
+
+    def test_snooze_bogus_exits_2(self):
+        self.seed()
+        iid = self.doc()["items"][0]["id"]
+        self.assertEqual(self.run_cli("snooze", "bogus", "1h").returncode, 2)
+        self.assertEqual(self.run_cli("snooze", iid, "someday").returncode, 2)
+
+    def test_top_set_item_and_free_text(self):
+        self.seed()
+        iid = self.doc()["items"][0]["id"]
+        r = self.run_cli("top", "set", iid, "Write the Q4 plan")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        top = self.doc()["top"]
+        self.assertEqual([e["set_by"] for e in top], ["manager", "manager"])
+        self.assertEqual((top[0]["title"], top[0]["item_id"]), ("T review_requested", iid))
+        self.assertEqual((top[1]["title"], top[1]["item_id"]), ("Write the Q4 plan", None))
+        self.assertEqual(self.run_cli("top", "set").returncode, 2)
+        self.assertEqual(self.run_cli("top", "set", "a", "b", "c", "d").returncode, 2)
+
+    def test_top_swap_and_append_and_done(self):
+        self.seed()
+        iid = self.doc()["items"][0]["id"]
+        other = self.doc()["items"][1]["id"]
+        self.run_cli("top", "set", "Plan")
+        self.assertEqual(self.run_cli("top", "swap", "3", iid).returncode, 0)
+        top = self.doc()["top"]
+        self.assertEqual([e["title"] for e in top], ["Plan", "T review_requested"])
+        self.assertEqual(self.run_cli("top", "swap", "1", other).returncode, 0)
+        self.assertEqual(self.doc()["top"][0]["item_id"], other)
+        self.assertEqual(self.run_cli("top", "swap", "1", "nope").returncode, 2)
+        self.assertEqual(self.run_cli("top", "swap", "4", iid).returncode, 2)
+        self.assertEqual(self.run_cli("top", "done", "2").returncode, 0)
+        self.assertEqual([e["state"] for e in self.doc()["top"]], ["open", "done"])
+        self.assertEqual(self.run_cli("top", "done", "3").returncode, 2)
+
+    def test_do_prints_item_and_action(self):
+        self.seed()
+        r = self.run_cli("do", "S1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["action"]["id"], "S1")
+        self.assertEqual(out["item"]["signal"], "review_requested")
+
+    def test_do_unknown_exits_2(self):
+        self.seed()
+        self.assertEqual(self.run_cli("do", "S9").returncode, 2)
+
+    def test_do_lapsed_suggestion_exits_2(self):
+        self.merge(cand("suggestion_waiting", since="2026-10-27T07:00:00Z", kind="todo",
+                        link="https://example.com/s", actions=[{"label": "Do"}]))
+        self.assertEqual(self.run_cli("do", "S1").returncode, 0)
+        self.env["MOTHER_NOW"] = "2026-11-03T09:00:00Z"
+        self.assertEqual(self.run_cli("do", "S1").returncode, 2)
+
+    def test_unknown_verb(self):
+        self.assertEqual(self.run_cli("bogus").returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

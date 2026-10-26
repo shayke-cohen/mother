@@ -16,6 +16,8 @@ Commands:
   channels <cmd>               reply modes for team channels (`mother channels help`)
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
+  now merge|show|done|snooze|top|do
+                               the Now list behind the hourly tick and panel (`mother now help`); merge reads JSON on stdin
   eval brief|verdict|report    A/B the brief's gather mode on the same inputs (`mother eval help`)
   health record|pick|classify|summary|merge|alert|pending  per-server connector health in capabilities.json (`mother health help`)
   speak [--in FILE] [--name N] [--voice V] [--rate WPM]
@@ -867,6 +869,16 @@ def cmd_items(args):
     items.main(args)
 
 
+def cmd_now(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import now
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        now.main(args, None, {}, _now())
+        return
+    ws = workspace()
+    now.main(args, ws, load_config(ws), _now())
+
+
 def cmd_eval(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import evals
@@ -883,7 +895,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "items": cmd_items, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "items": cmd_items, "now": cmd_now, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 
