@@ -429,7 +429,7 @@ class CliTest(unittest.TestCase):
             "- 2026-10-24T21:31:00Z reflect partial — chat search missing_scope\n"
             "- 2026-10-19T08:31:00Z doctor ok — 5 connectors\n"
             "- 2026-10-25T07:01:00Z doctor ok — 5 connectors\n"
-            "- 2026-10-19T08:00:00Z himalaya-weekly ok — not a configured routine\n"
+            "- 2026-10-19T08:00:00Z team-weekly ok — not a configured routine\n"
             "not a run line\n")
         r = run(["runs", "--json"], env)
         self.assertEqual(r.returncode, 2, r.stderr)
