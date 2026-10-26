@@ -161,12 +161,13 @@ Useful commands in your terminal:
 
 | Path | What |
 |---|---|
-| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `path`, `link` (Python 3.9 stdlib) |
+| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `runs`, `path`, `link`, `speak`, `tts`, `channels`, `items`, `eval` (Python 3.9 stdlib) |
 | `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
-| `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember` |
-| `lib/channels.py` | `mother channels`: the reply-mode engine behind `mother:channels` |
+| `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `commitments`, `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember` |
+| `agents/` | Read-only sub-agents: `reader` (one source) and `critic` (one draft) |
+| `lib/` | `channels.py` (reply-mode engine), `items.py` (reader evidence check), `evals.py` (A/B harness) |
 | `routines/` | What each scheduled run does |
-| `assets/deck/` | Weekly meeting deck with meeting mode |
+| `assets/deck/`, `assets/plan/` | Weekly meeting deck with meeting mode; sprint plan page |
 | `rules/` | Default policies: outbound, privacy, memory, todos, projects, teams |
 | `templates/workspace/` | A new workspace's skeleton |
 
@@ -175,6 +176,9 @@ Useful commands in your terminal:
 ```
 python3 -m unittest discover tests
 ```
+
+Start with [AGENTS.md](AGENTS.md) (rules, commands, release steps) and [ARCHITECTURE.md](ARCHITECTURE.md)
+(code map and how a run flows). Both are written for coding agents and humans alike.
 
 ## License
 
