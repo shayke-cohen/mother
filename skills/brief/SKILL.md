@@ -24,6 +24,18 @@ a connector set to `none`, or `capabilities.json` missing or older than 7 days �
 `⚠️ <source>: couldn't check — <value>`. **Never turn "couldn't check" into "nothing there."** A silent
 gap reads as "all clear", which is the worst possible failure for a brief.
 
+**Every external source gets a verdict.** The brief ends with a **Sources** line naming all five external
+sources (Calendar, Mail, Chat, Tracker, Code) in that order, each with exactly one state:
+- `✓ <n>`: read; `<n>` is how many of its items made the brief, and `0` means read and quiet
+- `partial — <what was left>`: read in part (mail bodies left unopened, channels you couldn't read, a
+  capped page)
+- `couldn't check — <why>`: not read
+- `off`: the connector is set to `none`
+
+Before you write it, go through the five and ask what you did with each. A source you never got to is
+`couldn't check — not reached`, never left off. A brief that omits a source is wrong, however good the
+rest is.
+
 How to reach a source: `config.connectors.<kind>` names the vendor; in `capabilities.json`,
 `servers["<kind>.<capability>"]` (when present) or else `connectors.<vendor>.server` names the tool prefix
 to use — one server may read while another searches. Code goes through `connectors.<code>.tool`
@@ -36,7 +48,7 @@ below) or `readers`. An A/B run passes it explicitly (see **Dry run** below).
 
 With `readers`, the five external sources (Calendar, Mail, Chat, Tracker, Code) each go to one
 `mother:reader` sub-agent. Dispatch them all **in one message**, so they run at the same time:
-- Dispatch only sources whose capability is `ok`. Anything else goes straight to "Couldn't check", as
+- Dispatch only sources whose capability is `ok`. Anything else goes straight into the Sources line as `couldn't check`, as
   in §0. A reader is never a way around a missing capability.
 - Each reader's brief contains:
   - the source;
@@ -47,12 +59,12 @@ With `readers`, the five external sources (Calendar, Mail, Chat, Tracker, Code) 
   It does not get the rest of the brief, config, or the manager's notes.
 - Pipe each reply, unedited, into `${CLAUDE_PLUGIN_ROOT}/bin/mother items check` through a quoted heredoc
   (`<<'READER'`). Write no file for it. Build the brief only from the checked output:
-  - Every `warning` goes under ⚠️ Couldn't check, word for word.
+  - Every `warning` becomes that source's state in the Sources line, word for word.
   - `dropped` items are gone. Don't go back and re-read the source to rescue them.
   - `counts` are one-line tallies ("16 assigned items stale 14+ days, not reprinted"), never findings.
   - A source with `status: ok` and no items is genuinely quiet. Say nothing, or one line if it matters.
   - Exit `2`, a reader that errored, or a reader that never answered all mean
-    `⚠️ <source>: couldn't check — reader failed`. Never leave that source out.
+    `<Source> couldn't check — reader failed` in the Sources line. Never leave that source out.
 - If the Agent tool isn't available, gather inline and say `readers unavailable — gathered inline` in the
   runs note.
 
@@ -161,7 +173,7 @@ Lead with what's time-critical. A quiet day gets a short brief; don't pad. Under
 ### From last night
 - <journal item that needs the manager>        (omit if none)
 
-⚠️ Couldn't check: <source> — <capability value or error>
+**Sources:** Calendar ✓ 3 · Mail partial — 8 of 31 opened · Chat ✓ 2 · Tracker ✓ 0 · Code couldn't check — gh not authenticated
 ```
 
 ## Rules

@@ -98,8 +98,9 @@ LIST_LINE = re.compile(r"^\s*(?:[-*]|\d+\.)\s+\S")
 
 def couldnt_sources(text):
     out = set()
-    for line in (text or "").splitlines():
-        low = line.lower()
+    # One source per clause: the brief's Sources line puts all five on one line, separated by "·".
+    for clause in re.split(r"[·\n]", text or ""):
+        low = clause.lower()
         if "couldn't check" in low or "couldnt check" in low or "could not check" in low:
             out.update(s for s in items.SOURCES if re.search(r"\b%s\b" % s, low))
     return out

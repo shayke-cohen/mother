@@ -87,6 +87,11 @@ class TestScore(unittest.TestCase):
         s = evals.score_pair({"inline": "- https://github.com/acme/web/pull/9\n", "readers": "- web#9\n"})
         self.assertEqual((s["inline"]["recall"], s["readers"]["recall"]), (1.0, 1.0))
 
+    def test_sources_line_flags_only_its_own_clause(self):
+        line = ("**Sources:** Calendar ✓ 3 · Mail partial — 8 of 31 opened · Chat ✓ 2 · Tracker ✓ 0 · "
+                "Code couldn't check — gh not authenticated")
+        self.assertEqual(evals.couldnt_sources(line), {"code"})
+
     def test_empty_pair(self):
         s = evals.score_pair({"inline": "", "readers": ""})
         self.assertEqual((s["inline"]["recall"], s["inline"]["cited"]), (1.0, 1.0))
