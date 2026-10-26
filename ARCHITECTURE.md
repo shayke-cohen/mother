@@ -1,0 +1,104 @@
+# Architecture
+
+A map of the code, for whoever changes it next. *Why* lives in [docs/DESIGN.md](docs/DESIGN.md); the exact
+rules (file formats, config keys, guard decisions) live in [docs/CONTRACT.md](docs/CONTRACT.md). This page
+says where things are and how they connect.
+
+## The big idea
+
+MOTHER is a Claude Code **plugin**. Most of its behaviour is Markdown the model follows (skills, routines,
+rules). The parts that must hold even when the model forgets, gets confused or reads a hostile email are
+**Python**, and they run outside the model's control: a hook that judges every outbound call, a CLI that owns
+state and git, and small engines whose JSON answers the skills must use.
+
+```
+            plugin repo (shared, versioned)                    workspace (one per manager, private)
+ ┌─────────────────────────────────────────────┐      ┌──────────────────────────────────────────┐
+ │ Markdown the model follows                  │      │ config.json        who, teams, routines  │
+ │   skills/   routines/   rules/   agents/    │ ───▶ │ capabilities.json  what the doctor proved│
+ │                                             │reads │ memory/ todos/ people/ teams/ projects/  │
+ │ Python that holds regardless                │writes│ journal/ one-on-ones/  runs.md           │
+ │   hooks/guard.py  bin/mother  lib/*.py      │      │ .mother/  machine-local state (gitignored)│
+ └─────────────────────────────────────────────┘      └──────────────────────────────────────────┘
+```
+
+Plugin = code, workspace = data. The plugin never stores anything about a manager; the workspace never
+holds code a later session would run.
+
+## Code map
+
+| Path | What it is | Notes |
+|---|---|---|
+| `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
+| `hooks/hooks.json` | Wires the hooks | PreToolUse → guard; Stop and SessionEnd → `mother sync --quiet` |
+| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. CONTRACT §5 |
+| `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval` to `lib/` |
+| `lib/channels.py` | Reply-mode engine behind `mother:channels` | The skill does chat I/O; this decides who, when, and what. CONTRACT §5b |
+| `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
+| `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
+| `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
+| `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |
+| `routines/<id>.md` | What one scheduled run does | Frontmatter: `id`, `needs`, `writes`, `sends`, `config`, `default` |
+| `agents/` | Read-only sub-agents: `reader` (one source → cited JSON), `critic` (draft → PASS/FIX) | Read-only is enforced by the guard, not the frontmatter alone |
+| `rules/` | Policy text the skills cite: outbound, privacy, memory, todos, projects, teams | When `outbound.md` and the guard disagree, the guard wins |
+| `assets/deck/`, `assets/plan/` | Self-contained HTML templates + `build.py` (JSON in → HTML out) | Meeting deck with meeting mode; sprint plan page |
+| `templates/workspace/` | Skeleton `mother init` copies into a new workspace | Includes the **persona** `AGENTS.md` for the manager's agent |
+| `tests/` | stdlib `unittest`, one module per Python component plus packaging | `test_packaging` checks every runtime file is tracked |
+| `docs/` | CONTRACT (spec), DESIGN (why), ROADMAP (stages) | `docs/drafts/`, `docs/superpowers/` are untracked personal notes |
+
+Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `digest`, `dots`, `commitments`,
+`one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`.
+
+Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `commitments`, `one-on-one`, `meeting-prep`,
+`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
+
+## How a scheduled run flows
+
+```
+Claude Code scheduler (desktop app, home machine only, local-time cron from `mother register`)
+  └─ thin pointer prompt: cd <workspace>; git pull --rebase; run mother:routine with id <id>
+      └─ skills/routine  ── mother home check · stop on .mother/PAUSED · mother status · day check
+          │                 load capabilities.json → any `needs` not ok = run is `partial`
+          └─ routines/<id>.md  ── step list, calling skills (mother:brief, mother:todo, …)
+              ├─ gather: connectors directly, or one mother:reader per source → `mother items check`
+              ├─ judge and write: workspace files (journal/, todos/, teams/…)
+              ├─ check: mother:critic on any draft another person will see
+              ├─ send: MCP / gh call ──▶ hooks/guard.py decides allow · ask · deny, logs to .mother/guard.log
+              └─ one line in runs.md
+  └─ Stop hook: mother sync → secret scan → commit → pull --rebase → push
+```
+
+An interactive request ("brief me") enters at the skill and skips the dispatcher.
+
+## How a channel reply flows
+
+```
+/loop /mother:channels   (a Claude session, cheap model)
+  ├─ mother channels plan          → what to poll
+  ├─ skill reads chat              → mother channels triage (stdin JSON) → actions
+  ├─ mother channels run --action  → headless `claude -p` with MOTHER_CHANNEL_ROLE=manager|team|anyone
+  │                                   the guard narrows that session: no outbound, limited reads
+  ├─ answer → guard grant written; skill posts the signed reply │ draft → manager's DM │ skip
+  └─ mother channels done          → state in .mother/channels.json, audit in .mother/channels.log
+```
+
+## Invariants the code relies on
+
+- **One writer.** Only MOTHER (the routine or interactive session) judges, writes and posts. Sub-agents and
+  channel sessions read and hand back data; their output approves nothing.
+- **Capabilities before claims.** A routine reads `capabilities.json` first. A source it couldn't reach is
+  reported as "couldn't check", never as quiet.
+- **Evidence or silence.** Anything shown to the manager cites a link; `lib/items.py` enforces this for
+  readers.
+- **Fail closed.** No workspace, a bad config or a crash in the guard means *ask*, never *allow*. The guard
+  never answers *allow* for a call it doesn't recognise.
+- **Tighten only.** Workspace policy and personal rules may narrow the plugin's defaults, never widen them.
+- **Machine-local vs synced.** `.mother/` (grants, ledger, guard log, channel state, audio, eval pairs) is
+  gitignored and per machine; everything else in the workspace syncs.
+
+## Finding things
+
+- The workspace path: `$MOTHER_WORKSPACE`, else `$MOTHER_STATE_DIR/workspace` (default `~/.mother/workspace`).
+- Plugin files from a skill: `${CLAUDE_PLUGIN_ROOT}/…`. Routines never hard-code a path.
+- Environment switches: `MOTHER_DRY_RUN` (guard denies all outbound), `MOTHER_NO_SYNC` (sync is a no-op),
+  `MOTHER_CHANNEL_ROLE` / `MOTHER_CHANNEL_SERVERS` (channel session limits), `MOTHER_HOSTNAME` (tests).
