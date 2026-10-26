@@ -119,9 +119,9 @@ Present, in this order:
 3. Channels with proposed modes.
 4. Routines with times in the manager's time zone (defaults from `templates/workspace/config.example.json`;
    omit routines whose sources don't exist — no `digest` sprint section without a tracker, etc.). The
-   `doctor` routine is `days: "all"` with `at` 30 minutes before the earliest `routines.*.at`, never before
+   `doctor` routine is `days: "all"` with `at` 30 minutes before the earliest `routines.*.at` other than the doctor's own, never before
    05:00. In Edit mode on an existing install whose doctor is weekly or differently timed, show that as a
-   changed key — asked once, for the manager's yes like every other change.
+   changed key — asked once, for the manager's yes like every other change; if the manager declines, don't ask again.
 5. The full `config.json` draft, as JSON.
 6. What you could **not** discover and why (missing capability, no data).
 
