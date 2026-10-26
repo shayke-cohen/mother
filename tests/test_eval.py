@@ -72,16 +72,16 @@ class TestScore(unittest.TestCase):
 
     def test_coverage_weighs_sources_not_link_counts(self):
         # The first live pair: inline listed ten PRs but read only the DM; readers read mail and channels.
-        prs = ", ".join(["himalaya#%d" % n for n in range(4740, 4750)])
+        prs = ", ".join(["app#%d" % n for n in range(4740, 4750)])
         inline = "- Review: %s\n- DM: https://acme.slack.com/archives/D1/p1\n" % prs
-        readers = ("- Review: himalaya#4745, #4744, acme/web#9\n- Sagy — https://mail.google.com/mail/u/0/#inbox/a1\n"
+        readers = ("- Review: app#4745, #4744, acme/web#9\n- Alex — https://mail.google.com/mail/u/0/#inbox/a1\n"
                    "- Chat — https://acme.slack.com/archives/C1/p1\n- Chat — https://acme.slack.com/archives/C2/p2\n"
                    "- Chat — https://acme.slack.com/archives/C3/p3\n")
         s = evals.score_pair({"inline": inline, "readers": readers})
         self.assertGreater(s["inline"]["recall"], s["readers"]["recall"])      # link counting favours inline
         self.assertEqual(s["inline"]["coverage"], 0.444)                       # (10/10 + 0/1 + 1/3) / 3
         self.assertEqual(s["readers"]["coverage"], 0.767)                      # (3/10 + 1/1 + 3/3) / 3
-        self.assertEqual(s["readers"]["per_source"]["code"], 3)                # #4744 read as himalaya#4744
+        self.assertEqual(s["readers"]["per_source"]["code"], 3)                # #4744 read as app#4744
 
     def test_same_pr_cited_two_ways_counts_once(self):
         s = evals.score_pair({"inline": "- https://github.com/acme/web/pull/9\n", "readers": "- web#9\n"})

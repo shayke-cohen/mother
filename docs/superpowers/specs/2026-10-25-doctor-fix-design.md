@@ -12,19 +12,19 @@ What the `runs.md` lines for 2026-10-25 show:
 
 | Run | What broke |
 |---|---|
-| weekly-snapshot `failed` | Willow Jira unreachable (offline / VPN) |
-| commitments `partial` | Willow Gmail offline; DM went out through the claude.ai Slack connector instead |
-| one-on-one `failed` | Willow Calendar offline **and** claude.ai Calendar "connection invalidated" |
-| brief, dots, meeting-prep `partial` | Slack search and private history need scopes Willow lacks; capabilities.json missing at run time |
+| weekly-snapshot `failed` | Acme Jira unreachable (offline / VPN) |
+| commitments `partial` | Acme Gmail offline; DM went out through the claude.ai Slack connector instead |
+| one-on-one `failed` | Acme Calendar offline **and** claude.ai Calendar "connection invalidated" |
+| brief, dots, meeting-prep `partial` | Slack search and private history need scopes Acme lacks; capabilities.json missing at run time |
 
 Three lessons drive the design:
 
 1. **A "connected" status lies.** On 2026-10-25 claude.ai Calendar showed `connected` in both
    `claude mcp list` and the session's connector status, but a real call returned "connection was
    invalidated". Only a real call counts.
-2. **Most failures are shared or temporary, not expired sign-ins.** When Willow is unreachable (off VPN),
-   every Willow server fails together. Re-trying or switching servers fixes that. A human sign-in doesn't.
-3. **There are already two servers for each important kind.** Willow and the claude.ai connectors overlap
+2. **Most failures are shared or temporary, not expired sign-ins.** When Acme is unreachable (off VPN),
+   every Acme server fails together. Re-trying or switching servers fixes that. A human sign-in doesn't.
+3. **There are already two servers for each important kind.** Acme and the claude.ai connectors overlap
    for chat, mail, calendar and tracker. One of them failing shouldn't fail a routine.
 
 ## Goals
@@ -40,7 +40,7 @@ Three lessons drive the design:
 
 - Git sync failures (`pull --rebase` with unstaged changes or several branches). These are real and appear
   in the same log, but they are plumbing, not connectors. Separate follow-up.
-- Installing new connectors, or changing Willow or connector infrastructure.
+- Installing new connectors, or changing Acme or connector infrastructure.
 - Connecting a VPN or changing any system or security setting.
 
 ## Anti-goals (failure even if it "works")
@@ -63,7 +63,7 @@ The doctor classifies by **what fixes it**, recorded alongside the existing CONT
 
 | Class | How it shows up | Fix |
 |---|---|---|
-| `unreachable` | Network or timeout error; **every** server on one gateway fails together (Willow at `mcp-s.wewix.net`) | Switch to the other server; tell the manager "connect VPN" only if nothing else covers the capability |
+| `unreachable` | Network or timeout error; **every** server on one gateway fails together (Acme at `mcp.acme.internal`) | Switch to the other server; tell the manager "connect VPN" only if nothing else covers the capability |
 | `dropped` | Server status `failed`, or "connection closed" on a call | Reconnect (`reconnect_session_connector` for claude.ai connectors), re-test |
 | `invalidated` / `expired` | "Connection invalidated", "reconnect from connector settings", 401, `needs_auth` | Human sign-in (assisted, §5); meanwhile switch servers |
 | `missing_scope:<s>` / `denied` | As today | No healing. Send that capability to the server that has it (as today) |
@@ -77,19 +77,19 @@ Extend CONTRACT §4. Today `servers.<capability>` holds one prefix. It becomes a
 first server is preferred, and the rest are tested backups.
 
 ```json
-"slack": { "server": "mcp__Willow_Slack__slack",
+"slack": { "server": "mcp__Acme_Slack__slack",
            "read": "ok", "post": "ok", "search": "ok",
-           "servers": { "read":   ["mcp__Willow_Slack__slack", "mcp__<claude.ai slack>"],
+           "servers": { "read":   ["mcp__Acme_Slack__slack", "mcp__<claude.ai slack>"],
                         "search": ["mcp__<claude.ai slack>"],
-                        "post":   ["mcp__Willow_Slack__slack", "mcp__<claude.ai slack>"] },
-           "health":  { "mcp__Willow_Slack__slack": {
+                        "post":   ["mcp__Acme_Slack__slack", "mcp__<claude.ai slack>"] },
+           "health":  { "mcp__Acme_Slack__slack": {
                           "read": {"status": "error:unreachable", "class": "unreachable",
                                    "checked_at": "…", "alerted_at": null},
                           "search": {"status": "missing_scope:search:read", "class": "missing_scope", "checked_at": "…"} },
                         "mcp__<claude.ai slack>": {
                           "read": {"status": "ok", "checked_at": "…"} } },
            "stamps":  ["mcp__<claude.ai slack>"],
-           "token":   { "mcp__Willow_Slack__slack": "user", "mcp__<claude.ai slack>": "user" } }
+           "token":   { "mcp__Acme_Slack__slack": "user", "mcp__<claude.ai slack>": "user" } }
 ```
 
 Settled after review (my calls):
@@ -169,9 +169,9 @@ The aim is to bring the manager to a single click, not to sign in for them.
   manager's behalf. After that, re-test.
 - **Fallback when browser driving fails**, or the page isn't reachable: give the exact path
   (Settings → Connectors → <name> → Reconnect, or `/mcp` in a terminal session) and wait for "done".
-- **Willow `unreachable`**: check the gateway host. When it's down, say "Willow is unreachable, probably
+- **Acme `unreachable`**: check the gateway host. When it's down, say "Acme is unreachable, probably
   VPN. Connect and say done". Don't touch the VPN.
-- **Willow sign-in** (`needs_auth` on a Willow server): use the server's own `authenticate` tool when it
+- **Acme sign-in** (`needs_auth` on a Acme server): use the server's own `authenticate` tool when it
   has one, and show the URL in the session only.
 
 ### 6. Unattended alerts
@@ -202,7 +202,7 @@ Each failure and fix is logged as one line in `<workspace>/health.md`, with no c
 - <UTC ISO> <kind>.<capability> <server-short> <class> → <fixed-by|open>
 ```
 
-`/mother:doctor` ends with a 7-day summary from it: "Willow unreachable 4× (all off-VPN hours);
+`/mother:doctor` ends with a 7-day summary from it: "Acme unreachable 4× (all off-VPN hours);
 claude.ai Calendar invalidated 1×". That tells the manager whether the problem is the gateway, the
 connector, or the schedule.
 
@@ -227,12 +227,12 @@ connector, or the schedule.
   **scheduled** run. Check each one; any that isn't is skipped in unattended mode.
 - How to locate the claude.ai connector settings page and its Reconnect control. Discover it live and
   don't hard-code coordinates.
-- Gateway host detection: derive it from `claude mcp list` URLs, not a hard-coded Willow name (doctor
+- Gateway host detection: derive it from `claude mcp list` URLs, not a hard-coded Acme name (doctor
   rule: never assume a server name).
 
 ## Decisions and calls to check (items 2–8 made by Claude, not yet confirmed by the manager)
 
-1. **Decided by the manager (2026-10-25):** when Willow Slack is down, a DM to the manager may go through
+1. **Decided by the manager (2026-10-25):** when Acme Slack is down, a DM to the manager may go through
    claude.ai Slack, stamp included. This applies to the manager's own DM only.
 6. A write to others falls back only to a server with no stamp and the same identity; otherwise it is
    queued and the manager is asked. The guard enforces the stamp part.

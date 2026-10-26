@@ -143,7 +143,7 @@ are Markdown, and they call the CLI instead of editing JSON. `lib/channels.py` r
     | anything else | `("error:" + scrub(text)[:40], "other")`. `scrub` replaces runs of digits and hex ids (≥8 chars) with `#` |
 
   - `server_short(prefix) -> str`: drop `mcp__`. For an opaque id segment (≥16 hex/dash characters), keep
-    the first 8. `mcp__Willow_Slack__slack` → `Willow_Slack__slack`.
+    the first 8. `mcp__Acme_Slack__slack` → `Acme_Slack__slack`.
   - `health_line(now, kind, cap, server, cls, fixed_by) -> str`, exactly:
     `- <UTC ISO Z> <kind>.<cap> <server_short> <cls> → <fixed_by|open>`. The log goes in
     `<workspace>/health.md`, which is created with the header line
@@ -347,8 +347,8 @@ Content requirements (from spec §1, §3, §5, §6, §8). The skill must:
   `anthropic-skills:built-in-browser` skill first). Open the claude.ai connector settings and click
   Reconnect. In the account picker, pick the manager's own Google account. **Stop** at a password, 2FA or
   consent screen and say "click Allow in the browser pane". Never type credentials. Never click consent
-  on the manager's behalf. When the browser path fails, give the manual path. For Willow `unreachable`,
-  say "probably VPN — connect and say done" and never touch the VPN. For a Willow `needs_auth`, use the
+  on the manager's behalf. When the browser path fails, give the manual path. For Acme `unreachable`,
+  say "probably VPN — connect and say done" and never touch the VPN. For a Acme `needs_auth`, use the
   server's own `authenticate` tool.
 - **End with `mother health summary`** under the table, then the existing `mother runs` rows.
 - **`/mother:doctor fix`** (and the default for interactive runs) runs the ladder.
@@ -397,10 +397,10 @@ No new code. This proves the feature on the manager's real setup. Run it **inter
 manager**, since it may reach a browser sign-in.
 
 - [ ] **Step 1:** Load the plugin from the worktree (`claude --plugin-dir <worktree>` in a fresh session),
-  and run `mother status` with `MOTHER_WORKSPACE=/Users/shayco/mother-workspace`. Expected: a valid config,
+  and run `mother status` with `MOTHER_WORKSPACE=~/mother-workspace`. Expected: a valid config,
   and the `health:` line renders from today's legacy file without error.
 - [ ] **Step 2:** Run `/mother:doctor fix`. Expected on 2026-10-25's state:
-  - claude.ai Google Calendar `read` is `expired`/`invalidated` and covered by Willow Calendar (`fallback`).
+  - claude.ai Google Calendar `read` is `expired`/`invalidated` and covered by Acme Calendar (`fallback`).
   - The assisted sign-in opens the connector settings and stops for the manager's click.
   - After the click, a re-test shows `ok` with `→ you` in `health.md`.
 - [ ] **Step 3:** With the manager's OK, disconnect VPN and run

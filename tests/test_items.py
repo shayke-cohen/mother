@@ -62,7 +62,7 @@ class TestCheck(unittest.TestCase):
 
     def test_noise_count_with_a_query_is_a_count_not_a_failure(self):
         # The live tracker reader found nothing recent and reported only a stale-backlog tally cited by its JQL.
-        jql = "project = MOBPUB AND assignee = currentUser() AND statusCategory != Done AND updated < -14d"
+        jql = "project = PLAT AND assignee = currentUser() AND statusCategory != Done AND updated < -14d"
         code, r = items.check(reply(source="tracker", its=[it(jql, title="16 assigned issues stale 14+ days",
                                                                state="noise")]))
         self.assertEqual((code, r["coverage"]["status"], r["warning"]), (0, "ok", None))
@@ -110,10 +110,10 @@ class TestLinks(unittest.TestCase):
                                               "https://acme.slack.com/archives/C1/p2", "acme/web#412", "PLAT-12"])
 
     def test_short_and_bare_pr_refs(self):
-        md = ("- Review (10): wix-private/himalaya#4745, #4744; app-smith-agent#712, #709\n"
+        md = ("- Review (10): acme/app#4745, #4744; agent-svc#712, #709\n"
               "- Plugin PR #2 is blocked\n- Slack #platform-support stays out")
-        self.assertEqual(items.links_in(md), ["wix-private/himalaya#4745", "himalaya#4744", "app-smith-agent#712",
-                                              "app-smith-agent#709"])
+        self.assertEqual(items.links_in(md), ["acme/app#4745", "app#4744", "agent-svc#712",
+                                              "agent-svc#709"])
 
     def test_canon(self):
         for v in ("https://github.com/acme/web/pull/412", "acme/web#412", "web#412", "Web#412"):

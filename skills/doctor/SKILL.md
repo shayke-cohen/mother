@@ -181,7 +181,7 @@ or token, never click a consent/Allow screen, never toggle a VPN or system setti
   browser pane"; then re-test.
 - **Browser path fails or the page is unreachable**: give the manual path (Settings -> Connectors -> the
   connector -> Reconnect, or `/mcp` in a terminal) and wait for "done".
-- **Gateway server `unreachable`** (e.g. Willow): say "<gateway> is unreachable, probably VPN. Connect and
+- **Gateway server `unreachable`** (e.g. Acme): say "<gateway> is unreachable, probably VPN. Connect and
   say done." Do not touch the VPN.
 - **Gateway server `needs_auth`**: use that server's own `authenticate` tool. A signed sign-in URL is a
   credential: show it in the session only, never in a file, log, memory or commit.

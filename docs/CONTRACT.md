@@ -84,15 +84,15 @@ The CLI validates this (`mother status`) and fails loudly on unknown keys or a w
 ## 4. `capabilities.json`
 
 ```json
-{ "checked_at": "2026-10-23T08:00:00Z", "host": "shays-mbp",
+{ "checked_at": "2026-10-23T08:00:00Z", "host": "home-mac",
   "connectors": {
-    "slack":   { "server": "mcp__Willow_Slack__slack",
+    "slack":   { "server": "mcp__Acme_Slack__slack",
                  "read": "ok", "post": "ok", "search": "ok",
-                 "servers": { "read":   ["mcp__Willow_Slack__slack", "mcp__<claude.ai slack>"],
+                 "servers": { "read":   ["mcp__Acme_Slack__slack", "mcp__<claude.ai slack>"],
                               "search": ["mcp__<claude.ai slack>"],
-                              "post":   ["mcp__Willow_Slack__slack", "mcp__<claude.ai slack>"] },
-                 "health":  { "mcp__Willow_Slack__slack": {
-                                "_gateway": "mcp-s.wewix.net",
+                              "post":   ["mcp__Acme_Slack__slack", "mcp__<claude.ai slack>"] },
+                 "health":  { "mcp__Acme_Slack__slack": {
+                                "_gateway": "mcp.acme.internal",
                                 "read": {"status": "error:unreachable", "class": "unreachable",
                                          "checked_at": "2026-10-25T07:30:00Z"},
                                 "search": {"status": "missing_scope:search:read", "class": "missing_scope",
@@ -100,7 +100,7 @@ The CLI validates this (`mother status`) and fails loudly on unknown keys or a w
                               "mcp__<claude.ai slack>": {
                                 "read": {"status": "ok", "checked_at": "2026-10-25T07:30:00Z"} } },
                  "stamps":  ["mcp__<claude.ai slack>"],
-                 "token":   { "mcp__Willow_Slack__slack": "user", "mcp__<claude.ai slack>": "user" } },
+                 "token":   { "mcp__Acme_Slack__slack": "user", "mcp__<claude.ai slack>": "user" } },
     "jira":    { "server": "...", "read": "ok", "create": "ok|untested|denied", "transition": "...", "sprint": "..." },
     "calendar":{ "server": "...", "read": "ok" }, "mail": { ... }, "code": { "tool": "gh", "read": "ok" } },
   "notes": [ "tracker: sprint update is a full replace; names max 30 chars" ] }
@@ -114,7 +114,7 @@ Per connector:
 | `<cap>` (`read`, `post`, …) | The **rollup** for that capability: `ok` when any server in its list is `ok`, else the first (preferred) server's status. Routines that read only this keep working. |
 | `servers.<cap>` | Ordered list of server prefixes. First = preferred, rest = tested backups. The order is a preference, not a cache: setup and the doctor write it, preferring a server with no stamp and the manager's identity. A failure never reorders it; `mother health pick` takes the first server whose entry is `ok`, so a recovered server is used again. For a **write** capability (`post`, `post_dm`, `create`, `comment`, `transition`, `sprint`, `draft`, `send`, `write`), which the doctor never probes unattended, it then takes the first `untested` one and says `"verified": false`; failing statuses are never picked. `pick` on a tool-based connector returns `{"server": null, "tool": "gh", "status": …}`. |
 | `health.<server>.<cap>` | One server's result: `status` (value list below), `class`, `checked_at` (ISO UTC), and when alerted `alerted_at`, `alerted_class`, `pending`. |
-| `health.<server>._gateway` | The gateway host the server shares with others (Willow). Keys starting `_` are metadata, not capabilities. Servers on one gateway that fail with a network error are one `unreachable` issue. |
+| `health.<server>._gateway` | The gateway host the server shares with others (Acme). Keys starting `_` are metadata, not capabilities. Servers on one gateway that fail with a network error are one `unreachable` issue. |
 | `stamps` | Server prefixes that add their own attribution to chat writes. The guard reads this (§5). |
 | `token` | `{server: user\|bot}` — the identity each server writes as. A write to anyone but the manager falls back (`pick --target other`) only to a server with no stamp whose token is known and equal to the preferred server's. |
 

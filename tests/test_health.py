@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "bin" / "mother"
-W = "mcp__Willow_Slack__slack"
+W = "mcp__Acme_Slack__slack"
 C = "mcp__claudeai_slack"
 NOW = 1_700_000_000
 ISO_NOW = "2023-11-14T22:13:20Z"
@@ -238,16 +238,16 @@ class HealthTest(unittest.TestCase):
     def test_server_short(self):
         sys.path.insert(0, str(ROOT / "lib"))
         import health
-        self.assertEqual(health.server_short(W), "Willow_Slack__slack")
+        self.assertEqual(health.server_short(W), "Acme_Slack__slack")
         self.assertEqual(health.server_short("mcp__486bd9bf-5fd4-4917-848c-4f2ddfdfb82e"), "486bd9bf")
 
     def test_health_line_format(self):
         sys.path.insert(0, str(ROOT / "lib"))
         import health
         self.assertEqual(health.health_line(ISO_NOW, "chat", "read", W, "unreachable", None),
-                         "- 2023-11-14T22:13:20Z chat.read Willow_Slack__slack unreachable \u2192 open")
+                         "- 2023-11-14T22:13:20Z chat.read Acme_Slack__slack unreachable \u2192 open")
         self.assertEqual(health.health_line(ISO_NOW, "chat", "read", W, "unreachable", "fallback"),
-                         "- 2023-11-14T22:13:20Z chat.read Willow_Slack__slack unreachable \u2192 fallback")
+                         "- 2023-11-14T22:13:20Z chat.read Acme_Slack__slack unreachable \u2192 fallback")
 
     def test_record_logs_open_then_fixed_once(self):
         self.rec("error:unreachable", W, "read", "unreachable")
@@ -283,7 +283,7 @@ class HealthTest(unittest.TestCase):
         self.rec("ok", W, "send", None, "--fixed-by", "retry")
         self.rec("error:unreachable", C, "read", "unreachable")
         out = self.run_cli("summary").stdout.strip().splitlines()
-        self.assertIn("Willow_Slack__slack dropped \u00d72 (fixed: retry 1; open 1)", out)
+        self.assertIn("Acme_Slack__slack dropped \u00d72 (fixed: retry 1; open 1)", out)
         self.assertIn("claudeai_slack unreachable \u00d71 (open 1)", out)
         self.assertEqual(len(out), 2)
 
@@ -550,22 +550,22 @@ class HealthTest(unittest.TestCase):
         self.merge({"server": W, "read": "ok", "servers": {"read": [W, C]}, "health": {
             W: {"_gateway": "gw.example", "read": down}, C: {"read": {"status": "ok", "class": None}}}})
         lines = [l for l in self.health_md().splitlines() if l.startswith("- ")]
-        self.assertEqual(lines, ["- %s chat.read Willow_Slack__slack unreachable → open @gw.example" % ISO_NOW])
+        self.assertEqual(lines, ["- %s chat.read Acme_Slack__slack unreachable → open @gw.example" % ISO_NOW])
         self.merge({"server": W, "read": "ok", "servers": {"read": [W, C]}, "health": {
             W: {"_gateway": "gw.example", "read": down}, C: {"read": {"status": "ok", "class": None}}}})
         self.rec("error:unreachable", W, "read", "unreachable")  # the ladder's re-test: same issue
         self.rec("ok", C, "read", None, "--fixed-by", "fallback")  # backup was already ok
         lines = [l for l in self.health_md().splitlines() if l.startswith("- ")]
         self.assertEqual(len(lines), 2, lines)
-        self.assertEqual(lines[1], "- %s chat.read Willow_Slack__slack unreachable → fallback @gw.example" % ISO_NOW)
+        self.assertEqual(lines[1], "- %s chat.read Acme_Slack__slack unreachable → fallback @gw.example" % ISO_NOW)
         out = self.run_cli("summary").stdout.strip().splitlines()
-        self.assertEqual(out, ["Willow_Slack__slack unreachable ×2 (fixed: fallback 1; open 1)"])
+        self.assertEqual(out, ["Acme_Slack__slack unreachable ×2 (fixed: fallback 1; open 1)"])
 
     def test_i1_fallback_logged_when_backup_had_no_entry(self):
         self.write_caps({"server": W, "read": "error:unreachable", "servers": {"read": [W]}, "health": {
             W: {"read": {"status": "error:unreachable", "class": "unreachable", "checked_at": iso_ago(1)}}}})
         self.rec("ok", C, "read", None, "--fixed-by", "fallback")
-        self.assertTrue(self.health_md().rstrip().endswith("chat.read Willow_Slack__slack unreachable → fallback"))
+        self.assertTrue(self.health_md().rstrip().endswith("chat.read Acme_Slack__slack unreachable → fallback"))
 
     def gateway_caps(self, cls="unreachable"):
         st = "error:unreachable" if cls == "unreachable" else "expired"
@@ -655,7 +655,7 @@ class HealthTest(unittest.TestCase):
         self.rec("ok", C, "read", None, "--fixed-by", "fallback")
         lines = [l for l in self.health_md().splitlines() if l.startswith("- ")]
         self.assertEqual(sorted(l.split(" ", 3)[3] for l in lines),
-                         ["Willow_Slack__slack unreachable → fallback", "claudeai_slack unreachable → fallback"])
+                         ["Acme_Slack__slack unreachable → fallback", "claudeai_slack unreachable → fallback"])
 
     def test_merge_does_not_refresh_skipped_connectors(self):
         old = self.real_shape()

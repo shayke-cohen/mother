@@ -28,7 +28,7 @@ NOTE_MAX = 200
 URL = re.compile(r"https?://[^\s<>()\]\"'`]+")
 TICKET = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d+\b")
 PR_REF = re.compile(r"\b[\w.-]+/([\w.-]+)#(\d+)\b")
-# In a brief: `himalaya#4745`, and a bare `#4744` that follows a repo ref on the same line.
+# In a brief: `app#4745`, and a bare `#4744` that follows a repo ref on the same line.
 SHORT_REF = re.compile(r"(?<![\w./#-])([A-Za-z][\w.-]*)?#(\d+)\b")
 GH_URL = re.compile(r"https?://[^/\s]+/[\w.-]+/([\w.-]+)/(?:pull|issues|merge_requests)/(\d+)")
 PATH = re.compile(r"^(?:[\w.-]+/)+[\w.-]+\.(?:md|json|jsonl)$")
