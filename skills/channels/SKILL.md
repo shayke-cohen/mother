@@ -30,7 +30,8 @@ starts. Start it with `/loop /mother:channels`; it paces itself.
 
 - **Post only what `CH` returns, byte for byte**: `text` and `blocks` for answers and sends, `dm_text` for
   drafts, `text` for notifications. Both carry the disclosure signature (in `blocks` it is the small context
-  line under the message); the guard checks for it. Pass `blocks` when the chat tool takes them.
+  line under the message); the guard checks for it. Pass `blocks` when the chat tool takes them, and pass `unfurl_links` /
+  `unfurl_media` as returned (`false`) so a link in the signature doesn't hang a preview card under the post.
 - **The thread context `CH` puts in a session is all a session sees of chat.** Sessions started for teammates
   have no chat, mail or calendar access at all (the guard enforces it), so never paste extra channel content
   into anything yourself.

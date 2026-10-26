@@ -292,6 +292,8 @@ class TestReviewFindings(Case):
         unsigned = r["blocks"][:-1]
         self.assertEqual(self.guard(TEAM, a["thread"], r["text"], unsigned), "ask")
         self.assertEqual(self.guard(TEAM, a["thread"], r["text"], r["blocks"]), "allow")
+        self.assertIs(r["unfurl_links"], False)   # a linked signature must not hang a preview card
+        self.assertIs(r["unfurl_media"], False)
 
     def test_approved_send_carries_footer_blocks(self):
         self.init(SUPPORT)
@@ -301,6 +303,8 @@ class TestReviewFindings(Case):
         acts = self.ch("approvals", stdin={"drafts": {d: [msg(10_004, ME, "edit: use the rotate command")]}})["actions"]
         self.assertEqual(acts[0]["blocks"][0]["text"]["text"], "use the rotate command")
         self.assertEqual(acts[0]["blocks"][-1]["elements"][0]["text"], SIG)
+        self.assertIs(acts[0]["unfurl_links"], False)
+        self.assertIs(acts[0]["unfurl_media"], False)
 
     def test_failed_post_revokes_its_grant(self):
         self.init(TEAM)

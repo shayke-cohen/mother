@@ -56,7 +56,9 @@ e.g. `:sparkles: *Agnes (AI)* · on behalf of Dana`, or `agent.signature` if the
 the first or last line of chat messages, emails, tracker comments and code-host comments. A chat post sent
 with blocks shows it as a small grey footer: the body in `section` blocks, then a `context` block whose one
 `mrkdwn` element is the signature, the way Slack shows an app's "Sent using" line. Its `text` still starts
-with the signature, since that is the notification fallback and what the hook reads. Messages to the
+with the signature, since that is the notification fallback and what the hook reads. Send signed chat
+posts with link previews off (`unfurl_links: false`, `unfurl_media: false`): a signature that links
+somewhere would otherwise put a preview card under every message. Messages to the
 manager's own DM don't need it. The hook checks the signature only on grant-backed writes (below): a
 grant-backed chat post, thread reply or tracker comment must contain `{name} (AI)` (or the full
 `agent.signature`), in its `text` and in its `blocks` if it has any, or it falls back to ask.
