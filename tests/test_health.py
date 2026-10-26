@@ -117,7 +117,7 @@ class HealthTest(unittest.TestCase):
         r, out = self.pick("--target", "other")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(out, {"server": "mcp__X", "status": "ok", "fresh": True, "fallback": False,
-                               "stamped": False})
+                               "stamped": False, "verified": True})
 
     def test_pick_legacy_top_level_servers(self):
         self.caps_path.write_text(json.dumps({"checked_at": iso_ago(2), "servers": {"chat.search": "mcp__X"},
@@ -404,7 +404,7 @@ class HealthTest(unittest.TestCase):
         c = self.caps()
         self.assertEqual(c["servers"]["read"], [W, C])
         self.assertEqual(c["read"], "error:unreachable")
-        self.assertEqual(c["server"], W)
+        self.assertEqual(c["server"], C)  # the doctor's `server`, still listed, stands (I3)
         self.assertEqual(out, {"changed": []})
 
     def test_alert_skips_ok(self):
@@ -437,6 +437,239 @@ class HealthTest(unittest.TestCase):
         e = self.caps()["health"][C]["read"]
         self.assertNotIn("pending", e)
         self.assertIn("alerted_at", e)
+
+    # ---- final review fixes
+
+    def real_shape(self, **slack_over):
+        """capabilities.json in the shape the doctor actually wrote (placeholder values)."""
+        slack = {"server": "mcp__gw__slack", "read": "ok", "post": "ok", "search": "ok",
+                 "private_history": "ok", "users": "ok", "token": "user",
+                 "servers": {"search": "mcp__abcd1234", "private_history": "mcp__abcd1234", "post": "mcp__gw__slack"},
+                 "notes": ["note", "note", "note", "note", "note"]}
+        slack.update(slack_over)
+        return {"checked_at": iso_ago(1), "host": "h1", "connectors": {
+            "slack": slack,
+            "jira": {"server": "mcp__gw__jira", "read": "ok", "create": "ok", "comment": "ok",
+                     "transition": "untested", "sprint": "untested", "notes": ["note", "note"]},
+            "gmail": {"server": "mcp__gw__gmail", "read": "ok", "draft": "ok", "send": "untested", "notes": ["note"]},
+            "google": {"server": "mcp__gw__calendar", "read": "ok", "create": "untested", "notes": ["note"]},
+            "github": {"tool": "gh", "read": "ok", "write": "untested", "token": "user", "notes": ["note"]}}}
+
+    def all_caps(self):
+        return json.loads(self.caps_path.read_text())
+
+    def pick_kind(self, kind, cap, *args):
+        r = self.run_cli("pick", "--kind", kind, "--cap", cap, *args)
+        return r, (json.loads(r.stdout) if r.stdout.strip() else None)
+
+    def test_c1_real_shape_pick(self):
+        self.caps_path.write_text(json.dumps(self.real_shape()))
+        r, out = self.pick_kind("code", "read")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(out["server"])
+        self.assertEqual(out["tool"], "gh")
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(self.pick_kind("chat", "search")[1]["server"], "mcp__abcd1234")
+        self.assertEqual(self.pick_kind("chat", "read")[1]["server"], "mcp__gw__slack")
+        self.assertEqual(self.pick_kind("tracker", "read")[1]["server"], "mcp__gw__jira")
+        r, out = self.pick_kind("code", "write", "--target", "other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((out["tool"], out["verified"]), ("gh", False))
+
+    def test_c1_tool_connector_survives_record(self):
+        self.caps_path.write_text(json.dumps(self.real_shape()))
+        self.assertEqual(self.record("read", "mcp__gw__slack", "ok").returncode, 0)
+        gh = self.all_caps()["connectors"]["github"]
+        self.assertEqual({k: gh[k] for k in ("tool", "read", "write", "token", "notes")},
+                         {"tool": "gh", "read": "ok", "write": "untested", "token": "user", "notes": ["note"]})
+        slack = self.all_caps()["connectors"]["slack"]
+        self.assertEqual(slack["notes"], ["note"] * 5)
+        self.assertNotIn("notes", slack["servers"])
+        self.assertEqual(self.pick_kind("code", "read")[0].returncode, 0)
+
+    def test_c1_tool_connector_survives_merge(self):
+        self.caps_path.write_text(json.dumps(self.real_shape()))
+        f = Path(self.tmp.name) / "fresh.json"
+        f.write_text(json.dumps(self.real_shape()))
+        r = self.run_cli("merge", "--file", str(f))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {"changed": []})
+        gh = self.all_caps()["connectors"]["github"]
+        self.assertEqual((gh["tool"], gh["read"], gh["write"], gh["token"]), ("gh", "ok", "untested", "user"))
+        self.assertEqual(self.pick_kind("code", "read")[0].returncode, 0)
+
+    def post_caps(self, w, c=None, **extra):
+        order = [W] + ([C] if c else [])
+        health = {W: {"post": {"status": w, "class": None if w in ("ok", "untested") else "unreachable",
+                               "checked_at": iso_ago(1)}}}
+        if c:
+            health[C] = {"post": {"status": c, "class": None, "checked_at": iso_ago(1)}}
+        slack = {"server": W, "post": w, "servers": {"post": order}, "health": health}
+        slack.update(extra)
+        self.write_caps(slack)
+
+    def test_c2_untested_post_is_pickable(self):
+        self.post_caps("untested")
+        r, out = self.pick_kind("chat", "post", "--target", "dm")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((out["server"], out["status"], out["verified"]), (W, "untested", False))
+        r, out = self.pick_kind("chat", "post", "--target", "other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_c2_untested_read_is_not_pickable(self):
+        self.two_servers(w="untested", c="error:unreachable")
+        self.assertEqual(self.pick()[0].returncode, 3)
+
+    def test_c2_ok_backup_preferred_over_untested(self):
+        self.post_caps("untested", "ok")
+        r, out = self.pick_kind("chat", "post", "--target", "dm")
+        self.assertEqual((out["server"], out["verified"], out["fallback"]), (C, True, True))
+
+    def test_c2_failing_post_excluded(self):
+        self.post_caps("error:unreachable")
+        self.assertEqual(self.pick_kind("chat", "post", "--target", "dm")[0].returncode, 3)
+
+    def test_c2_merge_ok_to_untested_not_changed(self):
+        self.post_caps("ok")
+        f = Path(self.tmp.name) / "fresh.json"
+        f.write_text(json.dumps({"checked_at": ISO_NOW, "connectors": {"slack": {
+            "server": W, "post": "untested", "servers": {"post": [W]},
+            "health": {W: {"post": {"status": "untested", "class": None}}}}}}))
+        r = self.run_cli("merge", "--file", str(f))
+        self.assertEqual(json.loads(r.stdout), {"changed": []})
+        self.assertEqual(self.pick_kind("chat", "post", "--target", "dm")[0].returncode, 0)
+
+    def test_c2_alert_skips_untested(self):
+        self.post_caps("untested")
+        r = self.run_cli("alert", "--kind", "chat", "--cap", "post", "--server", W)
+        self.assertEqual(json.loads(r.stdout)["action"], "skip")
+
+    def test_i1_outage_found_by_doctor_is_logged(self):
+        self.two_servers()
+        down = {"status": "error:unreachable", "class": "unreachable", "checked_at": ISO_NOW}
+        self.merge({"server": W, "read": "ok", "servers": {"read": [W, C]}, "health": {
+            W: {"_gateway": "gw.example", "read": down}, C: {"read": {"status": "ok", "class": None}}}})
+        lines = [l for l in self.health_md().splitlines() if l.startswith("- ")]
+        self.assertEqual(lines, ["- %s chat.read Willow_Slack__slack unreachable → open @gw.example" % ISO_NOW])
+        self.merge({"server": W, "read": "ok", "servers": {"read": [W, C]}, "health": {
+            W: {"_gateway": "gw.example", "read": down}, C: {"read": {"status": "ok", "class": None}}}})
+        self.rec("error:unreachable", W, "read", "unreachable")  # the ladder's re-test: same issue
+        self.rec("ok", C, "read", None, "--fixed-by", "fallback")  # backup was already ok
+        lines = [l for l in self.health_md().splitlines() if l.startswith("- ")]
+        self.assertEqual(len(lines), 2, lines)
+        self.assertEqual(lines[1], "- %s chat.read Willow_Slack__slack unreachable → fallback @gw.example" % ISO_NOW)
+        out = self.run_cli("summary").stdout.strip().splitlines()
+        self.assertEqual(out, ["Willow_Slack__slack unreachable ×2 (fixed: fallback 1; open 1)"])
+
+    def test_i1_fallback_logged_when_backup_had_no_entry(self):
+        self.write_caps({"server": W, "read": "error:unreachable", "servers": {"read": [W]}, "health": {
+            W: {"read": {"status": "error:unreachable", "class": "unreachable", "checked_at": iso_ago(1)}}}})
+        self.rec("ok", C, "read", None, "--fixed-by", "fallback")
+        self.assertTrue(self.health_md().rstrip().endswith("chat.read Willow_Slack__slack unreachable → fallback"))
+
+    def gateway_caps(self, cls="unreachable"):
+        st = "error:unreachable" if cls == "unreachable" else "expired"
+        e = {"status": st, "class": cls, "checked_at": iso_ago(1)}
+        self.caps_path.write_text(json.dumps({"checked_at": iso_ago(1), "connectors": {
+            "slack": {"server": W, "read": st, "servers": {"read": [W]},
+                      "health": {W: {"_gateway": "gw.example", "read": dict(e)}}},
+            "jira": {"server": "mcp__gw__jira", "read": st, "servers": {"read": ["mcp__gw__jira"]},
+                     "health": {"mcp__gw__jira": {"_gateway": "gw.example", "read": dict(e)},
+                                "mcp__other": {"_gateway": "elsewhere", "read": dict(e)}}}}}))
+
+    def galert(self, now, kind, server, *args):
+        self.env["MOTHER_NOW"] = str(now)
+        r = self.run_cli("alert", "--kind", kind, "--cap", "read", "--server", server, *args)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["action"]
+
+    def test_i2_gateway_outage_alerts_once(self):
+        self.set_cfg(quiet="01:00-02:00")
+        self.gateway_caps()
+        t = self.at(12)
+        self.assertEqual(self.galert(t, "chat", W), "send")
+        self.assertEqual(self.galert(t, "chat", W, "--sent"), "sent")
+        self.assertEqual(self.galert(t + 60, "tracker", "mcp__gw__jira"), "skip")
+        jira = self.all_caps()["connectors"]["jira"]["health"]
+        self.assertIn("alerted_at", jira["mcp__gw__jira"]["read"])
+        self.assertNotIn("alerted_at", jira["mcp__other"]["read"])
+        self.assertEqual(self.galert(t + 60, "tracker", "mcp__other"), "send")
+
+    def test_i2_gateway_different_class_alerts(self):
+        self.set_cfg(quiet="01:00-02:00")
+        self.gateway_caps()
+        t = self.at(12)
+        self.assertEqual(self.galert(t, "chat", W, "--sent"), "sent")
+        r = self.run_cli("record", "--kind", "tracker", "--cap", "read", "--server", "mcp__gw__jira",
+                         "--status", "expired", "--class", "invalidated")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.galert(t + 60, "tracker", "mcp__gw__jira"), "send")
+
+    def test_i3_merge_carries_old_only_connectors(self):
+        old = self.real_shape(stamps=["mcp__abcd1234"])
+        old["connectors"]["slack"]["health"] = {"mcp__abcd1234": {"search": {
+            "status": "ok", "class": None, "checked_at": iso_ago(1), "alerted_at": iso_ago(2)}}}
+        self.caps_path.write_text(json.dumps(old))
+        f = Path(self.tmp.name) / "fresh.json"
+        f.write_text(json.dumps({"checked_at": ISO_NOW, "connectors": {"jira": old["connectors"]["jira"]}}))
+        self.assertEqual(self.run_cli("merge", "--file", str(f)).returncode, 0)
+        slack = self.all_caps()["connectors"]["slack"]
+        self.assertEqual(slack["stamps"], ["mcp__abcd1234"])
+        self.assertEqual(slack["health"]["mcp__abcd1234"]["search"]["alerted_at"], iso_ago(2))
+        self.assertIn("github", self.all_caps()["connectors"])
+
+    def test_i3_merge_keeps_doctor_server(self):
+        self.caps_path.write_text(json.dumps(self.real_shape()))
+        f = Path(self.tmp.name) / "fresh.json"
+        f.write_text(json.dumps(self.real_shape()))
+        self.run_cli("merge", "--file", str(f))
+        self.assertEqual(self.all_caps()["connectors"]["slack"]["server"], "mcp__gw__slack")
+        # a doctor server no longer listed falls back to servers.read[0]
+        fresh = {"server": "mcp__gone", "post": "ok", "read": "ok", "servers": {"post": [C], "read": [W]},
+                 "health": {W: {"read": {"status": "ok", "class": None}}, C: {"post": {"status": "ok", "class": None}}}}
+        self.merge(fresh)
+        self.assertEqual(self.caps()["server"], W)
+        fresh["server"] = C  # still listed (for post): the doctor's choice stands
+        self.merge(fresh)
+        self.assertEqual(self.caps()["server"], C)
+
+    def test_i4_merge_fills_checked_at(self):
+        self.two_servers()
+        self.merge({"server": W, "read": "ok", "servers": {"read": [W]},
+                    "health": {W: {"read": {"status": "ok", "class": None}}}})
+        self.assertEqual(self.caps()["health"][W]["read"]["checked_at"], ISO_NOW)
+        self.assertIs(self.pick("--max-age-hours", "6")[1]["fresh"], True)
+
+    def test_i5_other_fallback_needs_known_same_identity(self):
+        self.two_servers(w="error:unreachable")
+        self.assertEqual(self.pick("--target", "other")[0].returncode, 3)
+        self.assertEqual(self.pick("--target", "dm")[0].returncode, 0)
+        self.two_servers(w="error:unreachable", token={W: "user"})
+        self.assertEqual(self.pick("--target", "other")[0].returncode, 3)
+        self.two_servers(w="error:unreachable", token={W: "user", C: "user"})
+        r, out = self.pick("--target", "other")
+        self.assertEqual((r.returncode, out["server"]), (0, C))
+
+    def test_merge_refuses_corrupt_file(self):
+        self.caps_path.write_text("{nope")
+        f = Path(self.tmp.name) / "fresh.json"
+        f.write_text(json.dumps(self.real_shape()))
+        r = self.run_cli("merge", "--file", str(f))
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.caps_path.read_text(), "{nope")
+        self.two_servers()
+        before = self.caps_path.read_text()
+        f.write_text("{nope")
+        self.assertEqual(self.run_cli("merge", "--file", str(f)).returncode, 2)
+        self.assertEqual(self.caps_path.read_text(), before)
+
+    def test_classify_strips_urls(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        import health
+        status, cls = health.classify("go to https://auth.example/x?code=abc then")
+        self.assertEqual(cls, "other")
+        self.assertNotIn("auth.example", status)
+        self.assertIn("<url>", status)
 
 
 if __name__ == "__main__":

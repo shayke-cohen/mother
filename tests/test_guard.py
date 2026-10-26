@@ -632,6 +632,10 @@ class StampRule(GuardCase):
         self.expect("ask", "mcp__gw__slackbot__post_message", {"channel_id": TEAM, "text": SIG})
         self.expect("deny", "mcp__gw__slack__post_message", {"channel_id": TEAM, "text": SIG})
 
+    def test_stamp_on_sibling_server_does_not_block(self):
+        self.caps({"connectors": {"jira": {"stamps": ["mcp__gw__jira"]}}})
+        self.expect("ask", "mcp__gw__slack__post_message", {"channel_id": TEAM, "text": SIG})
+
     def test_bad_capabilities_file_ignored(self):
         self.caps('"nope"')
         self.expect("allow", CHAT2 + "slack_send_message", {"channel_id": DM, "text": SIG})

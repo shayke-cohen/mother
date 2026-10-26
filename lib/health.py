@@ -9,15 +9,20 @@ Commands (JSON out, one object per call):
   classify --error TEXT        map an error message to a status and failure class -> {status, class}
   summary [--days N]           failures and fixes from health.md, most frequent first (text lines)
   pick --kind K --cap C [--target dm|other] [--max-age-hours N]
-                               the server to use now -> {server, status, fresh, fallback, stamped}
-  merge --file F               merge the doctor's fresh capabilities JSON in -> {changed: [kind.cap, ...]}
+                               the server to use now -> {server, status, fresh, fallback, stamped, verified}
+                               (a write capability may be `untested`: verified false; a tool-based
+                               connector answers {server: null, tool, ...})
+  merge --file F               merge the doctor's fresh capabilities JSON in -> {changed: [kind.cap, ...]};
+                               logs an `open` line per newly failing entry
   alert --kind K --cap C --server S [--urgent] [--sent]
                                once-a-day alert decision -> {action: send|pending|skip}; --sent records it
   pending                      held alerts now outside quiet hours -> [{kind, cap, server, status, class}]
 
-Alerts: at most one per (server, capability) per manager-local day; held (`pending`) during
-manager.quiet_hours unless --urgent.
-`record` also appends one line per failure or fix to <workspace>/health.md (no ids, no content).
+Alerts: at most one per issue per manager-local day, where an issue is a (server, capability) or, for
+servers on one `_gateway`, every entry there with the same class; never for `ok` or `untested`. Held
+(`pending`) during manager.quiet_hours unless --urgent.
+`record` also appends one line per failure or fix to <workspace>/health.md (no ids, no content);
+`--fixed-by fallback` on a backup logs the preferred server's failure as fixed by fallback.
 Exit codes: 0 ok; 2 bad file or bad arguments; 3 `pick` found no usable server.
 $MOTHER_NOW (epoch seconds) pins the clock. Python 3.9 stdlib only.
 """
@@ -38,9 +43,21 @@ CLASSES = ("unreachable", "dropped", "invalidated", "missing_scope", "denied", "
 FIXED_BY = ("retry", "reconnect", "fallback", "you", "—")
 TARGETS = ("dm", "other")
 # Keys of a connector that are not capabilities.
-RESERVED = ("server", "servers", "health", "stamps", "token")
+RESERVED = ("server", "servers", "health", "stamps", "token", "tool", "notes", "host")
 STATUS_WORDS = ("ok", "untested", "denied", "expired")
 STATUS_PREFIXES = ("missing_scope:", "error:")
+# Capabilities that write. The doctor never probes them unattended, so `untested` is usable for these.
+WRITE_CAPS = ("post", "post_dm", "create", "comment", "transition", "sprint", "draft", "send", "write")
+
+
+def valid_status(s):
+    return isinstance(s, str) and (s in STATUS_WORDS or any(s.startswith(p) and len(s) > len(p)
+                                                            for p in STATUS_PREFIXES))
+
+
+def usable(status, cap):
+    """`ok`; or, for a write capability, `untested` (never probed, not known broken)."""
+    return status == "ok" or (status == "untested" and cap in WRITE_CAPS)
 
 
 class HealthError(Exception):
@@ -79,7 +96,7 @@ def load(ws):
     if not p.is_file():
         return {"connectors": {}}
     try:
-        caps = json.loads(p.read_text())
+        caps = json.loads(p.read_text(encoding="utf-8"))
     except ValueError as e:
         raise HealthError("capabilities.json is not valid JSON (%s); fix or delete it" % e)
     if not isinstance(caps, dict) or not isinstance(caps.get("connectors", {}), dict):
@@ -90,7 +107,7 @@ def load(ws):
 
 def load_config(ws):
     try:
-        cfg = json.loads((Path(ws) / "config.json").read_text())
+        cfg = json.loads((Path(ws) / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise HealthError("cannot read config.json (%s)" % e)
     if not isinstance(cfg, dict):
@@ -127,7 +144,7 @@ def vendor_of(cfg, kind):
 
 
 def cap_names(conn):
-    names = [k for k, v in conn.items() if k not in RESERVED and isinstance(v, str)]
+    names = [k for k, v in conn.items() if k not in RESERVED and valid_status(v)]
     for k in (conn.get("servers") or {}):
         if k not in names:
             names.append(k)
@@ -150,8 +167,8 @@ def normalize(caps, cfg):
     for conn in conns.values():
         if not isinstance(conn, dict):
             continue
-        if isinstance(conn.get("token"), str):  # legacy: one identity, the main server's
-            conn["token"] = {conn["server"]: conn["token"]} if conn.get("server") else {}
+        if isinstance(conn.get("token"), str) and conn.get("server"):  # legacy: one identity, the main server's
+            conn["token"] = {conn["server"]: conn["token"]}  # (a tool-based connector keeps its string)
         servers = conn.setdefault("servers", {})
         health = conn.setdefault("health", {})
         for cap in cap_names(conn):
@@ -164,7 +181,9 @@ def normalize(caps, cfg):
                 else:  # the old doctor only recorded an alternate server when it worked
                     seed = "ok"
             elif not cur:
-                servers[cap] = [conn["server"]] if conn.get("server") else []
+                if not conn.get("server"):  # tool-based (e.g. `gh`): the status lives on the connector
+                    continue
+                servers[cap] = [conn["server"]]
                 seed = conn.get(cap)
             else:
                 seed = conn.get(cap)
@@ -182,8 +201,8 @@ def status_of(conn, server, cap):
 
 def rollup(conn, cap):
     servers = (conn.get("servers") or {}).get(cap) or []
-    if not servers:
-        return "untested"
+    if not servers:  # no server list: a tool-based connector keeps the value it was given
+        return conn.get(cap) if valid_status(conn.get(cap)) else "untested"
     for s in servers:
         if status_of(conn, s, cap) == "ok":
             return "ok"
@@ -229,14 +248,25 @@ def record(caps, vendor, cap, server, status, cls=None, gateway=None, now=None):
 def merge(old, new):
     """The doctor's fresh capabilities `new` over the stored `old` (both normalized).
 
-    `new` wins for statuses, stamps, tokens and the top-level checked_at/host. Server order: old order for
-    servers in both, new ones appended, absent ones dropped; the rollups and the primary `server` are
-    recomputed for that order. Alert state is carried as in `carry_alert`.
+    `new` wins for statuses, stamps, tokens, `server` and the top-level checked_at/host. Server order: old
+    order for servers in both, new ones appended, absent ones dropped; the rollups are recomputed for that
+    order. Alert state is carried as in `carry_alert`. A connector only in `old` is kept as it was; an entry
+    with no `checked_at` takes the fresh file's.
     """
     out = copy.deepcopy(new)
-    for vendor, conn in (out.get("connectors") or {}).items():
+    conns = out.setdefault("connectors", {})
+    for vendor, oc in (old.get("connectors") or {}).items():
+        if vendor not in conns:  # a narrow doctor run: keep what it didn't look at
+            conns[vendor] = copy.deepcopy(oc)
+    for vendor, conn in conns.items():
+        if not isinstance(conn, dict):
+            continue
+        for caps_ in (conn.get("health") or {}).values():
+            for cap, e in caps_.items():
+                if isinstance(e, dict) and not e.get("checked_at") and new.get("checked_at"):
+                    e["checked_at"] = new["checked_at"]
         oc = (old.get("connectors") or {}).get(vendor)
-        if not isinstance(conn, dict) or not isinstance(oc, dict):
+        if not isinstance(oc, dict) or vendor not in (new.get("connectors") or {}):
             continue
         for cap, fresh in list((conn.get("servers") or {}).items()):
             prior = (oc.get("servers") or {}).get(cap) or []
@@ -246,11 +276,12 @@ def merge(old, new):
                 o = (((oc.get("health") or {}).get(server) or {}).get(cap)) if not cap.startswith("_") else None
                 if isinstance(e, dict) and o:
                     carry_alert(o, e)
-        for cap in conn.get("servers") or {}:
-            conn[cap] = rollup(conn, cap)  # the doctor computed it against its own order
-        names = [c for c in cap_names(conn) if conn["servers"].get(c)]
-        if conn.get("server") and names:
-            conn["server"] = conn["servers"][names[0]][0]
+        for cap, lst in (conn.get("servers") or {}).items():
+            if lst:
+                conn[cap] = rollup(conn, cap)  # the doctor computed it against its own order
+        listed = [s for c in cap_names(conn) for s in (conn.get("servers") or {}).get(c) or []]
+        if listed and conn.get("server") not in listed:  # `.server` is the prefix callers use
+            conn["server"] = ((conn["servers"].get("read") or [None])[0]) or listed[0]
     return out
 
 
@@ -268,15 +299,39 @@ def _entry(caps, vendor, cap, server):
     return e if isinstance(e, dict) else None
 
 
-def alert_action(caps, cfg, vendor, cap, server, urgent=False, now=None):
-    """`send`, `pending` or `skip` for one failing entry (`now`: epoch seconds); `pending` is recorded."""
-    t = _clock() if now is None else now
+def _group(caps, vendor, cap, server):
+    """The entry and every other failing entry on the same gateway with the same class (one outage)."""
     e = _entry(caps, vendor, cap, server)
-    if not e or e.get("status") == "ok":
+    if e is None:
+        return []
+    gw = ((((caps.get("connectors") or {}).get(vendor) or {}).get("health") or {}).get(server) or {}).get("_gateway")
+    out = [e]
+    if not gw:
+        return out
+    for conn in (caps.get("connectors") or {}).values():
+        for caps_ in ((conn or {}).get("health") or {}).values() if isinstance(conn, dict) else ():
+            if not isinstance(caps_, dict) or caps_.get("_gateway") != gw:
+                continue
+            for c, x in caps_.items():
+                if isinstance(x, dict) and x is not e and x.get("status") not in ("ok", "untested") \
+                        and x.get("class") == e.get("class"):
+                    out.append(x)
+    return out
+
+
+def alert_action(caps, cfg, vendor, cap, server, urgent=False, now=None):
+    """`send`, `pending` or `skip` for one failing entry (`now`: epoch seconds); `pending` is recorded.
+    One alert a day per issue: a gateway outage (same `_gateway`, same class) is one issue."""
+    t = _clock() if now is None else now
+    group = _group(caps, vendor, cap, server)
+    e = group[0] if group else None
+    if not e or e.get("status") in ("ok", "untested"):
         return "skip"
-    last = parse_iso(e.get("alerted_at"))
-    if last is not None and _local_date(last, cfg) == _local_date(t, cfg):
-        return "skip"
+    for x in group:
+        last = parse_iso(x.get("alerted_at"))
+        same = x is e or x.get("alerted_class", x.get("class")) == e.get("class")
+        if same and last is not None and _local_date(last, cfg) == _local_date(t, cfg):
+            return "skip"
     if not urgent and channels.quiet_now(cfg, now=t):
         e["pending"] = True
         return "pending"
@@ -284,8 +339,7 @@ def alert_action(caps, cfg, vendor, cap, server, urgent=False, now=None):
 
 
 def mark_alerted(caps, vendor, cap, server, now=None):
-    e = _entry(caps, vendor, cap, server)
-    if e is not None:
+    for e in _group(caps, vendor, cap, server):
         e["alerted_at"] = iso(now)
         e.pop("pending", None)
         if e.get("class"):
@@ -340,7 +394,7 @@ def classify(error):
     for cls, status, pats in _RULES:
         if any(re.search(p, low) for p in pats):
             return status, cls
-    return "error:" + scrub(error.strip())[:40], "other"
+    return "error:" + scrub(re.sub(r"https?://\S+", "<url>", error.strip()))[:40], "other"
 
 
 def server_short(prefix):
@@ -407,37 +461,44 @@ def summary(ws, days=7, now=None):
 
 
 def pick(caps, vendor, cap, target=None, max_age_h=None, now=None):
-    """Choose a server (`now`: epoch seconds, default the clock). See the module docstring for the result."""
+    """Choose a server (`now`: epoch seconds, default the clock). See the module docstring for the result.
+
+    The first `ok` server; for a write capability, else the first `untested` one (`verified: false`).
+    `--target other` skips stamping servers, and a backup needs a known token equal to the preferred one's.
+    A tool-based connector (no servers, e.g. `"tool": "gh"`) answers with its `tool` and `server: null`."""
     conn = (caps.get("connectors") or {}).get(vendor) or {}
     servers = (conn.get("servers") or {}).get(cap) or []
     stamps = conn.get("stamps") or []
-    tokens = conn.get("token") or {}
+    tokens = conn.get("token") if isinstance(conn.get("token"), dict) else {}
     pref_tok = tokens.get(servers[0]) if servers else None
+    t_now = now if now is not None else _clock()
+
+    def fresh_at(stamp):
+        t = parse_iso(stamp)
+        return max_age_h is None or (t is not None and t_now - t <= max_age_h * 3600)
+
+    if not servers and conn.get("tool"):
+        status = conn.get(cap) if valid_status(conn.get(cap)) else "untested"
+        return {"server": None, "tool": conn["tool"], "status": status, "fresh": fresh_at(caps.get("checked_at")),
+                "fallback": False, "stamped": False, "verified": status == "ok"}
     result = {"server": None, "status": status_of(conn, servers[0], cap) if servers else "untested",
-              "fresh": False, "fallback": False, "stamped": False}
-    for s in servers:
-        if status_of(conn, s, cap) != "ok":
-            continue
-        if target == "other":
-            if s in stamps:
+              "fresh": False, "fallback": False, "stamped": False, "verified": False}
+    for want in ("ok", "untested") if cap in WRITE_CAPS else ("ok",):
+        for i, s in enumerate(servers):
+            if status_of(conn, s, cap) != want:
                 continue
-            tok = tokens.get(s)
-            if tok and pref_tok and tok != pref_tok:
-                continue
-        entry = conn["health"][s][cap]
-        fresh = True
-        if max_age_h is not None:
-            t = parse_iso(entry.get("checked_at"))
-            fresh = t is not None and (now if now is not None else _clock()) - t <= max_age_h * 3600
-        return {"server": s, "status": "ok", "fresh": fresh, "fallback": s != servers[0], "stamped": s in stamps}
+            if target == "other":
+                if s in stamps:
+                    continue
+                if i and not (pref_tok and tokens.get(s) == pref_tok):  # spec §2: same identity, known
+                    continue
+            entry = ((conn.get("health") or {}).get(s) or {}).get(cap) or {}
+            return {"server": s, "status": want, "fresh": want == "ok" and fresh_at(entry.get("checked_at")),
+                    "fallback": i > 0, "stamped": s in stamps, "verified": want == "ok"}
     return result
 
 
 # ---------------------------------------------------------------- CLI
-
-def valid_status(s):
-    return s in STATUS_WORDS or any(s.startswith(p) and len(s) > len(p) for p in STATUS_PREFIXES)
-
 
 def parse_args(args, flags):
     out, i = {}, 0
@@ -469,7 +530,10 @@ def cmd_record(ws, args):
     vendor = vendor_of(cfg, o["kind"])
     with locked(ws):
         caps = normalize(load(ws), cfg)
-        old = (((caps["connectors"].get(vendor) or {}).get("health") or {}).get(o["server"]) or {}).get(o["cap"]) or {}
+        conn = caps["connectors"].get(vendor) or {}
+        old = ((conn.get("health") or {}).get(o["server"]) or {}).get(o["cap"]) or {}
+        pref = ((conn.get("servers") or {}).get(o["cap"]) or [None])[0]
+        pref_old = dict(((conn.get("health") or {}).get(pref) or {}).get(o["cap"]) or {})
         stamp = iso()
         previous = record(caps, vendor, o["cap"], o["server"], o["status"], o.get("class"), o.get("gateway"), stamp)
         save(ws, caps)
@@ -478,6 +542,12 @@ def cmd_record(ws, args):
             cls = o.get("class") or "other"
             if not (old.get("status") == o["status"] and old.get("class") == o.get("class")):
                 append_log(ws, health_line(stamp, o["kind"], o["cap"], o["server"], cls, None, gw))
+        elif o.get("fixed_by") == "fallback" and pref and pref != o["server"]:
+            # the fix is for the preferred server's failure, whatever the backup's own previous status
+            if pref_old.get("status") not in (None, "ok", "untested"):
+                pgw = (caps["connectors"][vendor]["health"].get(pref) or {}).get("_gateway")
+                append_log(ws, health_line(stamp, o["kind"], o["cap"], pref, pref_old.get("class") or "other",
+                                           "fallback", pgw))
         elif previous not in (None, "ok") and o.get("fixed_by"):
             append_log(ws, health_line(stamp, o["kind"], o["cap"], o["server"], old.get("class") or "other",
                                        o["fixed_by"], gw))
@@ -496,7 +566,8 @@ def cmd_pick(ws, args):
     cfg = load_config(ws)
     vendor = vendor_of(cfg, o["kind"])
     res = pick(normalize(load(ws), cfg), vendor, o["cap"], o.get("target"), age)
-    return (0 if res["server"] else 3), res
+    found = res["server"] or (res.get("tool") and usable(res["status"], o["cap"]))
+    return (0 if found else 3), res
 
 
 def cmd_classify(ws, args):
@@ -515,6 +586,24 @@ def cmd_summary(ws, args):
     for line in summary(ws, days):
         print(line)
     return 0, None
+
+
+def failing(e):
+    return isinstance(e, dict) and e.get("status") not in (None, "ok", "untested")
+
+
+def opened(old, merged):
+    """(vendor, server, cap, entry) for each entry the merge moved into a failing status or class."""
+    out = []
+    for vendor, conn in (merged.get("connectors") or {}).items():
+        for server, caps_ in ((conn or {}).get("health") or {}).items() if isinstance(conn, dict) else ():
+            for cap, e in caps_.items():
+                if cap.startswith("_") or not failing(e):
+                    continue
+                o = _entry(old, vendor, cap, server) or {}
+                if not (o.get("status") == e.get("status") and o.get("class") == e.get("class")):
+                    out.append((vendor, server, cap, e))
+    return out
 
 
 def rollups(caps):
@@ -538,9 +627,13 @@ def cmd_merge(ws, args):
         merged = merge(old, new)
         before, after = rollups(old), rollups(merged)
         save(ws, merged)
-    kinds = {v: k for k, v in (cfg.get("connectors") or {}).items() if isinstance(v, str)}
+        kinds = {v: k for k, v in (cfg.get("connectors") or {}).items() if isinstance(v, str)}
+        for vendor, server, cap, e in opened(old, merged):
+            gw = merged["connectors"][vendor]["health"][server].get("_gateway")
+            append_log(ws, health_line(iso(), kinds.get(vendor, vendor), cap, server,
+                                       e.get("class") or "other", None, gw))
     changed = ["%s.%s" % (kinds.get(v, v), c) for (v, c), r in after.items()
-               if r != "ok" and before.get((v, c), "untested") == "ok"]
+               if r not in ("ok", "untested") and before.get((v, c), "untested") == "ok"]
     return 0, {"changed": changed}
 
 
