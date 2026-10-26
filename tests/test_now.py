@@ -221,6 +221,33 @@ class Merge(unittest.TestCase):
         ), None, {}, CFG, NOW)
         self.assertEqual([i["link"] for i in out["items"]], ["c", "b", "a"])
 
+    def test_lapsed_suggestion_stays_lapsed(self):
+        c = cand("suggestion_waiting", kind="sug", since=iso(NOW), actions=[{"label": "Do", "prompt": "x"}])
+        later = NOW + timedelta(hours=72)    # 48 working hours after since
+        out = now.merge(inp(c), None, {}, CFG, later)
+        self.assertEqual(out["items"], [])
+        out = now.merge(inp(c), out, {}, CFG, later + H)
+        self.assertEqual(out["items"], [])
+
+    def test_item_dropped_when_signal_or_connector_turned_off(self):
+        first = now.merge(inp(cand("ticket_stalled", since=days_ago(7))), None, {}, CFG, NOW)
+        self.assertEqual(len(first["items"]), 1)
+        off = with_tick(CFG, signals={"ticket_stalled": False})
+        self.assertEqual(now.merge(inp(), first, {}, off, NOW + H)["items"], [])
+        none = with_connectors(CFG, tracker="none")
+        self.assertEqual(now.merge(inp(), first, {}, none, NOW + H)["items"], [])
+
+    def test_malformed_input_is_skipped_and_counted(self):
+        bad = cand("review_requested")
+        del bad["link"]
+        bad_action = cand("mail_needs_reply", kind="mail", link="m", actions=[{"prompt": "x"}])
+        good = cand("review_requested", link="ok")
+        out = now.merge(inp(bad, good, bad_action, coverage={"chat": {}}), None, {}, CFG, NOW)
+        self.assertEqual(sorted(i["link"] for i in out["items"]), ["m", "ok"])
+        self.assertEqual(out["dropped"], 2)   # bad candidate + bad action
+        self.assertEqual(out["coverage"]["chat"]["status"], "couldnt_check")
+        self.assertEqual(now.merge(inp(good), None, {}, CFG, NOW)["dropped"], 0)
+
     def test_write_is_atomic_and_load_rejects_bad_files(self):
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d)

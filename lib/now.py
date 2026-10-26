@@ -171,7 +171,9 @@ def _coverage(inp: dict, prev: Optional[dict], cfg: dict, now: datetime) -> dict
     for src, row in (inp.get("coverage") or {}).items():
         if src != "workspace" and conns.get(src, "none") in ("none", None, ""):
             continue
-        row = {"status": row} if isinstance(row, str) else dict(row)
+        row = {"status": row} if isinstance(row, str) else dict(row or {})
+        if not row.get("status"):
+            row["status"] = "couldnt_check"
         if row.get("status") == "ok":
             row.pop("since", None)
         else:
@@ -196,13 +198,20 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
                 next_action = max(next_action, int(m.group(1)) + 1)
     lapse = SUGGESTION_LAPSE_DAYS * day_hours(s)
 
-    items, seen = [], set()
+    items, seen, dropped = [], set(), 0
     for c in inp.get("candidates") or []:
-        sig = c["signal"]
+        try:
+            if not isinstance(c, dict) or any(not c.get(k) for k in ("kind", "link", "signal", "since", "title")):
+                raise KeyError("candidate")
+            sig = c["signal"]
+            since = _parse_iso(c["since"])
+        except (KeyError, ValueError, TypeError):
+            dropped += 1
+            continue
         if sig not in SIGNALS:
             continue
         th = threshold_hours(sig, cfg, s)
-        if th is None or working_hours(_parse_iso(c["since"]), now, s) < th:
+        if th is None or working_hours(since, now, s) < th:
             continue
         iid = item_id(c)
         if iid in seen:
@@ -215,13 +224,16 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         old_ids = {a["label"]: a["id"] for a in (old or {}).get("actions") or []}
         actions = []
         for a in c.get("actions") or []:
+            if not isinstance(a, dict) or not a.get("label"):
+                dropped += 1
+                continue
             aid = old_ids.get(a["label"])
             if aid is None:
                 aid = "S%d" % next_action
                 next_action += 1
             actions.append({"id": aid, "label": a["label"], "prompt": "mother now do %s" % aid})
         first_seen = old["first_seen"] if old else _iso(now)
-        if section == "suggestion" and working_hours(_parse_iso(first_seen), now, s) >= lapse:
+        if section == "suggestion" and working_hours(since, now, s) >= lapse:
             continue
         items.append({
             "id": iid, "section": section, "signal": sig, "title": c["title"], "why": c.get("why", ""),
@@ -235,6 +247,8 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         if iid in seen:
             continue
         sig = pi.get("signal")
+        if sig not in SIGNALS or threshold_hours(sig, cfg, s) is None:
+            continue                       # signal switched off or source gone
         row = coverage.get(SIGNALS[sig][1]) if sig in SIGNALS else None
         if sig in checked and row is not None and row["status"] == "ok":
             continue                       # looked, and it is gone: closed
@@ -268,6 +282,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         "routines": list(inp.get("routines") or []),
         "counts": {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS},
         "next_action": next_action,
+        "dropped": dropped,
         "items": items,
     }
 
