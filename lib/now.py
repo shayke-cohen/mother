@@ -479,7 +479,9 @@ def apply_edit(doc: dict, st: dict) -> dict:
     out["counts"] = {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS}
     top = (st or {}).get("top")
     if isinstance(top, dict) and top.get("date") and top["date"] >= str(out.get("top_date") or ""):
-        out["top"] = _carry_done(_top_entries(top.get("entries"), "manager"), doc.get("top"))
+        out["top"] = _top_entries(top.get("entries"), "manager")
+        if top["date"] == doc.get("top_date"):
+            _carry_done(out["top"], doc.get("top"))
         out["top_date"] = top["date"]
         out["swap_hint"] = None
     _mark_top_done(out.get("top") or [], {i["id"] for i in items}, before, (st or {}).get("items") or {})

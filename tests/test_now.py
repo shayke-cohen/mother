@@ -454,6 +454,14 @@ class ManagerState(unittest.TestCase):
                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)      # released after the block
             self.assertEqual(now.load_state(ws), {"items": {}, "top": None})
 
+    def test_apply_edit_does_not_carry_done_from_yesterday(self):
+        yday = datetime(2026, 10, 26, 7, 0, tzinfo=UTC)
+        a = now.merge(inp(top=[t("A", "x")]), None, {"items": {"x": {"state": "done", "at": iso(yday)}}}, CFG, yday)
+        self.assertEqual(a["top"][0]["state"], "done")
+        st = {"items": {}, "top": {"date": "2026-10-27", "set_by": "manager", "entries": [t("A", "x")]}}
+        e = now.apply_edit(a, st)
+        self.assertEqual((e["top_date"], e["top"][0]["state"]), ("2026-10-27", "open"))
+
 
 if __name__ == "__main__":
     unittest.main()
