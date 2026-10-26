@@ -107,6 +107,18 @@ TRIGGERS = {"manager", "team", "anyone"}
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
+TICK_EVERY = (30, 60, 120, 180, 240)
+
+
+def _tick_hours(active):
+    """(start, end) in minutes since midnight for 'HH:MM-HH:MM', or None when malformed or start >= end."""
+    m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)", active) if isinstance(active, str) else None
+    if not m:
+        return None
+    a, b = int(m[1]) * 60 + int(m[2]), int(m[3]) * 60 + int(m[4])
+    return (a, b) if a < b else None
+
+
 def validate(cfg: dict) -> list:
     errs = []
     def need(obj, key, typ, where):
@@ -197,6 +209,36 @@ def validate(cfg: dict) -> list:
                     and au.get("language", "en") in ("en", "he")
                     and (au.get("rate") is None or (isinstance(au["rate"], int) and 90 <= au["rate"] <= 360)))):
                 errs.append("routines.brief.audio must be true/false or {voice, voice_he, rate 90-360, language en|he, save_to, engine say|kokoro, kokoro_voice}")
+            if rid == "tick":
+                sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+                import now as _now_mod
+                ev = r.get("every")
+                if ev is not None and (isinstance(ev, bool) or ev not in TICK_EVERY):
+                    errs.append("routines.tick.every must be one of " + ", ".join(str(x) for x in TICK_EVERY))
+                ah = r.get("active_hours")
+                if ah is not None and _tick_hours(ah) is None:
+                    errs.append("routines.tick.active_hours must be HH:MM-HH:MM with start before end")
+                th = r.get("thresholds")
+                if th is not None and not isinstance(th, dict):
+                    errs.append("routines.tick.thresholds must be an object")
+                for sig, v in (th if isinstance(th, dict) else {}).items():
+                    if sig not in _now_mod.SIGNALS:
+                        errs.append(f"routines.tick.thresholds.{sig} is not a known signal")
+                    elif not (v == 0 and not isinstance(v, bool)) and not (isinstance(v, str) and re.fullmatch(r"\d+[hd]", v)):
+                        errs.append(f"routines.tick.thresholds.{sig} must be Nh, Nd or 0")
+                sg = r.get("signals")
+                if sg is not None and not isinstance(sg, dict):
+                    errs.append("routines.tick.signals must be an object")
+                for sig, v in (sg if isinstance(sg, dict) else {}).items():
+                    if sig not in _now_mod.SIGNALS:
+                        errs.append(f"routines.tick.signals.{sig} is not a known signal")
+                    elif not isinstance(v, bool):
+                        errs.append(f"routines.tick.signals.{sig} must be true or false")
+                if r.get("notify", "none") not in ("none", "dm"):
+                    errs.append("routines.tick.notify must be none or dm")
+                se = r.get("slow_every")
+                if se is not None and (not isinstance(se, int) or isinstance(se, bool) or not 1 <= se <= 6):
+                    errs.append("routines.tick.slow_every must be an integer 1-6")
             if rid == "commitments":
                 for k, lo, hi in (("no_reply_days", 1, 30), ("lookback_days", 1, 60)):
                     v = r.get(k)
@@ -534,10 +576,19 @@ def _cron(at: str, days, workdays) -> str:
     return f"{int(mm)} {int(hh)} * * {dow}"
 
 
-def _pointer(ws: Path, rid: str, team: str = None) -> str:
+def _interval_cron(every: int, active: str, days, workdays) -> str:
+    """Cron for an interval routine: slots at minute :05 (and :35 for 30-minute), hourly steps inside active hours."""
+    a, b = _tick_hours(active)
+    hours = list(range(a // 60, -(-b // 60), max(1, every // 60)))
+    hh = f"{hours[0]}-{hours[-1]}" if len(hours) > 1 and every <= 60 else ",".join(str(h) for h in hours)
+    return f"{'5,35' if every == 30 else '5'} {hh} " + _cron("00:00", days, workdays).split(" ", 2)[2]
+
+
+def _pointer(ws: Path, rid: str, team: str = None, pull: bool = True) -> str:
     who = f" for team {team}" if team else ""
-    return (f'cd "{ws}" and run `git pull --rebase -q` if the workspace has a remote (on failure, continue with the '
-            f"local copy and say so). Then invoke the mother:routine skill with routine id `{rid}`{who}. "
+    lead = (f'cd "{ws}" and run `git pull --rebase -q` if the workspace has a remote (on failure, continue with the '
+            f"local copy and say so). Then invoke" if pull else f'cd "{ws}". Invoke')
+    return (f"{lead} the mother:routine skill with routine id `{rid}`{who}. "
             "All behaviour lives in the mother plugin's routines/ files and the workspace config; this pointer "
             "carries no other instructions. Always append a line to runs.md, including on failure.")
 
@@ -551,6 +602,12 @@ def cmd_register(args):
     workdays = (cfg.get("manager") or {}).get("workdays") or DAYS[:5]
     tasks = []
     for rid, r in (cfg.get("routines") or {}).items():
+        if rid == "tick" and isinstance(r, dict):
+            every, active = r.get("every", 60), r.get("active_hours", "06:00-22:00")
+            tasks.append({"taskId": "mother-tick", "title": f"Mother: tick (every {every} min, {active})",
+                          "cronExpression": _interval_cron(every, active, r.get("days"), workdays),
+                          "prompt": _pointer(ws, "tick", pull=False)})
+            continue
         if rid == "meeting" or not isinstance(r, dict) or "at" not in r:
             continue
         tasks.append({"taskId": f"mother-{rid}", "title": f"Mother: {rid} ({r['at']})",
@@ -630,6 +687,39 @@ def _log_start(ws: Path, runs: dict):
     return min(times) if times else None
 
 
+def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime) -> dict:
+    """Tick row. Missed only inside active hours on a scheduled day, 2x every after the day's first slot, with no run in 2x every."""
+    every = r.get("every", 60)
+    a, b = _tick_hours(r.get("active_hours", "06:00-22:00"))
+    local = now.astimezone()
+    days = r.get("days")
+    want = workdays if days in (None, "workdays") else DAYS if days == "all" else [days] if isinstance(days, str) else days
+    mins = local.hour * 60 + local.minute
+    window = _dt.timedelta(minutes=2 * every)
+    hist = runs.get("tick") or []
+    last = hist[-1] if hist else None
+    first_slot = (a // 60) * 60 + 5 if a % 60 <= 5 else a
+    expected = None
+    if DAYS[local.weekday()] in want and mins >= a:
+        steps = [h * 60 + m for h in range(a // 60, -(-b // 60), max(1, every // 60))
+                 for m in ((5, 35) if every == 30 else (5,)) if a <= h * 60 + m < b]
+        past = [x for x in steps if x <= mins]
+        if past:
+            expected = (local.replace(hour=past[-1] // 60, minute=past[-1] % 60, second=0, microsecond=0)).astimezone(_dt.timezone.utc)
+    recent = [h for h in hist if now - window <= h[0] <= now]
+    overdue = (DAYS[local.weekday()] in want and a <= mins < b and mins >= first_slot + 2 * every
+               and not recent and not (start and now - window < start))
+    if overdue:
+        state = "missed"
+    elif last is None:
+        state = "pending"
+    else:
+        state = "ok" if last[1] in ("ok", "skipped") else last[1]
+    return {"id": "tick", "state": state, "expected": expected.strftime("%Y-%m-%dT%H:%MZ") if expected else None,
+            "last": last[0].strftime("%Y-%m-%dT%H:%MZ") if last else None,
+            "last_status": last[1] if last else None, "note": last[2] if last else ""}
+
+
 def routine_health(ws: Path, cfg: dict) -> list:
     """One row per scheduled routine: {id, state, expected, last, note}. state: ok|partial|failed|missed|pending."""
     now = _now()
@@ -638,6 +728,9 @@ def routine_health(ws: Path, cfg: dict) -> list:
     start = _log_start(ws, runs)
     rows = []
     for rid, r in (cfg.get("routines") or {}).items():
+        if rid == "tick" and isinstance(r, dict):
+            rows.append(_tick_health(r, runs, start, workdays, now))
+            continue
         if not isinstance(r, dict) or "at" not in r:
             continue
         slot = _last_slot(r["at"], r.get("days"), workdays, now)
