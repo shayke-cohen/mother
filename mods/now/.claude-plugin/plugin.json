@@ -1,0 +1,16 @@
+{
+  "name": "mother-now",
+  "version": "0.1.2",
+  "description": "The Now panel for MOTHER: what's on you and what the team is neglecting, beside the chat. Reads the tick's now.json; makes no network or MCP calls.",
+  "author": { "name": "Shay Cohen", "url": "https://github.com/shayke-cohen" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "mother_bin": {
+      "type": "string",
+      "title": "MOTHER command",
+      "description": "Path to the mother script, used to find the workspace (`mother path`). A leading ~ is the home folder.",
+      "default": "~/.claude/plugins/marketplaces/mother/bin/mother"
+    }
+  }
+}

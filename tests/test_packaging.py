@@ -5,9 +5,12 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME_DIRS = ["agents", "bin", "lib", "hooks", "skills", "routines", "rules", "assets", "templates", ".claude-plugin",
+RUNTIME_DIRS = ["agents", "bin", "lib", "hooks", "skills", "routines", "rules", "assets", "templates", ".claude-plugin", "mods",
                 "bridge"]
 SKIP_PARTS = {"__pycache__", "node_modules"}  # node_modules: installed by `npm ci`, never shipped
+# Written by the Claude Code engine when it loads a mod (its API types and a tsconfig that extends them);
+# local to each machine, never shipped.
+ENGINE_WRITTEN = ("mods/now/tsconfig.json", "mods/now/.claude-plugin/types/")
 
 
 class PackagingTest(unittest.TestCase):
@@ -21,7 +24,7 @@ class PackagingTest(unittest.TestCase):
             for p in (ROOT / d).rglob("*"):
                 if p.is_file() and p.name != ".DS_Store" and not SKIP_PARTS.intersection(p.parts):
                     rel = str(p.relative_to(ROOT))
-                    if rel not in tracked:
+                    if rel not in tracked and not rel.startswith(ENGINE_WRITTEN):
                         missing.append(rel)
         self.assertEqual(missing, [], "runtime files not tracked by git (ignored or never added)")
 

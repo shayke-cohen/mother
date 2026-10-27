@@ -55,9 +55,10 @@ To try an unreleased change end to end in Claude Code: `claude --plugin-dir /pat
 ## Gotchas
 
 - **The guard is live while you work.** If MOTHER is installed, `hooks/guard.py` runs on your own tool
-  calls in this repo. A shell command that names `guard.py`, `hooks.json`, `PAUSED`, `ledger.json` or
-  `guard.log` and could change it will **ask**. Edit those files with the Edit/Write tools; reads (`cat`,
-  `grep`) pass. Any `gh … delete` is denied outright; ask the user to run it.
+  calls in this repo. A shell command that could write the *installed* guard's files (under
+  `.claude/plugins/` or `${CLAUDE_PLUGIN_ROOT}`) or the workspace's `config.json` / `.mother/` state will
+  **ask**; the same names in this checkout pass. With `--plugin-dir` this checkout *is* the running copy, so
+  edit with the Edit/Write tools. Any `gh … delete` is denied outright; ask the user to run it.
 - **Two copies of the plugin.** The installed plugin lives under `~/.claude/plugins/…`; your checkout is
   separate. Editing the checkout changes nothing a running routine sees until a release is installed, or
   you run with `--plugin-dir`.

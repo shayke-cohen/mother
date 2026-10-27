@@ -38,6 +38,7 @@ holds code a later session would run.
 | `lib/whatsapp.py` | `mother whatsapp`: chats and read from the local WhatsApp database, send through the bridge, setup and link | Home machine only; the guard asks before each send to someone else. CONTRACT §5d |
 | `bridge/whatsapp/` | Send-only WhatsApp bridge (Node, Baileys linked device) on a 0600 Unix socket | Optional; `checks.mjs` = pure send rules (cap, gap), `bridge.mjs` = socket + WhatsApp. CONTRACT §5d |
 | `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
+| `lib/now.py` | Deterministic core of the hourly tick and Now panel (working hours, signal thresholds, merge into `now.json`, the `mother now` verbs) | Python 3.9 stdlib only |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
 | `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |
@@ -49,10 +50,10 @@ holds code a later session would run.
 | `tests/` | stdlib `unittest`, one module per Python component plus packaging | `test_packaging` checks every runtime file is tracked |
 | `docs/` | CONTRACT (spec), DESIGN (why), ROADMAP (stages) | `docs/drafts/`, `docs/superpowers/` are untracked personal notes |
 
-Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `digest`, `dots`, `commitments`,
+Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `digest`, `dots`, `commitments`,
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`.
 
-Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `commitments`, `one-on-one`, `meeting-prep`,
+Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
 `meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
 
 ## How a scheduled run flows

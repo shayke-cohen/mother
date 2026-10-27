@@ -20,6 +20,8 @@ Commands:
                                the manager's guided WhatsApp setup and device link; own terminal only (a TTY; the guard denies them to the agent)
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
+  now merge|show|done|snooze|top|do
+                               the Now list behind the hourly tick and panel (`mother now help`); merge reads JSON on stdin
   eval brief|verdict|report    A/B the brief's gather mode on the same inputs (`mother eval help`)
   health record|pick|classify|summary|merge|alert|pending  per-server connector health in capabilities.json (`mother health help`)
   speak [--in FILE] [--name N] [--voice V] [--rate WPM]
@@ -40,7 +42,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.6.1"
+VERSION = "0.7.3"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -111,6 +113,66 @@ WA_KEYS = {"enabled", "self_jid", "max_per_day", "min_gap_seconds", "read", "sen
 WA_LEGACY_KEYS = {"allow", "approve_via", "max_prompts_per_day"}  # the earlier design: accepted, ignored
 WA_MAX_PER_DAY_CEILING = 50
 WA_USER_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net", re.ASCII)
+
+
+TICK_EVERY = (30, 60, 120, 180, 240)
+TICK_KEYS = {"every", "active_hours", "days", "thresholds", "signals", "notify", "slow_every", "max_age_days"}
+
+
+def _tick_hours(active):
+    """(start, end) in minutes since midnight for 'HH:MM-HH:MM', or None when malformed or start >= end."""
+    m = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)", active) if isinstance(active, str) else None
+    if not m:
+        return None
+    a, b = int(m[1]) * 60 + int(m[2]), int(m[3]) * 60 + int(m[4])
+    return (a, b) if a < b else None
+
+
+def _manager_tz(cfg: dict):
+    """manager.timezone as a tzinfo; UTC when unset or unknown (validate reports a bad zone elsewhere)."""
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo((cfg.get("manager") or {}).get("timezone") or "UTC")
+    except Exception:
+        return _dt.timezone.utc
+
+
+def _tick_offset(cfg: dict, now: _dt.datetime) -> int:
+    """Minutes to add to a manager.timezone clock time to get this machine's clock time, at today's offsets."""
+    tz = _manager_tz(cfg)
+    day = now.astimezone(tz).date()
+    noon = _dt.datetime(day.year, day.month, day.day, 12, tzinfo=tz)
+    return int((noon.astimezone().utcoffset() - noon.utcoffset()).total_seconds() // 60)
+
+
+def _tick_slots(every: int, a: int, b: int) -> list:
+    """Tick slots in minutes since midnight, manager time: :05 (and :35 for 30-minute) of each step hour."""
+    return [h * 60 + m for h in range(a // 60, -(-b // 60), max(1, every // 60))
+            for m in ((5, 35) if every == 30 else (5,))]
+
+
+TICK_OFFSET_CHANGED = "re-run mother register (time-zone offset changed)"
+TICK_MIDNIGHT = ("routines.tick.active_hours crosses midnight in this machine's time zone; narrow active_hours, "
+                 "or run tick on a machine whose time zone is nearer manager.timezone")
+
+
+def _tick_crosses_midnight(r: dict, cfg: dict, now: _dt.datetime) -> bool:
+    hours = _tick_hours(r.get("active_hours", "06:00-22:00"))
+    every = r.get("every", 60)
+    if hours is None or every not in TICK_EVERY:
+        return False
+    d = _tick_offset(cfg, now)
+    slots = _tick_slots(every, *hours)
+    return min([hours[0]] + slots) + d < 0 or max(hours[1], max(slots) + 1) + d > 24 * 60
+
+
+def _tick_registered_offset(ws: Path):
+    """The manager->machine offset (minutes) the registered tick cron was built with, or None if unknown."""
+    try:
+        v = json.loads((ws / ".mother" / "tick-register.json").read_text()).get("offset_minutes")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
 def validate(cfg: dict) -> list:
@@ -192,6 +254,8 @@ def validate(cfg: dict) -> list:
                   or (isinstance(d, list) and d and all(x in DAYS for x in d)))
             if not ok:
                 errs.append(f"routines.{rid}.days must be workdays, all, a day, a list of days, or monthly:<1-28>")
+            if rid == "tick" and isinstance(d, str) and d.startswith("monthly:"):
+                errs.append("routines.tick.days must be workdays, all, a day, or a list of days")
             if rid == "brief" and "draft_replies" in r and not isinstance(r["draft_replies"], bool):
                 errs.append("routines.brief.draft_replies must be true or false")
             if rid == "brief" and r.get("gather", "inline") not in ("inline", "readers"):
@@ -203,6 +267,42 @@ def validate(cfg: dict) -> list:
                     and au.get("language", "en") in ("en", "he")
                     and (au.get("rate") is None or (isinstance(au["rate"], int) and 90 <= au["rate"] <= 360)))):
                 errs.append("routines.brief.audio must be true/false or {voice, voice_he, rate 90-360, language en|he, save_to, engine say|kokoro, kokoro_voice}")
+            if rid == "tick":
+                sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+                import now as _now_mod
+                for k in r:
+                    if k not in TICK_KEYS:
+                        errs.append(f"routines.tick.{k} is not a known key")
+                ev = r.get("every")
+                if ev is not None and (not isinstance(ev, int) or isinstance(ev, bool) or ev not in TICK_EVERY):
+                    errs.append("routines.tick.every must be one of " + ", ".join(str(x) for x in TICK_EVERY))
+                ah = r.get("active_hours")
+                if ah is not None and _tick_hours(ah) is None:
+                    errs.append("routines.tick.active_hours must be HH:MM-HH:MM with start before end")
+                th = r.get("thresholds")
+                if th is not None and not isinstance(th, dict):
+                    errs.append("routines.tick.thresholds must be an object")
+                for sig, v in (th if isinstance(th, dict) else {}).items():
+                    if sig not in _now_mod.SIGNALS:
+                        errs.append(f"routines.tick.thresholds.{sig} is not a known signal")
+                    elif not (v == 0 and not isinstance(v, bool)) and not (isinstance(v, str) and re.fullmatch(r"\d+[hd]", v)):
+                        errs.append(f"routines.tick.thresholds.{sig} must be Nh, Nd or 0")
+                sg = r.get("signals")
+                if sg is not None and not isinstance(sg, dict):
+                    errs.append("routines.tick.signals must be an object")
+                for sig, v in (sg if isinstance(sg, dict) else {}).items():
+                    if sig not in _now_mod.SIGNALS:
+                        errs.append(f"routines.tick.signals.{sig} is not a known signal")
+                    elif not isinstance(v, bool):
+                        errs.append(f"routines.tick.signals.{sig} must be true or false")
+                if r.get("notify", "none") not in ("none", "dm"):
+                    errs.append("routines.tick.notify must be none or dm")
+                se = r.get("slow_every")
+                if se is not None and (not isinstance(se, int) or isinstance(se, bool) or not 1 <= se <= 6):
+                    errs.append("routines.tick.slow_every must be an integer 1-6")
+                ma = r.get("max_age_days")
+                if ma is not None and (not isinstance(ma, int) or isinstance(ma, bool) or not 0 <= ma <= 365):
+                    errs.append("routines.tick.max_age_days must be an integer 0-365")
             if rid == "commitments":
                 for k, lo, hi in (("no_reply_days", 1, 30), ("lookback_days", 1, 60)):
                     v = r.get(k)
@@ -370,6 +470,26 @@ def cmd_join(args):
 
 # ---------------------------------------------------------------- sync
 
+def _only_tick_runs(ws: Path) -> bool:
+    """True when the only change in the workspace is runs.md lines appended by the tick routine.
+    The hourly tick ends through the Stop/SessionEnd hooks' `sync --quiet`; committing for those lines alone
+    would add a commit and a push every hour. The next non-tick sync carries them."""
+    if git(ws, "status", "--porcelain", "--untracked-files=all").stdout.splitlines() != [" M runs.md"]:
+        return False
+    diff = git(ws, "diff", "--no-color", "--unified=0", "--", "runs.md").stdout.splitlines()
+    added = 0
+    for line in diff:
+        if line.startswith(("diff ", "index ", "--- ", "+++ ", "@@")):
+            continue
+        if not line.startswith("+"):
+            return False                       # a removed or changed line: not a plain append
+        m = RUN_LINE.match(line[1:].strip())
+        if not m or m.group(2) != "tick":
+            return False
+        added += 1
+    return added > 0
+
+
 def cmd_sync(args):
     quiet = "--quiet" in args
     def say(m):
@@ -379,6 +499,7 @@ def cmd_sync(args):
         print(f"mother sync: {m}", file=sys.stderr)
     if os.environ.get("MOTHER_NO_SYNC"):
         return  # a channel reply session: the loop's own session syncs, and parallel syncs collide on git
+    ws, tick_only = None, False
     try:
         ws = workspace(required=False)
         if not ws or not (ws / ".git").exists():
@@ -394,6 +515,9 @@ def cmd_sync(args):
         if (ws / "QUARANTINE.md").exists():
             warn("QUARANTINE.md present — not committing until it is resolved and deleted")
             return
+        if quiet and _only_tick_runs(ws):
+            tick_only = True
+            return                             # the hook path after a tick: no hourly commit or push
         if git(ws, "status", "--porcelain").stdout.strip():
             hits = scan_files(changed_files(ws))
             if hits:
@@ -434,7 +558,7 @@ def cmd_sync(args):
         warn("push still rejected after 3 tries; work is safe locally")
     finally:
         try:
-            if ws and (ws / ".mother").is_dir():
+            if ws and not tick_only and (ws / ".mother").is_dir():
                 (ws / ".mother" / "last-sync").write_text(now_iso() + "\n")
         except Exception:
             pass
@@ -551,7 +675,11 @@ def cmd_status(args):
             print(f"  - {e}")
         sys.exit(1)
     print("config:      valid")
-    bad = [f"{r['id']} {r['state']}" for r in routine_health(ws, cfg) if r["state"] in ("missed", "failed")]
+    rows = routine_health(ws, cfg)
+    bad = [f"{r['id']} {r['state']}" for r in rows if r["state"] in ("missed", "failed")]
+    for r in rows:
+        if r["id"] == "tick" and r["note"] in (TICK_MIDNIGHT, TICK_OFFSET_CHANGED):
+            print(f"tick:        WARNING — {r['note']}")
     print(f"routines:    {'; '.join(bad) + ' — see `mother runs`' if bad else 'all scheduled runs logged'}")
 
 
@@ -570,10 +698,24 @@ def _cron(at: str, days, workdays) -> str:
     return f"{int(mm)} {int(hh)} * * {dow}"
 
 
-def _pointer(ws: Path, rid: str, team: str = None) -> str:
+def _interval_cron(every: int, active: str, days, workdays, offset: int = 0) -> str:
+    """Cron for an interval routine: slots at minute :05 (and :35 for 30-minute) of manager.timezone, hourly
+    steps inside active hours, moved by `offset` minutes into the machine's clock (cron runs in machine time).
+    A half-hour offset moves :05 to :35. The caller has refused a window that crosses machine midnight."""
+    a, b = _tick_hours(active)
+    local = [x + offset for x in _tick_slots(every, a, b)]
+    mins = sorted({x % 60 for x in local})
+    hours = sorted({x // 60 for x in local})
+    run = hours == list(range(hours[0], hours[-1] + 1))
+    hh = f"{hours[0]}-{hours[-1]}" if len(hours) > 1 and every <= 60 and run else ",".join(str(h) for h in hours)
+    return f"{','.join(str(m) for m in mins)} {hh} " + _cron("00:00", days, workdays).split(" ", 2)[2]
+
+
+def _pointer(ws: Path, rid: str, team: str = None, pull: bool = True) -> str:
     who = f" for team {team}" if team else ""
-    return (f'cd "{ws}" and run `git pull --rebase -q` if the workspace has a remote (on failure, continue with the '
-            f"local copy and say so). Then invoke the mother:routine skill with routine id `{rid}`{who}. "
+    lead = (f'cd "{ws}" and run `git pull --rebase --autostash -q` if the workspace has a remote (on failure, continue with the '
+            f"local copy and say so). Then invoke" if pull else f'cd "{ws}". Invoke')
+    return (f"{lead} the mother:routine skill with routine id `{rid}`{who}. "
             "All behaviour lives in the mother plugin's routines/ files and the workspace config; this pointer "
             "carries no other instructions. Always append a line to runs.md, including on failure.")
 
@@ -585,8 +727,24 @@ def cmd_register(args):
     if errs:
         die("config invalid — run `mother status`")
     workdays = (cfg.get("manager") or {}).get("workdays") or DAYS[:5]
-    tasks = []
+    tasks, problems = [], []
     for rid, r in (cfg.get("routines") or {}).items():
+        if rid == "tick" and isinstance(r, dict):
+            if _tick_crosses_midnight(r, cfg, _now()):
+                problems.append(TICK_MIDNIGHT)          # tick is not registered; the other routines are
+                continue
+            every, active = r.get("every", 60), r.get("active_hours", "06:00-22:00")
+            offset = _tick_offset(cfg, _now())
+            tasks.append({"taskId": "mother-tick", "title": f"Mother: tick (every {every} min, {active})",
+                          "cronExpression": _interval_cron(every, active, r.get("days"), workdays, offset),
+                          "prompt": _pointer(ws, "tick", pull=False), "offset_minutes": offset})
+            try:
+                (ws / ".mother").mkdir(exist_ok=True)
+                (ws / ".mother" / "tick-register.json").write_text(
+                    json.dumps({"offset_minutes": offset, "registered_at": now_iso()}) + "\n")
+            except OSError:
+                pass
+            continue
         if rid == "meeting" or not isinstance(r, dict) or "at" not in r:
             continue
         tasks.append({"taskId": f"mother-{rid}", "title": f"Mother: {rid} ({r['at']})",
@@ -605,7 +763,14 @@ def cmd_register(args):
             tasks.append({"taskId": f"mother-meeting-recap-{t['slug']}", "title": f"Mother: {t['name']} recap draft",
                           "cronExpression": _cron(recap, wk["day"], workdays),
                           "prompt": _pointer(ws, "meeting-recap", t["slug"])})
-    print(json.dumps({"home_machine": (cfg.get("workspace") or {}).get("home_machine"), "tasks": tasks}, indent=2))
+    out = {"home_machine": (cfg.get("workspace") or {}).get("home_machine"), "tasks": tasks}
+    if problems:
+        out["errors"] = problems
+    print(json.dumps(out, indent=2))
+    for m in problems:
+        print(f"mother register: {m}", file=sys.stderr)
+    if problems:
+        sys.exit(2)
 
 # ---------------------------------------------------------------- runs (watchdog)
 
@@ -666,6 +831,52 @@ def _log_start(ws: Path, runs: dict):
     return min(times) if times else None
 
 
+def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime, cfg: dict = None, registered=None) -> dict:
+    """Tick row. Missed only inside active hours on a scheduled day, 2x every after the day's first slot, with no run in 2x every.
+    Judged in manager.timezone, the clock lib/now.py and the dispatcher's active-hours gate use."""
+    every = r.get("every", 60)
+    hours = _tick_hours(r.get("active_hours", "06:00-22:00"))
+    days = r.get("days")
+    if (hours is None or not isinstance(every, int) or isinstance(every, bool) or every not in TICK_EVERY
+            or (isinstance(days, str) and days.startswith("monthly:"))):
+        return {"id": "tick", "state": "failed", "expected": None, "last": None, "last_status": None,
+                "note": "invalid tick config — run mother status"}
+    problem = (TICK_MIDNIGHT if _tick_crosses_midnight(r, cfg or {}, now) else
+               TICK_OFFSET_CHANGED if registered is not None and registered != _tick_offset(cfg or {}, now) else None)
+    if problem:
+        hist = runs.get("tick") or []
+        last = hist[-1] if hist else None
+        return {"id": "tick", "state": "failed", "expected": None,
+                "last": last[0].strftime("%Y-%m-%dT%H:%MZ") if last else None,
+                "last_status": last[1] if last else None, "note": problem}
+    a, b = hours
+    local = now.astimezone(_manager_tz(cfg or {}))
+    want = workdays if days in (None, "workdays") else DAYS if days == "all" else [days] if isinstance(days, str) else days
+    mins = local.hour * 60 + local.minute
+    window = _dt.timedelta(minutes=2 * every)
+    hist = runs.get("tick") or []
+    last = hist[-1] if hist else None
+    first_slot = (a // 60) * 60 + 5 if a % 60 <= 5 else a
+    expected = None
+    if DAYS[local.weekday()] in want and mins >= a:
+        steps = [x for x in _tick_slots(every, a, b) if a <= x < b]
+        past = [x for x in steps if x <= mins]
+        if past:
+            expected = (local.replace(hour=past[-1] // 60, minute=past[-1] % 60, second=0, microsecond=0)).astimezone(_dt.timezone.utc)
+    recent = [h for h in hist if now - window <= h[0] <= now]
+    overdue = (DAYS[local.weekday()] in want and a <= mins < b and mins >= first_slot + 2 * every
+               and not recent and not (start and now - window < start))
+    if overdue:
+        state = "missed"
+    elif last is None:
+        state = "pending"
+    else:
+        state = "ok" if last[1] in ("ok", "skipped") else last[1]
+    return {"id": "tick", "state": state, "expected": expected.strftime("%Y-%m-%dT%H:%MZ") if expected else None,
+            "last": last[0].strftime("%Y-%m-%dT%H:%MZ") if last else None,
+            "last_status": last[1] if last else None, "note": last[2] if last else ""}
+
+
 def routine_health(ws: Path, cfg: dict) -> list:
     """One row per scheduled routine: {id, state, expected, last, note}. state: ok|partial|failed|missed|pending."""
     now = _now()
@@ -674,6 +885,9 @@ def routine_health(ws: Path, cfg: dict) -> list:
     start = _log_start(ws, runs)
     rows = []
     for rid, r in (cfg.get("routines") or {}).items():
+        if rid == "tick" and isinstance(r, dict):
+            rows.append(_tick_health(r, runs, start, workdays, now, cfg, _tick_registered_offset(ws)))
+            continue
         if not isinstance(r, dict) or "at" not in r:
             continue
         slot = _last_slot(r["at"], r.get("days"), workdays, now)
@@ -710,7 +924,7 @@ def cmd_runs(args):
                 detail = "not due since logging began"
             else:
                 note = r["note"] if len(r["note"]) <= 90 else r["note"][:89] + "…"
-                detail = f"{r['last']}" + (f" — {note}" if note else "")
+                detail = f"{r['last'] or 'never ran'}" + (f" — {note}" if note else "")
             print(f"{r['id']:<16} {r['state'].upper() if r['state'] in ('missed', 'failed') else r['state']:<8} {detail}")
     sys.exit(2 if any(r["state"] in ("missed", "failed") for r in rows) else 0)
 
@@ -914,6 +1128,16 @@ def cmd_items(args):
     items.main(args)
 
 
+def cmd_now(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import now
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        now.main(args, None, {}, _now())
+        return
+    ws = workspace()
+    now.main(args, ws, load_config(ws), _now())
+
+
 def cmd_eval(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import evals
@@ -930,7 +1154,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

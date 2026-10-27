@@ -363,6 +363,78 @@ class TestNotOutbound(GuardCase):
         self.expect("none", "Read", {"file_path": "/etc/hosts"})
 
 
+class TestShellSelfEdit(GuardCase):
+    """The shell check asks only when a write reaches the running guard's files, not a checkout's or another
+    project's files with the same names."""
+
+    def bash(self, want, cmd, **kw):
+        self.expect(want, "Bash", {"command": cmd}, **kw)
+
+    def test_writes_to_the_running_copy_ask(self):
+        self.bash("ask", "sed -i '' s/a/b/ %s" % GUARD)
+        self.bash("ask", "rm ${CLAUDE_PLUGIN_ROOT}/hooks/guard.py")
+        self.bash("ask", "sed -i '' s/a/b/ hooks/guard.py", cwd=ROOT)  # running from inside the plugin
+        self.bash("ask", "cp /tmp/x %s" % os.path.join(self.ws, "config.json"))
+        self.bash("ask", "cp /tmp/x %s" % os.path.join(self.ws, "Config.json"))  # macOS ignores case
+        self.bash("ask", "cp /tmp/x config.json", cwd=self.ws)
+        self.bash("ask", "cd %s && python3 -c \"open('config.json','w').write('{}')\"" % self.ws)
+        self.bash("ask", "W=$(cat ~/.mother/workspace); cp /tmp/x \"$W/config.json\"")
+        self.bash("ask", "cp /tmp/x \"$MOTHER_WORKSPACE/.mother/ledger.json\"")
+        self.bash("ask", "echo /tmp/elsewhere > ~/.mother/workspace")
+
+    def test_checkouts_and_other_projects_pass(self):
+        other = os.path.join(self.tmp, "checkout")
+        self.bash("none", "cd %s && python3 - <<'PY'\np = 'hooks/guard.py'\nopen(p, 'w').write('x')\nPY" % other)
+        self.bash("none", "git -C %s diff hooks/guard.py > /tmp/x" % other)
+        self.bash("none", "cd %s && sed -i '' s/a/b/ hooks/hooks.json" % other)
+        self.bash("none", "wc -l scratch/native-ledger.jsonl > /tmp/n")
+        self.bash("none", "export MOTHER_WORKSPACE=/tmp/t; cp /tmp/x \"$MOTHER_WORKSPACE/config.json\"")
+
+    def test_reads_and_prose_pass(self):
+        self.bash("none", "W=$(cat ~/.mother/workspace); ls $W/teams 2>/dev/null")
+        self.bash("none", "grep -n x %s 2>&1 | head" % self.state("guard.log"))
+        self.bash("none", "python3 -c \"import json; print(json.load(open('config.json'))['version'])\"", cwd=self.ws)
+        self.bash("none", "git add config.json && git commit -m \"config: x\n\nCo-Authored-By: Agnes <agnes@example.com>\"",
+                  cwd=self.ws)
+        self.bash("none", "echo 'routines paused today' >> notes.md", cwd=self.ws)
+        self.bash("none", "cat > notes.md <<'EOF'\nchange config.json later\nEOF", cwd=self.ws)
+
+
+class TestShellCodeHost(GuardCase):
+    """`gh` text the shell won't run (prompts, notes, commit messages) is not a code-host write."""
+
+    def bash(self, want, cmd, **kw):
+        self.expect(want, "Bash", {"command": cmd}, **kw)
+
+    def test_quoted_and_heredoc_text_pass(self):
+        self.bash("none", "dev3 note add \"rerun with gh run rerun 1 --failed, then gh pr merge 2 --auto\"")
+        self.bash("none", "git commit -F - <<'EOF'\nguard: x\n\nThe hook blocks gh pr create until a review.\nEOF")
+        self.bash("none", "cat > task.md <<'EOF'\nOpen it with `gh pr create`.\nEOF")
+
+    def test_gets_and_query_files_pass(self):
+        self.bash("none", "gh api -X GET search/code -f q='repo:o/r x' --jq '.items[].path'")
+        q = os.path.join(self.tmp, "q.graphql")
+        with open(q, "w") as f:
+            f.write("# threads\nquery($o:String!){ repository(owner:$o, name:\"r\"){ id } }\n")
+        self.bash("none", "gh api graphql -F query=@%s -f o=x" % q)
+        with open(q, "w") as f:
+            f.write("mutation { resolveReviewThread(input:{threadId:\"T\"}){ thread { id } } }\n")
+        self.bash("ask", "gh api graphql -F query=@%s" % q)
+        self.bash("ask", "gh api graphql -F query=@%s" % os.path.join(self.tmp, "missing.graphql"))
+
+    def test_real_writes_still_ask(self):
+        self.bash("ask", "url=$(gh issue create --title \"t\" --body b)")
+        self.bash("ask", "bash -c 'gh pr merge 1 --squash'")
+        self.bash("ask", "gh pr comment 1 --body \"$(cat <<'EOF'\nhi\nEOF\n)\"")
+        self.bash("ask", "cat > x.sh <<'EOF'\ngh issue edit 1 --body y\nEOF\nchmod +x x.sh; ./x.sh")
+        self.bash("ask", "gh api repos/o/r/issues/1/comments -f body=hi")
+
+    def test_read_tier_and_watch_tools_pass(self):
+        self.expect("none", TRK2 + "executeRead", {"name": "getIssue", "inputs": {"issueIdOrKey": "PLAT-1"}})
+        self.expect("none", "mcp__pr__set_monitor", {"url": "https://example.com/o/r/pull/1", "auto_fix": True})
+        self.expect("ask", "mcp__pr__set_auto_merge", {"url": "https://example.com/o/r/pull/1"})
+
+
 class TestChannelSession(GuardCase):
     """A headless channel reply session (MOTHER_CHANNEL_ROLE set by `mother channels run`)."""
 

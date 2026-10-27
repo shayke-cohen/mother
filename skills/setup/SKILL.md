@@ -117,7 +117,7 @@ Present, in this order:
    projects, <K> repos, and run: brief 08:45, digest 09:00 …".
 2. The roster table with evidence per person.
 3. Channels with proposed modes.
-4. Routines with times in the manager's time zone (defaults from `templates/workspace/config.example.json`;
+4. Routines (the tick shown as "hourly, 06:05-21:05") with times in the manager's time zone (defaults from `templates/workspace/config.example.json`;
    omit routines whose sources don't exist — no `digest` sprint section without a tracker, etc.). The
    `doctor` routine is `days: "all"` with `at` 30 minutes before the earliest `routines.*.at` other than the doctor's own, never before
    05:00. In Edit mode on an existing install whose doctor is weekly or differently timed, show that as a
@@ -150,10 +150,24 @@ In this order, reporting each step's result:
      new ids → `create_scheduled_task` with the printed `taskId`, `cronExpression`, `prompt` (verbatim)
      and a one-line `description`. A routine removed from config → `update_scheduled_task` with
      `enabled: false` (never delete).
+   - **Tick (default on).** Offer the hourly tick in step 5's draft: "every hour 06:05-21:05 on workdays I'll
+     refresh a short list of what is waiting on you and what the team is neglecting (the Now panel and
+     `/mother:now`); nothing is sent unless you set `notify` to `dm`". Add `routines.tick`
+     (`every`, `active_hours`, `days`, `notify: "none"`, `slow_every: 3` from the example config) unless the
+     manager declines. It is an interval routine: `mother register` prints it with a cron for each slot and a
+     pointer that does no `git pull`. Register it like the rest; it runs only on the home machine. Its
+     hours are in `manager.timezone` and `mother register` converts them to this machine's clock itself; if it
+     exits 2 with "crosses midnight in this machine's time zone" in `errors`, tick was left out: register the
+     tasks it did print, then offer narrower `active_hours` and register again. If `mother runs` later says
+     "re-run mother register (time-zone offset changed)", register again and update the tick task's cron.
+   - **The Now panel (offer, after the tick is registered).** "Want the list beside the chat? Run
+     `/plugin install mother-now@mother`, then `/now-panel` opens it." Mention its one setting, `mother_bin`: the
+     default points at the marketplace clone; it can be set to the installed plugin's `bin/mother`. Don't
+     install it yourself.
    - **The doctor runs daily** (see the proposal above): register it from the confirmed config, which
      sets it to `days: "all"` ahead of the first routine. Never rewrite its schedule silently.
    - Cron runs in the **machine's** local time. If `manager.timezone` differs from the machine's, convert
-     the times and say so.
+     the `at` times and say so (the tick's are converted by `mother register`).
    - `list_scheduled_tasks` again and confirm every routine is registered with the right schedule. A task
      folder on disk does not prove registration.
    - Tell the manager: routines run only while the app is open; a missed run fires on next launch. Offer

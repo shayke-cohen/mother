@@ -324,9 +324,26 @@ API_DELETE_RE = re.compile(r"(?:-X|--method)\s*['\"]?DELETE\b", re.I)
 GRAPHQL_READ_RE = re.compile(
     r"\b(?:gh|glab)\s+api\s+graphql\b.*?(?:-f|-F|--field|--raw-field)[\s=]+['\"]?query=['\"]?\s*(?:query\b|\{)")
 GRAPHQL_UNSAFE_RE = re.compile(r"\bmutation\b|--input\b|(?:-X|--method)\s*['\"]?(?:PATCH|PUT|DELETE)\b", re.I)
+API_GET_RE = re.compile(r"(?:-X|--method)\s*['\"]?GET\b", re.I)
+GRAPHQL_FILE_RE = re.compile(r"(?:-f|-F|--field|--raw-field)[\s=]+['\"]?query=@([^\s'\"]+)")
 CMD_SPLIT_RE = re.compile(r"&&|\|\||[;\n|]")
-SHELL_WRITE_RE = re.compile(r">|\b(?:rm|mv|cp|ln|tee|truncate|chmod|chown|unlink|touch|sed\s+-i|perl|python3?|"
-                            r"node|ruby|jq|dd|install|rsync|git\s+(?:checkout|restore|reset|rm|mv|apply|stash))\b")
+# Text the shell will not run: quoted strings and quoted-delimiter heredoc bodies (commit messages, PR bodies,
+# prompts). Blanked before matching, unless the command hands text to another interpreter.
+EXEC_RE = re.compile(r"(?:^|[\s;&|(`$])(?:bash|sh|zsh|eval|xargs|ssh|parallel|watch|env|osascript|python3?|node|ruby"
+                     r"|perl|source|chmod)(?=[\s;&|)]|$)|(?:^|[;&|(\n])\s*(?:\.{1,2}/|/)[^\s;&|]+")
+# Writing a script and running it (`cat > x.sh <<'EOF' … EOF; chmod +x x.sh; ./x.sh`): heredoc bodies stay.
+SCRIPT_RUN_RE = re.compile(r"(?:^|[\s;&|(])(?:chmod|source|bash|sh|zsh|\.)\s|(?:^|[;&|(\n])\s*(?:\.{1,2}/|/)[^\s;&|]+")
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w-]*)\1")
+SHELL_WRITE_RE = re.compile(r">|\b(?:rm|mv|cp|ln|tee|truncate|chmod|chown|unlink|touch|sed\s+-i|dd|install|rsync"
+                            r"|git\s+(?:checkout|restore|reset|rm|mv|apply|stash))\b")
+SAFE_REDIRECT_RE = re.compile(r"\d*>>?\s*/dev/(?:null|stdout|stderr)\b|&>>?\s*/dev/null\b|\d*>&\d|<[^<>\s]+@[^<>\s]+>")
+SCRIPT_RE = re.compile(r"(?:^|[\s;&|(`$])(?:python3?|node|ruby|perl)(?=[\s;&|)]|$)")
+SCRIPT_WRITE_RE = re.compile(
+    r"\.write\(|write_text|write_bytes|open\([^)]*['\"][wax]\+?b?['\"]|os\.(?:remove|unlink|rename|replace|symlink"
+    r"|rmdir|truncate)|shutil\.|\.unlink\(|\.rename\(|\.touch\(|json\.dump\(|subprocess|os\.system|writeFile"
+    r"|appendFile|fs\.\w*(?:write|unlink|rename|copy|rm)|rmSync|File\.(?:write|delete)|\bperl\s+-\w*i")
+POINTER_READ_RE = re.compile(r"\bcat\s+[\"']?(?:~|\$\{?HOME\}?|/[^\s\"']*)/\.mother/workspace[\"']?")
+POINTER_RE = re.compile(r"(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.mother/workspace(?![\w/.-])", re.I)
 
 
 def tokens_of(name):
@@ -407,15 +424,32 @@ def protected_paths(ctx):
     return {_cf(p) for p in ps}  # casefolded: macOS file systems ignore case (Config.json is config.json)
 
 
-def api_write(cmd):
-    """A `gh api` / `glab api` write anywhere in the command line. Read-only GraphQL queries pass."""
+def graphql_file_is_query(seg, cwd):
+    """`-F query=@file`: a read when the file holds a query and no mutation."""
+    m = GRAPHQL_FILE_RE.search(seg)
+    if not m:
+        return False
+    p = os.path.join(cwd or os.getcwd(), os.path.expanduser(os.path.expandvars(m.group(1))))
+    try:
+        with open(p) as f:
+            q = f.read(65536)
+    except Exception:
+        return False
+    q = re.sub(r"(?m)^\s*#.*$", "", q)
+    return bool(re.match(r"\s*(?:query\b|\{)", q)) and not re.search(r"\bmutation\b", q)
+
+
+def api_write(cmd, cwd=None):
+    """A `gh api` / `glab api` write anywhere in the command line. GETs and read-only GraphQL queries pass."""
     if not (API_RE.search(cmd) and API_WRITE_RE.search(cmd)):
         return False
     unsafe = GRAPHQL_UNSAFE_RE.search(cmd)
     for seg in CMD_SPLIT_RE.split(cmd):
         if not (API_RE.search(seg) and API_WRITE_RE.search(seg)):
             continue
-        if not unsafe and GRAPHQL_READ_RE.search(seg):
+        if API_GET_RE.search(seg):
+            continue
+        if not unsafe and (GRAPHQL_READ_RE.search(seg) or graphql_file_is_query(seg, cwd)):
             continue
         return True
     return False
@@ -1684,33 +1718,120 @@ def wa_block_edit(tool, inp, fp):
     return old != new
 
 
+def run_text(cmd, quotes=True, bodies=False):
+    """The command with text the shell won't run blanked out: quoted strings, and heredoc bodies that feed a
+    plain command (`git commit -F -`, `cat >`). Nothing is blanked in quotes when the command hands text to
+    another interpreter (`bash -c`, `python3 -c`, `ssh`, `xargs` …), nor in a heredoc that feeds one.
+    `quotes=False` keeps quoted strings (they hold paths); `bodies=True` blanks every heredoc body."""
+    blank = quotes and not EXEC_RE.search(cmd)
+    scripted = not bodies and SCRIPT_RUN_RE.search(run_text(cmd, quotes=False, bodies=True))
+    out, pending, i, n = [], [], 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            out.append(cmd[i:i + 2])
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            j = n - 1 if j < 0 else j
+            out.append("''" if blank else cmd[i:j + 1])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                j += 2 if cmd[j] == "\\" else 1
+            s = cmd[i:j + 1]
+            live = re.search(r"\$\(|(?<!\\)`", s)
+            out.append('""' if blank and not live else s)
+            i = j + 1
+        elif cmd.startswith("<<", i) and HEREDOC_RE.match(cmd, i):
+            m = HEREDOC_RE.match(cmd, i)
+            start = max(cmd.rfind(x, 0, i) for x in ("\n", ";", "&", "|", "(")) + 1
+            pending.append((m.group(2), bool(m.group(1)), cmd[start:i]))
+            out.append(m.group(0))
+            i = m.end()
+        elif c == "\n" and pending:
+            out.append(c)
+            i += 1
+            for delim, quoted, head in pending:
+                end = re.compile(r"^\t*" + re.escape(delim) + r"[ \t]*$", re.M).search(cmd, i)
+                j = end.start() if end else n
+                body = cmd[i:j]
+                runs = not bodies and (scripted or EXEC_RE.search(" " + head) or
+                                       (not quoted and re.search(r"\$\(|`", body)))
+                out.append(body if runs else "\n" * body.count("\n"))
+                i = j
+            pending = []
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def shell_writes(cmd, run):
+    if SHELL_WRITE_RE.search(SAFE_REDIRECT_RE.sub(" ", run)):
+        return True
+    return bool(SCRIPT_RE.search(run) and SCRIPT_WRITE_RE.search(cmd))
+
+
+def shell_self_edit(cmd, run, cwd, ctx):
+    """A shell command that could change the guard's own files: it writes, and it names one of them by a path
+    that reaches the running copy (the installed plugin, the workspace) or runs from inside it. The same file
+    names in a checkout of this repo or in another project pass. Reads (cat, grep, 2>/dev/null) pass."""
+    if not shell_writes(cmd, run):
+        return False
+    text = run_text(cmd, quotes=False)  # a `cat > notes.md <<'EOF'` body that mentions config.json names nothing
+    low = text.lower()
+    shell = run_text(cmd, quotes=False, bodies=True).lower()  # markers count only where the shell expands them
+    # the session's cwd says where relative names land, unless the command moves first (then its cd path counts)
+    here = os.path.realpath(cwd).lower() if cwd and not re.search(r"(?:^|[\s;&|(])cd\s", shell) else ""
+    home = os.path.expanduser("~").lower()
+    homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "hooks.json"])]
+    if ctx.ws:
+        # a command that sets its own MOTHER_WORKSPACE / MOTHER_STATE_DIR is working on a test workspace
+        test_ws = re.search(r"\b(?:mother_workspace|mother_state_dir)=", shell)
+        homes.append((ctx.ws, [] if test_ws else [r"\$\{?mother_workspace\b", r"\.mother/workspace\b"],
+                      ["config.json", "PAUSED", "ledger.json", "guard.log"]))
+    for base, marks, names in homes:
+        # exact case as a bare word (so prose "paused" is not PAUSED), any case after a slash (macOS ignores case)
+        if not any(re.search(r"(?<![\w.-])" + re.escape(x) + r"(?![\w.-])", text) or
+                   re.search(r"/" + re.escape(x.lower()) + r"(?![\w.-])", low) for x in names):
+            continue
+        base = base.lower()
+        forms = [base] + (["~" + base[len(home):], "$home" + base[len(home):], "${home}" + base[len(home):]]
+                          if base.startswith(home + os.sep) else [])
+        if base.startswith("/private/"):  # macOS: /tmp and /var are links into /private
+            forms.append(base[len("/private"):])
+        if (here == base or here.startswith(base + os.sep) or any(f in low for f in forms)
+                or any(re.search(mk, shell) for mk in marks)):
+            return True
+    # the workspace pointer itself; reading it (`cat ~/.mother/workspace`) is how every routine finds the workspace
+    return bool(POINTER_RE.search(POINTER_READ_RE.sub(" ", text)))
+
+
+def wa_shell_names_config(cmd):
+    """A shell write that shell_self_edit already matched also names config.json (quoted paths included)."""
+    text = run_text(cmd, quotes=False)
+    return bool(re.search(r"(?<![\w.-])config\.json(?![\w.-])", text) or re.search(r"/config\.json(?![\w.-])", text.lower()))
+
+
 def classify_bash(cmd, cwd, ctx):
     wa = classify_whatsapp(cmd, cwd, ctx)
     if wa:
         return wa
-    # Edits to the guard's own state through the shell. Reads (cat, grep) pass.
-    if SHELL_WRITE_RE.search(cmd):
-        names = ["paused", "ledger.json", "guard.log", "guard.py", "hooks.json", ".mother/workspace"]
-        low = cmd.casefold()
-        hit = any(n in low for n in names)
-        cfg_hit = False
-        if ctx.ws:
-            roots = {ctx.ws, os.environ.get("MOTHER_WORKSPACE", "").strip()} - {""}
-            here = _cf(cwd) if cwd else ""
-            cfg_hit = any(os.path.join(r, "config.json").casefold() in low for r in roots) \
-                or ("config.json" in low and here == _cf(ctx.ws))
-            hit = hit or cfg_hit
-        if hit and cfg_hit and wa_block_now(ctx):
-            return wa_act("terminal", "a shell write to config.json, which holds the whatsapp block (who MOTHER "
-                                      "may message)")
-        if hit:
-            return act("config", "guard_config", "a shell command that could change the guard's own files")
+    run = run_text(cmd)
+    if shell_self_edit(cmd, run, cwd, ctx):
+        # config.json holds the whatsapp block: only `mother whatsapp setup`, in the manager's terminal, changes it
+        if wa_shell_names_config(cmd) and wa_block_now(ctx):
+            return wa_act("terminal", "a shell write to config.json, which holds the whatsapp block (MOTHER's "
+                                      "WhatsApp setup)")
+        return act("config", "guard_config", "a shell command that could change the guard's own files")
     short = cmd.strip()[:160]
-    if GH_CRED_RE.search(cmd):
+    if GH_CRED_RE.search(run):
         return act("credential", "credentials", "storing a credential on the code host: " + short)
-    if GH_DELETE_RE.search(cmd) or (API_RE.search(cmd) and API_DELETE_RE.search(cmd)):
+    if GH_DELETE_RE.search(run) or (API_RE.search(run) and API_DELETE_RE.search(cmd)):
         return act("deletion", "deletions", "a code-host deletion: " + short)
-    if GH_WRITE_RE.search(cmd) or api_write(cmd):
+    if GH_WRITE_RE.search(run) or (API_RE.search(run) and api_write(cmd, cwd)):
         return act("code", "code_host_comments", "a code-host write: " + short, text=cmd)
     return None
 
@@ -1736,6 +1857,8 @@ def classify_mcp(tool, inp):
         return None
     if "reminder" in verbs or "reminders" in verbs:
         return None  # reminders reach only the manager
+    if op == "execute_read" or verbs & {"monitor", "watch"}:
+        return None  # a read-tier call; watching a PR or thread reaches no one
     if lead in DELETE_VERBS or "execute_destructive" in op:
         return act("deletion", "deletions", "a deletion (%s)" % short)
 
@@ -1840,8 +1963,8 @@ def classify(tool, inp, cwd, ctx):
             if wa_inside(fp, ctx):
                 return wa_act("state", "an edit to the WhatsApp bridge's state: " + fp)
             if wa_config_path(fp, ctx) and wa_block_edit(tool, inp, fp):
-                return wa_act("terminal", "an edit that changes the whatsapp block of config.json (who MOTHER "
-                                          "may message)")
+                return wa_act("terminal", "an edit that changes the whatsapp block of config.json (MOTHER's "
+                                          "WhatsApp setup)")
             if fp.casefold() in protected_paths(ctx):
                 return act("config", "guard_config", "an edit to the guard's own files: " + fp)
         return None
