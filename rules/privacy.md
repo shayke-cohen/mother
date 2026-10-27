@@ -86,6 +86,21 @@ Everything the agent sends is signed (`agent.signature`) and goes through the gu
   people outside the thread, no internal links.
 - Digests and decks never contain customer identifiers; cite the thread.
 
+## WhatsApp
+
+WhatsApp chats are the manager's personal channel, read only for the chats on `whatsapp.allow`.
+
+- **No bodies in the workspace.** Don't copy WhatsApp messages into memory, journal, todos, people or project
+  notes. Write the fact ("Sam confirmed the Thursday cutover") and cite `whatsapp://<chat>/<stanza>`.
+  Drafts and approvals live in `.mother/whatsapp/`, machine-local and never synced.
+- **JIDs only in config.** A JID is a phone number. It lives in `config.json` (`whatsapp.allow`, `self_jid`)
+  and nowhere else: not in memory, journal, people files, commit messages or outbound text. Use the chat's
+  name.
+- **Nothing off the allowlist.** Never read, quote or summarise a chat that is not allowlisted, even if
+  `mother whatsapp chats` shows its name.
+- **No assessing people from their messages**, same as everywhere: what was decided or asked, not how
+  someone seems.
+
 ## If a secret lands in the workspace
 
 1. Stop. Don't let the next sync push it (`mother sync` will refuse and write `QUARANTINE.md`).

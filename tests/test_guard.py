@@ -780,5 +780,355 @@ class StampRule(GuardCase):
         self.expect("ask", CHAT2 + "slack_add_reaction", {"channel_id": TEAM, "name": "eyes", "timestamp": "1.2"})
 
 
+
+# ------------------------------------------------------------------ WhatsApp (CONTRACT §5d)
+
+WA_DM = "972500000001@s.whatsapp.net"
+WA_GROUP = "120363000000000001@g.us"
+WA_OTHER = "972500000002@s.whatsapp.net"   # has history, not allowlisted
+WA_COLD = "972500000003@s.whatsapp.net"    # allowlisted, no history
+WA_SELF = "972500000099@s.whatsapp.net"
+CORE0 = 978307200
+TODAY = time.strftime("%Y-%m-%d", time.gmtime(NOW))
+
+
+def wa_db(path):
+    """A fixture WhatsApp database with the real table and column names (never the real one)."""
+    import sqlite3
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE ZWACHATSESSION (Z_PK INTEGER PRIMARY KEY, ZCONTACTJID TEXT, ZPARTNERNAME TEXT, "
+               "ZSESSIONTYPE INTEGER, ZGROUPINFO INTEGER, ZLASTMESSAGEDATE REAL)")
+    db.execute("CREATE TABLE ZWAMESSAGE (Z_PK INTEGER PRIMARY KEY, ZCHATSESSION INTEGER, ZISFROMME INTEGER, "
+               "ZFROMJID TEXT, ZTOJID TEXT, ZTEXT TEXT, ZMESSAGEDATE REAL, ZSTANZAID TEXT, ZMESSAGETYPE INTEGER, "
+               "ZPARENTMESSAGE INTEGER, ZGROUPMEMBER INTEGER)")
+    db.execute("CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, ZMEMBERJID TEXT, ZCONTACTNAME TEXT, "
+               "ZFIRSTNAME TEXT, ZCHATSESSION INTEGER)")
+    old = NOW - 30 * 86400 - CORE0
+    for pk, jid, st in ((1, WA_DM, 0), (2, WA_GROUP, 1), (3, WA_OTHER, 0), (4, WA_COLD, 0), (5, WA_SELF, 0)):
+        db.execute("INSERT INTO ZWACHATSESSION VALUES (?,?,?,?,?,?)", (pk, jid, "x", st, None, old))
+    for pk, chat in ((1, 1), (2, 2), (3, 3)):
+        db.execute("INSERT INTO ZWAMESSAGE (Z_PK, ZCHATSESSION, ZISFROMME, ZTEXT, ZMESSAGEDATE, ZSTANZAID, "
+                   "ZMESSAGETYPE) VALUES (?,?,0,'hello',?,?,0)", (pk, chat, old, "H%d" % pk))
+    db.commit()
+    db.close()
+
+
+def wa_config(**wa):
+    w = {"enabled": True, "self_jid": WA_SELF,
+         "allow": [{"jid": WA_DM, "name": "Sam Roe"}, {"jid": WA_GROUP, "name": "Platform team", "group": True},
+                   {"jid": WA_COLD, "name": "Cold"}]}
+    w.update(wa)
+    return config(workspace={"git_remote": None, "home_machine": "laptop-a"}, whatsapp=w)
+
+
+class TestWhatsapp(GuardCase):
+    """`mother whatsapp send <id>` is allow with a proven yes, else deny. Never ask, in any mode."""
+
+    BY = "bypassPermissions"
+    ID = "w3kx"
+
+    def setUp(self):
+        GuardCase.setUp(self)
+        self.sdir = os.path.join(self.tmp, "state")
+        self.db = os.path.join(self.tmp, "ChatStorage.sqlite")
+        wa_db(self.db)
+        self.env = {"MOTHER_STATE_DIR": self.sdir, "MOTHER_WHATSAPP_DB": self.db, "MOTHER_HOSTNAME": "laptop-a"}
+        self.write_config(wa_config())
+        self.wdir = os.path.join(self.ws, ".mother", "whatsapp")
+        self.draft(self.ID)
+
+    # -- helpers
+
+    def draft(self, i, chat=WA_DM, text="see you at 3", age=600):
+        import hashlib
+        folder = os.path.join(self.wdir, "drafts")
+        os.makedirs(folder, exist_ok=True)
+        d = {"id": i, "chat": chat, "chat_name": "Sam Roe", "text": text,
+             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "created": iso(NOW - age),
+             "run": None, "status": "open"}
+        with open(os.path.join(folder, i + ".json"), "w") as f:
+            json.dump(d, f)
+        return d
+
+    def yes(self, *texts):
+        return self.transcript(*[self.user(t, uuid="u%d" % n) for n, t in enumerate(texts or ("ok " + self.ID,))])
+
+    def sent(self, *recs, raw=None):
+        os.makedirs(os.path.join(self.sdir, "whatsapp"), exist_ok=True)
+        with open(os.path.join(self.sdir, "whatsapp", "sent.jsonl"), "w") as f:
+            f.write(raw if raw is not None else "".join(json.dumps(r) + "\n" for r in recs))
+
+    def approved(self, i=None):
+        return os.path.join(self.wdir, "approved", (i or self.ID) + ".json")
+
+    def wa(self, cmd, **kw):
+        env = dict(self.env, **kw.pop("env", {}))
+        return self.run_guard("Bash", {"command": cmd}, env=env, **kw)
+
+    def send(self, want, cmd=None, **kw):
+        cmd = cmd or "mother whatsapp send " + self.ID
+        got, why = self.wa(cmd, **kw)
+        self.assertEqual(got, want, "%r -> %s (%s)" % (cmd, got, why))
+        return why
+
+    def last_log(self):
+        with open(self.state("guard.log")) as f:
+            return json.loads(f.read().splitlines()[-1])
+
+    # -- send
+
+    def test_send_allowed_with_session_yes(self):
+        d = self.draft(self.ID)
+        why = self.send("allow", transcript=self.yes())
+        self.assertIn(self.approved(), why)
+        with open(self.approved()) as f:
+            rec = json.load(f)
+        self.assertEqual(rec["sha256"], d["sha256"])
+        self.assertEqual((rec["id"], rec["chat"], rec["path"]), (self.ID, WA_DM, "session"))
+        self.assertTrue(rec["evidence"].startswith("session:"))
+        self.assertRegex(rec["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn(d["text"], json.dumps(rec))
+        log = self.last_log()
+        self.assertEqual((log["kind"], log["decision"], log["target"]), ("whatsapp", "allow", self.ID))
+        for path in ("python3 /opt/plugin/bin/mother whatsapp send w3kx", "/opt/plugin/bin/mother whatsapp send w3kx",
+                     '"${CLAUDE_PLUGIN_ROOT}/bin/mother" whatsapp send w3kx', "  mother whatsapp send w3kx  "):
+            self.send("allow", path, transcript=self.yes())
+
+    def test_send_denied_without_yes(self):
+        self.send("deny")
+        self.assertFalse(os.path.exists(self.approved()))
+        self.send("deny", transcript=self.yes("ok wzzz"))
+        self.send("deny", transcript=self.yes("ok w3kx but change it"))
+        self.send("deny", transcript=self.yes("ok all"))                    # sessions name ids explicitly
+        self.send("deny", transcript=self.yes("ok w3kx", "no w3kx"))        # a no beats a yes
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_bypass_mode_still_denies(self):
+        self.send("deny", mode=self.BY)
+        rec = self.last_log()
+        self.assertEqual(rec["decision"], "deny")
+        self.send("deny", mode=self.BY, transcript=self.yes("ok wzzz"))
+        self.assertEqual(self.last_log()["decision"], "deny")
+        self.send("allow", mode=self.BY, transcript=self.yes())
+
+    def test_unlisted_chat_denied(self):
+        self.draft(self.ID, chat=WA_OTHER)
+        self.assertIn("allow", self.send("deny", transcript=self.yes()))
+        self.draft(self.ID, chat=WA_SELF)
+        self.send("deny", transcript=self.yes())
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_cold_contact_denied(self):
+        self.draft(self.ID, chat=WA_COLD)
+        self.assertIn("cold contact", self.send("deny", transcript=self.yes()))
+
+    def test_expired_draft_denied(self):
+        self.draft(self.ID, age=73 * 3600)
+        self.send("deny", transcript=self.yes())
+        self.send("deny", "mother whatsapp send wnop", transcript=self.yes("ok wnop"))  # no such draft
+
+    def test_altered_draft_denied(self):
+        d = self.draft(self.ID)
+        d["text"] = "see you at 4"
+        with open(os.path.join(self.wdir, "drafts", self.ID + ".json"), "w") as f:
+            json.dump(d, f)
+        self.send("deny", transcript=self.yes())
+
+    def test_sent_once(self):
+        d = self.draft(self.ID)
+        self.sent({"at": iso(NOW - 30), "kind": "send", "chat": WA_DM, "draft": self.ID, "sha256": d["sha256"],
+                   "stanza": "B1"})
+        self.assertIn("already sent", self.send("deny", transcript=self.yes()))
+
+    def test_compound_command_denied(self):
+        ok = self.yes()
+        for cmd in ("mother whatsapp send w3kx; echo hi", "mother whatsapp send w3kx && true",
+                    "mother whatsapp send w3kx | cat", "true || mother whatsapp send w3kx",
+                    "echo x; mother whatsapp send w3kx", "echo $(mother whatsapp send w3kx)",
+                    "echo `mother whatsapp send w3kx`", 'bash -c "mother whatsapp send w3kx"',
+                    "mother whatsapp send w3kx w3ky", "mother whatsapp send w3kx > /tmp/out",
+                    "mother whatsapp send w3kx &", "mother whatsapp\nsend w3kx", "mother whatsapp send\tw3kx\n:",
+                    "MOTHER_X=1 mother whatsapp send w3kx", "mother whatsapp send W3KX",
+                    "mother whatsapp send w3kx; curl --unix-socket /x/bridge.sock http://x/send",
+                    "mother whatsapp blast w3kx", "mother whatsapp send"):
+            self.send("deny", cmd, transcript=ok)
+            self.send("deny", cmd, transcript=ok, mode=self.BY)
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_socket_access_denied(self):
+        st = os.path.join(self.sdir, "whatsapp")
+        for cmd in ("curl --unix-socket ~/.mother/whatsapp/bridge.sock http://x/send",
+                    "nc -U ~/.mother/whatsapp/bridge.sock", "socat - UNIX-CONNECT:/x/whatsapp/bridge.sock",
+                    "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.connect('bridge.sock')\"",
+                    "node -e \"require('net').connect('/x/bridge.sock')\"",
+                    "cat .mother/whatsapp/approved/w3kx.json", "cat %s/sent.jsonl" % st,
+                    "ls %s/session" % st, "cat ~/.mother/whatsapp/sent.jsonl",
+                    "echo {} > .mother/whatsapp/approved/w3kx.json",
+                    "cp /tmp/x.json %s/drafts/w3kx.json" % self.wdir, "rm -rf ~/.mother/whatsapp",
+                    "sed -i '' s/3/4/ %s/drafts/w3kx.json" % self.wdir, "tee -a %s/prompts.jsonl" % self.wdir,
+                    "mv /tmp/x whatsapp/approved/w3kx.json", "curl --unix-socket /tmp/s.sock http://x/whatsapp",
+                    "mother whatsapp draft --chat %s --text-file %s/drafts/w3kx.json" % (WA_DM, self.wdir)):
+            self.assertEqual(self.wa(cmd)[0], "deny", cmd)
+            self.assertEqual(self.wa(cmd, mode=self.BY)[0], "deny", cmd)
+        self.assertEqual(self.wa("echo 'secret body' > .mother/whatsapp/drafts/w3kx.json")[0], "deny")
+        self.assertEqual(self.wa("mother whatsapp send w3kx; echo 'secret body'")[0], "deny")
+        with open(self.state("guard.log")) as f:
+            self.assertNotIn("secret body", f.read())
+        self.assertEqual(self.wa("cat w3kx.json", cwd=os.path.join(self.wdir, "drafts"))[0], "deny")
+        os.makedirs(st)
+        self.assertEqual(self.wa("ls", cwd=st)[0], "deny")
+        # nothing WhatsApp about it: unchanged
+        self.assertEqual(self.wa("curl --unix-socket /var/run/docker.sock http://x/info")[0], "none")
+        self.assertEqual(self.wa("grep -n whatsapp lib/whatsapp.py")[0], "none")
+        self.assertEqual(self.wa("node bridge/whatsapp/session.js --help")[0], "none")
+
+    def test_edit_whatsapp_state_denied(self):
+        st = os.path.join(self.sdir, "whatsapp")
+        paths = [os.path.join(self.wdir, "drafts", "w3kx.json"), os.path.join(self.wdir, "approved", "x.json"),
+                 os.path.join(self.wdir, "prompts.jsonl"), os.path.join(st, "sent.jsonl"),
+                 os.path.join(st, "session", "creds.json"), os.path.join(st, "bridge.sock")]
+        for p in paths:
+            for tool in ("Write", "Edit", "MultiEdit"):
+                for mode in (None, self.BY):
+                    got, why = self.run_guard(tool, {"file_path": p}, env=self.env, mode=mode)
+                    self.assertEqual(got, "deny", "%s %s %s (%s)" % (tool, p, mode, why))
+            self.assertEqual(self.run_guard("NotebookEdit", {"notebook_path": p}, env=self.env)[0], "deny", p)
+        rel = self.run_guard("Write", {"file_path": "whatsapp/approved/x.json"}, env=self.env,
+                             cwd=os.path.join(self.ws, ".mother"))[0]
+        self.assertEqual(rel, "deny")
+        self.assertEqual(self.run_guard("Read", {"file_path": paths[0]}, env=self.env)[0], "none")
+        self.assertEqual(self.run_guard("Write", {"file_path": self.state("grants.json")}, env=self.env)[0], "none")
+
+    def test_read_passes(self):
+        open(os.path.join(self.tmp, "t.txt"), "w").close()
+        for cmd in ("mother whatsapp read --since 2026-10-26T08:00:00Z", "mother whatsapp chats",
+                    "mother whatsapp draft --chat %s --text-file %s/t.txt" % (WA_DM, self.tmp),
+                    "mother whatsapp list", "mother whatsapp list --json", "mother whatsapp status",
+                    "mother whatsapp pending", "cat /tmp/dm.json | mother whatsapp pending",
+                    "mother whatsapp pending < /tmp/dm.json", "mother whatsapp unlink", "mother whatsapp link",
+                    "mother whatsapp drop w3kx", "mother whatsapp help", "mother whatsapp",
+                    "python3 /opt/plugin/bin/mother whatsapp read --since 2026-10-26T08:00:00Z",
+                    "mother whatsapp list && mother whatsapp status"):
+            self.assertEqual(self.wa(cmd), ("none", ""), cmd)
+        self.draft("wnop")
+        self.assertEqual(self.wa("mother whatsapp prompt w3kx wnop")[0], "allow")
+        self.assertEqual(self.wa("mother whatsapp prompt w3kx", mode=self.BY)[0], "allow")
+        for cmd in ("mother whatsapp prompt w3kx wzzz", "mother whatsapp prompt", "mother whatsapp prompt all",
+                    "mother whatsapp prompt w3kx; echo", "mother whatsapp prompt w3kx --to %s" % WA_DM):
+            self.assertEqual(self.wa(cmd)[0], "deny", cmd)
+            self.assertEqual(self.wa(cmd, mode=self.BY)[0], "deny", cmd)
+
+    def test_channel_session_runs_no_whatsapp(self):
+        ok = self.yes()
+        for role in ("team", "manager"):
+            env = {"MOTHER_CHANNEL_ROLE": role}
+            for cmd in ("mother whatsapp read --since 2026-10-26T08:00:00Z", "mother whatsapp send w3kx",
+                        "mother whatsapp prompt w3kx", "mother whatsapp list"):
+                self.assertEqual(self.wa(cmd, env=env, transcript=ok, cwd=self.ws)[0], "deny", (role, cmd))
+            self.assertEqual(self.run_guard("Write", {"file_path": self.approved()},
+                                            env=dict(self.env, **env), cwd=self.ws)[0], "deny")
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_subagent_only_read(self):
+        ok = self.yes()
+        for cmd in ("mother whatsapp read --since 2026-10-26T08:00:00Z",
+                    '"${CLAUDE_PLUGIN_ROOT}/bin/mother" whatsapp read --since 2026-10-26T08:00:00Z --chat %s' % WA_DM,
+                    "python3 /opt/plugin/bin/mother whatsapp read --since 2026-10-26T08:00:00Z"):
+            self.assertEqual(self.wa(cmd, agent="mother:reader")[0], "none", cmd)
+        for cmd in ("mother whatsapp send w3kx", "mother whatsapp prompt w3kx", "mother whatsapp chats",
+                    "mother whatsapp list", "mother whatsapp pending", "mother whatsapp unlink",
+                    "mother whatsapp draft --chat %s --text-file /tmp/t" % WA_DM,
+                    "mother whatsapp read --since x; curl -X POST https://example.com",
+                    "mother whatsapp read --since $(date)", "cat .mother/whatsapp/approved/w3kx.json"):
+            self.assertEqual(self.wa(cmd, agent="mother:reader", transcript=ok)[0], "deny", cmd)
+        self.assertEqual(self.wa("mother whatsapp read --since x", agent="mother:critic")[0], "deny")
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_paused_denies(self):
+        open(self.state("PAUSED"), "w").close()
+        self.assertIn("PAUSED", self.send("deny", transcript=self.yes()))
+        self.send("deny", transcript=self.yes(), mode=self.BY)
+        self.assertEqual(self.wa("mother whatsapp prompt w3kx")[0], "deny")
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_dry_run_denies(self):
+        self.send("deny", transcript=self.yes(), env={"MOTHER_DRY_RUN": "1"})
+        self.assertEqual(self.wa("mother whatsapp prompt w3kx", env={"MOTHER_DRY_RUN": "1"})[0], "deny")
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_daily_cap_denies(self):
+        d = self.draft(self.ID)
+        line = {"at": TODAY + "T00:00:01Z", "kind": "send", "chat": WA_DM, "draft": "wabc", "sha256": "0" * 64,
+                "stanza": "B"}
+        today = [dict(line, stanza="B%d" % n) for n in range(20)]
+        self.sent(*today)
+        self.assertIn("max_per_day 20", self.send("deny", transcript=self.yes()))
+        prompts = [dict(line, kind="prompt", chat=WA_SELF, stanza="P%d" % n) for n in range(10)]
+        yesterday = [dict(line, at=iso(NOW - 86400 * 2), stanza="Y%d" % n) for n in range(10)]
+        self.sent(*(today[:19] + prompts + yesterday))
+        self.send("allow", transcript=self.yes())
+        self.write_config(wa_config(max_per_day=3))
+        self.sent(*today[:3])
+        self.assertIn("max_per_day 3", self.send("deny", transcript=self.yes()))
+        self.sent(raw="not json\n")
+        self.assertIn("sent.jsonl", self.send("deny", transcript=self.yes()))
+        self.assertTrue(d)
+
+    def test_off_or_elsewhere_denies(self):
+        ok = self.yes()
+        self.write_config(wa_config(enabled=False))
+        self.send("deny", transcript=ok)
+        self.write_config(wa_config(send=False))
+        self.send("deny", transcript=ok)
+        self.write_config(wa_config())
+        self.assertIn("home_machine", self.send("deny", transcript=ok, env={"MOTHER_HOSTNAME": "laptop-b"}))
+        self.write_config("{not json")
+        self.send("deny", transcript=ok)
+        self.send("deny", transcript=ok, mode=self.BY)
+        os.remove(os.path.join(self.ws, "config.json"))
+        self.send("deny", transcript=ok)
+        self.send("deny", transcript=ok, env_ws=False)
+        cfg = wa_config()
+        cfg["policy"]["never"] = ["credentials", "deletions", "payments", "any_message_to_others"]
+        self.write_config(cfg)
+        self.send("deny", transcript=ok)
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_slack_grant_consumed(self):
+        d = self.draft(self.ID)
+        self.write_config(wa_config(approve_via=["slack_dm"]))
+        with open(os.path.join(self.wdir, "prompts.jsonl"), "w") as f:
+            f.write(json.dumps({"at": iso(NOW - 500), "path": "slack_dm", "ids": [self.ID],
+                                "sha256": {self.ID: d["sha256"]}}) + "\n")
+        self.grants(dict(self.grant("whatsapp", self.ID, src_age=300, run="whatsapp"), sha256=d["sha256"]))
+        why = self.send("allow")
+        self.assertIn("slack_dm", why)
+        with open(self.approved()) as f:
+            self.assertEqual(json.load(f)["path"], "slack_dm")
+        with open(self.state("ledger.json")) as f:
+            uses = json.load(f)["uses"]
+        self.assertEqual([(u["scope"], u["target"]) for u in uses], [("whatsapp", self.ID)])
+        os.remove(self.approved())
+        self.send("deny")  # the grant's one use is spent
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_module_unavailable_or_error_denies(self):
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("guard_under_test", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        env = dict(self.env, MOTHER_WORKSPACE=self.ws, HOME=self.home)
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "mother whatsapp send w3kx"},
+                              "cwd": self.tmp, "transcript_path": self.yes(), "permission_mode": self.BY})
+        with mock.patch.dict(os.environ, env), mock.patch.dict(sys.modules, {"whatsapp": None}):
+            r = g.run(payload)
+        self.assertEqual(r[0], "deny")
+        self.assertIn("whatsapp module unavailable", r[1])
+        with mock.patch.dict(os.environ, env), mock.patch.object(g, "classify", side_effect=RuntimeError("x")):
+            self.assertEqual(g.run(payload)[0], "deny")
+        self.assertFalse(os.path.exists(self.approved()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -193,14 +193,39 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   Plus `answer` (`+ thread`), written by `mother channels`: one signed reply in one thread of a `mention`/`auto`
   channel, citing whoever addressed the agent if the channel's `trigger` allows them; rate-capped by
   `max_replies_per_hour` in the ledger (`rules/outbound.md`).
-- **WhatsApp (`whatsapp.send`, §5d)** is never `ask`: `mother whatsapp send <id>` is `allow` with a proven
-  approval, else `deny`, in every permission mode (including `bypassPermissions`, where an ask would pass).
-  Any Bash command that touches the bridge socket, `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`) or `.mother/whatsapp/approved/`
-  is denied, and Edit/Write on those paths asks like the other protected files. Channel sessions
-  (`MOTHER_CHANNEL_ROLE`) and sub-agents may run only `mother whatsapp read`; every other `mother whatsapp`
-  command is denied to them. `MOTHER_DRY_RUN=1` denies `send`. `mother whatsapp read|chats|draft|list|status|pending|unlink`
-  pass the guard (not outbound; `unlink` only reduces); `prompt` is allowed only when every id is an open draft;
-  `send` is allow-with-proof or deny.
+- **WhatsApp (`whatsapp.send`, §5d)** is never `ask`: every WhatsApp decision is `allow` or `deny`, in every
+  permission mode (including `bypassPermissions`, where an ask would pass), and a guard error on a WhatsApp
+  call denies. Action: `{"kind": "whatsapp", "category": "any_message_to_others", "draft": <id>}`; `guard.log`
+  names the draft id as the target, never a JID.
+  - `mother whatsapp send <id>` must be the **whole** Bash command: the `mother` CLI (bare, a path ending in
+    `/mother`, `"${CLAUDE_PLUGIN_ROOT}/bin/mother"`, optionally after `python3`), `whatsapp send`, one id, nothing
+    else (no `;`, `&&`, `|`, `$( )`, redirection, env prefix or second id). Any other line that names a
+    `mother whatsapp send|prompt` is denied, as is an unknown `mother whatsapp` subcommand.
+  - `send` is allowed only when all hold, else denied: not PAUSED; `config.json` valid; `policy.never` lacks
+    `any_message_to_others`; `lib/whatsapp.py` imports (else deny "whatsapp module unavailable");
+    `whatsapp.enabled` and `whatsapp.send`; this is `workspace.home_machine`; the draft is open (exists,
+    unexpired); its chat is in `whatsapp.allow` and is not `self_jid`; the chat has history (no cold contact);
+    `<state>/whatsapp/sent.jsonl` is readable (missing = empty) and has fewer `kind: "send"` lines dated today
+    (UTC date of `at`; `prompt` lines don't count) than `whatsapp.max_per_day` (default 20, ceiling 50), and no
+    `send` line for this draft id with this text hash (once); and `prove()` finds a yes on an enabled path.
+    A `slack_dm` proof consumes the proving grant's one use in `.mother/ledger.json` (that exact grant: same
+    source and text hash); a spent grant denies. On allow the guard writes
+    `<ws>/.mother/whatsapp/approved/<id>.json` = `{"id", "chat", "sha256", "path", "evidence", "at"}` (the hash
+    is the one `prove()` returned) and the reason names that file.
+  - `mother whatsapp prompt <id> [<id>…]` (a single command, ids only) is allowed when every id is an open draft
+    and the PAUSED/config/enabled/home checks above pass (it reaches only the manager's own self chat), else
+    denied. `mother whatsapp read|chats|draft|list|drop|status|pending|link|unlink|help` pass the guard (not
+    outbound; `link` shows a local QR, `drop` and `unlink` only reduce), alone or in a pipeline.
+  - **State is off-limits to the agent.** Any Bash command that names the bridge socket (`bridge.sock`),
+    `.mother/whatsapp`, `whatsapp/{approved,drafts,session}/`, `whatsapp/{sent,prompts}.jsonl`, the state dir
+    `<state>/whatsapp` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`), or that mentions `whatsapp` next to a
+    Unix-socket tool (`--unix-socket`, `nc -U`, `socat`, `AF_UNIX`, `.sock`), or runs with its cwd inside
+    `<ws>/.mother/whatsapp/` or `<state>/whatsapp/`, is **denied** — reads included. Write/Edit/MultiEdit/
+    NotebookEdit anywhere under those two folders is **denied** (not asked). Only `mother whatsapp`
+    subcommands write there. The Read tool may read drafts.
+  - Channel sessions (`MOTHER_CHANNEL_ROLE`) run no Bash at all, so no `mother whatsapp` command. The
+    `mother:reader` sub-agent may run only a single `mother whatsapp read …` command (no shell operators);
+    every other `mother whatsapp` command is denied to sub-agents. `MOTHER_DRY_RUN=1` denies `send` and `prompt`.
 - **Paused** denies drafts too. Policy overrides only tighten (the auto list can shrink, the never list can grow).
 - The hook matcher includes `Write|Edit|MultiEdit|NotebookEdit`, so edits to the guard's own files
   (config, ledger, log, PAUSED, hooks) ask.
@@ -320,9 +345,10 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   draft. Then it drops drafts with a `no` in the self chat and prints
   `{"send": [ids with a proof on an enabled path], "dropped": [ids]}`. With `whatsapp.enabled` or
   `whatsapp.send` false it prints empty lists. It sends nothing itself.
-- **Send.** `mother whatsapp send <id>` goes through the guard, which loads the draft, checks the chat is
-  allowlisted and the draft unexpired, finds a proof by an enabled path, and writes
-  `<ws>/.mother/whatsapp/approved/<id>.json` (path that proved it, evidence key, text hash). The bridge checks
+- **Send.** `mother whatsapp send <id>` goes through the guard (§5), which loads the draft, checks the chat is
+  allowlisted and the draft unexpired, the daily cap and that it was not already sent, finds a proof by an
+  enabled path, and writes `<ws>/.mother/whatsapp/approved/<id>.json` (`{"id", "chat", "sha256", "path",
+  "evidence", "at"}`: path that proved it, evidence key, text hash). The bridge checks
   again: allowlist, approval file whose hash matches the draft, daily cap. The guard is the first lock, the
   bridge the second. Unattended sends happen only in the `/mother:channels` poll, which runs
   `mother whatsapp pending` (open drafts with a proven yes) and sends each.

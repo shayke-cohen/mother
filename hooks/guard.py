@@ -12,6 +12,9 @@ tool call that sends, posts or writes somewhere another person can see, the guar
   ask    every other outbound call: the human confirms it in the UI. In a session whose permission_mode is
          bypassPermissions, these get no output instead (logged as "pass"); denies and the self-edit ask stay
 
+WhatsApp is the exception to "ask": `mother whatsapp send <id>` is allow with a proven yes (lib/whatsapp.py
+prove()) or deny, in every mode, and any agent touch of the bridge socket or WhatsApp's state folders is deny.
+
 Calls that are not outbound get no output, so Claude Code's normal permission flow applies. The guard never
 answers "allow" for a call it does not recognise: an allow would skip the user's own permission rules.
 
@@ -417,7 +420,108 @@ def api_write(cmd):
     return False
 
 
+# ------------------------------------------------------------------ WhatsApp (CONTRACT §5, §5d)
+# Every WhatsApp decision is allow or deny, never ask: in bypassPermissions mode an ask would pass.
+
+WA_PASS = {None, "read", "chats", "draft", "list", "drop", "status", "pending", "link", "unlink", "help", "-h",
+           "--help"}
+WA_OUT = {"send", "prompt"}
+WA_ID = r"w[a-z2-9]{3}"
+_WA_BIN = (r"(?:python3?[ \t]+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother\"|\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother"
+           r"|\"[^\"$`\\\n]*/mother\"|'[^'\n]*/mother'|(?:[\w.~+-]*/)*mother)")
+WA_SEND_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+send[ \t]+(%s)\Z" % (_WA_BIN, WA_ID))
+WA_PROMPT_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+prompt((?:[ \t]+%s)+)\Z" % (_WA_BIN, WA_ID))
+WA_READ_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+read(?:[ \t]+[^\s;&|<>`$()\\'\"]+)*\Z" % _WA_BIN)
+WA_SUB_RE = re.compile(r"(?:^|[\s/;&|(`'\"])mother['\"]?\s+whatsapp\b(?:\s+([^\s;&|)`'\"<>]+))?")
+WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:approved|drafts|session)(?=/|$|[\s'\";&|)])"
+                         r"|whatsapp/(?:sent|prompts)\.jsonl")
+WA_SOCKET_RE = re.compile(r"--unix-socket|\bnc\b[^;&|\n]*\s-U\b|\bsocat\b|AF_UNIX|\.sock\b")
+
+
+def wa_dirs(ctx):
+    """The two folders only `mother whatsapp` writes: <state>/whatsapp and <ws>/.mother/whatsapp."""
+    state = os.path.expanduser(os.environ.get("MOTHER_STATE_DIR", "").strip() or "~/.mother")
+    ds = [os.path.join(state, "whatsapp")]
+    if ctx.ws:
+        ds.append(os.path.join(ctx.ws, ".mother", "whatsapp"))
+    return ds
+
+
+def wa_inside(path, ctx):
+    rp = os.path.realpath(path)
+    return any(inside(rp, os.path.realpath(d)) for d in wa_dirs(ctx))
+
+
+def wa_act(op, what, **kw):
+    return act("whatsapp", "whatsapp_state" if op == "state" else "any_message_to_others", what, op=op, **kw)
+
+
+def classify_whatsapp(cmd, cwd, ctx):
+    """A WhatsApp action for a Bash command, or None when the command is not WhatsApp's business (or only
+    reads: read, chats, draft, list, …). Ops: send, prompt (decided on proof), state, compound, unknown (denied)."""
+    low = cmd.lower()
+    names = set()
+    for d in wa_dirs(ctx):
+        names |= {d, os.path.realpath(d)}
+    if WA_STATE_RE.search(cmd) or any(n in cmd for n in names) \
+            or ("whatsapp" in low and WA_SOCKET_RE.search(cmd)) or (cwd and wa_inside(cwd, ctx)):
+        # The command itself stays out of the reason: guard.log never holds message text.
+        return wa_act("state", "a shell command on WhatsApp's bridge socket or its state folders")
+    subs = [m.group(1) for m in WA_SUB_RE.finditer(cmd)]
+    if not subs:
+        return None
+    bad = [s for s in subs if s not in WA_PASS and s not in WA_OUT]
+    if bad:
+        return wa_act("unknown", "an unrecognised whatsapp command (%s)" % bad[0][:40])
+    if not any(s in WA_OUT for s in subs):
+        return None
+    line = cmd.strip()
+    m = WA_SEND_RE.match(line)
+    if m:
+        return wa_act("send", "a WhatsApp send of draft " + m.group(1), draft=m.group(1))
+    m = WA_PROMPT_RE.match(line)
+    if m:
+        ids = m.group(1).split()
+        return wa_act("prompt", "a WhatsApp self-chat prompt for " + " ".join(ids), draft=",".join(ids), drafts=ids)
+    return wa_act("compound", "a whatsapp send or prompt that is not a command of its own")
+
+
+def wa_module():
+    """lib/whatsapp.py, imported only here (it imports this file lazily too). Raises ImportError."""
+    lib = os.path.join(os.path.dirname(HERE), "lib")
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
+    import whatsapp
+    return whatsapp
+
+
+def wa_sent(path):
+    """sent.jsonl records ([] when missing), or None when it can't be read or a line is malformed."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    recs = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            return None
+        if not isinstance(r, dict):
+            return None
+        recs.append(r)
+    return recs
+
+
 def classify_bash(cmd, cwd, ctx):
+    wa = classify_whatsapp(cmd, cwd, ctx)
+    if wa:
+        return wa
     # Edits to the guard's own state through the shell. Reads (cat, grep) pass.
     if SHELL_WRITE_RE.search(cmd):
         names = ["PAUSED", "ledger.json", "guard.log", "guard.py", "hooks.json", ".mother/workspace"]
@@ -560,6 +664,8 @@ def classify(tool, inp, cwd, ctx):
         fp = str(inp.get("file_path") or inp.get("notebook_path") or "")
         if fp:
             fp = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(fp)))
+            if wa_inside(fp, ctx):
+                return wa_act("state", "an edit to WhatsApp's drafts, approvals or bridge state: " + fp)
             if fp in protected_paths(ctx):
                 return act("config", "guard_config", "an edit to the guard's own files: " + fp)
         return None
@@ -822,10 +928,14 @@ def answers_last_hour(book, target, now):
     return n
 
 
-def run_grant_scope(a, ctx, sc, now=None):
+def run_grant_scope(a, ctx, sc, now=None, only=None):
+    """`only` = (source key, sha256): consume that one grant and no other (a WhatsApp proof names it)."""
     scope, target, n = sc
     scopes, max_age = grant_limits(ctx.cfg)
-    if scope not in scopes or not target or target not in allowed_targets(scope, ctx.cfg):
+    if scope == "whatsapp":
+        if not only or not re.match(r"^%s$" % WA_ID, str(target or "")) or scope not in scopes:
+            return None
+    elif scope not in scopes or not target or target not in allowed_targets(scope, ctx.cfg):
         return None
     if scope in ("chat-post", "chat-reply", "tracker-comment", "answer"):
         agent = ctx.cfg.get("agent") or {}
@@ -854,6 +964,8 @@ def run_grant_scope(a, ctx, sc, now=None):
             if not v:
                 continue
             key, cap = v
+            if only and (key != only[0] or g.get("sha256") != only[1]):
+                continue
             used = 0
             for r in book["uses"]:
                 if isinstance(r, dict) and r.get("scope") == scope and r.get("source") == key:
@@ -878,7 +990,91 @@ def paused(ctx):
     return p if os.path.exists(p) else None
 
 
+def decide_whatsapp(a, ctx, transcript=None):
+    """allow or deny, never ask (CONTRACT §5). On an allowed send, writes approved/<id>.json for the bridge."""
+    op, what = a.get("op"), a["what"]
+    if op == "state":
+        return "deny", "%s. Only `mother whatsapp` commands touch it; the bridge is reached only through " \
+                       "`mother whatsapp send <id>`." % what
+    if op == "unknown":
+        return "deny", "%s. See `mother whatsapp help`." % what
+    if op == "compound":
+        return "deny", "%s. Run `mother whatsapp send <id>` (or `prompt <ids>`) alone." % what
+    p = paused(ctx)
+    if p:
+        return "deny", "Outbound is PAUSED (%s exists). Blocked: %s." % (p, what)
+    if not ctx.ok:
+        return "deny", "%s: no valid config (%s)." % (what, ctx.problem)
+    if a["category"] in policy_lists(ctx.cfg)[1]:
+        return "deny", "%s: policy.never lists %s." % (what, a["category"])
+    try:
+        wa = wa_module()
+    except Exception:
+        return "deny", "%s: whatsapp module unavailable." % what
+    cfg = ctx.cfg
+    w = cfg.get("whatsapp") if isinstance(cfg.get("whatsapp"), dict) else {}
+    if not (w.get("enabled") is True and w.get("send", True) is True):
+        return "deny", "%s: whatsapp sending is off (whatsapp.enabled / whatsapp.send)." % what
+    import contextlib
+    import io
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            wa.require_home(cfg)
+    except SystemExit:
+        return "deny", "%s: WhatsApp runs only on workspace.home_machine." % what
+    if op == "prompt":
+        missing = [i for i in a.get("drafts") or [] if not wa.load_draft(ctx.ws, i)]
+        if missing or not a.get("drafts"):
+            return "deny", "%s: not an open draft: %s." % (what, ", ".join(missing) or "none named")
+        return "allow", "%s: every id is an open draft; the prompt reaches only the manager." % what
+    if op != "send":
+        return "deny", "%s: not a WhatsApp action the guard knows." % what
+    i = a.get("draft")
+    d = wa.load_draft(ctx.ws, i)
+    if not d:
+        return "deny", "%s: no open draft %s (missing or expired)." % (what, i)
+    chat = d.get("chat")
+    allowed = {x.get("jid") for x in w.get("allow") or [] if isinstance(x, dict)}
+    if not chat or chat not in allowed or chat == w.get("self_jid"):
+        return "deny", "%s: its chat is not in whatsapp.allow." % what
+    if not wa.has_history(cfg, chat):
+        return "deny", "%s: no cold contact (no history with that chat in the local database)." % what
+    recs = wa_sent(os.path.join(wa_dirs(ctx)[0], "sent.jsonl"))
+    if recs is None:
+        return "deny", "%s: the bridge's sent.jsonl can't be read, so the daily cap can't be checked." % what
+    cap = w.get("max_per_day", 20)
+    cap = min(cap, 50) if isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1 else 20
+    today = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    n = sum(1 for r in recs if r.get("kind") == "send" and str(r.get("at") or "")[:10] == today)
+    if n >= cap:
+        return "deny", "%s: today's cap is reached (%d of whatsapp.max_per_day %d)." % (what, n, cap)
+    if any(r.get("kind") == "send" and r.get("draft") == i and r.get("sha256") == d.get("sha256") for r in recs):
+        return "deny", "%s: already sent (one yes sends once)." % what
+    proof = wa.prove(ctx.ws, cfg, i, transcript_path=transcript)
+    if not proof or not proof.get("sha256") or proof.get("path") not in ("session", "self_chat", "slack_dm"):
+        return "deny", "%s: no proven yes. Show the draft and get the manager's `ok %s` on an enabled path." % (
+            what, i)
+    if proof["path"] == "slack_dm":
+        key = str(proof.get("evidence") or "")[len("slack_dm:"):]
+        if not run_grant_scope(a, ctx, ("whatsapp", i, 1), only=(key, proof["sha256"])):
+            return "deny", "%s: the manager's DM grant for it is already used." % what
+    path = os.path.join(ctx.ws, ".mother", "whatsapp", "approved", i + ".json")
+    rec = {"id": i, "chat": chat, "sha256": proof["sha256"], "path": proof["path"],
+           "evidence": proof.get("evidence"), "at": now_iso()}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(rec, f, indent=1)
+        os.replace(tmp, path)
+    except OSError as e:
+        return "deny", "%s: could not write the approval record (%s)." % (what, type(e).__name__)
+    return "allow", "%s: proven yes via %s; approval record %s." % (what, proof["path"], path)
+
+
 def decide(a, ctx, transcript=None):
+    if a["kind"] == "whatsapp":
+        return decide_whatsapp(a, ctx, transcript)
     if a["kind"] == "config":
         return "ask", "%s. The agent must not change its own guard; confirm this is you." % a["what"]
     p = paused(ctx)
@@ -939,7 +1135,7 @@ def log(ctx, tool, a, decision, reason):
         os.makedirs(d, exist_ok=True)
         rec = {"at": now_iso(), "tool": tool, "kind": a.get("kind") if a else None,
                "category": a.get("category") if a else None,
-               "target": (a.get("channel") or ",".join(sorted(str(x) for x in (a.get("projects") or []) if x))
+               "target": (a.get("channel") or a.get("draft") or ",".join(sorted(str(x) for x in (a.get("projects") or []) if x))
                           or None) if a else None,
                "decision": decision, "reason": reason}
         with open(os.path.join(d, "guard.log"), "a") as f:
@@ -1053,6 +1249,10 @@ def subagent_session(kind, tool, inp, cwd, ctx):
         return "deny", "%s can't use %s: it is read-only." % (who, tool)
     if tool == "Bash":
         cmd = str(inp.get("command") or "").strip()
+        if WA_SUB_RE.search(cmd) or classify_whatsapp(cmd, cwd, ctx):
+            if kind == "reader" and WA_READ_RE.match(cmd) and classify_whatsapp(cmd, cwd, ctx) is None:
+                return None
+            return "deny", "%s may run only a single `mother whatsapp read` command, not: %s" % (who, cmd[:120])
         bare = unquoted(cmd)
         first = os.path.basename(bare.split()[0]) if bare.split() else ""
         if first not in READER_BASH or re.search(r"[;&|`<>]|\$\(", bare):
@@ -1107,11 +1307,20 @@ def run(raw):
             r = stamp_block(tool, a, ctx) or decide(a, ctx, payload.get("transcript_path"))
         # The manager chose bypass mode for this session: an ask becomes no decision, so Claude Code's own
         # mode applies. Denies (PAUSED, the never-list, dry run) and the guard's self-edit check still hold.
-        if r[0] == "ask" and a["kind"] != "config" and payload.get("permission_mode") == "bypassPermissions":
+        # WhatsApp never takes this branch: its decisions are allow or deny only (anything else becomes deny).
+        if a["kind"] == "whatsapp" and r[0] not in ("allow", "deny"):
+            r = "deny", "%s: no WhatsApp decision (%s), so deny." % (a["what"], r[0])
+        if r[0] == "ask" and a["kind"] not in ("config", "whatsapp") \
+                and payload.get("permission_mode") == "bypassPermissions":
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])
             return None
-    except Exception as e:  # fail closed on anything that might be outbound
-        r = "ask", "guard error (%s: %s): confirm %s manually." % (type(e).__name__, e, tool)
+    except Exception as e:  # fail closed on anything that might be outbound; WhatsApp fails to deny
+        blob = str(inp.get("command") or inp.get("file_path") or inp.get("notebook_path") or "") \
+            if isinstance(inp, dict) else ""
+        if (a and a.get("kind") == "whatsapp") or "whatsapp" in blob.lower():
+            r = "deny", "guard error (%s) on a WhatsApp call: denied." % type(e).__name__
+        else:
+            r = "ask", "guard error (%s: %s): confirm %s manually." % (type(e).__name__, e, tool)
     log(ctx, tool, a, r[0], r[1])
     return r
 

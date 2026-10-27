@@ -154,6 +154,28 @@ or says what the routine claims. An agent that is hijacked and can write files c
 gets is bounded: a few posts to one configured team channel, or a few tracker writes in one configured project,
 per forged message. Never email, never a deletion, never while paused. `.mother/guard.log` records every one.
 
+## WhatsApp
+
+WhatsApp sends from the manager's own number, so it is stricter than chat: the guard **never asks**. Every
+WhatsApp call is allow or deny, in every permission mode, bypass included (an ask there would pass silently).
+
+- **Allowlist only.** A draft goes only to a chat in `whatsapp.allow` that already has history with the
+  manager (no cold contact), never to the manager's own self chat.
+- **Draft, then one yes, then send.** `mother whatsapp draft` writes the draft; show it on the enabled paths
+  (`WhatsApp -> <chat name>: "<text>" - reply ok <id>`); the manager answers `ok <id>` in the session, their
+  DM, or "Message yourself". One yes sends one exact text to one chat, once. Any edit is a new draft that
+  needs its own yes. `no <id>` on any path drops it.
+- **`mother whatsapp send <id>` alone.** It must be the whole Bash command: nothing chained, piped, redirected
+  or wrapped. The guard allows it only with a proven yes, under the daily cap (`whatsapp.max_per_day`), not
+  already sent, not PAUSED, on the home machine; then it writes the approval record the bridge checks. A
+  yes in the DM is spent on the first send.
+- **Hands off the bridge and its state.** Never touch the bridge socket, `<state>/whatsapp/` or
+  `.mother/whatsapp/` by any other means: no `curl --unix-socket`, `nc -U`, `socat`, script, `cat`, `cp`,
+  `rm`, Write or Edit. The guard denies all of it. To change a draft, drop it and draft again.
+- `mother whatsapp prompt <ids>` (the self-chat ask) is allowed only for open drafts. Reading (`read`,
+  `chats`, `list`, `pending`, `status`) is not outbound. MOTHER's sub-agents may run only `mother whatsapp
+  read`; channel sessions run no WhatsApp command.
+
 ## Kill switch
 
 ```
@@ -170,7 +192,7 @@ log, the hook itself or `~/.mother/workspace`, is an ask.
 When the manager runs a session in bypass permissions mode (`permission_mode` is `bypassPermissions` in the
 hook payload), every call that would ask gets no decision instead, so Claude Code's own mode applies and the
 call runs without a prompt. That covers messages to others, tracker writes, email, calendar invites and
-code-host writes. What doesn't change: the kill switch, the never-list and a dry run still deny, MOTHER's
+code-host writes. What doesn't change: the kill switch, the never-list, a dry run and an unproven WhatsApp send still deny, MOTHER's
 sub-agents are still denied, an edit to the guard's own files still asks, and allows stay allows. Each pass is
 logged with decision `pass`.
 
@@ -190,8 +212,8 @@ granted and session-approved writes. It also denies Write/Edit, web tools, and a
 ## Fail closed
 
 No workspace, or a `config.json` that isn't valid schema v1 with a `manager.chat_dm`: nothing is auto and no
-grant counts, so every outbound call asks (never-list calls still deny). An unreadable hook payload asks. A
-crash while classifying asks. The hook never answers allow for a call it doesn't recognise.
+grant counts, so every outbound call asks (never-list calls still deny; WhatsApp denies). An unreadable hook
+payload asks. A crash while classifying asks, except on a WhatsApp call, which denies. The hook never answers allow for a call it doesn't recognise.
 
 ## The log
 
