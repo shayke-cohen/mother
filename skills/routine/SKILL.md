@@ -37,11 +37,12 @@ there is nowhere to log: print the error and stop.
 |---|---|
 | `${CLAUDE_PLUGIN_ROOT}/bin/mother home check` exits 0 | `failed — not home machine (<host>)`, stop. If the home machine is unset: `failed — home machine not set; run mother home set`, stop |
 | `.mother/PAUSED` does not exist | `failed — paused`, stop |
-| Remote set: `git pull --rebase -q` | Continue on the local copy; note `pull failed` |
+| Remote set, and the routine isn't `sync: false`: `git pull --rebase --autostash -q` | Continue on the local copy; note `pull failed` |
 | `mother status` validates `config.json` | `failed — config invalid: <first error>`, stop |
 | `config.json` has `routines.<id>` | `failed — routine not configured (disabled?)`, stop |
 | Today is in `routines.<id>.days` in `manager.timezone` (`workdays` = `manager.workdays`, `all`) | `ok — not a scheduled day`, stop |
 | `${CLAUDE_PLUGIN_ROOT}/routines/<id>.md` exists | `failed — unknown routine <id>`, stop |
+| The routine has `active_hours` (`routines.<id>.active_hours`, else the routine file's default) and local now in `manager.timezone` is outside it | `skipped — outside active hours`, stop |
 
 ## 2. Load context
 
@@ -123,6 +124,7 @@ Write the `runs.md` line(s) last — even after an unexpected error, catch it an
 Note examples: `ok — 4 sources, DM sent`, `partial — chat search missing_scope; tracker ok; DM sent`,
 `failed — DM post expired`.
 
-Then run `${CLAUDE_PLUGIN_ROOT}/bin/mother sync` yourself. The Stop hook also syncs, but only while the
+If the routine's frontmatter says `sync: false`, don't run `mother sync`: the
+routine's output is machine-local. Otherwise run `${CLAUDE_PLUGIN_ROOT}/bin/mother sync` yourself. The Stop hook also syncs, but only while the
 plugin is enabled; a run that relies on it alone leaves its work uncommitted on this machine whenever the
 hook doesn't load, and the next run then skips its pull. Sync is safe to run twice.

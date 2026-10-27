@@ -84,6 +84,13 @@
     }
   ],
   "routines": {
+    "tick": {
+      "every": 60,
+      "active_hours": "06:00-22:00",
+      "days": "workdays",
+      "notify": "none",
+      "slow_every": 3
+    },
     "brief": {
       "at": "08:45",
       "days": "workdays"
