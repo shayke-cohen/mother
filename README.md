@@ -114,7 +114,9 @@ Day to day you mostly read what it sends you and answer in one line. The default
 You can also just ask: "brief me", "what's open", "remember that …", "add a todo …", "take notes on the
 design review", "prep my 1:1 with Sam", "what did I promise", "set up a new project". Each one routes to a
 skill: `brief`, `todo`, `remember`, `one-on-one`, `commitments`,
-`meeting`, `project`, `team` and so on.
+`meeting`, `project`, `team` and so on. With WhatsApp set up (`mother whatsapp setup`), "what did Sam say on
+WhatsApp" or "WhatsApp Dana that I'm late" go to the `whatsapp` skill: it reads any chat, and each message to
+someone else waits for your yes in the permission prompt.
 
 ### Replying in team channels
 
@@ -147,12 +149,12 @@ Useful commands in your terminal:
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
 | `mother channels pause` / `resume` | Stop or restart replies in every channel |
-| `mother whatsapp setup` | One guided WhatsApp setup, in your own terminal: installs and links the bridge, turns WhatsApp on for your account, checks database access, lets you pick chats from your recent ones and the ways you approve sends. Safe to re-run |
-| `mother whatsapp allow <number>` / `disallow <number>` | Add a chat to (or remove one from) the WhatsApp allowlist, in your own terminal; MOTHER can't run these |
+| `mother whatsapp setup` | One guided WhatsApp setup, in your own terminal: installs and links the bridge (a QR, or a code typed on your phone), turns WhatsApp on for your account and checks database access. Safe to re-run |
+| `mother whatsapp chats` / `read` | Your recent chats (`--query` to find one), and the messages of one chat or of the last day. Read from WhatsApp desktop's local database; nothing is copied anywhere |
+| `mother whatsapp send --to WHO --text …` | Send one message from your number to a chat you've already used. MOTHER runs it; the guard asks you first, showing who and the text, except for `--to me` |
 | `mother whatsapp install` | Install the optional WhatsApp bridge into `~/.mother/whatsapp/app` (Node 20+, runs `npm ci`; repeat after a plugin update when `status` says `reinstall_needed`) |
-| `mother whatsapp link` / `unlink` | Pair the bridge (run it in your own terminal: the QR needs one) / log it out and delete its keys; both stop a running bridge first (`mother whatsapp stop`) |
+| `mother whatsapp link` / `unlink` | Pair the bridge again, in your own terminal / log it out and delete its keys; both stop a running bridge first (`mother whatsapp stop`) |
 | `mother whatsapp status` | Is the bridge linked, and is the local WhatsApp database readable (no messages shown) |
-| `mother whatsapp send <id>` / `prompt <ids>` | Send an approved draft / ask you to approve open drafts. MOTHER runs these; the guard lets `send` through only with your yes |
 
 ### Pausing, stopping, uninstalling
 

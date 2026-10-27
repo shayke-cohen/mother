@@ -133,7 +133,7 @@ no message sent before that yes.** In Edit mode, show a diff of the changed keys
 In this order, reporting each step's result:
 
 1. **Write `config.json`** in the workspace. Carry the `whatsapp` block over unchanged, byte for byte in
-   meaning: the guard denies a write that changes it (only `mother whatsapp setup|allow|disallow` in the
+   meaning: the guard denies a write that changes it (only `mother whatsapp setup` in the
    manager's own terminal do). Then `mother status` — it validates against the schema and
    fails loudly; fix and re-show if it does. Do not hand-wave a validation error.
 2. **Persona.** If the workspace `AGENTS.md` still carries template placeholders for the agent's name or
@@ -174,9 +174,9 @@ In this order, reporting each step's result:
 ## WhatsApp (optional)
 
 The manager sets up WhatsApp, not you. Never write or edit the `whatsapp` block of `config.json`, and never
-run `mother whatsapp setup`, `allow` or `disallow`: they decide who MOTHER may message, so the guard denies
-them to you. Offer WhatsApp when the manager asks for it, or when a `mother whatsapp` command says "reading
-is off" or "sending is off".
+run `mother whatsapp setup`, `link` or `unlink`: they link WhatsApp to MOTHER, so the guard denies them to you.
+Offer WhatsApp when the manager asks for it, or when a `mother whatsapp` command says "reading is off" or
+"sending is off".
 
 Tell the manager to run this in their own terminal (not in this session: it needs their keyboard and shows a
 QR), with `${CLAUDE_PLUGIN_ROOT}` expanded to the absolute path:
@@ -195,12 +195,11 @@ is safe:
 | Link | A QR: WhatsApp on the phone > Settings > Linked devices > Link a device (or `p` for a code typed on the phone, when the QR won't scan) |
 | Config | Turns WhatsApp on for the linked account; nothing to type |
 | Database | If it can't read WhatsApp's database: how to grant Full Disk Access, then run it again |
-| Chats | Their 100 most recent chats (names and dates, never messages); they type the numbers MOTHER may use |
-| Approvals | `ok <id>` in a session always works; it asks about the WhatsApp self chat and their chat DM |
 
+There is no chat list to pick from and no approval setup: MOTHER may read any chat, may message only chats
+the manager has already used, and every message to someone else asks the manager in the permission prompt.
 When it finishes, run `mother whatsapp status` and report whether the bridge is linked and the database is
-readable. Later changes are theirs too: `mother whatsapp allow <number>` and `mother whatsapp disallow
-<number>`, in their own terminal.
+readable.
 
 ## Rules
 
