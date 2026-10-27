@@ -187,8 +187,19 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, held)
     const stored = held.toasted as string[]
     expect(stored.length).toBe(500)
-    expect(stored.slice(-3)).toEqual(['x1', 'x2', 'x3'])
+    expect(stored.slice(-3)).toEqual(['x1', 'x2', 'x3'].map(id => id + '@2026-10-26T09:05:00Z'))
     expect(stored[0]).toBe('old2')
+  })
+
+  test(`an item asked for again after Done toasts again, on ${surface}`, async ($, on) => {
+    const d = doc({ items: [item('n1', 'on_you', 'new', 'Review needed')] })
+    const files = { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }
+    const { clock, out } = await boot($, on, files)
+    expect(out.toasts.length).toBe(1)
+    const again: any = doc({ items: [{ ...item('n1', 'on_you', 'new', 'Review needed'), first_seen: '2026-10-26T11:05:00Z' }] })
+    files[PATH] = { text: JSON.stringify(again), mtimeMs: 2 }
+    await clock.advance(60_000)
+    expect(out.toasts.length).toBe(2)
   })
 
   const PANE = {
@@ -200,6 +211,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
   const nowCalls = (out: { argv: string[][] }) => out.argv.filter(a => a[2] === 'now').map(a => a.slice(3))
   const TOP1 = [{ rank: 1, title: 'T1', why: '', link: null, item_id: null, set_by: 'agent', state: 'open' }]
   const BIN = '/home/m/.claude/plugins/marketplaces/mother/bin/mother'
+  const hotkeys = async (ui: any) => {
+    const all = await ui.findAll({ type: 'Button' })
+    return all.filter((b: any) => b.props.hotkey).map((b: any) => `${b.props.hotkey}:${b.key}`)
+  }
 
   test(`/now registers and opens the pane, on ${surface}`, async ($, on) => {
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
@@ -267,7 +282,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`a row shows title, age, link and the unverified tag, on ${surface}`, async ($, on) => {
     const it: any = item('a', 'on_you', 'open', 'Review A')
     it.unverified_since = '2026-10-26T09:05:00Z'
-    it.first_seen = '2026-10-25T09:00:00Z'
+    it.since = '2026-10-25T09:00:00Z'       // raised a day ago; the tick first saw it this morning
     const d = doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
     await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
@@ -325,6 +340,36 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(out.fills).toEqual([{ text: 'mother now do S1', mode: 'replace' }])
     expect(out.submits).toBe(0)
     expect(out.argv.filter(a => a[2] === 'now').length).toBe(0)
+    await ui.unmount()
+  })
+
+  test(`Do it is drawn for a tick-owned action on an on-you item, with x on the selected row, on ${surface}`, async ($, on) => {
+    const d: any = doc({ coverage: {} })
+    d.items[0].actions = [{ id: 'S2', label: 'Draft a nudge', prompt: 'mother now do S2', task: 'draft a nudge to the reviewer' }]
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hotkeys(ui)).toEqual(['d:done-a', 's:snooze-a', 't:maketop-a', 'x:doit-a'])
+    await ui.press({ key: 'doit-a' })
+    expect(out.fills).toEqual([{ text: 'mother now do S2', mode: 'replace' }])
+    expect(await ui.find({ key: 'doit-b' })).toBeUndefined()           // no action, no Do it
+    await ui.unmount()
+  })
+
+  test(`yesterday's Top 3 is not shown, by the doc's timezone, on ${surface}`, async ($, on) => {
+    const top = [{ rank: 1, title: 'Old one', why: '', link: null, item_id: null, set_by: 'manager', state: 'open' }]
+    await boot($, on, { [PATH]: { text: JSON.stringify(doc({ top, top_date: '2026-10-25' })), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Top 3 today|Old one/)).toBe(false)
+    expect(await hotkeys(ui)).toEqual(['d:done-a', 's:snooze-a', 't:maketop-a'])
+    await ui.unmount()
+  })
+
+  test(`today is the manager's date: at UTC+14 the 26th's Top 3 is already yesterday's, on ${surface}`, async ($, on) => {
+    const top = [{ rank: 1, title: 'Old one', why: '', link: null, item_id: null, set_by: 'agent', state: 'open' }]
+    const far = doc({ top, top_date: '2026-10-26', timezone: 'Pacific/Kiritimati' })   // 10:00Z = 00:00 on the 27th
+    await boot($, on, { [PATH]: { text: JSON.stringify(far), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Top 3 today/)).toBe(false)
     await ui.unmount()
   })
 
@@ -419,11 +464,6 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ key: 'swap-hint' })).toBeUndefined()
     await ui.unmount()
   })
-
-  const hotkeys = async (ui: any) => {
-    const all = await ui.findAll({ type: 'Button' })
-    return all.filter((b: any) => b.props.hotkey).map((b: any) => `${b.props.hotkey}:${b.key}`)
-  }
 
   test(`with no focus event the first row holds the hotkeys, on ${surface}`, async ($, on) => {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })

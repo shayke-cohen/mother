@@ -56,13 +56,17 @@ async function workspace($: Dollar, bin: string): Promise<string | null> {
   }
 }
 
+// A toast is keyed on the item and when it first showed: a done item that is asked for again comes back
+// with a new first_seen, so it toasts again.
+export const toastKey = (i: NowItem): string => `${i.id}@${i.first_seen}`
+
 async function toastNew($: Dollar, doc: NowDoc): Promise<void> {
   if (doc.quiet) return
   const seen: string[] = ((await $.store.get('toasted')) as string[] | undefined) ?? []
-  const fresh = (doc.items ?? []).filter(i => i.section === 'on_you' && i.state === 'new' && !seen.includes(i.id))
+  const fresh = (doc.items ?? []).filter(i => i.section === 'on_you' && i.state === 'new' && !seen.includes(toastKey(i)))
   if (fresh.length === 0) return
   for (const i of fresh) $.ui.toast(`◆ New on you: ${i.title}`)
-  await $.store.set('toasted', [...seen, ...fresh.map(i => i.id)].slice(-TOASTED_CAP))
+  await $.store.set('toasted', [...seen, ...fresh.map(toastKey)].slice(-TOASTED_CAP))
 }
 
 // One pass: resolve the workspace, re-read now.json when its mtime moved, toast what is new, draw the
@@ -142,8 +146,24 @@ export function clock(iso: string | undefined | null, tz: string | null | undefi
   return /T(\d\d:\d\d)/.exec(iso)?.[1] ?? '--:--'
 }
 
-export function age(firstSeen: string, nowMs: number): string {
-  const hours = Math.max(0, Math.floor((nowMs - Date.parse(firstSeen)) / 3_600_000))
+// YYYY-MM-DD of an instant in the doc's timezone (the manager's local date); UTC when the zone is unknown.
+export function localDate(nowMs: number, tz: string | null | undefined): string {
+  if (tz) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(nowMs)
+      const part = (t: string) => parts.find(p => p.type === t)?.value
+      const y = part('year'), m = part('month'), d = part('day')
+      if (y && m && d) return `${y}-${m}-${d}`
+    } catch {
+      // fall through to UTC
+    }
+  }
+  return new Date(nowMs).toISOString().slice(0, 10)
+}
+
+// How long an item has waited: from `since`, when it was raised, not from when the tick first saw it.
+export function age(since: string, nowMs: number): string {
+  const hours = Math.max(0, Math.floor((nowMs - Date.parse(since)) / 3_600_000))
   return Number.isNaN(hours) ? '' : hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`
 }
 
@@ -196,7 +216,8 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
   const tz = doc.timezone
   const at = (iso: string | undefined | null) => clock(iso, tz)
   const items = doc.items ?? []
-  const top = doc.top ?? []
+  // Top 3 is today's list only: yesterday's (or Friday's) is not shown, and the next day starts fresh.
+  const top = doc.top_date === localDate(nowMs, tz) ? doc.top ?? [] : []
   // Hotkeys belong to the selected row alone: the one the ring is on (`ui.focus`), else the first row.
   const rows = [...top.filter(e => e.state !== 'done').map(e => 'top:' + e.rank),
                 ...['on_you', 'neglected', 'suggestion'].flatMap(k => items.filter(i => i.section === k).map(i => i.id))]
@@ -211,7 +232,7 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
     <Box key={'row-' + i.id} flexDirection="column">
       <Box>
         <Text>{'• ' + i.title}</Text>
-        <Text dimColor>{' ' + age(i.first_seen, nowMs) + ' '}</Text>
+        <Text dimColor>{' ' + age(i.since, nowMs) + ' '}</Text>
         {i.link ? <Link href={i.link}>↗</Link> : null}
         {i.unverified_since ? <Text color="yellow">{' unverified'}</Text> : null}
       </Box>
@@ -221,7 +242,7 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
         {rank !== null && !inTop.has(i.id)
           ? <Button key={'maketop-' + i.id} hotkey={hot(i.id, 't')} onPress={() => go(['top', 'swap', String(rank), i.id], i.id)}>Make top 3</Button>
           : null}
-        {i.section === 'suggestion' && i.actions?.[0]
+        {i.actions?.[0]
           ? <Button key={'doit-' + i.id} hotkey={hot(i.id, 'x')}
               onPress={() => { void $.prompt.fill({ text: i.actions[0].prompt || `mother now do ${i.actions[0].id}`, mode: 'replace' }) }}>Do it</Button>
           : null}
