@@ -570,6 +570,30 @@ test("--link that never opens: {linked: false, reason}, exit 1, a plain sentence
   }
 });
 
+test("--link --phone: a pairing code instead of a QR, told where to type it", async () => {
+  const out = [];
+  let opts = null;
+  const code = await runLink(locations(env), {
+    connect: async (o) => { opts = o; o.onPairCode("ABCD1234"); return fakeLinkClient(); },
+    qr: { generate: () => out.push("QR") }, out: (l) => out.push(l), err: () => {}, settleMs: 0, phone: "972500000099",
+  });
+  assert.equal(code, 0);
+  assert.equal(opts.pairPhone, "972500000099");
+  assert.ok(!out.includes("QR"));
+  assert.ok(out.some((l) => l.includes("Link with phone number instead, then type this code: ABCD-1234")), out.join("|"));
+  assert.deepEqual(JSON.parse(out[out.length - 1]), { linked: true, me: SELF });
+});
+
+test("--link: later codes say WhatsApp replaced them, not that they timed out", async () => {
+  const out = [];
+  await runLink(locations(env), {
+    connect: async ({ onQR }) => { onQR("A"); onQR("B"); return fakeLinkClient(); },
+    qr: { generate() {} }, out: (l) => out.push(l), err: () => {}, settleMs: 0,
+  });
+  assert.ok(out.some((l) => l.includes("New code (WhatsApp replaces it every 20 seconds or so)")));
+  assert.ok(!out.some((l) => l.includes("timed out")));
+});
+
 test("--link says where to scan before the first code", async () => {
   const out = [];
   await runLink(locations(env), {

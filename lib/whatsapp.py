@@ -1525,14 +1525,16 @@ LINK_STOPS = {"logged_out": "WhatsApp logged this device out while linking; run 
               "no_account": "the device linked but WhatsApp didn't say which account; run it again."}
 
 
-def link_once(say) -> dict:
-    """One `bridge.mjs --link` attempt in this terminal: its QR and sentences pass through, and its last stdout
-    line names the outcome. {"linked": bool, "me": JID without device suffix or None, "reason": str or None}."""
+def link_once(say, phone=None) -> dict:
+    """One `bridge.mjs --link` attempt in this terminal (`--phone <digits>` for a pairing code instead of a QR):
+    its QR or code and sentences pass through, and its last stdout line names the outcome.
+    {"linked": bool, "me": JID without device suffix or None, "reason": str or None}."""
     import subprocess
     stop_bridge()  # a running bridge would hold the old session (and block the link)
     env = dict(os.environ)
     env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)
-    p = subprocess.Popen(_bridge_argv("--link"), stdout=subprocess.PIPE, env=env)  # stdin, stderr: the terminal
+    argv = _bridge_argv("--link") + (["--phone", phone.split("@")[0]] if phone else [])
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, env=env)  # stdin, stderr: the terminal
     res = None
     for raw in p.stdout:
         line = raw.decode("utf-8", "replace").rstrip("\n")
@@ -1551,20 +1553,40 @@ def link_once(say) -> dict:
     return {"linked": bool(me), "me": me, "reason": None if me else "no_account"}
 
 
-def link_loop(io) -> str:
-    """Link until it works: an expired QR (or a dropped connection) offers a new one. Returns the linked
-    account's JID as WhatsApp gave it (it may be a private `@lid` id). Raises SetupStop."""
+def _link_phone(io):
+    """The manager's choice of how to link: None for a QR, else their number as a JID (they typed it)."""
+    a = io.ask("Link by scanning a QR code (Enter), or type p to link with your phone number instead: ").strip()
+    if a.lower() not in ("p", "phone"):
+        return None
     while True:
-        r = link_once(io.say)
+        raw = io.ask("Your WhatsApp phone number, with country code (e.g. +972 50 000 0001): ").strip()
+        if not raw:
+            return None
+        jid = phone_jid(raw)
+        if jid:
+            return jid
+        io.say("That isn't a phone number (6-15 digits with the country code).")
+
+
+def link_loop(io, want=None) -> str:
+    """Link until it works: an expired QR or code (or a dropped connection) offers a new one. Returns the linked
+    account's JID as WhatsApp gave it (it may be a private `@lid` id). Raises SetupStop. `want` (a dict) gets
+    "phone": the number the manager typed to link by phone, or None."""
+    phone = _link_phone(io)
+    if want is not None:
+        want["phone"] = phone
+    what = "code" if phone else "QR"
+    while True:
+        r = link_once(io.say, phone)
         if r.get("linked") and r.get("me"):
             return r["me"]
         reason = r.get("reason")
         if reason in LINK_STOPS:
             raise SetupStop(LINK_STOPS[reason])
-        q = "QR expired — show a new one?" if reason in ("qr_expired", "timeout") else \
-            "The link didn't complete — try again with a new QR?"
+        q = "%s expired — show a new one?" % what if reason in ("qr_expired", "timeout") else \
+            "The link didn't complete — try again with a new %s?" % what
         if not _yes(io, q, True):
-            raise SetupStop("not linked; run `mother whatsapp setup` again when you're ready to scan.")
+            raise SetupStop("not linked; run `mother whatsapp setup` again when you're ready to link.")
 
 
 def _phone_from_manager(io, private_id) -> str:
@@ -1601,7 +1623,10 @@ def _step_link(io) -> str:
     got = strip_device(r.get("me")) if r.get("ok") and r.get("linked") else None
     if not got:
         io.say("Link MOTHER as a device on your phone: WhatsApp > Settings > Linked devices > Link a device.")
-        got = link_loop(io)
+        want = {}
+        got = link_loop(io, want)
+        if got and got.endswith("@lid") and want.get("phone"):
+            got = want["phone"]  # WhatsApp named the account privately; the manager already typed the number
     me = bare_jid(got) or _phone_from_manager(io, got)
     io.say("Linked: your WhatsApp account %s." % me)
     return me

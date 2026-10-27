@@ -192,7 +192,7 @@ is safe:
 | Step | What the manager sees |
 |---|---|
 | Bridge | Installs it (Node 20 or later; a minute of npm) |
-| Link | A QR: WhatsApp on the phone > Settings > Linked devices > Link a device |
+| Link | A QR: WhatsApp on the phone > Settings > Linked devices > Link a device (or `p` for a code typed on the phone, when the QR won't scan) |
 | Config | Turns WhatsApp on for the linked account; nothing to type |
 | Database | If it can't read WhatsApp's database: how to grant Full Disk Access, then run it again |
 | Chats | Their 15 most recent chats (names and dates, never messages); they type the numbers MOTHER may use |

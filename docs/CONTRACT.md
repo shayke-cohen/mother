@@ -458,7 +458,7 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
 - **Bridge** (`bridge/whatsapp/`, Node 20+, Baileys pinned exactly in `package.json` and `package-lock.json`;
   optional, nothing else depends on it). `node bridge.mjs` serves on `<state>/whatsapp/bridge.sock` (0600, in
   a 0700 folder; a stale socket is replaced, a live one refused); `--link` prints the QR and exits once
-  linked; `--unlink` logs out and deletes `session/`. It resolves the workspace as `bin/mother` does
+  linked (`--link --phone <digits>` shows an 8-character pairing code instead, typed on the phone); `--unlink` logs out and deletes `session/`. It resolves the workspace as `bin/mother` does
   (`$MOTHER_WORKSPACE`, else `<state>/workspace`). One JSON request per connection, one JSON reply:
   `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "prompts_today", "connecting"?}`;
   `{"op": "stop"}` → `{"ok": true}`, then the bridge exits;
@@ -546,7 +546,12 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   - **`mother whatsapp setup`** is one guided flow; each step is skipped when already done, so it is safe to
     re-run. (a) Install: when `bridge_problem()` says not installed, or `reinstall_needed`, run `install` (a Node
     problem stops with its hint), then stop a running bridge. (b) Link: ask the bridge (`status`, started on
-    demand) whether it is linked; if not, run `bridge.mjs --link` with the QR passed through to the terminal.
+    demand) whether it is linked; if not, ask "Link by scanning a QR code (Enter), or type p to link with your
+    phone number instead:" — `p` asks for the number (digits with country code, as `allow` takes it) and runs
+    `bridge.mjs --link --phone <digits>`, which prints "On your phone: WhatsApp → Settings → Linked devices → Link
+    a device → Link with phone number instead, then type this code: <code>" and no QR; otherwise run
+    `bridge.mjs --link` with the QR passed through to the terminal. Each later code is introduced as "New code
+    (WhatsApp replaces it every 20 seconds or so):".
     `--link` ends with one JSON line on stdout, `{"linked": true, "me": "<jid>"}` (device suffix stripped) or
     `{"linked": false, "reason"}`, `reason` one of `qr_expired` (WhatsApp closed with 408), `logged_out` (401),
     `replaced` (440), `network` (any other close), `timeout` (no scan in 180 s), `no_account`. In link mode a
@@ -558,7 +563,7 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
     code lasts about 20 seconds." before the first code, and one plain sentence per outcome. The bridge's
     `me()` prefers the phone JID (`user.id`, else `creds.me.id`). The manager's `self_jid` is that `me` (or the
     linked `status.me`), suffix stripped; when WhatsApp gives only a private `@lid` id, setup says so and asks
-    the manager to type their number (digits with country code). No JID: stop, nothing written. (c) Config: set `whatsapp.enabled: true` and `self_jid` in one write, keep
+    the manager to type their number (digits with country code), unless they already typed it to link by phone. No JID: stop, nothing written. (c) Config: set `whatsapp.enabled: true` and `self_jid` in one write, keep
     `allow` and every other key, set `approve_via: ["session"]` when absent, leave the caps alone. (d) Database:
     probe it; `denied` prints the Full Disk Access instruction and stops (exit 2), `missing` says to install and
     sign in to WhatsApp desktop and stops. (e) Chats: show up to 15 recent chats from `ZWACHATSESSION` (name,

@@ -5,6 +5,7 @@
 //   node bridge.mjs            serve on <state>/whatsapp/bridge.sock (0600, no TCP)
 //   node bridge.mjs --link     print the QR in this terminal, exit once linked; the last stdout line is
 //                              {"linked": true, "me": "<jid>"} (device suffix stripped) or {"linked": false}
+//   node bridge.mjs --link --phone <digits>   the same, with a pairing code to type on the phone instead of a QR
 //   node bridge.mjs --unlink   log the device out and delete <state>/whatsapp/session/
 //
 // <state> = $MOTHER_STATE_DIR or ~/.mother. The workspace is $MOTHER_WORKSPACE, else the <state>/workspace
@@ -363,7 +364,8 @@ export function closeAction(mode, code, retry) {
  * each QR to onQR. No handler is registered for messages or any other incoming event: the library does what
  * the protocol needs and the bridge keeps nothing.
  */
-export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () => {}, log = defaultLog }) {
+export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () => {}, log = defaultLog,
+                                        pairPhone = null, onPairCode = () => {} }) {
   const baileys = await import("baileys");
   const makeWASocket = baileys.makeWASocket || baileys.default;
   const { useMultiFileAuthState, DisconnectReason, jidNormalizedUser, Browsers } = baileys;
@@ -375,6 +377,7 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
   let loggedOut = false;
   let reason = null;
   let retry = 0;
+  let pairAsked = false;
   const waiters = [];
   const settle = (v) => { while (waiters.length) waiters.shift()(v); };
 
@@ -389,8 +392,17 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
     s.ev.on("connection.update", (u) => {
       if (s !== sock) return;
       if (u.qr) {
-        if (mode === "link") onQR(u.qr);
-        else { stopped = true; s.end(undefined); }  // serve mode never pairs
+        if (mode !== "link") { stopped = true; s.end(undefined); }  // serve mode never pairs
+        else if (!pairPhone) onQR(u.qr);
+        else if (!pairAsked) {  // the first QR means the socket is ready to ask for a pairing code instead
+          pairAsked = true;
+          s.requestPairingCode(pairPhone).then(onPairCode, (e) => {
+            log({ op: "pair_code", error: errCode(e) });
+            reason = "network";
+            stopped = true;
+            settle(false);
+          });
+        }
       }
       if (u.connection === "open") {
         linked = true;
@@ -458,12 +470,12 @@ export const LINK_WORDS = {
 };
 
 export async function runLink(loc, { connect = connectWhatsApp, qr = null, out = (l) => console.log(l),
-                                     err = (l) => console.error(l), settleMs = 2_000 } = {}) {
+                                     err = (l) => console.error(l), settleMs = 2_000, phone = null } = {}) {
   if (fs.existsSync(loc.sock) && await alive(loc.sock)) {
     err("The bridge is running; stop it before linking again.");
     return 1;
   }
-  const qrcode = qr || (await import("qrcode-terminal")).default;
+  const qrcode = phone ? null : qr || (await import("qrcode-terminal")).default;
   const fileLog = (rec) => {  // structured lines go to bridge.log only; the terminal gets the QR and sentences
     try {
       fs.mkdirSync(loc.dir || path.dirname(loc.sock), { recursive: true, mode: 0o700 });
@@ -473,12 +485,17 @@ export async function runLink(loc, { connect = connectWhatsApp, qr = null, out =
   };
   let shown = 0;
   const client = await connect({
-    sessionDir: loc.session, mode: "link", log: fileLog,
+    sessionDir: loc.session, mode: "link", log: fileLog, pairPhone: phone,
     onQR: (code) => {
       out(shown++ === 0
         ? "\nOpen WhatsApp → Settings → Linked devices → Link a device first; each code lasts about 20 seconds.\n"
-        : "\nNew code (the last one timed out):\n");
+        : "\nNew code (WhatsApp replaces it every 20 seconds or so):\n");
       qrcode.generate(code, { small: true });
+    },
+    onPairCode: (code) => {
+      const c = String(code).replace(/-/g, "");
+      out("\nOn your phone: WhatsApp → Settings → Linked devices → Link a device → Link with phone number "
+        + "instead, then type this code: " + (c.length === 8 ? c.slice(0, 4) + "-" + c.slice(4) : c) + "\n");
     },
   });
   const ok = await client.waitOpen(180_000);
@@ -574,10 +591,13 @@ export async function main(argv = process.argv.slice(2)) {
   const loc = locations();
   fs.mkdirSync(loc.dir, { recursive: true, mode: 0o700 });
   const arg = argv[0];
-  if (arg === "--link") return runLink(loc);
+  if (arg === "--link" && argv.length === 1) return runLink(loc);
+  if (arg === "--link" && argv[1] === "--phone" && /^\d{6,15}$/.test(argv[2] || "") && argv.length === 3) {
+    return runLink(loc, { phone: argv[2] });
+  }
   if (arg === "--unlink") return runUnlink(loc);
   if (arg === undefined) return runServe(loc);
-  console.error("usage: bridge.mjs [--link | --unlink]");
+  console.error("usage: bridge.mjs [--link [--phone <digits>] | --unlink]");
   return 2;
 }
 

@@ -1825,9 +1825,10 @@ class SetupCase(Base):
     def read_cfg(self):
         return json.loads((self.ws / "config.json").read_text())
 
-    def setup(self, *answers, linked=None, link=SELF, problem=None, reinstall=False, install_ok=True):
+    def setup(self, *answers, linked=None, link=SELF, problem=None, reinstall=False, install_ok=True, by_phone=None):
         """Run setup with the bridge faked: `problem` until install runs, `linked` = status.me (None: not linked),
-        `link` = what the QR link learns (a JID, None for a logged-out link, or a list of link_once results)."""
+        `link` = what the QR link learns (a JID, None for a logged-out link, or a list of link_once results);
+        `by_phone` = the number the manager typed to link by phone (None: they scanned the QR)."""
         state = {"problem": problem}
 
         def install():
@@ -1841,6 +1842,7 @@ class SetupCase(Base):
                 mock.patch.object(whatsapp, "install_bridge", side_effect=install) as inst, \
                 mock.patch.object(whatsapp, "stop_bridge", return_value=False) as stop, \
                 mock.patch.object(whatsapp, "bridge_call", return_value=status), \
+                mock.patch.object(whatsapp, "_link_phone", return_value=by_phone), \
                 mock.patch.object(whatsapp, "link_once", side_effect=list(link) if isinstance(link, list) else
                                   [{"linked": True, "me": link} if link else {"linked": False,
                                                                                 "reason": "logged_out"}]) as lk:
@@ -2023,21 +2025,44 @@ class TestLinkLoop(Cmd7):
 
     def test_an_expired_qr_offers_a_new_one(self):
         me, io, lk = self.loop([{"linked": False, "reason": "qr_expired"}, {"linked": False, "reason": "qr_expired"},
-                                {"linked": True, "me": SELF}], "", "y")
+                                {"linked": True, "me": SELF}], "", "", "y")
         self.assertEqual(me, SELF)
         self.assertEqual(lk.call_count, 3)
-        self.assertIn("QR expired — show a new one? [Y/n]", io.asked[0])
+        self.assertIn("QR expired — show a new one? [Y/n]", io.asked[1])
 
     def test_no_to_a_new_qr_stops(self):
-        e, io, lk = self.loop([{"linked": False, "reason": "qr_expired"}], "n")
+        e, io, lk = self.loop([{"linked": False, "reason": "qr_expired"}], "", "n")
         self.assertIsInstance(e, whatsapp.SetupStop)
 
     def test_logged_out_or_replaced_stop_in_plain_words(self):
         for reason, words in (("logged_out", "logged"), ("replaced", "another device")):
-            e, io, lk = self.loop([{"linked": False, "reason": reason}])
+            e, io, lk = self.loop([{"linked": False, "reason": reason}], "")
             self.assertIsInstance(e, whatsapp.SetupStop)
             self.assertIn(words, str(e).lower())
-            self.assertEqual(io.asked, [])
+            self.assertEqual(len(io.asked), 1)  # only how to link
+
+    def test_p_links_by_phone_number_and_a_bad_number_is_asked_again(self):
+        me, io, lk = self.loop([{"linked": False, "reason": "qr_expired"}, {"linked": True, "me": SELF}],
+                               "p", "12", "+972 50-000-0099", "y")
+        self.assertEqual(me, SELF)
+        self.assertEqual([c.args[1] for c in lk.call_args_list], [SELF, SELF])
+        self.assertIn("isn't a phone number", io.text)
+        self.assertIn("code expired — show a new one?", io.asked[-1])
+
+    def test_enter_or_an_empty_number_scans_the_qr(self):
+        for answers in (("",), ("p", "")):
+            me, io, lk = self.loop([{"linked": True, "me": SELF}], *answers)
+            self.assertEqual(lk.call_args.args[1], None)
+
+    def test_the_phone_number_reaches_the_bridge_without_the_server(self):
+        fake = mock.Mock()
+        fake.stdout = [b'{"linked": true, "me": "972500000099@s.whatsapp.net"}\n']
+        fake.returncode = 0
+        with mock.patch.object(whatsapp, "_node", return_value="/usr/bin/node"), \
+                mock.patch.object(whatsapp, "stop_bridge"), \
+                mock.patch("subprocess.Popen", return_value=fake) as po:
+            whatsapp.link_once(lambda t: None, SELF)
+        self.assertEqual(po.call_args.args[0][-3:], ["--link", "--phone", "972500000099"])
 
     def test_the_link_command_loops_too(self):
         class Tty(__import__("io").StringIO):
@@ -2064,6 +2089,15 @@ class TestSetupRound1(SetupCase):
             self.assertIn("private id", io.text)
             self.assertNotIn("didn't complete", io.text)
             self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
+
+    def test_a_private_id_linked_by_phone_uses_the_number_already_typed(self):
+        cfg = self.read_cfg()
+        cfg.pop("whatsapp", None)
+        self.write_cfg(cfg)
+        code, io, m = self.setup("", "n", "n", link="123456789012@lid", by_phone=SELF)
+        self.assertEqual(code, 0, io.text)
+        self.assertNotIn("private id", io.text)
+        self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
 
     def test_hidden_id_chats_are_shown_and_skipped(self):
         db = sqlite3.connect(str(self.db))

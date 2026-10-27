@@ -33,6 +33,7 @@ Known risks of the dependency:
 | Command | Does |
 |---|---|
 | `node bridge.mjs --link` | Prints the QR in the terminal; scan it in WhatsApp > Settings > Linked devices. Exits once linked. |
+| `node bridge.mjs --link --phone <digits>` | The same with a pairing code instead of a QR: Link a device > Link with phone number instead, and type it. |
 | `node bridge.mjs` | Serves on `<state>/whatsapp/bridge.sock`. An unlinked bridge stays unlinked and refuses every send. |
 | `node bridge.mjs --unlink` | Logs the device out and deletes `<state>/whatsapp/session/`: the kill switch. |
 
