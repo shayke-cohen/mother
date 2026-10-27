@@ -359,6 +359,36 @@ export function closeAction(mode, code, retry) {
   return { retryMs: Math.min(60_000, 2_000 * 2 ** retry) };
 }
 
+/** True once a pairing completed: a pairing code sets creds.me before the phone confirms, so me alone isn't it. */
+export function isPaired(creds) {
+  return !!(creds && creds.me && creds.me.id && creds.account);
+}
+
+/** Drop a half-done pairing (keys without a confirmed account) so a new link starts clean. */
+export function clearUnpaired(sessionDir) {
+  const f = path.join(sessionDir, "creds.json");
+  let creds = null;
+  try { creds = JSON.parse(fs.readFileSync(f, "utf8")); } catch { return false; }
+  if (isPaired(creds)) return false;
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * The WhatsApp Web version to announce: the live one from web.whatsapp.com (WhatsApp refuses to pair a client
+ * that is too old), else the library's built-in one. `fetchLatest` is baileys' fetchLatestWaWebVersion.
+ */
+export async function waVersion(fetchLatest, log = () => {}) {
+  try {
+    const r = await fetchLatest({ signal: AbortSignal.timeout(10_000) });
+    if (r && r.isLatest && Array.isArray(r.version)) return r.version;
+    log({ op: "wa_version", error: "not_found" });
+  } catch (e) {
+    log({ op: "wa_version", error: errCode(e) });
+  }
+  return undefined;  // the library's default
+}
+
 /**
  * A linked-device client. `mode` "serve" never shows a QR (an unlinked bridge stays unlinked); "link" passes
  * each QR to onQR. No handler is registered for messages or any other incoming event: the library does what
@@ -368,8 +398,9 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
                                         pairPhone = null, onPairCode = () => {} }) {
   const baileys = await import("baileys");
   const makeWASocket = baileys.makeWASocket || baileys.default;
-  const { useMultiFileAuthState, DisconnectReason, jidNormalizedUser, Browsers } = baileys;
+  const { useMultiFileAuthState, DisconnectReason, jidNormalizedUser, Browsers, fetchLatestWaWebVersion } = baileys;
   tighten(sessionDir);
+  const version = fetchLatestWaWebVersion ? await waVersion(fetchLatestWaWebVersion, log) : undefined;
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
   let sock = null;
   let linked = false;
@@ -384,6 +415,7 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
   const start = () => {
     sock = makeWASocket({
       auth: state, logger: SILENT, browser: Browsers.macOS("Desktop"), markOnlineOnConnect: false,
+      ...(version ? { version } : {}),
       syncFullHistory: false, shouldSyncHistoryMessage: () => false, getMessage: async () => undefined,
       emitOwnEvents: false, generateHighQualityLinkPreview: false,
     });
@@ -428,7 +460,7 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
     });
   };
 
-  const paired = !!state.creds?.me?.id;
+  const paired = isPaired(state.creds);
   if (paired || mode === "link") start();
   return {
     paired,
@@ -476,6 +508,7 @@ export async function runLink(loc, { connect = connectWhatsApp, qr = null, out =
     return 1;
   }
   const qrcode = phone ? null : qr || (await import("qrcode-terminal")).default;
+  clearUnpaired(loc.session);
   const fileLog = (rec) => {  // structured lines go to bridge.log only; the terminal gets the QR and sentences
     try {
       fs.mkdirSync(loc.dir || path.dirname(loc.sock), { recursive: true, mode: 0o700 });

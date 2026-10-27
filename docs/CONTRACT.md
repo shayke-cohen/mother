@@ -458,7 +458,10 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
 - **Bridge** (`bridge/whatsapp/`, Node 20+, Baileys pinned exactly in `package.json` and `package-lock.json`;
   optional, nothing else depends on it). `node bridge.mjs` serves on `<state>/whatsapp/bridge.sock` (0600, in
   a 0700 folder; a stale socket is replaced, a live one refused); `--link` prints the QR and exits once
-  linked (`--link --phone <digits>` shows an 8-character pairing code instead, typed on the phone); `--unlink` logs out and deletes `session/`. It resolves the workspace as `bin/mother` does
+  linked (`--link --phone <digits>` shows an 8-character pairing code instead, typed on the phone); every connection announces the live WhatsApp Web version (read from `web.whatsapp.com/sw.js`, 10 s
+  timeout; WhatsApp refuses to pair a client that is too old), else the library's built-in one; the bridge counts as
+  paired only once `creds.json` holds a confirmed `account` (a pairing code writes `me` before the phone
+  confirms), and `--link` first deletes a `session/` that isn't paired, so each attempt starts clean; `--unlink` logs out and deletes `session/`. It resolves the workspace as `bin/mother` does
   (`$MOTHER_WORKSPACE`, else `<state>/workspace`). One JSON request per connection, one JSON reply:
   `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "prompts_today", "connecting"?}`;
   `{"op": "stop"}` → `{"ok": true}`, then the bridge exits;

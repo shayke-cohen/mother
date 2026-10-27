@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import {
-  createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs, silenceConsole, runLink, bareJid, closeAction,
+  createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs, silenceConsole, runLink, bareJid, closeAction, waVersion, isPaired, clearUnpaired,
 } from "./bridge.mjs";
 
 const SELF = "972500000099@s.whatsapp.net";
@@ -614,4 +614,26 @@ test("closeAction: in link mode a close ends the attempt with a reason (no recon
   assert.deepEqual(closeAction("serve", 408, 2), { retryMs: 8000 });
   assert.deepEqual(closeAction("serve", 515, 3), { retryMs: 0 });
   assert.deepEqual(closeAction("serve", 401, 0), { end: true, reason: "logged_out", loggedOut: true });
+});
+
+test("waVersion: the live WhatsApp Web version, else the library default (and a log line)", async () => {
+  assert.deepEqual(await waVersion(async () => ({ version: [2, 3000, 9], isLatest: true })), [2, 3000, 9]);
+  const logged = [];
+  assert.equal(await waVersion(async () => ({ version: [2, 3000, 1], isLatest: false }), (r) => logged.push(r)), undefined);
+  assert.equal(await waVersion(async () => { throw Object.assign(new Error("x"), { name: "TimeoutError" }); },
+                               (r) => logged.push(r)), undefined);
+  assert.deepEqual(logged, [{ op: "wa_version", error: "not_found" }, { op: "wa_version", error: "TimeoutError" }]);
+});
+
+test("isPaired needs a confirmed account; clearUnpaired drops only a half-done pairing", () => {
+  assert.equal(isPaired({ me: { id: "972500000099@s.whatsapp.net" } }), false);
+  assert.equal(isPaired({ me: { id: "972500000099:3@s.whatsapp.net" }, account: { details: "x" } }), true);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wa-sess-"));
+  fs.writeFileSync(path.join(dir, "creds.json"), JSON.stringify({ me: { id: "1@s.whatsapp.net" }, account: {} }));
+  assert.equal(clearUnpaired(dir), false);
+  assert.ok(fs.existsSync(path.join(dir, "creds.json")));
+  fs.writeFileSync(path.join(dir, "creds.json"), JSON.stringify({ me: { id: "1@s.whatsapp.net" } }));
+  assert.equal(clearUnpaired(dir), true);
+  assert.ok(!fs.existsSync(dir));
+  assert.equal(clearUnpaired(dir), false);  // nothing there
 });
