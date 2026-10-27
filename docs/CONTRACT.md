@@ -215,6 +215,18 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **Paused** denies drafts too. Policy overrides only tighten (the auto list can shrink, the never list can grow).
 - The hook matcher includes `Write|Edit|MultiEdit|NotebookEdit`, so edits to the guard's own files
   (config, ledger, log, PAUSED, hooks) ask.
+- A shell command asks as a self-edit only when it can write (a redirect other than `/dev/null` or `2>&1`,
+  `rm`/`mv`/`cp`/`sed -i`/…, or a script that opens a file for writing) **and** it reaches the running copy:
+  it names `guard.py`/`hooks.json` together with the installed plugin's path (`${CLAUDE_PLUGIN_ROOT}`,
+  `.claude/plugins/`), or `config.json`/`PAUSED`/`ledger.json`/`guard.log` together with the workspace's
+  path (`$MOTHER_WORKSPACE`, `$(cat ~/.mother/workspace)`, the path itself), or it runs from inside either
+  without a `cd`; or it writes `~/.mother/workspace`. The same names in a checkout of this repo, another
+  project or a test workspace (a command that sets its own `MOTHER_WORKSPACE`/`MOTHER_STATE_DIR`) pass.
+- `gh`/`glab` text the shell won't run passes: quoted strings and heredoc bodies that feed a plain command
+  (commit messages, PR bodies, prompts). Quotes count when the command hands them to an interpreter
+  (`bash -c`, `python3 -c`, `ssh`, `xargs` …); heredoc bodies count when they feed one or the command runs a
+  script it wrote (`chmod`, `./x.sh`). `gh api -X GET …` and `-F query=@file` whose file holds a query and no
+  mutation are reads. Connector calls `executeRead` and `*_monitor`/`*_watch` are not outbound.
 
 ## 5b. Channel reply loop (`lib/channels.py`, `mother channels`, skill `mother:channels`)
 
