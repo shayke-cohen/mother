@@ -40,6 +40,17 @@ class DeckTest(unittest.TestCase):
         self.assertIn("function delta(c)", html)
         self.assertIn('"prevLabel": "vs last month"', html)
 
+    def test_hygiene_intake_is_a_proposal(self):
+        items = self.data["intake"]["items"]
+        hyg = [r for r in items if r.get("source") == "hygiene"]
+        self.assertTrue(hyg, "example.json should show a hygiene-sourced intake item")
+        self.assertTrue(all(r.get("key") and r.get("proposed") and not r.get("owner") for r in hyg))
+        keys = [r["key"] for r in items if r.get("key")]
+        self.assertEqual(len(keys), len(set(keys)), "intake is deduped by ticket key")
+        r = build(self.data, self.out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("from tracker hygiene", self.out.read_text())
+
     def test_missing_section_fails(self):
         del self.data["carryover"]
         r = build(self.data, self.out)

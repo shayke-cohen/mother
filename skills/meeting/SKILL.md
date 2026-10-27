@@ -42,6 +42,25 @@ Fill it from:
 Read the tracker live, not from last week's files: the team may have started the sprint or moved issues since.
 Trackers cap page sizes; read in slices (e.g. by date) until each slice is complete.
 
+**Unowned intake.** A team that still runs the meeting from the slide deck (§3) also gets
+`teams/<slug>/meetings/<date>-deck.json`, rendered with `${CLAUDE_PLUGIN_ROOT}/assets/deck/build.py`. Its
+`intake.items[]` (slide "4 · Unowned intake") come from two sources, in this order:
+
+1. `teams/<slug>/intake.md` items still `proposed`, plus unassigned tracker items labelled for triage — as before.
+2. **If it exists,** `teams/<slug>/meetings/<date>-hygiene.md` (same meeting date; never an older one), written by a
+   tracker-hygiene pass. Take only its per-ticket owner proposals: urgent tickets with no owner, tickets whose
+   owner left or is away, in-progress tickets with no owner. Each becomes one item with `key`, `issue`, the
+   file's proposed owner as `proposed`, its reason as `why`, and `source: "hygiene"`. Re-read each ticket live
+   first and drop it if it now has an owner, is done, or was closed — the file was written days before.
+
+Dedupe by ticket key: a key already in an `intake.md` item keeps that item and its owner proposal; the hygiene
+line is dropped. Every owner in the hygiene file is a **proposal for the room, never an assignment** — it goes in
+`proposed`, never `owner`, and nothing from the file is written to the tracker at prep. The rest of the file
+(project-wide asks, repeats, stuck work, batches) is not intake: link the file in `intake.note` so the room can
+open it, and never put its "Not for the meeting" section on the deck. No hygiene file → intake is built exactly
+as before. In the plan, hygiene owners never become `assign` or `create` items, since applying the plan writes
+owners; at most one `decisions` entry pointing at the file.
+
 Content rules (the page is shown to the team): no customer names or identifiers, no person scoring, every
 number names its source and time (`meta.sources`, `meta.generated`). Put `teams/<slug>/meetings/<date>-meeting.md`
 next to it with the goals and decisions in text.
@@ -113,6 +132,8 @@ Read the tracker gotchas in the doctor's notes in `capabilities.json` first. App
 1. **`intake[]`** with a `key` → assign `owner`. Without one → create the item (summary = the issue text,
    description = source link from `intake.md` + "created from the <meeting> on <date>"), assigned.
    `deferred: true` → leave it `proposed` in `intake.md` for next week. Update each applied item in `intake.md`.
+   A hygiene item (`source: "hygiene"` in the deck JSON) has no `intake.md` line: assign the owner the room chose, add no line, and
+   leave a deferred one alone (the next hygiene pass proposes it again).
 2. **`added[]`** with a `key` → by `action`: `assign` (owner, plus the new sprint if `nextSprint`), `done`
    (transition to the done state found via available transitions), `comment` (comment only). A `comment`
    text is added in every case. Without a key → create, assigned, with its priority and the comment as description.

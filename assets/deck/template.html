@@ -206,7 +206,7 @@ select:focus,input:focus,textarea:focus{outline:2px solid var(--accent);outline-
     '<table><tr><th>#</th><th>issue</th><th>proposed owner</th><th>owner</th></tr>'+I.items.map(function(r){
       var o = ST.owners[r.id] != null ? ST.owners[r.id] : (r.owner||'');
       var sp = ST.sprint[r.id] != null ? ST.sprint[r.id] : true;
-      return '<tr><td class="num">'+esc(r.id)+'</td><td>'+rich(r.issue)+pill(r.priority,r.priority==='P0'?'bad':'warn')+'</td><td class="owner">'+esc(r.proposed)+'<span class="why">'+esc(r.why)+'</span></td>'+
+      return '<tr><td class="num">'+esc(r.id)+'</td><td>'+rich(r.issue)+pill(r.priority,r.priority==='P0'?'bad':'warn')+'</td><td class="owner">'+esc(r.proposed)+'<span class="why">'+esc(r.why)+(r.source==='hygiene'?' · from tracker hygiene':'')+'</span></td>'+
         '<td class="owner"><span class="view-only">'+(r.owner?'<b>'+esc(r.owner)+'</b>':'<span class="blank">&nbsp;</span>')+'</span>'+
         '<span class="edit-only">'+ownerSelect('data-owner="'+esc(r.id)+'"',o)+'<label class="chk"><input type="checkbox" data-sprint="'+esc(r.id)+'"'+(sp?' checked':'')+'> in next sprint</label></span></td></tr>'}).join('')+'</table>'+
     note(I.note));
