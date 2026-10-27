@@ -22,6 +22,7 @@ export const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.u
 const ID_RE = /^w[a-z2-9]{3}$/;
 const MAX_REQUEST = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_GAP_WAIT_MS = 30_000;  // a request waits out at most this much of min_gap_seconds, then refuses `gap`
 
 const expand = (p) => (p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p);
 
@@ -45,10 +46,12 @@ export function workspace(env = process.env) {
   }
 }
 
-/** `mother whatsapp verify <id>` (no shell): true only on exit 0, i.e. the yes still stands for this text. */
-export function verifyWithCli(id, { env = process.env, python = "python3" } = {}) {
+/** `mother whatsapp verify <id> --sha256 <hash>` (no shell): true only on exit 0, i.e. the recorded yes still
+ * stands for exactly the text whose hash is `sha256`. */
+export function verifyWithCli(id, { env = process.env, python = "python3", sha256: hash } = {}) {
+  if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return Promise.resolve(false);
   return new Promise((resolve) => {
-    execFile(python, [path.join(PLUGIN_ROOT, "bin", "mother"), "whatsapp", "verify", id],
+    execFile(python, [path.join(PLUGIN_ROOT, "bin", "mother"), "whatsapp", "verify", id, "--sha256", hash],
       { env, timeout: 30_000, maxBuffer: 64 * 1024 }, (err) => resolve(!err));
   });
 }
@@ -63,7 +66,7 @@ const errCode = (e) => String((e && (e.code || e.output?.statusCode || e.name)) 
  * The request handler and socket server, independent of WhatsApp: `client` is anything with
  * linked(), me(), presence(jid, "composing"|"paused"), sendText(jid, text) -> stanza id.
  */
-export function createBridge({ env = process.env, client, verify = (id) => verifyWithCli(id, { env }),
+export function createBridge({ env = process.env, client, verify = (id, hash) => verifyWithCli(id, { env, sha256: hash }),
                                now = Date.now, rand = Math.random,
                                sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = defaultLog }) {
   const loc = locations(env);
@@ -101,8 +104,23 @@ export function createBridge({ env = process.env, client, verify = (id) => verif
     const ws = workspace(env);
     const cfg = ws ? readJson(path.join(ws, "config.json")) : null;
     if (!ws || !cfg) return { error: "no_workspace" };
-    if (fs.existsSync(path.join(ws, ".mother", "PAUSED"))) return { error: "paused" };
-    return { ws, cfg };
+    return { ws, cfg, paused: fs.existsSync(path.join(ws, ".mother", "PAUSED")) };
+  }
+
+  /** The linked account is the manager's own number (device suffix ignored), the one config calls self_jid. */
+  function rightAccount(cfg) {
+    const me = String((client && client.me()) || "").replace(/:\d+(?=@)/, "");
+    return !!me && me === cfg?.whatsapp?.self_jid;
+  }
+
+  /** Run a pure check; on `gap`, wait out what is left (at most MAX_GAP_WAIT_MS) and check once more. */
+  async function checkWithGap(check) {
+    let r = check();
+    if (!r.ok && r.error === "gap" && r.waitMs <= MAX_GAP_WAIT_MS) {
+      await sleep(r.waitMs);
+      r = check();
+    }
+    return r.ok || r.error !== "gap" ? r : fail("gap");
   }
 
   function settle(approvalPath, suffix, id) {
@@ -115,23 +133,34 @@ export function createBridge({ env = process.env, client, verify = (id) => verif
 
   async function send(id) {
     if (typeof id !== "string" || !ID_RE.test(id)) return fail("bad_request");
-    const c = context();
-    if (c.error) return fail(c.error);
-    const base = path.join(c.ws, ".mother", "whatsapp");
-    const draft = readJson(path.join(base, "drafts", id + ".json"));
+    const ws = workspace(env);
+    if (!ws) return fail("no_workspace");
+    const base = path.join(ws, ".mother", "whatsapp");
     const approvalPath = path.join(base, "approved", id + ".json");
-    const approval = readJson(approvalPath);
-    const gapSeconds = jitteredGap(minGapSeconds(c.cfg), rand());
-    const r = checkSend({ cfg: c.cfg, draft, approval, sentLines: readSent(), now: now(), gapSeconds });
-    if (!r.ok) {
-      log({ op: "send", draft: id, error: r.error });
-      return r;
-    }
-    if (!client || !client.linked()) return fail("unlinked");
-    if (!(await verify(id))) {  // the second lock re-proves the manager's yes on its own
+    if (!fs.existsSync(approvalPath)) {
       log({ op: "send", draft: id, error: "no_approval" });
-      return fail("no_approval");
+      return fail("no_approval");  // nothing to settle
     }
+    // From here every outcome settles the approval: .used once sent (or already sent), else .failed, so a
+    // fresh `mother whatsapp send` can re-prove the manager's yes (T6-b).
+    const refuse = (error, extra = {}) => {
+      settle(approvalPath, error === "already_sent" ? ".used" : ".failed", id);
+      log({ op: "send", draft: id, error, ...extra });
+      return fail(error);
+    };
+    const approval = readJson(approvalPath);
+    const c = context();
+    if (c.error) return refuse(c.error);
+    if (c.paused) return refuse("paused");
+    const draft = readJson(path.join(base, "drafts", id + ".json"));
+    const gapSeconds = jitteredGap(minGapSeconds(c.cfg), rand());
+    const r = await checkWithGap(() => checkSend({ cfg: c.cfg, draft, approval, sentLines: readSent(), now: now(),
+                                                   gapSeconds }));
+    if (!r.ok) return refuse(r.error);
+    if (!client || !client.linked()) return refuse("unlinked");
+    if (!rightAccount(c.cfg)) return refuse("wrong_account");
+    const hash = sha256(draft.text);  // the bytes about to go out
+    if (!(await verify(id, hash))) return refuse("no_approval");  // the second lock re-proves the yes itself
     let stanza;
     try {
       await client.presence(draft.chat, "composing");
@@ -139,14 +168,12 @@ export function createBridge({ env = process.env, client, verify = (id) => verif
       await client.presence(draft.chat, "paused");
       stanza = await client.sendText(draft.chat, draft.text);
     } catch (e) {
-      settle(approvalPath, ".failed", id);
-      log({ op: "send", draft: id, error: "send_failed", code: errCode(e) });
-      return fail("send_failed");
+      return refuse("send_failed", { code: errCode(e) });
     }
-    stanza = typeof stanza === "string" ? stanza : "";
+    stanza = typeof stanza === "string" && stanza ? stanza : null;
     try {
-      appendSent({ at: isoZ(now()), kind: "send", chat: draft.chat, draft: id, sha256: draft.sha256, stanza });
-    } catch (e) {
+      appendSent({ at: isoZ(now()), kind: "send", chat: draft.chat, draft: id, sha256: hash, stanza });
+    } catch (e) {  // sent all the same; .used below keeps the guard from sending it twice
       log({ op: "send", draft: id, stanza, error: "sent_log_failed", code: errCode(e) });
     }
     settle(approvalPath, ".used", id);
@@ -157,13 +184,19 @@ export function createBridge({ env = process.env, client, verify = (id) => verif
   async function prompt(text) {
     const c = context();
     if (c.error) return fail(c.error);
+    if (c.paused) return fail("paused");
     const gapSeconds = jitteredGap(minGapSeconds(c.cfg), rand());
-    const r = checkPrompt({ cfg: c.cfg, text, sentLines: readSent(), now: now(), gapSeconds });
+    const r = await checkWithGap(() => checkPrompt({ cfg: c.cfg, text, sentLines: readSent(), now: now(),
+                                                     gapSeconds }));
     if (!r.ok) {
       log({ op: "prompt", error: r.error });
       return r;
     }
     if (!client || !client.linked()) return fail("unlinked");
+    if (!rightAccount(c.cfg)) {
+      log({ op: "prompt", error: "wrong_account" });
+      return fail("wrong_account");
+    }
     let stanza;
     try {  // the manager's own chat: no "typing…", no cold-contact rule
       stanza = await client.sendText(r.chat, text);
@@ -171,11 +204,13 @@ export function createBridge({ env = process.env, client, verify = (id) => verif
       log({ op: "prompt", error: "send_failed", code: errCode(e) });
       return fail("send_failed");
     }
-    stanza = typeof stanza === "string" ? stanza : "";
+    stanza = typeof stanza === "string" && stanza ? stanza : null;
     try {
       appendSent({ at: isoZ(now()), kind: "prompt", chat: r.chat, sha256: sha256(text), stanza });
     } catch (e) {
-      log({ op: "prompt", stanza, error: "sent_log_failed", code: errCode(e) });
+      log({ op: "prompt", stanza, error: "log_failed", code: errCode(e) });
+      return { ok: false, error: "log_failed", stanza,
+               detail: "the prompt was sent but not logged in sent.jsonl; don't count on it as the bridge's own" };
     }
     log({ op: "prompt", stanza });
     return { ok: true, stanza };
@@ -279,7 +314,7 @@ const SILENT = {
   trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {},
 };
 
-function tighten(dir) {  // session keys: folder 0700, files 0600
+export function tighten(dir) {  // session keys: folder 0700, files 0600
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.chmodSync(dir, 0o700);
   for (const f of fs.readdirSync(dir)) {

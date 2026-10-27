@@ -759,13 +759,23 @@ class TestProof(Base):
         self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "self_chat")
         p = self.t / "state" / "whatsapp" / "sent.jsonl"
         good = p.read_text()
-        for bad in ({"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": None},
-                    {"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x"},
+        for bad in ({"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x"},
                     {"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": ""}):
             p.write_text(good + json.dumps(bad) + "\n")
             self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"), bad)
         p.write_text(good + "{not json\n")
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_survives_a_sent_line_with_null_stanza(self):
+        """M4: the bridge writes `"stanza": null` when WhatsApp returned no id. That well-formed line is
+        skipped, not malformed: it must not switch the self-chat path off for good."""
+        self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        self.sent({"at": fmt(ago(minutes=40)), "kind": "send", "chat": DM, "draft": "w9pa", "sha256": "x",
+                   "stanza": None},
+                  {"at": fmt(ago(minutes=35)), "kind": "prompt", "chat": SELF, "sha256": "y", "stanza": None})
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "self_chat")
 
     def test_self_chat_null_stanza_never_counts(self):
         self.via("self_chat")
@@ -1061,6 +1071,38 @@ class TestVerify(Base):
         self.approve(path="slack_dm", transcript=False)
         self.assertTrue(self.verify()[0])  # the guard consumed the grant's one use; the proof still stands
 
+    def test_bound_to_the_hash_the_bridge_sends(self):
+        """M1: --sha256 is the hash of the bytes the bridge is about to send; verify must agree with it too."""
+        self.approve()
+        self.assertTrue(whatsapp.verify(self.ws, self.cfg, "w3kx", sha=self.d["sha256"])[0])
+        ok, why = whatsapp.verify(self.ws, self.cfg, "w3kx", sha="0" * 64)
+        self.assertFalse(ok)
+        self.assertIn("hash", why)
+        self.assertFalse(whatsapp.verify(self.ws, self.cfg, "w3kx", sha="")[0])
+
+    def test_only_the_recorded_path(self):
+        """M8: a yes on another path doesn't stand in for the one the guard recorded."""
+        self.approve(path="slack_dm")  # recorded slack, but only the session (recorded transcript) has a yes
+        self.assertFalse(self.verify()[0])
+        self.approve(path="self_chat")
+        self.assertFalse(self.verify()[0])
+        self.approve(path="session")
+        self.assertTrue(self.verify()[0])
+
+    def test_read_only_on_an_expired_draft(self):
+        """M6: verify never deletes or changes anything, not even an expired draft."""
+        self.approve()
+        f = self.ws / ".mother/whatsapp/drafts/w3kx.json"
+        d = json.loads(f.read_text())
+        d["created"] = fmt(ago(hours=73))
+        f.write_text(json.dumps(d))
+        before = sorted((str(p), p.stat().st_mtime_ns) for p in self.ws.rglob("*"))
+        ok, why = self.verify()
+        self.assertFalse(ok)
+        self.assertIn("expired", why)
+        self.assertTrue(f.exists())
+        self.assertEqual(sorted((str(p), p.stat().st_mtime_ns) for p in self.ws.rglob("*")), before)
+
     def test_cli(self):
         (self.ws / "config.json").write_text(json.dumps(self.cfg))
         env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
@@ -1071,6 +1113,11 @@ class TestVerify(Base):
         r = cli(env, "verify", "w3kx")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn(self.d["text"], r.stdout + r.stderr)
+        self.assertEqual(cli(env, "verify", "w3kx", "--sha256", self.d["sha256"]).returncode, 0)
+        r = cli(env, "verify", "w3kx", "--sha256", "0" * 64)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hash", r.stderr)
+        self.assertEqual(cli(env, "verify", "w3kx", "--sha256").returncode, 1)
         self.assertEqual(cli(env, "verify").returncode, 1)
         self.assertEqual(cli(env, "verify", "w3kx", "w9pa").returncode, 1)
         self.cfg["whatsapp"]["send"] = False

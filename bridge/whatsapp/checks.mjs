@@ -1,6 +1,6 @@
 // Pure checks the bridge runs before every message it sends. No I/O, no clock, no randomness of their own:
 // the bridge passes `now` (ms since epoch) and random numbers in, so every rule is testable without WhatsApp.
-// docs/CONTRACT.md §5d. Errors: not_allowlisted, no_approval, hash_mismatch, cap, gap, no_draft,
+// docs/CONTRACT.md §5d. Errors: not_allowlisted, no_approval, hash_mismatch, cap, gap (with waitMs), no_draft,
 // already_sent, off, bad_request.
 import { createHash } from "node:crypto";
 
@@ -45,9 +45,23 @@ function lastAt(lines) {
   return last;
 }
 
-function gapOk(lines, now, gapSeconds) {
+/** ms still to wait before the next message may go (0 = none). */
+function gapLeft(lines, now, gapSeconds) {
   const last = lastAt(lines);
-  return last === null || now - last >= gapSeconds * 1000;
+  return last === null ? 0 : Math.max(0, Math.ceil(last + gapSeconds * 1000 - now));
+}
+
+function gapCheck(lines, now, gapSeconds) {
+  const waitMs = gapLeft(lines, now, gapSeconds);
+  return waitMs > 0 ? { ok: false, error: "gap", waitMs } : null;
+}
+
+// The manager's approval reply (lib/whatsapp.py REPLY_RE): `ok <id>…`, `ok all`, `no <id>…`.
+const REPLY_RE = /^(ok|no)((?:[ \t]+w[a-z0-9]+)+|[ \t]+all)$/i;
+
+/** True when the text, or any line of it, would read as the manager's `ok`/`no` reply. */
+export function looksLikeReply(text) {
+  return [String(text), ...String(text).split(/\r?\n/)].some((l) => REPLY_RE.test(l.trim()));
 }
 
 /** whatsapp.min_gap_seconds, default 5. */
@@ -85,8 +99,7 @@ export function checkSend({ cfg, draft, approval, sentLines, now, gapSeconds }) 
     return fail("already_sent");
   }
   if (count(sentLines, "send", now) >= sendCap(w)) return fail("cap");
-  if (!gapOk(sentLines, now, gapSeconds ?? minGapSeconds(cfg))) return fail("gap");
-  return { ok: true };
+  return gapCheck(sentLines, now, gapSeconds ?? minGapSeconds(cfg)) || { ok: true };
 }
 
 /**
@@ -96,13 +109,14 @@ export function checkSend({ cfg, draft, approval, sentLines, now, gapSeconds }) 
 export function checkPrompt({ cfg, text, sentLines, now, gapSeconds }) {
   const w = wa(cfg);
   if (!sendingOn(w)) return fail("off");
-  if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT) return fail("bad_request");
+  if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT || looksLikeReply(text)) {
+    return fail("bad_request");  // a prompt must never read as the manager's own yes or no
+  }
   if (typeof w.self_jid !== "string" || !/^\d+@s\.whatsapp\.net$/.test(w.self_jid)) return fail("not_allowlisted");
   if (!Array.isArray(sentLines)) return fail("cap");
   const cap = isInt(w.max_prompts_per_day) && w.max_prompts_per_day >= 1 ? w.max_prompts_per_day : MAX_PROMPTS_PER_DAY;
   if (count(sentLines, "prompt", now) >= cap) return fail("cap");
-  if (!gapOk(sentLines, now, gapSeconds ?? minGapSeconds(cfg))) return fail("gap");
-  return { ok: true, chat: w.self_jid };
+  return gapCheck(sentLines, now, gapSeconds ?? minGapSeconds(cfg)) || { ok: true, chat: w.self_jid };
 }
 
 /** sent.jsonl text → records; null when any non-empty line is not a JSON object (a torn write included). */
@@ -122,12 +136,13 @@ export function parseSent(text) {
   return out;
 }
 
-/** One sent.jsonl line, fields in contract order, ending in a newline. `draft` only for a send. */
+/** One sent.jsonl line, fields in contract order, ending in a newline. `draft` only for a send. A missing or
+ * empty stanza id is written as null (readers skip such a line rather than treat the file as malformed). */
 export function sentLine({ at, kind, chat, draft, sha256: hash, stanza }) {
   const r = { at, kind, chat };
   if (kind === "send") r.draft = draft;
   r.sha256 = hash;
-  r.stanza = stanza;
+  r.stanza = typeof stanza === "string" && stanza ? stanza : null;
   return JSON.stringify(r) + "\n";
 }
 

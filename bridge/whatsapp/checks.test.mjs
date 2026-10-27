@@ -1,4 +1,4 @@
-// Pure checks the bridge runs before every message. Run: node --test bridge/whatsapp
+// Pure checks the bridge runs before every message. Run: node --test 'bridge/whatsapp/*.test.mjs'
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -98,11 +98,11 @@ test("prompts don't count toward the send cap", () => {
   assert.deepEqual(ok({ sentLines: sends(30, "prompt") }), { ok: true });
 });
 
-test("last send 2 s ago: gap", () => {
-  assert.deepEqual(ok({ sentLines: sends(1, "send", 2000) }), { ok: false, error: "gap" });
-  assert.deepEqual(ok({ sentLines: sends(1, "prompt", 2000) }), { ok: false, error: "gap" });  // any message
+test("last send 2 s ago: gap, with the time left to wait", () => {
+  assert.deepEqual(ok({ sentLines: sends(1, "send", 2000) }), { ok: false, error: "gap", waitMs: 3000 });
+  assert.deepEqual(ok({ sentLines: sends(1, "prompt", 2000) }), { ok: false, error: "gap", waitMs: 3000 });  // any message
   assert.deepEqual(ok({ sentLines: sends(1, "send", 6000) }), { ok: true });
-  assert.deepEqual(ok({ sentLines: sends(1, "send", 6000), gapSeconds: 6.5 }), { ok: false, error: "gap" });
+  assert.deepEqual(ok({ sentLines: sends(1, "send", 6000), gapSeconds: 6.5 }), { ok: false, error: "gap", waitMs: 500 });
   assert.deepEqual(ok({ cfg: cfg({ min_gap_seconds: 0 }), sentLines: sends(1, "send", 10) }), { ok: true });
 });
 
@@ -130,11 +130,22 @@ test("prompt: only to self_jid, its own cap, the gap", () => {
   assert.deepEqual(p({ sentLines: sends(10, "prompt") }), { ok: false, error: "cap" });
   assert.deepEqual(p({ cfg: cfg({ max_prompts_per_day: 2 }), sentLines: sends(2, "prompt") }),
                    { ok: false, error: "cap" });
-  assert.deepEqual(p({ sentLines: sends(1, "prompt", 1000) }), { ok: false, error: "gap" });
+  assert.deepEqual(p({ sentLines: sends(1, "prompt", 1000) }), { ok: false, error: "gap", waitMs: 4000 });
   assert.deepEqual(p({ cfg: cfg({ self_jid: undefined }) }), { ok: false, error: "not_allowlisted" });
   assert.deepEqual(p({ text: "" }), { ok: false, error: "bad_request" });
   assert.deepEqual(p({ text: 7 }), { ok: false, error: "bad_request" });
   assert.deepEqual(p({ cfg: cfg({ enabled: false }) }), { ok: false, error: "off" });
+});
+
+test("prompt text that reads as the manager's reply is refused (M3)", () => {
+  const p = (text) => checkPrompt({ cfg: cfg(), text, sentLines: [], now: NOW });
+  for (const bad of ["ok w3kx", "OK w3kx w9pa", "ok all", "no w3kx", "  ok w3kx  ", "intro\nok w3kx\noutro",
+                     "ok\tw3kx"]) {
+    assert.deepEqual(p(bad), { ok: false, error: "bad_request" }, JSON.stringify(bad));
+  }
+  for (const fine of ['WhatsApp -> Dana: "see you at 3" - reply ok w3kx', "ok w3kx but change it", "okay"]) {
+    assert.deepEqual(p(fine), { ok: true, chat: SELF }, fine);
+  }
 });
 
 test("parseSent: one record per line; a torn or malformed line makes it unreadable", () => {

@@ -11,10 +11,18 @@ Optional. Nothing else in MOTHER depends on Node or on this folder. Node 20 or l
 ## Install
 
 ```bash
-cd "${CLAUDE_PLUGIN_ROOT}/bridge/whatsapp" && npm ci --omit=dev
+cd "${CLAUDE_PLUGIN_ROOT}/bridge/whatsapp" && npm ci --ignore-scripts --omit=dev
 ```
 
 Versions are pinned exactly in `package.json` and `package-lock.json`. `node_modules/` is never committed.
+
+Known risks of the dependency:
+- Baileys is pinned to a **release candidate** (`7.0.0-rc14`, npm's `latest` at the time). It is an
+  unofficial client of the WhatsApp Web protocol and can break when WhatsApp changes it.
+- It has **install scripts** (Baileys' Node-version check, protobufjs' postinstall). They are not needed:
+  `npm ci --ignore-scripts` installs a working bridge (checked on macOS arm64, Node 24), so skip them.
+- It pulls **`sharp`**, which brings prebuilt native binaries (`@img/sharp-darwin-*`, libvips) for image
+  handling the bridge never uses.
 
 ## Run
 
@@ -39,18 +47,28 @@ A Unix socket, mode 0600, no TCP. One JSON request per connection, one JSON repl
 | `{"op": "send", "draft": "<id>"}` | `{"ok": true, "stanza"}` or `{"ok": false, "error"}` |
 | `{"op": "prompt", "text": "…"}` | the same; goes to `whatsapp.self_jid` only |
 
-Before every `send` the bridge checks, in order: sending is on and the workspace isn't PAUSED; the draft's
-chat is in `whatsapp.allow` and isn't the self chat; `approved/<id>.json` exists for this draft and chat;
-`sha256` of the draft text equals both the draft's stored hash and the approval's; not already sent; today's
-`max_per_day` (UTC day of `sent.jsonl`'s `at`); the jittered `min_gap_seconds` since the last message; linked;
-and then `python3 <plugin>/bin/mother whatsapp verify <id>` must exit 0 (it re-proves the yes from the
-evidence the guard recorded). Then it shows "typing…" for `min(8 s, 40 ms × characters)` plus jitter, sends,
-appends one line to `sent.jsonl`, and renames the approval to `.used` (`.failed` if the send threw).
+Before every `send` the bridge checks, in order: `approved/<id>.json` exists (else `no_approval`, nothing
+else happens); sending is on and the workspace isn't PAUSED; the draft's chat is in `whatsapp.allow` and isn't
+the self chat; the approval names this draft and chat; `sha256` of the draft text equals both the draft's
+stored hash and the approval's; not already sent; today's `max_per_day` (UTC day of `sent.jsonl`'s `at`); the
+jittered `min_gap_seconds` since the last message (waited out inside the request when 30 s or less, else
+`gap`); linked; the linked account is `whatsapp.self_jid`; and then `python3 <plugin>/bin/mother whatsapp
+verify <id> --sha256 <hash of the text about to go out>` must exit 0 (it re-proves the yes from the evidence
+the guard recorded, on the path it recorded). Then it shows "typing…" for `min(8 s, 40 ms × characters)` plus
+jitter, sends, and appends one line to `sent.jsonl` (`"stanza": null` if WhatsApp returned no id).
+
+Once the approval file exists, every outcome settles it: `.used` after a send or on `already_sent`,
+`.failed` on any refusal or failure, so a fresh `mother whatsapp send <id>` re-proves the manager's yes.
+If the bridge dies between sending and logging, the approval stays `.json`: the guard then denies a resend
+(the safe side) and the outcome is unrecorded.
+
+A `prompt` must not read as the manager's reply (`ok <id>`, `ok all`, `no <id>` on any line: `bad_request`).
+If its `sent.jsonl` line can't be written it returns `{"ok": false, "error": "log_failed", "stanza",
+"detail"}`: the message went out but isn't recorded as the bridge's own.
 
 Errors: `not_allowlisted`, `no_approval`, `hash_mismatch`, `cap`, `gap`, `unlinked`, plus `no_draft`,
-`already_sent`, `off`, `paused`, `no_workspace`, `send_failed`, `bad_request`, `internal`. A refusal leaves
-`approved/<id>.json` in place (a `gap` or `unlinked` send can be retried); only a send that threw marks it
-`.failed`.
+`already_sent`, `off`, `paused`, `wrong_account`, `no_workspace`, `send_failed`, `log_failed` (prompt only),
+`bad_request`, `internal`.
 
 ## Test
 

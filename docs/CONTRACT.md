@@ -397,7 +397,8 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   prompt, no self-chat proof). A message with an empty stanza id never counts. A yes needs
   `<state>/whatsapp/sent.jsonl` (`{"at", "kind": "send"|"prompt", "chat", "draft"?, "sha256", "stanza"}`) to
   exist and parse: if it is missing, unreadable, or any line is malformed or lacks a stanza id, the self chat
-  proves nothing. When `self_chat` is in `approve_via` and the self chat can't be read from the database, no
+  proves nothing. A well-formed line whose `stanza` is JSON `null` (the bridge got no id back) is skipped.
+  When `self_chat` is in `approve_via` and the self chat can't be read from the database, no
   path proves (a `no` there might be hidden). `slack_dm`: the grant's source channel must be a
   `manager.chat_dm` id (not `manager.chat_user`); with no `chat_dm` the DM path is unavailable. A `no` on any
   enabled path beats a yes: the draft is not sendable. Drafts never go to `whatsapp.self_jid` (`draft` exits 2).
@@ -421,12 +422,14 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   "evidence", "at", "transcript"?}`: path that proved it, evidence key, text hash, and the session transcript
   the guard read when it had one). The bridge checks again: allowlist, approval file whose hash matches the
   draft, daily cap, and the yes itself: before every send it runs `python3 <plugin>/bin/mother whatsapp verify
-  <id>` (no shell) and refuses with `no_approval` unless it exits 0. **`mother whatsapp verify <id>`** is
-  read-only and passes the guard: it loads `approved/<id>.json`, re-runs the proof on the evidence it records
-  (the recorded transcript for `session`, the local database for `self_chat`, the signed grant for `slack_dm`,
-  whose use the guard already consumed), and exits 0 only if a yes is found (no `no` on any path) and the
-  proof's sha256 equals both the approval's and `sha256` of the draft's current text; else exit 1 with the
-  reason on stderr (exit 2 when sending is off, like `draft`). **Approval lifecycle:** the guard
+  <id> --sha256 <hex>` (no shell) and refuses with `no_approval` unless it exits 0. **`mother whatsapp verify
+  <id> [--sha256 <hex>]`** passes the guard and is read-only: it never deletes or changes a file (an expired
+  draft is exit 1 "expired", not removed). It loads `approved/<id>.json`, re-runs the proof **on the path the
+  record names only** with the evidence it records (the recorded transcript for `session`, the local database
+  for `self_chat`, the signed grant for `slack_dm`, whose use the guard already consumed), and exits 0 only if
+  that path holds a yes (and no enabled path a `no`) and the proof's sha256 equals the approval's, `sha256` of
+  the draft's current text, and `--sha256` when given; else exit 1 with the reason on stderr (exit 2 when
+  sending is off, like `draft`). **Approval lifecycle:** the guard
   creates `approved/<id>.json` (exclusive); the bridge renames it to `approved/<id>.used` after a send and to
   `approved/<id>.failed` on a definite failure. `.json` present = in flight (the guard denies another send);
   `.used` = sent (denied for good); `.failed` = a fresh `send` re-proves and approves again. `mother whatsapp
@@ -441,16 +444,24 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "prompts_today"}`;
   `{"op": "send", "draft": "<id>"}` → `{"ok": true, "stanza"}`; `{"op": "prompt", "text"}` → the same, sent
   to `whatsapp.self_jid` only. A refusal is `{"ok": false, "error"}`, one of `not_allowlisted`, `no_approval`,
-  `hash_mismatch`, `cap`, `gap`, `unlinked`, `no_draft`, `already_sent`, `off`, `paused`, `no_workspace`,
-  `send_failed`, `bad_request`, `internal`. Messages go out one at a time. A send needs, in order: sending on,
-  no `PAUSED`; the draft's chat in `whatsapp.allow` and not `self_jid`; `approved/<id>.json` for that id and
-  chat; `sha256(text)` equal to the draft's and the approval's hash; no `sent.jsonl` send of that id and hash;
-  fewer than `max_per_day` sends and (for a prompt) `max_prompts_per_day` prompts on today's UTC date of
-  `at`; at least `min_gap_seconds` × a random 0.7–1.3 (never below `min_gap_seconds`) since the last message
-  of either kind; an unreadable `sent.jsonl` refuses as `cap`; linked; then `mother whatsapp verify <id>`
-  exit 0. It shows "typing…" for `min(8 s, 40 ms × characters)` plus up to 1 s (not for a prompt), sends,
-  appends one `sent.jsonl` line (one `O_APPEND` write, `at` UTC ISO-8601 with `Z`; a prompt has no `draft`),
-  and renames the approval `.used`; a send that throws renames it `.failed`; any refusal leaves it in place.
+  `hash_mismatch`, `cap`, `gap`, `unlinked`, `no_draft`, `already_sent`, `off`, `paused`, `wrong_account`,
+  `no_workspace`, `send_failed`, `log_failed` (prompt only), `bad_request`, `internal`. Messages go out one at
+  a time. A send needs, in order: `approved/<id>.json` exists (else `no_approval` and nothing else); sending
+  on, no `PAUSED`; the draft's chat in `whatsapp.allow` and not `self_jid`; the approval for that id and chat;
+  `sha256(text)` equal to the draft's and the approval's hash; no `sent.jsonl` send of that id and hash; fewer
+  than `max_per_day` sends and (for a prompt) `max_prompts_per_day` prompts on today's UTC date of `at`; at
+  least `min_gap_seconds` × a random 0.7–1.3 (never below `min_gap_seconds`) since the last message of either
+  kind, **waited out inside the request** when 30 s or less, else refused `gap`; an unreadable `sent.jsonl`
+  refuses as `cap`; linked; the linked account (device suffix stripped) equal to `self_jid` (else
+  `wrong_account`, for prompts too); then `mother whatsapp verify <id> --sha256 <hash of the text in memory>`
+  exit 0. It shows "typing…" for `min(8 s, 40 ms × characters)` plus up to 1 s (not for a prompt), sends, and
+  appends one `sent.jsonl` line (one `O_APPEND` write, `at` UTC ISO-8601 with `Z`; a prompt has no `draft`;
+  `"stanza": null` when WhatsApp returned no id). **Once the approval file exists every outcome settles it:**
+  `.used` after a send or on `already_sent`; `.failed` on every refusal or failure (so a fresh `send`
+  re-proves the same yes). A crash between the send and the log line leaves the approval `.json` and the
+  outcome unrecorded; the guard then denies a resend, which is the safe side. A prompt whose text (or any line
+  of it) reads as a reply (`ok <id>…`, `ok all`, `no <id>…`) is `bad_request`; a prompt whose `sent.jsonl`
+  line can't be written returns `log_failed` with its `stanza` and a `detail` saying it went out unlogged.
   Incoming events have no handler: nothing is stored, logged or forwarded. Logs (stderr) carry draft ids,
   stanza ids and error codes only, never text or a JID. Everything it creates is the manager's alone (umask
   077; session files 0600).

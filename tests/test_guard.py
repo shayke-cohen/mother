@@ -1032,6 +1032,7 @@ class TestWhatsapp(WhatsappCase):
                     "mother whatsapp pending < /tmp/dm.json", "mother whatsapp unlink", "mother whatsapp link",
                     "mother whatsapp drop w3kx", "mother whatsapp help", "mother whatsapp",
                     "mother whatsapp verify w3kx", "python3 /opt/plugin/bin/mother whatsapp verify w3kx",
+                    "mother whatsapp verify w3kx --sha256 %s" % ("ab" * 32),
                     "python3 /opt/plugin/bin/mother whatsapp read --since 2026-10-26T08:00:00Z",
                     "mother whatsapp list && mother whatsapp status"):
             self.assertEqual(self.wa(cmd), ("none", ""), cmd)

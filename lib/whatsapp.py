@@ -11,8 +11,9 @@ Commands:
   drop ID                            delete a draft
   pending                            stdin {"dm": [manager DM messages]}: record Slack `ok`/`no` replies, then
                                      print {"send": [ids with a proven yes], "dropped": [ids]}
-  verify ID                          exit 0 only if approved/ID.json still proves a yes for the draft's
-                                     current text (the bridge runs it before every send); else exit 1
+  verify ID [--sha256 HEX]           exit 0 only if approved/ID.json still proves a yes, on the path it
+                                     records, for the draft's current text (and HEX, the hash the bridge is
+                                     about to send); else exit 1. Read-only. The bridge runs it per send
 
 The database is opened read-only (`mode=ro`). The allowlist is applied in SQL, so rows from other chats are
 never fetched. Nothing is copied to disk. Python 3.9 stdlib only.
@@ -270,8 +271,9 @@ def new_draft(ws: Path, cfg: dict, chat: str, text: str, run: str = None) -> dic
     return d
 
 
-def load_draft(ws: Path, draft_id: str):
-    """The draft, or None when missing, unreadable or older than 72 hours (an expired file is removed)."""
+def load_draft(ws: Path, draft_id: str, expire: bool = True):
+    """The draft, or None when missing, unreadable or older than 72 hours (an expired file is removed, unless
+    `expire` is False: the proof and `verify` only read)."""
     if not ID_RE.match(draft_id or ""):
         return None
     path = _drafts_dir(ws) / (draft_id + ".json")
@@ -280,6 +282,8 @@ def load_draft(ws: Path, draft_id: str):
     except (OSError, ValueError):
         return None
     if not isinstance(d, dict) or _expired(d):
+        if not expire:
+            return None
         try:
             path.unlink()
         except OSError:
@@ -403,7 +407,8 @@ def resolve_all(ws: Path, path: str, at: float) -> list:
 
 def _bridge_stanzas():
     """Stanza ids the bridge sent (sent.jsonl), or None when that can't be told: the file is missing or
-    unreadable, or any line is malformed or lacks a stanza id."""
+    unreadable, or any line is malformed or lacks a stanza id. A line whose stanza is JSON null (WhatsApp
+    returned no id) is well-formed and skipped: there is no id to recognise, and it must not shut the path."""
     p = _state_dir() / "whatsapp" / "sent.jsonl"
     try:
         with open(str(p), encoding="utf-8") as f:
@@ -418,6 +423,8 @@ def _bridge_stanzas():
             r = json.loads(line)
         except ValueError:
             return None
+        if isinstance(r, dict) and "stanza" in r and r["stanza"] is None:
+            continue
         if not isinstance(r, dict) or not isinstance(r.get("stanza"), str) or not r["stanza"].strip():
             return None
         out.add(r["stanza"])
@@ -432,7 +439,7 @@ class _Case(object):
         self.now = time.time() if now is None else now
         self.via = approve_via(cfg)
         self.ok = False
-        d = load_draft(ws, draft_id)
+        d = load_draft(ws, draft_id, expire=False)  # a proof only reads
         self.created = _epoch((d or {}).get("created"))
         if not d or self.created is None or d.get("id") != draft_id or not isinstance(d.get("text"), str):
             return
@@ -525,7 +532,10 @@ def _slack_hit(c):
     return None
 
 
-def _hit(word, c):
+def _hit(word, c, only=None):
+    """The first proof of `word` on an enabled path (only that path when `only` is given)."""
+    if only is not None:
+        c = _Only(c, only)
     if "session" in c.via:
         ev = _session_hit(word, c)
         if ev:
@@ -541,6 +551,14 @@ def _hit(word, c):
     return None
 
 
+class _Only(object):
+    """A case seen through one approval path: same draft, `via` narrowed to that path if it is enabled."""
+
+    def __init__(self, c, path):
+        self.__dict__.update(c.__dict__)
+        self.via = [path] if path in c.via else []
+
+
 def rejected(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None) -> bool:
     """True when the manager said `no` to this draft on an enabled path (session or self chat)."""
     try:
@@ -550,15 +568,15 @@ def rejected(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None)
         return False
 
 
-def prove(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None):
-    """{"path", "evidence", "sha256"} for the manager's yes to this draft's current text on an enabled path,
-    else None. Fails closed: any error, a missing, expired or altered draft, an unreadable self chat (when
-    that path is on), or a `no` on any path means None."""
+def prove(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None, path=None):
+    """{"path", "evidence", "sha256"} for the manager's yes to this draft's current text on an enabled path
+    (only on `path` when given), else None. Fails closed: any error, a missing, expired or altered draft, an
+    unreadable self chat (when that path is on), or a `no` on any enabled path means None. Writes nothing."""
     try:
         c = _Case(ws, cfg, draft_id, transcript_path, now)
         if not c.ok or _hit("no", c):
             return None
-        got = _hit("ok", c)
+        got = _hit("ok", c, only=path)
         if got:
             got["sha256"] = c.sha
         return got
@@ -566,11 +584,13 @@ def prove(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None):
         return None
 
 
-def verify(ws: Path, cfg: dict, draft_id: str):
+def verify(ws: Path, cfg: dict, draft_id: str, sha: str = None):
     """(True, why) when approved/<id>.json still stands: prove() run again on the evidence it records (the
-    transcript the guard read, the self chat, the signed DM grant) finds a yes for the draft's current text,
-    and that text's sha256 equals both the draft's stored hash and the approval's. Else (False, reason).
-    Read-only; the bridge runs it before every send."""
+    transcript the guard read, the self chat, the signed DM grant), on the path it records only, finds a yes
+    for the draft's current text, and that text's sha256 equals the draft's stored hash, the approval's, and
+    `sha` (the hash of the bytes the bridge is about to send) when given. Else (False, reason).
+    Read-only: it never deletes or changes a file, an expired draft included. The bridge runs it before every
+    send."""
     if not isinstance(draft_id, str) or not ID_RE.match(draft_id):
         return False, "%s: not a draft id" % draft_id
     p = Path(ws) / ".mother" / "whatsapp" / "approved" / (draft_id + ".json")
@@ -581,17 +601,25 @@ def verify(ws: Path, cfg: dict, draft_id: str):
     if not isinstance(rec, dict) or rec.get("id") != draft_id or rec.get("path") not in PATHS \
             or not isinstance(rec.get("sha256"), str):
         return False, "%s: malformed approval record" % draft_id
-    d = load_draft(ws, draft_id)
-    if not d or not isinstance(d.get("text"), str):
-        return False, "%s: no open draft (missing or expired)" % draft_id
+    if sha is not None and (not isinstance(sha, str) or not re.match(r"^[0-9a-f]{64}$", sha)):
+        return False, "%s: --sha256 must be 64 hex characters" % draft_id
+    try:
+        d = json.loads((_drafts_dir(ws) / (draft_id + ".json")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        d = None
+    if not isinstance(d, dict) or not isinstance(d.get("text"), str):
+        return False, "%s: no open draft" % draft_id
+    if _expired(d):
+        return False, "%s: the draft expired" % draft_id
     if rec.get("chat") != d.get("chat"):
         return False, "%s: the approval names another chat" % draft_id
-    sha = hashlib.sha256(d["text"].encode("utf-8")).hexdigest()
     transcript = rec.get("transcript") if isinstance(rec.get("transcript"), str) else None
-    proof = prove(ws, cfg, draft_id, transcript_path=transcript)
+    proof = prove(ws, cfg, draft_id, transcript_path=transcript, path=rec["path"])
     if not proof:
-        return False, "%s: no proven yes on re-check" % draft_id
-    if not (proof.get("sha256") == rec["sha256"] == d.get("sha256") == sha):
+        return False, "%s: no proven yes via %s on re-check" % (draft_id, rec["path"])
+    text_sha = hashlib.sha256(d["text"].encode("utf-8")).hexdigest()
+    if not (proof.get("sha256") == rec["sha256"] == d.get("sha256") == text_sha) \
+            or (sha is not None and sha != text_sha):
         return False, "%s: text hash differs between draft, approval and proof" % draft_id
     return True, "%s: verified via %s" % (draft_id, proof["path"])
 
@@ -862,9 +890,14 @@ def cmd_drop(cfg, args, ws):
 
 
 def cmd_verify(cfg, args, ws):
-    if len(args) != 1:
-        _fail("usage: mother whatsapp verify ID")
-    ok, why = verify(ws, cfg, args[0])
+    usage = "usage: mother whatsapp verify ID [--sha256 HEX]"
+    if len(args) == 3 and args[1] == "--sha256":
+        sha = args[2]
+    elif len(args) == 1:
+        sha = None
+    else:
+        _fail(usage)
+    ok, why = verify(ws, cfg, args[0], sha)
     if not ok:
         _fail("verify %s" % why)
     print(why)
