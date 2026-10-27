@@ -120,6 +120,43 @@ def _tick_hours(active):
     return (a, b) if a < b else None
 
 
+def _manager_tz(cfg: dict):
+    """manager.timezone as a tzinfo; UTC when unset or unknown (validate reports a bad zone elsewhere)."""
+    from zoneinfo import ZoneInfo
+    try:
+        return ZoneInfo((cfg.get("manager") or {}).get("timezone") or "UTC")
+    except Exception:
+        return _dt.timezone.utc
+
+
+def _tick_offset(cfg: dict, now: _dt.datetime) -> int:
+    """Minutes to add to a manager.timezone clock time to get this machine's clock time, at today's offsets."""
+    tz = _manager_tz(cfg)
+    day = now.astimezone(tz).date()
+    noon = _dt.datetime(day.year, day.month, day.day, 12, tzinfo=tz)
+    return int((noon.astimezone().utcoffset() - noon.utcoffset()).total_seconds() // 60)
+
+
+def _tick_slots(every: int, a: int, b: int) -> list:
+    """Tick slots in minutes since midnight, manager time: :05 (and :35 for 30-minute) of each step hour."""
+    return [h * 60 + m for h in range(a // 60, -(-b // 60), max(1, every // 60))
+            for m in ((5, 35) if every == 30 else (5,))]
+
+
+TICK_MIDNIGHT = ("routines.tick.active_hours crosses midnight in this machine's time zone; narrow active_hours, "
+                 "or run tick on a machine whose time zone is nearer manager.timezone")
+
+
+def _tick_crosses_midnight(r: dict, cfg: dict, now: _dt.datetime) -> bool:
+    hours = _tick_hours(r.get("active_hours", "06:00-22:00"))
+    every = r.get("every", 60)
+    if hours is None or every not in TICK_EVERY:
+        return False
+    d = _tick_offset(cfg, now)
+    slots = _tick_slots(every, *hours)
+    return min([hours[0]] + slots) + d < 0 or max(hours[1], max(slots) + 1) + d > 24 * 60
+
+
 def validate(cfg: dict) -> list:
     errs = []
     def need(obj, key, typ, where):
@@ -245,6 +282,8 @@ def validate(cfg: dict) -> list:
                 se = r.get("slow_every")
                 if se is not None and (not isinstance(se, int) or isinstance(se, bool) or not 1 <= se <= 6):
                     errs.append("routines.tick.slow_every must be an integer 1-6")
+                if _tick_crosses_midnight(r, cfg, _now()):
+                    errs.append(TICK_MIDNIGHT)
             if rid == "commitments":
                 for k, lo, hi in (("no_reply_days", 1, 30), ("lookback_days", 1, 60)):
                     v = r.get(k)
@@ -382,6 +421,26 @@ def cmd_join(args):
 
 # ---------------------------------------------------------------- sync
 
+def _only_tick_runs(ws: Path) -> bool:
+    """True when the only change in the workspace is runs.md lines appended by the tick routine.
+    The hourly tick ends through the Stop/SessionEnd hooks' `sync --quiet`; committing for those lines alone
+    would add a commit and a push every hour. The next non-tick sync carries them."""
+    if git(ws, "status", "--porcelain", "--untracked-files=all").stdout.splitlines() != [" M runs.md"]:
+        return False
+    diff = git(ws, "diff", "--no-color", "--unified=0", "--", "runs.md").stdout.splitlines()
+    added = 0
+    for line in diff:
+        if line.startswith(("diff ", "index ", "--- ", "+++ ", "@@")):
+            continue
+        if not line.startswith("+"):
+            return False                       # a removed or changed line: not a plain append
+        m = RUN_LINE.match(line[1:].strip())
+        if not m or m.group(2) != "tick":
+            return False
+        added += 1
+    return added > 0
+
+
 def cmd_sync(args):
     quiet = "--quiet" in args
     def say(m):
@@ -391,6 +450,7 @@ def cmd_sync(args):
         print(f"mother sync: {m}", file=sys.stderr)
     if os.environ.get("MOTHER_NO_SYNC"):
         return  # a channel reply session: the loop's own session syncs, and parallel syncs collide on git
+    ws, tick_only = None, False
     try:
         ws = workspace(required=False)
         if not ws or not (ws / ".git").exists():
@@ -406,6 +466,9 @@ def cmd_sync(args):
         if (ws / "QUARANTINE.md").exists():
             warn("QUARANTINE.md present — not committing until it is resolved and deleted")
             return
+        if quiet and _only_tick_runs(ws):
+            tick_only = True
+            return                             # the hook path after a tick: no hourly commit or push
         if git(ws, "status", "--porcelain").stdout.strip():
             hits = scan_files(changed_files(ws))
             if hits:
@@ -446,7 +509,7 @@ def cmd_sync(args):
         warn("push still rejected after 3 tries; work is safe locally")
     finally:
         try:
-            if ws and (ws / ".mother").is_dir():
+            if ws and not tick_only and (ws / ".mother").is_dir():
                 (ws / ".mother" / "last-sync").write_text(now_iso() + "\n")
         except Exception:
             pass
@@ -582,12 +645,17 @@ def _cron(at: str, days, workdays) -> str:
     return f"{int(mm)} {int(hh)} * * {dow}"
 
 
-def _interval_cron(every: int, active: str, days, workdays) -> str:
-    """Cron for an interval routine: slots at minute :05 (and :35 for 30-minute), hourly steps inside active hours."""
+def _interval_cron(every: int, active: str, days, workdays, offset: int = 0) -> str:
+    """Cron for an interval routine: slots at minute :05 (and :35 for 30-minute) of manager.timezone, hourly
+    steps inside active hours, moved by `offset` minutes into the machine's clock (cron runs in machine time).
+    A half-hour offset moves :05 to :35. The caller has refused a window that crosses machine midnight."""
     a, b = _tick_hours(active)
-    hours = list(range(a // 60, -(-b // 60), max(1, every // 60)))
-    hh = f"{hours[0]}-{hours[-1]}" if len(hours) > 1 and every <= 60 else ",".join(str(h) for h in hours)
-    return f"{'5,35' if every == 30 else '5'} {hh} " + _cron("00:00", days, workdays).split(" ", 2)[2]
+    local = [x + offset for x in _tick_slots(every, a, b)]
+    mins = sorted({x % 60 for x in local})
+    hours = sorted({x // 60 for x in local})
+    run = hours == list(range(hours[0], hours[-1] + 1))
+    hh = f"{hours[0]}-{hours[-1]}" if len(hours) > 1 and every <= 60 and run else ",".join(str(h) for h in hours)
+    return f"{','.join(str(m) for m in mins)} {hh} " + _cron("00:00", days, workdays).split(" ", 2)[2]
 
 
 def _pointer(ws: Path, rid: str, team: str = None, pull: bool = True) -> str:
@@ -603,6 +671,8 @@ def cmd_register(args):
     ws = workspace()
     cfg = load_config(ws)
     errs = validate(cfg)
+    if TICK_MIDNIGHT in errs:
+        die(TICK_MIDNIGHT)
     if errs:
         die("config invalid — run `mother status`")
     workdays = (cfg.get("manager") or {}).get("workdays") or DAYS[:5]
@@ -611,7 +681,7 @@ def cmd_register(args):
         if rid == "tick" and isinstance(r, dict):
             every, active = r.get("every", 60), r.get("active_hours", "06:00-22:00")
             tasks.append({"taskId": "mother-tick", "title": f"Mother: tick (every {every} min, {active})",
-                          "cronExpression": _interval_cron(every, active, r.get("days"), workdays),
+                          "cronExpression": _interval_cron(every, active, r.get("days"), workdays, _tick_offset(cfg, _now())),
                           "prompt": _pointer(ws, "tick", pull=False)})
             continue
         if rid == "meeting" or not isinstance(r, dict) or "at" not in r:
@@ -693,8 +763,9 @@ def _log_start(ws: Path, runs: dict):
     return min(times) if times else None
 
 
-def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime) -> dict:
-    """Tick row. Missed only inside active hours on a scheduled day, 2x every after the day's first slot, with no run in 2x every."""
+def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime, cfg: dict = None) -> dict:
+    """Tick row. Missed only inside active hours on a scheduled day, 2x every after the day's first slot, with no run in 2x every.
+    Judged in manager.timezone, the clock lib/now.py and the dispatcher's active-hours gate use."""
     every = r.get("every", 60)
     hours = _tick_hours(r.get("active_hours", "06:00-22:00"))
     days = r.get("days")
@@ -703,7 +774,7 @@ def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime) -> dic
         return {"id": "tick", "state": "failed", "expected": None, "last": None, "last_status": None,
                 "note": "invalid tick config — run mother status"}
     a, b = hours
-    local = now.astimezone()
+    local = now.astimezone(_manager_tz(cfg or {}))
     want = workdays if days in (None, "workdays") else DAYS if days == "all" else [days] if isinstance(days, str) else days
     mins = local.hour * 60 + local.minute
     window = _dt.timedelta(minutes=2 * every)
@@ -712,8 +783,7 @@ def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime) -> dic
     first_slot = (a // 60) * 60 + 5 if a % 60 <= 5 else a
     expected = None
     if DAYS[local.weekday()] in want and mins >= a:
-        steps = [h * 60 + m for h in range(a // 60, -(-b // 60), max(1, every // 60))
-                 for m in ((5, 35) if every == 30 else (5,)) if a <= h * 60 + m < b]
+        steps = [x for x in _tick_slots(every, a, b) if a <= x < b]
         past = [x for x in steps if x <= mins]
         if past:
             expected = (local.replace(hour=past[-1] // 60, minute=past[-1] % 60, second=0, microsecond=0)).astimezone(_dt.timezone.utc)
@@ -740,7 +810,7 @@ def routine_health(ws: Path, cfg: dict) -> list:
     rows = []
     for rid, r in (cfg.get("routines") or {}).items():
         if rid == "tick" and isinstance(r, dict):
-            rows.append(_tick_health(r, runs, start, workdays, now))
+            rows.append(_tick_health(r, runs, start, workdays, now, cfg))
             continue
         if not isinstance(r, dict) or "at" not in r:
             continue

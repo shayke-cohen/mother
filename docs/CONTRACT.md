@@ -18,6 +18,9 @@ lib/                       channels.py (§5b), items.py (reader evidence check),
 assets/deck/               meeting deck template.html + build.py
 rules/                     default policy text skills cite: outbound.md, privacy.md, memory.md, todos.md, projects.md, teams.md
 templates/workspace/       files `mother init` copies into a new workspace
+mods/now/                  the Now panel, a second plugin in the same marketplace (`/plugin install mother-now@mother`):
+                           .claude-plugin/plugin.json (userConfig `mother_bin`), hooks/register.tsx (+ tests), types/index.d.ts;
+                           reads `.mother/now.json`, writes only through `mother now done|snooze|top`, no network or MCP calls
 tests/                     stdlib unittest; `python3 -m unittest discover tests`
 ```
 
@@ -38,7 +41,7 @@ journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for co
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
 .mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs),
                            now.json (the tick's Now list: items, Top 3, coverage; ids and links, no message bodies, no per-person counts),
-                           now-state.json (the manager's done/snooze/Top 3 edits and which toasts fired), now.lock (serialises both); all written atomically. Each item's `actions[]` is `{id (S<n>), label, prompt, task}`: `prompt` is always `mother now do <id>` (what the panel pastes); `task` is the routine's original instruction (`dots do A3`, `digest ok 12`, `draft a nudge to …`) that `mother now do` prints for the `mother:now` skill. Top 3 entries are `{rank, title, why, link, item_id, set_by (agent|manager), set_at, state}`: `set_at` is the ISO time the list was set (the tick's `generated_at` when it first proposed it, carried on later ticks; the edit time for `mother now top set|swap|done`, kept as `at` in now-state.json). `swap_hint` is null or `{title, why, link, item_id?}`; merge keeps `item_id` only when it names an item of this run, else takes the one item with the same `link`, else drops it (the hint stays)
+                           now-state.json (the manager's done/snooze/Top 3 edits), now.lock (serialises both); all written atomically. Each item's `actions[]` is `{id (S<n>), label, prompt, task}`: `prompt` is always `mother now do <id>` (what the panel pastes); `task` is the routine's original instruction (`dots do A3`, `digest ok 12`, `draft a nudge to …`) that `mother now do` prints for the `mother:now` skill. Top 3 entries are `{rank, title, why, link, item_id, set_by (agent|manager), set_at, state}`: `set_at` is the ISO time the list was set (the tick's `generated_at` when it first proposed it, carried on later ticks; the edit time for `mother now top set|swap`, kept as `at` in now-state.json). Only `top set` and `top swap` make the list the manager's (`set_by: manager` on every entry, and no swap hint); `top done` marks one entry done and keeps every entry's `set_by` and `set_at`, so an agent list stays the agent's (its swap hint too). The tick sends a fresh proposal on the first tick of each local day; merge ignores it while a manager list for today exists. Which toasts fired is per-device, in the mod's store (`toasted`, keyed `<item id>@<first_seen>`, so an item asked for again toasts again), not in the workspace. `swap_hint` is null or `{title, why, link, item_id?}`; merge keeps `item_id` only when it names an item of this run, else takes the one item with the same `link`, else drops it (the hint stays)
 ```
 
 ## 2. Finding each other
@@ -51,15 +54,24 @@ runs.md                    one line per routine run: `- <ISO> <routine> <ok|part
   `<id>`. Behaviour lives in `routines/<id>.md`.
 - `mother register` prints `{"home_machine": …, "tasks": [{taskId, title, cronExpression, prompt}]}`. Crons are
   in the **machine's local time** (the scheduler's convention); setup warns when that differs from
-  `manager.timezone`.
-- **Interval routines** (only `tick`) have `every` (minutes) and `active_hours` instead of `at`. `mother register`
-  emits a cron with slots at minute :05 (and :35 for `every: 30`), one per `every` inside `active_hours`
-  (`5 6-21 * * 1,2,3,4,5` for the defaults), in the machine's local time. `mother runs` judges `tick` missed only
-  inside active hours on a scheduled day, once 2x `every` has passed after the day's first slot with no `runs.md`
-  line in 2x `every`.
+  `manager.timezone`, and converts `at` times by hand.
+- **Interval routines** (only `tick`) have `every` (minutes) and `active_hours` instead of `at`. Their slots are
+  minute :05 (and :35 for `every: 30`) of each step hour inside `active_hours`, in **`manager.timezone`** — the
+  clock `lib/now.py`, the dispatcher's active-hours gate and `mother runs` all use. `mother register` converts
+  them to the machine's clock with today's offset between the two zones, minute included (a half-hour offset
+  turns :05 into :35): `5 6-21 * * 1,2,3,4,5` for the defaults when the zones agree, `35 11-22 …` for
+  `06:00-18:00` in London on a +05:30 machine. With `every: 30` and a half-hour offset the cron can fire once
+  more at either end; the dispatcher skips that fire as outside active hours. A window that would cross the
+  machine's midnight fails `mother register` and `mother status` with `routines.tick.active_hours crosses
+  midnight in this machine's time zone; …` (days are never shifted). Re-register after a DST change that moves
+  the offset. `mother runs` judges `tick` in `manager.timezone`: missed only inside active hours on a
+  scheduled day, once 2x `every` has passed after the day's first slot with no `runs.md` line in 2x `every`.
 - A routine whose frontmatter says `sync: false` (`tick`) is machine-local: its pointer **omits** the
   `git pull --rebase` (`_pointer(…, pull=False)`: just `cd "<workspace>"`, then the mother:routine skill), and
-  the dispatcher skips the final `mother sync`.
+  the dispatcher skips the final `mother sync`. The Stop/SessionEnd hooks' `mother sync --quiet` still runs when
+  that session ends, so it skips the commit and push when the only change in the workspace is `runs.md` lines
+  appended for routine `tick`; the next sync with anything else (or any `mother sync` without `--quiet`) carries
+  them.
 - Routine files start with frontmatter: `id`, `needs` (capabilities, e.g. `[chat.read, tracker.read]`) and
   `team_scoped`. The dispatcher pre-marks a run `partial` when a needed capability isn't `ok`.
 
@@ -248,6 +260,8 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 
 ## 6. Sync (`bin/mother sync`)
 
+- `--quiet` (the hook path) with nothing changed but appended `tick` lines in `runs.md` → no commit, no push,
+  `last-sync` untouched (§2).
 - No remote → commit locally only. Remote → `git add -A`, run `mother scan` (abort the whole commit and write
   `QUARANTINE.md` on any secret hit), commit `chore(sync): <ISO>`, `pull --rebase`, push; retry ×3 on reject;
   stop on conflict and say so. Never force-push.

@@ -31,6 +31,8 @@ class CliTest(unittest.TestCase):
             "MOTHER_HOSTNAME": "laptop-a",
             "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
             "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com",
+            # The machine clock matches the template's manager.timezone unless a test says otherwise.
+            "TZ": "Europe/London",
         })
         self.ws = self.t / "ws"
 
@@ -255,6 +257,55 @@ class CliTest(unittest.TestCase):
         (self.ws / "memory" / "leak.md").unlink()
         run(["sync"], self.env)
         self.assertEqual(git(self.ws, "rev-parse", "HEAD").stdout, before)
+
+    def _tick_sync_setup(self):
+        remote = self.t / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        self.init("--remote", str(remote))
+        self.assertEqual(run(["sync"], self.env).returncode, 0)
+        return remote
+
+    def test_quiet_sync_skips_commit_and_push_for_tick_runs_lines_alone(self):
+        remote = self._tick_sync_setup()
+        head, pushed = git(self.ws, "rev-parse", "HEAD").stdout, git(remote, "rev-parse", "main").stdout
+        last_sync = (self.ws / ".mother/last-sync").read_text()
+        runs = self.ws / "runs.md"
+        with runs.open("a") as f:
+            f.write("- 2026-10-27T09:05:00Z tick ok — 1 on you (1 new), 0 neglected, 0 suggestions; couldn't check: none · slow\n")
+            f.write("- 2026-10-27T10:05:00Z tick partial — 1 on you (0 new), 0 neglected, 0 suggestions; couldn't check: tracker · fast\n")
+        r = run(["sync", "--quiet"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(git(self.ws, "rev-parse", "HEAD").stdout, head)
+        self.assertEqual(git(remote, "rev-parse", "main").stdout, pushed)
+        self.assertIn("M runs.md", git(self.ws, "status", "--porcelain").stdout)
+        self.assertEqual((self.ws / ".mother/last-sync").read_text(), last_sync)
+        # an explicit sync is unchanged: it commits and pushes the tick lines
+        self.assertEqual(run(["sync"], self.env).returncode, 0)
+        self.assertNotEqual(git(self.ws, "rev-parse", "HEAD").stdout, head)
+        self.assertIn("tick ok", git(remote, "show", "main:runs.md").stdout)
+
+    def test_quiet_sync_commits_when_anything_but_tick_lines_changed(self):
+        runs = self.ws / "runs.md"
+
+        def append(text):
+            with runs.open("a") as f:
+                f.write(text)
+        cases = [
+            ("brief line", lambda: append("- 2026-10-27T07:00:00Z brief ok — x\n")),
+            ("other file", lambda: (append("- 2026-10-27T09:05:00Z tick ok — x · fast\n"),
+                                    (self.ws / "memory" / "n.md").write_text("note\n"))),
+            ("edited line", lambda: runs.write_text("- 2026-10-27T09:05:00Z tick ok — x · fast\n")),
+        ]
+        remote = self._tick_sync_setup()
+        append("- 2026-10-26T07:00:00Z brief ok — seed\n")
+        self.assertEqual(run(["sync"], self.env).returncode, 0)
+        for name, change in cases:
+            head = git(self.ws, "rev-parse", "HEAD").stdout
+            change()
+            self.assertEqual(run(["sync", "--quiet"], self.env).returncode, 0, name)
+            self.assertNotEqual(git(self.ws, "rev-parse", "HEAD").stdout, head, name)
+            self.assertEqual(git(self.ws, "status", "--porcelain").stdout.strip(), "", name)
+            self.assertEqual(git(remote, "rev-parse", "main").stdout, git(self.ws, "rev-parse", "HEAD").stdout, name)
 
     def test_sync_without_workspace_is_silent_success(self):
         r = run(["sync", "--quiet"], self.env)
@@ -522,6 +573,48 @@ class CliTest(unittest.TestCase):
         by_id = {t["taskId"]: t for t in json.loads(run(["register"], self.env).stdout)["tasks"]}
         self.assertEqual(by_id["mother-tick"]["cronExpression"], "5,35 6-21 * * 1,2,3,4,5")
 
+    def test_register_tick_converts_manager_hours_to_machine_time(self):
+        self.init()
+        cfg = self.write_config()
+        pin = {"MOTHER_NOW": "2026-10-27T09:00:00Z"}   # London is on GMT; Kolkata is +05:30 all year
+
+        def cron(tz, tick):
+            cfg["routines"]["tick"] = dict(cfg["routines"]["tick"], **tick)
+            (self.ws / "config.json").write_text(json.dumps(cfg))
+            r = run(["register"], dict(self.env, TZ=tz, **pin))
+            return r, (json.loads(r.stdout)["tasks"] if r.returncode == 0 else None)
+        for tz, tick, want in (("UTC", {"active_hours": "06:00-22:00"}, "5 6-21 * * 1,2,3,4,5"),
+                               ("Asia/Kolkata", {"active_hours": "06:00-18:00"}, "35 11-22 * * 1,2,3,4,5"),
+                               ("Asia/Kolkata", {"active_hours": "06:00-18:00", "every": 30}, "5,35 11-23 * * 1,2,3,4,5"),
+                               ("America/New_York", {"active_hours": "06:00-22:00", "every": 120}, "5 2,4,6,8,10,12,14,16 * * 1,2,3,4,5")):
+            r, tasks = cron(tz, tick)
+            self.assertEqual(r.returncode, 0, (tz, tick, r.stderr))
+            self.assertEqual({t["taskId"]: t for t in tasks}["mother-tick"]["cronExpression"], want, (tz, tick))
+        r, _ = cron("Asia/Kolkata", {"active_hours": "06:00-22:00", "every": 60})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("routines.tick.active_hours crosses midnight in this machine's time zone", r.stderr)
+        r = run(["status"], dict(self.env, TZ="Asia/Kolkata", **pin))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("routines.tick.active_hours crosses midnight in this machine's time zone", r.stdout + r.stderr)
+
+    def test_runs_tick_judged_in_manager_timezone(self):
+        self.init()
+        self.write_config()                              # manager in Europe/London, GMT on these dates
+        env = dict(self.env, TZ="Asia/Kolkata")          # the machine is 5:30 ahead
+
+        def row(now, lines):
+            (self.ws / "runs.md").write_text(lines)
+            r = run(["runs", "--json"], dict(env, MOTHER_NOW=now))
+            return {x["id"]: x for x in json.loads(r.stdout)}["tick"]
+        r = row("2026-10-26T10:30:00Z", "- 2026-10-26T09:05:00Z tick ok — 0 new\n")
+        self.assertEqual((r["state"], r["expected"]), ("ok", "2026-10-26T10:05Z"))
+        r = row("2026-10-26T10:30:00Z", "- 2026-10-26T08:05:00Z tick ok — 0 new\n")
+        self.assertEqual(r["state"], "missed")
+        r = row("2026-10-26T21:30:00Z", "- 2026-10-26T21:05:00Z tick ok — 0 new\n")   # 03:00 next day on the machine
+        self.assertEqual((r["state"], r["expected"]), ("ok", "2026-10-26T21:05Z"))
+        r = row("2026-10-26T05:30:00Z", "- 2026-10-23T21:05:00Z tick ok\n")          # 11:00 on the machine, 05:30 London
+        self.assertEqual((r["state"], r["expected"]), ("ok", None))
+
     def test_runs_tick_invalid_config_does_not_crash(self):
         self.init()
         cfg = self.write_config()
@@ -569,6 +662,10 @@ class CliTest(unittest.TestCase):
         self.assertIn("manager.chat_dm", lines["sends"])
         self.assertIn("slow_every", text)
         self.assertEqual(lines["config"].split("#")[0].strip(), "routines.tick")
+        self.assertNotIn("journal/digest/", text)                      # the queue lives in intake.md
+        self.assertIn("teams/<slug>/intake.md", text)
+        self.assertIn("**containing** ` · slow`", text)
+        self.assertIn("latest `journal/dots/` file", text)
         disp = (Path(__file__).resolve().parent.parent / "skills" / "routine" / "SKILL.md").read_text()
         self.assertIn("sync: false", disp)
         self.assertIn("skipped — outside active hours", disp)
