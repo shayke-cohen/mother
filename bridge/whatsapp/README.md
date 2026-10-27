@@ -37,6 +37,11 @@ Known risks of the dependency:
 outside the workspace, never synced. The agent never runs these directly or talks to the socket: it goes
 through `mother whatsapp …`, and the guard denies anything else that touches the socket or the state.
 
+Normally nobody starts it by hand: `mother whatsapp send|prompt` start `node bridge.mjs` detached (log in
+`<state>/whatsapp/bridge.log`, ids and codes only) when the socket is missing or refuses, and the bridge exits
+by itself after 30 minutes with no request (`MOTHER_BRIDGE_IDLE_MS` overrides it, in ms; the socket is removed).
+`mother whatsapp link|unlink` run `--link|--unlink` in your terminal.
+
 ## Protocol
 
 A Unix socket, mode 0600, no TCP. One JSON request per connection, one JSON reply, each ending in a newline.

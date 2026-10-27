@@ -66,7 +66,7 @@ const errCode = (e) => String((e && (e.code || e.output?.statusCode || e.name)) 
  * The request handler and socket server, independent of WhatsApp: `client` is anything with
  * linked(), me(), presence(jid, "composing"|"paused"), sendText(jid, text) -> stanza id.
  */
-export function createBridge({ env = process.env, client, verify = (id, hash) => verifyWithCli(id, { env, sha256: hash }),
+export function createBridge({ env = process.env, client, onActivity = () => {}, verify = (id, hash) => verifyWithCli(id, { env, sha256: hash }),
                                now = Date.now, rand = Math.random,
                                sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = defaultLog }) {
   const loc = locations(env);
@@ -237,6 +237,7 @@ export function createBridge({ env = process.env, client, verify = (id, hash) =>
   function onConnection(conn) {
     let buf = "";
     let done = false;
+    onActivity();
     conn.setEncoding("utf8");
     conn.setTimeout(REQUEST_TIMEOUT_MS, () => { if (!done) conn.destroy(); });
     const answer = async () => {
@@ -257,6 +258,7 @@ export function createBridge({ env = process.env, client, verify = (id, hash) =>
         reply = fail("internal");
       }
       if (!conn.destroyed) conn.end(JSON.stringify(reply) + "\n");
+      onActivity();
     };
     conn.on("data", (chunk) => {
       buf += chunk;
@@ -432,18 +434,48 @@ async function runUnlink(loc) {
   return 0;
 }
 
+export const IDLE_MS = 30 * 60_000;  // exit after this long with no request; `mother whatsapp` restarts it on demand
+
+/** Idle timeout in ms: $MOTHER_BRIDGE_IDLE_MS when it is a positive number (tests), else 30 minutes. */
+export function idleMs(env = process.env) {
+  const n = Number(env.MOTHER_BRIDGE_IDLE_MS);
+  return Number.isFinite(n) && n > 0 ? n : IDLE_MS;
+}
+
+/**
+ * Serve on loc.sock until SIGINT/SIGTERM or `ms` without a request, then close the client and the socket and
+ * call `exit(0)`. `client` is the WhatsApp client (anything with close()); the socket file is removed on exit.
+ */
+export async function serve({ client, loc, ms = idleMs(), exit = (c) => process.exit(c), signals = true,
+                              env = process.env }) {
+  let last = Date.now();
+  const bridge = createBridge({ env, client, onActivity: () => { last = Date.now(); } });
+  const server = await bridge.listen(loc.sock);
+  let timer = null;
+  const stop = () => {
+    if (timer) clearInterval(timer);
+    try { client.close(); } catch { /* already closed */ }
+    server.close();
+    try { fs.unlinkSync(loc.sock); } catch { /* gone */ }
+    exit(0);
+  };
+  timer = setInterval(() => {
+    if (Date.now() - last >= ms) {
+      defaultLog({ op: "idle_exit" });
+      stop();
+    }
+  }, Math.max(20, Math.min(30_000, Math.floor(ms / 4))));
+  if (signals) {
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+  }
+  return { server, stop };
+}
+
 async function runServe(loc) {
   const client = await connectWhatsApp({ sessionDir: loc.session, mode: "serve" });
   if (!client.paired) defaultLog({ op: "connection", state: "unlinked" });
-  const server = await createBridge({ client }).listen(loc.sock);
-  const stop = () => {
-    client.close();
-    server.close();
-    try { fs.unlinkSync(loc.sock); } catch { /* gone */ }
-    process.exit(0);
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  await serve({ client, loc });
   return new Promise(() => {});
 }
 

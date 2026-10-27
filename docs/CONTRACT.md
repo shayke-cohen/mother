@@ -465,13 +465,44 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   Incoming events have no handler: nothing is stored, logged or forwarded. Logs (stderr) carry draft ids,
   stanza ids and error codes only, never text or a JID. Everything it creates is the manager's alone (umask
   077; session files 0600).
+- **Commands that talk to the bridge** (all refuse off the home machine except `status`; `send` and `prompt` exit 2
+  "whatsapp sending is off" when `enabled` or `send` is false). The client is `whatsapp.bridge_call(req,
+  timeout=None, start=True)`: it never raises, it returns `{"ok": false, "error": …}` with `bridge_down` (not
+  running and not started, or no socket within 15 s), `bridge_not_installed` (no `node` on PATH or no
+  `bridge/whatsapp/node_modules`; carries a `hint` to run `npm ci --ignore-scripts --omit=dev` there),
+  `bridge_start_failed`, `bridge_timeout` or `bridge_bad_reply`. Default timeout 60 s for `send`/`prompt` (the bridge
+  may wait 30 s for the gap, then type and verify), 5 s for `status`.
+  - **`mother whatsapp send <id>`** exits 2 without calling the bridge unless `approved/<id>.json` exists. On a
+    bridge `ok` it sets the draft's `status` to `sent` (a sent draft is no longer listed, prompted or
+    returned by `pending`) and prints `{"ok": true, "stanza"}`; any bridge error prints the reply as JSON and
+    exits 2 with the code. It never touches `approved/`: the bridge settles the approval.
+  - **`mother whatsapp prompt <id> [<id>…]`** (ids only: the guard accepts nothing else) needs every id to be
+    an open draft (exit 2 otherwise) and runs every path in `whatsapp.approve_via` that can prompt, as one
+    batched text. `self_chat`: the bridge `prompt` op. `slack_dm`: no call; the output carries
+    `{"slack_dm": {"ok": true, "channel": <first manager.chat_dm>, "text"}}` for the skill to post (no
+    `chat_dm`: `{"ok": false, "error": "no_chat_dm"}`). Output `{"ids", "self_chat"?, "slack_dm"?}`; exit 2 when no
+    path delivered. Each path that delivered appends one `prompts.jsonl` line (`{"at", "path", "ids", "sha256"}`,
+    one `O_APPEND` write; a bridge `log_failed` counts as delivered because the message went out; a bridge refusal
+    records nothing). During `manager.quiet_hours` it prints `{"held": true}`, records nothing and calls nothing. The
+    text is `<id> WhatsApp -> <chat name>: "<text>"` per draft (continuation lines of the text quoted with `> `),
+    a blank line, then `Reply with: ok <ids>  |  ok all  |  no <id>`; no line can read as an approval reply, which the
+    bridge would refuse as `bad_request`.
+  - **`mother whatsapp link` / `unlink`** run `node bridge/whatsapp/bridge.mjs --link|--unlink` in the foreground,
+    inheriting the terminal (the QR shows there). **`status`** prints `{"bridge": <status reply or error>, "read":
+    {"db_reachable": bool}}`; it never starts the bridge and never reads a message.
+  - **Bridge supervision.** No launchd agent. When the socket is missing or refuses a connection, `bridge_call`
+    starts `node bridge.mjs` detached (new session, stdin closed, stdout and stderr appended to
+    `<state>/whatsapp/bridge.log`, which holds ids and codes only) and waits up to 15 s for the socket. The bridge exits
+    cleanly (socket removed) after 30 minutes with no request (`$MOTHER_BRIDGE_IDLE_MS` overrides it, for tests), so
+    the first send after a quiet spell takes a few seconds longer. The guard already classifies `send` (proof
+    required), `prompt` (ids only, each an open draft) and `link`, `unlink`, `status` (pass).
 - **Limits.** `max_per_day` (default 20, ceiling 50) counts every send; `min_gap_seconds` (default 5, jittered)
   between sends; one recipient per call; no first message to a JID with no prior message in the local
   database. Self-chat prompts go to the manager's own number: they do not count toward `max_per_day`; they count only toward
   `max_prompts_per_day` (default 10), are batched to one prompt per routine run per path, and are held during
   `manager.quiet_hours`.
 - **Machine-local state.** Bridge: `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`):
-  `session/` (device keys, 0600), `bridge.sock` (Unix socket, 0600, no TCP) and `sent.jsonl` (time, chat JID,
+  `session/` (device keys, 0600), `bridge.sock` (Unix socket, 0600, no TCP), `bridge.log` (ids and codes only) and `sent.jsonl` (time, chat JID,
   draft id, text hash, stanza id). Workspace, git-ignored: `.mother/whatsapp/drafts/`, `approved/`,
   `prompts.jsonl`. `mother whatsapp link` shows the QR; `unlink` logs the device out and deletes the keys.
   `.mother/PAUSED` stops all sends.

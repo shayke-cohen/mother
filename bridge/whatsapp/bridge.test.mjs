@@ -7,7 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { createBridge, locations, workspace, verifyWithCli, tighten } from "./bridge.mjs";
+import { createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs } from "./bridge.mjs";
 
 const SELF = "972500000099@s.whatsapp.net";
 const DM = "972500000001@s.whatsapp.net";
@@ -405,4 +405,35 @@ test("verifyWithCli runs `mother whatsapp verify`: yes for an approved draft, no
   draft("w3kx", "see you at 4");
   assert.equal(await verifyWithCli("w3kx", { env: venv, sha256: d.sha256 }), false);
   assert.equal(await verifyWithCli("w9pa", { env: venv, sha256: d.sha256 }), false);
+});
+
+test("idleMs reads MOTHER_BRIDGE_IDLE_MS, default 30 minutes", () => {
+  assert.equal(idleMs({}), 30 * 60_000);
+  assert.equal(idleMs({ MOTHER_BRIDGE_IDLE_MS: "250" }), 250);
+  assert.equal(idleMs({ MOTHER_BRIDGE_IDLE_MS: "nope" }), 30 * 60_000);
+  assert.equal(idleMs({ MOTHER_BRIDGE_IDLE_MS: "-5" }), 30 * 60_000);
+});
+
+test("serve exits cleanly after the idle time with no request, removing its socket", async () => {
+  const closed = [];
+  const stub = { ...client, linked: client.linked, me: client.me, close: () => closed.push("client") };
+  const codes = [];
+  const loc = locations(env);
+  const { stop } = await serve({ client: stub, loc, ms: 300, exit: (c) => codes.push(c), signals: false, env });
+  try {
+    assert.ok(fs.existsSync(loc.sock));
+    // a request resets the clock: three requests 150 ms apart outlast the 300 ms idle time
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal((await request({ op: "status" })).ok, true);
+      assert.deepEqual(codes, []);
+    }
+    assert.ok(fs.existsSync(loc.sock));
+    await new Promise((r) => setTimeout(r, 700));
+    assert.deepEqual(codes, [0]);
+    assert.deepEqual(closed, ["client"]);
+    assert.equal(fs.existsSync(loc.sock), false);
+  } finally {
+    stop();
+  }
 });
