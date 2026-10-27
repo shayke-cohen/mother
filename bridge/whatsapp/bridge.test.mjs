@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import {
-  createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs, silenceConsole, runLink, bareJid,
+  createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs, silenceConsole, runLink, bareJid, closeAction,
 } from "./bridge.mjs";
 
 const SELF = "972500000099@s.whatsapp.net";
@@ -549,12 +549,45 @@ test("--link: the QR goes to the terminal, then one JSON line names the linked a
   assert.deepEqual(JSON.parse(out[out.length - 1]), { linked: true, me: SELF });
 });
 
-test("--link that never opens: {linked: false}, exit 1", async () => {
+test("--link that never opens: {linked: false, reason}, exit 1, a plain sentence, no raw log on the terminal", async () => {
+  for (const [reason, words] of [["qr_expired", "expired"], ["logged_out", "logged"], ["replaced", "another device"],
+                                 ["network", "connection"], [null, "3 minutes"]]) {
+    const out = [];
+    const c = fakeLinkClient({ open: false });
+    c.closeReason = () => reason;
+    let logged = null;
+    const code = await runLink(locations(env), {
+      connect: async ({ log }) => { logged = log; log({ op: "connection", state: "close", code: "408" }); return c; },
+      qr: { generate() {} }, out: (l) => out.push(l), err: (l) => out.push(l), settleMs: 0,
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(JSON.parse(out[out.length - 1]), { linked: false, reason: reason || "timeout" });
+    assert.ok(out.slice(0, -1).some((l) => l.toLowerCase().includes(words)), reason + ": " + out.join("|"));
+    assert.ok(!out.slice(0, -1).some((l) => l.startsWith("{")), "no JSON on the terminal: " + out.join("|"));
+    const log = fs.readFileSync(path.join(locations(env).dir, "bridge.log"), "utf8");
+    assert.match(log, /"op":"connection"/);  // the structured line went to bridge.log
+    assert.equal(typeof logged, "function");
+  }
+});
+
+test("--link says where to scan before the first code", async () => {
   const out = [];
-  const code = await runLink(locations(env), {
-    connect: async () => fakeLinkClient({ open: false }), qr: { generate() {} }, out: (l) => out.push(l),
-    err: () => {}, settleMs: 0,
+  await runLink(locations(env), {
+    connect: async ({ onQR }) => { onQR("A"); onQR("B"); return fakeLinkClient(); },
+    qr: { generate: (q) => out.push("QR:" + q) }, out: (l) => out.push(l), err: () => {}, settleMs: 0,
   });
-  assert.equal(code, 1);
-  assert.deepEqual(JSON.parse(out[out.length - 1]), { linked: false });
+  const first = out.findIndex((l) => l.startsWith("QR:"));
+  assert.ok(out.slice(0, first).join(" ").includes("Linked devices → Link a device first; each code lasts about 20 seconds"));
+  assert.ok(out.includes("QR:B"));
+});
+
+test("closeAction: in link mode a close ends the attempt with a reason (no reconnect), 515 restarts", () => {
+  assert.deepEqual(closeAction("link", 408, 0), { end: true, reason: "qr_expired" });
+  assert.deepEqual(closeAction("link", 401, 0), { end: true, reason: "logged_out", loggedOut: true });
+  assert.deepEqual(closeAction("link", 440, 0), { end: true, reason: "replaced" });
+  assert.deepEqual(closeAction("link", 428, 0), { end: true, reason: "network" });
+  assert.deepEqual(closeAction("link", 515, 0), { retryMs: 0 });
+  assert.deepEqual(closeAction("serve", 408, 2), { retryMs: 8000 });
+  assert.deepEqual(closeAction("serve", 515, 3), { retryMs: 0 });
+  assert.deepEqual(closeAction("serve", 401, 0), { end: true, reason: "logged_out", loggedOut: true });
 });

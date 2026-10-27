@@ -508,6 +508,9 @@ WA_WRAPPERS = {  # commands that run the rest of their arguments as a command; t
     "xargs": ("-I", "-n", "-L", "-P", "-s", "-E", "-d", "-a", "-J", "-R", "-S"), "builtin": (),
     "stdbuf": ("-i", "-o", "-e"), "caffeinate": ("-t", "-w"), "unbuffer": (), "chronic": (),
     "watch": ("-n", "--interval"), "ionice": ("-c", "-n", "-p"), "taskpolicy": ("-c", "-d", "-g", "-b")}
+WA_SCRIPT_OPTS = ("-t", "-T", "-F", "-O", "-I", "-B", "-E", "-o", "-m", "--log-out", "--log-in", "--log-io",
+                  "--log-timing", "--echo", "--output-limit", "--logging-format")
+WA_PTY_CMDS = {"expect", "tmux", "screen", "dtach", "abduco", "ptyexec", "pty", "rlwrap", "empty"}
 WA_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"}
 WA_INTERPS = {"python", "python2", "python3", "perl", "ruby", "node", "nodejs", "deno", "bun", "osascript", "php",
               "lua", "swift", "tclsh", "pwsh", "rscript", "awk", "gawk", "nawk", "mawk"}
@@ -1132,6 +1135,11 @@ class _WaScan(object):
             self.hit("state", "a git clean of a folder that holds WhatsApp's state")
         if name in WA_WRAPPERS:
             self.unwrap(name, args, vals, seg, text)
+        elif name == "script":
+            self.script(args, vals, seg, text)
+        elif name in WA_PTY_CMDS:
+            if wa_names_cli(wa_norm(self.cmd)):
+                self.hit("unknown", "a terminal wrapper (%s) around a mother whatsapp command" % name)
         elif name == "eval":
             if any(v is None for v in vals):
                 self.unreadable(args, "an eval of text the guard can't compute")
@@ -1199,6 +1207,30 @@ class _WaScan(object):
                 continue
             break
         self.command(args[k:], seg, text, name)
+
+    def script(self, args, vals, seg, text):
+        """`script [opts] [file [command …]]` (BSD) or `script -c CMD [file]` (Linux): it gives the command a
+        terminal, so the command is read like any other."""
+        k = 0
+        while k < len(args):
+            v = vals[k]
+            if v is None:
+                return self.unreadable(args[k:], "a script command the guard can't compute")
+            if v in ("-c", "--command") and k + 1 < len(args):
+                if vals[k + 1] is None:
+                    return self.unreadable([args[k + 1]], "a script -c string the guard can't compute")
+                self.line(vals[k + 1])
+                k += 2
+                continue
+            if v == "--":
+                k += 1
+                break
+            if v.startswith("-") and len(v) > 1:
+                k += 2 if v in WA_SCRIPT_OPTS else 1
+                continue
+            break
+        if k + 1 < len(args):  # the first word is the typescript file; the rest is the command
+            self.command(args[k + 1:], seg, text, "script")
 
     def shell(self, args, vals, seg):
         for k, v in enumerate(vals):
@@ -1455,6 +1487,76 @@ def wa_sent(path):
     return recs
 
 
+_ABSENT = object()
+
+
+def wa_config_path(fp, ctx):
+    """fp (already realpath'd) is the workspace's config.json."""
+    if not ctx.ws:
+        return False
+    p = os.path.join(ctx.ws, "config.json")
+    return _cf(fp) in (_cf(p), _cf(os.path.realpath(p)))
+
+
+def _wa_block(text):
+    """The parsed whatsapp value of a config text (_ABSENT when there is none), or None when it doesn't parse."""
+    try:
+        cfg = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return cfg.get("whatsapp", _ABSENT) if isinstance(cfg, dict) else _ABSENT
+
+
+def wa_block_now(ctx):
+    """config.json holds a whatsapp block today (an unreadable file counts as one: fail closed)."""
+    try:
+        with open(os.path.join(ctx.ws, "config.json"), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+    old = _wa_block(text)
+    return old is None or old is not _ABSENT
+
+
+def wa_block_edit(tool, inp, fp):
+    """A Write/Edit/MultiEdit/NotebookEdit of config.json that would change the parsed whatsapp value. An edit whose
+    old text isn't in the file is left to the existing ask (the tool will fail); a result that doesn't parse
+    counts as a change when the file has a whatsapp block today."""
+    try:
+        with open(fp, encoding="utf-8") as f:
+            cur = f.read()
+    except FileNotFoundError:
+        cur = ""
+    except OSError:
+        return True
+    old = _wa_block(cur)
+    had = old is None or old is not _ABSENT
+    if tool == "Write":
+        new_text = inp.get("content")
+        if not isinstance(new_text, str):
+            return False  # malformed: the tool fails; the existing ask stands
+    elif tool in ("Edit", "MultiEdit"):
+        edits = inp.get("edits") if tool == "MultiEdit" else [inp]
+        if not isinstance(edits, list):
+            return False
+        new_text = cur
+        for e in edits:
+            if not isinstance(e, dict) or not isinstance(e.get("old_string"), str) \
+                    or not isinstance(e.get("new_string"), str):
+                return False
+            if e["old_string"] not in new_text:
+                return False
+            new_text = new_text.replace(e["old_string"], e["new_string"], -1 if e.get("replace_all") else 1)
+    else:
+        return had  # a notebook edit of config.json: nothing sane to compare
+    new = _wa_block(new_text)
+    if new is None:
+        return had
+    if old is None:
+        return new is not _ABSENT
+    return old != new
+
+
 def classify_bash(cmd, cwd, ctx):
     wa = classify_whatsapp(cmd, cwd, ctx)
     if wa:
@@ -1464,11 +1566,16 @@ def classify_bash(cmd, cwd, ctx):
         names = ["paused", "ledger.json", "guard.log", "guard.py", "hooks.json", ".mother/workspace"]
         low = cmd.casefold()
         hit = any(n in low for n in names)
-        if ctx.ws and not hit:
+        cfg_hit = False
+        if ctx.ws:
             roots = {ctx.ws, os.environ.get("MOTHER_WORKSPACE", "").strip()} - {""}
             here = _cf(cwd) if cwd else ""
-            hit = any(os.path.join(r, "config.json").casefold() in low for r in roots) \
+            cfg_hit = any(os.path.join(r, "config.json").casefold() in low for r in roots) \
                 or ("config.json" in low and here == _cf(ctx.ws))
+            hit = hit or cfg_hit
+        if hit and cfg_hit and wa_block_now(ctx):
+            return wa_act("terminal", "a shell write to config.json, which holds the whatsapp block (who MOTHER "
+                                      "may message)")
         if hit:
             return act("config", "guard_config", "a shell command that could change the guard's own files")
     short = cmd.strip()[:160]
@@ -1605,6 +1712,9 @@ def classify(tool, inp, cwd, ctx):
             fp = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(fp)))
             if wa_inside(fp, ctx):
                 return wa_act("state", "an edit to WhatsApp's drafts, approvals or bridge state: " + fp)
+            if wa_config_path(fp, ctx) and wa_block_edit(tool, inp, fp):
+                return wa_act("terminal", "an edit that changes the whatsapp block of config.json (who MOTHER "
+                                          "may message)")
             if fp.casefold() in protected_paths(ctx):
                 return act("config", "guard_config", "an edit to the guard's own files: " + fp)
         return None

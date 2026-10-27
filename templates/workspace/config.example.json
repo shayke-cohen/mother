@@ -123,7 +123,7 @@
     "enabled": false,
     "self_jid": "972500000099@s.whatsapp.net",
     "allow": [
-      { "jid": "972500000001@s.whatsapp.net", "name": "Dana", "team": "platform" },
+      { "jid": "972500000001@s.whatsapp.net", "name": "Sam Roe", "team": "platform" },
       { "jid": "120363000000000001@g.us", "name": "PLAT", "team": "platform", "group": true }
     ],
     "approve_via": ["slack_dm", "self_chat", "session"],

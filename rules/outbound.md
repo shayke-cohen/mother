@@ -162,7 +162,9 @@ WhatsApp call is allow or deny, in every permission mode, bypass included (an as
 - **Allowlist only.** A draft goes only to a chat in `whatsapp.allow` that already has history with the
   manager (no cold contact), never to the manager's own self chat.
 - **The manager sets it up, not you.** Never edit the `whatsapp` block of `config.json`, and never run
-  `mother whatsapp setup`, `allow` or `disallow`: the guard denies all three. Tell the manager to run
+  `mother whatsapp setup`, `allow` or `disallow`, wrapped in `script`, `expect` or anything else: the guard
+  denies all of it, including a config.json write that changes the block and any shell write to config.json
+  while the block exists. When you rewrite config.json for other keys, keep the block exactly as it is. Tell the manager to run
   `mother whatsapp setup` (or `allow <number>`) in their own terminal.
 - **Draft, then one yes, then send.** `mother whatsapp draft` writes the draft; show it on the enabled paths
   (`WhatsApp -> <chat name>: "<text>" - reply ok <id>`); the manager answers `ok <id>` in the session, their

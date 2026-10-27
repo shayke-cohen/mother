@@ -344,6 +344,20 @@ export function tighten(dir) {  // session keys: folder 0700, files 0600
   }
 }
 
+const LINK_REASONS = { 408: "qr_expired", 401: "logged_out", 440: "replaced" };
+
+/**
+ * What a closed connection does next. Link mode ends the attempt on any close but 515 (restart after a scan):
+ * a 408 there is the QR timing out, and reconnecting would show a code the window then kills. Serve mode
+ * reconnects with backoff. 401 (logged out) ends both. Returns {end, reason, loggedOut?} or {retryMs}.
+ */
+export function closeAction(mode, code, retry) {
+  if (code === 401) return { end: true, reason: "logged_out", loggedOut: true };
+  if (code === 515) return { retryMs: 0 };
+  if (mode === "link") return { end: true, reason: LINK_REASONS[code] || "network" };
+  return { retryMs: Math.min(60_000, 2_000 * 2 ** retry) };
+}
+
 /**
  * A linked-device client. `mode` "serve" never shows a QR (an unlinked bridge stays unlinked); "link" passes
  * each QR to onQR. No handler is registered for messages or any other incoming event: the library does what
@@ -359,6 +373,7 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
   let linked = false;
   let stopped = false;
   let loggedOut = false;
+  let reason = null;
   let retry = 0;
   const waiters = [];
   const settle = (v) => { while (waiters.length) waiters.shift()(v); };
@@ -386,15 +401,17 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
         linked = false;
         const code = u.lastDisconnect?.error?.output?.statusCode;
         log({ op: "connection", state: "close", code: String(code ?? "none") });
-        if (code === DisconnectReason.loggedOut) {
-          loggedOut = true;
+        const next = closeAction(mode, code, retry);
+        if (next.end) {
+          reason = next.reason;
+          if (next.loggedOut) loggedOut = true;
           stopped = true;
           settle(false);
           return;
         }
         if (stopped) { settle(false); return; }
-        const wait = code === DisconnectReason.restartRequired ? 0 : Math.min(60_000, 2_000 * 2 ** retry++);
-        setTimeout(() => { if (!stopped) start(); }, wait);
+        if (next.retryMs) retry++;
+        setTimeout(() => { if (!stopped) start(); }, next.retryMs);
       }
     });
   };
@@ -405,7 +422,12 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
     paired,
     linked: () => linked,
     loggedOut: () => loggedOut,
-    me: () => (linked && sock?.user?.id ? jidNormalizedUser(sock.user.id) : null),
+    me: () => {  // the phone-number JID when WhatsApp gives one (user.id, else creds.me.id), else what there is
+      if (!linked) return null;
+      const ids = [sock?.user?.id, state.creds?.me?.id].filter(Boolean).map((j) => jidNormalizedUser(j));
+      return ids.find((j) => j.endsWith("@s.whatsapp.net")) || ids[0] || null;
+    },
+    closeReason: () => reason,
     presence: (jid, s) => sock.sendPresenceUpdate(s, jid),
     sendText: async (jid, text) => (await sock.sendMessage(jid, { text }))?.key?.id,
     waitOpen: (ms) => (linked ? Promise.resolve(true) : new Promise((resolve) => {
@@ -427,6 +449,14 @@ export function bareJid(jid) {
  * `mother whatsapp setup` to learn the manager's own JID: {"linked": true, "me": "<jid>"} or {"linked": false}.
  * `connect`, `qr`, `out`, `err` and `settleMs` are for tests.
  */
+export const LINK_WORDS = {
+  qr_expired: "The QR code expired before it was scanned.",
+  logged_out: "WhatsApp logged this device out.",
+  replaced: "Another device replaced this link.",
+  network: "The connection to WhatsApp dropped.",
+  timeout: "Nothing was scanned within 3 minutes.",
+};
+
 export async function runLink(loc, { connect = connectWhatsApp, qr = null, out = (l) => console.log(l),
                                      err = (l) => console.error(l), settleMs = 2_000 } = {}) {
   if (fs.existsSync(loc.sock) && await alive(loc.sock)) {
@@ -434,19 +464,31 @@ export async function runLink(loc, { connect = connectWhatsApp, qr = null, out =
     return 1;
   }
   const qrcode = qr || (await import("qrcode-terminal")).default;
+  const fileLog = (rec) => {  // structured lines go to bridge.log only; the terminal gets the QR and sentences
+    try {
+      fs.mkdirSync(loc.dir || path.dirname(loc.sock), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(path.join(loc.dir || path.dirname(loc.sock), "bridge.log"),
+        JSON.stringify({ at: isoZ(Date.now()), ...rec }) + "\n", { mode: 0o600 });
+    } catch { /* a log is never worth failing a link */ }
+  };
+  let shown = 0;
   const client = await connect({
-    sessionDir: loc.session, mode: "link",
+    sessionDir: loc.session, mode: "link", log: fileLog,
     onQR: (code) => {
-      out("\nWhatsApp > Settings > Linked devices > Link a device, then scan:\n");
+      out(shown++ === 0
+        ? "\nOpen WhatsApp → Settings → Linked devices → Link a device first; each code lasts about 20 seconds.\n"
+        : "\nNew code (the last one timed out):\n");
       qrcode.generate(code, { small: true });
     },
   });
   const ok = await client.waitOpen(180_000);
   const me = ok ? bareJid(client.me()) : null;  // read while the connection is open
+  const reason = ok ? null : (client.closeReason && client.closeReason()) || "timeout";
   await new Promise((r) => setTimeout(r, settleMs));  // let the last creds.update land on disk
   client.close();
   if (fs.existsSync(loc.session)) tighten(loc.session);
-  out(JSON.stringify(ok && me ? { linked: true, me } : { linked: false }));
+  if (!ok) out(LINK_WORDS[reason] || LINK_WORDS.network);
+  out(JSON.stringify(ok && me ? { linked: true, me } : { linked: false, reason: ok ? "no_account" : reason }));
   return ok && me ? 0 : 1;
 }
 

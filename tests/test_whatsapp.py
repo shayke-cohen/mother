@@ -1551,8 +1551,8 @@ class TestCliLinkStatus(Cmd7):
             code = whatsapp.cmd_link(sub, [])
         return code, call, stop
 
-    def test_link_and_unlink_stop_the_bridge_then_run_the_installed_copy_in_the_foreground(self):
-        for sub in ("link", "unlink"):
+    def test_unlink_stops_the_bridge_then_runs_the_installed_copy_in_the_foreground(self):
+        for sub in ("unlink",):
             code, call, stop = self.link(sub)
             self.assertEqual(code, 0)
             stop.assert_called_once()
@@ -1827,7 +1827,7 @@ class SetupCase(Base):
 
     def setup(self, *answers, linked=None, link=SELF, problem=None, reinstall=False, install_ok=True):
         """Run setup with the bridge faked: `problem` until install runs, `linked` = status.me (None: not linked),
-        `link` = what the QR link learns."""
+        `link` = what the QR link learns (a JID, None for a logged-out link, or a list of link_once results)."""
         state = {"problem": problem}
 
         def install():
@@ -1841,7 +1841,9 @@ class SetupCase(Base):
                 mock.patch.object(whatsapp, "install_bridge", side_effect=install) as inst, \
                 mock.patch.object(whatsapp, "stop_bridge", return_value=False) as stop, \
                 mock.patch.object(whatsapp, "bridge_call", return_value=status), \
-                mock.patch.object(whatsapp, "link_account", return_value=link) as lk:
+                mock.patch.object(whatsapp, "link_once", side_effect=list(link) if isinstance(link, list) else
+                                  [{"linked": True, "me": link} if link else {"linked": False,
+                                                                                "reason": "logged_out"}]) as lk:
             code = whatsapp.setup(self.ws, VALIDATE, io)
         return code, io, {"install": inst, "stop": stop, "link": lk}
 
@@ -1977,7 +1979,7 @@ class FakePopen(object):
         return self._code
 
 
-class TestLinkAccount(Cmd7):
+class TestLinkOnce(Cmd7):
     def link(self, lines, code=0):
         fake = FakePopen(lines, code)
         io = FakeIO()
@@ -1990,22 +1992,128 @@ class TestLinkAccount(Cmd7):
                 mock.patch.object(whatsapp, "_node", return_value="/usr/bin/node"), \
                 mock.patch.object(whatsapp, "stop_bridge") as stop, \
                 mock.patch("subprocess.Popen", side_effect=popen):
-            me = whatsapp.link_account(io.say)
+            r = whatsapp.link_once(io.say)
         stop.assert_called_once()
-        return me, io, fake
+        return r, io, fake
 
     def test_the_qr_passes_through_and_the_json_line_names_the_account(self):
-        me, io, fake = self.link([b"scan this\n", b"\xe2\x96\x88\xe2\x96\x88 qr\n",
-                                  b'{"linked": true, "me": "972500000099:2@s.whatsapp.net"}\n'])
-        self.assertEqual(me, SELF)
+        r, io, fake = self.link([b"scan this\n", b"\xe2\x96\x88\xe2\x96\x88 qr\n",
+                                 b'{"linked": true, "me": "972500000099:2@s.whatsapp.net"}\n'])
+        self.assertEqual(r, {"linked": True, "me": SELF, "reason": None})
         self.assertEqual(fake.argv[-1], "--link")
         self.assertIn("scan this", io.text)
         self.assertNotIn('"linked"', io.text)
 
-    def test_no_link_is_none(self):
-        self.assertIsNone(self.link([b'{"linked": false}\n'], code=1)[0])
-        self.assertIsNone(self.link([b"just text\n"], code=0)[0])
-        self.assertIsNone(self.link([b'{"linked": true, "me": "not-a-jid"}\n'], code=0)[0])
+    def test_no_link(self):
+        self.assertEqual(self.link([b'{"linked": false, "reason": "qr_expired"}\n'], code=1)[0],
+                         {"linked": False, "me": None, "reason": "qr_expired"})
+        self.assertEqual(self.link([b"just text\n"], code=0)[0]["linked"], False)
+        self.assertEqual(self.link([b'{"linked": true, "me": "123456789@lid"}\n'])[0],
+                         {"linked": True, "me": "123456789@lid", "reason": None})
+
+
+class TestLinkLoop(Cmd7):
+    def loop(self, results, *answers):
+        io = FakeIO(*answers)
+        with mock.patch.object(whatsapp, "link_once", side_effect=list(results)) as lk:
+            try:
+                return whatsapp.link_loop(io), io, lk
+            except whatsapp.SetupStop as e:
+                return e, io, lk
+
+    def test_an_expired_qr_offers_a_new_one(self):
+        me, io, lk = self.loop([{"linked": False, "reason": "qr_expired"}, {"linked": False, "reason": "qr_expired"},
+                                {"linked": True, "me": SELF}], "", "y")
+        self.assertEqual(me, SELF)
+        self.assertEqual(lk.call_count, 3)
+        self.assertIn("QR expired — show a new one? [Y/n]", io.asked[0])
+
+    def test_no_to_a_new_qr_stops(self):
+        e, io, lk = self.loop([{"linked": False, "reason": "qr_expired"}], "n")
+        self.assertIsInstance(e, whatsapp.SetupStop)
+
+    def test_logged_out_or_replaced_stop_in_plain_words(self):
+        for reason, words in (("logged_out", "logged"), ("replaced", "another device")):
+            e, io, lk = self.loop([{"linked": False, "reason": reason}])
+            self.assertIsInstance(e, whatsapp.SetupStop)
+            self.assertIn(words, str(e).lower())
+            self.assertEqual(io.asked, [])
+
+    def test_the_link_command_loops_too(self):
+        class Tty(__import__("io").StringIO):
+            def isatty(self):
+                return True
+        out = Tty()
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch("sys.stdin.isatty", return_value=True), \
+                mock.patch("builtins.input", return_value=""), mock.patch("sys.stdout", new=out), \
+                mock.patch.object(whatsapp, "link_once", side_effect=[{"linked": False, "reason": "qr_expired"},
+                                                                     {"linked": True, "me": SELF}]):
+            self.assertEqual(whatsapp.cmd_link("link", []), 0)
+        self.assertIn(SELF, out.getvalue())
+
+
+class TestSetupRound1(SetupCase):
+    def test_a_private_account_id_asks_for_the_number(self):
+        for kw in ({"link": "123456789012@lid"}, {"linked": "123456789012@lid"}):
+            del_cfg = self.read_cfg()
+            del_cfg.pop("whatsapp", None)
+            self.write_cfg(del_cfg)
+            code, io, m = self.setup("12", "+972 50 000 0099", "", "n", "n", **kw)
+            self.assertEqual(code, 0, io.text)
+            self.assertIn("private id", io.text)
+            self.assertNotIn("didn't complete", io.text)
+            self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
+
+    def test_hidden_id_chats_are_shown_and_skipped(self):
+        db = sqlite3.connect(str(self.db))
+        db.execute("INSERT INTO ZWACHATSESSION VALUES (9, '987654321012345@lid', 'Hidden One', 0, NULL, ?)",
+                   (core("2026-10-27T08:00:00Z"),))
+        db.commit()
+        db.close()
+        code, io, m = self.setup("1 4", "n", "n", linked=SELF)
+        self.assertEqual(code, 0, io.text)
+        first = [ln for ln in io.lines if ln.strip().startswith("1.")][0]
+        self.assertIn("Hidden One", first)
+        self.assertIn("id hidden by WhatsApp", first)
+        self.assertIn("skipped", io.text)
+        self.assertEqual(self.read_cfg()["whatsapp"]["allow"], [{"jid": DM, "name": "Dana"}])
+
+    def test_ctrl_c_exits_130_and_changes_nothing_more(self):
+        class Interrupt(FakeIO):
+            def ask(self, prompt):
+                raise KeyboardInterrupt
+        io = Interrupt()
+        status = {"ok": True, "linked": True, "me": SELF}
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "reinstall_needed", return_value=False), \
+                mock.patch.object(whatsapp, "bridge_call", return_value=status):
+            code = whatsapp.setup(self.ws, VALIDATE, io)
+        self.assertEqual(code, 130)
+        self.assertIn("setup stopped; nothing more was changed", io.text)
+        self.assertEqual(VALIDATE(self.read_cfg()), [])
+        self.assertEqual(whatsapp.allow_chat(self.ws, VALIDATE, Interrupt(), []), 130)
+        self.assertFalse(list(self.ws.glob(".config*.tmp")))
+
+    def test_config_writes_hold_a_lock(self):
+        import fcntl
+        import threading as th
+        self.cfg["whatsapp"] = {"enabled": False}
+        self.write_cfg()
+        lock = self.ws / ".mother" / "config.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        f = open(str(lock), "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        done = []
+        t = th.Thread(target=lambda: done.append(whatsapp.save_whatsapp(self.ws, VALIDATE,
+                                                                        lambda wa: wa.update(read=False))))
+        t.start()
+        time.sleep(0.3)
+        self.assertEqual(done, [])  # waits for the lock
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+        t.join(5)
+        self.assertEqual(self.read_cfg()["whatsapp"]["read"], False)
 
 
 class TestAllow(SetupCase):
@@ -2055,6 +2163,16 @@ class TestAllow(SetupCase):
             code, io = self.allow(*args)
             self.assertEqual(code, 2, (args, io.text))
         self.assertEqual((self.ws / "config.json").read_text(), before)
+
+    def test_a_hidden_id_chat_cannot_be_allowed(self):
+        db = sqlite3.connect(str(self.db))
+        db.execute("INSERT INTO ZWACHATSESSION VALUES (9, '987654321012345@lid', 'Hidden One', 0, NULL, ?)",
+                   (core("2026-10-27T08:00:00Z"),))
+        db.commit()
+        db.close()
+        code, io = self.allow("1")
+        self.assertEqual(code, 2)
+        self.assertIn("id hidden by WhatsApp", io.text)
 
     def test_already_allowed_is_left_alone(self):
         self.allow(DM)

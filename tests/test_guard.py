@@ -1213,6 +1213,12 @@ class TestWhatsappFixRound1(WhatsappCase):
             self.assertEqual(self.run_guard("Write", {"file_path": p}, env=self.env)[0], "ask", p)
             self.assertEqual(self.run_guard("Edit", {"file_path": p}, env=self.env, mode=self.BY)[0], "ask", p)
         self.assertEqual(self.wa("rm %s" % os.path.join(self.ws, ".mother", "paused"))[0], "ask")
+        # Task 7b fix round 1 (I1): a shell write to config.json while it holds a whatsapp block is denied,
+        # case variants included; without a block it asks like the original
+        self.assertEqual(self.wa("rm %s" % os.path.join(self.ws, "CONFIG.JSON"))[0], "deny")
+        cfg = wa_config()
+        del cfg["whatsapp"]
+        self.write_config(cfg)
         self.assertEqual(self.wa("rm %s" % os.path.join(self.ws, "CONFIG.JSON"))[0], "ask")
 
     def test_glob_and_variable_paths_denied(self):
@@ -1489,6 +1495,88 @@ class TestWhatsappTerminalOnly(WhatsappCase):
         for cmd in ("mother whatsapp status", "mother whatsapp link", "mother whatsapp chats",
                     "grep -n 'whatsapp setup' docs/CONTRACT.md", "git commit -m 'whatsapp: setup'"):
             self.assertEqual(self.wa(cmd)[0], "none", cmd)
+
+
+
+class TestWhatsappConfigBlock(WhatsappCase):
+    """Fix round 1 (I1, I2): the whatsapp block of config.json changes only through the manager's own terminal."""
+
+    def setUp(self):
+        WhatsappCase.setUp(self)
+        self.cfg = wa_config()
+        self.path = os.path.join(self.ws, "config.json")
+        self.text = json.dumps(self.cfg, indent=2) + "\n"
+        self.write_config(self.text)
+
+    def changed(self, f):
+        c = json.loads(self.text)
+        f(c)
+        return json.dumps(c, indent=2) + "\n"
+
+    def both(self, want, tool, inp, **kw):
+        for mode in (None, self.BY):
+            got, why = self.run_guard(tool, inp, env=self.env, mode=mode, **kw)
+            self.assertEqual(got, want, "%s %s -> %s (%s)" % (tool, mode, got, why))
+            if want == "deny":
+                self.assertIn("own terminal", why)
+
+    def test_write_that_keeps_the_block_still_asks(self):
+        same = self.changed(lambda c: c["agent"].update(name="Agnes2"))
+        self.assertEqual(self.run_guard("Write", {"file_path": self.path, "content": same}, env=self.env)[0], "ask")
+        reformatted = json.dumps(self.cfg) + "\n"
+        self.assertEqual(self.run_guard("Write", {"file_path": self.path, "content": reformatted},
+                                        env=self.env)[0], "ask")
+
+    def test_write_that_changes_the_block_is_denied(self):
+        for f in (lambda c: c["whatsapp"]["allow"].append({"jid": WA_OTHER, "name": "X"}),
+                  lambda c: c["whatsapp"].update(self_jid=WA_OTHER),
+                  lambda c: c["whatsapp"].update(approve_via=["session", "self_chat", "slack_dm"]),
+                  lambda c: c.pop("whatsapp"),
+                  lambda c: c["whatsapp"].update(allow=[])):
+            self.both("deny", "Write", {"file_path": self.path, "content": self.changed(f)})
+        self.both("deny", "Write", {"file_path": self.path, "content": "{ not json"})
+
+    def test_edit_and_multiedit(self):
+        self.assertEqual(self.run_guard("Edit", {"file_path": self.path, "old_string": '"version": 1',
+                                                 "new_string": '"version": 1'}, env=self.env)[0], "ask")
+        self.assertEqual(self.run_guard("Edit", {"file_path": self.path, "old_string": "no such text",
+                                                 "new_string": "x"}, env=self.env)[0], "ask")
+        jid = '"jid": "%s"' % WA_DM
+        self.assertIn(jid, self.text)
+        self.both("deny", "Edit", {"file_path": self.path, "old_string": jid, "new_string": '"jid": "%s"' % WA_OTHER})
+        self.both("deny", "Edit", {"file_path": self.path, "old_string": WA_DM, "new_string": WA_OTHER,
+                                   "replace_all": True})
+        self.both("deny", "Edit", {"file_path": self.path, "old_string": '"whatsapp"', "new_string": '"whatsapp" x'})
+        self.both("deny", "MultiEdit", {"file_path": self.path, "edits": [
+            {"old_string": '"version": 1', "new_string": '"version": 1'},
+            {"old_string": jid, "new_string": '"jid": "%s"' % WA_OTHER}]})
+        rel = self.run_guard("Write", {"file_path": "config.json", "content": "{}"}, env=self.env, cwd=self.ws)
+        self.assertEqual(rel[0], "deny")
+
+    def test_shell_writes_to_config_with_a_block_are_denied(self):
+        for cmd in ("echo {} > %s" % self.path, "sed -i '' s/a/b/ %s" % self.path, "cp /tmp/x.json config.json"):
+            for mode in (None, self.BY):
+                got, why = self.wa(cmd, mode=mode, cwd=self.ws)
+                self.assertEqual(got, "deny", (cmd, mode, why))
+        cfg = json.loads(self.text)
+        del cfg["whatsapp"]
+        self.write_config(cfg)
+        self.assertEqual(self.wa("echo {} > %s" % self.path)[0], "ask")  # no block: the old ask
+        self.assertEqual(self.run_guard("Write", {"file_path": self.path, "content": "{}"}, env=self.env)[0], "ask")
+
+    def test_pty_wrappers_are_read(self):
+        for cmd in ("script -q /dev/null mother whatsapp allow 972500000007 --name Agnes",
+                    "script -q -t 0 /dev/null mother whatsapp setup", "script /tmp/log mother whatsapp disallow x",
+                    "expect -c 'spawn mother whatsapp allow 3'", "unbuffer mother whatsapp allow 3",
+                    "tmux new-session -d 'mother whatsapp allow 3'", "screen -dm mother whatsapp allow 3",
+                    "socat - EXEC:'mother whatsapp allow 3',pty",
+                    "python3 -c 'import pty; pty.spawn([\"mother\", \"whatsapp\", \"allow\", \"3\"])'"):
+            for mode in (None, self.BY):
+                got, why = self.wa(cmd, mode=mode)
+                self.assertEqual(got, "deny", "%r %s -> %s (%s)" % (cmd, mode, got, why))
+        self.assertEqual(self.wa("script -q /dev/null mother whatsapp list")[0], "deny")  # wrapped, like nohup
+        self.assertEqual(self.wa("script -q /dev/null ls -la")[0], "none")
+        self.assertEqual(self.wa("script -q /tmp/session.log")[0], "none")
 
 
 if __name__ == "__main__":

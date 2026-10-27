@@ -132,7 +132,9 @@ no message sent before that yes.** In Edit mode, show a diff of the changed keys
 
 In this order, reporting each step's result:
 
-1. **Write `config.json`** in the workspace. Then `mother status` — it validates against the schema and
+1. **Write `config.json`** in the workspace. Carry the `whatsapp` block over unchanged, byte for byte in
+   meaning: the guard denies a write that changes it (only `mother whatsapp setup|allow|disallow` in the
+   manager's own terminal do). Then `mother status` — it validates against the schema and
    fails loudly; fix and re-show if it does. Do not hand-wave a validation error.
 2. **Persona.** If the workspace `AGENTS.md` still carries template placeholders for the agent's name or
    the manager, fill them from the config.

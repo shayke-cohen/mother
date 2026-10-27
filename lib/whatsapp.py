@@ -1287,17 +1287,29 @@ def _bridge_argv(flag: str) -> list:
 
 def cmd_link(sub, args) -> int:
     """`link` / `unlink`: stop a running bridge, then run the installed bridge in this terminal (the QR shows
-    here). Returns the exit code."""
+    here; an expired QR offers a new one). Returns the exit code."""
     import subprocess
     if args:
         _fail("usage: mother whatsapp %s" % sub)
-    if sub == "link" and not sys.stdout.isatty():
+    if sub == "link" and not (sys.stdout.isatty() and sys.stdin.isatty()):
         print("mother: run `mother whatsapp link` in your own terminal (the QR needs one)", file=sys.stderr)
         return 2
     prob = bridge_problem()
     if prob:
         print(json.dumps(_problem_reply(prob)))
         return 2
+    if sub == "link":
+        io = TerminalIO()
+        try:
+            me = link_loop(io)
+        except SetupStop as e:
+            io.say("Stopped: %s" % e)
+            return 1
+        except KeyboardInterrupt:
+            io.say("\nlink stopped; nothing more was changed")
+            return 130
+        io.say("Linked: %s. Run `mother whatsapp setup` to finish (it is safe to re-run)." % me)
+        return 0
     stop_bridge()  # a running bridge would hold the old session (and block the link)
     env = dict(os.environ)
     env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)
@@ -1387,6 +1399,18 @@ def _load_cfg(ws: Path) -> dict:
 def save_whatsapp(ws: Path, validate, change) -> dict:
     """Re-read config.json, let `change(block)` edit the whatsapp block, validate the whole config and write it
     atomically (temp file + rename, mode kept). An invalid result is never written: SetupStop with the errors."""
+    import fcntl
+    lockp = Path(ws) / ".mother" / "config.lock"  # .mother/ is git-ignored: the lock is never synced
+    lockp.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lockp), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return _save_whatsapp_locked(ws, validate, change)
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def _save_whatsapp_locked(ws: Path, validate, change) -> dict:
     path = Path(ws) / "config.json"
     cfg = _load_cfg(ws)
     wa = cfg.get("whatsapp")
@@ -1412,12 +1436,16 @@ def save_whatsapp(ws: Path, validate, change) -> dict:
 
 
 def pickable_chats(cfg: dict, limit: int = SETUP_CHATS) -> list:
-    """Recent chats the manager may allow: not the self chat, a JID config accepts, a last message (history).
-    Names and dates only. Raises ReaderError."""
+    """Recent chats with a last message (history), not the self chat: ones config accepts, and ones WhatsApp
+    keys by a private `@lid` id (marked "hidden": shown, never allowed). Names and dates only. Raises ReaderError."""
     me = _wa(cfg).get("self_jid")
     out = []
     for c in recent_chats(limit * 4):
-        if c["jid"] == me or not c["last_at"] or not ALLOW_JID_RE.fullmatch(c["jid"] or ""):
+        if c["jid"] == me or not c["last_at"]:
+            continue
+        if (c["jid"] or "").endswith("@lid"):
+            c = dict(c, hidden=True)
+        elif not ALLOW_JID_RE.fullmatch(c["jid"] or ""):
             continue
         out.append(c)
         if len(out) >= limit:
@@ -1428,6 +1456,8 @@ def pickable_chats(cfg: dict, limit: int = SETUP_CHATS) -> list:
 def _chat_name(c: dict) -> str:
     if c.get("name"):
         return c["name"]
+    if c.get("hidden"):
+        return "a chat"
     return "+" + c["jid"].split("@")[0] if not c.get("group") else "group " + c["jid"].split("@")[0]
 
 
@@ -1440,8 +1470,9 @@ def _allow_entry(c: dict, name: str = None) -> dict:
 
 def _show_chats(io, chats: list, allowed: set) -> None:
     for n, c in enumerate(chats, 1):
-        io.say("  %2d. %s  (%s, last %s)%s" % (n, _chat_name(c), "group" if c["group"] else "DM",
-                                               (c["last_at"] or "")[:10], "  [allowed]" if c["jid"] in allowed else ""))
+        io.say("  %2d. %s  (%s, last %s)%s%s" % (n, _chat_name(c), "group" if c["group"] else "DM",
+                                                 (c["last_at"] or "")[:10], "  [allowed]" if c["jid"] in allowed else "",
+                                                 "  (id hidden by WhatsApp)" if c.get("hidden") else ""))
 
 
 def _pick(io, chats: list) -> list:
@@ -1452,7 +1483,11 @@ def _pick(io, chats: list) -> list:
             return []
         toks = [t for t in re.split(r"[\s,]+", raw) if t]
         if all(t.isdigit() and 1 <= int(t) <= len(chats) for t in toks):
-            return [chats[int(t) - 1] for t in dict.fromkeys(toks)]
+            picked = [chats[int(t) - 1] for t in dict.fromkeys(toks)]
+            for c in picked:
+                if c.get("hidden"):
+                    io.say("%s skipped: WhatsApp hides its id, so MOTHER can't allow it yet." % _chat_name(c))
+            return [c for c in picked if not c.get("hidden")]
         io.say("Type numbers from 1 to %d, separated by spaces." % len(chats))
 
 
@@ -1480,15 +1515,25 @@ def _db_stop(read: dict) -> str:
     return "WhatsApp's database can't be read (%s); MOTHER may need an update for this WhatsApp version." % reason
 
 
-def link_account(say) -> str:
-    """Run `bridge.mjs --link` here: the QR passes through to the terminal, and the bridge's last stdout line
-    {"linked": true, "me": ...} names the linked account. Returns its bare JID, or None."""
+def strip_device(jid):
+    """`<id>:<device>@<server>` -> `<id>@<server>`; anything else as it is (None for a non-string)."""
+    return re.sub(r":\d+(?=@)", "", jid.strip()) if isinstance(jid, str) and jid.strip() else None
+
+
+LINK_STOPS = {"logged_out": "WhatsApp logged this device out while linking; run it again for a fresh code.",
+              "replaced": "another device replaced this link; run it again for a fresh code.",
+              "no_account": "the device linked but WhatsApp didn't say which account; run it again."}
+
+
+def link_once(say) -> dict:
+    """One `bridge.mjs --link` attempt in this terminal: its QR and sentences pass through, and its last stdout
+    line names the outcome. {"linked": bool, "me": JID without device suffix or None, "reason": str or None}."""
     import subprocess
     stop_bridge()  # a running bridge would hold the old session (and block the link)
     env = dict(os.environ)
     env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)
     p = subprocess.Popen(_bridge_argv("--link"), stdout=subprocess.PIPE, env=env)  # stdin, stderr: the terminal
-    me = None
+    res = None
     for raw in p.stdout:
         line = raw.decode("utf-8", "replace").rstrip("\n")
         try:
@@ -1496,11 +1541,43 @@ def link_account(say) -> str:
         except ValueError:
             r = None
         if isinstance(r, dict) and "linked" in r:
-            me = bare_jid(r.get("me")) if r.get("linked") is True else None
+            res = r
             continue
         say(line)
     p.wait()
-    return me if p.returncode == 0 else None
+    if not isinstance(res, dict) or res.get("linked") is not True or p.returncode != 0:
+        return {"linked": False, "me": None, "reason": (res or {}).get("reason") or "no_result"}
+    me = strip_device(res.get("me"))
+    return {"linked": bool(me), "me": me, "reason": None if me else "no_account"}
+
+
+def link_loop(io) -> str:
+    """Link until it works: an expired QR (or a dropped connection) offers a new one. Returns the linked
+    account's JID as WhatsApp gave it (it may be a private `@lid` id). Raises SetupStop."""
+    while True:
+        r = link_once(io.say)
+        if r.get("linked") and r.get("me"):
+            return r["me"]
+        reason = r.get("reason")
+        if reason in LINK_STOPS:
+            raise SetupStop(LINK_STOPS[reason])
+        q = "QR expired — show a new one?" if reason in ("qr_expired", "timeout") else \
+            "The link didn't complete — try again with a new QR?"
+        if not _yes(io, q, True):
+            raise SetupStop("not linked; run `mother whatsapp setup` again when you're ready to scan.")
+
+
+def _phone_from_manager(io, private_id) -> str:
+    """WhatsApp named the account by a private id: the manager types their number instead."""
+    io.say("WhatsApp gave MOTHER a private id for your account (%s), not your phone number." % private_id)
+    while True:
+        raw = io.ask("Your WhatsApp phone number, with country code (e.g. +972 50 000 0001): ").strip()
+        if not raw:
+            raise SetupStop("MOTHER needs your number to tell your own chat apart; run setup again with it.")
+        jid = phone_jid(raw)
+        if jid:
+            return jid
+        io.say("That isn't a phone number (6-15 digits with the country code).")
 
 
 def _step_install(io) -> None:
@@ -1521,14 +1598,11 @@ def _step_install(io) -> None:
 
 def _step_link(io) -> str:
     r = bridge_call({"op": "status"})
-    me = bare_jid(r.get("me")) if r.get("ok") and r.get("linked") else None
-    if me:
-        io.say("Linked: your WhatsApp account %s." % me)
-        return me
-    io.say("Link MOTHER as a device on your phone: WhatsApp > Settings > Linked devices > Link a device.")
-    me = bare_jid(link_account(io.say))
-    if not me:
-        raise SetupStop("the link didn't complete; run `mother whatsapp setup` again to get a fresh QR.")
+    got = strip_device(r.get("me")) if r.get("ok") and r.get("linked") else None
+    if not got:
+        io.say("Link MOTHER as a device on your phone: WhatsApp > Settings > Linked devices > Link a device.")
+        got = link_loop(io)
+    me = bare_jid(got) or _phone_from_manager(io, got)
     io.say("Linked: your WhatsApp account %s." % me)
     return me
 
@@ -1615,6 +1689,8 @@ def _resolve_chat(cfg: dict, arg: str, io):
     if re.fullmatch(r"\d{1,2}", arg):
         if not chats or not 1 <= int(arg) <= len(chats):
             raise SetupStop("%s is not a number on the list (run `mother whatsapp allow` to see it)" % arg)
+        if chats[int(arg) - 1].get("hidden"):
+            raise SetupStop("%s (id hidden by WhatsApp) can't be allowed yet" % _chat_name(chats[int(arg) - 1]))
         return chats[int(arg) - 1]
     jid = arg if ALLOW_JID_RE.fullmatch(arg) else phone_jid(arg)
     if not jid:
@@ -1714,6 +1790,22 @@ def disallow_chat(ws: Path, validate, io, args) -> int:
         return 2
 
 
+def _interruptible(name, f):
+    """Ctrl-C at any prompt: exit 130 with one plain line. Every write is atomic, so the config is whole."""
+    def run(ws, validate, io, args=None):
+        try:
+            return f(ws, validate, io, args)
+        except KeyboardInterrupt:
+            io.say("\n%s stopped; nothing more was changed" % name)
+            return 130
+    run.__name__ = f.__name__
+    run.__doc__ = f.__doc__
+    return run
+
+
+setup = _interruptible("setup", setup)
+allow_chat = _interruptible("allow", allow_chat)
+disallow_chat = _interruptible("disallow", disallow_chat)
 TERMINAL_COMMANDS = {"setup": setup, "allow": allow_chat, "disallow": disallow_chat}
 
 READ_COMMANDS = {"read": cmd_read, "chats": cmd_chats}

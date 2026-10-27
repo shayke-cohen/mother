@@ -259,7 +259,18 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   - `mother whatsapp setup|allow|disallow` (a resolved `mother` command whose subcommand is one of these, in any
     position on the line) is `terminal`: denied, in every mode, with "run it in your own terminal". They write
     `whatsapp.allow`, `self_jid` and `approve_via`, which are safety controls: the agent never widens them. The
-    manager runs them in a terminal (or Claude Code's `!` prefix, which no hook sees; the CLI still wants a TTY).
+    manager runs them in their own terminal app; Claude Code's `!` prefix gives no TTY, so they refuse there.
+    Commands that give another command a terminal are read as wrappers: `script [opts] [file [command…]]`
+    (and `script -c CMD`) is unwrapped and its command judged as usual (a wrapped `mother whatsapp` command is
+    denied, like `nohup`); `expect`, `tmux`, `screen`, `dtach`, `abduco`, `ptyexec`, `pty`, `rlwrap`, `empty`
+    on a line that names `mother` and `whatsapp` deny; `socat` on a line about WhatsApp denies (above).
+  - **The `whatsapp` block of `config.json` is the manager's.** A Write, Edit, MultiEdit or NotebookEdit of
+    `<ws>/config.json` (realpath, casefolded) whose result changes the parsed `whatsapp` value (absent = absent;
+    any change, narrowing too) is `terminal`: denied in every mode. Edit/MultiEdit are applied in memory to the
+    current text in order (`replace_all` honoured); a result that doesn't parse counts as a change when the
+    file has a block today; an Edit whose old text isn't in the file, a Write without `content` and an edit
+    that keeps the block keep the existing self-edit ask. A shell write that names `config.json` (the self-edit
+    rule below) is `terminal` (deny) while the file holds a `whatsapp` block, and the old ask otherwise.
   - **State is off-limits to the agent.** The protected folders are `<ws>/.mother/whatsapp/`,
     `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`) and `~/.mother/whatsapp/`; every path
     comparison is case-insensitive (casefolded after `realpath`), here and for the guard's own files below.
@@ -537,23 +548,36 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
     problem stops with its hint), then stop a running bridge. (b) Link: ask the bridge (`status`, started on
     demand) whether it is linked; if not, run `bridge.mjs --link` with the QR passed through to the terminal.
     `--link` ends with one JSON line on stdout, `{"linked": true, "me": "<jid>"}` (device suffix stripped) or
-    `{"linked": false}`; the manager's `self_jid` is that `me` (or the linked `status.me`, suffix stripped).
-    No JID: stop, nothing written. (c) Config: set `whatsapp.enabled: true` and `self_jid` in one write, keep
+    `{"linked": false, "reason"}`, `reason` one of `qr_expired` (WhatsApp closed with 408), `logged_out` (401),
+    `replaced` (440), `network` (any other close), `timeout` (no scan in 180 s), `no_account`. In link mode a
+    close other than 515 (restart after a scan) ends the attempt: no reconnect, so no code is shown that the
+    window then kills. On `qr_expired`, `timeout` or `network` setup and `link` ask "QR expired — show a new
+    one? [Y/n]" (or "try again") and run a fresh attempt; `logged_out`, `replaced`, `no_account` stop with a
+    plain sentence. In link mode the bridge writes its structured lines to `<state>/whatsapp/bridge.log` only;
+    the terminal gets the QR, the line "Open WhatsApp → Settings → Linked devices → Link a device first; each
+    code lasts about 20 seconds." before the first code, and one plain sentence per outcome. The bridge's
+    `me()` prefers the phone JID (`user.id`, else `creds.me.id`). The manager's `self_jid` is that `me` (or the
+    linked `status.me`), suffix stripped; when WhatsApp gives only a private `@lid` id, setup says so and asks
+    the manager to type their number (digits with country code). No JID: stop, nothing written. (c) Config: set `whatsapp.enabled: true` and `self_jid` in one write, keep
     `allow` and every other key, set `approve_via: ["session"]` when absent, leave the caps alone. (d) Database:
     probe it; `denied` prints the Full Disk Access instruction and stops (exit 2), `missing` says to install and
     sign in to WhatsApp desktop and stops. (e) Chats: show up to 15 recent chats from `ZWACHATSESSION` (name,
     DM/group, last message date; never a message; not `self_jid`, only JIDs `validate` accepts, only chats with a
-    last message), numbered, marking ones already allowed; the manager types numbers (`1 4`) or Enter to skip;
+    last message), numbered, marking ones already allowed; chats WhatsApp keys by a private `@lid` id are
+    listed "(id hidden by WhatsApp)" and skipped with a note when picked; the manager types numbers (`1 4`) or Enter to skip;
     chosen chats are added as `{jid, name, group?}`. (f) Approval paths: `session` always; offer `self_chat`;
     offer `slack_dm` only when `manager.chat_dm` is set; write `approve_via` in the order `session`,
     `self_chat`, `slack_dm`. (g) A summary and the next step. Every write re-reads `config.json`, runs the full
     `validate()` and writes only a valid config, atomically (temp file + rename, mode kept), `indent=2`,
     `ensure_ascii=False`, trailing newline, key order kept. An invalid config (from any key) is never written:
-    setup prints the errors and exits 2. Exit 0 when done, 2 when a step stops.
+    setup prints the errors and exits 2. Every read-modify-write holds an exclusive `flock` on
+    `<ws>/.mother/config.lock` (git-ignored, so never synced). Exit 0 when done, 2 when a step stops, 130 on
+    Ctrl-C ("setup stopped; nothing more was changed"; `allow` and `disallow` the same), which never leaves a
+    half-written config.
   - **`mother whatsapp allow [<number>|<jid>|<n>] [--name NAME]`** adds one chat: a phone number (`+`, spaces,
     `-`, `(`, `)` dropped; 6-15 digits) becomes `<digits>@s.whatsapp.net`; a 1-2 digit `<n>` is the n-th chat of
     setup's list; with no argument it shows that list and asks. The name comes from `--name`, else the chat's
-    name in the database, else a prompt. It refuses (exit 2) before setup has set `self_jid`, `self_jid` itself, a JID `validate` rejects, and a chat
+    name in the database, else a prompt. It refuses (exit 2) a hidden-id (`@lid`) chat, before setup has set `self_jid`, `self_jid` itself, a JID `validate` rejects, and a chat
     the readable database holds no message in (no cold contact); an unreadable database adds it with a note.
     An already allowed JID is left as is. **`mother whatsapp disallow <jid|number>`** removes it (exit 1 if
     absent). Both write like setup.
