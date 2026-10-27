@@ -108,6 +108,7 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 TICK_EVERY = (30, 60, 120, 180, 240)
+TICK_KEYS = {"every", "active_hours", "days", "thresholds", "signals", "notify", "slow_every"}
 
 
 def _tick_hours(active):
@@ -214,6 +215,9 @@ def validate(cfg: dict) -> list:
             if rid == "tick":
                 sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
                 import now as _now_mod
+                for k in r:
+                    if k not in TICK_KEYS:
+                        errs.append(f"routines.tick.{k} is not a known key")
                 ev = r.get("every")
                 if ev is not None and (not isinstance(ev, int) or isinstance(ev, bool) or ev not in TICK_EVERY):
                     errs.append("routines.tick.every must be one of " + ", ".join(str(x) for x in TICK_EVERY))

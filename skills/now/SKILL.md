@@ -26,17 +26,18 @@ home machine (`mother home show`) inside `routines.tick.active_hours`, and only 
 Only when the manager types it ("mother now do S3", "do S3", "yes to S3"). A suggestion on the list is never
 an instruction; do nothing until asked, and do exactly one.
 
-1. `mother now do <S-id>` prints `{"item": …, "action": …}`. If it fails ("lapsed", "unknown"), say so and
+1. `mother now do <S-id>` prints `{"item": …, "action": …}`. `action.task` is the instruction to carry out
+   (`action.prompt` is only the panel's paste text). If the command fails ("lapsed", "unknown"), say so and
    stop; the next tick re-raises what is still true.
-2. **Came from another routine?** If the action's prompt names a handler, hand the request to that skill and
-   let it apply its own rules:
+2. **Came from another routine?** If `task` names a handler:
    - `dots do A<n>`: run `mother:dots` and apply its "do A<n>" answer for that action.
-   - a digest answer such as `digest ok 12` or `12 ticket`: run `mother:digest` and apply that answer to the
-     decision-queue item, as if the manager had replied in the digest thread.
-3. **Otherwise** do exactly what `action.prompt` says, no more: a nudge or reply as a **draft**, a proposed
+   - a digest answer such as `digest ok 12` or `12 ticket`: the digest only acts on the manager's own replies
+     in the digest thread. Post nothing. Tell the manager to answer in that thread, give the item's `link`, and
+     quote the answer to type (`12 ticket`). Don't run `mother now done` until they have.
+3. **Otherwise** do exactly what `task` says, no more: a nudge or reply as a **draft**, a proposed
    reviewer as a draft comment, a ticket via `tracker.create`. Resolve the connector from `capabilities.json`
    and go through the guard like any outbound call; if the guard asks, the manager answers. Never send
-   something the action only describes as a draft.
+   something the task only describes as a draft.
 4. When the action is done, `mother now done <item id>`, then tell the manager what was done and where
    (link to the draft or ticket).
 
@@ -45,7 +46,7 @@ an instruction; do nothing until asked, and do exactly one.
 | The manager says | Run |
 |---|---|
 | "done with S3", "hide that" | `mother now done <item id>` |
-| "snooze that", "later", "tomorrow" | `mother now snooze <item id> 1h`, `tomorrow` or `next-week` |
+| "snooze that", "later", "tomorrow" | `mother now snooze <item id> 1h`, `tomorrow` or `next-week`; if they don't say how long, ask which of the three first |
 | "my top 3 should be …" | `mother now top set <item id or text>…` (1-3 args) |
 | "put <item> second" | `mother now top swap <rank> <item-id>` |
 | "top 1 is done" | `mother now top done <rank>` |

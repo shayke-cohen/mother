@@ -495,6 +495,7 @@ class CliTest(unittest.TestCase):
                          ({"every": 60.0}, "routines.tick.every must be one of 30, 60, 120, 180, 240"),
                          ({"days": "monthly:1"}, "routines.tick.days must be workdays, all, a day, or a list of days"),
                          ({"notify": "email"}, "routines.tick.notify must be none or dm"),
+                         ({"at": "09:00"}, "routines.tick.at is not a known key"),
                          ({"slow_every": 7}, "routines.tick.slow_every must be an integer 1-6")):
             r = status_with(bad)
             self.assertNotEqual(r.returncode, 0, bad)

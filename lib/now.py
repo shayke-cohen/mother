@@ -300,7 +300,8 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
             if aid is None:
                 aid = "S%d" % next_action
                 next_action += 1
-            actions.append({"id": aid, "label": a["label"], "prompt": "mother now do %s" % aid})
+            actions.append({"id": aid, "label": a["label"], "prompt": "mother now do %s" % aid,
+                            "task": str(a.get("prompt") or a["label"])})
         first_seen = old["first_seen"] if old else _iso(now)
         if section == "suggestion" and working_hours(since, now, s) >= lapse:
             continue

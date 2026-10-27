@@ -135,7 +135,7 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    - `title` is a short paraphrase naming the work; `why` is **one line of facts, no message bodies** ("Asked 6
      working hours ago; the release is blocked on it"). A person is named only as the work needs, never with a
      count, score or judgement. `also` holds other keys for the same work (a ticket for a PR).
-   - `actions` come only from these kinds, each a tick-owned suggestion the `mother:now` skill will run on
+   - `actions` are `{"label","prompt"}` (merge stores your `prompt` as the action's `task` and gives the panel its own `mother now do <S-id>` prompt). They come only from these kinds, each a tick-owned suggestion the `mother:now` skill will run on
      the manager's yes: a nudge **draft** in the manager's DM or a mail draft (never sent); a proposed
      reviewer for an unreviewed PR as a draft comment; a ticket for a meeting action item (tracker create,
      via grant or approval); a draft question to the person out today about reassigning their in-progress

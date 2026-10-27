@@ -149,7 +149,7 @@ class Merge(unittest.TestCase):
         c = cand("review_requested", actions=acts)
         first = now.merge(inp(c), None, {}, CFG, NOW)
         self.assertEqual(first["items"][0]["actions"],
-                         [{"id": "S1", "label": "Nudge", "prompt": "mother now do S1"}])
+                         [{"id": "S1", "label": "Nudge", "prompt": "mother now do S1", "task": "x"}])
         self.assertEqual(first["next_action"], 2)
         other = cand("mail_needs_reply", link="m1", kind="mail", actions=acts)
         second = now.merge(inp(c, other), first, {}, CFG, NOW + H)
@@ -590,6 +590,7 @@ class NowCli(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout)
         self.assertEqual(out["action"]["id"], "S1")
+        self.assertIn("task", out["action"])
         self.assertEqual(out["item"]["signal"], "review_requested")
 
     def test_do_unknown_exits_2(self):

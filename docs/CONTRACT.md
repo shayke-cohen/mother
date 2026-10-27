@@ -38,7 +38,7 @@ journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for co
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
 .mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs),
                            now.json (the tick's Now list: items, Top 3, coverage; ids and links, no message bodies, no per-person counts),
-                           now-state.json (the manager's done/snooze/Top 3 edits and which toasts fired), now.lock (serialises both); all written atomically
+                           now-state.json (the manager's done/snooze/Top 3 edits and which toasts fired), now.lock (serialises both); all written atomically. Each item's `actions[]` is `{id (S<n>), label, prompt, task}`: `prompt` is always `mother now do <id>` (what the panel pastes); `task` is the routine's original instruction (`dots do A3`, `digest ok 12`, `draft a nudge to …`) that `mother now do` prints for the `mother:now` skill
 ```
 
 ## 2. Finding each other
@@ -54,7 +54,7 @@ runs.md                    one line per routine run: `- <ISO> <routine> <ok|part
   `manager.timezone`.
 - **Interval routines** (only `tick`) have `every` (minutes) and `active_hours` instead of `at`. `mother register`
   emits a cron with slots at minute :05 (and :35 for `every: 30`), one per `every` inside `active_hours`
-  (`5 6-21 * * 1-5` for the defaults), in the machine's local time. `mother runs` judges `tick` missed only
+  (`5 6-21 * * 1,2,3,4,5` for the defaults), in the machine's local time. `mother runs` judges `tick` missed only
   inside active hours on a scheduled day, once 2x `every` has passed after the day's first slot with no `runs.md`
   line in 2x `every`.
 - A routine whose frontmatter says `sync: false` (`tick`) is machine-local: its pointer **omits** the
