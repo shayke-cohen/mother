@@ -3,7 +3,8 @@
 // after the manager's proven yes, and nothing else. docs/CONTRACT.md §5d.
 //
 //   node bridge.mjs            serve on <state>/whatsapp/bridge.sock (0600, no TCP)
-//   node bridge.mjs --link     print the QR in this terminal, exit once linked
+//   node bridge.mjs --link     print the QR in this terminal, exit once linked; the last stdout line is
+//                              {"linked": true, "me": "<jid>"} (device suffix stripped) or {"linked": false}
 //   node bridge.mjs --unlink   log the device out and delete <state>/whatsapp/session/
 //
 // <state> = $MOTHER_STATE_DIR or ~/.mother. The workspace is $MOTHER_WORKSPACE, else the <state>/workspace
@@ -416,25 +417,37 @@ export async function connectWhatsApp({ sessionDir, mode = "serve", onQR = () =>
   };
 }
 
-async function runLink(loc) {
+/** A user JID without its device suffix ("<digits>:<device>@s.whatsapp.net" -> "<digits>@s.whatsapp.net"). */
+export function bareJid(jid) {
+  return typeof jid === "string" && jid ? jid.replace(/:\d+(?=@)/, "") : null;
+}
+
+/**
+ * Pair a linked device: the QR goes to this terminal, then one JSON line on stdout says how it went, for
+ * `mother whatsapp setup` to learn the manager's own JID: {"linked": true, "me": "<jid>"} or {"linked": false}.
+ * `connect`, `qr`, `out`, `err` and `settleMs` are for tests.
+ */
+export async function runLink(loc, { connect = connectWhatsApp, qr = null, out = (l) => console.log(l),
+                                     err = (l) => console.error(l), settleMs = 2_000 } = {}) {
   if (fs.existsSync(loc.sock) && await alive(loc.sock)) {
-    console.error("The bridge is running; stop it before linking again.");
+    err("The bridge is running; stop it before linking again.");
     return 1;
   }
-  const { default: qrcode } = await import("qrcode-terminal");
-  const client = await connectWhatsApp({
+  const qrcode = qr || (await import("qrcode-terminal")).default;
+  const client = await connect({
     sessionDir: loc.session, mode: "link",
-    onQR: (qr) => {
-      console.log("\nWhatsApp > Settings > Linked devices > Link a device, then scan:\n");
-      qrcode.generate(qr, { small: true });
+    onQR: (code) => {
+      out("\nWhatsApp > Settings > Linked devices > Link a device, then scan:\n");
+      qrcode.generate(code, { small: true });
     },
   });
   const ok = await client.waitOpen(180_000);
-  await new Promise((r) => setTimeout(r, 2_000));  // let the last creds.update land on disk
+  const me = ok ? bareJid(client.me()) : null;  // read while the connection is open
+  await new Promise((r) => setTimeout(r, settleMs));  // let the last creds.update land on disk
   client.close();
-  tighten(loc.session);
-  console.log(ok ? "linked" : "not linked");
-  return ok ? 0 : 1;
+  if (fs.existsSync(loc.session)) tighten(loc.session);
+  out(JSON.stringify(ok && me ? { linked: true, me } : { linked: false }));
+  return ok && me ? 0 : 1;
 }
 
 async function runUnlink(loc) {
@@ -527,6 +540,8 @@ export async function main(argv = process.argv.slice(2)) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().then((code) => { if (typeof code === "number") process.exit(code); },
+  // exit only once stdout is flushed: on macOS a pipe is written asynchronously, and setup reads the last line
+  const exit = (code) => process.stdout.write("", () => process.exit(code));
+  main().then((code) => { if (typeof code === "number") exit(code); },
     (e) => { process.stderr.write("bridge: " + errCode(e) + "\n"); process.exit(1); });
 }

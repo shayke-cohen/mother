@@ -147,6 +147,8 @@ Useful commands in your terminal:
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
 | `mother channels pause` / `resume` | Stop or restart replies in every channel |
+| `mother whatsapp setup` | One guided WhatsApp setup, in your own terminal: installs and links the bridge, turns WhatsApp on for your account, checks database access, lets you pick chats from your recent ones and the ways you approve sends. Safe to re-run |
+| `mother whatsapp allow <number>` / `disallow <number>` | Add a chat to (or remove one from) the WhatsApp allowlist, in your own terminal; MOTHER can't run these |
 | `mother whatsapp install` | Install the optional WhatsApp bridge into `~/.mother/whatsapp/app` (Node 20+, runs `npm ci`; repeat after a plugin update when `status` says `reinstall_needed`) |
 | `mother whatsapp link` / `unlink` | Pair the bridge (run it in your own terminal: the QR needs one) / log it out and delete its keys; both stop a running bridge first (`mother whatsapp stop`) |
 | `mother whatsapp status` | Is the bridge linked, and is the local WhatsApp database readable (no messages shown) |

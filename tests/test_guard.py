@@ -1467,5 +1467,29 @@ class TestWhatsappFixRound4(WhatsappCase):
         self.pass_all(["git clean -fdx"], cwd=os.path.join(ws, "memory"))
 
 
+
+class TestWhatsappTerminalOnly(WhatsappCase):
+    """Task 7b: setup, allow and disallow change who MOTHER may message; the agent never runs them."""
+
+    def test_setup_allow_disallow_are_denied_to_the_agent_in_every_mode(self):
+        lines = ["mother whatsapp setup", "mother whatsapp allow +972-50-000-0001",
+                 "mother whatsapp allow 3 --name Dana", "mother whatsapp allow", "mother whatsapp disallow %s" % WA_DM,
+                 "python3 /opt/plugin/bin/mother whatsapp setup", '"${CLAUDE_PLUGIN_ROOT}/bin/mother" whatsapp allow 1',
+                 "mother whatsapp list && mother whatsapp allow 2", "echo 1 | mother whatsapp allow",
+                 "mother whatsapp SETUP", "MOTHER_STATE_DIR=/tmp/x mother whatsapp setup",
+                 "cd /tmp && mother whatsapp disallow %s" % WA_DM]
+        for cmd in lines:
+            for mode in (None, self.BY):
+                got, why = self.wa(cmd, mode=mode)
+                self.assertEqual(got, "deny", "%r %s -> %s (%s)" % (cmd, mode, got, why))
+                self.assertIn("own terminal", why, cmd)
+        self.assertEqual(self.last_log()["decision"], "deny")
+
+    def test_other_subcommands_unchanged(self):
+        for cmd in ("mother whatsapp status", "mother whatsapp link", "mother whatsapp chats",
+                    "grep -n 'whatsapp setup' docs/CONTRACT.md", "git commit -m 'whatsapp: setup'"):
+            self.assertEqual(self.wa(cmd)[0], "none", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

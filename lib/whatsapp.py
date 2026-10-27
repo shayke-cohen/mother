@@ -17,6 +17,12 @@ Commands:
   install                            copy the bridge out of the plugin into <state>/whatsapp/app and npm ci there
   stop                               stop a running bridge (link and unlink do it first)
   link | unlink                      pair the bridge with WhatsApp (QR in this terminal) | log it out, delete keys
+  setup                              the manager's guided setup, in their own terminal: install, link, learn
+                                     self_jid, write the whatsapp block, check database access, pick chats,
+                                     pick approval paths. Safe to re-run
+  allow [NUMBER|JID|N] [--name NAME] add one chat to whatsapp.allow (N = the n-th chat setup lists; no argument:
+                                     show that list and ask). Own terminal only
+  disallow JID|NUMBER                remove a chat from whatsapp.allow. Own terminal only
   status                             bridge state and whether the local database is readable (JSON)
   verify ID [--sha256 HEX]           exit 0 only if approved/ID.json still proves a yes, on the path it
                                      records, for the draft's current text (and HEX, the hash the bridge is
@@ -1010,15 +1016,12 @@ def _run_npm(folder: Path, node: str) -> int:
     return subprocess.call(["npm", "ci", "--ignore-scripts", "--omit=dev"], cwd=str(folder), env=env)
 
 
-def cmd_install(cfg, args, ws):
+def install_bridge() -> dict:
+    """Copy the bridge out of the plugin into app_dir() and npm ci there. {"ok": True, "app"} or an error reply."""
     import shutil
-    if args:
-        _fail("usage: mother whatsapp install")
     node = _node()
     if not node or _node_major(node) < MIN_NODE:
-        prob = bridge_problem() or ("node_too_old", "")
-        print(json.dumps(_problem_reply(prob)))
-        sys.exit(2)
+        return _problem_reply(bridge_problem() or ("node_too_old", ""))
     dest = app_dir()
     dest.mkdir(parents=True, exist_ok=True)
     os.chmod(str(dest.parent), 0o700)
@@ -1026,9 +1029,17 @@ def cmd_install(cfg, args, ws):
         shutil.copyfile(str(BRIDGE_SRC / n), str(dest / n))
     code = _run_npm(dest, node)
     if code != 0:
-        print(json.dumps({"ok": False, "error": "npm_failed", "code": code}))
+        return {"ok": False, "error": "npm_failed", "code": code}
+    return {"ok": True, "app": str(dest)}
+
+
+def cmd_install(cfg, args, ws):
+    if args:
+        _fail("usage: mother whatsapp install")
+    r = install_bridge()
+    print(json.dumps(r))
+    if not r.get("ok"):
         sys.exit(2)
-    print(json.dumps({"ok": True, "app": str(dest)}))
 
 
 def _exchange(req: dict, timeout: float) -> dict:
@@ -1293,19 +1304,28 @@ def cmd_link(sub, args) -> int:
     return subprocess.call(_bridge_argv("--" + sub), env=env)
 
 
-def cmd_status(cfg, args):
-    if args:
-        _fail("usage: mother whatsapp status")
-    read = {"db_reachable": True}
+FDA_HINT = ("grant Full Disk Access to the app that runs Claude Code (your terminal or the desktop app) in "
+            "System Settings > Privacy & Security > Full Disk Access")
+
+
+def db_check() -> dict:
+    """{"db_reachable": True} or {"db_reachable": False, "reason", "hint"?}. Reads no message."""
     try:
         _query("SELECT 1 FROM ZWACHATSESSION LIMIT 1")
     except ReaderError as e:
         read = {"db_reachable": False, "reason": e.reason}
         if e.reason == "denied":
-            read["hint"] = ("grant Full Disk Access to the app that runs Claude Code (your terminal or the "
-                            "desktop app) in System Settings > Privacy & Security > Full Disk Access")
+            read["hint"] = FDA_HINT
+        return read
     except Exception:
-        read = {"db_reachable": False, "reason": "error"}
+        return {"db_reachable": False, "reason": "error"}
+    return {"db_reachable": True}
+
+
+def cmd_status(cfg, args):
+    if args:
+        _fail("usage: mother whatsapp status")
+    read = db_check()
     out = {"bridge": bridge_call({"op": "status"}, start=False), "read": read}
     if reinstall_needed():
         out["reinstall_needed"] = True
@@ -1313,27 +1333,421 @@ def cmd_status(cfg, args):
     print(json.dumps(out, indent=2))
 
 
+# ---------------------------------------------------------------- setup, allow, disallow (the manager's terminal)
+
+ALLOW_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us", re.ASCII)  # = bin/mother WA_JID_RE
+SETUP_CHATS = 15
+PATH_ORDER = ("session", "self_chat", "slack_dm")
+
+
+class TerminalIO(object):
+    """The manager's terminal. Tests pass an object with the same two methods."""
+
+    def ask(self, prompt):
+        try:
+            return input(prompt)
+        except EOFError:
+            return ""
+
+    def say(self, text=""):
+        print(text, flush=True)
+
+
+class SetupStop(Exception):
+    """A step can't go on; the message says what to do."""
+
+
+def bare_jid(jid):
+    """A user JID without its device suffix, or None when it isn't one."""
+    if not isinstance(jid, str):
+        return None
+    j = re.sub(r":\d+(?=@)", "", jid.strip())
+    return j if re.fullmatch(r"\d{6,15}@s\.whatsapp\.net", j, re.ASCII) else None
+
+
+def phone_jid(text):
+    """`+972-50-000-0001` -> `972500000001@s.whatsapp.net`; None unless it is 6-15 digits after dropping + - ( ) and
+    spaces."""
+    if not isinstance(text, str):
+        return None
+    digits = re.sub(r"[\s+()\-]", "", text)
+    return digits + "@s.whatsapp.net" if re.fullmatch(r"\d{6,15}", digits, re.ASCII) else None
+
+
+def _load_cfg(ws: Path) -> dict:
+    try:
+        cfg = json.loads((Path(ws) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SetupStop("can't read %s: %s" % (Path(ws) / "config.json", e))
+    if not isinstance(cfg, dict):
+        raise SetupStop("config.json is not a JSON object")
+    return cfg
+
+
+def save_whatsapp(ws: Path, validate, change) -> dict:
+    """Re-read config.json, let `change(block)` edit the whatsapp block, validate the whole config and write it
+    atomically (temp file + rename, mode kept). An invalid result is never written: SetupStop with the errors."""
+    path = Path(ws) / "config.json"
+    cfg = _load_cfg(ws)
+    wa = cfg.get("whatsapp")
+    wa = dict(wa) if isinstance(wa, dict) else {}
+    change(wa)
+    cfg["whatsapp"] = wa
+    errs = validate(cfg) if validate else ["no validator"]
+    if errs:
+        raise SetupStop("config.json would not be valid, so nothing was written:\n  " + "\n  ".join(errs) +
+                        "\nFix it (ask MOTHER: /mother:setup), then run this again.")
+    tmp = path.with_name(".config.json.%d.tmp" % os.getpid())
+    try:
+        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            os.chmod(str(tmp), path.stat().st_mode & 0o777)
+        except OSError:
+            pass
+        os.replace(str(tmp), str(path))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return cfg
+
+
+def pickable_chats(cfg: dict, limit: int = SETUP_CHATS) -> list:
+    """Recent chats the manager may allow: not the self chat, a JID config accepts, a last message (history).
+    Names and dates only. Raises ReaderError."""
+    me = _wa(cfg).get("self_jid")
+    out = []
+    for c in recent_chats(limit * 4):
+        if c["jid"] == me or not c["last_at"] or not ALLOW_JID_RE.fullmatch(c["jid"] or ""):
+            continue
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _chat_name(c: dict) -> str:
+    if c.get("name"):
+        return c["name"]
+    return "+" + c["jid"].split("@")[0] if not c.get("group") else "group " + c["jid"].split("@")[0]
+
+
+def _allow_entry(c: dict, name: str = None) -> dict:
+    e = {"jid": c["jid"], "name": name or _chat_name(c)}
+    if c.get("group") or c["jid"].endswith("@g.us"):
+        e["group"] = True
+    return e
+
+
+def _show_chats(io, chats: list, allowed: set) -> None:
+    for n, c in enumerate(chats, 1):
+        io.say("  %2d. %s  (%s, last %s)%s" % (n, _chat_name(c), "group" if c["group"] else "DM",
+                                               (c["last_at"] or "")[:10], "  [allowed]" if c["jid"] in allowed else ""))
+
+
+def _pick(io, chats: list) -> list:
+    """Numbers the manager types (`1 4`, commas fine), asked again until each is on the list; Enter = none."""
+    while True:
+        raw = io.ask("Chats MOTHER may read and draft to (numbers, e.g. `1 4`; Enter to skip): ").strip()
+        if not raw:
+            return []
+        toks = [t for t in re.split(r"[\s,]+", raw) if t]
+        if all(t.isdigit() and 1 <= int(t) <= len(chats) for t in toks):
+            return [chats[int(t) - 1] for t in dict.fromkeys(toks)]
+        io.say("Type numbers from 1 to %d, separated by spaces." % len(chats))
+
+
+def _yes(io, question: str, default: bool) -> bool:
+    while True:
+        a = io.ask("%s [%s] " % (question, "Y/n" if default else "y/N")).strip().lower()
+        if not a:
+            return default
+        if a in ("y", "yes"):
+            return True
+        if a in ("n", "no"):
+            return False
+        io.say("Answer y or n.")
+
+
+def _db_stop(read: dict) -> str:
+    reason = read.get("reason")
+    if reason == "denied":
+        return "MOTHER can't read WhatsApp's database: %s, then run this again." % FDA_HINT
+    if reason == "missing":
+        return ("WhatsApp's database isn't at %s: install WhatsApp desktop from the App Store, sign in, let it "
+                "sync, then run this again." % db_path())
+    if reason == "locked":
+        return "WhatsApp's database is busy; run this again in a moment."
+    return "WhatsApp's database can't be read (%s); MOTHER may need an update for this WhatsApp version." % reason
+
+
+def link_account(say) -> str:
+    """Run `bridge.mjs --link` here: the QR passes through to the terminal, and the bridge's last stdout line
+    {"linked": true, "me": ...} names the linked account. Returns its bare JID, or None."""
+    import subprocess
+    stop_bridge()  # a running bridge would hold the old session (and block the link)
+    env = dict(os.environ)
+    env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)
+    p = subprocess.Popen(_bridge_argv("--link"), stdout=subprocess.PIPE, env=env)  # stdin, stderr: the terminal
+    me = None
+    for raw in p.stdout:
+        line = raw.decode("utf-8", "replace").rstrip("\n")
+        try:
+            r = json.loads(line) if line.startswith("{") else None
+        except ValueError:
+            r = None
+        if isinstance(r, dict) and "linked" in r:
+            me = bare_jid(r.get("me")) if r.get("linked") is True else None
+            continue
+        say(line)
+    p.wait()
+    return me if p.returncode == 0 else None
+
+
+def _step_install(io) -> None:
+    prob = bridge_problem()
+    if prob and prob[0] != "bridge_not_installed":
+        raise SetupStop(prob[1])
+    if not prob and not reinstall_needed():
+        io.say("Bridge: installed.")
+        return
+    io.say("Installing the WhatsApp bridge (Node packages from the npm registry; a minute or two)...")
+    r = install_bridge()
+    if not r.get("ok"):
+        raise SetupStop("the bridge didn't install (%s%s). Fix that, then run this again." % (
+            r.get("error"), (": " + r["hint"]) if r.get("hint") else ""))
+    stop_bridge()  # an old copy may still be running
+    io.say("Bridge: installed in %s." % app_dir())
+
+
+def _step_link(io) -> str:
+    r = bridge_call({"op": "status"})
+    me = bare_jid(r.get("me")) if r.get("ok") and r.get("linked") else None
+    if me:
+        io.say("Linked: your WhatsApp account %s." % me)
+        return me
+    io.say("Link MOTHER as a device on your phone: WhatsApp > Settings > Linked devices > Link a device.")
+    me = bare_jid(link_account(io.say))
+    if not me:
+        raise SetupStop("the link didn't complete; run `mother whatsapp setup` again to get a fresh QR.")
+    io.say("Linked: your WhatsApp account %s." % me)
+    return me
+
+
+def setup(ws: Path, validate, io, args=None) -> int:
+    """`mother whatsapp setup`. Returns the exit code: 0 done, 2 a step stopped."""
+    if args:
+        io.say("usage: mother whatsapp setup")
+        return 2
+    try:
+        _load_cfg(ws)
+        _step_install(io)
+        me = _step_link(io)
+
+        def enable(wa):
+            if wa.get("self_jid") and wa["self_jid"] != me:
+                io.say("whatsapp.self_jid was %s; the linked account is %s, so it is now that." % (wa["self_jid"], me))
+            wa["enabled"] = True
+            wa["self_jid"] = me
+            wa.setdefault("allow", [])
+            wa.setdefault("approve_via", ["session"])
+        cfg = save_whatsapp(ws, validate, enable)
+        io.say("Config: whatsapp is on for %s." % me)
+
+        read = db_check()
+        if not read["db_reachable"]:
+            raise SetupStop(_db_stop(read))
+        io.say("Database: readable.")
+
+        try:
+            chats = pickable_chats(cfg)
+        except ReaderError as e:
+            raise SetupStop(_db_stop({"reason": e.reason}))
+        allowed = {a.get("jid") for a in _wa(cfg).get("allow") or [] if isinstance(a, dict)}
+        if chats:
+            io.say("")
+            io.say("Your recent chats (names and dates only):")
+            _show_chats(io, chats, allowed)
+            new = [c for c in _pick(io, chats) if c["jid"] not in allowed]
+            if new:
+                cfg = save_whatsapp(ws, validate, lambda wa: wa.setdefault("allow", []).extend(
+                    _allow_entry(c) for c in new))
+                io.say("Allowed: %s." % ", ".join(_chat_name(c) for c in new))
+        else:
+            io.say("No recent chats to offer; add one later with `mother whatsapp allow <number>`.")
+
+        io.say("")
+        io.say("Approving drafts: you can always reply `ok <id>` in a Claude session.")
+        via = approve_via(cfg)
+        want = {"session": True}
+        want["self_chat"] = _yes(io, "Also approve in your WhatsApp self chat (\"Message yourself\"): MOTHER posts "
+                                     "the drafts there and you reply `ok <id>`?", "self_chat" in via)
+        if _dm_channels(cfg):
+            want["slack_dm"] = _yes(io, "Also approve in your chat DM (manager.chat_dm): MOTHER posts the drafts "
+                                        "there and you reply `ok <id>`?", "slack_dm" in via)
+        else:
+            want["slack_dm"] = False
+        new_via = [p for p in PATH_ORDER if want.get(p)]
+        if new_via != _wa(cfg).get("approve_via"):
+            cfg = save_whatsapp(ws, validate, lambda wa: wa.__setitem__("approve_via", new_via))
+
+        names = [a.get("name") for a in _wa(cfg).get("allow") or [] if isinstance(a, dict)]
+        io.say("")
+        io.say("WhatsApp is set up: account %s; chats: %s; approve via: %s." % (
+            me, ", ".join(names) or "none yet", ", ".join(new_via)))
+        if names:
+            io.say("Next: in a Claude session, ask MOTHER to draft a WhatsApp message to %s; reply `ok <id>` to "
+                   "send it." % names[0])
+        else:
+            io.say("Next: add a chat with `mother whatsapp allow <number>`, then ask MOTHER in a Claude session to "
+                   "draft a message to it; reply `ok <id>` to send it.")
+        return 0
+    except SetupStop as e:
+        io.say("Stopped: %s" % e)
+        return 2
+
+
+def _resolve_chat(cfg: dict, arg: str, io):
+    """(entry, note) for `allow`'s argument, or raise SetupStop."""
+    try:
+        chats = pickable_chats(cfg)
+    except ReaderError:
+        chats = None
+    if re.fullmatch(r"\d{1,2}", arg):
+        if not chats or not 1 <= int(arg) <= len(chats):
+            raise SetupStop("%s is not a number on the list (run `mother whatsapp allow` to see it)" % arg)
+        return chats[int(arg) - 1]
+    jid = arg if ALLOW_JID_RE.fullmatch(arg) else phone_jid(arg)
+    if not jid:
+        raise SetupStop("%s is not a phone number, a WhatsApp JID or a list number" % arg)
+    for c in chats or []:
+        if c["jid"] == jid:
+            return c
+    try:
+        rows = _query("SELECT ZPARTNERNAME, ZSESSIONTYPE FROM ZWACHATSESSION WHERE ZCONTACTJID = ? LIMIT 1", [jid])
+    except ReaderError:
+        return {"jid": jid, "name": "", "group": jid.endswith("@g.us"), "unchecked": True}
+    if not rows or not has_history({"whatsapp": {}}, jid):
+        raise SetupStop("no cold contact: you have no chat with %s yet; message them yourself first" % arg)
+    return {"jid": jid, "name": rows[0][0] or "", "group": rows[0][1] == GROUP_SESSION}
+
+
+def allow_chat(ws: Path, validate, io, args) -> int:
+    """`mother whatsapp allow [NUMBER|JID|N] [--name NAME]`. Returns the exit code."""
+    usage = "usage: mother whatsapp allow [NUMBER|JID|N] [--name NAME]"
+    name, rest, i = None, [], 0
+    while i < len(args):
+        if args[i] == "--name" and i + 1 < len(args) and args[i + 1].strip():
+            name, i = args[i + 1].strip(), i + 2
+        elif args[i].startswith("-"):
+            io.say(usage)
+            return 2
+        else:
+            rest.append(args[i])
+            i += 1
+    if len(rest) > 1:
+        io.say(usage)
+        return 2
+    try:
+        cfg = _load_cfg(ws)
+        if not _wa(cfg).get("self_jid"):
+            raise SetupStop("run `mother whatsapp setup` first: it links your account, which tells your own self "
+                            "chat apart from the chats you allow")
+        if rest:
+            c = _resolve_chat(cfg, rest[0], io)
+        else:
+            try:
+                chats = pickable_chats(cfg)
+            except ReaderError as e:
+                raise SetupStop(_db_stop({"reason": e.reason}))
+            if not chats:
+                raise SetupStop("no recent chats to offer; give a number: mother whatsapp allow <number>")
+            allowed = {a.get("jid") for a in _wa(cfg).get("allow") or [] if isinstance(a, dict)}
+            _show_chats(io, chats, allowed)
+            picked = _pick(io, chats)
+            if not picked:
+                return 0
+            if len(picked) > 1:
+                for p in picked[1:]:
+                    io.say("One at a time: adding %s only; run it again for %s." % (_chat_name(picked[0]),
+                                                                                 _chat_name(p)))
+            c = picked[0]
+        if c["jid"] == _wa(cfg).get("self_jid"):
+            raise SetupStop("that is your own self chat, which carries approvals; it can't be allowed")
+        if any(isinstance(a, dict) and a.get("jid") == c["jid"] for a in _wa(cfg).get("allow") or []):
+            io.say("%s is already allowed." % c["jid"])
+            return 0
+        if not name and not c.get("name"):
+            name = io.ask("Name for %s: " % c["jid"]).strip()
+            if not name:
+                raise SetupStop("a chat needs a name")
+        entry = _allow_entry(c, name)
+        save_whatsapp(ws, validate, lambda wa: wa.setdefault("allow", []).append(entry))
+        io.say("Allowed: %s (%s)." % (entry["name"], entry["jid"]))
+        if c.get("unchecked"):
+            io.say("Note: couldn't check the database for history with it; drafts to it are refused until you have "
+                   "chatted (no cold contact).")
+        if not _wa(cfg).get("enabled"):
+            io.say("WhatsApp is still off: run `mother whatsapp setup`.")
+        return 0
+    except SetupStop as e:
+        io.say("Stopped: %s" % e)
+        return 2
+
+
+def disallow_chat(ws: Path, validate, io, args) -> int:
+    """`mother whatsapp disallow JID|NUMBER`. Returns the exit code (1 when it wasn't allowed)."""
+    if len(args) != 1:
+        io.say("usage: mother whatsapp disallow JID|NUMBER")
+        return 2
+    jid = args[0] if ALLOW_JID_RE.fullmatch(args[0]) else phone_jid(args[0])
+    try:
+        cfg = _load_cfg(ws)
+        if not jid or not any(isinstance(a, dict) and a.get("jid") == jid for a in _wa(cfg).get("allow") or []):
+            io.say("%s is not in whatsapp.allow." % args[0])
+            return 1
+        save_whatsapp(ws, validate, lambda wa: wa.__setitem__(
+            "allow", [a for a in wa.get("allow") or [] if not (isinstance(a, dict) and a.get("jid") == jid)]))
+        io.say("Removed %s from whatsapp.allow." % jid)
+        return 0
+    except SetupStop as e:
+        io.say("Stopped: %s" % e)
+        return 2
+
+
+TERMINAL_COMMANDS = {"setup": setup, "allow": allow_chat, "disallow": disallow_chat}
+
 READ_COMMANDS = {"read": cmd_read, "chats": cmd_chats}
 DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop, "pending": cmd_pending,
                   "verify": cmd_verify, "send": cmd_send, "prompt": cmd_prompt, "install": cmd_install,
                   "stop": cmd_stop}
 
 
-def main(argv, cfg=None, ws=None):
+def main(argv, cfg=None, ws=None, validate=None):
+    """`validate` is bin/mother's config validator: setup, allow and disallow write config.json only through it."""
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return
     cfg = cfg or {}
-    if argv[0] not in READ_COMMANDS and argv[0] not in DRAFT_COMMANDS and argv[0] not in ("status", "link", "unlink"):
+    if argv[0] not in READ_COMMANDS and argv[0] not in DRAFT_COMMANDS and argv[0] not in TERMINAL_COMMANDS \
+            and argv[0] not in ("status", "link", "unlink"):
         _fail("unknown whatsapp command '%s' — see `mother whatsapp help`" % argv[0])
     if argv[0] == "status":
         return cmd_status(cfg, argv[1:])
+    if argv[0] in TERMINAL_COMMANDS and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        _fail("run `mother whatsapp %s` in your own terminal: it changes who MOTHER may message, so only you "
+              "run it" % argv[0], 2)
     require_home(cfg)
     wa = _wa(cfg)
     if argv[0] in READ_COMMANDS and not (wa.get("enabled") and wa.get("read", True)):
-        _fail("whatsapp reading is off (whatsapp.enabled / whatsapp.read in config.json)", 2)
+        _fail("whatsapp reading is off (whatsapp.enabled / whatsapp.read in config.json): run `mother whatsapp "
+              "setup` in your own terminal", 2)
     if argv[0] in ("draft", "verify", "send", "prompt") and not (wa.get("enabled") and wa.get("send", True)):
-        _fail("whatsapp sending is off (whatsapp.enabled / whatsapp.send in config.json)", 2)
+        _fail("whatsapp sending is off (whatsapp.enabled / whatsapp.send in config.json): run `mother whatsapp "
+              "setup` in your own terminal", 2)
+    if argv[0] in TERMINAL_COMMANDS:
+        if ws is None or validate is None:
+            _fail("no workspace")
+        sys.exit(TERMINAL_COMMANDS[argv[0]](Path(ws), validate, TerminalIO(), argv[1:]))
     if argv[0] in ("link", "unlink"):
         sys.exit(cmd_link(argv[0], argv[1:]))
     if argv[0] in READ_COMMANDS:

@@ -76,7 +76,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.brief.draft_replies` | bool, optional | default false; true = the brief routine saves mail **drafts** for To-respond mail it triaged as `prep` (never sends) |
 | `routines.commitments` | map, optional | `at`, `days`, `no_reply_days` (1-30, default 3), `lookback_days` (1-60, default 14), `draft_nudges` (bool, default false: mail drafts for no-reply asks only on the manager's `nudge <n>`) |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
-| `whatsapp` | map, optional | WhatsApp read and send for allowlisted work chats (§5d). `enabled` (bool), `self_jid` (the manager's own JID; required when `enabled`), `allow[]` (`{jid, name, team?, group?}`; `jid` is `<digits>@s.whatsapp.net` or `<digits>@g.us`), `approve_via` (non-empty subset of `slack_dm`, `self_chat`, `session`; default all three), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `max_prompts_per_day` (1-100, default 10), `read`, `send` (bool). Unknown keys fail. JIDs are phone numbers: they live in `config.json` only, never in memory, journal or people files. Policy may tighten `approve_via` and the cap, never widen. |
+| `whatsapp` | map, optional | WhatsApp read and send for allowlisted work chats (§5d). `enabled` (bool), `self_jid` (the manager's own JID; required when `enabled`), `allow[]` (`{jid, name, team?, group?}`; `jid` is `<digits>@s.whatsapp.net` or `<digits>@g.us`), `approve_via` (non-empty subset of `slack_dm`, `self_chat`, `session`; default all three), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `max_prompts_per_day` (1-100, default 10), `read`, `send` (bool). Unknown keys fail. The block is written by `mother whatsapp setup`, `allow` and `disallow`, run by the manager in their own terminal (§5d); the agent never edits it. JIDs are phone numbers: they live in `config.json` only, never in memory, journal or people files. Policy may tighten `approve_via` and the cap, never widen. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 
@@ -195,10 +195,10 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `max_replies_per_hour` in the ledger (`rules/outbound.md`).
 - **WhatsApp (`whatsapp.send`, §5d)** is never `ask`: every WhatsApp decision is `allow` or `deny`, in every
   permission mode (including `bypassPermissions`, where an ask would pass), and a guard error on a WhatsApp
-  call denies. Action: `{"kind": "whatsapp", "op": "send"|"prompt"|"state"|"compound"|"unknown"|"computed",
-  "category": "any_message_to_others" | "whatsapp_state" (for `state`) | "computed_command" (for `computed`),
-  "draft": <id>}` (`prompt` adds `"drafts": [ids]`; `state`, `compound`, `unknown` and `computed` always
-  deny); `guard.log` names the draft id as the target, never a JID, and never echoes the command.
+  call denies. Action: `{"kind": "whatsapp", "op": "send"|"prompt"|"state"|"compound"|"unknown"|"computed"|"terminal",
+  "category": "any_message_to_others" | "whatsapp_state" (for `state`) | "computed_command" (for `computed`)
+  | "whatsapp_setup" (for `terminal`), "draft": <id>}` (`prompt` adds `"drafts": [ids]`; `state`, `compound`,
+  `unknown`, `computed` and `terminal` always deny); `guard.log` names the draft id as the target, never a JID, and never echoes the command.
   - **Recognition: shapes, not spellings.** A `send` or `prompt` is recognised only on the **raw** command:
     `mother whatsapp send <id>` as the **whole** command — the `mother` CLI (bare, a path ending in `/mother`,
     `"${CLAUDE_PLUGIN_ROOT}/bin/mother"`, optionally after `python3`), lower-case unquoted `whatsapp send`, one
@@ -256,6 +256,10 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     and the PAUSED/config/enabled/home checks above pass (it reaches only the manager's own self chat), else
     denied. `mother whatsapp read|chats|draft|list|drop|status|pending|verify|link|unlink|help` pass the guard (not
     outbound; `link` shows a local QR, `drop` and `unlink` only reduce), alone or in a pipeline.
+  - `mother whatsapp setup|allow|disallow` (a resolved `mother` command whose subcommand is one of these, in any
+    position on the line) is `terminal`: denied, in every mode, with "run it in your own terminal". They write
+    `whatsapp.allow`, `self_jid` and `approve_via`, which are safety controls: the agent never widens them. The
+    manager runs them in a terminal (or Claude Code's `!` prefix, which no hook sees; the CLI still wants a TTY).
   - **State is off-limits to the agent.** The protected folders are `<ws>/.mother/whatsapp/`,
     `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`) and `~/.mother/whatsapp/`; every path
     comparison is case-insensitive (casefolded after `realpath`), here and for the guard's own files below.
@@ -369,7 +373,8 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   database ("no cold contact"), prints the draft as JSON, and exits 1 on empty text. `mother whatsapp list [--json]`
   shows open drafts (an expired one is deleted when read); `mother whatsapp drop <id>` deletes one (exit 1 if
   none). `read` and `chats` exit 2 "whatsapp reading is off" when `whatsapp.enabled` or `whatsapp.read` is false;
-  `draft` exits 2 "whatsapp sending is off" when `enabled` or `send` is false. In a group, the sender is the
+  `draft` exits 2 "whatsapp sending is off" when `enabled` or `send` is false; both messages name
+  `mother whatsapp setup`. In a group, the sender is the
   member's contact name, else first name, else "a member"; never a phone number.
 - **Three approval paths** (`whatsapp.approve_via`), each shown the same wording, `WhatsApp -> <chat name>:
   "<text>" - reply ok <id>`:
@@ -506,7 +511,8 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   - **`mother whatsapp link` / `unlink`** first stop a running bridge, then run the installed `bridge.mjs
     --link|--unlink` in the foreground, inheriting the terminal. `link` exits 2 unless stdout is a TTY ("run
     `mother whatsapp link` in your own terminal (the QR needs one)"): the manager runs it, not the agent; it waits up
-    to 180 s for the scan. **`status`** prints `{"bridge": <status reply or error>, "read": {"db_reachable": bool,
+    to 180 s for the scan, and the bridge's last stdout line is `{"linked": true, "me": "<jid>"}` or
+    `{"linked": false}` (setup reads it). **`status`** prints `{"bridge": <status reply or error>, "read": {"db_reachable": bool,
     "reason"?, "hint"?}, "reinstall_needed"?}`; `reason` is `missing`, `denied` (hint: grant Full Disk Access to the
     app that runs Claude Code), `locked` or `schema_changed`. It never starts the bridge and never reads a message,
     and it probes the database even when `whatsapp.enabled` is false.
@@ -523,6 +529,34 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
     not open in the window. `status` answers at once with `"connecting": true` while it waits. The guard
     classifies `send` (proof required), `prompt` (ids only, each an open unsent draft) and `link`, `unlink`,
     `status`, `install`, `stop` (pass).
+- **Setup** (the manager's own terminal; the guard denies all three to the agent, §5). `setup`, `allow` and
+  `disallow` exit 2 "run `mother whatsapp <sub>` in your own terminal" unless stdin and stdout are TTYs, and run
+  only on the home machine like every other subcommand.
+  - **`mother whatsapp setup`** is one guided flow; each step is skipped when already done, so it is safe to
+    re-run. (a) Install: when `bridge_problem()` says not installed, or `reinstall_needed`, run `install` (a Node
+    problem stops with its hint), then stop a running bridge. (b) Link: ask the bridge (`status`, started on
+    demand) whether it is linked; if not, run `bridge.mjs --link` with the QR passed through to the terminal.
+    `--link` ends with one JSON line on stdout, `{"linked": true, "me": "<jid>"}` (device suffix stripped) or
+    `{"linked": false}`; the manager's `self_jid` is that `me` (or the linked `status.me`, suffix stripped).
+    No JID: stop, nothing written. (c) Config: set `whatsapp.enabled: true` and `self_jid` in one write, keep
+    `allow` and every other key, set `approve_via: ["session"]` when absent, leave the caps alone. (d) Database:
+    probe it; `denied` prints the Full Disk Access instruction and stops (exit 2), `missing` says to install and
+    sign in to WhatsApp desktop and stops. (e) Chats: show up to 15 recent chats from `ZWACHATSESSION` (name,
+    DM/group, last message date; never a message; not `self_jid`, only JIDs `validate` accepts, only chats with a
+    last message), numbered, marking ones already allowed; the manager types numbers (`1 4`) or Enter to skip;
+    chosen chats are added as `{jid, name, group?}`. (f) Approval paths: `session` always; offer `self_chat`;
+    offer `slack_dm` only when `manager.chat_dm` is set; write `approve_via` in the order `session`,
+    `self_chat`, `slack_dm`. (g) A summary and the next step. Every write re-reads `config.json`, runs the full
+    `validate()` and writes only a valid config, atomically (temp file + rename, mode kept), `indent=2`,
+    `ensure_ascii=False`, trailing newline, key order kept. An invalid config (from any key) is never written:
+    setup prints the errors and exits 2. Exit 0 when done, 2 when a step stops.
+  - **`mother whatsapp allow [<number>|<jid>|<n>] [--name NAME]`** adds one chat: a phone number (`+`, spaces,
+    `-`, `(`, `)` dropped; 6-15 digits) becomes `<digits>@s.whatsapp.net`; a 1-2 digit `<n>` is the n-th chat of
+    setup's list; with no argument it shows that list and asks. The name comes from `--name`, else the chat's
+    name in the database, else a prompt. It refuses (exit 2) before setup has set `self_jid`, `self_jid` itself, a JID `validate` rejects, and a chat
+    the readable database holds no message in (no cold contact); an unreadable database adds it with a note.
+    An already allowed JID is left as is. **`mother whatsapp disallow <jid|number>`** removes it (exit 1 if
+    absent). Both write like setup.
 - **Limits.** `max_per_day` (default 20, ceiling 50) counts every send; `min_gap_seconds` (default 5, jittered)
   between sends; one recipient per call; no first message to a JID with no prior message in the local
   database. Self-chat prompts go to the manager's own number: they do not count toward `max_per_day`; they count only toward

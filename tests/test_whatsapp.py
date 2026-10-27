@@ -61,7 +61,7 @@ def core(iso):
 
 CHATS = [(1, DM, "Dana", 0), (2, GROUP, "PLAT team", 1), (3, OTHER, "Stranger", 0), (4, SELF, "You", 0)]
 MSGS = [
-    {"chat": 1, "text": "hello from sam", "date": core("2026-10-26T08:00:00Z"), "stanza": "A1", "from": DM},
+    {"chat": 1, "text": "hello from dana", "date": core("2026-10-26T08:00:00Z"), "stanza": "A1", "from": DM},
     {"chat": 1, "text": "I replied", "date": core("2026-10-26T08:05:00Z"), "stanza": "A2", "me": 1},
     {"chat": 1, "text": None, "date": core("2026-10-26T08:10:00Z"), "stanza": "A3", "from": DM, "type": 1},
     {"chat": 1, "text": "old news", "date": core("2026-10-20T08:00:00Z"), "stanza": "A0", "from": DM},
@@ -142,7 +142,7 @@ class TestReader(Base):
         self.build()
         out = whatsapp.read_messages(make_cfg(), SINCE)
         texts = [i["text"] for i in out["items"]]
-        self.assertEqual(texts, ["hello from sam", "I replied", "[media]", "ship it"])
+        self.assertEqual(texts, ["hello from dana", "I replied", "[media]", "ship it"])
         first = out["items"][0]
         self.assertEqual(first["link"], "whatsapp://%s/A1" % DM)
         self.assertEqual(first["chat_name"], "Dana")
@@ -276,7 +276,7 @@ class TestReader(Base):
         self.assertTrue(grp["group"])
         self.assertEqual(grp["name"], "PLAT team")
         blob = json.dumps(got)
-        for text in ("hello from sam", "secret", "ship it", "ok w3k", "note to self"):
+        for text in ("hello from dana", "secret", "ship it", "ok w3k", "note to self"):
             self.assertNotIn(text, blob)
 
     def test_recent_chats_never_touches_messages(self):
@@ -1141,7 +1141,7 @@ def fixture_db_fresh(path, self_msgs):
     """A fixture DB with history in the DM chat plus the given self-chat messages."""
     if Path(path).exists():
         Path(path).unlink()
-    hist = [{"chat": 1, "text": "hello from sam", "date": core("2026-10-20T08:00:00Z"), "stanza": "A1", "from": DM}]
+    hist = [{"chat": 1, "text": "hello from dana", "date": core("2026-10-20T08:00:00Z"), "stanza": "A1", "from": DM}]
     fixture_db(path, CHATS, hist + list(self_msgs))
 
 
@@ -1766,6 +1766,339 @@ class TestColdStart(Cmd7):
             whatsapp._start_bridge()
         self.assertTrue((d / "bridge.log.1").exists())
         self.assertEqual((d / "bridge.log").stat().st_size, 0)
+
+
+
+# ---------------------------------------------------------------- setup, allow, disallow (Task 7b)
+
+def load_validate():
+    """validate() from bin/mother (a script without .py, loaded by path)."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("mother_cli", str(CLI))
+    spec = importlib.util.spec_from_loader("mother_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod.validate
+
+
+VALIDATE = load_validate()
+
+
+class FakeIO(object):
+    """The terminal: `ask` returns the next scripted answer (an unscripted question fails the test)."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.asked = []
+        self.lines = []
+
+    def ask(self, prompt):
+        self.asked.append(prompt)
+        if not self.answers:
+            raise AssertionError("unexpected question: %s" % prompt)
+        return self.answers.pop(0)
+
+    def say(self, text=""):
+        self.lines.append(str(text))
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+
+class SetupCase(Base):
+    def setUp(self):
+        Base.setUp(self)
+        self.build()
+        self.ws = self.t / "ws"
+        self.ws.mkdir()
+        cfg = json.loads((ROOT / "templates/workspace/config.example.json").read_text())
+        cfg["workspace"]["home_machine"] = "laptop-a"
+        del cfg["whatsapp"]
+        self.cfg = cfg
+        self.write_cfg()
+
+    def write_cfg(self, cfg=None):
+        (self.ws / "config.json").write_text(json.dumps(cfg or self.cfg, indent=2) + "\n")
+
+    def read_cfg(self):
+        return json.loads((self.ws / "config.json").read_text())
+
+    def setup(self, *answers, linked=None, link=SELF, problem=None, reinstall=False, install_ok=True):
+        """Run setup with the bridge faked: `problem` until install runs, `linked` = status.me (None: not linked),
+        `link` = what the QR link learns."""
+        state = {"problem": problem}
+
+        def install():
+            state["problem"] = None
+            return {"ok": install_ok, "error": None if install_ok else "npm_failed"}
+
+        io = FakeIO(*answers)
+        status = {"ok": True, "linked": bool(linked), "me": linked}
+        with mock.patch.object(whatsapp, "bridge_problem", side_effect=lambda: state["problem"]), \
+                mock.patch.object(whatsapp, "reinstall_needed", return_value=reinstall), \
+                mock.patch.object(whatsapp, "install_bridge", side_effect=install) as inst, \
+                mock.patch.object(whatsapp, "stop_bridge", return_value=False) as stop, \
+                mock.patch.object(whatsapp, "bridge_call", return_value=status), \
+                mock.patch.object(whatsapp, "link_account", return_value=link) as lk:
+            code = whatsapp.setup(self.ws, VALIDATE, io)
+        return code, io, {"install": inst, "stop": stop, "link": lk}
+
+
+class TestSetup(SetupCase):
+    def test_first_run_installs_links_writes_the_block_and_adds_the_chats_picked(self):
+        before = self.read_cfg()
+        code, io, m = self.setup("3 2", "y", "n", problem=("bridge_not_installed", "run install"),
+                                 link="972500000099:3@s.whatsapp.net")
+        self.assertEqual(code, 0, io.text)
+        m["install"].assert_called_once()
+        m["link"].assert_called_once()
+        cfg = self.read_cfg()
+        self.assertEqual(cfg["whatsapp"], {
+            "enabled": True, "self_jid": SELF,
+            "allow": [{"jid": DM, "name": "Dana"}, {"jid": GROUP, "name": "PLAT team", "group": True}],
+            "approve_via": ["session", "self_chat"]})
+        self.assertEqual({k: v for k, v in cfg.items() if k != "whatsapp"}, before)
+        self.assertEqual(list(cfg)[:-1], list(before))  # key order kept; the new block goes last
+        self.assertEqual((self.ws / "config.json").read_text(),
+                         json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+        self.assertEqual(VALIDATE(cfg), [])
+        listed = [ln for ln in io.lines if __import__("re").match(r"^\s*\d+\. ", ln)]
+        self.assertEqual(len(listed), 3, io.text)  # the self chat is not offered
+        self.assertIn("Stranger", listed[0])
+        self.assertIn("group", listed[1])
+        for text in ("hello from dana", "secret", "ship it", "note to self"):
+            self.assertNotIn(text, io.text)  # names and dates only, never a message
+        self.assertIn("ok <id>", io.text)  # the next step
+        self.assertIn("Dana", io.lines[-1] + io.lines[-2] + io.text[-300:])
+
+    def test_rerun_skips_what_is_done_and_keeps_the_block(self):
+        self.cfg["whatsapp"] = {"enabled": True, "self_jid": SELF, "allow": [{"jid": DM, "name": "Dana"}],
+                                "approve_via": ["session", "self_chat"], "max_per_day": 12}
+        self.write_cfg()
+        before = (self.ws / "config.json").read_text()
+        code, io, m = self.setup("", "", "", linked=SELF)
+        self.assertEqual(code, 0, io.text)
+        m["install"].assert_not_called()
+        m["link"].assert_not_called()
+        self.assertEqual(json.loads(before), self.read_cfg())
+        dana = [ln for ln in io.lines if "Dana" in ln and "DM" in ln]
+        self.assertTrue(dana and "allowed" in dana[0], io.text)
+
+    def test_the_linked_accounts_device_suffix_is_dropped(self):
+        code, io, m = self.setup("", "n", "n", linked="972500000099:5@s.whatsapp.net")
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
+        self.assertEqual(self.read_cfg()["whatsapp"]["approve_via"], ["session"])
+        m["link"].assert_not_called()
+
+    def test_a_link_that_fails_writes_nothing(self):
+        before = (self.ws / "config.json").read_text()
+        code, io, m = self.setup(link=None)
+        self.assertEqual(code, 2)
+        self.assertEqual((self.ws / "config.json").read_text(), before)
+
+    def test_an_invalid_config_is_never_written(self):
+        self.cfg["version"] = 2
+        self.write_cfg()
+        before = (self.ws / "config.json").read_text()
+        code, io, m = self.setup(linked=SELF)
+        self.assertEqual(code, 2)
+        self.assertEqual((self.ws / "config.json").read_text(), before)
+        self.assertIn("version", io.text)
+
+    def test_full_disk_access_denied_stops_before_the_chat_list(self):
+        real = whatsapp._query
+
+        def q(sql, params=()):
+            if "ZWACHATSESSION" in sql:
+                raise whatsapp.ReaderError("denied")
+            return real(sql, params)
+
+        with mock.patch.object(whatsapp, "_query", side_effect=q):
+            code, io, m = self.setup(linked=SELF)
+        self.assertEqual(code, 2)
+        self.assertIn("Full Disk Access", io.text)
+        self.assertEqual(io.asked, [])
+        wa = self.read_cfg()["whatsapp"]
+        self.assertEqual((wa["enabled"], wa["self_jid"]), (True, SELF))
+
+    def test_no_database_says_to_install_whatsapp_desktop(self):
+        self.db.unlink()
+        code, io, m = self.setup(linked=SELF)
+        self.assertEqual(code, 2)
+        self.assertIn("WhatsApp desktop", io.text)
+
+    def test_slack_dm_is_offered_only_with_a_chat_dm(self):
+        self.cfg["manager"]["chat_dm"] = ""
+        self.write_cfg()
+        code, io, m = self.setup("", "y", linked=SELF)  # no third question
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(len(io.asked), 2)
+        self.assertEqual(self.read_cfg()["whatsapp"]["approve_via"], ["session", "self_chat"])
+        self.cfg["manager"]["chat_dm"] = "U00000000"
+        self.write_cfg()
+        code, io, m = self.setup("", "n", "y", linked=SELF)
+        self.assertEqual(self.read_cfg()["whatsapp"]["approve_via"], ["session", "slack_dm"])
+
+    def test_bad_picks_are_asked_again(self):
+        code, io, m = self.setup("9", "x", "1", "n", "n", linked=SELF)
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(self.read_cfg()["whatsapp"]["allow"], [{"jid": OTHER, "name": "Stranger"}])
+
+    def test_a_node_problem_stops_with_its_hint(self):
+        code, io, m = self.setup(problem=("node_too_old", "install a newer Node"))
+        self.assertEqual(code, 2)
+        m["install"].assert_not_called()
+        self.assertIn("install a newer Node", io.text)
+
+    def test_a_failed_install_stops(self):
+        code, io, m = self.setup(problem=("bridge_not_installed", "x"), install_ok=False)
+        self.assertEqual(code, 2)
+        m["link"].assert_not_called()
+
+    def test_reinstall_needed_reinstalls_and_stops_the_old_bridge(self):
+        code, io, m = self.setup("", "n", "n", linked=SELF, reinstall=True)
+        self.assertEqual(code, 0, io.text)
+        m["install"].assert_called_once()
+        m["stop"].assert_called()
+
+
+class FakePopen(object):
+    def __init__(self, lines, code=0):
+        self.stdout = iter(lines)
+        self.returncode = None
+        self._code = code
+        self.argv = None
+
+    def wait(self):
+        self.returncode = self._code
+        return self._code
+
+
+class TestLinkAccount(Cmd7):
+    def link(self, lines, code=0):
+        fake = FakePopen(lines, code)
+        io = FakeIO()
+
+        def popen(argv, **kw):
+            fake.argv, fake.kw = argv, kw
+            return fake
+
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "_node", return_value="/usr/bin/node"), \
+                mock.patch.object(whatsapp, "stop_bridge") as stop, \
+                mock.patch("subprocess.Popen", side_effect=popen):
+            me = whatsapp.link_account(io.say)
+        stop.assert_called_once()
+        return me, io, fake
+
+    def test_the_qr_passes_through_and_the_json_line_names_the_account(self):
+        me, io, fake = self.link([b"scan this\n", b"\xe2\x96\x88\xe2\x96\x88 qr\n",
+                                  b'{"linked": true, "me": "972500000099:2@s.whatsapp.net"}\n'])
+        self.assertEqual(me, SELF)
+        self.assertEqual(fake.argv[-1], "--link")
+        self.assertIn("scan this", io.text)
+        self.assertNotIn('"linked"', io.text)
+
+    def test_no_link_is_none(self):
+        self.assertIsNone(self.link([b'{"linked": false}\n'], code=1)[0])
+        self.assertIsNone(self.link([b"just text\n"], code=0)[0])
+        self.assertIsNone(self.link([b'{"linked": true, "me": "not-a-jid"}\n'], code=0)[0])
+
+
+class TestAllow(SetupCase):
+    def setUp(self):
+        SetupCase.setUp(self)
+        self.cfg["whatsapp"] = {"enabled": True, "self_jid": SELF, "allow": [], "approve_via": ["session"]}
+        self.write_cfg()
+
+    def test_allow_needs_setup_first(self):
+        del self.cfg["whatsapp"]
+        self.write_cfg()
+        code, io = self.allow(DM)
+        self.assertEqual(code, 2)
+        self.assertIn("mother whatsapp setup", io.text)
+        self.assertNotIn("whatsapp", self.read_cfg())
+
+    def allow(self, *args, answers=()):
+        io = FakeIO(*answers)
+        code = whatsapp.allow_chat(self.ws, VALIDATE, io, list(args))
+        return code, io
+
+    def allowed(self):
+        return (self.read_cfg().get("whatsapp") or {}).get("allow")
+
+    def test_a_phone_number_becomes_a_jid_named_from_the_database(self):
+        code, io = self.allow("+972-50-000-0001")
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(self.allowed(), [{"jid": DM, "name": "Dana"}])
+        self.assertEqual(VALIDATE(self.read_cfg()), [])
+
+    def test_a_list_index_and_an_explicit_name(self):
+        self.assertEqual(self.allow("2")[0], 0)
+        self.assertEqual(self.allow(DM, "--name", "Dana L")[0], 0)
+        self.assertEqual(self.allowed(), [{"jid": GROUP, "name": "PLAT team", "group": True},
+                                          {"jid": DM, "name": "Dana L"}])
+
+    def test_no_argument_shows_the_list_and_asks(self):
+        code, io = self.allow(answers=("1",))
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(self.allowed(), [{"jid": OTHER, "name": "Stranger"}])
+
+    def test_refusals(self):
+        before = (self.ws / "config.json").read_text()
+        for args in (["+972 50 000 0007"],  # no history: no cold contact
+                     [SELF],                # the self chat carries approvals
+                     ["abc"], ["12"], ["123@lid"]):
+            code, io = self.allow(*args)
+            self.assertEqual(code, 2, (args, io.text))
+        self.assertEqual((self.ws / "config.json").read_text(), before)
+
+    def test_already_allowed_is_left_alone(self):
+        self.allow(DM)
+        code, io = self.allow("972500000001")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.allowed()), 1)
+        self.assertIn("already", io.text)
+
+    def test_unreadable_database_adds_with_a_note(self):
+        with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("denied")):
+            code, io = self.allow("972500000005", "--name", "Agnes")
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(self.allowed(), [{"jid": "972500000005@s.whatsapp.net", "name": "Agnes"}])
+        self.assertIn("couldn't check", io.text)
+
+    def test_disallow(self):
+        self.allow(DM)
+        self.allow(GROUP)
+        io = FakeIO()
+        self.assertEqual(whatsapp.disallow_chat(self.ws, VALIDATE, io, ["+972 50 000 0001"]), 0)
+        self.assertEqual(self.allowed(), [{"jid": GROUP, "name": "PLAT team", "group": True}])
+        self.assertEqual(whatsapp.disallow_chat(self.ws, VALIDATE, FakeIO(), [DM]), 1)
+        self.assertEqual(whatsapp.disallow_chat(self.ws, VALIDATE, FakeIO(), []), 2)
+
+
+class TestTerminalOnly(Cmd7):
+    def test_setup_allow_disallow_need_a_terminal(self):
+        before = (self.ws / "config.json").read_text()
+        for args in (["setup"], ["allow", DM], ["disallow", DM]):
+            r = self.run_cli(*args)
+            self.assertEqual(r.returncode, 2, (args, r.stderr))
+            self.assertIn("run `mother whatsapp %s` in your own terminal" % args[0], r.stderr)
+        self.assertEqual((self.ws / "config.json").read_text(), before)
+
+    def test_off_messages_point_at_setup(self):
+        self.cfg["whatsapp"]["enabled"] = False
+        self.write_cfg()
+        self.assertIn("mother whatsapp setup", self.run_cli("chats").stderr)
+
+    def test_phone_jid(self):
+        self.assertEqual(whatsapp.phone_jid("+972-50-000-0001"), DM)
+        self.assertEqual(whatsapp.phone_jid("(972) 50 000 0001"), DM)
+        self.assertIsNone(whatsapp.phone_jid("12345"))
+        self.assertIsNone(whatsapp.phone_jid("972500000001@s.whatsapp.net"))
 
 
 if __name__ == "__main__":

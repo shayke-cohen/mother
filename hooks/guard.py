@@ -13,7 +13,8 @@ tool call that sends, posts or writes somewhere another person can see, the guar
          bypassPermissions, these get no output instead (logged as "pass"); denies and the self-edit ask stay
 
 WhatsApp is the exception to "ask": `mother whatsapp send <id>` is allow with a proven yes (lib/whatsapp.py
-prove()) or deny, in every mode, and any agent touch of the bridge socket or WhatsApp's state folders is deny.
+prove()) or deny, in every mode, and any agent touch of the bridge socket or WhatsApp's state folders is deny, as
+are `mother whatsapp setup|allow|disallow` (the manager's own terminal only).
 
 Calls that are not outbound get no output, so Claude Code's normal permission flow applies. The guard never
 answers "allow" for a call it does not recognise: an allow would skip the user's own permission rules.
@@ -426,6 +427,7 @@ def api_write(cmd):
 
 WA_PASS_SUBS = ("read", "chats", "draft", "list", "drop", "status", "pending", "verify", "link", "unlink", "help",
                 "install", "stop", "-h", "--help")
+WA_TERMINAL_SUBS = ("setup", "allow", "disallow")  # the manager's own terminal only: they widen who MOTHER may message
 WA_ID = r"w[a-z2-9]{3}"
 _WA_BIN = (r"(?:python3?[ \t]+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother\"|\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother"
            r"|\"[^\"$`\\\n]*/mother\"|'[^'\n]*/mother'|(?:[\w.~+-]*/)*mother)")
@@ -1277,6 +1279,9 @@ class _WaScan(object):
         if len(args) > 1:
             if vals[1] is None:
                 self.hit("unknown", "a whatsapp subcommand that is computed")
+            if vals[1].casefold() in WA_TERMINAL_SUBS:
+                self.hit("terminal", "`mother whatsapp %s` changes WhatsApp setup and who MOTHER may message"
+                         % vals[1].casefold())
             if vals[1].casefold() in ("send", "prompt"):
                 self.hit("compound", "a whatsapp send or prompt that is not a command of its own")
         own = text[seg["start"]:seg["end"]].strip()
@@ -1390,7 +1395,8 @@ class _WaScan(object):
 
 
 def wa_act(op, what, **kw):
-    cat = {"state": "whatsapp_state", "computed": "computed_command"}.get(op, "any_message_to_others")
+    cat = {"state": "whatsapp_state", "computed": "computed_command",
+           "terminal": "whatsapp_setup"}.get(op, "any_message_to_others")
     return act("whatsapp", cat, what, op=op, **kw)
 
 
@@ -1930,6 +1936,9 @@ def decide_whatsapp(a, ctx, transcript=None):
     if op == "state":
         return "deny", "%s. Only `mother whatsapp` commands touch it; the bridge is reached only through " \
                        "`mother whatsapp send <id>`." % what
+    if op == "terminal":
+        return "deny", "%s: the manager runs it in their own terminal, never the agent. Tell them to run it in " \
+                       "their own terminal." % what
     if op == "unknown":
         return "deny", "%s. See `mother whatsapp help`." % what
     if op == "compound":

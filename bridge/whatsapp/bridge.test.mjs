@@ -7,7 +7,9 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs, silenceConsole } from "./bridge.mjs";
+import {
+  createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs, silenceConsole, runLink, bareJid,
+} from "./bridge.mjs";
 
 const SELF = "972500000099@s.whatsapp.net";
 const DM = "972500000001@s.whatsapp.net";
@@ -518,4 +520,41 @@ test("silenceConsole drops console.* output (libsignal prints session objects th
     process.stderr.write = se;
   }
   assert.deepEqual(writes, []);
+});
+
+test("bareJid drops the device suffix", () => {
+  assert.equal(bareJid("972500000099:12@s.whatsapp.net"), SELF);
+  assert.equal(bareJid(SELF), SELF);
+  assert.equal(bareJid(null), null);
+  assert.equal(bareJid(""), null);
+});
+
+function fakeLinkClient({ open = true, me = "972500000099:7@s.whatsapp.net" } = {}) {
+  const c = { closed: false };
+  c.me = () => (open && !c.closed ? me : null);
+  c.waitOpen = async () => open;
+  c.close = () => { c.closed = true; };
+  return c;
+}
+
+test("--link: the QR goes to the terminal, then one JSON line names the linked account (suffix stripped)", async () => {
+  const out = [];
+  const loc = locations(env);
+  const code = await runLink(loc, {
+    connect: async ({ onQR }) => { onQR("QRDATA"); return fakeLinkClient(); },
+    qr: { generate: (q) => out.push("QR:" + q) }, out: (l) => out.push(l), err: () => {}, settleMs: 0,
+  });
+  assert.equal(code, 0);
+  assert.ok(out.includes("QR:QRDATA"));
+  assert.deepEqual(JSON.parse(out[out.length - 1]), { linked: true, me: SELF });
+});
+
+test("--link that never opens: {linked: false}, exit 1", async () => {
+  const out = [];
+  const code = await runLink(locations(env), {
+    connect: async () => fakeLinkClient({ open: false }), qr: { generate() {} }, out: (l) => out.push(l),
+    err: () => {}, settleMs: 0,
+  });
+  assert.equal(code, 1);
+  assert.deepEqual(JSON.parse(out[out.length - 1]), { linked: false });
 });
