@@ -14,9 +14,10 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
-  whatsapp <cmd>               read allowlisted WhatsApp chats, keep send drafts, send/prompt/install/stop/link/status via the bridge (`mother whatsapp help`); home machine only
-  whatsapp setup | allow | disallow
-                               the manager's guided WhatsApp setup and allowlist changes; own terminal only (a TTY; the guard denies them to the agent)
+  whatsapp <cmd>               read WhatsApp chats from the local database (chats, read) and send through the
+                               bridge (send; the guard asks first), install/stop/status (`mother whatsapp help`); home machine only
+  whatsapp setup | link | unlink
+                               the manager's guided WhatsApp setup and device link; own terminal only (a TTY; the guard denies them to the agent)
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   eval brief|verdict|report    A/B the brief's gather mode on the same inputs (`mother eval help`)
@@ -106,11 +107,9 @@ TOP_KEYS = {"version", "agent", "manager", "workspace", "connectors", "teams", "
 MODES = {"off", "watch", "mention", "draft", "auto"}
 TRIGGERS = {"manager", "team", "anyone"}
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-WA_KEYS = {"enabled", "self_jid", "allow", "approve_via", "max_per_day", "min_gap_seconds",
-           "max_prompts_per_day", "read", "send"}
-WA_APPROVE_VIA = ("slack_dm", "self_chat", "session")
+WA_KEYS = {"enabled", "self_jid", "max_per_day", "min_gap_seconds", "read", "send"}
+WA_LEGACY_KEYS = {"allow", "approve_via", "max_prompts_per_day"}  # the earlier design: accepted, ignored
 WA_MAX_PER_DAY_CEILING = 50
-WA_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us", re.ASCII)
 WA_USER_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net", re.ASCII)
 
 
@@ -221,7 +220,7 @@ def validate_whatsapp(wa) -> list:
     if not isinstance(wa, dict):
         return ["whatsapp must be an object"]
     for k in wa:
-        if k not in WA_KEYS:
+        if k not in WA_KEYS and k not in WA_LEGACY_KEYS:
             errs.append(f"unknown key whatsapp.{k}")
 
     def is_int(v):
@@ -235,33 +234,9 @@ def validate_whatsapp(wa) -> list:
             errs.append("missing whatsapp.self_jid (required when whatsapp.enabled is true)")
     elif not (isinstance(sj, str) and WA_USER_JID_RE.fullmatch(sj)):
         errs.append("whatsapp.self_jid must be <digits>@s.whatsapp.net")
-    allow = wa.get("allow", [])
-    if not isinstance(allow, list):
-        errs.append("whatsapp.allow must be a list")
-        allow = []
-    for i, a in enumerate(allow):
-        where = f"whatsapp.allow[{i}]"
-        if not isinstance(a, dict):
-            errs.append(f"{where} must be an object")
-            continue
-        for k in a:
-            if k not in ("jid", "name", "team", "group"):
-                errs.append(f"unknown key {where}.{k}")
-        if not (isinstance(a.get("jid"), str) and WA_JID_RE.fullmatch(a["jid"])):
-            errs.append(f"{where}.jid must be <digits>@s.whatsapp.net or <digits>@g.us")
-        if not (isinstance(a.get("name"), str) and a["name"]):
-            errs.append(f"{where}.name must be a non-empty string")
-        if "team" in a and not isinstance(a["team"], str):
-            errs.append(f"{where}.team must be a string")
-        if "group" in a and not isinstance(a["group"], bool):
-            errs.append(f"{where}.group must be true or false")
-    av = wa.get("approve_via", list(WA_APPROVE_VIA))
-    if not (isinstance(av, list) and av and all(x in WA_APPROVE_VIA for x in av)):
-        errs.append(f"whatsapp.approve_via must be a non-empty list of {list(WA_APPROVE_VIA)}")
-    for k, hi in (("max_per_day", WA_MAX_PER_DAY_CEILING), ("max_prompts_per_day", 100)):
-        v = wa.get(k)
-        if v is not None and (not is_int(v) or not 1 <= v <= hi):
-            errs.append(f"whatsapp.{k} must be an integer 1-{hi}")
+    v = wa.get("max_per_day")
+    if v is not None and (not is_int(v) or not 1 <= v <= WA_MAX_PER_DAY_CEILING):
+        errs.append(f"whatsapp.max_per_day must be an integer 1-{WA_MAX_PER_DAY_CEILING}")
     v = wa.get("min_gap_seconds")
     if v is not None and (not is_int(v) or v < 0):
         errs.append("whatsapp.min_gap_seconds must be an integer >= 0")

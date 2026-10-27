@@ -1,41 +1,29 @@
-"""mother whatsapp — read the allowlisted WhatsApp chats from the local macOS database.
+"""mother whatsapp — read the manager's WhatsApp chats from the local macOS database, and send through the bridge.
 
-Reader half of the WhatsApp feature (docs/CONTRACT.md §5d). Everything here is home-machine-only.
+The WhatsApp feature (docs/CONTRACT.md §5d). Everything here is home-machine-only, except `status`.
 
 Commands:
-  read --since ISO [--chat JID]...   reader items (JSON) from the allowlisted chats since ISO
-  chats                              recent chats, names and dates only (for setup's allowlist proposal)
-  draft --chat JID --text-file PATH [--run ID]
-                                     write a draft for an allowlisted chat with history (JSON)
-  list [--json]                      open drafts
-  drop ID                            delete a draft
-  pending                            stdin {"dm": [manager DM messages]}: record Slack `ok`/`no` replies, then
-                                     print {"send": [ids with a proven yes], "dropped": [ids]}
-  send ID                            send an approved draft through the bridge (the guard requires a proven yes)
-  prompt ID [ID]...                  ask the manager to approve open drafts: self-chat via the bridge, Slack DM
-                                     text returned for the skill to post; held during quiet hours
+  chats [--query TEXT] [--limit N]   recent chats (default 30): name, DM/group, last date ("pinned"), JID. JSON
+  read [--chat WHO] [--since ISO] [--limit N]
+                                     messages of one chat, or across chats since ISO (default 24 h ago). JSON
+  send --to WHO (--text TEXT | --text-file PATH)
+                                     send one message through the bridge. WHO = me, a name, a phone number or a
+                                     JID; only a chat with history (no cold contact). The guard asks the
+                                     manager first for anyone but `me`. Others get the signature line appended
   install                            copy the bridge out of the plugin into <state>/whatsapp/app and npm ci there
-  stop                               stop a running bridge (link and unlink do it first)
-  link | unlink                      pair the bridge with WhatsApp (QR in this terminal) | log it out, delete keys
-  setup                              the manager's guided setup, in their own terminal: install, link, learn
-                                     self_jid, write the whatsapp block, check database access, pick chats,
-                                     pick approval paths. Safe to re-run
-  allow [NUMBER|JID|N] [--name NAME] add a chat to whatsapp.allow (N = the n-th chat setup lists; no argument:
-                                     show that list and add every number typed). Own terminal only
-  disallow JID|NUMBER                remove a chat from whatsapp.allow. Own terminal only
+  stop                               stop a running bridge
   status                             bridge state and whether the local database is readable (JSON)
-  verify ID [--sha256 HEX]           exit 0 only if approved/ID.json still proves a yes, on the path it
-                                     records, for the draft's current text (and HEX, the hash the bridge is
-                                     about to send); else exit 1. Read-only. The bridge runs it per send
+  setup                              the manager's guided setup, in their own terminal: install, link, turn
+                                     WhatsApp on for the linked account, check database access. Safe to re-run
+  link | unlink                      pair the bridge (QR or phone code) | log it out and delete its keys. Own
+                                     terminal only
 
-The database is opened read-only (`mode=ro`). The allowlist is applied in SQL, so rows from other chats are
-never fetched. Nothing is copied to disk. Python 3.9 stdlib only.
+The database is opened read-only (`mode=ro`); nothing read is written anywhere. Python 3.9 stdlib only.
 """
 import datetime as _dt
 import hashlib
 import json
 import os
-import random
 import re
 import socket
 import sqlite3
@@ -47,15 +35,24 @@ DEFAULT_DB = "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Chat
 CORE_EPOCH = 978307200  # Core Data counts seconds from 2001-01-01 UTC
 TEXT_TYPES = (0, 7)  # 0 = text, 7 = text with a link preview; every other type is media
 GROUP_SESSION = 1  # ZSESSIONTYPE: 0 = DM, 1 = group
-DRAFT_TTL_HOURS = 72
-ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz23456789"
-ID_RE = re.compile(r"^w[a-z2-9]{3}$")
+PIN_AHEAD = 86400  # a ZLASTMESSAGEDATE more than a day in the future is a pinned chat, not a date
+DEFAULT_CHATS = 30
+DEFAULT_LIMIT = 100
+DEFAULT_SINCE_HOURS = 24
+MAX_TEXT = 4096
+USER_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net", re.ASCII)
+GROUP_JID_RE = re.compile(r"\d{6,30}(-\d+)?@g\.us", re.ASCII)
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
 
 class ReaderError(Exception):
     def __init__(self, reason):
         Exception.__init__(self, reason)
         self.reason = reason
+
+
+class ChatError(Exception):
+    """WHO can't be used: the message is a plain sentence for the manager."""
 
 
 # ---------------------------------------------------------------- small helpers
@@ -96,7 +93,17 @@ def require_home(cfg: dict) -> None:
 
 
 def _wa(cfg: dict) -> dict:
-    return cfg.get("whatsapp") or {}
+    w = cfg.get("whatsapp")
+    return w if isinstance(w, dict) else {}
+
+
+def _state_dir() -> Path:
+    return Path(os.environ.get("MOTHER_STATE_DIR") or "~/.mother").expanduser()
+
+
+def _fail(msg, code=1):
+    print("mother: %s" % msg, file=sys.stderr)
+    sys.exit(code)
 
 
 # ---------------------------------------------------------------- database access
@@ -146,32 +153,155 @@ def _couldnt(reason: str) -> dict:
     return {"status": "couldnt_check", "reason": reason, "items": []}
 
 
+# ---------------------------------------------------------------- chats
+
+CHAT_COLS = "Z_PK, ZCONTACTJID, ZPARTNERNAME, ZLASTMESSAGEDATE, ZSESSIONTYPE"
+NOT_BROADCAST = "ZCONTACTJID IS NOT NULL AND ZCONTACTJID NOT LIKE '%broadcast'"
+
+
+def _chat(row, now=None) -> dict:
+    """A ZWACHATSESSION row as a chat: {pk, jid, name, group, last, hidden_id?}. `last` is an ISO date, "pinned"
+    (WhatsApp keeps a pinned chat's date far in the future) or None."""
+    pk, jid, name, last, stype = row
+    now = time.time() if now is None else now
+    if not last:
+        when = None
+    elif CORE_EPOCH + float(last) > now + PIN_AHEAD:
+        when = "pinned"
+    else:
+        when = core_ts(last)
+    c = {"pk": pk, "jid": jid, "name": name or "", "group": stype == GROUP_SESSION, "last": when}
+    if (jid or "").endswith("@lid"):
+        c["hidden_id"] = True
+    return c
+
+
+def chat_name(c: dict) -> str:
+    if c.get("name"):
+        return c["name"]
+    if c.get("hidden_id"):
+        return "a chat"
+    head = (c.get("jid") or "").split("@")[0]
+    return ("group " + head) if c.get("group") else ("+" + head)
+
+
+def _sort_chats(chats: list) -> list:
+    """Pinned first (in the order given), then the newest; chats with no date last."""
+    pinned = [c for c in chats if c["last"] == "pinned"]
+    dated = sorted([c for c in chats if c["last"] not in (None, "pinned")], key=lambda c: c["last"], reverse=True)
+    return pinned + dated + [c for c in chats if c["last"] is None]
+
+
+def recent_chats(limit=DEFAULT_CHATS, query=None) -> list:
+    """Chats from ZWACHATSESSION only (never a message), pinned first, then newest. Raises ReaderError."""
+    sql = "SELECT %s FROM ZWACHATSESSION WHERE %s" % (CHAT_COLS, NOT_BROADCAST)
+    params = []
+    if query:
+        sql += " AND (ZPARTNERNAME LIKE ? ESCAPE '\\' OR ZCONTACTJID LIKE ? ESCAPE '\\')"
+        q = "%" + re.sub(r"([%_\\])", r"\\\1", query) + "%"
+        params += [q, q]
+    sql += " ORDER BY ZLASTMESSAGEDATE DESC LIMIT ?"
+    params.append(int(limit))
+    return _sort_chats([_chat(r) for r in _query(sql, params)])
+
+
+def chat_out(c: dict) -> dict:
+    """A chat as `chats` prints it."""
+    o = {"name": chat_name(c), "type": "group" if c["group"] else "dm", "last": c["last"], "jid": c["jid"]}
+    if c.get("hidden_id"):
+        o["hidden_id"] = True
+    return o
+
+
+def phone_jid(text):
+    """`+972-50-000-0001` -> `972500000001@s.whatsapp.net`; None unless it is 6-15 digits after dropping + - ( ) and
+    spaces."""
+    if not isinstance(text, str):
+        return None
+    digits = re.sub(r"[\s+()\-]", "", text)
+    return digits + "@s.whatsapp.net" if re.fullmatch(r"\d{6,15}", digits, re.ASCII) else None
+
+
+def _by_jid(jid: str):
+    rows = _query("SELECT %s FROM ZWACHATSESSION WHERE ZCONTACTJID = ? ORDER BY ZLASTMESSAGEDATE DESC LIMIT 1"
+                  % CHAT_COLS, [jid])
+    return _chat(rows[0]) if rows else None
+
+
+def _listing(chats: list) -> str:
+    return "\n".join("  %s  (%s, last %s)  %s" % (chat_name(c), "group" if c["group"] else "DM",
+                                                  (c["last"] or "never")[:10], c["jid"]) for c in chats)
+
+
+def resolve_chat(cfg: dict, who: str) -> dict:
+    """WHO -> one chat {pk, jid, name, group, last, hidden_id?, self?}. `me` is whatsapp.self_jid. Raises ChatError
+    (a plain sentence) or ReaderError."""
+    who = (who or "").strip()
+    if not who:
+        raise ChatError("say which chat: a name, a phone number, a JID, or me")
+    me = _wa(cfg).get("self_jid")
+    if who.casefold() == "me":
+        if not me:
+            raise ChatError("whatsapp.self_jid isn't set: run `mother whatsapp setup` in your own terminal")
+        c = _by_jid(me) or {"pk": None, "jid": me, "name": "", "group": False, "last": None}
+        return dict(c, self=True, name=c.get("name") or "you")
+    jid = who if "@" in who else phone_jid(who)
+    if jid:
+        c = _by_jid(jid)
+        if not c:
+            raise ChatError("there is no WhatsApp chat with %s on this Mac" % who)
+        return dict(c, self=(jid == me))
+    rows = _query("SELECT %s FROM ZWACHATSESSION WHERE %s AND ZPARTNERNAME LIKE ? ESCAPE '\\' "
+                  "ORDER BY ZLASTMESSAGEDATE DESC LIMIT 200" % (CHAT_COLS, NOT_BROADCAST),
+                  ["%" + re.sub(r"([%_\\])", r"\\\1", who) + "%"])
+    found = [_chat(r) for r in rows]
+    exact = [c for c in found if c["name"].casefold() == who.casefold()]
+    cands = exact or [c for c in found if who.casefold() in c["name"].casefold()]
+    if not cands:
+        raise ChatError("no WhatsApp chat is named %r; `mother whatsapp chats --query` lists them" % who)
+    if len(cands) > 1:
+        raise ChatError("%r matches %d chats; name one exactly, or give its JID:\n%s" % (
+            who, len(cands), _listing(_sort_chats(cands)[:10])))
+    return dict(cands[0], self=(cands[0]["jid"] == me))
+
+
+def has_history(c: dict) -> bool:
+    """True when the database holds at least one message in this chat. Reads no content."""
+    if c.get("pk") is None:
+        return False
+    try:
+        return bool(_query("SELECT 1 FROM ZWAMESSAGE WHERE ZCHATSESSION = ? LIMIT 1", [c["pk"]]))
+    except ReaderError:
+        return False
+
+
 # ---------------------------------------------------------------- reader
 
-def _allowed(cfg: dict) -> dict:
-    return {a["jid"]: a.get("name") or a["jid"] for a in _wa(cfg).get("allow") or []
-            if isinstance(a, dict) and a.get("jid")}
-
-
-def read_messages(cfg: dict, since_iso: str, chats: list = None) -> dict:
-    allowed = _allowed(cfg)
-    jids = [j for j in allowed if chats is None or j in chats]  # a filter can narrow, never widen
-    if not jids:
-        return {"status": "ok", "items": []}
-    marks = ",".join("?" * len(jids))
+def read_messages(chat: dict = None, since_iso: str = None, limit: int = DEFAULT_LIMIT) -> dict:
+    """The last `limit` messages of one chat (since `since_iso` if given), or across chats since `since_iso`,
+    oldest first, as reader items."""
+    where, params = ["s.ZCONTACTJID IS NOT NULL", "s.ZCONTACTJID NOT LIKE '%broadcast'"], []
+    if chat is not None:
+        if chat.get("pk") is None:
+            return {"status": "ok", "items": []}
+        where.append("m.ZCHATSESSION = ?")
+        params.append(chat["pk"])
+    if since_iso:
+        where.append("m.ZMESSAGEDATE >= ?")
+        params.append(to_core(since_iso))
     sql = ("SELECT s.ZCONTACTJID, s.ZPARTNERNAME, s.ZSESSIONTYPE, m.ZISFROMME, m.ZTEXT, m.ZMESSAGETYPE, "
            "m.ZMESSAGEDATE, m.ZSTANZAID, COALESCE(g.ZCONTACTNAME, g.ZFIRSTNAME) "
            "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK "
            "LEFT JOIN ZWAGROUPMEMBER g ON m.ZGROUPMEMBER = g.Z_PK "
-           "WHERE s.ZCONTACTJID IN (%s) AND m.ZMESSAGEDATE >= ? ORDER BY m.ZMESSAGEDATE, m.Z_PK" % marks)
+           "WHERE %s ORDER BY m.ZMESSAGEDATE DESC, m.Z_PK DESC LIMIT ?" % " AND ".join(where))
     try:
-        rows = _query(sql, jids + [to_core(since_iso)])
+        rows = _query(sql, params + [int(limit)])
     except ReaderError as e:
         return _couldnt(e.reason)
     items = []
-    for jid, pname, stype, from_me, text, mtype, mdate, stanza, member in rows:
-        name = allowed.get(jid) or pname or jid
-        is_text = mtype in TEXT_TYPES and text is not None
+    for jid, pname, stype, from_me, text, mtype, mdate, stanza, member in reversed(rows):
+        name = chat_name({"jid": jid, "name": pname, "group": stype == GROUP_SESSION,
+                          "hidden_id": (jid or "").endswith("@lid")})
         if from_me:
             sender = "me"
         elif stype == GROUP_SESSION:
@@ -179,740 +309,136 @@ def read_messages(cfg: dict, since_iso: str, chats: list = None) -> dict:
         else:
             sender = name
         items.append({"chat": jid, "chat_name": name, "from_me": bool(from_me), "sender": sender,
-                      "text": text if is_text else "[media]", "at": core_ts(mdate),
-                      "link": "whatsapp://%s/%s" % (jid, stanza)})
+                      "text": text if mtype in TEXT_TYPES and text is not None else "[media]",
+                      "at": core_ts(mdate), "link": "whatsapp://%s/%s" % (jid, stanza)})
     return {"status": "ok", "items": items}
 
 
-def self_messages(cfg: dict, since_iso: str) -> list:
-    """The manager's own texts in the self chat (from_me only); [] when the database can't be read."""
-    if not _wa(cfg).get("self_jid"):
-        return []
-    try:
-        return self_messages_strict(cfg, since_iso)
-    except ReaderError:
-        return []
+# ---------------------------------------------------------------- CLI: chats, read
 
-
-def self_messages_strict(cfg: dict, since_iso: str) -> list:
-    """Like self_messages, but raises ReaderError when the self chat can't be read. Approval proof uses this:
-    a list that silently comes back empty could hide the manager's `no`."""
-    self_jid = _wa(cfg).get("self_jid")
-    if not self_jid:
-        raise ReaderError("missing")
-    sql = ("SELECT m.ZSTANZAID, m.ZTEXT, m.ZMESSAGEDATE FROM ZWAMESSAGE m "
-           "JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK "
-           "WHERE s.ZCONTACTJID = ? AND m.ZISFROMME = 1 AND m.ZMESSAGETYPE IN (0,7) AND m.ZTEXT IS NOT NULL "
-           "AND m.ZMESSAGEDATE >= ? ORDER BY m.ZMESSAGEDATE, m.Z_PK")
-    rows = _query(sql, [self_jid, to_core(since_iso)])
-    return [{"stanza": r[0], "text": r[1], "at": core_ts(r[2])} for r in rows]
-
-
-def has_history(cfg: dict, jid: str) -> bool:
-    """True when the database holds at least one message in this chat. Reads no content."""
-    sql = ("SELECT 1 FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK "
-           "WHERE s.ZCONTACTJID = ? LIMIT 1")
-    try:
-        return bool(_query(sql, [jid]))
-    except ReaderError:
-        return False
-
-
-def recent_chats(limit=30) -> list:
-    """Chat names and dates from ZWACHATSESSION only. Never reads a message. Raises ReaderError."""
-    sql = ("SELECT ZCONTACTJID, ZPARTNERNAME, ZLASTMESSAGEDATE, ZSESSIONTYPE FROM ZWACHATSESSION "
-           "WHERE ZCONTACTJID IS NOT NULL AND ZCONTACTJID NOT LIKE '%broadcast' "
-           "ORDER BY ZLASTMESSAGEDATE DESC LIMIT ?")
-    rows = _query(sql, [int(limit)])
-    return [{"jid": r[0], "name": r[1] or "", "last_at": core_ts(r[2]) if r[2] else None,
-             "group": r[3] == GROUP_SESSION} for r in rows]
-
-
-# ---------------------------------------------------------------- drafts
-
-def _drafts_dir(ws: Path) -> Path:
-    return Path(ws) / ".mother" / "whatsapp" / "drafts"
-
-
-def _now() -> _dt.datetime:
-    return _dt.datetime.now(_dt.timezone.utc)
-
-
-def _fmt(t: _dt.datetime) -> str:
-    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _expired(d: dict) -> bool:
-    try:
-        made = _dt.datetime.strptime(d["created"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
-    except (KeyError, ValueError, TypeError):
-        return True
-    return _now() - made > _dt.timedelta(hours=DRAFT_TTL_HOURS)
-
-
-def _new_id(ws: Path) -> str:
-    taken = set()
-    for sub in ("drafts", "approved"):
-        d = Path(ws) / ".mother" / "whatsapp" / sub
-        if d.is_dir():
-            taken.update(p.name.split(".")[0] for p in d.iterdir())  # approved/<id>.used|.failed keep the id
-    for _ in range(200):
-        i = "w" + "".join(random.SystemRandom().choice(ID_ALPHABET) for _ in range(3))
-        if i not in taken:
-            return i
-    _fail("could not find a free draft id; drop old drafts (`mother whatsapp list`)", 1)
-
-
-def new_draft(ws: Path, cfg: dict, chat: str, text: str, run: str = None) -> dict:
-    """Write a draft. Exit 2 for a chat that is not allowlisted or has no history (no cold contact)."""
-    allowed = _allowed(cfg)
-    if chat == _wa(cfg).get("self_jid"):
-        _fail("%s is your own self chat, which carries approvals; drafts can't go there" % chat, 2)
-    if chat not in allowed:
-        _fail("%s is not in whatsapp.allow; drafts go only to allowlisted chats" % chat, 2)
-    if not has_history(cfg, chat):
-        _fail("no cold contact: %s has no history with you; start that chat yourself first" % allowed[chat], 2)
-    d = {"id": _new_id(ws), "chat": chat, "chat_name": allowed[chat], "text": text,
-         "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "created": _fmt(_now()),
-         "run": run, "status": "open"}
-    folder = _drafts_dir(ws)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / (d["id"] + ".json")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(str(tmp), str(path))
-    return d
-
-
-def load_draft(ws: Path, draft_id: str, expire: bool = True):
-    """The draft, or None when missing, unreadable or older than 72 hours (an expired file is removed, unless
-    `expire` is False: the proof and `verify` only read)."""
-    if not ID_RE.match(draft_id or ""):
-        return None
-    path = _drafts_dir(ws) / (draft_id + ".json")
-    try:
-        d = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(d, dict) or _expired(d):
-        if not expire:
-            return None
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return None
-    return d
-
-
-def drop_draft(ws: Path, draft_id: str) -> bool:
-    if not ID_RE.match(draft_id or ""):
-        return False
-    try:
-        (_drafts_dir(ws) / (draft_id + ".json")).unlink()
-        return True
-    except OSError:
-        return False
-
-
-def list_drafts(ws: Path) -> list:
-    folder = _drafts_dir(ws)
-    if not folder.is_dir():
-        return []
-    out = [d for d in (load_draft(ws, p.stem) for p in sorted(folder.glob("*.json")))
-           if d and d.get("status") != "sent"]  # `send` marks a draft sent; it is no longer open
-    return sorted(out, key=lambda d: d["created"])
-
-
-# ---------------------------------------------------------------- approval proof
-
-PATHS = ("session", "self_chat", "slack_dm")
-REPLY_RE = re.compile(r"^(ok|no)((?:[ \t]+w[a-z0-9]+)+|[ \t]+all)$", re.I)
-SESSION_MAX_HOURS = DRAFT_TTL_HOURS
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-_GUARD = []
-
-
-def _guard():
-    """hooks/guard.py, imported lazily (it imports this module lazily too; no cycle at load time)."""
-    if not _GUARD:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("mother_guard", str(PLUGIN_ROOT / "hooks" / "guard.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _GUARD.append(mod)
-    return _GUARD[0]
-
-
-def _state_dir() -> Path:
-    return Path(os.environ.get("MOTHER_STATE_DIR") or "~/.mother").expanduser()
-
-
-def _epoch(iso):
-    try:
-        return _dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc).timestamp()
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_reply(text):
-    """("ok"|"no", [ids] | "all") when the whole message is the command, else None."""
-    if not isinstance(text, str):
-        return None
-    m = REPLY_RE.match(text.strip())
-    if not m:
-        return None
-    rest = m.group(2).split()
-    if [r.lower() for r in rest] == ["all"]:
-        return m.group(1).lower(), "all"
-    return m.group(1).lower(), [r.lower() for r in rest]
-
-
-def approve_via(cfg: dict) -> list:
-    v = _wa(cfg).get("approve_via")
-    if v is None:
-        return list(PATHS)
-    return [p for p in v if p in PATHS] if isinstance(v, list) else []
-
-
-def _prompts(ws: Path, path: str) -> list:
-    """[(epoch, [ids], {id: sha256})] of prompts.jsonl entries for one path, oldest first."""
-    p = Path(ws) / ".mother" / "whatsapp" / "prompts.jsonl"
-    out = []
-    try:
-        with open(str(p), encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return []
-    for line in lines:
-        try:
-            r = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(r, dict) or r.get("path") != path:
-            continue
-        t, ids, shas = _epoch(r.get("at")), r.get("ids"), r.get("sha256")
-        if t is not None and isinstance(ids, list) and isinstance(shas, dict):
-            out.append((t, [str(i) for i in ids], {str(k): str(v) for k, v in shas.items()}))
-    return sorted(out, key=lambda x: x[0])
-
-
-def _shown(ws: Path, path: str, draft_id: str, sha: str, created: float, until: float = None) -> list:
-    """Times a prompt on this path showed this draft with this exact text, after the draft existed."""
-    return [t for t, ids, shas in _prompts(ws, path)
-            if t >= created and (until is None or t <= until) and draft_id in ids and shas.get(draft_id) == sha]
-
-
-def _all_covers(ws: Path, path: str, at: float, draft_id: str, sha: str, created: float) -> bool:
-    """`all` = the latest prompt on this path sent at or before `at`. It covers this draft only if that prompt
-    came after the draft existed and showed this draft's current text."""
-    before = [p for p in _prompts(ws, path) if p[0] <= at]
-    if not before:
-        return False
-    t, ids, shas = before[-1]
-    return t >= created and draft_id in ids and shas.get(draft_id) == sha
-
-
-def resolve_all(ws: Path, path: str, at: float) -> list:
-    """The ids of the latest prompt on this path sent at or before `at`."""
-    before = [p for p in _prompts(ws, path) if p[0] <= at]
-    return list(before[-1][1]) if before else []
-
-
-def _bridge_stanzas():
-    """Stanza ids the bridge sent (sent.jsonl), or None when that can't be told: the file is missing or
-    unreadable, or any line is malformed or lacks a stanza id. A line whose stanza is JSON null (WhatsApp
-    returned no id) is well-formed and skipped: there is no id to recognise, and it must not shut the path."""
-    p = _state_dir() / "whatsapp" / "sent.jsonl"
-    try:
-        with open(str(p), encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except (OSError, UnicodeDecodeError):
-        return None
-    out = set()
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            r = json.loads(line)
-        except ValueError:
-            return None
-        if isinstance(r, dict) and "stanza" in r and r["stanza"] is None:
-            continue
-        if not isinstance(r, dict) or not isinstance(r.get("stanza"), str) or not r["stanza"].strip():
-            return None
-        out.add(r["stanza"])
+def _opts(args, known, usage):
+    """{option: value} for `--opt VALUE` / `--opt=VALUE`; each option once. _fail(usage) on anything else."""
+    out, i = {}, 0
+    while i < len(args):
+        a = args[i]
+        name, val = (a.split("=", 1) + [None])[:2] if a.startswith("--") and "=" in a else (a, None)
+        if name not in known or name in out:
+            _fail(usage)
+        if val is None:
+            if i + 1 >= len(args):
+                _fail(usage)
+            val, i = args[i + 1], i + 2
+        else:
+            i += 1
+        out[name] = val
     return out
 
 
-class _Case(object):
-    """Everything one proof needs about one draft, read once."""
-
-    def __init__(self, ws, cfg, draft_id, transcript_path, now):
-        self.ws, self.cfg, self.id, self.transcript = ws, cfg, draft_id, transcript_path
-        self.now = time.time() if now is None else now
-        self.via = approve_via(cfg)
-        self.ok = False
-        d = load_draft(ws, draft_id, expire=False)  # a proof only reads
-        self.created = _epoch((d or {}).get("created"))
-        if not d or self.created is None or d.get("id") != draft_id or not isinstance(d.get("text"), str):
-            return
-        self.sha = hashlib.sha256(d["text"].encode("utf-8")).hexdigest()
-        if d.get("sha256") != self.sha:
-            return  # the text changed after the draft was written: nothing approves it
-        self.self_rows = None
-        if "self_chat" in self.via:  # raises ReaderError: a self-chat `no` we can't see blocks every path
-            self.self_rows = self_messages_strict(cfg, _fmt(_dt.datetime.fromtimestamp(self.created,
-                                                                                      _dt.timezone.utc)))
-        self.ok = True
-
-
-def _session_hit(word, c):
-    if not isinstance(c.transcript, str) or not os.path.isfile(c.transcript):
-        return None
-    g = _guard()
-    with open(c.transcript, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if c.id not in line.lower():
-                continue
-            try:
-                e = json.loads(line)
-            except ValueError:
-                continue
-            text = g.user_text(e)  # genuine human messages only
-            ts = g.parse_time(e.get("timestamp")) if isinstance(e, dict) else None
-            if not text or ts is None or ts <= c.created or ts > c.now + 60 \
-                    or c.now - ts > SESSION_MAX_HOURS * 3600:
-                continue
-            reply = parse_reply(text)
-            if reply and reply[0] == word and reply[1] != "all" and c.id in reply[1]:  # explicit ids only
-                return "session:%s" % (e.get("uuid") or e.get("timestamp"))
-    return None
-
-
-def _self_chat_hit(word, c):
-    shown = _shown(c.ws, "self_chat", c.id, c.sha, c.created)
-    if not shown:
-        return None  # never shown in the self chat with this text: nothing there counts
-    bridge = _bridge_stanzas()
-    if bridge is None:
-        if word == "ok":
-            return None  # can't tell the bridge's own messages from the manager's: no yes
-        bridge = set()  # a `no` only ever reduces
-    for m in c.self_rows or []:
-        stanza = m.get("stanza")
-        if not isinstance(stanza, str) or not stanza.strip() or stanza in bridge:
-            continue  # sent by the bridge, or unidentifiable: MOTHER cannot approve itself
-        at = _epoch(m.get("at"))
-        if at is None or at < shown[0]:
-            continue
-        reply = parse_reply(m.get("text"))
-        if not reply or reply[0] != word:
-            continue
-        if reply[1] == "all":
-            hit = _all_covers(c.ws, "self_chat", at, c.id, c.sha, c.created)
-        else:
-            hit = c.id in reply[1]
-        if hit:
-            return "self_chat:%s" % stanza
-    return None
-
-
-def _dm_channels(cfg):
-    """The manager's DM channel ids (manager.chat_dm), never the user id."""
-    return [str(x) for x in _guard().as_list((cfg.get("manager") or {}).get("chat_dm")) if x]
-
-
-def _slack_hit(c):
-    g = _guard()
-    dms = set(_dm_channels(c.cfg))
-    scopes, max_age = g.grant_limits(c.cfg)
-    if "whatsapp" not in scopes or not dms:
-        return None
-    data, ok = g.read_json(str(Path(c.ws) / ".mother" / "grants.json"))
-    if not ok or not isinstance(data, dict) or not isinstance(data.get("grants"), list):
-        return None
-    for gr in data["grants"]:
-        v = g.valid_grant(gr, "whatsapp", c.id, c.cfg, scopes, max_age, c.now)
-        if not v or gr.get("sha256") != c.sha or not grant_sig_ok(gr):
-            continue  # a grant for other text, or one `pending` didn't sign
-        src = gr["source"]
-        ts = g.parse_time(src.get("ts"))
-        if str(src.get("channel")) not in dms or ts is None or ts <= c.created:
-            continue  # the manager's DM only, and a yes given after this draft existed
-        if not _shown(c.ws, "slack_dm", c.id, c.sha, c.created, until=ts):
-            continue  # the DM never showed this text before the yes
-        return "slack_dm:%s" % v[0]
-    return None
-
-
-def _hit(word, c, only=None):
-    """The first proof of `word` on an enabled path (only that path when `only` is given)."""
-    if only is not None:
-        c = _Only(c, only)
-    if "session" in c.via:
-        ev = _session_hit(word, c)
-        if ev:
-            return {"path": "session", "evidence": ev}
-    if "self_chat" in c.via:
-        ev = _self_chat_hit(word, c)
-        if ev:
-            return {"path": "self_chat", "evidence": ev}
-    if word == "ok" and "slack_dm" in c.via:  # a Slack `no` is applied by `pending` at once (the draft is dropped)
-        ev = _slack_hit(c)
-        if ev:
-            return {"path": "slack_dm", "evidence": ev}
-    return None
-
-
-class _Only(object):
-    """A case seen through one approval path: same draft, `via` narrowed to that path if it is enabled."""
-
-    def __init__(self, c, path):
-        self.__dict__.update(c.__dict__)
-        self.via = [path] if path in c.via else []
-
-
-def rejected(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None) -> bool:
-    """True when the manager said `no` to this draft on an enabled path (session or self chat)."""
+def _int(v, usage, lo=1, hi=1000):
     try:
-        c = _Case(ws, cfg, draft_id, transcript_path, now)
-        return c.ok and _hit("no", c) is not None
-    except Exception:
-        return False
-
-
-def prove(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None, path=None):
-    """{"path", "evidence", "sha256"} for the manager's yes to this draft's current text on an enabled path
-    (only on `path` when given), else None. Fails closed: any error, a missing, expired or altered draft, an
-    unreadable self chat (when that path is on), or a `no` on any enabled path means None. Writes nothing."""
-    try:
-        c = _Case(ws, cfg, draft_id, transcript_path, now)
-        if not c.ok or _hit("no", c):
-            return None
-        got = _hit("ok", c, only=path)
-        if got:
-            got["sha256"] = c.sha
-        return got
-    except Exception:
-        return None
-
-
-def verify(ws: Path, cfg: dict, draft_id: str, sha: str = None):
-    """(True, why) when approved/<id>.json still stands: prove() run again on the evidence it records (the
-    transcript the guard read, the self chat, the signed DM grant), on the path it records only, finds a yes
-    for the draft's current text, and that text's sha256 equals the draft's stored hash, the approval's, and
-    `sha` (the hash of the bytes the bridge is about to send) when given. Else (False, reason).
-    Read-only: it never deletes or changes a file, an expired draft included. The bridge runs it before every
-    send."""
-    if not isinstance(draft_id, str) or not ID_RE.match(draft_id):
-        return False, "%s: not a draft id" % draft_id
-    p = Path(ws) / ".mother" / "whatsapp" / "approved" / (draft_id + ".json")
-    try:
-        rec = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False, "%s: no approval record" % draft_id
-    if not isinstance(rec, dict) or rec.get("id") != draft_id or rec.get("path") not in PATHS \
-            or not isinstance(rec.get("sha256"), str):
-        return False, "%s: malformed approval record" % draft_id
-    if sha is not None and (not isinstance(sha, str) or not re.match(r"^[0-9a-f]{64}$", sha)):
-        return False, "%s: --sha256 must be 64 hex characters" % draft_id
-    try:
-        d = json.loads((_drafts_dir(ws) / (draft_id + ".json")).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        d = None
-    if not isinstance(d, dict) or not isinstance(d.get("text"), str):
-        return False, "%s: no open draft" % draft_id
-    if _expired(d):
-        return False, "%s: the draft expired" % draft_id
-    if rec.get("chat") != d.get("chat"):
-        return False, "%s: the approval names another chat" % draft_id
-    transcript = rec.get("transcript") if isinstance(rec.get("transcript"), str) else None
-    proof = prove(ws, cfg, draft_id, transcript_path=transcript, path=rec["path"])
-    if not proof:
-        return False, "%s: no proven yes via %s on re-check" % (draft_id, rec["path"])
-    text_sha = hashlib.sha256(d["text"].encode("utf-8")).hexdigest()
-    if not (proof.get("sha256") == rec["sha256"] == d.get("sha256") == text_sha) \
-            or (sha is not None and sha != text_sha):
-        return False, "%s: text hash differs between draft, approval and proof" % draft_id
-    return True, "%s: verified via %s" % (draft_id, proof["path"])
-
-
-class _GrantsLock(object):
-    """Exclusive lock on <ws>/.mother/grants.lock around a read-modify-write of grants.json."""
-
-    def __init__(self, ws):
-        self.path = Path(ws) / ".mother" / "grants.lock"
-        self.f = None
-
-    def __enter__(self):
-        import fcntl
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.f = open(str(self.path), "a")
-        fcntl.flock(self.f, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *exc):
-        import fcntl
-        try:
-            fcntl.flock(self.f, fcntl.LOCK_UN)
-        finally:
-            self.f.close()
-
-
-def _grant_key(create: bool = False):
-    """The HMAC key in <state>/whatsapp/grant.key (0600), or None. Only `mother whatsapp` creates it. The guard
-    denies shell access to <state>/whatsapp/, but the macOS account (and so the agent's Read tool) can read the
-    key: the signature stops a grant written by mistake or by an injected instruction, not a deliberately
-    evasive agent (CONTRACT §5d)."""
-    p = _state_dir() / "whatsapp" / "grant.key"
-    if create and not p.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        except FileExistsError:
-            pass
-        else:
-            with os.fdopen(fd, "w") as f:
-                f.write(os.urandom(32).hex())
-    try:
-        if p.is_symlink():
-            return None
-        key = bytes.fromhex(p.read_text().strip())
-    except (OSError, ValueError):
-        return None
-    return key if len(key) >= 16 else None
-
-
-def grant_sig(scope: str, target: str, ts: str, sha: str, create: bool = True):
-    """HMAC-SHA256 over (scope, target, DM message ts, text sha256): what `pending` puts in a whatsapp grant."""
-    import hmac
-    key = _grant_key(create=create)
-    if key is None:
-        return None
-    msg = "\n".join([str(scope), str(target), str(ts), str(sha)]).encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()
-
-
-def grant_sig_ok(g) -> bool:
-    """A whatsapp grant carries a valid `sig`. A grant any other writer made (grants.json is agent-writable for
-    the digest) has none and proves nothing."""
-    import hmac
-    if not isinstance(g, dict) or not isinstance(g.get("sig"), str) or not isinstance(g.get("source"), dict):
-        return False
-    want = grant_sig(g.get("scope"), g.get("target"), g["source"].get("ts"), g.get("sha256"), create=False)
-    if want is None:
-        return False
-    try:  # bytes, so a non-ASCII sig compares unequal instead of raising: a malformed sig is no sig
-        return hmac.compare_digest(want.encode("utf-8"), g["sig"].encode("utf-8", "surrogatepass"))
+        n = int(v)
     except (TypeError, ValueError):
-        return False
-
-
-def _write_grant(ws: Path, cfg: dict, draft_id: str, sha: str, channel: str, ts: str) -> None:
-    """Append one whatsapp grant. The caller holds _GrantsLock."""
-    g = _guard()
-    path = Path(ws) / ".mother" / "grants.json"
-    data, ok = g.read_json(str(path))
-    if not ok or not isinstance(data, dict) or not isinstance(data.get("grants"), list):
-        if path.exists():
-            raise ValueError("grants.json is unreadable; not overwriting it")
-        data = {"grants": []}
-    for gr in data["grants"]:
-        src = gr.get("source") if isinstance(gr, dict) else None
-        if isinstance(src, dict) and gr.get("scope") == "whatsapp" and gr.get("target") == draft_id \
-                and str(src.get("channel")) == channel and str(src.get("ts")) == str(ts):
-            return  # this message already granted it
-    sent = g.parse_time(ts)
-    sig = grant_sig("whatsapp", draft_id, str(ts), sha, create=True)
-    if sig is None:
-        raise ValueError("can't create or read the grant key in %s" % (_state_dir() / "whatsapp"))
-    data["grants"].append({"scope": "whatsapp", "target": draft_id, "sha256": sha, "uses": 1, "run": "whatsapp",
-                           "expires": _fmt(_dt.datetime.fromtimestamp(sent + DRAFT_TTL_HOURS * 3600,
-                                                                      _dt.timezone.utc)),
-                           "source": {"channel": channel, "user": str(g.owner_id(cfg)), "ts": str(ts)},
-                           "sig": sig})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1))
-    os.replace(str(tmp), str(path))
-
-
-def _own_post(cfg: dict, m: dict) -> bool:
-    """A bot/app post, or the agent's own post through the manager's token (signed on its first line)."""
-    if m.get("bot_id") or m.get("bot_profile") or m.get("app_id"):
-        return True
-    if m.get("subtype") not in (None, "", "thread_broadcast"):
-        return True
-    agent = cfg.get("agent") or {}
-    marks = ["%s (AI)" % agent["name"]] if agent.get("name") else []
-    if isinstance(agent.get("signature"), str) and agent["signature"].strip():
-        marks.append(agent["signature"].strip())
-    first = str(m.get("text") or "").lstrip().split("\n", 1)[0]
-    return any(mk in first for mk in marks)
-
-
-def pending(ws: Path, cfg: dict, dm: list) -> dict:
-    """Apply the manager's Slack DM replies (grants for `ok`, drops for `no`), then list drafts with a proof."""
-    g = _guard()
-    owner = g.owner_id(cfg)
-    chat_dm = _dm_channels(cfg)
-    dropped = []
-    if "slack_dm" in approve_via(cfg) and owner and chat_dm:
-        decided = set()
-        msgs = [m for m in dm or [] if isinstance(m, dict) and g.parse_time(m.get("ts")) is not None]
-        with _GrantsLock(ws):
-            for m in sorted(msgs, key=lambda m: g.parse_time(m.get("ts"))):
-                if str(m.get("user")) != str(owner) or _own_post(cfg, m):
-                    continue  # only the manager approves, and never through the agent's own text
-                reply = parse_reply(m.get("text"))
-                if not reply:
-                    continue
-                at = g.parse_time(m.get("ts"))
-                word, ids = reply
-                if ids == "all":
-                    if word == "ok":
-                        continue  # a Slack yes names explicit ids: no post can be proven to be what `all` meant
-                    ids = resolve_all(ws, "slack_dm", at)  # `no all` only drops, so the latest prompt is fine
-                for i in ids:
-                    d = load_draft(ws, i)
-                    created = _epoch((d or {}).get("created"))
-                    if i in decided or not d or created is None or at <= created:
-                        continue  # one decision per draft per batch; an old reply can't touch a newer same-id draft
-                    if word == "no":
-                        decided.add(i)
-                        if drop_draft(ws, i):
-                            dropped.append(i)
-                        continue
-                    sha = hashlib.sha256(str(d.get("text")).encode("utf-8")).hexdigest()
-                    if d.get("sha256") != sha:
-                        continue
-                    if not _shown(ws, "slack_dm", i, sha, created, until=at):
-                        continue  # the DM never showed this text before the yes
-                    decided.add(i)
-                    try:
-                        _write_grant(ws, cfg, i, sha, chat_dm[0], str(m.get("ts")))
-                    except (OSError, ValueError) as e:
-                        print("mother: no grant for %s: %s" % (i, e), file=sys.stderr)
-    send = []
-    for d in list_drafts(ws):
-        if rejected(ws, cfg, d["id"]):
-            if drop_draft(ws, d["id"]):
-                dropped.append(d["id"])
-        elif prove(ws, cfg, d["id"]):
-            send.append(d["id"])
-    return {"send": send, "dropped": dropped}
-
-
-# ---------------------------------------------------------------- CLI
-
-def _fail(msg, code=1):
-    print("mother: %s" % msg, file=sys.stderr)
-    sys.exit(code)
-
-
-def cmd_read(cfg, args):
-    since, chats, i = None, [], 0
-    while i < len(args):
-        if args[i] == "--since" and i + 1 < len(args):
-            since, i = args[i + 1], i + 2
-        elif args[i] == "--chat" and i + 1 < len(args):
-            chats.append(args[i + 1])
-            i += 2
-        else:
-            _fail("usage: mother whatsapp read --since ISO [--chat JID]...")
-    if not since:
-        _fail("usage: mother whatsapp read --since ISO [--chat JID]...")
-    try:
-        to_core(since)
-    except ValueError:
-        _fail("--since must be an ISO date-time, e.g. 2026-10-26T08:00:00Z")
-    print(json.dumps(read_messages(cfg, since, chats or None), indent=2, ensure_ascii=False))
+        _fail(usage)
+    if not lo <= n <= hi:
+        _fail(usage)
+    return n
 
 
 def cmd_chats(cfg, args):
+    usage = "usage: mother whatsapp chats [--query TEXT] [--limit N]"
+    o = _opts(args, ("--query", "--limit"), usage)
+    limit = _int(o.get("--limit", DEFAULT_CHATS), usage)
     try:
-        print(json.dumps(recent_chats(), indent=2, ensure_ascii=False))
+        chats = recent_chats(limit, o.get("--query"))
     except ReaderError as e:
-        print(json.dumps({"status": "couldnt_check", "reason": e.reason, "items": []}))
+        print(json.dumps(_couldnt(e.reason)))
         sys.exit(1)
+    print(json.dumps([chat_out(c) for c in chats], indent=2, ensure_ascii=False))
 
 
-def cmd_draft(cfg, args, ws):
-    chat, text_file, run, i = None, None, None, 0
-    usage = "usage: mother whatsapp draft --chat JID --text-file PATH [--run ID]"
-    while i < len(args):
-        if args[i] == "--chat" and i + 1 < len(args):
-            chat, i = args[i + 1], i + 2
-        elif args[i] == "--text-file" and i + 1 < len(args):
-            text_file, i = args[i + 1], i + 2
-        elif args[i] == "--run" and i + 1 < len(args):
-            run, i = args[i + 1], i + 2
-        else:
-            _fail(usage)
-    if not chat or not text_file:
+def cmd_read(cfg, args):
+    usage = "usage: mother whatsapp read [--chat WHO] [--since ISO] [--limit N]"
+    o = _opts(args, ("--chat", "--since", "--limit"), usage)
+    limit = _int(o.get("--limit", DEFAULT_LIMIT), usage)
+    since = o.get("--since")
+    if since:
+        try:
+            to_core(since)
+        except ValueError:
+            _fail("--since must be an ISO date-time, e.g. 2026-10-26T08:00:00Z")
+    chat = None
+    if "--chat" in o:
+        try:
+            chat = resolve_chat(cfg, o["--chat"])
+        except ChatError as e:
+            _fail(str(e), 2)
+        except ReaderError as e:
+            print(json.dumps(_couldnt(e.reason)))
+            sys.exit(1)
+    elif not since:
+        since = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=DEFAULT_SINCE_HOURS)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    print(json.dumps(read_messages(chat, since, limit), indent=2, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------- CLI: send
+
+def signature(cfg: dict) -> str:
+    """The disclosure line (rules/outbound.md) as WhatsApp shows it: a Slack `:shortcode:` emoji is left out."""
+    a = cfg.get("agent") or {}
+    if isinstance(a.get("signature"), str) and a["signature"].strip():
+        return a["signature"].strip()
+    emoji = a.get("emoji") if isinstance(a.get("emoji"), str) else ""
+    emoji = "" if re.fullmatch(r":[\w+-]+:", emoji.strip()) else emoji.strip()
+    line = "*%s (AI)* · on behalf of %s" % (a.get("name") or "Agent",
+                                             a.get("manager_short") or a.get("manager") or "the manager")
+    return (emoji + " " + line) if emoji else line
+
+
+def signed(cfg: dict, text: str) -> str:
+    name = (cfg.get("agent") or {}).get("name") or "Agent"
+    if "%s (AI)" % name in text:
+        return text
+    return text + "\n\n" + signature(cfg)
+
+
+def cmd_send(cfg, args):
+    usage = "usage: mother whatsapp send --to WHO (--text TEXT | --text-file PATH)"
+    o = _opts(args, ("--to", "--text", "--text-file"), usage)
+    if "--to" not in o or ("--text" in o) == ("--text-file" in o):
         _fail(usage)
-    try:
-        text = Path(text_file).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as e:
-        _fail("cannot read --text-file: %s" % e)
-    text = text.strip("\n")
-    if not text.strip():
-        _fail("the draft text is empty")
-    print(json.dumps(new_draft(ws, cfg, chat, text, run), indent=2, ensure_ascii=False))
-
-
-def cmd_list(cfg, args, ws):
-    if args not in ([], ["--json"]):
-        _fail("usage: mother whatsapp list [--json]")
-    drafts = list_drafts(ws)
-    if args:
-        print(json.dumps(drafts, indent=2, ensure_ascii=False))
-        return
-    if not drafts:
-        print("no open WhatsApp drafts")
-    for d in drafts:
-        one = d["text"].replace("\n", " ")
-        print('%s  %s  %s  "%s"' % (d["id"], d["created"], d["chat_name"], one if len(one) <= 60 else one[:57] + "..."))
-
-
-def cmd_pending(cfg, args, ws):
-    if args:
-        _fail("usage: mother whatsapp pending  (stdin: {\"dm\": [chat messages]})")
-    raw = sys.stdin.read()
-    try:
-        inp = json.loads(raw) if raw.strip() else {}
-    except ValueError as e:
-        _fail("pending: bad JSON on stdin: %s" % e)
-    if not isinstance(inp, dict) or not isinstance(inp.get("dm", []), list):
-        _fail("pending: stdin must be {\"dm\": [chat messages]}")
-    wa = _wa(cfg)
-    if not (wa.get("enabled") and wa.get("send", True)):
-        print(json.dumps({"send": [], "dropped": []}))
-        return
-    print(json.dumps(pending(ws, cfg, inp.get("dm") or []), indent=2))
-
-
-def cmd_drop(cfg, args, ws):
-    if len(args) != 1:
-        _fail("usage: mother whatsapp drop ID")
-    if not drop_draft(ws, args[0]):
-        _fail("no such draft: %s" % args[0])
-    print("dropped %s" % args[0])
-
-
-def cmd_verify(cfg, args, ws):
-    usage = "usage: mother whatsapp verify ID [--sha256 HEX]"
-    if len(args) == 3 and args[1] == "--sha256":
-        sha = args[2]
-    elif len(args) == 1:
-        sha = None
+    if "--text-file" in o:
+        try:
+            text = Path(o["--text-file"]).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            _fail("can't read --text-file: %s" % e)
     else:
-        _fail(usage)
-    ok, why = verify(ws, cfg, args[0], sha)
-    if not ok:
-        _fail("verify %s" % why)
-    print(why)
+        text = o["--text"]
+    text = text.rstrip("\n")
+    if not text.strip():
+        _fail("the message is empty; nothing was sent", 2)
+    try:
+        c = resolve_chat(cfg, o["--to"])
+    except ChatError as e:
+        _fail("%s; nothing was sent" % e, 2)
+    except ReaderError as e:
+        _fail("can't read WhatsApp's database (%s), so MOTHER can't check the chat; nothing was sent" % e.reason, 2)
+    if not c.get("self"):
+        if c.get("hidden_id"):
+            _fail("WhatsApp hides the number of %s, so MOTHER can't address it; send it yourself; nothing was sent" % chat_name(c), 2)
+        if not (USER_JID_RE.fullmatch(c["jid"] or "") or GROUP_JID_RE.fullmatch(c["jid"] or "")):
+            _fail("%s isn't a person or a group MOTHER can message; nothing was sent" % chat_name(c), 2)
+        if not has_history(c):
+            _fail("no cold contact: you have no messages with %s yet; start that chat yourself; nothing was sent" % chat_name(c), 2)
+        text = signed(cfg, text)
+    if len(text) > MAX_TEXT:
+        _fail("the message is longer than %d characters; nothing was sent" % MAX_TEXT, 2)
+    r = bridge_call({"op": "send", "jid": c["jid"], "text": text})
+    if not r.get("ok"):
+        print(json.dumps(r))
+        _fail("the send failed: %s; nothing was sent" % (r.get("error") or "error"), 2)
+    print(json.dumps({"ok": True, "to": c["jid"], "name": chat_name(c), "id": r.get("stanza")},
+                     ensure_ascii=False))
 
 
 # ---------------------------------------------------------------- bridge client
@@ -921,7 +447,7 @@ BRIDGE_SRC = PLUGIN_ROOT / "bridge" / "whatsapp"  # the plugin's copy; `install`
 START_WAIT = 15.0  # seconds to wait for a bridge we just started to open its socket
 READY_WAIT = 20.0  # then up to this long for its WhatsApp connection to open
 CALL_TIMEOUT = {"status": 5.0}
-DEFAULT_TIMEOUT = 60.0  # send/prompt: up to 30 s for the gap, plus typing and verify
+DEFAULT_TIMEOUT = 60.0  # send: up to 30 s for the gap, plus typing
 MIN_NODE = 20
 NODE_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
@@ -1033,7 +559,7 @@ def install_bridge() -> dict:
     return {"ok": True, "app": str(dest)}
 
 
-def cmd_install(cfg, args, ws):
+def cmd_install(cfg, args):
     if args:
         _fail("usage: mother whatsapp install")
     r = install_bridge()
@@ -1074,10 +600,8 @@ def _start_bridge():
         pass
     log = open(str(logp), "ab")
     try:
-        env = dict(os.environ)
-        env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)  # the bridge runs outside the plugin but verifies with it
         return subprocess.Popen([_node(), str(app_dir() / "bridge.mjs")], stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=log, start_new_session=True, cwd=str(app_dir()), env=env)
+                                stderr=log, start_new_session=True, cwd=str(app_dir()))
     finally:
         log.close()
 
@@ -1164,130 +688,21 @@ def stop_bridge(wait: float = 5.0) -> bool:
     return True
 
 
-def cmd_stop(cfg, args, ws):
+def cmd_stop(cfg, args):
     if args:
         _fail("usage: mother whatsapp stop")
     print(json.dumps({"ok": True, "stopped": stop_bridge()}))
 
 
-# ---------------------------------------------------------------- send, prompt, link, status
-
-def _approved_dir(ws: Path) -> Path:
-    return Path(ws) / ".mother" / "whatsapp" / "approved"
-
-
-def _mark_sent(ws: Path, draft_id: str) -> None:
-    d = load_draft(ws, draft_id, expire=False)
-    if not d:
-        return
-    d["status"] = "sent"
-    path = _drafts_dir(ws) / (draft_id + ".json")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(str(tmp), str(path))
-
-
-def cmd_send(cfg, args, ws):
-    if len(args) != 1 or not ID_RE.match(args[0]):
-        _fail("usage: mother whatsapp send ID")
-    i = args[0]
-    if not (_approved_dir(ws) / (i + ".json")).is_file():
-        _fail("no approval for %s: it needs the manager's yes first (the guard records it)" % i, 2)
-    r = bridge_call({"op": "send", "draft": i})
-    if not r.get("ok") and r.get("error") != "already_sent":
-        print(json.dumps(r))
-        _fail("send %s failed: %s" % (i, r.get("error") or "error"), 2)
-    try:
-        _mark_sent(ws, i)
-    except OSError as e:
-        print("mother: sent, but couldn't mark %s sent: %s" % (i, e), file=sys.stderr)
-    if r.get("ok"):
-        print(json.dumps({"ok": True, "stanza": r.get("stanza")}))
-    else:  # already sent earlier: it can't go twice, and it must not be prompted again
-        print(json.dumps({"ok": True, "already_sent": True, "note": "this draft was already sent"}))
-
-
-def _in_quiet_hours(cfg: dict) -> bool:
-    import channels
-    return channels.quiet_now(cfg)
-
-
-def prompt_text(drafts: list, allow_all: bool = True) -> str:
-    """The batched approval prompt. No line of it may read as an approval reply (the bridge refuses such text):
-    every draft starts `<id> WhatsApp ->`, text continuation lines are quoted with `> `, and the hint starts
-    `Reply with`. The Slack path takes explicit ids only (`allow_all` False): its post can't be proven to be
-    the prompt `all` would resolve to."""
-    lines = []
-    for d in drafts:
-        body = str(d["text"]).split("\n")
-        lines.append('%s WhatsApp -> %s: "%s' % (d["id"], d.get("chat_name") or "chat", body[0]))
-        lines.extend("> " + b for b in body[1:])
-        lines[-1] += '"'
-    lines.append("")
-    ids = " ".join(d["id"] for d in drafts)
-    if allow_all:
-        lines.append("Reply with: ok %s  |  ok all  |  no <id>" % ids)
-    else:
-        lines.append("Reply with explicit ids: ok %s  |  no <id>" % ids)
-    return "\n".join(lines)
-
-
-def _record_prompt(ws: Path, path: str, drafts: list) -> None:
-    rec = {"at": _fmt(_now()), "path": path, "ids": [d["id"] for d in drafts],
-           "sha256": {d["id"]: d["sha256"] for d in drafts}}
-    p = Path(ws) / ".mother" / "whatsapp" / "prompts.jsonl"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(p), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        os.write(fd, (json.dumps(rec) + "\n").encode("utf-8"))  # one write: a torn line shows nothing
-    finally:
-        os.close(fd)
-
-
-def cmd_prompt(cfg, args, ws):
-    if not args or not all(ID_RE.match(a) for a in args):
-        _fail("usage: mother whatsapp prompt ID [ID]...")
-    drafts = []
-    for i in dict.fromkeys(args):
-        d = load_draft(ws, i)
-        if not d or d.get("status") == "sent":
-            _fail("%s is not an open draft" % i, 2)
-        if not d.get("sha256") or d["sha256"] != hashlib.sha256(str(d.get("text")).encode("utf-8")).hexdigest():
-            _fail("%s: the draft's hash does not match its text; drop it and draft again" % i, 2)
-        drafts.append(d)
-    if _in_quiet_hours(cfg):
-        print(json.dumps({"held": True}))
-        return
-    out = {"ids": [d["id"] for d in drafts]}
-    failed = False
-    for path in approve_via(cfg):
-        if path == "self_chat":
-            r = bridge_call({"op": "prompt", "text": prompt_text(drafts)})
-            out["self_chat"] = r
-            if r.get("ok") or r.get("error") == "log_failed":  # log_failed: the message did go out
-                _record_prompt(ws, "self_chat", drafts)
-            if not r.get("ok"):
-                failed = True
-        elif path == "slack_dm":
-            dms = _dm_channels(cfg)
-            if not dms:
-                out["slack_dm"] = {"ok": False, "error": "no_chat_dm"}
-                failed = True
-                continue
-            out["slack_dm"] = {"ok": True, "channel": dms[0], "text": prompt_text(drafts, allow_all=False)}
-            _record_prompt(ws, "slack_dm", drafts)
-    print(json.dumps(out, indent=2, ensure_ascii=False))
-    if failed:  # per-path results are in the JSON; the caller must read them
-        sys.exit(2)
-
+# ---------------------------------------------------------------- link, status
 
 def _bridge_argv(flag: str) -> list:
     return [_node(), str(app_dir() / "bridge.mjs"), flag]
 
 
 def cmd_link(sub, args) -> int:
-    """`link` / `unlink`: stop a running bridge, then run the installed bridge in this terminal (the QR shows
-    here; an expired QR offers a new one). Returns the exit code."""
+    """`link` / `unlink`: stop a running bridge, then run the installed bridge in this terminal (link: the QR or
+    phone-code choice and retry loop of setup). Returns the exit code."""
     import subprocess
     if args:
         _fail("usage: mother whatsapp %s" % sub)
@@ -1311,9 +726,7 @@ def cmd_link(sub, args) -> int:
         io.say("Linked: %s. Run `mother whatsapp setup` to finish (it is safe to re-run)." % me)
         return 0
     stop_bridge()  # a running bridge would hold the old session (and block the link)
-    env = dict(os.environ)
-    env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)
-    return subprocess.call(_bridge_argv("--" + sub), env=env)
+    return subprocess.call(_bridge_argv("--" + sub))
 
 
 FDA_HINT = ("grant Full Disk Access to the app that runs Claude Code (your terminal or the desktop app) in "
@@ -1345,11 +758,9 @@ def cmd_status(cfg, args):
     print(json.dumps(out, indent=2))
 
 
-# ---------------------------------------------------------------- setup, allow, disallow (the manager's terminal)
+# ---------------------------------------------------------------- setup (the manager's terminal)
 
-ALLOW_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us", re.ASCII)  # = bin/mother WA_JID_RE
-SETUP_CHATS = 100
-PATH_ORDER = ("session", "self_chat", "slack_dm")
+LEGACY_KEYS = ("allow", "approve_via", "max_prompts_per_day")  # the earlier design's keys; setup drops them
 
 
 class TerminalIO(object):
@@ -1374,16 +785,7 @@ def bare_jid(jid):
     if not isinstance(jid, str):
         return None
     j = re.sub(r":\d+(?=@)", "", jid.strip())
-    return j if re.fullmatch(r"\d{6,15}@s\.whatsapp\.net", j, re.ASCII) else None
-
-
-def phone_jid(text):
-    """`+972-50-000-0001` -> `972500000001@s.whatsapp.net`; None unless it is 6-15 digits after dropping + - ( ) and
-    spaces."""
-    if not isinstance(text, str):
-        return None
-    digits = re.sub(r"[\s+()\-]", "", text)
-    return digits + "@s.whatsapp.net" if re.fullmatch(r"\d{6,15}", digits, re.ASCII) else None
+    return j if USER_JID_RE.fullmatch(j) else None
 
 
 def _load_cfg(ws: Path) -> dict:
@@ -1435,62 +837,6 @@ def _save_whatsapp_locked(ws: Path, validate, change) -> dict:
     return cfg
 
 
-def pickable_chats(cfg: dict, limit: int = SETUP_CHATS) -> list:
-    """Recent chats with a last message (history), not the self chat: ones config accepts, and ones WhatsApp
-    keys by a private `@lid` id (marked "hidden": shown, never allowed). Names and dates only. Raises ReaderError."""
-    me = _wa(cfg).get("self_jid")
-    out = []
-    for c in recent_chats(limit * 4):
-        if c["jid"] == me or not c["last_at"]:
-            continue
-        if (c["jid"] or "").endswith("@lid"):
-            c = dict(c, hidden=True)
-        elif not ALLOW_JID_RE.fullmatch(c["jid"] or ""):
-            continue
-        out.append(c)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _chat_name(c: dict) -> str:
-    if c.get("name"):
-        return c["name"]
-    if c.get("hidden"):
-        return "a chat"
-    return "+" + c["jid"].split("@")[0] if not c.get("group") else "group " + c["jid"].split("@")[0]
-
-
-def _allow_entry(c: dict, name: str = None) -> dict:
-    e = {"jid": c["jid"], "name": name or _chat_name(c)}
-    if c.get("group") or c["jid"].endswith("@g.us"):
-        e["group"] = True
-    return e
-
-
-def _show_chats(io, chats: list, allowed: set) -> None:
-    for n, c in enumerate(chats, 1):
-        io.say("  %2d. %s  (%s, last %s)%s%s" % (n, _chat_name(c), "group" if c["group"] else "DM",
-                                                 (c["last_at"] or "")[:10], "  [allowed]" if c["jid"] in allowed else "",
-                                                 "  (id hidden by WhatsApp)" if c.get("hidden") else ""))
-
-
-def _pick(io, chats: list) -> list:
-    """Numbers the manager types (`1 4`, commas fine), asked again until each is on the list; Enter = none."""
-    while True:
-        raw = io.ask("Chats MOTHER may read and draft to (numbers, e.g. `1 4`; Enter to skip): ").strip()
-        if not raw:
-            return []
-        toks = [t for t in re.split(r"[\s,]+", raw) if t]
-        if all(t.isdigit() and 1 <= int(t) <= len(chats) for t in toks):
-            picked = [chats[int(t) - 1] for t in dict.fromkeys(toks)]
-            for c in picked:
-                if c.get("hidden"):
-                    io.say("%s skipped: WhatsApp hides its id, so MOTHER can't allow it yet." % _chat_name(c))
-            return [c for c in picked if not c.get("hidden")]
-        io.say("Type numbers from 1 to %d, separated by spaces." % len(chats))
-
-
 def _yes(io, question: str, default: bool) -> bool:
     while True:
         a = io.ask("%s [%s] " % (question, "Y/n" if default else "y/N")).strip().lower()
@@ -1531,10 +877,8 @@ def link_once(say, phone=None) -> dict:
     {"linked": bool, "me": JID without device suffix or None, "reason": str or None}."""
     import subprocess
     stop_bridge()  # a running bridge would hold the old session (and block the link)
-    env = dict(os.environ)
-    env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)
     argv = _bridge_argv("--link") + (["--phone", phone.split("@")[0]] if phone else [])
-    p = subprocess.Popen(argv, stdout=subprocess.PIPE, env=env)  # stdin, stderr: the terminal
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE)  # stdin, stderr: the terminal
     res = None
     for raw in p.stdout:
         line = raw.decode("utf-8", "replace").rstrip("\n")
@@ -1647,177 +991,19 @@ def setup(ws: Path, validate, io, args=None) -> int:
                 io.say("whatsapp.self_jid was %s; the linked account is %s, so it is now that." % (wa["self_jid"], me))
             wa["enabled"] = True
             wa["self_jid"] = me
-            wa.setdefault("allow", [])
-            wa.setdefault("approve_via", ["session"])
-        cfg = save_whatsapp(ws, validate, enable)
+            for k in LEGACY_KEYS:
+                wa.pop(k, None)
+        save_whatsapp(ws, validate, enable)
         io.say("Config: whatsapp is on for %s." % me)
 
         read = db_check()
         if not read["db_reachable"]:
             raise SetupStop(_db_stop(read))
         io.say("Database: readable.")
-
-        try:
-            chats = pickable_chats(cfg)
-        except ReaderError as e:
-            raise SetupStop(_db_stop({"reason": e.reason}))
-        allowed = {a.get("jid") for a in _wa(cfg).get("allow") or [] if isinstance(a, dict)}
-        if chats:
-            io.say("")
-            io.say("Your recent chats (names and dates only):")
-            _show_chats(io, chats, allowed)
-            new = [c for c in _pick(io, chats) if c["jid"] not in allowed]
-            if new:
-                cfg = save_whatsapp(ws, validate, lambda wa: wa.setdefault("allow", []).extend(
-                    _allow_entry(c) for c in new))
-                io.say("Allowed: %s." % ", ".join(_chat_name(c) for c in new))
-        else:
-            io.say("No recent chats to offer; add one later with `mother whatsapp allow <number>`.")
-
         io.say("")
-        io.say("Approving drafts: you can always reply `ok <id>` in a Claude session.")
-        via = approve_via(cfg)
-        want = {"session": True}
-        want["self_chat"] = _yes(io, "Also approve in your WhatsApp self chat (\"Message yourself\"): MOTHER posts "
-                                     "the drafts there and you reply `ok <id>`?", "self_chat" in via)
-        if _dm_channels(cfg):
-            want["slack_dm"] = _yes(io, "Also approve in your chat DM (manager.chat_dm): MOTHER posts the drafts "
-                                        "there and you reply `ok <id>`?", "slack_dm" in via)
-        else:
-            want["slack_dm"] = False
-        new_via = [p for p in PATH_ORDER if want.get(p)]
-        if new_via != _wa(cfg).get("approve_via"):
-            cfg = save_whatsapp(ws, validate, lambda wa: wa.__setitem__("approve_via", new_via))
-
-        names = [a.get("name") for a in _wa(cfg).get("allow") or [] if isinstance(a, dict)]
-        io.say("")
-        io.say("WhatsApp is set up: account %s; chats: %s; approve via: %s." % (
-            me, ", ".join(names) or "none yet", ", ".join(new_via)))
-        if names:
-            io.say("Next: in a Claude session, ask MOTHER to draft a WhatsApp message to %s; reply `ok <id>` to "
-                   "send it." % names[0])
-        else:
-            io.say("Next: add a chat with `mother whatsapp allow <number>`, then ask MOTHER in a Claude session to "
-                   "draft a message to it; reply `ok <id>` to send it.")
-        return 0
-    except SetupStop as e:
-        io.say("Stopped: %s" % e)
-        return 2
-
-
-def _resolve_chat(cfg: dict, arg: str, io):
-    """(entry, note) for `allow`'s argument, or raise SetupStop."""
-    try:
-        chats = pickable_chats(cfg)
-    except ReaderError:
-        chats = None
-    if re.fullmatch(r"\d{1,3}", arg):
-        if not chats or not 1 <= int(arg) <= len(chats):
-            raise SetupStop("%s is not a number on the list (run `mother whatsapp allow` to see it)" % arg)
-        if chats[int(arg) - 1].get("hidden"):
-            raise SetupStop("%s (id hidden by WhatsApp) can't be allowed yet" % _chat_name(chats[int(arg) - 1]))
-        return chats[int(arg) - 1]
-    jid = arg if ALLOW_JID_RE.fullmatch(arg) else phone_jid(arg)
-    if not jid:
-        raise SetupStop("%s is not a phone number, a WhatsApp JID or a list number" % arg)
-    for c in chats or []:
-        if c["jid"] == jid:
-            return c
-    try:
-        rows = _query("SELECT ZPARTNERNAME, ZSESSIONTYPE FROM ZWACHATSESSION WHERE ZCONTACTJID = ? LIMIT 1", [jid])
-    except ReaderError:
-        return {"jid": jid, "name": "", "group": jid.endswith("@g.us"), "unchecked": True}
-    if not rows or not has_history({"whatsapp": {}}, jid):
-        raise SetupStop("no cold contact: you have no chat with %s yet; message them yourself first" % arg)
-    return {"jid": jid, "name": rows[0][0] or "", "group": rows[0][1] == GROUP_SESSION}
-
-
-def allow_chat(ws: Path, validate, io, args) -> int:
-    """`mother whatsapp allow [NUMBER|JID|N] [--name NAME]`. Returns the exit code."""
-    usage = "usage: mother whatsapp allow [NUMBER|JID|N] [--name NAME]"
-    name, rest, i = None, [], 0
-    while i < len(args):
-        if args[i] == "--name" and i + 1 < len(args) and args[i + 1].strip():
-            name, i = args[i + 1].strip(), i + 2
-        elif args[i].startswith("-"):
-            io.say(usage)
-            return 2
-        else:
-            rest.append(args[i])
-            i += 1
-    if len(rest) > 1:
-        io.say(usage)
-        return 2
-    try:
-        cfg = _load_cfg(ws)
-        if not _wa(cfg).get("self_jid"):
-            raise SetupStop("run `mother whatsapp setup` first: it links your account, which tells your own self "
-                            "chat apart from the chats you allow")
-        if rest:
-            c = _resolve_chat(cfg, rest[0], io)
-        else:
-            try:
-                chats = pickable_chats(cfg)
-            except ReaderError as e:
-                raise SetupStop(_db_stop({"reason": e.reason}))
-            if not chats:
-                raise SetupStop("no recent chats to offer; give a number: mother whatsapp allow <number>")
-            allowed = {a.get("jid") for a in _wa(cfg).get("allow") or [] if isinstance(a, dict)}
-            _show_chats(io, chats, allowed)
-            picked = _pick(io, chats)
-            if not picked:
-                return 0
-            if len(picked) > 1:
-                me = _wa(cfg).get("self_jid")
-                new = [c for c in picked if c["jid"] not in allowed and c["jid"] != me]
-                if new:
-                    save_whatsapp(ws, validate, lambda wa: wa.setdefault("allow", []).extend(
-                        _allow_entry(c) for c in new))
-                    io.say("Allowed: %s." % ", ".join(_chat_name(c) for c in new))
-                if len(new) < len(picked):
-                    io.say("Skipped (already allowed or your own chat): %s." % ", ".join(
-                        _chat_name(c) for c in picked if c not in new))
-                if not _wa(cfg).get("enabled"):
-                    io.say("WhatsApp is still off: run `mother whatsapp setup`.")
-                return 0
-            c = picked[0]
-        if c["jid"] == _wa(cfg).get("self_jid"):
-            raise SetupStop("that is your own self chat, which carries approvals; it can't be allowed")
-        if any(isinstance(a, dict) and a.get("jid") == c["jid"] for a in _wa(cfg).get("allow") or []):
-            io.say("%s is already allowed." % c["jid"])
-            return 0
-        if not name and not c.get("name"):
-            name = io.ask("Name for %s: " % c["jid"]).strip()
-            if not name:
-                raise SetupStop("a chat needs a name")
-        entry = _allow_entry(c, name)
-        save_whatsapp(ws, validate, lambda wa: wa.setdefault("allow", []).append(entry))
-        io.say("Allowed: %s (%s)." % (entry["name"], entry["jid"]))
-        if c.get("unchecked"):
-            io.say("Note: couldn't check the database for history with it; drafts to it are refused until you have "
-                   "chatted (no cold contact).")
-        if not _wa(cfg).get("enabled"):
-            io.say("WhatsApp is still off: run `mother whatsapp setup`.")
-        return 0
-    except SetupStop as e:
-        io.say("Stopped: %s" % e)
-        return 2
-
-
-def disallow_chat(ws: Path, validate, io, args) -> int:
-    """`mother whatsapp disallow JID|NUMBER`. Returns the exit code (1 when it wasn't allowed)."""
-    if len(args) != 1:
-        io.say("usage: mother whatsapp disallow JID|NUMBER")
-        return 2
-    jid = args[0] if ALLOW_JID_RE.fullmatch(args[0]) else phone_jid(args[0])
-    try:
-        cfg = _load_cfg(ws)
-        if not jid or not any(isinstance(a, dict) and a.get("jid") == jid for a in _wa(cfg).get("allow") or []):
-            io.say("%s is not in whatsapp.allow." % args[0])
-            return 1
-        save_whatsapp(ws, validate, lambda wa: wa.__setitem__(
-            "allow", [a for a in wa.get("allow") or [] if not (isinstance(a, dict) and a.get("jid") == jid)]))
-        io.say("Removed %s from whatsapp.allow." % jid)
+        io.say("WhatsApp is set up for %s. In a Claude session, ask MOTHER to read a chat or send a message: "
+               "every message to someone else asks you first, in the normal permission prompt, and MOTHER only "
+               "messages chats you have already used." % me)
         return 0
     except SetupStop as e:
         io.say("Stopped: %s" % e)
@@ -1838,47 +1024,50 @@ def _interruptible(name, f):
 
 
 setup = _interruptible("setup", setup)
-allow_chat = _interruptible("allow", allow_chat)
-disallow_chat = _interruptible("disallow", disallow_chat)
-TERMINAL_COMMANDS = {"setup": setup, "allow": allow_chat, "disallow": disallow_chat}
 
+TERMINAL_COMMANDS = ("setup", "link", "unlink")  # the manager's own terminal only; the guard denies them too
 READ_COMMANDS = {"read": cmd_read, "chats": cmd_chats}
-DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop, "pending": cmd_pending,
-                  "verify": cmd_verify, "send": cmd_send, "prompt": cmd_prompt, "install": cmd_install,
-                  "stop": cmd_stop}
+OTHER_COMMANDS = {"install": cmd_install, "stop": cmd_stop}
+GONE = {"draft": "write the text and run `mother whatsapp send --to WHO --text ...`; the prompt asks the manager",
+        "list": "there are no drafts any more", "drop": "there are no drafts any more",
+        "pending": "there are no drafts any more", "prompt": "a send asks the manager in the permission prompt",
+        "verify": "a send asks the manager in the permission prompt",
+        "allow": "there is no allowlist: MOTHER may message any chat the manager has used",
+        "disallow": "there is no allowlist: MOTHER may message any chat the manager has used"}
 
 
 def main(argv, cfg=None, ws=None, validate=None):
-    """`validate` is bin/mother's config validator: setup, allow and disallow write config.json only through it."""
+    """`validate` is bin/mother's config validator: setup writes config.json only through it."""
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return
     cfg = cfg or {}
-    if argv[0] not in READ_COMMANDS and argv[0] not in DRAFT_COMMANDS and argv[0] not in TERMINAL_COMMANDS \
-            and argv[0] not in ("status", "link", "unlink"):
-        _fail("unknown whatsapp command '%s' — see `mother whatsapp help`" % argv[0])
-    if argv[0] == "status":
+    sub = argv[0]
+    if sub in GONE:
+        _fail("`mother whatsapp %s` is gone: %s. See `mother whatsapp help`." % (sub, GONE[sub]))
+    if sub not in READ_COMMANDS and sub not in OTHER_COMMANDS and sub not in TERMINAL_COMMANDS \
+            and sub not in ("status", "send"):
+        _fail("unknown whatsapp command '%s' — see `mother whatsapp help`" % sub)
+    if sub == "status":
         return cmd_status(cfg, argv[1:])
-    if argv[0] in TERMINAL_COMMANDS and not (sys.stdin.isatty() and sys.stdout.isatty()):
-        _fail("run `mother whatsapp %s` in your own terminal: it changes who MOTHER may message, so only you "
-              "run it" % argv[0], 2)
+    if sub in TERMINAL_COMMANDS and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        _fail("run `mother whatsapp %s` in your own terminal: it links WhatsApp to MOTHER, so only you run it" % sub, 2)
     require_home(cfg)
     wa = _wa(cfg)
-    if argv[0] in READ_COMMANDS and not (wa.get("enabled") and wa.get("read", True)):
+    if sub in READ_COMMANDS and not (wa.get("enabled") and wa.get("read", True)):
         _fail("whatsapp reading is off (whatsapp.enabled / whatsapp.read in config.json): run `mother whatsapp "
               "setup` in your own terminal", 2)
-    if argv[0] in ("draft", "verify", "send", "prompt") and not (wa.get("enabled") and wa.get("send", True)):
+    if sub == "send" and not (wa.get("enabled") and wa.get("send", True)):
         _fail("whatsapp sending is off (whatsapp.enabled / whatsapp.send in config.json): run `mother whatsapp "
               "setup` in your own terminal", 2)
-    if argv[0] in TERMINAL_COMMANDS:
+    if sub == "setup":
         if ws is None or validate is None:
             _fail("no workspace")
-        sys.exit(TERMINAL_COMMANDS[argv[0]](Path(ws), validate, TerminalIO(), argv[1:]))
-    if argv[0] in ("link", "unlink"):
-        sys.exit(cmd_link(argv[0], argv[1:]))
-    if argv[0] in READ_COMMANDS:
-        READ_COMMANDS[argv[0]](cfg, argv[1:])
-    else:
-        if ws is None:
-            _fail("no workspace")
-        DRAFT_COMMANDS[argv[0]](cfg, argv[1:], ws)
+        sys.exit(setup(Path(ws), validate, TerminalIO(), argv[1:]))
+    if sub in ("link", "unlink"):
+        sys.exit(cmd_link(sub, argv[1:]))
+    if sub == "send":
+        return cmd_send(cfg, argv[1:])
+    if sub in READ_COMMANDS:
+        return READ_COMMANDS[sub](cfg, argv[1:])
+    return OTHER_COMMANDS[sub](cfg, argv[1:])

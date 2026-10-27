@@ -1,21 +1,21 @@
 // Pure checks the bridge runs before every message it sends. No I/O, no clock, no randomness of their own:
 // the bridge passes `now` (ms since epoch) and random numbers in, so every rule is testable without WhatsApp.
-// docs/CONTRACT.md §5d. Errors: not_allowlisted, no_approval, hash_mismatch, cap, gap (with waitMs), no_draft,
-// already_sent, off, bad_request.
+// docs/CONTRACT.md §5d. Errors: off, bad_request, cap, gap (with waitMs).
 import { createHash } from "node:crypto";
 
 export const MAX_PER_DAY = 20;
 export const MAX_PER_DAY_CEILING = 50;
 export const MIN_GAP_SECONDS = 5;
-export const MAX_PROMPTS_PER_DAY = 10;
 export const MAX_TEXT = 4096;
+export const USER_JID_RE = /^\d{6,15}@s\.whatsapp\.net$/;
+export const GROUP_JID_RE = /^\d{6,30}(-\d+)?@g\.us$/;
 
 export const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
 
-/** YYYY-MM-DD of a time (ms) in UTC: the day the caps count, the same day the guard counts. */
+/** YYYY-MM-DD of a time (ms) in UTC: the day the cap counts. */
 export const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 
-/** ISO-8601 UTC with a Z and whole seconds, as sent.jsonl and the guard write it. */
+/** ISO-8601 UTC with a Z and whole seconds, as sent.jsonl writes it. */
 export const isoZ = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 
 const fail = (error) => ({ ok: false, error });
@@ -31,9 +31,9 @@ function sendingOn(w) {
   return !!w && w.enabled === true && (w.send === undefined || w.send === true);
 }
 
-function count(lines, kind, now) {
+function sendsToday(lines, now) {
   const day = utcDay(now);
-  return lines.filter((r) => r.kind === kind && typeof r.at === "string" && r.at.slice(0, 10) === day).length;
+  return lines.filter((r) => r.kind === "send" && typeof r.at === "string" && r.at.slice(0, 10) === day).length;
 }
 
 function lastAt(lines) {
@@ -45,78 +45,38 @@ function lastAt(lines) {
   return last;
 }
 
-/** ms still to wait before the next message may go (0 = none). */
-function gapLeft(lines, now, gapSeconds) {
-  const last = lastAt(lines);
-  return last === null ? 0 : Math.max(0, Math.ceil(last + gapSeconds * 1000 - now));
-}
-
-function gapCheck(lines, now, gapSeconds) {
-  const waitMs = gapLeft(lines, now, gapSeconds);
-  return waitMs > 0 ? { ok: false, error: "gap", waitMs } : null;
-}
-
-// The manager's approval reply (lib/whatsapp.py REPLY_RE): `ok <id>…`, `ok all`, `no <id>…`.
-const REPLY_RE = /^(ok|no)((?:[ \t]+w[a-z0-9]+)+|[ \t]+all)$/i;
-
-/** True when the text, or any line of it, would read as the manager's `ok`/`no` reply. */
-export function looksLikeReply(text) {
-  return [String(text), ...String(text).split(/\r?\n/)].some((l) => REPLY_RE.test(l.trim()));
-}
-
 /** whatsapp.min_gap_seconds, default 5. */
 export function minGapSeconds(cfg) {
   const w = wa(cfg) || {};
   return isInt(w.min_gap_seconds) && w.min_gap_seconds >= 0 ? w.min_gap_seconds : MIN_GAP_SECONDS;
 }
 
-function sendCap(w) {
+/** whatsapp.max_per_day, default 20, never above 50. */
+export function sendCap(cfg) {
+  const w = wa(cfg) || {};
   const c = isInt(w.max_per_day) && w.max_per_day >= 1 ? w.max_per_day : MAX_PER_DAY;
   return Math.min(c, MAX_PER_DAY_CEILING);
 }
 
-/**
- * May the bridge send this draft now? {ok: true} or {ok: false, error}.
- * cfg: workspace config; draft: drafts/<id>.json; approval: approved/<id>.json (null if missing);
- * sentLines: parsed sent.jsonl (null if unreadable); now: ms; gapSeconds: the jittered gap (default
- * whatsapp.min_gap_seconds). The yes itself is re-proved separately (`mother whatsapp verify`).
- */
-export function checkSend({ cfg, draft, approval, sentLines, now, gapSeconds }) {
-  const w = wa(cfg);
-  if (!sendingOn(w)) return fail("off");
-  if (!draft || typeof draft !== "object" || typeof draft.id !== "string" || typeof draft.chat !== "string"
-      || typeof draft.text !== "string") return fail("no_draft");
-  const allowed = new Set((Array.isArray(w.allow) ? w.allow : []).filter((a) => a && typeof a === "object")
-    .map((a) => a.jid));
-  if (!allowed.has(draft.chat) || draft.chat === w.self_jid) return fail("not_allowlisted");
-  if (!approval || typeof approval !== "object" || approval.id !== draft.id || approval.chat !== draft.chat) {
-    return fail("no_approval");
-  }
-  const sha = sha256(draft.text);
-  if (draft.sha256 !== sha || approval.sha256 !== sha) return fail("hash_mismatch");
-  if (!Array.isArray(sentLines)) return fail("cap");  // can't count today's sends: don't send
-  if (sentLines.some((r) => r.kind === "send" && r.draft === draft.id && r.sha256 === sha)) {
-    return fail("already_sent");
-  }
-  if (count(sentLines, "send", now) >= sendCap(w)) return fail("cap");
-  return gapCheck(sentLines, now, gapSeconds ?? minGapSeconds(cfg)) || { ok: true };
+/** A JID the bridge may address: a user (`<digits>@s.whatsapp.net`) or a group (`<digits>@g.us`). */
+export function sendableJid(jid) {
+  return typeof jid === "string" && (USER_JID_RE.test(jid) || GROUP_JID_RE.test(jid));
 }
 
 /**
- * May the bridge send this approval prompt to the manager's own chat now? {ok: true, chat: self_jid} or
- * {ok: false, error}. Prompts count toward max_prompts_per_day only, never toward max_per_day.
+ * May the bridge send `text` to `jid` now? {ok: true} or {ok: false, error}.
+ * cfg: workspace config; sentLines: parsed sent.jsonl (null if unreadable); now: ms; gapSeconds: the jittered
+ * gap (default whatsapp.min_gap_seconds). The manager's yes was asked by the guard before the CLI called.
  */
-export function checkPrompt({ cfg, text, sentLines, now, gapSeconds }) {
-  const w = wa(cfg);
-  if (!sendingOn(w)) return fail("off");
-  if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT || looksLikeReply(text)) {
-    return fail("bad_request");  // a prompt must never read as the manager's own yes or no
-  }
-  if (typeof w.self_jid !== "string" || !/^\d+@s\.whatsapp\.net$/.test(w.self_jid)) return fail("not_allowlisted");
-  if (!Array.isArray(sentLines)) return fail("cap");
-  const cap = isInt(w.max_prompts_per_day) && w.max_prompts_per_day >= 1 ? w.max_prompts_per_day : MAX_PROMPTS_PER_DAY;
-  if (count(sentLines, "prompt", now) >= cap) return fail("cap");
-  return gapCheck(sentLines, now, gapSeconds ?? minGapSeconds(cfg)) || { ok: true, chat: w.self_jid };
+export function checkSend({ cfg, jid, text, sentLines, now, gapSeconds }) {
+  if (!sendableJid(jid)) return fail("bad_request");
+  if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT) return fail("bad_request");
+  if (!sendingOn(wa(cfg))) return fail("off");
+  if (!Array.isArray(sentLines)) return fail("cap");  // can't count today's sends: don't send
+  if (sendsToday(sentLines, now) >= sendCap(cfg)) return fail("cap");
+  const last = lastAt(sentLines);
+  const waitMs = last === null ? 0 : Math.max(0, Math.ceil(last + (gapSeconds ?? minGapSeconds(cfg)) * 1000 - now));
+  return waitMs > 0 ? { ok: false, error: "gap", waitMs } : { ok: true };
 }
 
 /** sent.jsonl text → records; null when any non-empty line is not a JSON object (a torn write included). */
@@ -136,14 +96,10 @@ export function parseSent(text) {
   return out;
 }
 
-/** One sent.jsonl line, fields in contract order, ending in a newline. `draft` only for a send. A missing or
- * empty stanza id is written as null (readers skip such a line rather than treat the file as malformed). */
-export function sentLine({ at, kind, chat, draft, sha256: hash, stanza }) {
-  const r = { at, kind, chat };
-  if (kind === "send") r.draft = draft;
-  r.sha256 = hash;
-  r.stanza = typeof stanza === "string" && stanza ? stanza : null;
-  return JSON.stringify(r) + "\n";
+/** One sent.jsonl line, fields in contract order, ending in a newline. A missing or empty message id is null. */
+export function sentLine({ at, chat, sha256: hash, stanza }) {
+  return JSON.stringify({ at, kind: "send", chat, sha256: hash,
+                          stanza: typeof stanza === "string" && stanza ? stanza : null }) + "\n";
 }
 
 /** min_gap_seconds with ±30 % jitter, never below min_gap_seconds. `r` is a random number in [0, 1). */

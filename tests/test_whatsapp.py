@@ -1,15 +1,19 @@
-"""Tests for lib/whatsapp.py (reader). Stdlib only: python3 -m unittest tests.test_whatsapp -v
+"""Tests for lib/whatsapp.py: chats, read, send, the bridge client, link and setup. Stdlib only:
+python3 -m unittest tests.test_whatsapp -v
 
 Every test builds a fixture database with the real table and column names; the real WhatsApp database is
-never opened (MOTHER_WHATSAPP_DB points at the fixture)."""
+never opened (MOTHER_WHATSAPP_DB points at the fixture), and the bridge is a fake on a temp socket."""
 import datetime as _dt
-import hashlib
+import io as _io
 import json
 import os
+import socket as _socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,11 +27,15 @@ SELF = "972500000099@s.whatsapp.net"
 DM = "972500000001@s.whatsapp.net"
 GROUP = "120363000000000001@g.us"
 OTHER = "972500000002@s.whatsapp.net"
+COLD = "972500000005@s.whatsapp.net"
+LEVI = "972500000006@s.whatsapp.net"
+LID = "987654321012345@lid"
 CORE0 = 978307200  # 2001-01-01 in unix seconds
 
 
-def fixture_db(path, chats, messages, drop=()):
-    """chats: [(pk, jid, name, sessiontype)]; messages: [dict]. `drop` omits columns from ZWAMESSAGE."""
+def fixture_db(path, chats, messages, drop=(), lasts=None):
+    """chats: [(pk, jid, name, sessiontype)]; messages: [dict]. `drop` omits columns from ZWAMESSAGE; `lasts`
+    overrides ZLASTMESSAGEDATE per chat pk (a pinned chat's is far in the future)."""
     cols = ["Z_PK INTEGER PRIMARY KEY", "ZCHATSESSION INTEGER", "ZISFROMME INTEGER", "ZFROMJID TEXT",
             "ZTOJID TEXT", "ZTEXT TEXT", "ZMESSAGEDATE REAL", "ZSTANZAID TEXT", "ZMESSAGETYPE INTEGER",
             "ZPARENTMESSAGE INTEGER", "ZGROUPMEMBER INTEGER"]
@@ -39,7 +47,7 @@ def fixture_db(path, chats, messages, drop=()):
     db.execute("CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, ZMEMBERJID TEXT, ZCONTACTNAME TEXT, "
                "ZFIRSTNAME TEXT, ZCHATSESSION INTEGER)")
     for pk, jid, name, st in chats:
-        last = max([m["date"] for m in messages if m["chat"] == pk] or [0])
+        last = (lasts or {}).get(pk, max([m["date"] for m in messages if m["chat"] == pk] or [0]))
         db.execute("INSERT INTO ZWACHATSESSION VALUES (?,?,?,?,?,?)", (pk, jid, name, st, None, last))
     for i, m in enumerate(messages, 1):
         row = {"Z_PK": i, "ZCHATSESSION": m["chat"], "ZISFROMME": m.get("me", 0), "ZFROMJID": m.get("from"),
@@ -59,25 +67,29 @@ def core(iso):
     return whatsapp.to_core(iso)
 
 
-CHATS = [(1, DM, "Dana", 0), (2, GROUP, "PLAT team", 1), (3, OTHER, "Stranger", 0), (4, SELF, "You", 0)]
+CHATS = [(1, DM, "Dana", 0), (2, GROUP, "PLAT team", 1), (3, OTHER, "Stranger", 0), (4, SELF, "You", 0),
+         (5, COLD, "Cold Caller", 0), (6, LID, "Hidden One", 0), (7, LEVI, "Dana Levi", 0),
+         (8, "status@broadcast", "Status", 0)]
 MSGS = [
     {"chat": 1, "text": "hello from dana", "date": core("2026-10-26T08:00:00Z"), "stanza": "A1", "from": DM},
     {"chat": 1, "text": "I replied", "date": core("2026-10-26T08:05:00Z"), "stanza": "A2", "me": 1},
     {"chat": 1, "text": None, "date": core("2026-10-26T08:10:00Z"), "stanza": "A3", "from": DM, "type": 1},
     {"chat": 1, "text": "old news", "date": core("2026-10-20T08:00:00Z"), "stanza": "A0", "from": DM},
     {"chat": 2, "text": "ship it", "date": core("2026-10-26T09:00:00Z"), "stanza": "G1", "member": 1},
-    {"chat": 3, "text": "secret", "date": core("2026-10-26T09:30:00Z"), "stanza": "X1", "from": OTHER},
-    {"chat": 4, "text": "ok w3k", "date": core("2026-10-26T10:00:00Z"), "stanza": "S1", "me": 1},
+    {"chat": 3, "text": "a stranger writes", "date": core("2026-10-26T09:30:00Z"), "stanza": "X1", "from": OTHER},
     {"chat": 4, "text": "note to self", "date": core("2026-10-26T10:05:00Z"), "stanza": "S2", "me": 1},
+    {"chat": 6, "text": "from a hidden id", "date": core("2026-10-25T10:00:00Z"), "stanza": "L1"},
+    {"chat": 7, "text": "levi here", "date": core("2026-10-24T10:00:00Z"), "stanza": "V1", "from": LEVI},
+    {"chat": 8, "text": "a status update", "date": core("2026-10-26T11:00:00Z"), "stanza": "B1"},
 ]
 SINCE = "2026-10-25T00:00:00Z"
+PINNED = core("7026-01-01T00:00:00Z")  # how WhatsApp stores a pinned chat's date
 
 
 def make_cfg(home="laptop-a"):
     return {"workspace": {"home_machine": home},
-            "whatsapp": {"enabled": True, "self_jid": SELF, "read": True,
-                         "allow": [{"jid": DM, "name": "Dana"},
-                                   {"jid": GROUP, "name": "PLAT team", "group": True}]}}
+            "agent": {"name": "Agnes", "emoji": ":sparkles:", "manager": "Dana Roe", "manager_short": "Dana"},
+            "whatsapp": {"enabled": True, "self_jid": SELF, "read": True, "send": True}}
 
 
 class Base(unittest.TestCase):
@@ -114,99 +126,166 @@ class SpyConn:
         self.real.close()
 
 
-class TestReader(Base):
-    def test_only_allowlisted_chats(self):
-        self.build()
-        out = whatsapp.read_messages(make_cfg(), SINCE)
-        self.assertEqual(out["status"], "ok")
-        self.assertEqual({i["chat"] for i in out["items"]}, {DM, GROUP})
-        self.assertNotIn("secret", json.dumps(out))
+def cli(env, *args):
+    return subprocess.run([sys.executable, str(CLI), "whatsapp", *args], capture_output=True, text=True, env=env)
 
-    def test_cli_read_prints_json(self):
+
+class TestChats(Base):
+    def test_recent_chats_names_types_dates_and_jids_never_a_message(self):
+        self.build()
+        got = whatsapp.recent_chats()
+        self.assertEqual([c["jid"] for c in got], [SELF, OTHER, GROUP, DM, LID, LEVI, COLD])  # newest first
+        out = [whatsapp.chat_out(c) for c in got]
+        self.assertEqual(out[3], {"name": "Dana", "type": "dm", "last": "2026-10-26T08:10:00Z", "jid": DM})
+        self.assertEqual(out[2]["type"], "group")
+        self.assertEqual(out[4], {"name": "Hidden One", "type": "dm", "last": "2026-10-25T10:00:00Z", "jid": LID,
+                                  "hidden_id": True})
+        self.assertIsNone(out[-1]["last"])  # no messages
+        blob = json.dumps(out)
+        for text in ("hello from dana", "ship it", "note to self", "a status update"):
+            self.assertNotIn(text, blob)
+        self.assertNotIn("broadcast", blob)
+
+    def test_pinned_chats_show_pinned_and_come_first(self):
+        self.build(lasts={7: PINNED, 3: PINNED + 100})
+        got = [whatsapp.chat_out(c) for c in whatsapp.recent_chats()]
+        self.assertEqual([c["name"] for c in got[:2]], ["Stranger", "Dana Levi"])
+        self.assertEqual({c["last"] for c in got[:2]}, {"pinned"})
+        self.assertNotIn("7026", json.dumps(got))
+        self.assertEqual(got[2]["jid"], SELF)
+
+    def test_query_and_limit(self):
+        self.build()
+        self.assertEqual([c["name"] for c in whatsapp.recent_chats(query="dana")], ["Dana", "Dana Levi"])
+        self.assertEqual([c["jid"] for c in whatsapp.recent_chats(query="000002")], [OTHER])
+        self.assertEqual(whatsapp.recent_chats(query="100%"), [])  # LIKE wildcards are literal
+        self.assertEqual(len(whatsapp.recent_chats(limit=2)), 2)
+
+    def test_chats_never_touch_messages(self):
+        self.build()
+        log = []
+        real = sqlite3.connect
+        with mock.patch.object(sqlite3, "connect", lambda *a, **k: SpyConn(real(*a, **k), log=log)):
+            whatsapp.recent_chats(query="x")
+        self.assertTrue(log)
+        for sql, _ in log:
+            self.assertNotIn("ZWAMESSAGE", sql)
+
+    def test_cli_chats(self):
         self.build()
         ws = self.t / "ws"
         ws.mkdir()
         (ws / "config.json").write_text(json.dumps(make_cfg()))
         env = dict(self.env, MOTHER_WORKSPACE=str(ws))
-        r = subprocess.run([sys.executable, str(CLI), "whatsapp", "read", "--since", SINCE, "--chat", DM],
-                           capture_output=True, text=True, env=env)
+        r = cli(env, "chats", "--query", "Dana", "--limit", "5")
         self.assertEqual(r.returncode, 0, r.stderr)
-        out = json.loads(r.stdout)
-        self.assertEqual({i["chat"] for i in out["items"]}, {DM})
-        self.assertNotIn("secret", r.stdout)
-        r = subprocess.run([sys.executable, str(CLI), "whatsapp", "chats"], capture_output=True, text=True, env=env)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("Stranger", r.stdout)
+        self.assertEqual([c["name"] for c in json.loads(r.stdout)], ["Dana", "Dana Levi"])
+        self.assertEqual(cli(env, "chats", "--limit", "x").returncode, 1)
+        self.assertEqual(cli(env, "chats", "--bogus").returncode, 1)
 
-    def test_items_shape_and_order(self):
+
+class TestResolve(Base):
+    def setUp(self):
+        Base.setUp(self)
         self.build()
-        out = whatsapp.read_messages(make_cfg(), SINCE)
-        texts = [i["text"] for i in out["items"]]
-        self.assertEqual(texts, ["hello from dana", "I replied", "[media]", "ship it"])
+
+    def who(self, w):
+        return whatsapp.resolve_chat(make_cfg(), w)
+
+    def test_a_name_a_number_a_jid_or_me(self):
+        self.assertEqual(self.who("Dana")["jid"], DM)          # the exact name beats "Dana Levi"
+        self.assertEqual(self.who("dana levi")["jid"], LEVI)
+        self.assertEqual(self.who("Strang")["jid"], OTHER)      # one chat contains it
+        self.assertEqual(self.who("+972 50-000-0001")["jid"], DM)
+        self.assertEqual(self.who(GROUP)["jid"], GROUP)
+        me = self.who("me")
+        self.assertEqual((me["jid"], me["self"]), (SELF, True))
+        self.assertTrue(self.who(SELF)["self"])
+        self.assertFalse(self.who("Dana")["self"])
+        self.assertTrue(self.who("Hidden One").get("hidden_id"))
+
+    def test_ambiguous_unknown_and_broadcast(self):
+        with self.assertRaises(whatsapp.ChatError) as cm:
+            self.who("Dan")
+        self.assertIn("matches 2 chats", str(cm.exception))
+        self.assertIn(LEVI, str(cm.exception))
+        for w in ("Nobody", "Status", "+972 50 000 0077", "123@g.us", ""):
+            with self.assertRaises(whatsapp.ChatError):
+                self.who(w)
+        cfg = make_cfg()
+        del cfg["whatsapp"]["self_jid"]
+        with self.assertRaises(whatsapp.ChatError):
+            whatsapp.resolve_chat(cfg, "me")
+
+
+class TestReader(Base):
+    def test_one_chat_by_name_oldest_first(self):
+        self.build()
+        out = whatsapp.read_messages(self.chat("Dana"), SINCE)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual([i["text"] for i in out["items"]], ["hello from dana", "I replied", "[media]"])
         first = out["items"][0]
-        self.assertEqual(first["link"], "whatsapp://%s/A1" % DM)
-        self.assertEqual(first["chat_name"], "Dana")
-        self.assertEqual(first["at"], "2026-10-26T08:00:00Z")
-        self.assertFalse(first["from_me"])
+        self.assertEqual(first, {"chat": DM, "chat_name": "Dana", "from_me": False, "sender": "Dana",
+                                 "text": "hello from dana", "at": "2026-10-26T08:00:00Z",
+                                 "link": "whatsapp://%s/A1" % DM})
         self.assertTrue(out["items"][1]["from_me"])
-        self.assertNotIn("old news", texts)
+        self.assertEqual(out["items"][1]["sender"], "me")
 
-    def test_chat_filter_cannot_widen(self):
-        self.build()
-        out = whatsapp.read_messages(make_cfg(), SINCE, chats=[GROUP, OTHER])
-        self.assertEqual({i["chat"] for i in out["items"]}, {GROUP})
+    def chat(self, who):
+        return whatsapp.resolve_chat(make_cfg(), who)
 
-    def test_unlisted_rows_never_fetched(self):
+    def test_one_chat_without_since_is_its_last_messages(self):
         self.build()
-        log = []
-        real = sqlite3.connect
-        with mock.patch.object(sqlite3, "connect", lambda *a, **k: SpyConn(real(*a, **k), log=log)):
-            whatsapp.read_messages(make_cfg(), SINCE)
-        sql, params = log[0]
-        self.assertIn("ZCONTACTJID IN (?,?)", sql)
-        self.assertEqual(set(params[:2]), {DM, GROUP})
-        self.assertNotIn(OTHER, params)
-        self.assertNotIn("secret", json.dumps(log))
+        out = whatsapp.read_messages(self.chat("Dana"), None, limit=2)
+        self.assertEqual([i["text"] for i in out["items"]], ["I replied", "[media]"])
+        out = whatsapp.read_messages(self.chat("Dana"))
+        self.assertIn("old news", [i["text"] for i in out["items"]])
 
-    def test_media_is_placeholder(self):
+    def test_across_chats_since(self):
         self.build()
-        out = whatsapp.read_messages(make_cfg(), SINCE, chats=[DM])
-        self.assertIn("[media]", [i["text"] for i in out["items"]])
+        out = whatsapp.read_messages(None, "2026-10-26T08:30:00Z")
+        self.assertEqual([i["text"] for i in out["items"]], ["ship it", "a stranger writes", "note to self"])
+        self.assertNotIn("a status update", json.dumps(out))  # status broadcasts are never read
+        out = whatsapp.read_messages(None, SINCE, limit=2)
+        self.assertEqual([i["text"] for i in out["items"]], ["a stranger writes", "note to self"])
+
+    def test_a_hidden_id_chat_is_read_by_name(self):
+        self.build()
+        out = whatsapp.read_messages(self.chat("Hidden One"))
+        self.assertEqual([i["text"] for i in out["items"]], ["from a hidden id"])
 
     def test_link_preview_type_is_text(self):
         fixture_db(self.db, CHATS, [{"chat": 1, "text": "see https://example.com", "type": 7,
                                      "date": core("2026-10-26T08:00:00Z"), "stanza": "P1", "from": DM}])
-        out = whatsapp.read_messages(make_cfg(), SINCE)
+        out = whatsapp.read_messages(None, SINCE)
         self.assertEqual(out["items"][0]["text"], "see https://example.com")
 
-    def test_schema_changed(self):
-        self.build(drop=("ZTEXT",))
-        out = whatsapp.read_messages(make_cfg(), SINCE)
-        self.assertEqual(out, {"status": "couldnt_check", "reason": "schema_changed", "items": []})
+    def test_group_sender_names_never_a_number(self):
+        msgs = [{"chat": 2, "text": "a", "date": core("2026-10-26T09:00:00Z"), "stanza": "G1", "member": 1},
+                {"chat": 2, "text": "b", "date": core("2026-10-26T09:01:00Z"), "stanza": "G2", "member": 2},
+                {"chat": 2, "text": "c", "date": core("2026-10-26T09:02:00Z"), "stanza": "G3", "member": 3}]
+        fixture_db(self.db, CHATS, msgs)
+        out = whatsapp.read_messages(None, SINCE)
+        self.assertEqual([i["sender"] for i in out["items"]], ["Dana", "Agnes", "a member"])
+        self.assertNotIn("97250000000", json.dumps([i["sender"] for i in out["items"]]))
 
-    def test_missing_db(self):
-        out = whatsapp.read_messages(make_cfg(), SINCE)
+    def test_schema_changed_missing_locked_denied(self):
+        out = whatsapp.read_messages(None, SINCE)
         self.assertEqual((out["status"], out["reason"], out["items"]), ("couldnt_check", "missing", []))
-
-    def test_locked_retry_once(self):
+        self.build(drop=("ZTEXT",))
+        self.assertEqual(whatsapp.read_messages(None, SINCE),
+                         {"status": "couldnt_check", "reason": "schema_changed", "items": []})
+        self.db.unlink()
         self.build()
         real = sqlite3.connect
         locked = sqlite3.OperationalError("database is locked")
         with mock.patch.object(sqlite3, "connect", lambda *a, **k: SpyConn(real(*a, **k), fail=[locked])):
-            out = whatsapp.read_messages(make_cfg(), SINCE)
-        self.assertEqual(out["status"], "ok")
-        self.assertEqual(len(out["items"]), 4)
-        with mock.patch.object(sqlite3, "connect",
-                               lambda *a, **k: SpyConn(real(*a, **k), fail=[locked, locked])):
-            out = whatsapp.read_messages(make_cfg(), SINCE)
-        self.assertEqual(out, {"status": "couldnt_check", "reason": "locked", "items": []})
-
-    def test_denied(self):
-        self.build()
-        err = sqlite3.OperationalError("unable to open database file")
-        with mock.patch.object(sqlite3, "connect", side_effect=err):
-            out = whatsapp.read_messages(make_cfg(), SINCE)
-        self.assertEqual((out["status"], out["reason"]), ("couldnt_check", "denied"))
+            self.assertEqual(whatsapp.read_messages(None, SINCE)["status"], "ok")
+        with mock.patch.object(sqlite3, "connect", lambda *a, **k: SpyConn(real(*a, **k), fail=[locked, locked])):
+            self.assertEqual(whatsapp.read_messages(None, SINCE),
+                             {"status": "couldnt_check", "reason": "locked", "items": []})
+        with mock.patch.object(sqlite3, "connect", side_effect=sqlite3.OperationalError("unable to open database file")):
+            self.assertEqual(whatsapp.read_messages(None, SINCE)["reason"], "denied")
 
     def test_readonly_uri(self):
         self.build()
@@ -217,941 +296,59 @@ class TestReader(Base):
             calls.append((a, k))
             return real(*a, **k)
         with mock.patch.object(sqlite3, "connect", spy):
-            whatsapp.read_messages(make_cfg(), SINCE)
+            whatsapp.read_messages(None, SINCE)
         (a, k) = calls[0]
         self.assertTrue(a[0].startswith("file:") and "mode=ro" in a[0], a[0])
         self.assertTrue(k.get("uri"))
 
-    def test_not_home_machine(self):
-        r = subprocess.run([sys.executable, "-c",
-                            "import sys; sys.path.insert(0, %r); import whatsapp, json; "
-                            "whatsapp.require_home(json.loads(sys.argv[1]))" % str(ROOT / "lib"),
-                            json.dumps(make_cfg(home="elsewhere"))],
-                           capture_output=True, text=True, env=self.env)
-        self.assertEqual(r.returncode, 2, r.stderr)
-        whatsapp.require_home(make_cfg())  # home: returns quietly
-
-    def test_cli_not_home_machine(self):
-        self.build()
+    def cli_env(self, home="laptop-a", **wa):
         ws = self.t / "ws"
-        ws.mkdir()
-        (ws / "config.json").write_text(json.dumps(make_cfg(home="elsewhere")))
-        env = dict(self.env, MOTHER_WORKSPACE=str(ws))
-        for sub in (["read", "--since", SINCE], ["chats"]):
-            r = subprocess.run([sys.executable, str(CLI), "whatsapp", *sub], capture_output=True, text=True, env=env)
+        ws.mkdir(exist_ok=True)
+        cfg = make_cfg(home)
+        cfg["whatsapp"].update(wa)
+        (ws / "config.json").write_text(json.dumps(cfg))
+        return dict(self.env, MOTHER_WORKSPACE=str(ws))
+
+    def test_cli_read(self):
+        self.build()
+        env = self.cli_env()
+        r = cli(env, "read", "--chat", "Dana Levi")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([i["text"] for i in json.loads(r.stdout)["items"]], ["levi here"])
+        r = cli(env, "read", "--since", "2026-10-26T09:10:00Z", "--limit", "1")
+        self.assertEqual([i["text"] for i in json.loads(r.stdout)["items"]], ["note to self"])
+        r = cli(env, "read", "--chat", "Dan")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("matches 2 chats", r.stderr)
+        self.assertIn("Dana Levi", r.stderr)
+        self.assertEqual(cli(env, "read", "--since", "yesterday").returncode, 1)
+        self.assertEqual(cli(env, "read", "--chat").returncode, 1)
+
+    def test_cli_read_defaults_to_the_last_24_hours(self):
+        now = time.time()
+        msgs = [{"chat": 1, "text": "fresh", "date": now - CORE0 - 3600, "stanza": "F1", "from": DM},
+                {"chat": 1, "text": "stale", "date": now - CORE0 - 30 * 3600, "stanza": "F0", "from": DM}]
+        fixture_db(self.db, CHATS, msgs)
+        r = cli(self.cli_env(), "read")
+        self.assertEqual([i["text"] for i in json.loads(r.stdout)["items"]], ["fresh"])
+
+    def test_reading_off_and_not_home(self):
+        self.build()
+        for wa in ({"enabled": False}, {"read": False}):
+            for sub in (["read"], ["chats"]):
+                r = cli(self.cli_env(**wa), *sub)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("whatsapp reading is off", r.stderr)
+                self.assertIn("mother whatsapp setup", r.stderr)
+                self.assertNotIn("hello", r.stdout)
+        for sub in (["read", "--since", SINCE], ["chats"], ["send", "--to", "me", "--text", "hi"]):
+            r = cli(self.cli_env(home="elsewhere"), *sub)
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertNotIn("hello", r.stdout)
 
-    def test_group_sender_name(self):
-        self.build()
-        out = whatsapp.read_messages(make_cfg(), SINCE, chats=[GROUP])
-        self.assertEqual(out["items"][0]["sender"], "Dana")
 
-    def test_group_sender_first_name_and_never_a_number(self):
-        msgs = [{"chat": 2, "text": "a", "date": core("2026-10-26T09:00:00Z"), "stanza": "G1", "member": 2},
-                {"chat": 2, "text": "b", "date": core("2026-10-26T09:01:00Z"), "stanza": "G2", "member": 3}]
-        fixture_db(self.db, CHATS, msgs)
-        out = whatsapp.read_messages(make_cfg(), SINCE, chats=[GROUP])
-        self.assertEqual([i["sender"] for i in out["items"]], ["Agnes", "a member"])
-        self.assertNotIn("97250000000", json.dumps(out))
 
-    def test_self_messages(self):
-        self.build()
-        got = whatsapp.self_messages(make_cfg(), SINCE)
-        self.assertEqual([g["text"] for g in got], ["ok w3k", "note to self"])
-        self.assertEqual(got[0]["stanza"], "S1")
-        self.assertEqual(set(got[0]), {"stanza", "text", "at"})
-
-    def test_has_history(self):
-        self.build()
-        self.assertTrue(whatsapp.has_history(make_cfg(), DM))
-        self.assertFalse(whatsapp.has_history(make_cfg(), "972500000077@s.whatsapp.net"))
-
-    def test_recent_chats_has_no_text(self):
-        self.build()
-        got = whatsapp.recent_chats()
-        self.assertEqual({c["jid"] for c in got}, {DM, GROUP, OTHER, SELF})
-        self.assertEqual(got[0]["jid"], SELF)  # newest first
-        grp = [c for c in got if c["jid"] == GROUP][0]
-        self.assertTrue(grp["group"])
-        self.assertEqual(grp["name"], "PLAT team")
-        blob = json.dumps(got)
-        for text in ("hello from dana", "secret", "ship it", "ok w3k", "note to self"):
-            self.assertNotIn(text, blob)
-
-    def test_recent_chats_never_touches_messages(self):
-        self.build()
-        log = []
-        real = sqlite3.connect
-        with mock.patch.object(sqlite3, "connect", lambda *a, **k: SpyConn(real(*a, **k), log=log)):
-            whatsapp.recent_chats()
-        self.assertTrue(log)
-        for sql, _ in log:
-            self.assertNotIn("ZWAMESSAGE", sql)
-
-
-def cli(env, *args):
-    return subprocess.run([sys.executable, str(CLI), "whatsapp", *args], capture_output=True, text=True, env=env)
-
-
-class TestOffSwitch(Base):
-    def run_with(self, wa_patch, *args):
-        if not self.db.exists():
-            self.build()
-        ws = self.t / "ws"
-        ws.mkdir(exist_ok=True)
-        cfg = make_cfg()
-        cfg["whatsapp"].update(wa_patch)
-        (ws / "config.json").write_text(json.dumps(cfg))
-        return cli(dict(self.env, MOTHER_WORKSPACE=str(ws)), *args)
-
-    def test_reading_off(self):
-        for patch in ({"enabled": False}, {"read": False}):
-            for sub in (["read", "--since", SINCE], ["chats"]):
-                r = self.run_with(patch, *sub)
-                self.assertEqual(r.returncode, 2, r.stderr)
-                self.assertIn("whatsapp reading is off", r.stderr)
-                self.assertNotIn("hello", r.stdout)
-
-    def test_sending_off(self):
-        txt = self.t / "t.txt"
-        txt.write_text("hi")
-        for patch in ({"enabled": False}, {"send": False}):
-            r = self.run_with(patch, "draft", "--chat", DM, "--text-file", str(txt))
-            self.assertEqual(r.returncode, 2, r.stderr)
-            self.assertIn("whatsapp sending is off", r.stderr)
-
-
-class TestDrafts(Base):
-    def setUp(self):
-        Base.setUp(self)
-        self.build()
-        self.ws = self.t / "ws"
-        self.ws.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.ws)], check=True)
-        (self.ws / ".gitignore").write_text(".mother/\n")
-        self.cfg = make_cfg()
-        (self.ws / "config.json").write_text(json.dumps(self.cfg))
-        self.wenv = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
-
-    def test_id_hash_and_shape(self):
-        d = whatsapp.new_draft(self.ws, self.cfg, DM, "héllo", run="brief-1")
-        self.assertRegex(d["id"], r"^w[a-z2-9]{3}$")
-        self.assertEqual(d["sha256"], hashlib.sha256("héllo".encode("utf-8")).hexdigest())
-        self.assertEqual((d["chat"], d["chat_name"], d["text"], d["run"], d["status"]),
-                         (DM, "Dana", "héllo", "brief-1", "open"))
-        self.assertRegex(d["created"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertEqual(whatsapp.load_draft(self.ws, d["id"]), d)
-        self.assertTrue((self.ws / ".mother/whatsapp/drafts" / (d["id"] + ".json")).exists())
-
-    def test_used_or_failed_approval_keeps_its_id(self):
-        folder = self.ws / ".mother/whatsapp/approved"
-        folder.mkdir(parents=True)
-        for i, suffix in (("wabc", "used"), ("wabd", "failed"), ("wabe", "json")):
-            (folder / ("%s.%s" % (i, suffix))).touch()
-        with mock.patch.object(whatsapp.random.SystemRandom, "choice", side_effect=list("abc") + list("abd")
-                               + list("abe") + list("abf")):
-            self.assertEqual(whatsapp._new_id(self.ws), "wabf")
-
-    def test_unlisted_chat_refused(self):
-        with self.assertRaises(SystemExit) as c:
-            whatsapp.new_draft(self.ws, self.cfg, OTHER, "x")
-        self.assertEqual(c.exception.code, 2)
-
-    def test_cold_chat_refused(self):
-        cold = "972500000077@s.whatsapp.net"
-        self.cfg["whatsapp"]["allow"].append({"jid": cold, "name": "New"})
-        with self.assertRaises(SystemExit) as c:
-            whatsapp.new_draft(self.ws, self.cfg, cold, "x")
-        self.assertEqual(c.exception.code, 2)
-        self.assertEqual(list((self.ws / ".mother/whatsapp/drafts").glob("*")) if
-                         (self.ws / ".mother/whatsapp/drafts").exists() else [], [])
-
-    def test_expires_after_72h(self):
-        d = whatsapp.new_draft(self.ws, self.cfg, DM, "x")
-        p = self.ws / ".mother/whatsapp/drafts" / (d["id"] + ".json")
-        old = json.loads(p.read_text())
-        old["created"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=73)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        p.write_text(json.dumps(old))
-        self.assertIsNone(whatsapp.load_draft(self.ws, d["id"]))
-        self.assertFalse(p.exists())
-        d2 = whatsapp.new_draft(self.ws, self.cfg, DM, "y")
-        p2 = self.ws / ".mother/whatsapp/drafts" / (d2["id"] + ".json")
-        old = json.loads(p2.read_text())
-        old["created"] = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=71)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        p2.write_text(json.dumps(old))
-        self.assertIsNotNone(whatsapp.load_draft(self.ws, d2["id"]))
-
-    def test_ids_unique(self):
-        ids = {whatsapp.new_draft(self.ws, self.cfg, DM, "t%d" % i)["id"] for i in range(30)}
-        self.assertEqual(len(ids), 30)
-
-    def test_drop(self):
-        d = whatsapp.new_draft(self.ws, self.cfg, DM, "x")
-        self.assertTrue(whatsapp.drop_draft(self.ws, d["id"]))
-        self.assertIsNone(whatsapp.load_draft(self.ws, d["id"]))
-        self.assertFalse(whatsapp.drop_draft(self.ws, d["id"]))
-        self.assertFalse(whatsapp.drop_draft(self.ws, "../config"))
-
-    def test_text_stays_under_dot_mother(self):
-        whatsapp.new_draft(self.ws, self.cfg, DM, "private words")
-        st = subprocess.run(["git", "-C", str(self.ws), "status", "--porcelain"], capture_output=True, text=True)
-        self.assertNotIn("private words", st.stdout)
-        self.assertNotIn(".mother", st.stdout)
-        for p in self.ws.rglob("*"):
-            if p.is_file() and ".git" not in p.parts and ".mother" not in p.parts:
-                self.assertNotIn("private words", p.read_text())
-
-    def test_cli_draft_list_drop(self):
-        txt = self.t / "t.txt"
-        txt.write_text("see you at 3")
-        r = cli(self.wenv, "draft", "--chat", DM, "--text-file", str(txt), "--run", "r1")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        d = json.loads(r.stdout)
-        self.assertEqual(d["text"], "see you at 3")
-        r = cli(self.wenv, "list", "--json")
-        self.assertEqual([x["id"] for x in json.loads(r.stdout)], [d["id"]])
-        r = cli(self.wenv, "list")
-        self.assertIn(d["id"], r.stdout)
-        self.assertIn("Dana", r.stdout)
-        r = cli(self.wenv, "drop", d["id"])
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(cli(self.wenv, "list", "--json").stdout), [])
-        self.assertEqual(cli(self.wenv, "drop", d["id"]).returncode, 1)
-
-    def test_cli_draft_refusals(self):
-        txt = self.t / "t.txt"
-        txt.write_text("x")
-        r = cli(self.wenv, "draft", "--chat", OTHER, "--text-file", str(txt))
-        self.assertEqual(r.returncode, 2, r.stderr)
-        r = cli(self.wenv, "draft", "--chat", DM, "--text-file", str(self.t / "missing.txt"))
-        self.assertNotEqual(r.returncode, 0)
-        txt.write_text("  \n")
-        self.assertEqual(cli(self.wenv, "draft", "--chat", DM, "--text-file", str(txt)).returncode, 1)
-
-    def test_cli_not_home(self):
-        cfg = make_cfg(home="elsewhere")
-        (self.ws / "config.json").write_text(json.dumps(cfg))
-        self.assertEqual(cli(self.wenv, "list").returncode, 2)
-
-
-
-# ---------------------------------------------------------------- approval proof
-
-MGR = "U00000001"
-MGR_DM = "D00000001"
-
-
-def ago(**kw):
-    return _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(**kw)
-
-
-def fmt(t):
-    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-class TestProof(Base):
-    def setUp(self):
-        Base.setUp(self)
-        self.ws = self.t / "ws"
-        (self.ws / ".mother").mkdir(parents=True)
-        self.cfg = make_cfg()
-        self.cfg["manager"] = {"chat_dm": MGR_DM, "chat_user": MGR}
-        self.cfg["agent"] = {"name": "Agnes"}
-        self.selfmsgs = []
-        self.draft("w3kx", ago(hours=2))
-
-    def draft(self, i, created, chat=DM, text="see you at 3"):
-        folder = self.ws / ".mother/whatsapp/drafts"
-        folder.mkdir(parents=True, exist_ok=True)
-        d = {"id": i, "chat": chat, "chat_name": "Dana", "text": text,
-             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "created": fmt(created),
-             "run": None, "status": "open"}
-        (folder / (i + ".json")).write_text(json.dumps(d))
-        return d
-
-    def say(self, text, when, stanza):
-        """A from-me text in the self chat."""
-        self.selfmsgs.append({"chat": 4, "text": text, "date": core(fmt(when)), "stanza": stanza, "me": 1})
-        fixture_db_fresh(self.db, self.selfmsgs)
-
-    def sent(self, *lines):
-        p = self.t / "state" / "whatsapp" / "sent.jsonl"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a") as f:
-            for ln in lines:
-                f.write(json.dumps(ln) + "\n")
-
-    def sha(self, i):
-        p = self.ws / ".mother/whatsapp/drafts" / (i + ".json")
-        return json.loads(p.read_text())["sha256"] if p.exists() else "0" * 64
-
-    def prompt(self, path, ids, when, sha=None, log=True):
-        """A prompt as Task 7 records it; a self-chat prompt also lands in the DB and in sent.jsonl."""
-        p = self.ws / ".mother/whatsapp/prompts.jsonl"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        shas = sha if sha is not None else {i: self.sha(i) for i in ids}
-        with open(p, "a") as f:
-            f.write(json.dumps({"at": fmt(when), "path": path, "ids": ids, "sha256": shas}) + "\n")
-        if path == "self_chat":
-            stanza = "PR%d" % len(self.selfmsgs)
-            self.say('WhatsApp -> Dana: "see you at 3" - reply ok %s' % " ".join(ids), when, stanza)
-            if log:
-                self.sent({"at": fmt(when), "kind": "prompt", "chat": SELF, "sha256": "x", "stanza": stanza})
-
-    def transcript(self, *entries):
-        p = self.t / ("t%d.jsonl" % len(list(self.t.glob("t*.jsonl"))))
-        p.write_text("".join(json.dumps(e) + "\n" for e in entries))
-        return str(p)
-
-    @staticmethod
-    def user(text, when, **extra):
-        e = {"type": "user", "timestamp": when.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "origin": {"kind": "human"},
-             "message": {"role": "user", "content": text}}
-        e.update(extra)
-        return e
-
-    def grant(self, target="w3kx", user=MGR, channel=MGR_DM, when=None, sha=None, shown=True, sig=True):
-        when = when or ago(minutes=30)
-        if shown:
-            self.prompt("slack_dm", [target], when - _dt.timedelta(minutes=5))
-        g = {"scope": "whatsapp", "target": target, "uses": 1, "run": "whatsapp",
-             "sha256": sha if sha is not None else self.sha(target),
-             "expires": fmt(when + _dt.timedelta(hours=72)),
-             "source": {"channel": channel, "user": user, "ts": "%.6f" % when.timestamp()}}
-        if sig is True:
-            g["sig"] = whatsapp.grant_sig("whatsapp", target, g["source"]["ts"], g["sha256"])
-        elif sig:
-            g["sig"] = sig
-        p = self.ws / ".mother/grants.json"
-        data = json.loads(p.read_text()) if p.exists() else {"grants": []}
-        data["grants"].append(g)
-        p.write_text(json.dumps(data))
-
-    def via(self, *paths):
-        self.cfg["whatsapp"]["approve_via"] = list(paths)
-
-    # -- grammar
-
-    def test_parse_reply(self):
-        self.assertEqual(whatsapp.parse_reply("ok w3k"), ("ok", ["w3k"]))
-        self.assertEqual(whatsapp.parse_reply("OK w3k w9p"), ("ok", ["w3k", "w9p"]))
-        self.assertEqual(whatsapp.parse_reply("ok all"), ("ok", "all"))
-        self.assertEqual(whatsapp.parse_reply("no w3k"), ("no", ["w3k"]))
-        self.assertEqual(whatsapp.parse_reply("  ok w3kx \n"), ("ok", ["w3kx"]))
-        for bad in ("ok w3k but change it", "okay", "w3k ok", "ok", "ok w3k all", "", None,
-                    "WhatsApp -> Dana: \"hi\" - reply ok w3k", "ok w3k\nalso this"):
-            self.assertIsNone(whatsapp.parse_reply(bad), bad)
-
-    # -- session
-
-    def test_session_ok(self):
-        self.via("session")
-        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
-        got = whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)
-        self.assertEqual(got["path"], "session")
-        self.assertTrue(got["evidence"])
-        t = self.transcript(self.user("ok w9pa", ago(minutes=10)))
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
-        t = self.transcript(self.user("OK W3KX", ago(minutes=10)))
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "session")
-        t = self.transcript(self.user("ok w3kx", ago(hours=1)))
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t,
-                                         now=_dt.datetime.now(_dt.timezone.utc).timestamp() + 72 * 3600))
-
-    def test_session_ignores_tool_results_and_sidechain(self):
-        self.via("session")
-        when = ago(minutes=10)
-        for e in (self.user("ok w3kx", when, isSidechain=True),
-                  self.user("ok w3kx", when, toolUseResult={}),
-                  self.user("ok w3kx", when, isMeta=True),
-                  self.user("ok w3kx", when, origin={"kind": "peer"}),
-                  self.user("ok w3kx", when, origin=None),
-                  self.user([{"type": "tool_result", "content": "ok w3kx"}], when),
-                  {"type": "assistant", "timestamp": fmt(when),
-                   "message": {"role": "assistant", "content": "ok w3kx"}}):
-            t = self.transcript(e)
-            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), e)
-
-    def test_session_before_draft_ignored(self):
-        self.via("session")
-        t = self.transcript(self.user("ok w3kx", ago(hours=3)))  # the draft was created 2 h ago
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
-
-    def test_session_ok_all_never_counts(self):
-        self.via("session")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        t = self.transcript(self.user("ok all", ago(minutes=10)))
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
-
-    def test_session_no_rejects(self):
-        self.via("session")
-        t = self.transcript(self.user("ok w3kx", ago(minutes=20)), self.user("no w3kx", ago(minutes=10)))
-        self.assertTrue(whatsapp.rejected(self.ws, self.cfg, "w3kx", transcript_path=t))
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
-
-    # -- self chat
-
-    def test_self_chat_ok(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        got = whatsapp.prove(self.ws, self.cfg, "w3kx")
-        self.assertEqual(got["path"], "self_chat")
-        self.assertIn("M1", got["evidence"])
-
-    def test_self_chat_ignores_bridge_sent(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), "B1")
-        self.sent({"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": "B1"})
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_prompt_text_never_counts(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        prompt = 'WhatsApp -> Dana: "see you at 3" - reply ok w3kx'
-        self.say(prompt, ago(minutes=30), "P1")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # even before sent.jsonl has it
-        self.sent({"at": fmt(ago(minutes=30)), "kind": "prompt", "chat": SELF, "sha256": "x", "stanza": "P1"})
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_before_draft_ignored(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(hours=3), "M0")  # an old yes for an earlier draft with the same id
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_unreadable_sent_log_fails_closed(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1), log=False)
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        (self.t / "state" / "whatsapp" / "sent.jsonl").mkdir(parents=True)  # exists, cannot be read as a file
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_ok_all_resolves_latest_prompt_only(self):
-        self.via("self_chat")
-        self.draft("w9pa", ago(hours=2))
-        self.prompt("self_chat", ["w3kx", "w9pa"], ago(minutes=90))
-        self.prompt("slack_dm", ["w3kx", "w9pa"], ago(minutes=70))  # another path's prompt does not count
-        self.prompt("self_chat", ["w9pa"], ago(minutes=60))
-        self.say("ok all", ago(minutes=30), "M1")
-        self.prompt("self_chat", ["w3kx"], ago(minutes=10))  # after the yes: does not count
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w9pa")["path"], "self_chat")
-
-    def test_ok_all_ignores_prompt_older_than_draft(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=3))  # named an earlier draft that had the same id
-        self.say("ok all", ago(minutes=30), "M1")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_no_rejects(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("no w3kx", ago(minutes=30), "M1")
-        self.assertTrue(whatsapp.rejected(self.ws, self.cfg, "w3kx"))
-        self.say("ok w3kx", ago(minutes=20), "M2")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    # -- slack dm grant
-
-    def test_slack_grant_ok(self):
-        self.via("slack_dm")
-        self.grant()
-        got = whatsapp.prove(self.ws, self.cfg, "w3kx")
-        self.assertEqual(got["path"], "slack_dm")
-        self.assertIn(MGR_DM, got["evidence"])
-
-    def test_slack_grant_needs_valid_signature(self):
-        self.via("slack_dm")
-        self.grant(sig=False)  # any agent can write grants.json; only `pending` holds the key
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-        self.grant(sig="0" * 64)
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-        (self.ws / ".mother/grants.json").unlink()
-        self.grant()
-        g = json.loads((self.ws / ".mother/grants.json").read_text())["grants"][0]
-        self.assertTrue(whatsapp.grant_sig_ok(g))
-        for k, v in (("target", "w9pa"), ("sha256", "f" * 64)):
-            self.assertFalse(whatsapp.grant_sig_ok(dict(g, **{k: v})))
-        self.assertFalse(whatsapp.grant_sig_ok(dict(g, source=dict(g["source"], ts="1.0"))))
-        key = self.t / "state" / "whatsapp" / "grant.key"
-        self.assertEqual(oct(key.stat().st_mode & 0o777), "0o600")
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "slack_dm")
-        key.unlink()  # no key, no valid signature
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_malformed_signature_is_unsigned(self):
-        self.via("slack_dm")
-        self.grant()
-        g = json.loads((self.ws / ".mother/grants.json").read_text())["grants"][0]
-        for bad in ("é" * 64, "\x00" * 64, 123, None, ["a"], {"a": 1}, ""):
-            self.assertFalse(whatsapp.grant_sig_ok(dict(g, sig=bad)), repr(bad))
-        (self.ws / ".mother/grants.json").unlink()
-        self.grant(sig="é" * 64)  # one bad grant in the agent-writable file must not take `prove` down
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_slack_grant_from_manager_only(self):
-        self.via("slack_dm")
-        self.grant(user="U00000002")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_slack_grant_checks(self):
-        self.via("slack_dm")
-        self.cfg["teams"] = [{"id": "plat", "channels": [{"id": "C00000001", "mode": "mention"}]}]
-        self.grant(channel="C00000001")  # the manager, but not in the DM
-        self.grant(target="w9pa")  # another draft
-        self.grant(when=ago(hours=3))  # before this draft existed
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    # -- paths
-
-    def test_path_disabled(self):
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        self.grant()
-        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
-        self.via("session")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-        self.via("self_chat")
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "self_chat")
-        self.via("slack_dm")
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "slack_dm")
-
-    def test_missing_or_expired_draft(self):
-        self.say("ok w9pa", ago(minutes=30), "M1")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w9pa"))
-        self.draft("w4ab", ago(hours=73))
-        self.say("ok w4ab", ago(minutes=20), "M2")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w4ab"))
-
-    # -- fix round 1: fail closed, bind to the text
-
-    def test_self_chat_needs_prompt(self):
-        self.via("self_chat")
-        self.sent({"at": fmt(ago(hours=1)), "kind": "send", "chat": DM, "sha256": "x", "stanza": "Z1"})
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # never shown in the self chat
-        self.prompt("slack_dm", ["w3kx"], ago(hours=1))
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # shown on another path only
-        self.prompt("self_chat", ["w3kx"], ago(minutes=40), sha={"w3kx": "f" * 64})
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # shown with another text
-        self.say("no w3kx", ago(minutes=20), "M2")
-        self.assertFalse(whatsapp.rejected(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_ok_all_needs_matching_hash(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1), sha={"w3kx": "f" * 64})
-        self.say("ok all", ago(minutes=30), "M1")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_missing_sent_log_fails_closed(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1), log=False)
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_malformed_sent_line_fails_closed(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "self_chat")
-        p = self.t / "state" / "whatsapp" / "sent.jsonl"
-        good = p.read_text()
-        for bad in ({"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x"},
-                    {"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": ""}):
-            p.write_text(good + json.dumps(bad) + "\n")
-            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"), bad)
-        p.write_text(good + "{not json\n")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_self_chat_survives_a_sent_line_with_null_stanza(self):
-        """M4: the bridge writes `"stanza": null` when WhatsApp returned no id. That well-formed line is
-        skipped, not malformed: it must not switch the self-chat path off for good."""
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        self.sent({"at": fmt(ago(minutes=40)), "kind": "send", "chat": DM, "draft": "w9pa", "sha256": "x",
-                   "stanza": None},
-                  {"at": fmt(ago(minutes=35)), "kind": "prompt", "chat": SELF, "sha256": "y", "stanza": None})
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "self_chat")
-
-    def test_self_chat_null_stanza_never_counts(self):
-        self.via("self_chat")
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), None)
-        self.say("ok w3kx", ago(minutes=25), "")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def rewrite(self, i, text, sha=None):
-        p = self.ws / ".mother/whatsapp/drafts" / (i + ".json")
-        d = json.loads(p.read_text())
-        d["text"] = text
-        if sha:
-            d["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        p.write_text(json.dumps(d))
-
-    def test_proof_returns_sha(self):
-        self.via("session")
-        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
-        got = whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)
-        self.assertEqual(got["sha256"], hashlib.sha256(b"see you at 3").hexdigest())
-
-    def test_text_changed_after_yes(self):
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        self.grant()
-        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
-        for via in ("self_chat", "slack_dm", "session"):
-            self.via(via)
-            self.assertIsNotNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), via)
-        self.rewrite("w3kx", "wire the money")  # stale stored hash
-        for via in ("self_chat", "slack_dm", "session"):
-            self.via(via)
-            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), via)
-        self.rewrite("w3kx", "wire the money", sha=True)  # consistent file, but not what was shown
-        for via in ("self_chat", "slack_dm"):
-            self.via(via)
-            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), via)
-
-    def test_slack_needs_prompt_and_matching_hash(self):
-        self.via("slack_dm")
-        self.grant(shown=False)
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-        (self.ws / ".mother/grants.json").unlink()
-        self.grant(sha="f" * 64)
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_db_error_hides_nothing(self):
-        self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.say("no w3kx", ago(minutes=40), "M1")
-        self.grant()
-        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
-        self.via("self_chat", "slack_dm", "session")
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
-        with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("locked")):
-            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
-        self.db.unlink()
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
-        self.via("slack_dm", "session")  # self chat off: the DB is not needed
-        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "session")
-
-    def test_slack_source_must_be_dm_channel(self):
-        self.via("slack_dm")
-        self.grant(channel=MGR)  # the manager's user id is not the DM channel
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-        (self.ws / ".mother/grants.json").unlink()
-        self.grant()
-        self.assertIsNotNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-        self.cfg["manager"] = {"chat_user": MGR}  # no DM channel: the Slack path is unavailable
-        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
-
-    def test_pending_needs_slack_prompt(self):
-        fixture_db_fresh(self.db, [])
-        out = self.pending([self.slack("ok w3kx", ago(minutes=5))])
-        self.assertEqual(out["send"], [])
-        self.assertEqual(self.grants(), [])
-        self.prompt("slack_dm", ["w3kx"], ago(minutes=30), sha={"w3kx": "f" * 64})
-        out = self.pending([self.slack("ok w3kx", ago(minutes=4))])
-        self.assertEqual((out["send"], self.grants()), ([], []))
-
-    def test_pending_locks_grants(self):
-        import fcntl
-        import time as _time
-        fixture_db_fresh(self.db, [])
-        self.prompt("slack_dm", ["w3kx"], ago(minutes=30))
-        (self.ws / "config.json").write_text(json.dumps(self.cfg))
-        env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
-        lock = open(str(self.ws / ".mother" / "grants.lock"), "a")
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            pr = subprocess.Popen([sys.executable, str(CLI), "whatsapp", "pending"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-            pr.stdin.write(json.dumps({"dm": [self.slack("ok w3kx", ago(minutes=5))]}))
-            pr.stdin.close()
-            _time.sleep(1.5)
-            self.assertIsNone(pr.poll())  # waiting for the lock
-            self.assertEqual(self.grants(), [])
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-            lock.close()
-        out = json.loads(pr.stdout.read())
-        pr.wait(timeout=30)
-        self.assertEqual(out["send"], ["w3kx"])
-        self.assertEqual(len(self.grants()), 1)
-
-    def test_draft_refuses_self_chat(self):
-        fixture_db_fresh(self.db, [{"chat": 4, "text": "x", "date": core("2026-10-20T08:00:00Z"),
-                                    "stanza": "S0", "me": 1}])
-        self.cfg["whatsapp"]["allow"].append({"jid": SELF, "name": "Me"})
-        with self.assertRaises(SystemExit) as c:
-            whatsapp.new_draft(self.ws, self.cfg, SELF, "ok w9pa")
-        self.assertEqual(c.exception.code, 2)
-        (self.ws / "config.json").write_text(json.dumps(self.cfg))
-        txt = self.t / "t.txt"
-        txt.write_text("ok w9pa")
-        r = cli(dict(self.env, MOTHER_WORKSPACE=str(self.ws)), "draft", "--chat", SELF, "--text-file", str(txt))
-        self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn("self chat", r.stderr)
-
-    # -- mother whatsapp pending
-
-    def pending(self, dm):
-        (self.ws / "config.json").write_text(json.dumps(self.cfg))
-        env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
-        r = subprocess.run([sys.executable, str(CLI), "whatsapp", "pending"], input=json.dumps({"dm": dm}),
-                           capture_output=True, text=True, env=env)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        return json.loads(r.stdout)
-
-    @staticmethod
-    def slack(text, when, user=MGR, **extra):
-        m = {"user": user, "ts": "%.6f" % when.timestamp(), "text": text}
-        m.update(extra)
-        return m
-
-    def grants(self):
-        p = self.ws / ".mother/grants.json"
-        return json.loads(p.read_text())["grants"] if p.exists() else []
-
-    def test_pending_cli(self):
-        fixture_db_fresh(self.db, [])
-        self.prompt("slack_dm", ["w3kx"], ago(minutes=30))
-        yes = self.slack("ok w3kx", ago(minutes=5))
-        out = self.pending([yes])
-        self.assertEqual(out, {"send": ["w3kx"], "dropped": []})
-        g = self.grants()
-        self.assertEqual(len(g), 1)
-        self.assertEqual((g[0]["scope"], g[0]["target"], g[0]["uses"]), ("whatsapp", "w3kx", 1))
-        self.assertEqual((g[0]["source"]["channel"], g[0]["source"]["user"]), (MGR_DM, MGR))
-        self.assertEqual(g[0]["sha256"], self.sha("w3kx"))
-        self.assertTrue(whatsapp.grant_sig_ok(g[0]))
-        self.pending([yes])  # the same message again: no second grant
-        self.assertEqual(len(self.grants()), 1)
-
-    def test_pending_ignores_others_and_own_posts(self):
-        fixture_db_fresh(self.db, [])
-        out = self.pending([
-            self.slack("ok w3kx", ago(minutes=5), user="U00000002"),
-            self.slack("ok w3kx", ago(minutes=5), bot_id="B1"),
-            self.slack("ok w3kx", ago(minutes=5), subtype="bot_message"),
-            self.slack('Agnes (AI)\nWhatsApp -> Dana: "see you at 3" - reply ok w3kx', ago(minutes=5)),
-            self.slack("ok w3kx", ago(hours=3)),  # before the draft existed
-        ])
-        self.assertEqual(out, {"send": [], "dropped": []})
-        self.assertEqual(self.grants(), [])
-
-    def test_pending_ok_all_and_no(self):
-        fixture_db_fresh(self.db, [])
-        self.draft("w9pa", ago(hours=2))
-        self.draft("w4ab", ago(hours=2))
-        self.prompt("slack_dm", ["w3kx", "w4ab"], ago(minutes=90))
-        self.prompt("slack_dm", ["w9pa"], ago(minutes=60))
-        out = self.pending([self.slack("no w4ab", ago(minutes=8)), self.slack("ok all", ago(minutes=5))])
-        self.assertEqual(out, {"send": [], "dropped": ["w4ab"]})  # `ok all` never counts on Slack (I3)
-        self.assertEqual(self.grants(), [])
-        self.assertIsNone(whatsapp.load_draft(self.ws, "w4ab"))
-        self.assertIsNotNone(whatsapp.load_draft(self.ws, "w3kx"))
-
-    def test_pending_slack_explicit_ids_still_count(self):
-        fixture_db_fresh(self.db, [])
-        self.draft("w9pa", ago(hours=2))
-        self.prompt("slack_dm", ["w3kx", "w9pa"], ago(minutes=60))
-        out = self.pending([self.slack("ok w9pa", ago(minutes=5))])
-        self.assertEqual(out, {"send": ["w9pa"], "dropped": []})
-
-    def test_pending_self_chat(self):
-        self.draft("w9pa", ago(hours=2))
-        self.prompt("self_chat", ["w3kx", "w9pa"], ago(hours=1))
-        self.say("ok w3kx", ago(minutes=30), "M1")
-        self.say("no w9pa", ago(minutes=20), "M2")
-        out = self.pending([])
-        self.assertEqual(out, {"send": ["w3kx"], "dropped": ["w9pa"]})
-
-    def test_pending_slack_path_off(self):
-        fixture_db_fresh(self.db, [])
-        self.via("session", "self_chat")
-        out = self.pending([self.slack("ok w3kx", ago(minutes=5))])
-        self.assertEqual(out["send"], [])
-
-
-class TestVerify(Base):
-    """`mother whatsapp verify <id>`: the bridge's own re-check of the yes, from the evidence in approved/<id>.json."""
-
-    def setUp(self):
-        Base.setUp(self)
-        self.p = TestProof("test_parse_reply")  # borrow its fixture helpers on this workspace
-        self.p.t, self.p.db, self.p.env = self.t, self.db, self.env
-        self.ws = self.p.ws = self.t / "ws"
-        (self.ws / ".mother").mkdir(parents=True)
-        self.cfg = self.p.cfg = make_cfg()
-        self.cfg["manager"] = {"chat_dm": MGR_DM, "chat_user": MGR}
-        self.cfg["agent"] = {"name": "Agnes"}
-        self.p.selfmsgs = []
-        fixture_db_fresh(self.db, [])
-        self.d = self.p.draft("w3kx", ago(hours=2))
-        self.t_ok = self.p.transcript(self.p.user("ok w3kx", ago(minutes=10)))
-
-    def approve(self, path="session", sha=None, transcript=True, **extra):
-        """approved/<id>.json as the guard writes it."""
-        rec = {"id": "w3kx", "chat": DM, "sha256": sha or self.d["sha256"], "path": path,
-               "evidence": "%s:x" % path, "at": fmt(ago(minutes=5))}
-        if transcript is True:
-            rec["transcript"] = self.t_ok
-        elif transcript:
-            rec["transcript"] = transcript
-        rec.update(extra)
-        folder = self.ws / ".mother/whatsapp/approved"
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / "w3kx.json").write_text(json.dumps(rec))
-        return rec
-
-    def verify(self, i="w3kx"):
-        return whatsapp.verify(self.ws, self.cfg, i)
-
-    def test_session_yes_verifies(self):
-        self.approve()
-        self.assertEqual(self.verify(), (True, "w3kx: verified via session"))
-
-    def test_no_record(self):
-        ok, why = self.verify()
-        self.assertFalse(ok)
-        self.assertIn("no approval", why)
-        (self.ws / ".mother/whatsapp/approved").mkdir(parents=True)
-        (self.ws / ".mother/whatsapp/approved/w3kx.json").write_text("{not json")
-        self.assertFalse(self.verify()[0])
-        self.approve()
-        self.assertFalse(self.verify("w9pa")[0])  # a record for another id proves nothing
-        self.assertFalse(self.verify("../w3kx")[0])
-
-    def test_record_for_other_id_or_chat(self):
-        self.approve(id="w9pa")
-        self.assertFalse(self.verify()[0])
-        self.approve(chat=GROUP)
-        self.assertFalse(self.verify()[0])
-        self.approve(path="email")
-        self.assertFalse(self.verify()[0])
-
-    def test_draft_text_changed_after_approval(self):
-        self.approve()
-        text = "see you at 4"
-        d = dict(self.d, text=text, sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
-        (self.ws / ".mother/whatsapp/drafts/w3kx.json").write_text(json.dumps(d))  # consistent, but not what was approved
-        ok, why = self.verify()
-        self.assertFalse(ok)
-        d["sha256"] = self.d["sha256"]  # text edited, stored hash left alone
-        (self.ws / ".mother/whatsapp/drafts/w3kx.json").write_text(json.dumps(d))
-        self.assertFalse(self.verify()[0])
-
-    def test_record_hash_differs(self):
-        self.approve(sha="0" * 64)
-        ok, why = self.verify()
-        self.assertFalse(ok)
-        self.assertIn("hash", why)
-
-    def test_session_needs_recorded_transcript(self):
-        self.approve(transcript=False)
-        self.assertFalse(self.verify()[0])
-        self.approve(transcript=self.p.transcript(self.p.user("ok w9pa", ago(minutes=10))))
-        self.assertFalse(self.verify()[0])
-        self.approve(transcript=str(self.t / "gone.jsonl"))
-        self.assertFalse(self.verify()[0])
-
-    def test_no_after_yes(self):
-        t = self.p.transcript(self.p.user("ok w3kx", ago(minutes=20)), self.p.user("no w3kx", ago(minutes=5)))
-        self.approve(transcript=t)
-        self.assertFalse(self.verify()[0])
-
-    def test_expired_or_dropped_draft(self):
-        self.approve()
-        whatsapp.drop_draft(self.ws, "w3kx")
-        self.assertFalse(self.verify()[0])
-
-    def test_self_chat_yes_verifies(self):
-        self.p.prompt("self_chat", ["w3kx"], ago(hours=1))
-        self.p.say("ok w3kx", ago(minutes=30), "M1")
-        self.approve(path="self_chat", transcript=False)
-        self.assertEqual(self.verify(), (True, "w3kx: verified via self_chat"))
-
-    def test_slack_yes_verifies_after_its_grant_is_used(self):
-        self.p.grant()
-        self.approve(path="slack_dm", transcript=False)
-        self.assertTrue(self.verify()[0])  # the guard consumed the grant's one use; the proof still stands
-
-    def test_bound_to_the_hash_the_bridge_sends(self):
-        """M1: --sha256 is the hash of the bytes the bridge is about to send; verify must agree with it too."""
-        self.approve()
-        self.assertTrue(whatsapp.verify(self.ws, self.cfg, "w3kx", sha=self.d["sha256"])[0])
-        ok, why = whatsapp.verify(self.ws, self.cfg, "w3kx", sha="0" * 64)
-        self.assertFalse(ok)
-        self.assertIn("hash", why)
-        self.assertFalse(whatsapp.verify(self.ws, self.cfg, "w3kx", sha="")[0])
-
-    def test_only_the_recorded_path(self):
-        """M8: a yes on another path doesn't stand in for the one the guard recorded."""
-        self.approve(path="slack_dm")  # recorded slack, but only the session (recorded transcript) has a yes
-        self.assertFalse(self.verify()[0])
-        self.approve(path="self_chat")
-        self.assertFalse(self.verify()[0])
-        self.approve(path="session")
-        self.assertTrue(self.verify()[0])
-
-    def test_read_only_on_an_expired_draft(self):
-        """M6: verify never deletes or changes anything, not even an expired draft."""
-        self.approve()
-        f = self.ws / ".mother/whatsapp/drafts/w3kx.json"
-        d = json.loads(f.read_text())
-        d["created"] = fmt(ago(hours=73))
-        f.write_text(json.dumps(d))
-        before = sorted((str(p), p.stat().st_mtime_ns) for p in self.ws.rglob("*"))
-        ok, why = self.verify()
-        self.assertFalse(ok)
-        self.assertIn("expired", why)
-        self.assertTrue(f.exists())
-        self.assertEqual(sorted((str(p), p.stat().st_mtime_ns) for p in self.ws.rglob("*")), before)
-
-    def test_cli(self):
-        (self.ws / "config.json").write_text(json.dumps(self.cfg))
-        env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
-        r = cli(env, "verify", "w3kx")
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("no approval", r.stderr)
-        self.approve()
-        r = cli(env, "verify", "w3kx")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertNotIn(self.d["text"], r.stdout + r.stderr)
-        self.assertEqual(cli(env, "verify", "w3kx", "--sha256", self.d["sha256"]).returncode, 0)
-        r = cli(env, "verify", "w3kx", "--sha256", "0" * 64)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("hash", r.stderr)
-        self.assertEqual(cli(env, "verify", "w3kx", "--sha256").returncode, 1)
-        self.assertEqual(cli(env, "verify").returncode, 1)
-        self.assertEqual(cli(env, "verify", "w3kx", "w9pa").returncode, 1)
-        self.cfg["whatsapp"]["send"] = False
-        (self.ws / "config.json").write_text(json.dumps(self.cfg))
-        self.assertEqual(cli(env, "verify", "w3kx").returncode, 2)
-        self.cfg["whatsapp"]["send"] = True
-        (self.ws / "config.json").write_text(json.dumps(self.cfg))
-        r = cli(dict(env, MOTHER_HOSTNAME="laptop-b"), "verify", "w3kx")
-        self.assertNotEqual(r.returncode, 0)
-
-
-def fixture_db_fresh(path, self_msgs):
-    """A fixture DB with history in the DM chat plus the given self-chat messages."""
-    if Path(path).exists():
-        Path(path).unlink()
-    hist = [{"chat": 1, "text": "hello from dana", "date": core("2026-10-20T08:00:00Z"), "stanza": "A1", "from": DM}]
-    fixture_db(path, CHATS, hist + list(self_msgs))
-
-
-
-# ---------------------------------------------------------------- Task 7: send, prompt, link, status
-
-import socket as _socket  # noqa: E402
-import threading  # noqa: E402
-import time  # noqa: E402
-
+# ---------------------------------------------------------------- send and the bridge client
 
 class FakeBridge(object):
     """A thread serving the bridge's socket protocol (one JSON request per connection, one JSON reply)."""
@@ -1201,7 +398,6 @@ class Cmd7(Base):
         self.ws = self.t / "ws"
         self.ws.mkdir()
         self.cfg = make_cfg()
-        self.cfg["whatsapp"]["send"] = True
         self.cfg["manager"] = {"chat_dm": "D00000001", "chat_user": "U00000001"}
         self.write_cfg()
         self.wenv = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
@@ -1216,112 +412,110 @@ class Cmd7(Base):
         self.addCleanup(self.bridge.stop)
         return self.bridge
 
-    def draft(self, text="see you at 3", chat=DM):
-        return whatsapp.new_draft(self.ws, self.cfg, chat, text)
-
-    def approve(self, d):
-        f = self.ws / ".mother/whatsapp/approved"
-        f.mkdir(parents=True, exist_ok=True)
-        (f / (d["id"] + ".json")).write_text(json.dumps({"id": d["id"], "chat": d["chat"], "sha256": d["sha256"],
-                                                          "path": "session", "evidence": "session:x"}))
-
-    def prompts(self):
-        p = self.ws / ".mother/whatsapp/prompts.jsonl"
-        return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
-
     def run_cli(self, *args):
         return cli(self.wenv, *args)
 
 
+SIGNATURE = "*Agnes (AI)* · on behalf of Dana"
+
+
 class TestCliSend(Cmd7):
-    def test_no_approval_file_refuses_without_calling_the_bridge(self):
+    def send(self, *args):
+        return self.run_cli("send", *args)
+
+    def test_a_send_to_someone_by_name_is_signed_and_reports_where_it_went(self):
         b = self.start_bridge()
-        d = self.draft()
-        r = self.run_cli("send", d["id"])
-        self.assertEqual(r.returncode, 2, r.stderr)
+        r = self.send("--to", "Dana", "--text", "see you at 3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {"ok": True, "to": DM, "name": "Dana", "id": "STANZA1"})
+        self.assertEqual(b.requests, [{"op": "send", "jid": DM, "text": "see you at 3\n\n" + SIGNATURE}])
+
+    def test_by_number_jid_group_and_text_file(self):
+        b = self.start_bridge()
+        msg = self.t / "msg.txt"
+        msg.write_text("line one\nline two\n\n", encoding="utf-8")
+        for args in (["--to", "+972-50-000-0001", "--text", "a"], ["--to=%s" % GROUP, "--text=b"],
+                     ["--text-file", str(msg), "--to", "PLAT team"]):
+            r = self.send(*args)
+            self.assertEqual(r.returncode, 0, (args, r.stderr))
+        self.assertEqual([q["jid"] for q in b.requests], [DM, GROUP, GROUP])
+        self.assertEqual(b.requests[2]["text"], "line one\nline two\n\n" + SIGNATURE)
+
+    def test_me_is_the_own_chat_unsigned(self):
+        b = self.start_bridge()
+        r = self.send("--to", "me", "--text", "note to self")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["to"], SELF)
+        self.assertEqual(b.requests, [{"op": "send", "jid": SELF, "text": "note to self"}])
+
+    def test_refusals_call_no_bridge(self):
+        b = self.start_bridge()
+        for args, words in ((["--to", "Cold Caller", "--text", "hi"], "no cold contact"),
+                            (["--to", "Hidden One", "--text", "hi"], "hides the number"),
+                            (["--to", "Dan", "--text", "hi"], "matches 2 chats"),
+                            (["--to", "Nobody", "--text", "hi"], "no WhatsApp chat is named"),
+                            (["--to", "+972 50 000 0077", "--text", "hi"], "no WhatsApp chat with"),
+                            (["--to", "Status", "--text", "hi"], "no WhatsApp chat is named"),
+                            (["--to", "Dana", "--text", "  \n"], "empty"),
+                            (["--to", "Dana", "--text", "x" * 4097], "longer than")):
+            r = self.send(*args)
+            self.assertEqual(r.returncode, 2, (args, r.stderr))
+            self.assertIn(words, r.stderr, args)
+            self.assertIn("nothing was sent", r.stderr, args)
         self.assertEqual(b.requests, [])
-        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "open")
 
-    def test_send_calls_the_bridge_and_marks_the_draft_sent(self):
-        b = self.start_bridge()
-        d = self.draft()
-        self.approve(d)
-        r = self.run_cli("send", d["id"])
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(r.stdout), {"ok": True, "stanza": "STANZA1"})
-        self.assertEqual(b.requests, [{"op": "send", "draft": d["id"]}])
-        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "sent")
-        self.assertEqual(whatsapp.list_drafts(self.ws), [])  # a sent draft is not open
-        # the CLI leaves the approval to the bridge
-        self.assertTrue((self.ws / ".mother/whatsapp/approved" / (d["id"] + ".json")).exists())
+    def test_usage_errors(self):
+        for args in ([], ["--to", "Dana"], ["--text", "hi"], ["--to", "Dana", "--text", "a", "--text-file", "f"],
+                     ["--to", "Dana", "--to", "Gil", "--text", "a"], ["--to", "Dana", "--text"],
+                     ["--to", "Dana", "--text", "a", "--cc", "x"], ["w3kx"]):
+            self.assertEqual(self.send(*args).returncode, 1, args)
+        self.assertEqual(self.send("--to", "Dana", "--text-file", str(self.t / "none.txt")).returncode, 1)
 
-    def test_not_installed_exits_2_and_keeps_the_draft_open(self):
-        d = self.draft()
-        self.approve(d)
-        empty = self.t / "nobin"
-        empty.mkdir()
-        self.wenv["PATH"] = str(empty)  # no node on PATH: the CLI can't start a bridge, and must not try
-        with mock.patch.object(whatsapp, "NODE_DIRS", ()), mock.patch("glob.glob", return_value=[]):
-            r = whatsapp.bridge_call({"op": "send", "draft": d["id"]})
-        self.assertEqual(r["error"], "bridge_not_installed")
-        self.assertIn("mother whatsapp install", r["hint"])
-        r = self.run_cli("send", d["id"])
-        self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn(json.loads(r.stdout)["error"], ("bridge_not_installed", "bridge_down"))
-        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "open")
-
-    def test_dead_socket_is_bridge_down(self):
-        d = self.draft()
-        self.approve(d)
-        self.sock.parent.mkdir(parents=True)
-        s = _socket.socket(_socket.AF_UNIX)
-        s.bind(str(self.sock))
-        s.close()  # a socket file nobody listens on
-        out = __import__("io").StringIO()
-        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
-                mock.patch.object(whatsapp, "_start_bridge"), mock.patch.object(whatsapp, "START_WAIT", 0.4), \
-                mock.patch("sys.stdout", new=out), self.assertRaises(SystemExit) as cm:
-            whatsapp.main(["send", d["id"]], self.cfg, self.ws)
-        self.assertEqual(cm.exception.code, 2)
-        self.assertEqual(json.loads(out.getvalue())["error"], "bridge_down")
-        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "open")
-
-    def test_already_sent_marks_the_draft_sent_and_exits_0(self):
-        self.start_bridge(send={"ok": False, "error": "already_sent"})
-        d = self.draft()
-        self.approve(d)
-        r = self.run_cli("send", d["id"])
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(r.stdout)["already_sent"], True)
-        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "sent")
-
-    def test_a_failed_mark_still_reports_the_send(self):
-        self.start_bridge()
-        d = self.draft()
-        self.approve(d)
-        with mock.patch.object(whatsapp, "_mark_sent", side_effect=OSError("disk")), \
-                mock.patch("sys.stdout", new=__import__("io").StringIO()) as out:
-            whatsapp.cmd_send(self.cfg, [d["id"]], self.ws)
-        self.assertEqual(json.loads(out.getvalue()), {"ok": True, "stanza": "STANZA1"})
+    def test_sending_off(self):
+        for wa in ({"enabled": False}, {"send": False}):
+            self.cfg["whatsapp"].update(wa)
+            self.write_cfg()
+            r = self.send("--to", "Dana", "--text", "hi")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("whatsapp sending is off", r.stderr)
+            self.cfg = make_cfg()
 
     def test_bridge_refusal_exits_2_with_the_code(self):
         self.start_bridge(send={"ok": False, "error": "cap"})
-        d = self.draft()
-        self.approve(d)
-        r = self.run_cli("send", d["id"])
+        r = self.send("--to", "Dana", "--text", "hi")
         self.assertEqual(r.returncode, 2)
         self.assertEqual(json.loads(r.stdout), {"ok": False, "error": "cap"})
         self.assertIn("cap", r.stderr)
-        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "open")
 
-    def test_bad_id_and_off_switch(self):
-        self.assertEqual(self.run_cli("send", "../x").returncode, 1)
-        self.assertEqual(self.run_cli("send").returncode, 1)
-        self.cfg["whatsapp"]["send"] = False
-        self.write_cfg()
-        r = self.run_cli("send", "w3kx")
-        self.assertEqual(r.returncode, 2)
-        self.assertIn("sending is off", r.stderr)
+    def test_not_installed_exits_2(self):
+        out = _io.StringIO()
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=("bridge_not_installed", "run `mother whatsapp install`")), \
+                mock.patch("sys.stdout", new=out), self.assertRaises(SystemExit) as cm:
+            whatsapp.main(["send", "--to", "Dana", "--text", "hi"], self.cfg, self.ws)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(json.loads(out.getvalue())["error"], "bridge_not_installed")
+
+    def test_an_unreadable_database_refuses(self):
+        with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("denied")), \
+                mock.patch.object(whatsapp, "bridge_call") as call, self.assertRaises(SystemExit) as cm:
+            whatsapp.main(["send", "--to", "Dana", "--text", "hi"], self.cfg, self.ws)
+        self.assertEqual(cm.exception.code, 2)
+        call.assert_not_called()
+
+    def test_the_signature(self):
+        cfg = make_cfg()
+        self.assertEqual(whatsapp.signature(cfg), SIGNATURE)  # a :shortcode: is dropped: WhatsApp shows it raw
+        cfg["agent"]["emoji"] = "✨"
+        self.assertEqual(whatsapp.signature(cfg), "✨ " + SIGNATURE)
+        cfg["agent"]["signature"] = "— Agnes (AI) for Dana"
+        self.assertEqual(whatsapp.signed(cfg, "hi"), "hi\n\n— Agnes (AI) for Dana")
+        self.assertEqual(whatsapp.signed(cfg, "hi\n— Agnes (AI)"), "hi\n— Agnes (AI)")  # never twice
+
+    def test_gone_commands_say_what_to_do(self):
+        for sub in ("draft", "list", "prompt", "allow", "pending", "verify"):
+            r = self.run_cli(sub)
+            self.assertEqual(r.returncode, 1, sub)
+            self.assertIn("is gone", r.stderr)
 
 
 class TestBridgeCall(Cmd7):
@@ -1363,7 +557,7 @@ class TestBridgeCall(Cmd7):
     def test_gives_up_after_the_wait(self):
         with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
                 mock.patch.object(whatsapp, "_start_bridge"), mock.patch.object(whatsapp, "START_WAIT", 0.5):
-            r = whatsapp.bridge_call({"op": "send", "draft": "w3kx"})
+            r = whatsapp.bridge_call({"op": "send", "jid": DM, "text": "hi"})
         self.assertEqual(r["error"], "bridge_down")
 
     def test_start_spawns_node_detached_with_stdin_closed_and_a_log(self):
@@ -1373,13 +567,13 @@ class TestBridgeCall(Cmd7):
         argv = popen.call_args[0][0]
         kw = popen.call_args[1]
         self.assertEqual(argv, ["/usr/bin/node", str(self.t / "state/whatsapp/app/bridge.mjs")])  # outside the plugin
-        self.assertEqual(kw["env"]["MOTHER_PLUGIN_ROOT"], str(ROOT))
+        self.assertNotIn("env", kw)
         self.assertEqual(kw["stdin"], subprocess.DEVNULL)
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(kw["stdout"].name, str(self.t / "state/whatsapp/bridge.log"))
         self.assertEqual(oct((self.t / "state/whatsapp").stat().st_mode & 0o777), "0o700")
 
-    def test_timeouts_default_60_for_send_and_prompt_5_for_status(self):
+    def test_timeouts_default_60_for_send_5_for_status(self):
         seen = []
 
         def fake(req, timeout):
@@ -1387,156 +581,14 @@ class TestBridgeCall(Cmd7):
             return {"ok": True}
 
         with mock.patch.object(whatsapp, "_exchange", side_effect=fake):
-            for op in ("send", "prompt", "status"):
+            for op in ("send", "status"):
                 whatsapp.bridge_call({"op": op})
             whatsapp.bridge_call({"op": "send"}, timeout=7)
-        self.assertEqual(seen, [("send", 60.0), ("prompt", 60.0), ("status", 5.0), ("send", 7)])
+        self.assertEqual(seen, [("send", 60.0), ("status", 5.0), ("send", 7)])
 
     def test_slow_bridge_is_a_timeout_reply(self):
         self.start_bridge(status=lambda req: (__import__("time").sleep(1.0), {"ok": True})[1])
         self.assertEqual(whatsapp.bridge_call({"op": "status"}, timeout=0.2), {"ok": False, "error": "bridge_timeout"})
-
-
-class TestCliPrompt(Cmd7):
-    def quiet_window(self):
-        now = _dt.datetime.now(_dt.timezone.utc)
-        a, b = now - _dt.timedelta(hours=1), now + _dt.timedelta(hours=1)
-        self.cfg["manager"]["quiet_hours"] = "%s-%s" % (a.strftime("%H:%M"), b.strftime("%H:%M"))
-        self.write_cfg()
-
-    def test_prompt_lists_every_id_ends_with_the_reply_hint_and_records_each_path(self):
-        b = self.start_bridge()
-        d1, d2 = self.draft("see you at 3"), self.draft("line one\nline two")
-        r = self.run_cli("prompt", d1["id"], d2["id"])
-        self.assertEqual(r.returncode, 0, r.stderr)
-        out = json.loads(r.stdout)
-        self.assertEqual(out["ids"], [d1["id"], d2["id"]])
-        self.assertEqual(out["self_chat"], {"ok": True, "stanza": "STANZA1"})
-        self.assertEqual(out["slack_dm"]["channel"], "D00000001")
-        stext = out["slack_dm"]["text"]
-        text = b.requests[0]["text"]
-        self.assertEqual(b.requests, [{"op": "prompt", "text": text}])
-        self.assertEqual(stext.splitlines()[-1], "Reply with explicit ids: ok %s %s  |  no <id>" % (d1["id"], d2["id"]))
-        self.assertNotIn("ok all", stext)  # Slack takes explicit ids only (I3)
-        for d in (d1, d2):
-            self.assertIn(d["id"], text)
-        self.assertIn('%s WhatsApp -> Dana: "see you at 3"' % d1["id"], text)
-        self.assertIn('%s WhatsApp -> Dana: "line one\n> line two"' % d2["id"], text)
-        last = text.splitlines()[-1]
-        self.assertEqual(last, "Reply with: ok %s %s  |  ok all  |  no <id>" % (d1["id"], d2["id"]))
-        rec = self.prompts()
-        self.assertEqual(sorted(x["path"] for x in rec), ["self_chat", "slack_dm"])
-        for x in rec:
-            self.assertEqual(x["ids"], [d1["id"], d2["id"]])
-            self.assertEqual(x["sha256"], {d1["id"]: d1["sha256"], d2["id"]: d2["sha256"]})
-            self.assertRegex(x["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-
-    def test_only_enabled_paths_run(self):
-        b = self.start_bridge()
-        self.cfg["whatsapp"]["approve_via"] = ["slack_dm", "session"]
-        self.write_cfg()
-        d = self.draft()
-        out = json.loads(self.run_cli("prompt", d["id"]).stdout)
-        self.assertNotIn("self_chat", out)
-        self.assertEqual(b.requests, [])
-        self.assertEqual([x["path"] for x in self.prompts()], ["slack_dm"])
-        self.cfg["whatsapp"]["approve_via"] = ["self_chat"]
-        self.write_cfg()
-        out = json.loads(self.run_cli("prompt", d["id"]).stdout)
-        self.assertNotIn("slack_dm", out)
-        self.assertEqual(len(b.requests), 1)
-
-    def test_quiet_hours_hold_everything(self):
-        b = self.start_bridge()
-        self.quiet_window()
-        d = self.draft()
-        r = self.run_cli("prompt", d["id"])
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(r.stdout), {"held": True})
-        self.assertEqual(b.requests, [])
-        self.assertEqual(self.prompts(), [])
-
-    def test_every_id_must_be_an_open_draft(self):
-        b = self.start_bridge()
-        d = self.draft()
-        for ids in (["w9pa"], [d["id"], "w9pa"], []):
-            r = self.run_cli("prompt", *ids)
-            self.assertNotEqual(r.returncode, 0)
-        self.assertEqual(b.requests, [])
-        self.assertEqual(self.prompts(), [])
-        whatsapp._mark_sent(self.ws, d["id"])
-        self.assertEqual(self.run_cli("prompt", d["id"]).returncode, 2)
-
-    def test_a_draft_whose_hash_no_longer_matches_is_refused(self):
-        self.start_bridge()
-        d = self.draft()
-        f = self.ws / ".mother/whatsapp/drafts" / (d["id"] + ".json")
-        f.write_text(json.dumps(dict(d, text="something else")))
-        self.assertEqual(self.run_cli("prompt", d["id"]).returncode, 2)
-        self.assertEqual(self.prompts(), [])
-
-    def test_bridge_failure_records_nothing_for_self_chat_but_slack_still_goes(self):
-        self.start_bridge(prompt={"ok": False, "error": "cap"})
-        d = self.draft()
-        r = self.run_cli("prompt", d["id"])
-        self.assertEqual(r.returncode, 2, r.stderr)  # any enabled path failing exits 2; results are in the JSON
-        out = json.loads(r.stdout)
-        self.assertEqual(out["self_chat"], {"ok": False, "error": "cap"})
-        self.assertEqual(out["slack_dm"]["ok"], True)
-        self.assertEqual([x["path"] for x in self.prompts()], ["slack_dm"])
-
-    def test_all_paths_failing_exits_2(self):
-        self.cfg["whatsapp"]["approve_via"] = ["self_chat"]
-        self.write_cfg()
-        self.start_bridge(prompt={"ok": False, "error": "cap"})
-        d = self.draft()
-        r = self.run_cli("prompt", d["id"])
-        self.assertEqual(r.returncode, 2)
-        self.assertEqual(self.prompts(), [])
-
-    def test_log_failed_still_counts_as_shown(self):
-        self.cfg["whatsapp"]["approve_via"] = ["self_chat"]
-        self.write_cfg()
-        self.start_bridge(prompt={"ok": False, "error": "log_failed", "stanza": "S9"})
-        d = self.draft()
-        self.run_cli("prompt", d["id"])
-        self.assertEqual([x["path"] for x in self.prompts()], ["self_chat"])
-
-    def test_no_chat_dm_skips_slack(self):
-        self.cfg["manager"].pop("chat_dm")
-        self.write_cfg()
-        self.start_bridge()
-        d = self.draft()
-        r = self.run_cli("prompt", d["id"])
-        self.assertEqual(r.returncode, 2)
-        out = json.loads(r.stdout)
-        self.assertEqual(out["slack_dm"], {"ok": False, "error": "no_chat_dm"})
-        self.assertEqual([x["path"] for x in self.prompts()], ["self_chat"])
-
-    def test_prompts_recorded_here_are_what_the_proof_reads(self):
-        self.start_bridge()
-        d = self.draft()
-        self.run_cli("prompt", d["id"])
-        created = whatsapp._epoch(d["created"])
-        for path in ("self_chat", "slack_dm"):
-            self.assertEqual(len(whatsapp._shown(self.ws, path, d["id"], d["sha256"], created)), 1)
-
-    def test_the_bridges_own_check_accepts_the_text(self):
-        import shutil
-        node = shutil.which("node")
-        if not node:
-            self.skipTest("node is not installed")
-        drafts = [self.draft("see you at 3"), self.draft("ok w3kx\nok all\nno w3kx"),
-                  self.draft("multi\nline text")]
-        text = whatsapp.prompt_text(drafts) + "\n" + whatsapp.prompt_text(drafts, allow_all=False)
-        script = ("import {looksLikeReply} from %s; "
-                  "process.stdout.write(String(looksLikeReply(process.argv[1])))"
-                  % json.dumps((ROOT / "bridge/whatsapp/checks.mjs").as_uri()))
-        r = subprocess.run([node, "--input-type=module", "-e", script, text], capture_output=True, text=True)
-        self.assertEqual((r.returncode, r.stdout), (0, "false"), r.stderr)
-        # and the check does fire on a bare reply, so this is not vacuous
-        r = subprocess.run([node, "--input-type=module", "-e", script, "hi\nok all"], capture_output=True, text=True)
-        self.assertEqual(r.stdout, "true")
 
 
 class TestCliLinkStatus(Cmd7):
@@ -1557,7 +609,6 @@ class TestCliLinkStatus(Cmd7):
             self.assertEqual(code, 0)
             stop.assert_called_once()
             self.assertEqual(call.call_args[0][0], ["/usr/bin/node", str(self.t / self.APP), "--" + sub])
-            self.assertEqual(call.call_args[1]["env"]["MOTHER_PLUGIN_ROOT"], str(ROOT))
             self.assertNotIn("stdout", call.call_args[1])  # inherits the terminal: no pipes
 
     def test_link_needs_a_terminal(self):
@@ -1567,7 +618,7 @@ class TestCliLinkStatus(Cmd7):
         stop.assert_not_called()
 
     def test_link_without_an_install_says_how(self):
-        out = __import__("io").StringIO()
+        out = _io.StringIO()
         with mock.patch.object(whatsapp, "bridge_problem", return_value=("bridge_not_installed", "run `mother whatsapp install`")), \
                 mock.patch("sys.stdout.isatty", return_value=True), mock.patch("sys.stdout", new=out), \
                 mock.patch("subprocess.call") as call:
@@ -1576,7 +627,7 @@ class TestCliLinkStatus(Cmd7):
         self.assertEqual(json.loads(out.getvalue())["error"], "bridge_not_installed")
 
     def test_status_reports_the_bridge_and_a_read_check(self):
-        self.start_bridge(status={"ok": True, "linked": True, "me": SELF, "sent_today": 1, "prompts_today": 0})
+        self.start_bridge(status={"ok": True, "linked": True, "me": SELF, "sent_today": 1})
         r = self.run_cli("status")
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout)
@@ -1592,7 +643,7 @@ class TestCliLinkStatus(Cmd7):
         self.assertEqual(out["read"], {"db_reachable": False, "reason": "missing"})
 
     def test_status_says_when_the_database_is_denied(self):
-        out = __import__("io").StringIO()
+        out = _io.StringIO()
         with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("denied")), \
                 mock.patch.object(whatsapp, "bridge_call", return_value={"ok": False, "error": "bridge_down"}), \
                 mock.patch("sys.stdout", new=out):
@@ -1605,7 +656,7 @@ class TestCliLinkStatus(Cmd7):
         with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
                 mock.patch.object(whatsapp, "_start_bridge") as st, \
                 mock.patch.object(whatsapp, "_query", return_value=[(1,)]), \
-                mock.patch("sys.stdout", new=__import__("io").StringIO()):
+                mock.patch("sys.stdout", new=_io.StringIO()):
             whatsapp.main(["status"], self.cfg, self.ws)
         st.assert_not_called()
 
@@ -1633,7 +684,7 @@ class TestStopInstall(Cmd7):
 
     def test_install_copies_the_bridge_out_of_the_plugin_and_runs_npm_ci_there(self):
         calls = []
-        out = __import__("io").StringIO()
+        out = _io.StringIO()
         with self.fake_node(), mock.patch.object(whatsapp, "_run_npm", side_effect=lambda d, n: calls.append((d, n)) or 0), \
                 mock.patch("sys.stdout", new=out):
             whatsapp.main(["install"], self.cfg, self.ws)
@@ -1648,13 +699,13 @@ class TestStopInstall(Cmd7):
         self.assertFalse(whatsapp.reinstall_needed())
 
     def test_install_npm_failure_and_old_node(self):
-        out = __import__("io").StringIO()
+        out = _io.StringIO()
         with self.fake_node(), mock.patch.object(whatsapp, "_run_npm", return_value=1), \
                 mock.patch("sys.stdout", new=out), self.assertRaises(SystemExit) as cm:
             whatsapp.main(["install"], self.cfg, self.ws)
         self.assertEqual(cm.exception.code, 2)
         self.assertEqual(json.loads(out.getvalue())["error"], "npm_failed")
-        out = __import__("io").StringIO()
+        out = _io.StringIO()
         with self.fake_node(major=18), mock.patch.object(whatsapp, "_run_npm") as npm, \
                 mock.patch("sys.stdout", new=out), self.assertRaises(SystemExit):
             whatsapp.main(["install"], self.cfg, self.ws)
@@ -1663,13 +714,13 @@ class TestStopInstall(Cmd7):
 
     def test_reinstall_needed_when_the_plugins_files_differ(self):
         with self.fake_node(), mock.patch.object(whatsapp, "_run_npm", return_value=0), \
-                mock.patch("sys.stdout", new=__import__("io").StringIO()):
+                mock.patch("sys.stdout", new=_io.StringIO()):
             whatsapp.main(["install"], self.cfg, self.ws)
         app = self.t / "state/whatsapp/app"
         self.assertFalse(whatsapp.reinstall_needed())
         (app / "checks.mjs").write_text("// changed\n")
         self.assertTrue(whatsapp.reinstall_needed())
-        out = __import__("io").StringIO()
+        out = _io.StringIO()
         with mock.patch.object(whatsapp, "bridge_call", return_value={"ok": False, "error": "bridge_down"}), \
                 mock.patch("sys.stdout", new=out):
             whatsapp.main(["status"], self.cfg, self.ws)
@@ -1724,7 +775,7 @@ class TestColdStart(Cmd7):
 
         with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
                 mock.patch.object(whatsapp, "_start_bridge", side_effect=started):
-            r = whatsapp.bridge_call({"op": "send", "draft": "w3kx"})
+            r = whatsapp.bridge_call({"op": "send", "jid": DM, "text": "hi"})
         self.assertEqual(r, {"ok": True, "stanza": "S"})
         self.assertGreater(seen[0], 3)  # the send came only after status stopped saying connecting
 
@@ -1732,7 +783,7 @@ class TestColdStart(Cmd7):
         self.start_bridge(status={"ok": True, "linked": False}, send={"ok": False, "error": "unlinked"})
         # already running: no start, no wait
         with mock.patch.object(whatsapp, "_start_bridge") as st:
-            self.assertEqual(whatsapp.bridge_call({"op": "send", "draft": "w3kx"})["error"], "unlinked")
+            self.assertEqual(whatsapp.bridge_call({"op": "send", "jid": DM, "text": "hi"})["error"], "unlinked")
         st.assert_not_called()
 
     def test_two_callers_start_one_bridge(self):
@@ -1769,7 +820,7 @@ class TestColdStart(Cmd7):
 
 
 
-# ---------------------------------------------------------------- setup, allow, disallow (Task 7b)
+# ---------------------------------------------------------------- setup and link
 
 def load_validate():
     """validate() from bin/mother (a script without .py, loaded by path)."""
@@ -1827,7 +878,7 @@ class SetupCase(Base):
 
     def setup(self, *answers, linked=None, link=SELF, problem=None, reinstall=False, install_ok=True, by_phone=None):
         """Run setup with the bridge faked: `problem` until install runs, `linked` = status.me (None: not linked),
-        `link` = what the QR link learns (a JID, None for a logged-out link, or a list of link_once results);
+        `link` = what the link learns (a JID, None for a logged-out link, or a list of link_once results);
         `by_phone` = the number the manager typed to link by phone (None: they scanned the QR)."""
         state = {"problem": problem}
 
@@ -1851,50 +902,40 @@ class SetupCase(Base):
 
 
 class TestSetup(SetupCase):
-    def test_first_run_installs_links_writes_the_block_and_adds_the_chats_picked(self):
+    def test_first_run_installs_links_and_turns_whatsapp_on(self):
         before = self.read_cfg()
-        code, io, m = self.setup("3 2", "y", "n", problem=("bridge_not_installed", "run install"),
-                                 link="972500000099:3@s.whatsapp.net")
+        code, io, m = self.setup(problem=("bridge_not_installed", "run install"), link="972500000099:3@s.whatsapp.net")
         self.assertEqual(code, 0, io.text)
         m["install"].assert_called_once()
         m["link"].assert_called_once()
         cfg = self.read_cfg()
-        self.assertEqual(cfg["whatsapp"], {
-            "enabled": True, "self_jid": SELF,
-            "allow": [{"jid": DM, "name": "Dana"}, {"jid": GROUP, "name": "PLAT team", "group": True}],
-            "approve_via": ["session", "self_chat"]})
+        self.assertEqual(cfg["whatsapp"], {"enabled": True, "self_jid": SELF})
         self.assertEqual({k: v for k, v in cfg.items() if k != "whatsapp"}, before)
         self.assertEqual(list(cfg)[:-1], list(before))  # key order kept; the new block goes last
-        self.assertEqual((self.ws / "config.json").read_text(),
-                         json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+        self.assertEqual((self.ws / "config.json").read_text(), json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
         self.assertEqual(VALIDATE(cfg), [])
-        listed = [ln for ln in io.lines if __import__("re").match(r"^\s*\d+\. ", ln)]
-        self.assertEqual(len(listed), 3, io.text)  # the self chat is not offered
-        self.assertIn("Stranger", listed[0])
-        self.assertIn("group", listed[1])
-        for text in ("hello from dana", "secret", "ship it", "note to self"):
-            self.assertNotIn(text, io.text)  # names and dates only, never a message
-        self.assertIn("ok <id>", io.text)  # the next step
-        self.assertIn("Dana", io.lines[-1] + io.lines[-2] + io.text[-300:])
+        self.assertEqual(io.asked, [])  # no chat picking, no approval questions
+        self.assertIn("asks you first", io.text)
+        for text in ("hello from dana", "ship it", "note to self"):
+            self.assertNotIn(text, io.text)
 
-    def test_rerun_skips_what_is_done_and_keeps_the_block(self):
+    def test_rerun_keeps_the_caps_and_drops_the_old_keys(self):
         self.cfg["whatsapp"] = {"enabled": True, "self_jid": SELF, "allow": [{"jid": DM, "name": "Dana"}],
-                                "approve_via": ["session", "self_chat"], "max_per_day": 12}
+                                "approve_via": ["session"], "max_prompts_per_day": 10, "max_per_day": 12,
+                                "min_gap_seconds": 9, "read": True}
         self.write_cfg()
-        before = (self.ws / "config.json").read_text()
-        code, io, m = self.setup("", "", "", linked=SELF)
+        self.assertEqual(VALIDATE(self.read_cfg()), [])  # the manager's live config validates as it is
+        code, io, m = self.setup(linked=SELF)
         self.assertEqual(code, 0, io.text)
         m["install"].assert_not_called()
         m["link"].assert_not_called()
-        self.assertEqual(json.loads(before), self.read_cfg())
-        dana = [ln for ln in io.lines if "Dana" in ln and "DM" in ln]
-        self.assertTrue(dana and "allowed" in dana[0], io.text)
+        self.assertEqual(self.read_cfg()["whatsapp"], {"enabled": True, "self_jid": SELF, "max_per_day": 12,
+                                                       "min_gap_seconds": 9, "read": True})
 
     def test_the_linked_accounts_device_suffix_is_dropped(self):
-        code, io, m = self.setup("", "n", "n", linked="972500000099:5@s.whatsapp.net")
+        code, io, m = self.setup(linked="972500000099:5@s.whatsapp.net")
         self.assertEqual(code, 0, io.text)
         self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
-        self.assertEqual(self.read_cfg()["whatsapp"]["approve_via"], ["session"])
         m["link"].assert_not_called()
 
     def test_a_link_that_fails_writes_nothing(self):
@@ -1912,19 +953,11 @@ class TestSetup(SetupCase):
         self.assertEqual((self.ws / "config.json").read_text(), before)
         self.assertIn("version", io.text)
 
-    def test_full_disk_access_denied_stops_before_the_chat_list(self):
-        real = whatsapp._query
-
-        def q(sql, params=()):
-            if "ZWACHATSESSION" in sql:
-                raise whatsapp.ReaderError("denied")
-            return real(sql, params)
-
-        with mock.patch.object(whatsapp, "_query", side_effect=q):
+    def test_full_disk_access_denied_stops_with_the_instruction(self):
+        with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("denied")):
             code, io, m = self.setup(linked=SELF)
         self.assertEqual(code, 2)
         self.assertIn("Full Disk Access", io.text)
-        self.assertEqual(io.asked, [])
         wa = self.read_cfg()["whatsapp"]
         self.assertEqual((wa["enabled"], wa["self_jid"]), (True, SELF))
 
@@ -1933,23 +966,6 @@ class TestSetup(SetupCase):
         code, io, m = self.setup(linked=SELF)
         self.assertEqual(code, 2)
         self.assertIn("WhatsApp desktop", io.text)
-
-    def test_slack_dm_is_offered_only_with_a_chat_dm(self):
-        self.cfg["manager"]["chat_dm"] = ""
-        self.write_cfg()
-        code, io, m = self.setup("", "y", linked=SELF)  # no third question
-        self.assertEqual(code, 0, io.text)
-        self.assertEqual(len(io.asked), 2)
-        self.assertEqual(self.read_cfg()["whatsapp"]["approve_via"], ["session", "self_chat"])
-        self.cfg["manager"]["chat_dm"] = "U00000000"
-        self.write_cfg()
-        code, io, m = self.setup("", "n", "y", linked=SELF)
-        self.assertEqual(self.read_cfg()["whatsapp"]["approve_via"], ["session", "slack_dm"])
-
-    def test_bad_picks_are_asked_again(self):
-        code, io, m = self.setup("9", "x", "1", "n", "n", linked=SELF)
-        self.assertEqual(code, 0, io.text)
-        self.assertEqual(self.read_cfg()["whatsapp"]["allow"], [{"jid": OTHER, "name": "Stranger"}])
 
     def test_a_node_problem_stops_with_its_hint(self):
         code, io, m = self.setup(problem=("node_too_old", "install a newer Node"))
@@ -1963,10 +979,59 @@ class TestSetup(SetupCase):
         m["link"].assert_not_called()
 
     def test_reinstall_needed_reinstalls_and_stops_the_old_bridge(self):
-        code, io, m = self.setup("", "n", "n", linked=SELF, reinstall=True)
+        code, io, m = self.setup(linked=SELF, reinstall=True)
         self.assertEqual(code, 0, io.text)
         m["install"].assert_called_once()
         m["stop"].assert_called()
+
+    def test_a_private_account_id_asks_for_the_number(self):
+        for kw in ({"link": "123456789012@lid"}, {"linked": "123456789012@lid"}):
+            cfg = self.read_cfg()
+            cfg.pop("whatsapp", None)
+            self.write_cfg(cfg)
+            code, io, m = self.setup("12", "+972 50 000 0099", **kw)
+            self.assertEqual(code, 0, io.text)
+            self.assertIn("private id", io.text)
+            self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
+
+    def test_a_private_id_linked_by_phone_uses_the_number_already_typed(self):
+        code, io, m = self.setup(link="123456789012@lid", by_phone=SELF)
+        self.assertEqual(code, 0, io.text)
+        self.assertNotIn("private id", io.text)
+        self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
+
+    def test_ctrl_c_exits_130_and_changes_nothing_more(self):
+        class Interrupt(FakeIO):
+            def ask(self, prompt):
+                raise KeyboardInterrupt
+        io = Interrupt()
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "reinstall_needed", return_value=False), \
+                mock.patch.object(whatsapp, "bridge_call", return_value={"ok": True, "linked": False}):
+            code = whatsapp.setup(self.ws, VALIDATE, io)
+        self.assertEqual(code, 130)
+        self.assertIn("setup stopped; nothing more was changed", io.text)
+        self.assertNotIn("whatsapp", self.read_cfg())
+        self.assertFalse(list(self.ws.glob(".config*.tmp")))
+
+    def test_config_writes_hold_a_lock(self):
+        import fcntl
+        self.cfg["whatsapp"] = {"enabled": False}
+        self.write_cfg()
+        lock = self.ws / ".mother" / "config.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        f = open(str(lock), "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        done = []
+        t = threading.Thread(target=lambda: done.append(whatsapp.save_whatsapp(self.ws, VALIDATE,
+                                                                               lambda wa: wa.update(read=False))))
+        t.start()
+        time.sleep(0.3)
+        self.assertEqual(done, [])  # waits for the lock
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+        t.join(5)
+        self.assertEqual(self.read_cfg()["whatsapp"]["read"], False)
 
 
 class FakePopen(object):
@@ -2065,7 +1130,7 @@ class TestLinkLoop(Cmd7):
         self.assertEqual(po.call_args.args[0][-3:], ["--link", "--phone", "972500000099"])
 
     def test_the_link_command_loops_too(self):
-        class Tty(__import__("io").StringIO):
+        class Tty(_io.StringIO):
             def isatty(self):
                 return True
         out = Tty()
@@ -2078,189 +1143,26 @@ class TestLinkLoop(Cmd7):
         self.assertIn(SELF, out.getvalue())
 
 
-class TestSetupRound1(SetupCase):
-    def test_a_private_account_id_asks_for_the_number(self):
-        for kw in ({"link": "123456789012@lid"}, {"linked": "123456789012@lid"}):
-            del_cfg = self.read_cfg()
-            del_cfg.pop("whatsapp", None)
-            self.write_cfg(del_cfg)
-            code, io, m = self.setup("12", "+972 50 000 0099", "", "n", "n", **kw)
-            self.assertEqual(code, 0, io.text)
-            self.assertIn("private id", io.text)
-            self.assertNotIn("didn't complete", io.text)
-            self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
-
-    def test_a_private_id_linked_by_phone_uses_the_number_already_typed(self):
-        cfg = self.read_cfg()
-        cfg.pop("whatsapp", None)
-        self.write_cfg(cfg)
-        code, io, m = self.setup("", "n", "n", link="123456789012@lid", by_phone=SELF)
-        self.assertEqual(code, 0, io.text)
-        self.assertNotIn("private id", io.text)
-        self.assertEqual(self.read_cfg()["whatsapp"]["self_jid"], SELF)
-
-    def test_hidden_id_chats_are_shown_and_skipped(self):
-        db = sqlite3.connect(str(self.db))
-        db.execute("INSERT INTO ZWACHATSESSION VALUES (9, '987654321012345@lid', 'Hidden One', 0, NULL, ?)",
-                   (core("2026-10-27T08:00:00Z"),))
-        db.commit()
-        db.close()
-        code, io, m = self.setup("1 4", "n", "n", linked=SELF)
-        self.assertEqual(code, 0, io.text)
-        first = [ln for ln in io.lines if ln.strip().startswith("1.")][0]
-        self.assertIn("Hidden One", first)
-        self.assertIn("id hidden by WhatsApp", first)
-        self.assertIn("skipped", io.text)
-        self.assertEqual(self.read_cfg()["whatsapp"]["allow"], [{"jid": DM, "name": "Dana"}])
-
-    def test_ctrl_c_exits_130_and_changes_nothing_more(self):
-        class Interrupt(FakeIO):
-            def ask(self, prompt):
-                raise KeyboardInterrupt
-        io = Interrupt()
-        status = {"ok": True, "linked": True, "me": SELF}
-        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
-                mock.patch.object(whatsapp, "reinstall_needed", return_value=False), \
-                mock.patch.object(whatsapp, "bridge_call", return_value=status):
-            code = whatsapp.setup(self.ws, VALIDATE, io)
-        self.assertEqual(code, 130)
-        self.assertIn("setup stopped; nothing more was changed", io.text)
-        self.assertEqual(VALIDATE(self.read_cfg()), [])
-        self.assertEqual(whatsapp.allow_chat(self.ws, VALIDATE, Interrupt(), []), 130)
-        self.assertFalse(list(self.ws.glob(".config*.tmp")))
-
-    def test_config_writes_hold_a_lock(self):
-        import fcntl
-        import threading as th
-        self.cfg["whatsapp"] = {"enabled": False}
-        self.write_cfg()
-        lock = self.ws / ".mother" / "config.lock"
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        f = open(str(lock), "a")
-        fcntl.flock(f, fcntl.LOCK_EX)
-        done = []
-        t = th.Thread(target=lambda: done.append(whatsapp.save_whatsapp(self.ws, VALIDATE,
-                                                                        lambda wa: wa.update(read=False))))
-        t.start()
-        time.sleep(0.3)
-        self.assertEqual(done, [])  # waits for the lock
-        fcntl.flock(f, fcntl.LOCK_UN)
-        f.close()
-        t.join(5)
-        self.assertEqual(self.read_cfg()["whatsapp"]["read"], False)
-
-
-class TestAllow(SetupCase):
-    def setUp(self):
-        SetupCase.setUp(self)
-        self.cfg["whatsapp"] = {"enabled": True, "self_jid": SELF, "allow": [], "approve_via": ["session"]}
-        self.write_cfg()
-
-    def test_allow_needs_setup_first(self):
-        del self.cfg["whatsapp"]
-        self.write_cfg()
-        code, io = self.allow(DM)
-        self.assertEqual(code, 2)
-        self.assertIn("mother whatsapp setup", io.text)
-        self.assertNotIn("whatsapp", self.read_cfg())
-
-    def allow(self, *args, answers=()):
-        io = FakeIO(*answers)
-        code = whatsapp.allow_chat(self.ws, VALIDATE, io, list(args))
-        return code, io
-
-    def allowed(self):
-        return (self.read_cfg().get("whatsapp") or {}).get("allow")
-
-    def test_a_phone_number_becomes_a_jid_named_from_the_database(self):
-        code, io = self.allow("+972-50-000-0001")
-        self.assertEqual(code, 0, io.text)
-        self.assertEqual(self.allowed(), [{"jid": DM, "name": "Dana"}])
-        self.assertEqual(VALIDATE(self.read_cfg()), [])
-
-    def test_a_list_index_and_an_explicit_name(self):
-        self.assertEqual(self.allow("2")[0], 0)
-        self.assertEqual(self.allow(DM, "--name", "Dana L")[0], 0)
-        self.assertEqual(self.allowed(), [{"jid": GROUP, "name": "PLAT team", "group": True},
-                                          {"jid": DM, "name": "Dana L"}])
-
-    def test_no_argument_shows_the_list_and_asks(self):
-        code, io = self.allow(answers=("1",))
-        self.assertEqual(code, 0, io.text)
-        self.assertEqual(self.allowed(), [{"jid": OTHER, "name": "Stranger"}])
-
-    def test_no_argument_adds_every_number_typed(self):
-        code, io = self.allow(answers=("1 2",))
-        self.assertEqual(code, 0, io.text)
-        self.assertEqual(len(self.allowed()), 2)
-        self.assertIn("Allowed:", io.text)
-        code, io = self.allow(answers=("1 2",))  # both already there
-        self.assertEqual(code, 0, io.text)
-        self.assertEqual(len(self.allowed()), 2)
-        self.assertIn("Skipped", io.text)
-
-    def test_refusals(self):
-        before = (self.ws / "config.json").read_text()
-        for args in (["+972 50 000 0007"],  # no history: no cold contact
-                     [SELF],                # the self chat carries approvals
-                     ["abc"], ["12"], ["123@lid"]):
-            code, io = self.allow(*args)
-            self.assertEqual(code, 2, (args, io.text))
-        self.assertEqual((self.ws / "config.json").read_text(), before)
-
-    def test_a_hidden_id_chat_cannot_be_allowed(self):
-        db = sqlite3.connect(str(self.db))
-        db.execute("INSERT INTO ZWACHATSESSION VALUES (9, '987654321012345@lid', 'Hidden One', 0, NULL, ?)",
-                   (core("2026-10-27T08:00:00Z"),))
-        db.commit()
-        db.close()
-        code, io = self.allow("1")
-        self.assertEqual(code, 2)
-        self.assertIn("id hidden by WhatsApp", io.text)
-
-    def test_already_allowed_is_left_alone(self):
-        self.allow(DM)
-        code, io = self.allow("972500000001")
-        self.assertEqual(code, 0)
-        self.assertEqual(len(self.allowed()), 1)
-        self.assertIn("already", io.text)
-
-    def test_unreadable_database_adds_with_a_note(self):
-        with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("denied")):
-            code, io = self.allow("972500000005", "--name", "Agnes")
-        self.assertEqual(code, 0, io.text)
-        self.assertEqual(self.allowed(), [{"jid": "972500000005@s.whatsapp.net", "name": "Agnes"}])
-        self.assertIn("couldn't check", io.text)
-
-    def test_disallow(self):
-        self.allow(DM)
-        self.allow(GROUP)
-        io = FakeIO()
-        self.assertEqual(whatsapp.disallow_chat(self.ws, VALIDATE, io, ["+972 50 000 0001"]), 0)
-        self.assertEqual(self.allowed(), [{"jid": GROUP, "name": "PLAT team", "group": True}])
-        self.assertEqual(whatsapp.disallow_chat(self.ws, VALIDATE, FakeIO(), [DM]), 1)
-        self.assertEqual(whatsapp.disallow_chat(self.ws, VALIDATE, FakeIO(), []), 2)
-
-
 class TestTerminalOnly(Cmd7):
-    def test_setup_allow_disallow_need_a_terminal(self):
+    def test_setup_link_unlink_need_a_terminal(self):
         before = (self.ws / "config.json").read_text()
-        for args in (["setup"], ["allow", DM], ["disallow", DM]):
+        for args in (["setup"], ["link"], ["unlink"]):
             r = self.run_cli(*args)
             self.assertEqual(r.returncode, 2, (args, r.stderr))
             self.assertIn("run `mother whatsapp %s` in your own terminal" % args[0], r.stderr)
         self.assertEqual((self.ws / "config.json").read_text(), before)
-
-    def test_off_messages_point_at_setup(self):
-        self.cfg["whatsapp"]["enabled"] = False
-        self.write_cfg()
-        self.assertIn("mother whatsapp setup", self.run_cli("chats").stderr)
 
     def test_phone_jid(self):
         self.assertEqual(whatsapp.phone_jid("+972-50-000-0001"), DM)
         self.assertEqual(whatsapp.phone_jid("(972) 50 000 0001"), DM)
         self.assertIsNone(whatsapp.phone_jid("12345"))
         self.assertIsNone(whatsapp.phone_jid("972500000001@s.whatsapp.net"))
+
+    def test_help(self):
+        r = self.run_cli("help")
+        self.assertEqual(r.returncode, 0)
+        for sub in ("chats", "read", "send --to WHO", "setup"):
+            self.assertIn(sub, r.stdout)
 
 
 if __name__ == "__main__":

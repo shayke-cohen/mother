@@ -88,16 +88,15 @@ Everything the agent sends is signed (`agent.signature`) and goes through the gu
 
 ## WhatsApp
 
-WhatsApp chats are the manager's personal channel, read only for the chats on `whatsapp.allow`.
+WhatsApp chats are the manager's personal channel. MOTHER may read any chat in the local WhatsApp database,
+because the manager asked it to; reading is local, and the bridge stores nothing it receives.
 
 - **No bodies in the workspace.** Don't copy WhatsApp messages into memory, journal, todos, people or project
   notes. Write the fact ("Sam confirmed the Thursday cutover") and cite `whatsapp://<chat>/<stanza>`.
-  Drafts and approvals live in `.mother/whatsapp/`, machine-local and never synced.
-- **JIDs only in config.** A JID is a phone number. It lives in `config.json` (`whatsapp.allow`, `self_jid`)
-  and nowhere else: not in memory, journal, people files, commit messages or outbound text. Use the chat's
-  name.
-- **Nothing off the allowlist.** Never read, quote or summarise a chat that is not allowlisted, even if
-  `mother whatsapp chats` shows its name.
+- **JIDs only in config and tool output.** A JID is a phone number. It lives in `config.json` (`self_jid`) and
+  in what `mother whatsapp` prints, and nowhere else: not in memory, journal, people files, commit messages or
+  outbound text. Use the chat's name.
+- **Read what the task needs.** Read the chat the manager asked about, not every chat because you can.
 - **No assessing people from their messages**, same as everywhere: what was decided or asked, not how
   someone seems.
 

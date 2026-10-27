@@ -1,8 +1,8 @@
 # WhatsApp bridge (send-only)
 
 The one process that sends WhatsApp messages for MOTHER. It links to the manager's WhatsApp as a device
-(like WhatsApp Web, via [Baileys](https://github.com/WhiskeySockets/Baileys)) and sends one text to one
-allowlisted chat after the manager's proven yes. It reads nothing: incoming messages are handled only as far
+(like WhatsApp Web, via [Baileys](https://github.com/WhiskeySockets/Baileys)) and sends one text to one chat
+when `mother whatsapp send` asks; the guard asked the manager before that command ran. It reads nothing: incoming messages are handled only as far
 as the protocol needs and are never stored, logged or forwarded. Reading goes through the local database
 (`mother whatsapp read`). The rules are in `docs/CONTRACT.md` §5d.
 
@@ -42,12 +42,13 @@ Known risks of the dependency:
 outside the workspace, never synced. The agent never runs these directly or talks to the socket: it goes
 through `mother whatsapp …`, and the guard denies anything else that touches the socket or the state.
 
-A freshly started bridge answers `send` and `prompt` only once its WhatsApp connection is open (it waits up to
-20 s; `unlinked` only with no session or when the connection fails in that window). It drops every `console.*`
-call (libsignal prints session objects there), so `bridge.log` holds ids and codes only. Normally nobody starts it by hand: `mother whatsapp send|prompt` start `node bridge.mjs` detached (log in
-`<state>/whatsapp/bridge.log`, ids and codes only) when the socket is missing or refuses, and the bridge exits
-by itself after 30 minutes with no request (`MOTHER_BRIDGE_IDLE_MS` overrides it, in ms; the socket is removed).
-`mother whatsapp link|unlink` run `--link|--unlink` in your terminal.
+A freshly started bridge answers `send` only once its WhatsApp connection is open (it waits up to 20 s;
+`unlinked` only with no session or when the connection fails in that window). It drops every `console.*` call
+(libsignal prints session objects there), so `bridge.log` holds ids and codes only. Normally nobody starts it by
+hand: `mother whatsapp send` starts `node bridge.mjs` detached (log in `<state>/whatsapp/bridge.log`) when the
+socket is missing or refuses, and the bridge exits by itself after 30 minutes with no request
+(`MOTHER_BRIDGE_IDLE_MS` overrides it, in ms; the socket is removed). `mother whatsapp link|unlink` run
+`--link|--unlink` in your terminal.
 
 ## Protocol
 
@@ -55,34 +56,22 @@ A Unix socket, mode 0600, no TCP. One JSON request per connection, one JSON repl
 
 | Request | Reply |
 |---|---|
-| `{"op": "status"}` | `{"ok": true, "linked", "me", "sent_today", "prompts_today"}`, plus `"connecting": true` while a paired session is still opening |
+| `{"op": "status"}` | `{"ok": true, "linked", "me", "sent_today"}`, plus `"connecting": true` while a paired session is still opening |
 | `{"op": "stop"}` | `{"ok": true}`, then the bridge exits (used by `mother whatsapp stop`, `link`, `unlink`) |
-| `{"op": "send", "draft": "<id>"}` | `{"ok": true, "stanza"}` or `{"ok": false, "error"}` |
-| `{"op": "prompt", "text": "…"}` | the same; goes to `whatsapp.self_jid` only |
+| `{"op": "send", "jid", "text"}` | `{"ok": true, "stanza"}` or `{"ok": false, "error"}` |
 
-Before every `send` the bridge checks, in order: `approved/<id>.json` exists (else `no_approval`, nothing
-else happens); sending is on and the workspace isn't PAUSED; the draft's chat is in `whatsapp.allow` and isn't
-the self chat; the approval names this draft and chat; `sha256` of the draft text equals both the draft's
-stored hash and the approval's; not already sent; today's `max_per_day` (UTC day of `sent.jsonl`'s `at`); the
-jittered `min_gap_seconds` since the last message (waited out inside the request when 30 s or less, else
-`gap`); linked; the linked account is `whatsapp.self_jid`; and then `python3 <plugin>/bin/mother whatsapp
-verify <id> --sha256 <hash of the text about to go out>` must exit 0 (it re-proves the yes from the evidence
-the guard recorded, on the path it recorded). Then it shows "typing…" for `min(8 s, 40 ms × characters)` plus
-jitter, sends, and appends one line to `sent.jsonl` (`"stanza": null` if WhatsApp returned no id).
+Before every `send` the bridge checks, in order: `jid` is a user (`<digits>@s.whatsapp.net`) or group
+(`<digits>@g.us`) JID and `text` is 1-4096 characters (else `bad_request`); sending is on and the workspace
+isn't PAUSED; `sent.jsonl` is readable and today's sends (UTC day of `at`) are under `max_per_day`; the jittered
+`min_gap_seconds` since the last send has passed (waited out inside the request when 30 s or less, else
+`gap`); linked; the linked account is `whatsapp.self_jid` (`wrong_account`); and the manager's own number is
+addressed only as `self_jid` (`self_mismatch`). Then it shows "typing…" for `min(8 s, 40 ms × characters)` plus
+jitter (not in the manager's own chat), sends, and appends one line to `sent.jsonl`
+(`{"at", "kind": "send", "chat", "sha256", "stanza"}`, `"stanza": null` if WhatsApp returned no id). It holds no
+approval of its own: anything that can open the 0600 socket can send, which is why the guard keeps the agent off it.
 
-Once the approval file exists, every outcome settles it: `.used` after a send or on `already_sent`,
-`.failed` on any refusal or failure, so a fresh `mother whatsapp send <id>` re-proves the manager's yes.
-If the bridge dies between sending and logging, the approval stays `.json`: the guard then denies a resend
-(the safe side) and the outcome is unrecorded.
-
-A `prompt` must not read as the manager's reply (`ok <id>`, `ok all`, `no <id>` on any line: `bad_request`).
-`MOTHER_PLUGIN_ROOT` (set by the CLI) tells an installed copy where the plugin's `bin/mother` is, for `verify`.
-If its `sent.jsonl` line can't be written it returns `{"ok": false, "error": "log_failed", "stanza",
-"detail"}`: the message went out but isn't recorded as the bridge's own.
-
-Errors: `not_allowlisted`, `no_approval`, `hash_mismatch`, `cap`, `gap`, `unlinked`, plus `no_draft`,
-`already_sent`, `off`, `paused`, `wrong_account`, `no_workspace`, `send_failed`, `log_failed` (prompt only),
-`bad_request`, `internal`.
+Errors: `bad_request`, `off`, `paused`, `no_workspace`, `cap`, `gap`, `unlinked`, `wrong_account`,
+`self_mismatch`, `send_failed`, `internal`.
 
 ## Test
 

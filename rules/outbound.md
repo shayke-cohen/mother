@@ -13,7 +13,7 @@ remembering anything. When this page and the hook disagree, the hook wins, and t
 
 | Name | Means |
 |---|---|
-| `own_dm` | A chat message or reaction to the manager's own DM (`manager.chat_dm`, plus `manager.chat_user` if set) |
+| `own_dm` | A chat message or reaction to the manager's own DM (`manager.chat_dm`, plus `manager.chat_user` if set); a WhatsApp message to the manager's own chat (`--to me`) |
 | `drafts` | A mail or chat draft. A draft delivers nothing |
 | `own_calendar_no_guests` | A calendar event whose only guest, if any, is `manager.email` |
 
@@ -23,7 +23,7 @@ Reading anything and local work (memory, todos, files in the workspace) is not o
 
 | Name | Means |
 |---|---|
-| `any_message_to_others` | Any chat post, reply, edit, scheduled message, reaction, topic or canvas change outside the manager's DM; sending email |
+| `any_message_to_others` | Any chat post, reply, edit, scheduled message, reaction, topic or canvas change outside the manager's DM; sending email; any WhatsApp message to someone else |
 | `tracker_writes` | Creating, updating, transitioning, commenting on, linking or moving issues; sprint operations |
 | `calendar_with_guests` | An event with other guests; any update to an existing event that doesn't state its full guest list; RSVPs |
 | `code_host_comments` | `gh` / `glab` writes: issues, PRs/MRs, reviews, comments, releases, repo changes, write-method `api` calls |
@@ -116,9 +116,8 @@ The hook honours a grant only when all of these hold. Anything else, including a
 and the call asks.
 
 - **Scope-limited.** `scope` is one of `chat-post` (top-level only), `chat-reply` (thread reply, no broadcast),
-  `tracker-create`, `tracker-comment`, `tracker-transition`, and `whatsapp` (one approved WhatsApp draft, cap 1,
-  written only by `mother whatsapp pending` from the manager's `ok <id>` in the DM). Nothing else can be granted: email, calendar,
-  code host, deletions and scheduled messages always need a live yes.
+  `tracker-create`, `tracker-comment`, `tracker-transition`. Nothing else can be granted: email, calendar,
+  code host, WhatsApp, deletions and scheduled messages always need a live yes.
 - **Target-limited.** A chat target must be a channel listed under a team in `config.json`, not `external`,
   and not `mode: off`. A tracker target must be a team's `tracker.project`. All issues in the call must belong
   to it.
@@ -156,46 +155,35 @@ per forged message. Never email, never a deletion, never while paused. `.mother/
 
 ## WhatsApp
 
-WhatsApp sends from the manager's own number, so it is stricter than chat: the guard **never asks**. Every
-WhatsApp call is allow or deny, in every permission mode, bypass included (an ask there would pass silently).
+WhatsApp sends from the manager's own number. It works like a chat message: reading is not outbound, and
+every send to someone else needs the manager's yes in the permission prompt.
 
-- **Allowlist only.** A draft goes only to a chat in `whatsapp.allow` that already has history with the
-  manager (no cold contact), never to the manager's own self chat.
+- **Read freely.** `mother whatsapp chats` and `mother whatsapp read` read any chat from the local database.
+  Reading is local; quote what was said or decided, not the bodies (`rules/privacy.md`).
+- **Send with `mother whatsapp send --to WHO --text '…'`, as the whole Bash command.** The guard asks the
+  manager, showing the recipient and the exact text (MOTHER's signature line is added to it). `--to me`, the
+  manager's own chat, is `own_dm`: no prompt. The text must be literal: in single quotes, or from
+  `--text-file PATH` (the guard reads the file to show it). A `$`, `$( )` or backtick in the text, anything
+  chained, piped, redirected or wrapped, or a command name built from a variable, is denied.
+- **Only chats with history.** The CLI refuses a chat with no message between the manager and that person
+  (no cold contact), a chat WhatsApp shows without a number, and a name that matches more than one chat. The
+  bridge enforces `whatsapp.max_per_day` (default 20) and a jittered `min_gap_seconds` between sends.
+- **A refused, denied or failed send is not retried by another path.** Report what it said.
 - **The manager sets it up, not you.** Never edit the `whatsapp` block of `config.json`, and never run
-  `mother whatsapp setup`, `allow` or `disallow`, wrapped in `script`, `expect` or anything else: the guard
+  `mother whatsapp setup`, `link` or `unlink`, wrapped in `script`, `expect` or anything else: the guard
   denies all of it, including a config.json write that changes the block and any shell write to config.json
-  while the block exists. When you rewrite config.json for other keys, keep the block exactly as it is. Tell the manager to run
-  `mother whatsapp setup` (or `allow <number>`) in their own terminal.
-- **Draft, then one yes, then send.** `mother whatsapp draft` writes the draft; show it on the enabled paths
-  (`WhatsApp -> <chat name>: "<text>" - reply ok <id>`); the manager answers `ok <id>` in the session, their
-  DM, or "Message yourself". One yes sends one exact text to one chat, once. Any edit is a new draft that
-  needs its own yes. `no <id>` on any path drops it.
-- **`mother whatsapp send <id>` alone.** It must be the whole Bash command: nothing chained, piped, redirected
-  or wrapped. The guard allows it only with a proven yes, under the daily cap (`whatsapp.max_per_day`), not
-  already sent, not PAUSED, on the home machine; then it writes the approval record the bridge checks. A
-  yes in the DM is spent on the first send.
-- **Hands off the bridge and its state.** Never touch the bridge socket, `<state>/whatsapp/` or
-  `.mother/whatsapp/` by any other means: no `curl --unix-socket`, `nc -U`, `socat`, script, `cat`, `cp`,
-  `rm`, Write or Edit, in any case, glob or variable spelling. The guard denies all of it, and also denies
-  deleting, moving or copying the folders that hold that state (`~/.mother`, the workspace, its `.mother/`).
-  To change a draft, drop it and draft again.
-- **Write commands plainly.** Write the `mother whatsapp` commands as they are: a quoted, capitalised or
-  computed form is denied. A command name built from a variable, `$( )` or a glob is denied when it could be
-  `mother` or the line could be a WhatsApp command (the guard can't tell what it runs); set the variable
-  earlier in the same line (`CH=…; $CH plan`) or write the name out.
-- **One approval per send.** The guard writes `approved/<id>.json` once; the bridge marks it `.used` after the
-  send. A second `send` while it is in flight, or after it was sent, is denied. A Slack `ok` counts only
-  through the signed grant `mother whatsapp pending` writes; never write a `whatsapp` grant yourself.
-- `mother whatsapp prompt <ids>` (the self-chat ask) is allowed only for open drafts. Reading (`read`,
-  `chats`, `list`, `pending`, `verify`, `status`) is not outbound. The bridge runs `mother whatsapp verify <id>`
-  before every send and refuses unless the yes still stands for the draft's current text. MOTHER's sub-agents may run only `mother whatsapp
-  read`; channel sessions run no WhatsApp command.
-- **What this stops, and what it doesn't.** The guard and the bridge stop mistakes and injected instructions.
-  They do not stop a deliberately evasive agent on the manager's own macOS account: such an agent could run a
-  script the guard can't read, or read the bridge's session keys, which the account can read. On the Slack
-  path, `mother whatsapp pending` signs whatever DM messages it is handed, and the signing key is readable by
-  the account, so that path trusts your report of the manager's DM: hand `pending` only the messages the chat
-  tool returned, unedited. The bridge re-checks the yes itself, which narrows this but does not remove it.
+  while the block exists. When you rewrite config.json for other keys, keep the block exactly as it is.
+  Tell the manager to run `mother whatsapp setup` in their own terminal.
+- **Hands off the bridge and its state.** Never touch the bridge socket or `<state>/whatsapp/` (the session
+  keys, `sent.jsonl`, the installed bridge) by any other means: no `curl --unix-socket`, `nc -U`, `socat`,
+  script, `node` with the WhatsApp library, `cat`, `cp`, `rm`, Write or Edit, in any case, glob or variable
+  spelling. The guard denies all of it, and also denies deleting, moving or copying the folders that hold it
+  (`~/.mother`, the workspace, its `.mother/`). MOTHER's sub-agents may run only `mother whatsapp read`;
+  channel sessions run no WhatsApp command.
+- **What this stops, and what it doesn't.** The guard stops mistakes and injected instructions. It does not
+  stop a deliberately evasive agent on the manager's own macOS account, which could run a script the guard
+  can't read or use the bridge's session keys. The bridge itself checks only the cap, the gap and the linked
+  account: the prompt is the approval. In bypass mode (below) a WhatsApp send asks nothing, as for chat.
 
 ## Kill switch
 
@@ -213,7 +201,7 @@ log, the hook itself or `~/.mother/workspace`, is an ask.
 When the manager runs a session in bypass permissions mode (`permission_mode` is `bypassPermissions` in the
 hook payload), every call that would ask gets no decision instead, so Claude Code's own mode applies and the
 call runs without a prompt. That covers messages to others, tracker writes, email, calendar invites and
-code-host writes. What doesn't change: the kill switch, the never-list, a dry run and an unproven WhatsApp send still deny, MOTHER's
+code-host writes, and WhatsApp messages to others. What doesn't change: the kill switch, the never-list, a dry run and the WhatsApp state and setup rules still deny, MOTHER's
 sub-agents are still denied, an edit to the guard's own files still asks, and allows stay allows. Each pass is
 logged with decision `pass`.
 
@@ -233,8 +221,8 @@ granted and session-approved writes. It also denies Write/Edit, web tools, and a
 ## Fail closed
 
 No workspace, or a `config.json` that isn't valid schema v1 with a `manager.chat_dm`: nothing is auto and no
-grant counts, so every outbound call asks (never-list calls still deny; WhatsApp denies). An unreadable hook
-payload asks. A crash while classifying asks, except on a WhatsApp call, which denies. The hook never answers allow for a call it doesn't recognise.
+grant counts, so every outbound call asks (never-list calls still deny; a WhatsApp send denies). An unreadable
+hook payload asks. A crash while classifying asks, except on a WhatsApp call, which denies. The hook never answers allow for a call it doesn't recognise.
 
 ## The log
 

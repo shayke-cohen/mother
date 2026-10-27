@@ -479,14 +479,8 @@ class TestWhatsappConfig(unittest.TestCase):
     BLOCK = {
         "enabled": True,
         "self_jid": "972500000099@s.whatsapp.net",
-        "allow": [
-            {"jid": "972500000001@s.whatsapp.net", "name": "Dana", "team": "platform"},
-            {"jid": "120363000000000001@g.us", "name": "PLAT team", "team": "platform", "group": True},
-        ],
-        "approve_via": ["slack_dm", "self_chat", "session"],
         "max_per_day": 20,
         "min_gap_seconds": 5,
-        "max_prompts_per_day": 10,
         "read": True,
         "send": True,
     }
@@ -505,34 +499,28 @@ class TestWhatsappConfig(unittest.TestCase):
     def test_example_config_ships_a_disabled_block(self):
         wa = json.loads((ROOT / "templates/workspace/config.example.json").read_text())["whatsapp"]
         self.assertIs(wa["enabled"], False)
+        self.assertEqual(set(wa), {"enabled", "self_jid", "max_per_day", "min_gap_seconds", "read", "send"})
         self.init()
         self.write_config()
         self.assertEqual(run(["status"], self.env).returncode, 0)
+
+    def test_the_earlier_designs_keys_are_accepted_and_ignored(self):
+        """The manager's live config still has allow and approve_via: any value passes."""
+        for legacy in ({"allow": [{"jid": "972500000001@s.whatsapp.net", "name": "Dana", "team": "platform"}],
+                        "approve_via": ["slack_dm", "self_chat", "session"], "max_prompts_per_day": 10},
+                       {"allow": 5, "approve_via": [], "max_prompts_per_day": "lots"}):
+            r = self.status_with(lambda b: b.update(legacy))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_unknown_key_rejected(self):
         r = self.status_with(lambda b: b.update(foo=1))
         self.assertEqual(r.returncode, 1)
         self.assertIn("whatsapp.foo", r.stdout)
 
-    def test_empty_approve_via_rejected(self):
-        r = self.status_with(lambda b: b.update(approve_via=[]))
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("whatsapp.approve_via", r.stdout)
-
-    def test_unknown_approve_via_rejected(self):
-        r = self.status_with(lambda b: b.update(approve_via=["sms"]))
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("whatsapp.approve_via", r.stdout)
-
     def test_max_per_day_above_ceiling_rejected(self):
         r = self.status_with(lambda b: b.update(max_per_day=51))
         self.assertEqual(r.returncode, 1)
         self.assertIn("whatsapp.max_per_day", r.stdout)
-
-    def test_bad_jid_rejected(self):
-        r = self.status_with(lambda b: b["allow"][0].update(jid="12345"))
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("whatsapp.allow[0].jid", r.stdout)
 
     def test_bad_self_jid_rejected(self):
         r = self.status_with(lambda b: b.update(self_jid="12345@g.us"))
@@ -549,23 +537,10 @@ class TestWhatsappConfig(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_other_limits_rejected(self):
-        for key, val in (("max_per_day", 0), ("min_gap_seconds", -1), ("max_prompts_per_day", 0), ("read", "yes")):
+        for key, val in (("max_per_day", 0), ("min_gap_seconds", -1), ("read", "yes"), ("send", 1)):
             r = self.status_with(lambda b: b.update({key: val}))
             self.assertEqual(r.returncode, 1, key)
             self.assertIn(f"whatsapp.{key}", r.stdout)
-
-    def test_allow_not_a_list_rejected_without_crash(self):
-        for bad in (5, {}):
-            r = self.status_with(lambda b: b.update(allow=bad))
-            self.assertEqual(r.returncode, 1, bad)
-            self.assertIn("whatsapp.allow must be a list", r.stdout)
-            self.assertNotIn("Traceback", r.stderr)
-
-    def test_allow_entry_shape_rejected(self):
-        r = self.status_with(lambda b: b["allow"][1].update(extra=1))
-        self.assertIn("whatsapp.allow[1].extra", r.stdout)
-        r = self.status_with(lambda b: b["allow"][0].pop("name"))
-        self.assertIn("whatsapp.allow[0].name", r.stdout)
 
 
 if __name__ == "__main__":
