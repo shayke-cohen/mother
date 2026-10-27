@@ -344,6 +344,15 @@ class TestDrafts(Base):
         self.assertEqual(whatsapp.load_draft(self.ws, d["id"]), d)
         self.assertTrue((self.ws / ".mother/whatsapp/drafts" / (d["id"] + ".json")).exists())
 
+    def test_used_or_failed_approval_keeps_its_id(self):
+        folder = self.ws / ".mother/whatsapp/approved"
+        folder.mkdir(parents=True)
+        for i, suffix in (("wabc", "used"), ("wabd", "failed"), ("wabe", "json")):
+            (folder / ("%s.%s" % (i, suffix))).touch()
+        with mock.patch.object(whatsapp.random.SystemRandom, "choice", side_effect=list("abc") + list("abd")
+                               + list("abe") + list("abf")):
+            self.assertEqual(whatsapp._new_id(self.ws), "wabf")
+
     def test_unlisted_chat_refused(self):
         with self.assertRaises(SystemExit) as c:
             whatsapp.new_draft(self.ws, self.cfg, OTHER, "x")
@@ -502,7 +511,7 @@ class TestProof(Base):
         e.update(extra)
         return e
 
-    def grant(self, target="w3kx", user=MGR, channel=MGR_DM, when=None, sha=None, shown=True):
+    def grant(self, target="w3kx", user=MGR, channel=MGR_DM, when=None, sha=None, shown=True, sig=True):
         when = when or ago(minutes=30)
         if shown:
             self.prompt("slack_dm", [target], when - _dt.timedelta(minutes=5))
@@ -510,6 +519,10 @@ class TestProof(Base):
              "sha256": sha if sha is not None else self.sha(target),
              "expires": fmt(when + _dt.timedelta(hours=72)),
              "source": {"channel": channel, "user": user, "ts": "%.6f" % when.timestamp()}}
+        if sig is True:
+            g["sig"] = whatsapp.grant_sig("whatsapp", target, g["source"]["ts"], g["sha256"])
+        elif sig:
+            g["sig"] = sig
         p = self.ws / ".mother/grants.json"
         data = json.loads(p.read_text()) if p.exists() else {"grants": []}
         data["grants"].append(g)
@@ -649,6 +662,25 @@ class TestProof(Base):
         got = whatsapp.prove(self.ws, self.cfg, "w3kx")
         self.assertEqual(got["path"], "slack_dm")
         self.assertIn(MGR_DM, got["evidence"])
+
+    def test_slack_grant_needs_valid_signature(self):
+        self.via("slack_dm")
+        self.grant(sig=False)  # any agent can write grants.json; only `pending` holds the key
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+        self.grant(sig="0" * 64)
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+        (self.ws / ".mother/grants.json").unlink()
+        self.grant()
+        g = json.loads((self.ws / ".mother/grants.json").read_text())["grants"][0]
+        self.assertTrue(whatsapp.grant_sig_ok(g))
+        for k, v in (("target", "w9pa"), ("sha256", "f" * 64)):
+            self.assertFalse(whatsapp.grant_sig_ok(dict(g, **{k: v})))
+        self.assertFalse(whatsapp.grant_sig_ok(dict(g, source=dict(g["source"], ts="1.0"))))
+        key = self.t / "state" / "whatsapp" / "grant.key"
+        self.assertEqual(oct(key.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "slack_dm")
+        key.unlink()  # no key, no valid signature
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
 
     def test_slack_grant_from_manager_only(self):
         self.via("slack_dm")
@@ -874,6 +906,7 @@ class TestProof(Base):
         self.assertEqual((g[0]["scope"], g[0]["target"], g[0]["uses"]), ("whatsapp", "w3kx", 1))
         self.assertEqual((g[0]["source"]["channel"], g[0]["source"]["user"]), (MGR_DM, MGR))
         self.assertEqual(g[0]["sha256"], self.sha("w3kx"))
+        self.assertTrue(whatsapp.grant_sig_ok(g[0]))
         self.pending([yes])  # the same message again: no second grant
         self.assertEqual(len(self.grants()), 1)
 

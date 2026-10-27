@@ -403,7 +403,7 @@ def protected_paths(ctx):
         m = os.path.join(ctx.ws, ".mother")
         ps |= {os.path.join(ctx.ws, "config.json"), os.path.join(m, "PAUSED"), os.path.join(m, "ledger.json"),
                os.path.join(m, "guard.log")}
-    return {os.path.realpath(p) for p in ps}
+    return {_cf(p) for p in ps}  # casefolded: macOS file systems ignore case (Config.json is config.json)
 
 
 def api_write(cmd):
@@ -421,35 +421,139 @@ def api_write(cmd):
 
 
 # ------------------------------------------------------------------ WhatsApp (CONTRACT §5, §5d)
-# Every WhatsApp decision is allow or deny, never ask: in bypassPermissions mode an ask would pass.
+# Every WhatsApp decision is allow or deny, never ask: in bypassPermissions mode an ask would pass. Paths are
+# compared casefolded (macOS file systems ignore case), commands after stripping quotes and backslashes.
 
-WA_PASS = {None, "read", "chats", "draft", "list", "drop", "status", "pending", "link", "unlink", "help", "-h",
-           "--help"}
-WA_OUT = {"send", "prompt"}
+WA_PASS_SUBS = ("read", "chats", "draft", "list", "drop", "status", "pending", "link", "unlink", "help", "-h",
+                "--help")
 WA_ID = r"w[a-z2-9]{3}"
 _WA_BIN = (r"(?:python3?[ \t]+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother\"|\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother"
            r"|\"[^\"$`\\\n]*/mother\"|'[^'\n]*/mother'|(?:[\w.~+-]*/)*mother)")
+# One argument of a passing subcommand: plain text, $VAR / ${VAR}, or a quoted string without $( ) or backticks.
+_WA_ARG = r"""(?:[^\s;&|<>`$()\\'"]|\$\{?[A-Za-z_]\w*\}?|"(?:[^"`$\\\n]|\$\{?[A-Za-z_]\w*\}?)*"|'[^'\n]*')+"""
+_WA_REDIR = r"[ \t]*[0-9]?(?:<|>>?)[ \t]*%s" % _WA_ARG
 WA_SEND_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+send[ \t]+(%s)\Z" % (_WA_BIN, WA_ID))
 WA_PROMPT_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+prompt((?:[ \t]+%s)+)\Z" % (_WA_BIN, WA_ID))
+WA_PASS_RE = re.compile(r"^%s[ \t]+whatsapp(?:[ \t]+(?:%s)(?:[ \t]+%s)*)?(?:%s)*\Z" % (
+    _WA_BIN, "|".join(re.escape(x) for x in WA_PASS_SUBS), _WA_ARG, _WA_REDIR))
 WA_READ_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+read(?:[ \t]+[^\s;&|<>`$()\\'\"]+)*\Z" % _WA_BIN)
-WA_SUB_RE = re.compile(r"(?:^|[\s/;&|(`'\"])mother['\"]?\s+whatsapp\b(?:\s+([^\s;&|)`'\"<>]+))?")
-WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:approved|drafts|session)(?=/|$|[\s'\";&|)])"
-                         r"|whatsapp/(?:sent|prompts)\.jsonl")
-WA_SOCKET_RE = re.compile(r"--unix-socket|\bnc\b[^;&|\n]*\s-U\b|\bsocat\b|AF_UNIX|\.sock\b")
+WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:approved|drafts|session)(?=/|$|[\s;&|)])"
+                         r"|whatsapp/(?:sent|prompts)\.jsonl|whatsapp/grant\.key", re.I)
+WA_SOCKET_WORDS = ("bridge", ".sock", "--unix-socket", "socat", "af_unix")
+WA_WORKSPACE_IDIOM = re.compile(r"\$\{MOTHER_WORKSPACE:-\$\(cat[ \t]+~/\.mother/workspace\)\}")
+WA_STATE_FILES = ("sent.jsonl", "bridge.sock", "session", "grant.key")
+WA_WS_FILES = ("drafts", "approved", "prompts.jsonl")
+
+
+def wa_norm(s):
+    """The command as the shell will mostly see it: quotes and backslashes gone, casefolded."""
+    return re.sub(r"[\"'\\]", "", s).casefold()
+
+
+def wa_tokens(norm):
+    return [t for t in re.split(r"[\s;&|<>()`]+", norm) if t]
+
+
+def wa_names_cli(norm):
+    """The normalised text names the `mother` CLI next to the word whatsapp (in any quoting or case)."""
+    toks = wa_tokens(norm)
+    return any(t.rstrip("/").split("/")[-1] == "mother" for t in toks) and any("whatsapp" in t for t in toks)
+
+
+def wa_state_root():
+    return os.path.expanduser(os.environ.get("MOTHER_STATE_DIR", "").strip() or "~/.mother")
 
 
 def wa_dirs(ctx):
-    """The two folders only `mother whatsapp` writes: <state>/whatsapp and <ws>/.mother/whatsapp."""
-    state = os.path.expanduser(os.environ.get("MOTHER_STATE_DIR", "").strip() or "~/.mother")
-    ds = [os.path.join(state, "whatsapp")]
+    """The folders only `mother whatsapp` writes: <state>/whatsapp (and the default ~/.mother/whatsapp) and
+    <ws>/.mother/whatsapp."""
+    ds = [os.path.join(wa_state_root(), "whatsapp"), os.path.join(os.path.expanduser("~"), ".mother", "whatsapp")]
     if ctx.ws:
         ds.append(os.path.join(ctx.ws, ".mother", "whatsapp"))
     return ds
 
 
+def _cf(path):
+    return os.path.realpath(path).casefold()
+
+
 def wa_inside(path, ctx):
-    rp = os.path.realpath(path)
-    return any(inside(rp, os.path.realpath(d)) for d in wa_dirs(ctx))
+    rp = _cf(path)
+    return any(inside(rp, _cf(d)) for d in wa_dirs(ctx))
+
+
+def wa_protected(ctx):
+    """Every protected WhatsApp path, as written and resolved, casefolded, for glob matching."""
+    found = set()
+    for d in wa_dirs(ctx):
+        kids = WA_WS_FILES if d.endswith(os.path.join(".mother", "whatsapp")) and ctx.ws and \
+            d == os.path.join(ctx.ws, ".mother", "whatsapp") else WA_STATE_FILES
+        for p in [d] + [os.path.join(d, k) for k in kids]:
+            found |= {os.path.abspath(p).casefold(), os.path.realpath(p).casefold()}
+    return found
+
+
+def _glob_hits(pattern, protected):
+    """A glob path hits a protected path when their leading components match (case-insensitive fnmatch): a
+    deeper glob names something inside it, a shallower one an ancestor of it."""
+    import fnmatch
+    comps = pattern.split("/")
+    lit = 0
+    while lit < len(comps) and not any(ch in comps[lit] for ch in "*?["):
+        lit += 1
+    head = "/".join(comps[:lit]) or "/"
+    pattern = os.path.join(os.path.realpath(head), *comps[lit:])  # resolve the literal part (/var → /private/var)
+    pat = [c for c in pattern.casefold().split("/") if c]
+    for p in protected:
+        comps = [c for c in p.split("/") if c]
+        n = min(len(pat), len(comps))
+        if n and all(fnmatch.fnmatchcase(comps[k], pat[k]) for k in range(n)):
+            return True
+    return False
+
+
+def wa_paths_hit(cmd, cwd, ctx):
+    """True when the command names a WhatsApp state path: literally, by a glob, through ~, $HOME,
+    $MOTHER_STATE_DIR, $MOTHER_WORKSPACE or a NAME=… set earlier in the line, relative to its cwd or a `cd`; or
+    through anything left unresolved ($var, $( ), backticks) next to `.mother` or `whatsapp`."""
+    home = os.path.expanduser("~")
+    ws = ctx.ws or os.environ.get("MOTHER_WORKSPACE", "").strip() or None
+    known = {"HOME": home, "MOTHER_STATE_DIR": wa_state_root()}
+    if ws:
+        known["MOTHER_WORKSPACE"] = ws
+    s = WA_WORKSPACE_IDIOM.sub(lambda m: ws or "$MOTHER_WORKSPACE", cmd)
+    s = re.sub(r"[\"'\\]", "", s)
+
+    def expand(text):
+        text = re.sub(r"\$\{(\w+):-[^}$`]*\}", lambda m: known.get(m.group(1), m.group(0)), text)
+        return re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda m: known.get(m.group(1) or m.group(2), m.group(0)), text)
+
+    for m in re.finditer(r"(?:^|[\s;&|(])([A-Za-z_]\w*)=([^\s;&|]*)", s):
+        v = expand(m.group(2))
+        if "$" not in v and "`" not in v:
+            known[m.group(1)] = v
+    s = expand(s)
+    bases = [os.path.realpath(cwd)] if cwd else []
+    for m in re.finditer(r"(?:^|[\s;&|(])cd[ \t]+([^\s;&|]+)", s):
+        t = os.path.expanduser(m.group(1))
+        bases.append(t if os.path.isabs(t) else os.path.join(bases[0] if bases else home, t))
+    protected = wa_protected(ctx)
+    for tok in re.split(r"[\s;&|<>]+", s):
+        low = tok.casefold()
+        if ("$" in tok or "`" in tok) and (".mother" in low or "whatsapp" in low):
+            return True
+        for piece in re.split(r"[()=:,`]+", tok):
+            if not piece or piece.startswith("-") or piece.startswith("$"):
+                continue
+            piece = os.path.expanduser(piece)
+            cands = [piece] if os.path.isabs(piece) else [os.path.join(b, piece) for b in bases]
+            for c in cands:
+                if any(ch in c for ch in "*?["):
+                    if _glob_hits(os.path.normpath(c), protected):
+                        return True
+                elif wa_inside(c, ctx):
+                    return True
+    return False
 
 
 def wa_act(op, what, **kw):
@@ -457,23 +561,17 @@ def wa_act(op, what, **kw):
 
 
 def classify_whatsapp(cmd, cwd, ctx):
-    """A WhatsApp action for a Bash command, or None when the command is not WhatsApp's business (or only
-    reads: read, chats, draft, list, …). Ops: send, prompt (decided on proof), state, compound, unknown (denied)."""
-    low = cmd.lower()
-    names = set()
-    for d in wa_dirs(ctx):
-        names |= {d, os.path.realpath(d)}
-    if WA_STATE_RE.search(cmd) or any(n in cmd for n in names) \
-            or ("whatsapp" in low and WA_SOCKET_RE.search(cmd)) or (cwd and wa_inside(cwd, ctx)):
+    """A WhatsApp action for a Bash command, or None when the command is not WhatsApp's business or is one of
+    the passing subcommands (read, chats, draft, list, …). Ops: send, prompt (decided on proof), state,
+    compound, unknown (always denied). Any mention of the CLI with `whatsapp`, in any quoting or case, must be
+    one of the exact shapes on the raw text (CONTRACT §5)."""
+    norm = wa_norm(cmd)
+    if WA_STATE_RE.search(norm) or ("whatsapp" in norm and (any(w in norm for w in WA_SOCKET_WORDS)
+                                                            or "nc" in wa_tokens(norm))) \
+            or (cwd and wa_inside(cwd, ctx)) or wa_paths_hit(cmd, cwd, ctx):
         # The command itself stays out of the reason: guard.log never holds message text.
         return wa_act("state", "a shell command on WhatsApp's bridge socket or its state folders")
-    subs = [m.group(1) for m in WA_SUB_RE.finditer(cmd)]
-    if not subs:
-        return None
-    bad = [s for s in subs if s not in WA_PASS and s not in WA_OUT]
-    if bad:
-        return wa_act("unknown", "an unrecognised whatsapp command (%s)" % bad[0][:40])
-    if not any(s in WA_OUT for s in subs):
+    if not wa_names_cli(norm):
         return None
     line = cmd.strip()
     m = WA_SEND_RE.match(line)
@@ -483,7 +581,14 @@ def classify_whatsapp(cmd, cwd, ctx):
     if m:
         ids = m.group(1).split()
         return wa_act("prompt", "a WhatsApp self-chat prompt for " + " ".join(ids), draft=",".join(ids), drafts=ids)
-    return wa_act("compound", "a whatsapp send or prompt that is not a command of its own")
+    if re.search(r"(?:^|[\s/])mother\s+whatsapp\s+(?:send|prompt)\b", norm):
+        return wa_act("compound", "a whatsapp send or prompt that is not a command of its own")
+    for seg in CMD_SPLIT_RE.split(cmd):
+        if wa_names_cli(wa_norm(seg)) or any(t.rstrip("/").split("/")[-1] == "mother"
+                                             for t in wa_tokens(wa_norm(seg))):
+            if not WA_PASS_RE.match(seg.strip()):
+                return wa_act("unknown", "an unrecognised whatsapp command")
+    return None
 
 
 def wa_module():
@@ -524,12 +629,14 @@ def classify_bash(cmd, cwd, ctx):
         return wa
     # Edits to the guard's own state through the shell. Reads (cat, grep) pass.
     if SHELL_WRITE_RE.search(cmd):
-        names = ["PAUSED", "ledger.json", "guard.log", "guard.py", "hooks.json", ".mother/workspace"]
-        hit = any(n in cmd for n in names)
+        names = ["paused", "ledger.json", "guard.log", "guard.py", "hooks.json", ".mother/workspace"]
+        low = cmd.casefold()
+        hit = any(n in low for n in names)
         if ctx.ws and not hit:
-            cfgp = os.path.join(ctx.ws, "config.json")
-            here = os.path.realpath(cwd) if cwd else ""
-            hit = cfgp in cmd or ("config.json" in cmd and here == ctx.ws)
+            roots = {ctx.ws, os.environ.get("MOTHER_WORKSPACE", "").strip()} - {""}
+            here = _cf(cwd) if cwd else ""
+            hit = any(os.path.join(r, "config.json").casefold() in low for r in roots) \
+                or ("config.json" in low and here == _cf(ctx.ws))
         if hit:
             return act("config", "guard_config", "a shell command that could change the guard's own files")
     short = cmd.strip()[:160]
@@ -666,7 +773,7 @@ def classify(tool, inp, cwd, ctx):
             fp = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(fp)))
             if wa_inside(fp, ctx):
                 return wa_act("state", "an edit to WhatsApp's drafts, approvals or bridge state: " + fp)
-            if fp in protected_paths(ctx):
+            if fp.casefold() in protected_paths(ctx):
                 return act("config", "guard_config", "an edit to the guard's own files: " + fp)
         return None
     if not tool.startswith("mcp__"):
@@ -929,7 +1036,8 @@ def answers_last_hour(book, target, now):
 
 
 def run_grant_scope(a, ctx, sc, now=None, only=None):
-    """`only` = (source key, sha256): consume that one grant and no other (a WhatsApp proof names it)."""
+    """`only` = (source key, sha256, signature check): consume that one signed grant and no other (a WhatsApp
+    proof names it)."""
     scope, target, n = sc
     scopes, max_age = grant_limits(ctx.cfg)
     if scope == "whatsapp":
@@ -964,7 +1072,7 @@ def run_grant_scope(a, ctx, sc, now=None, only=None):
             if not v:
                 continue
             key, cap = v
-            if only and (key != only[0] or g.get("sha256") != only[1]):
+            if only and (key != only[0] or g.get("sha256") != only[1] or not only[2](g)):
                 continue
             used = 0
             for r in book["uses"]:
@@ -1050,23 +1158,29 @@ def decide_whatsapp(a, ctx, transcript=None):
         return "deny", "%s: today's cap is reached (%d of whatsapp.max_per_day %d)." % (what, n, cap)
     if any(r.get("kind") == "send" and r.get("draft") == i and r.get("sha256") == d.get("sha256") for r in recs):
         return "deny", "%s: already sent (one yes sends once)." % what
+    base = os.path.join(ctx.ws, ".mother", "whatsapp", "approved", i)
+    if os.path.lexists(base + ".used"):
+        return "deny", "%s: already sent (approved/%s.used: one yes sends once)." % (what, i)
+    if os.path.lexists(base + ".json"):
+        return "deny", "%s: send for %s already approved/in flight (approved/%s.json)." % (what, i, i)
     proof = wa.prove(ctx.ws, cfg, i, transcript_path=transcript)
     if not proof or not proof.get("sha256") or proof.get("path") not in ("session", "self_chat", "slack_dm"):
         return "deny", "%s: no proven yes. Show the draft and get the manager's `ok %s` on an enabled path." % (
             what, i)
     if proof["path"] == "slack_dm":
         key = str(proof.get("evidence") or "")[len("slack_dm:"):]
-        if not run_grant_scope(a, ctx, ("whatsapp", i, 1), only=(key, proof["sha256"])):
+        if not run_grant_scope(a, ctx, ("whatsapp", i, 1), only=(key, proof["sha256"], wa.grant_sig_ok)):
             return "deny", "%s: the manager's DM grant for it is already used." % what
-    path = os.path.join(ctx.ws, ".mother", "whatsapp", "approved", i + ".json")
+    path = base + ".json"
     rec = {"id": i, "chat": chat, "sha256": proof["sha256"], "path": proof["path"],
            "evidence": proof.get("evidence"), "at": now_iso()}
-    try:
+    try:  # created exclusively, never through a symlink: a second allow for the same id can't race this one
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(rec, f, indent=1)
-        os.replace(tmp, path)
+    except FileExistsError:
+        return "deny", "%s: send for %s already approved/in flight." % (what, i)
     except OSError as e:
         return "deny", "%s: could not write the approval record (%s)." % (what, type(e).__name__)
     return "allow", "%s: proven yes via %s; approval record %s." % (what, proof["path"], path)
@@ -1249,7 +1363,7 @@ def subagent_session(kind, tool, inp, cwd, ctx):
         return "deny", "%s can't use %s: it is read-only." % (who, tool)
     if tool == "Bash":
         cmd = str(inp.get("command") or "").strip()
-        if WA_SUB_RE.search(cmd) or classify_whatsapp(cmd, cwd, ctx):
+        if wa_names_cli(wa_norm(cmd)) or classify_whatsapp(cmd, cwd, ctx):
             if kind == "reader" and WA_READ_RE.match(cmd) and classify_whatsapp(cmd, cwd, ctx) is None:
                 return None
             return "deny", "%s may run only a single `mother whatsapp read` command, not: %s" % (who, cmd[:120])

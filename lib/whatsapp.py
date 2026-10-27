@@ -239,7 +239,7 @@ def _new_id(ws: Path) -> str:
     for sub in ("drafts", "approved"):
         d = Path(ws) / ".mother" / "whatsapp" / sub
         if d.is_dir():
-            taken.update(p.stem for p in d.glob("*.json"))
+            taken.update(p.name.split(".")[0] for p in d.iterdir())  # approved/<id>.used|.failed keep the id
     for _ in range(200):
         i = "w" + "".join(random.SystemRandom().choice(ID_ALPHABET) for _ in range(3))
         if i not in taken:
@@ -511,8 +511,8 @@ def _slack_hit(c):
         return None
     for gr in data["grants"]:
         v = g.valid_grant(gr, "whatsapp", c.id, c.cfg, scopes, max_age, c.now)
-        if not v or gr.get("sha256") != c.sha:
-            continue
+        if not v or gr.get("sha256") != c.sha or not grant_sig_ok(gr):
+            continue  # a grant for other text, or one `pending` didn't sign
         src = gr["source"]
         ts = g.parse_time(src.get("ts"))
         if str(src.get("channel")) not in dms or ts is None or ts <= c.created:
@@ -586,6 +586,48 @@ class _GrantsLock(object):
             self.f.close()
 
 
+def _grant_key(create: bool = False):
+    """The HMAC key in <state>/whatsapp/grant.key (0600), or None. Only `mother whatsapp` creates it; the guard
+    denies the agent any access to <state>/whatsapp/ through its tools."""
+    p = _state_dir() / "whatsapp" / "grant.key"
+    if create and not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w") as f:
+                f.write(os.urandom(32).hex())
+    try:
+        if p.is_symlink():
+            return None
+        key = bytes.fromhex(p.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return key if len(key) >= 16 else None
+
+
+def grant_sig(scope: str, target: str, ts: str, sha: str, create: bool = True):
+    """HMAC-SHA256 over (scope, target, DM message ts, text sha256): what `pending` puts in a whatsapp grant."""
+    import hmac
+    key = _grant_key(create=create)
+    if key is None:
+        return None
+    msg = "\n".join([str(scope), str(target), str(ts), str(sha)]).encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def grant_sig_ok(g) -> bool:
+    """A whatsapp grant carries a valid `sig`. A grant any other writer made (grants.json is agent-writable for
+    the digest) has none and proves nothing."""
+    import hmac
+    if not isinstance(g, dict) or not isinstance(g.get("sig"), str) or not isinstance(g.get("source"), dict):
+        return False
+    want = grant_sig(g.get("scope"), g.get("target"), g["source"].get("ts"), g.get("sha256"), create=False)
+    return want is not None and hmac.compare_digest(want, g["sig"])
+
+
 def _write_grant(ws: Path, cfg: dict, draft_id: str, sha: str, channel: str, ts: str) -> None:
     """Append one whatsapp grant. The caller holds _GrantsLock."""
     g = _guard()
@@ -601,10 +643,14 @@ def _write_grant(ws: Path, cfg: dict, draft_id: str, sha: str, channel: str, ts:
                 and str(src.get("channel")) == channel and str(src.get("ts")) == str(ts):
             return  # this message already granted it
     sent = g.parse_time(ts)
+    sig = grant_sig("whatsapp", draft_id, str(ts), sha, create=True)
+    if sig is None:
+        raise ValueError("can't create or read the grant key in %s" % (_state_dir() / "whatsapp"))
     data["grants"].append({"scope": "whatsapp", "target": draft_id, "sha256": sha, "uses": 1, "run": "whatsapp",
                            "expires": _fmt(_dt.datetime.fromtimestamp(sent + DRAFT_TTL_HOURS * 3600,
                                                                       _dt.timezone.utc)),
-                           "source": {"channel": channel, "user": str(g.owner_id(cfg)), "ts": str(ts)}})
+                           "source": {"channel": channel, "user": str(g.owner_id(cfg)), "ts": str(ts)},
+                           "sig": sig})
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=1))

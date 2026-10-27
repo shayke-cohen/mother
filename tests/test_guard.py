@@ -815,14 +815,14 @@ def wa_db(path):
 
 def wa_config(**wa):
     w = {"enabled": True, "self_jid": WA_SELF,
-         "allow": [{"jid": WA_DM, "name": "Sam Roe"}, {"jid": WA_GROUP, "name": "Platform team", "group": True},
+         "allow": [{"jid": WA_DM, "name": "Dana"}, {"jid": WA_GROUP, "name": "PLAT", "group": True},
                    {"jid": WA_COLD, "name": "Cold"}]}
     w.update(wa)
     return config(workspace={"git_remote": None, "home_machine": "laptop-a"}, whatsapp=w)
 
 
-class TestWhatsapp(GuardCase):
-    """`mother whatsapp send <id>` is allow with a proven yes, else deny. Never ask, in any mode."""
+class WhatsappCase(GuardCase):
+    """Fixtures for the WhatsApp guard tests."""
 
     BY = "bypassPermissions"
     ID = "w3kx"
@@ -843,7 +843,7 @@ class TestWhatsapp(GuardCase):
         import hashlib
         folder = os.path.join(self.wdir, "drafts")
         os.makedirs(folder, exist_ok=True)
-        d = {"id": i, "chat": chat, "chat_name": "Sam Roe", "text": text,
+        d = {"id": i, "chat": chat, "chat_name": "Dana", "text": text,
              "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "created": iso(NOW - age),
              "run": None, "status": "open"}
         with open(os.path.join(folder, i + ".json"), "w") as f:
@@ -875,7 +875,28 @@ class TestWhatsapp(GuardCase):
         with open(self.state("guard.log")) as f:
             return json.loads(f.read().splitlines()[-1])
 
-    # -- send
+    def keyfile(self):
+        return os.path.join(self.sdir, "whatsapp", "grant.key")
+
+    def write_key(self, hexkey):
+        os.makedirs(os.path.dirname(self.keyfile()), exist_ok=True)
+        with open(self.keyfile(), "w") as f:
+            f.write(hexkey)
+
+    def sign(self, g):
+        """The HMAC `mother whatsapp pending` puts on a whatsapp grant (key in <state>/whatsapp/grant.key)."""
+        import hashlib
+        import hmac
+        if not os.path.exists(self.keyfile()):
+            self.write_key(os.urandom(32).hex())
+        with open(self.keyfile()) as f:
+            key = bytes.fromhex(f.read().strip())
+        msg = "\n".join(["whatsapp", g["target"], g["source"]["ts"], g["sha256"]]).encode()
+        return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+class TestWhatsapp(WhatsappCase):
+    """`mother whatsapp send <id>` is allow with a proven yes, else deny. Never ask, in any mode."""
 
     def test_send_allowed_with_session_yes(self):
         d = self.draft(self.ID)
@@ -892,6 +913,7 @@ class TestWhatsapp(GuardCase):
         self.assertEqual((log["kind"], log["decision"], log["target"]), ("whatsapp", "allow", self.ID))
         for path in ("python3 /opt/plugin/bin/mother whatsapp send w3kx", "/opt/plugin/bin/mother whatsapp send w3kx",
                      '"${CLAUDE_PLUGIN_ROOT}/bin/mother" whatsapp send w3kx', "  mother whatsapp send w3kx  "):
+            os.remove(self.approved())  # one approval at a time: the bridge consumes it (T5-f)
             self.send("allow", path, transcript=self.yes())
 
     def test_send_denied_without_yes(self):
@@ -980,7 +1002,7 @@ class TestWhatsapp(GuardCase):
         # nothing WhatsApp about it: unchanged
         self.assertEqual(self.wa("curl --unix-socket /var/run/docker.sock http://x/info")[0], "none")
         self.assertEqual(self.wa("grep -n whatsapp lib/whatsapp.py")[0], "none")
-        self.assertEqual(self.wa("node bridge/whatsapp/session.js --help")[0], "none")
+        self.assertEqual(self.wa("node bridge/whatsapp/session.js --help")[0], "deny")  # T5-c: bridge + whatsapp
 
     def test_edit_whatsapp_state_denied(self):
         st = os.path.join(self.sdir, "whatsapp")
@@ -1100,7 +1122,8 @@ class TestWhatsapp(GuardCase):
         with open(os.path.join(self.wdir, "prompts.jsonl"), "w") as f:
             f.write(json.dumps({"at": iso(NOW - 500), "path": "slack_dm", "ids": [self.ID],
                                 "sha256": {self.ID: d["sha256"]}}) + "\n")
-        self.grants(dict(self.grant("whatsapp", self.ID, src_age=300, run="whatsapp"), sha256=d["sha256"]))
+        g = dict(self.grant("whatsapp", self.ID, src_age=300, run="whatsapp"), sha256=d["sha256"])
+        self.grants(dict(g, sig=self.sign(g)))
         why = self.send("allow")
         self.assertIn("slack_dm", why)
         with open(self.approved()) as f:
@@ -1128,6 +1151,116 @@ class TestWhatsapp(GuardCase):
         with mock.patch.dict(os.environ, env), mock.patch.object(g, "classify", side_effect=RuntimeError("x")):
             self.assertEqual(g.run(payload)[0], "deny")
         self.assertFalse(os.path.exists(self.approved()))
+
+
+class TestWhatsappFixRound1(WhatsappCase):
+    """Review fix round 1: quoting, case, globs, variables, approvals used once, signed grants."""
+
+    def test_quoted_or_case_variant_send_denied(self):
+        ok = self.yes()
+        for cmd in ('mother whatsapp "send" w3kx', "mother whatsapp 'send' w3kx", 'mother "whatsapp" send w3kx',
+                    "mother wh''atsapp send w3kx", "Mother whatsapp send w3kx", "bin/Mother whatsapp send w3kx",
+                    'mother whatsapp read; mother whatsapp "send" w3kx', 'm"other" whatsapp send w3kx',
+                    "mother\\ whatsapp send w3kx", "mother whatsapp s\\end w3kx", 'eval "mother whatsapp send w3kx"',
+                    "mother WhatsApp send w3kx", "mother whatsapp SEND w3kx", "mother whatsapp list $(echo x)",
+                    "mother whatsapp list `echo x`", "mother whatsapp frobnicate", "bin/Mother whatsapp list",
+                    "grep -n whatsapp bin/mother"):
+            for mode in (None, self.BY):
+                got, why = self.wa(cmd, transcript=ok, mode=mode)
+                self.assertEqual(got, "deny", "%r %s -> %s (%s)" % (cmd, mode, got, why))
+        self.assertFalse(os.path.exists(self.approved()))
+        for cmd in ("echo hi | nc -l 9 whatsapp", "socat - x # whatsapp", "ls bridge/whatsapp",
+                    "curl --unix-socket /tmp/a http://x/whatsapp"):
+            self.assertEqual(self.wa(cmd)[0], "deny", cmd)
+        # still fine: quoted arguments to a passing subcommand, and a repo path that merely contains the words
+        for cmd in ('mother whatsapp read --since "2026-10-26T08:00:00Z"', 'mother whatsapp list --json',
+                    'mother whatsapp draft --chat %s --text-file "$W/t.txt"' % WA_DM,
+                    "ls /src/mother-whatsapp/lib", "git -C /src/mother-whatsapp status"):
+            self.assertEqual(self.wa(cmd)[0], "none", cmd)
+
+    def test_case_variant_paths_denied(self):
+        st = os.path.join(self.sdir, "whatsapp")
+        os.makedirs(st)
+        os.makedirs(os.path.join(self.wdir, "approved"))
+        for p in (os.path.join(self.ws, ".mother", "WhatsApp", "drafts", "w3kx.json"),
+                  os.path.join(self.sdir, "WHATSAPP", "sent.jsonl"),
+                  os.path.join(self.ws, ".MOTHER", "whatsapp", "approved", "w3kx.json")):
+            for mode in (None, self.BY):
+                got, why = self.run_guard("Write", {"file_path": p}, env=self.env, mode=mode)
+                self.assertEqual(got, "deny", "%s %s (%s)" % (p, got, why))
+        for cmd in ("echo x >> ~/.mother/WhatsApp/sent.jsonl", "cat %s/WhatsApp/sent.jsonl" % self.sdir,
+                    "cp x %s/.Mother/WHATSAPP/drafts/w3kx.json" % self.ws, "echo x > BRIDGE.SOCK"):
+            self.assertEqual(self.wa(cmd)[0], "deny", cmd)
+        # the guard's own files: case variants ask like the originals
+        for p in (os.path.join(self.ws, ".mother", "Paused"), os.path.join(self.ws, "Config.json"),
+                  os.path.join(self.ws, ".mother", "LEDGER.json"), os.path.join(self.ws, ".Mother", "guard.LOG")):
+            self.assertEqual(self.run_guard("Write", {"file_path": p}, env=self.env)[0], "ask", p)
+            self.assertEqual(self.run_guard("Edit", {"file_path": p}, env=self.env, mode=self.BY)[0], "ask", p)
+        self.assertEqual(self.wa("rm %s" % os.path.join(self.ws, ".mother", "paused"))[0], "ask")
+        self.assertEqual(self.wa("rm %s" % os.path.join(self.ws, "CONFIG.JSON"))[0], "ask")
+
+    def test_glob_and_variable_paths_denied(self):
+        for cmd in ("rm -rf ~/.mother/what*", "rm ~/.mother/w?atsapp/sent.jsonl", "cd ~/.mother && rm -rf whatsapp",
+                    "curl --unix-socket ~/.mother/wh*/b*.sock http://x/send",
+                    "python3 -c \"import glob; print(glob.glob('%s/.mother/wh*/drafts/w3kx.json'))\"" % self.ws,
+                    "rm -rf $HOME/.mother/[w]hatsapp", "rm -rf ${HOME}/.mother/W*",
+                    "rm -rf ${MOTHER_STATE_DIR}/whatsapp", 'rm -rf "$MOTHER_STATE_DIR"/wh*',
+                    "rm $MOTHER_WORKSPACE/.mother/wh*/approved/w3kx.json",
+                    "ls %s/*/whatsapp" % self.ws, "ls %s/.mother/*" % self.ws,
+                    'W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; rm -rf "$W/.mother/wh"*',
+                    "W=%s; rm $W/.mother/what?app/drafts/w3kx.json" % self.ws,
+                    "cat $UNKNOWN/.mother/x", "cat $(pwd)/.mother/x", "cat `pwd`/whatsapp/x",
+                    "D=$(pwd); cat $D/whatsapp"):
+            for mode in (None, self.BY):
+                got, why = self.wa(cmd, mode=mode)
+                self.assertEqual(got, "deny", "%r %s -> %s (%s)" % (cmd, mode, got, why))
+        # the workspace idiom and ordinary reads still pass
+        for cmd in ('W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"',
+                    'W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cat "$W/config.json"',
+                    'W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}" && ls "$W/todos" && cat "$W/.mother/runs.md"',
+                    "cat ~/.mother/workspace", "ls *.md", "ls %s/*.md" % self.ws, "echo $HOME",
+                    'cat "$MOTHER_WORKSPACE/memory/x.md"', "ls ~/.mother/*.log"):
+            got, why = self.wa(cmd, cwd=self.ws)
+            self.assertEqual(got, "none", "%r -> %s (%s)" % (cmd, got, why))
+
+    def test_approval_used_once(self):
+        ok = self.yes()
+        self.send("allow", transcript=ok)
+        self.assertIn("in flight", self.send("deny", transcript=ok))
+        self.assertIn("in flight", self.send("deny", transcript=ok, mode=self.BY))
+        failed = self.approved()[:-len(".json")] + ".failed"
+        os.rename(self.approved(), failed)
+        self.send("allow", transcript=ok)                       # a failed send may be approved afresh
+        os.rename(self.approved(), self.approved()[:-len(".json")] + ".used")
+        self.assertIn("already sent", self.send("deny", transcript=ok))
+        os.remove(self.approved()[:-len(".json")] + ".used")
+        os.symlink(os.path.join(self.tmp, "elsewhere.json"), self.approved())  # never followed
+        self.send("deny", transcript=ok)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "elsewhere.json")))
+
+    def slack_setup(self):
+        d = self.draft(self.ID)
+        self.write_config(wa_config(approve_via=["slack_dm"]))
+        with open(os.path.join(self.wdir, "prompts.jsonl"), "w") as f:
+            f.write(json.dumps({"at": iso(NOW - 500), "path": "slack_dm", "ids": [self.ID],
+                                "sha256": {self.ID: d["sha256"]}}) + "\n")
+        return d
+
+    def test_whatsapp_grant_needs_signature(self):
+        d = self.slack_setup()
+        g = dict(self.grant("whatsapp", self.ID, src_age=300, run="whatsapp"), sha256=d["sha256"])
+        self.grants(g)
+        self.send("deny")                                          # unsigned: forged by any agent write
+        self.grants(dict(g, sig="0" * 64))
+        self.send("deny")                                          # bad signature
+        self.grants(dict(g, sig=self.sign(g)))
+        self.write_key(os.urandom(32).hex())                       # a different key
+        self.send("deny")
+        os.remove(self.keyfile())
+        self.grants(dict(g, sig=self.sign(g)))
+        self.send("allow")
+        # digest still writes grants.json with agent tools, so the file itself stays writable
+        self.assertEqual(self.run_guard("Write", {"file_path": self.state("grants.json")}, env=self.env)[0], "none")
 
 
 if __name__ == "__main__":
