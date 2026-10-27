@@ -536,7 +536,7 @@ class CliTest(unittest.TestCase):
             (self.ws / "config.json").write_text(json.dumps(c))
             return run(["status"], self.env)
         good = {"every": 30, "active_hours": "07:00-19:30", "days": "all", "thresholds": {"review_requested": "2h", "invite_unanswered": 0},
-                "signals": {"mail_needs_reply": False}, "notify": "dm", "slow_every": 3}
+                "signals": {"mail_needs_reply": False}, "notify": "dm", "slow_every": 3, "max_age_days": 0}
         self.assertEqual(status_with(good).returncode, 0)
         for bad, msg in (({"every": 45}, "routines.tick.every must be one of 30, 60, 120, 180, 240"),
                          ({"active_hours": "22:00-06:00"}, "routines.tick.active_hours must be HH:MM-HH:MM with start before end"),
@@ -547,7 +547,8 @@ class CliTest(unittest.TestCase):
                          ({"days": "monthly:1"}, "routines.tick.days must be workdays, all, a day, or a list of days"),
                          ({"notify": "email"}, "routines.tick.notify must be none or dm"),
                          ({"at": "09:00"}, "routines.tick.at is not a known key"),
-                         ({"slow_every": 7}, "routines.tick.slow_every must be an integer 1-6")):
+                         ({"slow_every": 7}, "routines.tick.slow_every must be an integer 1-6"),
+                         ({"max_age_days": "30"}, "routines.tick.max_age_days must be an integer 0-365")):
             r = status_with(bad)
             self.assertNotEqual(r.returncode, 0, bad)
             self.assertIn(msg, r.stdout + r.stderr)

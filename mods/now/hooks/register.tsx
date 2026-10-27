@@ -30,7 +30,8 @@ export function statusText(doc: NowDoc | null, nowMs: number): string {
   if (nowMs > Date.parse(doc.stale_after)) return '◆ stale'
   let text = `◆ ${doc.counts?.on_you ?? 0} on you · ${doc.counts?.neglected ?? 0} neglected`
   for (const [source, row] of Object.entries(doc.coverage ?? {})) {
-    if (row && row.status !== 'ok') text += ` · ${source} ✗`
+    // ✗ = couldn't check, ~ = only partly checked
+    if (row && row.status !== 'ok') text += ` · ${source} ${row.status === 'partial' ? '~' : '✗'}`
   }
   return text
 }
