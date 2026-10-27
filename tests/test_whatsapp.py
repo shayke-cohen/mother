@@ -473,11 +473,22 @@ class TestProof(Base):
             for ln in lines:
                 f.write(json.dumps(ln) + "\n")
 
-    def prompt(self, path, ids, when):
+    def sha(self, i):
+        p = self.ws / ".mother/whatsapp/drafts" / (i + ".json")
+        return json.loads(p.read_text())["sha256"] if p.exists() else "0" * 64
+
+    def prompt(self, path, ids, when, sha=None, log=True):
+        """A prompt as Task 7 records it; a self-chat prompt also lands in the DB and in sent.jsonl."""
         p = self.ws / ".mother/whatsapp/prompts.jsonl"
         p.parent.mkdir(parents=True, exist_ok=True)
+        shas = sha if sha is not None else {i: self.sha(i) for i in ids}
         with open(p, "a") as f:
-            f.write(json.dumps({"at": fmt(when), "path": path, "ids": ids}) + "\n")
+            f.write(json.dumps({"at": fmt(when), "path": path, "ids": ids, "sha256": shas}) + "\n")
+        if path == "self_chat":
+            stanza = "PR%d" % len(self.selfmsgs)
+            self.say('WhatsApp -> Sam Roe: "see you at 3" - reply ok %s' % " ".join(ids), when, stanza)
+            if log:
+                self.sent({"at": fmt(when), "kind": "prompt", "chat": SELF, "sha256": "x", "stanza": stanza})
 
     def transcript(self, *entries):
         p = self.t / ("t%d.jsonl" % len(list(self.t.glob("t*.jsonl"))))
@@ -491,9 +502,12 @@ class TestProof(Base):
         e.update(extra)
         return e
 
-    def grant(self, target="w3kx", user=MGR, channel=MGR_DM, when=None):
+    def grant(self, target="w3kx", user=MGR, channel=MGR_DM, when=None, sha=None, shown=True):
         when = when or ago(minutes=30)
+        if shown:
+            self.prompt("slack_dm", [target], when - _dt.timedelta(minutes=5))
         g = {"scope": "whatsapp", "target": target, "uses": 1, "run": "whatsapp",
+             "sha256": sha if sha is not None else self.sha(target),
              "expires": fmt(when + _dt.timedelta(hours=72)),
              "source": {"channel": channel, "user": user, "ts": "%.6f" % when.timestamp()}}
         p = self.ws / ".mother/grants.json"
@@ -575,12 +589,14 @@ class TestProof(Base):
 
     def test_self_chat_ignores_bridge_sent(self):
         self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
         self.say("ok w3kx", ago(minutes=30), "B1")
         self.sent({"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": "B1"})
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
 
     def test_self_chat_prompt_text_never_counts(self):
         self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
         prompt = 'WhatsApp -> Sam Roe: "see you at 3" - reply ok w3kx'
         self.say(prompt, ago(minutes=30), "P1")
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # even before sent.jsonl has it
@@ -589,11 +605,13 @@ class TestProof(Base):
 
     def test_self_chat_before_draft_ignored(self):
         self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
         self.say("ok w3kx", ago(hours=3), "M0")  # an old yes for an earlier draft with the same id
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
 
     def test_self_chat_unreadable_sent_log_fails_closed(self):
         self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1), log=False)
         self.say("ok w3kx", ago(minutes=30), "M1")
         (self.t / "state" / "whatsapp" / "sent.jsonl").mkdir(parents=True)  # exists, cannot be read as a file
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
@@ -617,6 +635,7 @@ class TestProof(Base):
 
     def test_self_chat_no_rejects(self):
         self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
         self.say("no w3kx", ago(minutes=30), "M1")
         self.assertTrue(whatsapp.rejected(self.ws, self.cfg, "w3kx"))
         self.say("ok w3kx", ago(minutes=20), "M2")
@@ -647,6 +666,7 @@ class TestProof(Base):
     # -- paths
 
     def test_path_disabled(self):
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
         self.say("ok w3kx", ago(minutes=30), "M1")
         self.grant()
         t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
@@ -663,6 +683,165 @@ class TestProof(Base):
         self.draft("w4ab", ago(hours=73))
         self.say("ok w4ab", ago(minutes=20), "M2")
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w4ab"))
+
+    # -- fix round 1: fail closed, bind to the text
+
+    def test_self_chat_needs_prompt(self):
+        self.via("self_chat")
+        self.sent({"at": fmt(ago(hours=1)), "kind": "send", "chat": DM, "sha256": "x", "stanza": "Z1"})
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # never shown in the self chat
+        self.prompt("slack_dm", ["w3kx"], ago(hours=1))
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # shown on another path only
+        self.prompt("self_chat", ["w3kx"], ago(minutes=40), sha={"w3kx": "f" * 64})
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # shown with another text
+        self.say("no w3kx", ago(minutes=20), "M2")
+        self.assertFalse(whatsapp.rejected(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_ok_all_needs_matching_hash(self):
+        self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1), sha={"w3kx": "f" * 64})
+        self.say("ok all", ago(minutes=30), "M1")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_missing_sent_log_fails_closed(self):
+        self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1), log=False)
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_malformed_sent_line_fails_closed(self):
+        self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "self_chat")
+        p = self.t / "state" / "whatsapp" / "sent.jsonl"
+        good = p.read_text()
+        for bad in ({"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": None},
+                    {"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x"},
+                    {"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": ""}):
+            p.write_text(good + json.dumps(bad) + "\n")
+            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"), bad)
+        p.write_text(good + "{not json\n")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_null_stanza_never_counts(self):
+        self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
+        self.say("ok w3kx", ago(minutes=30), None)
+        self.say("ok w3kx", ago(minutes=25), "")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def rewrite(self, i, text, sha=None):
+        p = self.ws / ".mother/whatsapp/drafts" / (i + ".json")
+        d = json.loads(p.read_text())
+        d["text"] = text
+        if sha:
+            d["sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        p.write_text(json.dumps(d))
+
+    def test_proof_returns_sha(self):
+        self.via("session")
+        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
+        got = whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)
+        self.assertEqual(got["sha256"], hashlib.sha256(b"see you at 3").hexdigest())
+
+    def test_text_changed_after_yes(self):
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        self.grant()
+        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
+        for via in ("self_chat", "slack_dm", "session"):
+            self.via(via)
+            self.assertIsNotNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), via)
+        self.rewrite("w3kx", "wire the money")  # stale stored hash
+        for via in ("self_chat", "slack_dm", "session"):
+            self.via(via)
+            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), via)
+        self.rewrite("w3kx", "wire the money", sha=True)  # consistent file, but not what was shown
+        for via in ("self_chat", "slack_dm"):
+            self.via(via)
+            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), via)
+
+    def test_slack_needs_prompt_and_matching_hash(self):
+        self.via("slack_dm")
+        self.grant(shown=False)
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+        (self.ws / ".mother/grants.json").unlink()
+        self.grant(sha="f" * 64)
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_db_error_hides_nothing(self):
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
+        self.say("no w3kx", ago(minutes=40), "M1")
+        self.grant()
+        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
+        self.via("self_chat", "slack_dm", "session")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
+        with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("locked")):
+            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
+        self.db.unlink()
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
+        self.via("slack_dm", "session")  # self chat off: the DB is not needed
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "session")
+
+    def test_slack_source_must_be_dm_channel(self):
+        self.via("slack_dm")
+        self.grant(channel=MGR)  # the manager's user id is not the DM channel
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+        (self.ws / ".mother/grants.json").unlink()
+        self.grant()
+        self.assertIsNotNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+        self.cfg["manager"] = {"chat_user": MGR}  # no DM channel: the Slack path is unavailable
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_pending_needs_slack_prompt(self):
+        fixture_db_fresh(self.db, [])
+        out = self.pending([self.slack("ok w3kx", ago(minutes=5))])
+        self.assertEqual(out["send"], [])
+        self.assertEqual(self.grants(), [])
+        self.prompt("slack_dm", ["w3kx"], ago(minutes=30), sha={"w3kx": "f" * 64})
+        out = self.pending([self.slack("ok w3kx", ago(minutes=4))])
+        self.assertEqual((out["send"], self.grants()), ([], []))
+
+    def test_pending_locks_grants(self):
+        import fcntl
+        import time as _time
+        fixture_db_fresh(self.db, [])
+        self.prompt("slack_dm", ["w3kx"], ago(minutes=30))
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
+        lock = open(str(self.ws / ".mother" / "grants.lock"), "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            pr = subprocess.Popen([sys.executable, str(CLI), "whatsapp", "pending"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            pr.stdin.write(json.dumps({"dm": [self.slack("ok w3kx", ago(minutes=5))]}))
+            pr.stdin.close()
+            _time.sleep(1.5)
+            self.assertIsNone(pr.poll())  # waiting for the lock
+            self.assertEqual(self.grants(), [])
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        out = json.loads(pr.stdout.read())
+        pr.wait(timeout=30)
+        self.assertEqual(out["send"], ["w3kx"])
+        self.assertEqual(len(self.grants()), 1)
+
+    def test_draft_refuses_self_chat(self):
+        fixture_db_fresh(self.db, [{"chat": 4, "text": "x", "date": core("2026-10-20T08:00:00Z"),
+                                    "stanza": "S0", "me": 1}])
+        self.cfg["whatsapp"]["allow"].append({"jid": SELF, "name": "Me"})
+        with self.assertRaises(SystemExit) as c:
+            whatsapp.new_draft(self.ws, self.cfg, SELF, "ok w9pa")
+        self.assertEqual(c.exception.code, 2)
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        txt = self.t / "t.txt"
+        txt.write_text("ok w9pa")
+        r = cli(dict(self.env, MOTHER_WORKSPACE=str(self.ws)), "draft", "--chat", SELF, "--text-file", str(txt))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("self chat", r.stderr)
 
     # -- mother whatsapp pending
 
@@ -686,6 +865,7 @@ class TestProof(Base):
 
     def test_pending_cli(self):
         fixture_db_fresh(self.db, [])
+        self.prompt("slack_dm", ["w3kx"], ago(minutes=30))
         yes = self.slack("ok w3kx", ago(minutes=5))
         out = self.pending([yes])
         self.assertEqual(out, {"send": ["w3kx"], "dropped": []})
@@ -693,6 +873,7 @@ class TestProof(Base):
         self.assertEqual(len(g), 1)
         self.assertEqual((g[0]["scope"], g[0]["target"], g[0]["uses"]), ("whatsapp", "w3kx", 1))
         self.assertEqual((g[0]["source"]["channel"], g[0]["source"]["user"]), (MGR_DM, MGR))
+        self.assertEqual(g[0]["sha256"], self.sha("w3kx"))
         self.pending([yes])  # the same message again: no second grant
         self.assertEqual(len(self.grants()), 1)
 
@@ -721,6 +902,7 @@ class TestProof(Base):
 
     def test_pending_self_chat(self):
         self.draft("w9pa", ago(hours=2))
+        self.prompt("self_chat", ["w3kx", "w9pa"], ago(hours=1))
         self.say("ok w3kx", ago(minutes=30), "M1")
         self.say("no w9pa", ago(minutes=20), "M2")
         out = self.pending([])
