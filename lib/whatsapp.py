@@ -6,10 +6,10 @@ Commands:
   chats [--query TEXT] [--limit N]   recent chats (default 30): name, DM/group, last date ("pinned"), JID. JSON
   read [--chat WHO] [--since ISO] [--limit N]
                                      messages of one chat, or across chats since ISO (default 24 h ago). JSON
-  send --to WHO (--text TEXT | --text-file PATH)
-                                     send one message through the bridge. WHO = me, a name, a phone number or a
-                                     JID; only a chat with history (no cold contact). The guard asks the
-                                     manager first for anyone but `me`. Others get the signature line appended
+  send --to WHO --text TEXT          send one message through the bridge. WHO = me, a chat's exact name, a phone
+                                     number or a JID; only a chat with history (no cold contact). The guard asks
+                                     the manager first for anyone but `me` and writes the one-use ticket the
+                                     bridge needs. Others get the signature line appended
   install                            copy the bridge out of the plugin into <state>/whatsapp/app and npm ci there
   stop                               stop a running bridge
   status                             bridge state and whether the local database is readable (JSON)
@@ -254,23 +254,26 @@ def resolve_chat(cfg: dict, who: str) -> dict:
     rows = _query("SELECT %s FROM ZWACHATSESSION WHERE %s AND ZPARTNERNAME LIKE ? ESCAPE '\\' "
                   "ORDER BY ZLASTMESSAGEDATE DESC LIMIT 200" % (CHAT_COLS, NOT_BROADCAST),
                   ["%" + re.sub(r"([%_\\])", r"\\\1", who) + "%"])
-    found = [_chat(r) for r in rows]
-    exact = [c for c in found if c["name"].casefold() == who.casefold()]
-    cands = exact or [c for c in found if who.casefold() in c["name"].casefold()]
-    if not cands:
-        raise ChatError("no WhatsApp chat is named %r; `mother whatsapp chats --query` lists them" % who)
-    if len(cands) > 1:
-        raise ChatError("%r matches %d chats; name one exactly, or give its JID:\n%s" % (
-            who, len(cands), _listing(_sort_chats(cands)[:10])))
-    return dict(cands[0], self=(cands[0]["jid"] == me))
+    found = _sort_chats([_chat(r) for r in rows])
+    exact = [c for c in found if c["name"].strip().casefold() == who.casefold()]
+    if not exact:
+        hint = (":\n%s\nName one exactly, or give its number or JID" % _listing(found[:5])) if found else \
+            "; `mother whatsapp chats --query` lists chats"
+        raise ChatError("no WhatsApp chat is named %r%s" % (who, hint))
+    if len(exact) > 1:
+        raise ChatError("%d chats are named %r; give the JID of the one you mean:\n%s" % (
+            len(exact), who, _listing(exact[:5])))
+    return dict(exact[0], self=(exact[0]["jid"] == me))
 
 
 def has_history(c: dict) -> bool:
-    """True when the database holds at least one message in this chat. Reads no content."""
+    """True when the chat holds a text message, or any message the manager sent: system rows (the encryption
+    notice, a missed call) don't count. Reads no content."""
     if c.get("pk") is None:
         return False
     try:
-        return bool(_query("SELECT 1 FROM ZWAMESSAGE WHERE ZCHATSESSION = ? LIMIT 1", [c["pk"]]))
+        return bool(_query("SELECT 1 FROM ZWAMESSAGE WHERE ZCHATSESSION = ? AND (ZISFROMME = 1 OR "
+                           "(ZMESSAGETYPE IN (0, 7) AND ZTEXT IS NOT NULL)) LIMIT 1", [c["pk"]]))
     except ReaderError:
         return False
 
@@ -395,45 +398,43 @@ def signature(cfg: dict) -> str:
     return (emoji + " " + line) if emoji else line
 
 
-def signed(cfg: dict, text: str) -> str:
+def signature_for(cfg: dict, text: str):
+    """The signature the bridge appends to `text`, or None when the text already carries `<name> (AI)`."""
     name = (cfg.get("agent") or {}).get("name") or "Agent"
-    if "%s (AI)" % name in text:
-        return text
-    return text + "\n\n" + signature(cfg)
+    return None if "%s (AI)" % name in text else signature(cfg)
 
 
 def cmd_send(cfg, args):
-    usage = "usage: mother whatsapp send --to WHO (--text TEXT | --text-file PATH)"
-    o = _opts(args, ("--to", "--text", "--text-file"), usage)
-    if "--to" not in o or ("--text" in o) == ("--text-file" in o):
+    usage = "usage: mother whatsapp send --to WHO --text TEXT"
+    o = _opts(args, ("--to", "--text"), usage)
+    if "--to" not in o or "--text" not in o:
         _fail(usage)
-    if "--text-file" in o:
-        try:
-            text = Path(o["--text-file"]).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as e:
-            _fail("can't read --text-file: %s" % e)
-    else:
-        text = o["--text"]
-    text = text.rstrip("\n")
+    to, text = o["--to"], o["--text"]  # as received: the guard's ticket is for exactly these
     if not text.strip():
         _fail("the message is empty; nothing was sent", 2)
     try:
-        c = resolve_chat(cfg, o["--to"])
+        c = resolve_chat(cfg, to)
     except ChatError as e:
         _fail("%s; nothing was sent" % e, 2)
     except ReaderError as e:
         _fail("can't read WhatsApp's database (%s), so MOTHER can't check the chat; nothing was sent" % e.reason, 2)
+    sig = None
     if not c.get("self"):
         if c.get("hidden_id"):
-            _fail("WhatsApp hides the number of %s, so MOTHER can't address it; send it yourself; nothing was sent" % chat_name(c), 2)
+            _fail("WhatsApp hides the number of %s, so MOTHER can't address it; send it yourself; nothing was sent"
+                  % chat_name(c), 2)
         if not (USER_JID_RE.fullmatch(c["jid"] or "") or GROUP_JID_RE.fullmatch(c["jid"] or "")):
             _fail("%s isn't a person or a group MOTHER can message; nothing was sent" % chat_name(c), 2)
         if not has_history(c):
-            _fail("no cold contact: you have no messages with %s yet; start that chat yourself; nothing was sent" % chat_name(c), 2)
-        text = signed(cfg, text)
-    if len(text) > MAX_TEXT:
+            _fail("no cold contact: you have no messages with %s yet; start that chat yourself; nothing was sent"
+                  % chat_name(c), 2)
+        sig = signature_for(cfg, text)
+    if len(text) + (len(sig) + 2 if sig else 0) > MAX_TEXT:
         _fail("the message is longer than %d characters; nothing was sent" % MAX_TEXT, 2)
-    r = bridge_call({"op": "send", "jid": c["jid"], "text": text})
+    req = {"op": "send", "to": to, "jid": c["jid"], "text": text}
+    if sig:
+        req["signature"] = sig
+    r = bridge_call(req)
     if not r.get("ok"):
         print(json.dumps(r))
         _fail("the send failed: %s; nothing was sent" % (r.get("error") or "error"), 2)
@@ -505,10 +506,6 @@ def bridge_problem():
     if not (app_dir() / "bridge.mjs").is_file() or not (app_dir() / "node_modules").is_dir():
         return "bridge_not_installed", "run `mother whatsapp install` (installs the bridge into %s)" % app_dir()
     return None
-
-
-def bridge_installed() -> bool:
-    return bridge_problem() is None
 
 
 def _problem_reply(prob):

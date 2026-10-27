@@ -162,9 +162,13 @@ every send to someone else needs the manager's yes in the permission prompt.
   Reading is local; quote what was said or decided, not the bodies (`rules/privacy.md`).
 - **Send with `mother whatsapp send --to WHO --text '…'`, as the whole Bash command.** The guard asks the
   manager, showing the recipient and the exact text (MOTHER's signature line is added to it). `--to me`, the
-  manager's own chat, is `own_dm`: no prompt. The text must be literal: in single quotes, or from
-  `--text-file PATH` (the guard reads the file to show it). A `$`, `$( )` or backtick in the text, anything
-  chained, piped, redirected or wrapped, or a command name built from a variable, is denied.
+  manager's own chat, is `own_dm`: no prompt. The text must be literal, in single quotes. A `$`, `$( )` or
+  backtick in it, a control or text-direction character, anything chained, piped, redirected or wrapped, a
+  `mother` that isn't this plugin's CLI, or a command name built from a variable, is denied. Name the chat
+  exactly (or by number or JID): a partial name is refused.
+- **One guard decision, one send.** When the guard asks (or allows `--to me`) it leaves a one-use ticket for
+  exactly that recipient and text; the bridge refuses a send without a fresh one (2 minutes). A send that
+  went around the guard, from a script or inline code, gets `no_ticket`.
 - **Only chats with history.** The CLI refuses a chat with no message between the manager and that person
   (no cold contact), a chat WhatsApp shows without a number, and a name that matches more than one chat. The
   bridge enforces `whatsapp.max_per_day` (default 20) and a jittered `min_gap_seconds` between sends.
@@ -182,8 +186,8 @@ every send to someone else needs the manager's yes in the permission prompt.
   channel sessions run no WhatsApp command.
 - **What this stops, and what it doesn't.** The guard stops mistakes and injected instructions. It does not
   stop a deliberately evasive agent on the manager's own macOS account, which could run a script the guard
-  can't read or use the bridge's session keys. The bridge itself checks only the cap, the gap and the linked
-  account: the prompt is the approval. In bypass mode (below) a WhatsApp send asks nothing, as for chat.
+  can't read, forge a ticket, or use the bridge's session keys. The prompt is the approval; the ticket makes
+  the bridge send only what the guard just decided. In bypass mode (below) a WhatsApp send asks nothing, as for chat.
 
 ## Kill switch
 

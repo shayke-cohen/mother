@@ -443,7 +443,10 @@ WA_READ_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+read(?:[ \t]+(?:[^\s;&|<>`$()\\
 WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:session|app)(?=/|$|[\s;&|)])"
                          r"|whatsapp/sent\.jsonl", re.I)
 WA_STATE_FILES = ("sent.jsonl", "bridge.sock", "session", "app")
-WA_SEND_OPTS = ("--to", "--text", "--text-file")
+WA_SEND_OPTS = ("--to", "--text")
+# A recipient or text with these can't be shown as it is sent: NUL cuts an argv string, the rest hide or reorder.
+WA_UNSHOWABLE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]")
+WA_TICKET_MAX_AGE = 120  # seconds; the bridge refuses an older ticket (CONTRACT §5d)
 WA_SEND_HEAD_RE = re.compile(r"%s[ \t]+whatsapp[ \t]+send(?:[ \t]|\Z)" % _WA_BIN)
 
 
@@ -1293,6 +1296,9 @@ class _WaScan(object):
             self.hit("state", "a script that names WhatsApp's bridge socket or its state folders")
         if "whatsapp" in n and re.search(r"mother\W+whatsapp|af_unix|unix[-_]connect|\.sock\b|createconnection", n):
             self.hit("unknown", "a script that runs the mother whatsapp CLI or reaches the bridge")
+        if "whatsapp" in n and re.search(r"\bimport\s+whatsapp\b|\bfrom\s+whatsapp\s+import\b|__import__|"
+                                         r"import_module|\brunpy\b|\bbridge_call\b|\bcmd_send\b", n):
+            self.hit("unknown", "inline code that loads MOTHER's whatsapp module (send with `mother whatsapp send`)")
         if "baileys" in n:
             self.hit("state", "a script that loads the WhatsApp library (it could link or send without the bridge)")
 
@@ -1437,8 +1443,8 @@ def _wa_literal(word, cli=False):
     return "".join(out)
 
 
-def wa_send_parse(cmd):
-    """A Bash line that is exactly one `mother whatsapp send …` command: {"to", "text"|"file"}, or {"error"}
+def wa_send_parse(cmd, cwd=None):
+    """A Bash line that is exactly one `mother whatsapp send …` command: {"to", "text"}, or {"error"}
     when it is that command but can't be read safely. None for any other line (the shell reader judges it)."""
     line = cmd.strip()
     if not WA_SEND_HEAD_RE.match(line):  # the CLI and `whatsapp send` written plainly, as WA_PASS_RE wants them
@@ -1461,6 +1467,8 @@ def wa_send_parse(cmd):
     plain = all(p[0] == "t" and p[2] is False for w in words[k + 1:k + 3] for p in w)
     if exe is None or exe.rstrip("/").split("/")[-1] != "mother" or sub != ["whatsapp", "send"] or not plain:
         return None
+    if not wa_is_plugin_cli(exe, cwd):
+        return {"error": "%s is not this plugin's mother CLI" % exe}
     opts, rest = {}, words[k + 3:]
     i = 0
     while i < len(rest):
@@ -1471,26 +1479,35 @@ def wa_send_parse(cmd):
         if "=" in name and name.split("=", 1)[0] in WA_SEND_OPTS:
             name, val = name.split("=", 1)
         if name not in WA_SEND_OPTS or name in opts:
-            return {"error": "use --to WHO and one of --text TEXT / --text-file PATH, once each"}
+            return {"error": "use --to WHO and --text TEXT, once each"}
         if val is None:
             if i + 1 >= len(rest):
                 return {"error": "%s has no value" % name}
             val = _wa_literal(rest[i + 1])
             if val is None:
                 return {"error": "the guard can't show %s: it holds a $ expansion, $( ) or a backtick. Write the "
-                                 "text literally, in single quotes, or use --text-file" % name}
+                                 "text literally, in single quotes" % name}
             i += 2
         else:
             i += 1
         opts[name] = val
-    if "--to" not in opts or ("--text" in opts) == ("--text-file" in opts):
-        return {"error": "use --to WHO and one of --text TEXT / --text-file PATH"}
-    out = {"to": opts["--to"]}
-    if "--text" in opts:
-        out["text"] = opts["--text"]
-    else:
-        out["file"] = opts["--text-file"]
-    return out
+    if "--to" not in opts or "--text" not in opts:
+        return {"error": "use --to WHO and --text TEXT"}
+    for name in WA_SEND_OPTS:
+        if WA_UNSHOWABLE_RE.search(opts[name]):
+            return {"error": "%s holds a control or text-direction character, so the prompt couldn't show exactly "
+                             "what is sent; write it without one" % name}
+    return {"to": opts["--to"], "text": opts["--text"]}
+
+
+def wa_is_plugin_cli(exe, cwd):
+    """The executable is this plugin's bin/mother: by path (realpath), or a bare `mother` on PATH that is it."""
+    import shutil
+    mine = os.path.realpath(os.path.join(os.path.dirname(HERE), "bin", "mother"))
+    if "/" not in exe:
+        found = shutil.which(exe)
+        return bool(found) and os.path.realpath(found) == mine
+    return os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(exe))) == mine
 
 
 def wa_is_self(to, cfg):
@@ -1498,12 +1515,44 @@ def wa_is_self(to, cfg):
     w = cfg.get("whatsapp") if isinstance(cfg, dict) and isinstance(cfg.get("whatsapp"), dict) else {}
     me = w.get("self_jid")
     t = (to or "").strip()
+    if not isinstance(me, str) or not me:
+        return False  # no self_jid: nothing is the own chat (fail closed)
     if t.casefold() == "me":
         return True
-    if not isinstance(me, str) or not me:
-        return False
     digits = re.sub(r"[\s+()\-]", "", t)
     return t == me or (re.fullmatch(r"\d{6,15}", digits) is not None and digits + "@s.whatsapp.net" == me)
+
+
+def wa_is_number(to):
+    """A phone number or a JID: the prompt marks it, the log hides it."""
+    return "@" in to or len(re.sub(r"\D", "", to)) >= 6
+
+
+def wa_ticket(to, text):
+    """Write <state>/whatsapp/tickets/<sha256(to NUL text)> for the bridge (CONTRACT §5d). Returns None, or a
+    plain reason it couldn't. Temp file O_EXCL|O_NOFOLLOW 0600, then renamed over any old one."""
+    import hashlib
+    try:
+        hexname = hashlib.sha256((to + "\0" + text).encode("utf-8")).hexdigest()
+        d = os.path.join(wa_state_root(), "whatsapp", "tickets")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        if os.path.islink(d) or not os.path.isdir(d):
+            return "the ticket folder %s is not a plain folder" % d
+        os.chmod(d, 0o700)
+        tmp = os.path.join(d, ".%s.%d.tmp" % (hexname, os.getpid()))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, json.dumps({"at": int(time.time())}).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, os.path.join(d, hexname))
+        return None
+    except (OSError, UnicodeError, ValueError) as e:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return "the guard couldn't write the send ticket (%s)" % type(e).__name__
 
 
 def wa_act(op, what, **kw):
@@ -1519,27 +1568,15 @@ def classify_whatsapp(cmd, cwd, ctx):
     any other line is read by _WaScan (CONTRACT §5, §5d). `what` never holds the text: guard.log holds none."""
     if cwd and wa_inside(cwd, ctx):
         return wa_act("state", "a shell command run inside WhatsApp's state folder")
-    s = wa_send_parse(cmd)
+    s = wa_send_parse(cmd, cwd)
     if s is not None:
         if "error" in s:
             return wa_act("unknown", "a whatsapp send the guard can't read: " + s["error"])
-        to = s["to"]
-        if "file" in s:
-            fp = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(s["file"])))
-            if wa_inside(fp, ctx) or WA_STATE_RE.search(fp):
-                return wa_act("state", "a whatsapp send whose text file is in WhatsApp's state folder")
-            try:
-                with open(fp, encoding="utf-8") as f:
-                    text = f.read().rstrip("\n")
-            except (OSError, UnicodeDecodeError) as e:
-                return wa_act("unknown", "a whatsapp send whose --text-file the guard can't read (%s), so it can't "
-                                         "show the text" % type(e).__name__)
-        else:
-            text = s["text"]
+        to, text = s["to"], s["text"]
         if SECRET_RE.search(text):
             return act("credential", "credentials", "a WhatsApp message whose text looks like a credential")
         own = wa_is_self(to, ctx.cfg)
-        logged = "a number" if len(re.sub(r"\D", "", to)) >= 6 else to
+        logged = "a number" if wa_is_number(to) else to
         return act("whatsapp", "own_dm" if own else "any_message_to_others",
                    "a WhatsApp message to %s" % ("your own chat" if own else logged), op="send", to=to, text=text,
                    target=logged)
@@ -2125,9 +2162,14 @@ def decide_whatsapp(a, ctx):
     if not (w.get("enabled") is True and w.get("send", True) is True):
         return "deny", "%s: whatsapp sending is off (whatsapp.enabled / whatsapp.send); the manager turns it on " \
                        "with `mother whatsapp setup` in their own terminal." % what
+    err = wa_ticket(a.get("to") or "", a.get("text") or "")
+    if err:
+        return "deny", "%s: %s, so it can't go out; try again." % (what, err)
     if a["category"] == "own_dm" and "own_dm" in auto:
         return "allow", "%s: auto (the manager's own chat)." % what
-    shown = 'WhatsApp to %s: "%s"' % (a.get("to"), a.get("text"))
+    to = a.get("to") or ""
+    shown = "WhatsApp to %s%s: %s" % (json.dumps(to, ensure_ascii=False), " (number)" if wa_is_number(to) else "",
+                                       json.dumps(a.get("text") or "", ensure_ascii=False))
     note = "" if a["category"] == "own_dm" else " (MOTHER adds its signature line)"
     a["log_reason"] = "%s needs a yes (%s)." % (what, a["category"])  # guard.log never holds the text
     return "ask", "%s%s. Confirm it." % (shown, note)

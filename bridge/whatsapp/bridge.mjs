@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // MOTHER's send-only WhatsApp bridge: a linked device (Baileys) that sends one text to one chat when
-// `mother whatsapp send` asks, and nothing else. The guard asked the manager before that call. docs/CONTRACT.md §5d.
+// `mother whatsapp send` asks with a fresh ticket from the guard, and nothing else. docs/CONTRACT.md §5d.
 //
 //   node bridge.mjs            serve on <state>/whatsapp/bridge.sock (0600, no TCP)
 //   node bridge.mjs --link     print the QR in this terminal, exit once linked; the last stdout line is
@@ -16,12 +16,26 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  checkSend, parseSent, sentLine, jitteredGap, typingMs, sha256, isoZ, utcDay, minGapSeconds, sendableJid,
+  checkSend, parseSent, sentLine, jitteredGap, typingMs, sha256, isoZ, utcDay, minGapSeconds, sendableJid, MAX_TEXT,
 } from "./checks.mjs";
 
 const MAX_REQUEST = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_GAP_WAIT_MS = 30_000;  // a request waits out at most this much of min_gap_seconds, then refuses `gap`
+export const TICKET_MAX_AGE_MS = 120_000;  // a guard ticket is good for one send within this long
+
+/** The guard's ticket name for a send: sha256 of the recipient as typed, a NUL, and the text (CONTRACT §5d). */
+export const ticketName = (to, text) => sha256(to + "\0" + text);
+
+/** Does `to` (as typed) name `jid`? `me` is self_jid; a JID or number must be that JID; a name can't be checked. */
+export function recipientMatches(to, jid, selfJid) {
+  const t = to.trim();
+  if (t.toLowerCase() === "me") return !!selfJid && jid === selfJid;
+  if (t.includes("@")) return jid === t;
+  const digits = t.replace(/[\s+()\-]/g, "");
+  if (/^\d{6,15}$/.test(digits)) return jid === digits + "@s.whatsapp.net";
+  return true;
+}
 
 const expand = (p) => (p === "~" || p.startsWith("~/") ? path.join(os.homedir(), p.slice(1)) : p);
 
@@ -30,7 +44,7 @@ export function locations(env = process.env) {
   const state = expand((env.MOTHER_STATE_DIR || "").trim() || path.join(os.homedir(), ".mother"));
   const dir = path.join(state, "whatsapp");
   return { state, dir, sock: path.join(dir, "bridge.sock"), session: path.join(dir, "session"),
-           sent: path.join(dir, "sent.jsonl") };
+           sent: path.join(dir, "sent.jsonl"), tickets: path.join(dir, "tickets") };
 }
 
 /** The workspace, resolved like bin/mother: $MOTHER_WORKSPACE, else the <state>/workspace pointer. */
@@ -108,16 +122,59 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
 
   const bare = (jid) => String(jid || "").replace(/:\d+(?=@)/, "");
 
-  async function send(jid, text) {
+  /** Delete tickets older than TICKET_MAX_AGE_MS (or unreadable). */
+  function sweepTickets() {
+    let names = [];
+    try { names = fs.readdirSync(loc.tickets); } catch { return; }
+    for (const n of names) {
+      const p = path.join(loc.tickets, n);
+      const at = ticketAt(p);
+      if (at === null || now() - at >= TICKET_MAX_AGE_MS) {
+        try { fs.unlinkSync(p); } catch { /* gone already */ }
+      }
+    }
+  }
+
+  function ticketAt(p) {  // ms, or null when it isn't a regular file holding {"at": <epoch seconds>}
+    try {
+      if (!fs.lstatSync(p).isFile()) return null;
+      const at = JSON.parse(fs.readFileSync(p, "utf8")).at;
+      return Number.isFinite(at) ? at * 1000 : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Take (delete) the guard's ticket for this send: null when good, else the refusal code. */
+  function takeTicket(to, text) {
+    const p = path.join(loc.tickets, ticketName(to, text));
+    let st;
+    try { st = fs.lstatSync(p); } catch { return "no_ticket"; }
+    const at = st.isFile() ? ticketAt(p) : null;
+    try { fs.unlinkSync(p); } catch { return "no_ticket"; }  // one use: gone before anything is sent
+    if (!st.isFile()) return "no_ticket";
+    if (at === null || now() - at >= TICKET_MAX_AGE_MS || at - now() > 60_000) return "ticket_expired";
+    return null;
+  }
+
+  async function send(req) {
+    const { to, jid, text, signature } = req;
     const refuse = (error, extra = {}) => {
       log({ op: "send", error, ...extra });
       return fail(error);
     };
-    if (!sendableJid(jid) || typeof text !== "string") return refuse("bad_request");
+    if (!sendableJid(jid) || typeof text !== "string" || typeof to !== "string"
+        || (signature !== undefined && typeof signature !== "string")) return refuse("bad_request");
+    const full = signature ? text + "\n\n" + signature : text;
+    if (!text.trim() || full.length > MAX_TEXT) return refuse("bad_request");
     const c = context();
     if (c.error) return refuse(c.error);
+    const bad = takeTicket(to, text);
+    sweepTickets();
+    if (bad) return refuse(bad);
+    if (!recipientMatches(to, jid, c.cfg?.whatsapp?.self_jid)) return refuse("wrong_recipient");
     if (c.paused) return refuse("paused");
-    const check = () => checkSend({ cfg: c.cfg, jid, text, sentLines: readSent(), now: now(),
+    const check = () => checkSend({ cfg: c.cfg, jid, text: full, sentLines: readSent(), now: now(),
                                     gapSeconds: jitteredGap(minGapSeconds(c.cfg), rand()) });
     let r = check();
     if (!r.ok && r.error === "gap" && r.waitMs <= MAX_GAP_WAIT_MS) {  // wait out a short gap inside the request
@@ -134,16 +191,16 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
     try {
       if (jid !== self) {  // "typing…" for someone else; never in the manager's own chat
         await client.presence(jid, "composing");
-        await sleep(typingMs(text, rand()));
+        await sleep(typingMs(full, rand()));
         await client.presence(jid, "paused");
       }
-      stanza = await client.sendText(jid, text);
+      stanza = await client.sendText(jid, full);
     } catch (e) {
       return refuse("send_failed", { code: errCode(e) });
     }
     stanza = typeof stanza === "string" && stanza ? stanza : null;
     try {
-      appendSent({ at: isoZ(now()), chat: jid, sha256: sha256(text), stanza });
+      appendSent({ at: isoZ(now()), chat: jid, sha256: sha256(full), stanza });
     } catch (e) {  // sent all the same; the cap undercounts this one
       log({ op: "send", stanza, error: "sent_log_failed", code: errCode(e) });
     }
@@ -169,7 +226,7 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
       setTimeout(onStop, 50);
       return { ok: true };
     }
-    if (req.op === "send") return serial(() => send(req.jid, req.text));
+    if (req.op === "send") return serial(() => send(req));
     return fail("bad_request");
   }
 

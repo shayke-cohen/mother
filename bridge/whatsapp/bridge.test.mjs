@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import {
-  createBridge, locations, workspace, tighten, serve, idleMs, silenceConsole, runLink, bareJid, closeAction, waVersion, isPaired, clearUnpaired,
+  createBridge, locations, workspace, tighten, ticketName, recipientMatches, TICKET_MAX_AGE_MS, serve, idleMs, silenceConsole, runLink, bareJid, closeAction, waVersion, isPaired, clearUnpaired,
 } from "./bridge.mjs";
 
 const SELF = "972500000099@s.whatsapp.net";
@@ -51,7 +51,20 @@ function request(obj, raw) {
   });
 }
 
-const send = (jid = DM, text = TEXT) => request({ op: "send", jid, text });
+/** The ticket the guard writes when it decides a send (age in ms; null = none). */
+function ticket(to, text, ageMs = 0) {
+  const dir = locations(env).tickets;
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const p = path.join(dir, ticketName(to, text));
+  fs.writeFileSync(p, JSON.stringify({ at: Math.floor((clock - ageMs) / 1000) }), { mode: 0o600 });
+  return p;
+}
+
+/** A send the guard decided: its ticket first, then the request. */
+function send(jid = DM, text = TEXT, to = jid, extra = {}) {
+  ticket(to, text);
+  return request({ op: "send", to, jid, text, ...extra });
+}
 const readCfg = () => JSON.parse(fs.readFileSync(path.join(ws, "config.json"), "utf8"));
 const writeCfg = (c) => writeJson(path.join(ws, "config.json"), c);
 const sentPath = () => path.join(tmp, "state", "whatsapp", "sent.jsonl");
@@ -119,7 +132,7 @@ test("a send to a group, and to the manager's own chat without typing", async ()
   assert.equal((await send(GROUP, "ship it")).ok, true);
   clock += 60_000;
   client.calls.length = 0;
-  assert.deepEqual(await send(SELF, "note to self"), { ok: true, stanza: "STANZA2" });
+  assert.deepEqual(await send(SELF, "note to self", "me"), { ok: true, stanza: "STANZA2" });
   assert.deepEqual(client.calls, [["send", SELF, "note to self"]]);
 });
 
@@ -168,10 +181,12 @@ test("refusals send nothing", async () => {
 
 test("bad requests", async () => {
   await start();
-  for (const req of [{ op: "send", jid: "123@lid", text: "hi" }, { op: "send", jid: "status@broadcast", text: "hi" },
-                     { op: "send", jid: DM, text: "" }, { op: "send", jid: DM, text: "   " },
-                     { op: "send", jid: DM, text: "x".repeat(4097) }, { op: "send", jid: DM },
-                     { op: "send", jid: [DM], text: "hi" }, { op: "send", draft: "w3kx" }, { op: "prompt", text: "hi" },
+  for (const req of [{ op: "send", to: "x", jid: "123@lid", text: "hi" }, { op: "send", to: "x", jid: "status@broadcast", text: "hi" },
+                     { op: "send", to: DM, jid: DM, text: "" }, { op: "send", to: DM, jid: DM, text: "   " },
+                     { op: "send", to: DM, jid: DM, text: "x".repeat(4097) }, { op: "send", to: DM, jid: DM },
+                     { op: "send", to: DM, jid: DM, text: "x".repeat(4090), signature: "*Agnes (AI)*" },
+                     { op: "send", jid: DM, text: "hi" }, { op: "send", to: DM, jid: DM, text: "hi", signature: 5 },
+                     { op: "send", to: DM, jid: [DM], text: "hi" }, { op: "send", draft: "w3kx" }, { op: "prompt", text: "hi" },
                      { op: "read" }, [1, 2]]) {
     assert.deepEqual(await request(req), { ok: false, error: "bad_request" }, JSON.stringify(req));
   }
@@ -229,6 +244,7 @@ test("logs carry ids and error codes, never text or a phone number", async () =>
   clock += 60_000;
   await send(GROUP, "another secret");
   await send("123@lid", "third secret");
+  await request({ op: "send", to: "Dana", jid: DM, text: "fourth secret" });  // no ticket
   const all = JSON.stringify(logs);
   assert.ok(logs.length >= 3);
   for (const bad of ["secret", DM, SELF, GROUP, "972500000", "120363"]) {
@@ -485,4 +501,74 @@ test("isPaired needs a confirmed account; clearUnpaired drops only a half-done p
   assert.equal(clearUnpaired(dir), true);
   assert.ok(!fs.existsSync(dir));
   assert.equal(clearUnpaired(dir), false);  // nothing there
+});
+
+test("the guard's ticket name: sha256 of the recipient as typed, NUL, the text (same as hooks/guard.py)", () => {
+  assert.equal(ticketName("Dana", "hi"), "ce3bec50a9346edfd0630fc02404c10a2d38f912dd900f8b903b00f339a43ca0");
+});
+
+test("no ticket: no_ticket, nothing sent (a send that never got a guard decision)", async () => {
+  await start();
+  assert.deepEqual(await request({ op: "send", to: DM, jid: DM, text: TEXT }), { ok: false, error: "no_ticket" });
+  ticket(DM, "other text");  // a ticket for something else doesn't count
+  assert.deepEqual(await request({ op: "send", to: DM, jid: DM, text: TEXT }), { ok: false, error: "no_ticket" });
+  ticket("Dana", TEXT);  // nor one for another recipient as typed
+  assert.deepEqual(await request({ op: "send", to: DM, jid: DM, text: TEXT }), { ok: false, error: "no_ticket" });
+  assert.deepEqual(client.calls, []);
+});
+
+test("a ticket is used once and deleted before the send", async () => {
+  let seen = null;
+  client.sendText = async () => { seen = fs.existsSync(path.join(locations(env).tickets, ticketName("Dana", TEXT))); return "S1"; };
+  await start();
+  assert.equal((await send(DM, TEXT, "Dana")).ok, true);
+  assert.equal(seen, false);
+  clock += 60_000;
+  assert.deepEqual(await request({ op: "send", to: "Dana", jid: DM, text: TEXT }), { ok: false, error: "no_ticket" });
+});
+
+test("a stale ticket: ticket_expired, and it is gone; a refusal later on still spends the ticket", async () => {
+  await start();
+  const p = ticket(DM, TEXT, TICKET_MAX_AGE_MS + 1000);
+  const old = ticket("Sam Roe", "left by a declined prompt", TICKET_MAX_AGE_MS + 1000);
+  assert.deepEqual(await request({ op: "send", to: DM, jid: DM, text: TEXT }), { ok: false, error: "ticket_expired" });
+  assert.equal(fs.existsSync(p), false);
+  assert.equal(fs.existsSync(old), false);  // every send sweeps the expired ones
+  const q = ticket(DM, TEXT, TICKET_MAX_AGE_MS - 5000);
+  client.isLinked = false;
+  assert.deepEqual(await request({ op: "send", to: DM, jid: DM, text: TEXT }), { ok: false, error: "unlinked" });
+  assert.equal(fs.existsSync(q), false);
+  assert.deepEqual(client.calls, []);
+});
+
+test("a ticket that isn't a regular file, or holds no time, doesn't count", async () => {
+  await start();
+  const dir = locations(env).tickets;
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(tmp, "elsewhere");
+  fs.writeFileSync(target, JSON.stringify({ at: Math.floor(clock / 1000) }));
+  fs.symlinkSync(target, path.join(dir, ticketName(DM, TEXT)));
+  assert.deepEqual(await request({ op: "send", to: DM, jid: DM, text: TEXT }), { ok: false, error: "no_ticket" });
+  assert.ok(fs.existsSync(target));
+  fs.writeFileSync(path.join(dir, ticketName(DM, "x")), "{}");
+  assert.equal((await request({ op: "send", to: DM, jid: DM, text: "x" })).ok, false);
+  assert.deepEqual(client.calls, []);
+});
+
+test("the recipient as typed must name the JID: me, a number, a JID; a name can't be checked", async () => {
+  await start();
+  assert.deepEqual(await send(DM, "a", "me"), { ok: false, error: "wrong_recipient" });
+  assert.deepEqual(await send(GROUP, "b", "+972 50 000 0001"), { ok: false, error: "wrong_recipient" });
+  assert.deepEqual(await send(GROUP, "c", DM), { ok: false, error: "wrong_recipient" });
+  assert.equal((await send(DM, "d", "+972-50-000-0001")).ok, true);
+  assert.equal(recipientMatches("Dana", GROUP, SELF), true);
+  assert.equal(recipientMatches(" ME ", SELF, SELF), true);
+  assert.equal(recipientMatches("me", SELF, undefined), false);
+});
+
+test("the signature goes on its own line after a blank one", async () => {
+  await start();
+  assert.equal((await send(DM, "see you", DM, { signature: "*Agnes (AI)* · on behalf of Dana" })).ok, true);
+  assert.deepEqual(client.calls.at(-1), ["send", DM, "see you\n\n*Agnes (AI)* · on behalf of Dana"]);
+  assert.equal(sentLines()[0].sha256, createHash("sha256").update("see you\n\n*Agnes (AI)* · on behalf of Dana").digest("hex"));
 });

@@ -199,20 +199,30 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `unknown`, `computed` and `terminal` always deny, in every mode, and a guard error on a WhatsApp call denies.
   `guard.log` names the recipient as given (a number or JID is logged as `a number`), never the text, never
   the command.
-  - **A send.** A Bash command that is exactly one `mother whatsapp send …` command — the `mother` CLI (bare, a
-    path ending in `/mother`, `"${CLAUDE_PLUGIN_ROOT}/bin/mother"`, optionally after `python3`), then literal
-    `whatsapp send`, then `--to WHO` and one of `--text TEXT` / `--text-file PATH` (`--opt=value` too), and
+  - **A send.** A Bash command that is exactly one `mother whatsapp send …` command — the plugin's own CLI
+    (`"${CLAUDE_PLUGIN_ROOT}/bin/mother"` or any path whose realpath is the plugin's `bin/mother`, or a bare
+    `mother` that `PATH` resolves to it, optionally after `python3`; any other executable named `mother` is
+    `unknown`, deny), then literal `whatsapp send`, then `--to WHO` and `--text TEXT` (`--opt=value` too), and
     nothing else on the line except a `2>&1`-style redirection (no `;`, `&&`, `|`, `&`, other redirection,
     heredoc, env prefix or comment). Every word must be literal text: quotes, `$'…'` and backslashes are fine,
     a `$VAR`, `$( )` or backtick in any word but the CLI path is not (deny: "write the text literally, in
-    single quotes, or use --text-file"). `--text-file` is read by the guard (resolved against the cwd); a file
-    it can't read, or one under the protected WhatsApp folders, denies. Then: PAUSED denies; an invalid
-    `config.json` denies; `whatsapp.enabled` or `whatsapp.send` false denies ("sending is off"); the category
-    in `policy.never` denies. `--to me`, `--to <self_jid>` or the manager's own number is `own_dm`: **allow**
-    while `own_dm` is in the auto list, else ask. Any other recipient is **ask**, with the reason
-    `WhatsApp to <WHO>: "<text>"` and a note that MOTHER adds its signature line. The CLI resolves WHO and
-    refuses what can't go (§5d); the bridge enforces the cap and the gap. In `bypassPermissions` the ask passes
-    like any other (logged `pass`): the same caveat as chat, stated in `rules/outbound.md`.
+    single quotes"). A recipient or text holding a NUL, any other C0 or C1 control character except `\n` and
+    `\t`, or a Unicode bidi control (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069) is denied, so the prompt
+    shows exactly what is sent. A text shaped like a credential is on the never-list. Then: PAUSED denies; an
+    invalid `config.json` denies; `whatsapp.enabled` or `whatsapp.send` false denies ("sending is off"); the
+    category in `policy.never` denies. `--to me`, `--to <self_jid>` or the manager's own number (only while
+    `self_jid` is set) is `own_dm`: **allow** while `own_dm` is in the auto list, else ask. Any other recipient
+    is **ask**, with the reason `WhatsApp to <WHO as JSON>: <text as JSON>` (a number or JID gets ` (number)`
+    after it; the guard looks nothing up) and a note that MOTHER adds its signature line.
+  - **The send ticket.** On every ask or allow of a send, before answering, the guard writes
+    `<state>/whatsapp/tickets/<hex>`, `hex` = sha256 of the recipient as typed, a NUL, and the text, both as
+    the CLI receives them (UTF-8), hex-encoded; content `{"at": <epoch seconds>}`. The folder is created 0700
+    (a symlink there denies); the file is written to a temp name with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600,
+    then renamed over any old ticket of that name. If it can't be written the send is denied with a plain
+    reason. The bridge needs a fresh ticket for every send (§5d), so a send that never got a guard decision
+    is refused. A ticket left by a prompt the manager declined expires after 120 s. In `bypassPermissions`
+    the ask passes like any other (logged `pass`), the ticket still written: the same caveat as chat, stated
+    in `rules/outbound.md`.
   - **Everything else is read as shell.** Simple commands split on `;`, `&&`, `||`, `|`, `&`, newlines and
     parentheses; quotes, `$'…'`, `$"…"` and backslashes resolved; comments and quoted heredoc bodies are data;
     `$( )`, backticks, `<( )`, the strings given to `eval`, `sh|bash|zsh -c`, `env -S` and `find -exec`, and a
@@ -240,7 +250,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     - unquoted words spelling `mother whatsapp send` anywhere in the line (`mother whatsapp⏎send …`), or that
       text anywhere in a line where a shell or interpreter reads code from a pipe or heredoc, are `compound`;
       inline code (`python3 -c`, `node -e`, `awk '…'`, …) naming the state paths below, or `mother …
-      whatsapp`, or `whatsapp` with `AF_UNIX`, `UNIX-CONNECT` or `.sock`, or `baileys`, is denied; so is a
+      whatsapp`, or `whatsapp` with `AF_UNIX`, `UNIX-CONNECT` or `.sock`, or `baileys`, or `whatsapp` imported
+      as a module (`import whatsapp`, `from whatsapp import`, `__import__`/`import_module` on a line naming
+      it), is denied; so is a
       script under a `bridge/` folder on a line that mentions `whatsapp`, and `nc`, `ncat`, `socat` or
       `curl --unix-socket` on a line that mentions `whatsapp` or `bridge` or has an unresolved argument.
     A repo path, `grep` pattern or commit message that merely contains the words (`git -C …/mother log --grep
@@ -288,7 +300,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     folders, and work inside the workspace, pass (`ls ~/.mother`, `cd "$W" && git status`,
     `cp a.md "$W"/memory/`).
     Write/Edit/MultiEdit/NotebookEdit anywhere under a protected folder is **denied** (not asked). Only
-    `mother whatsapp` and the bridge write there. Residuals, stated plainly: see §5d "What the guard stops".
+    `mother whatsapp`, the bridge and the guard (tickets) write there. Residuals, stated plainly: see §5d "What the guard stops".
   - Channel sessions (`MOTHER_CHANNEL_ROLE`) run no Bash at all, so no `mother whatsapp` command. The
     `mother:reader` sub-agent may run only a single `mother whatsapp read …` command (plain or quoted
     arguments, no shell operators); every other `mother whatsapp` command is denied to sub-agents.
@@ -355,10 +367,11 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   message with the manager in the database (no cold contact: never a stranger), and to the manager's own
   chat. No allowlist.
 - **Naming a chat (WHO).** `me` (= `whatsapp.self_jid`), a JID, a phone number (`+`, spaces, `-`, `(`, `)`
-  dropped; 6-15 digits → `<digits>@s.whatsapp.net`), or a name. A JID or number must be a chat in
-  `ZWACHATSESSION`. A name matches `ZPARTNERNAME` case-insensitively: the one exact match, else the one chat
-  whose name contains it; none is exit 2 "no chat named …", more than one is exit 2 listing the candidates
-  (name, DM/group, last date, JID). Broadcast and status chats are never matched.
+  dropped; 6-15 digits → `<digits>@s.whatsapp.net`), or a chat's exact name. A JID or number must be a chat in
+  `ZWACHATSESSION`. A name must equal one `ZPARTNERNAME` exactly, case-insensitively, both sides trimmed: no
+  partial matches. None is exit 2 "no chat is named …", listing up to 5 chats whose names contain it; more
+  than one is exit 2 listing up to 5 of them (name, DM/group, last date, JID). Broadcast and status chats are
+  never matched.
 - **`mother whatsapp chats [--query TEXT] [--limit N]`** lists recent chats (default 30) from
   `ZWACHATSESSION` only, never a message: JSON `[{"name", "type": "dm"|"group", "last", "jid",
   "hidden_id"?}]`, newest first. WhatsApp stores a pinned chat's `ZLASTMESSAGEDATE` far in the future (it
@@ -376,25 +389,33 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   column is `schema_changed`; `denied` (no Full Disk Access) and `missing` likewise. Never a partial list.
   Citation: `whatsapp://<chat-jid>/<stanza-id>`. Nothing is written anywhere. `read` and `chats` exit 2
   "whatsapp reading is off" when `whatsapp.enabled` or `whatsapp.read` is false.
-- **`mother whatsapp send --to WHO (--text TEXT | --text-file PATH)`** goes through the guard first (§5: ask,
-  or allow for `me`). Then it exits 2 "whatsapp sending is off" when `enabled` or `send` is false; exits 2
+- **`mother whatsapp send --to WHO --text TEXT`** goes through the guard first (§5: ask, or allow for `me`;
+  either way the guard writes the send ticket). Then it exits 2 "whatsapp sending is off" when `enabled` or `send` is false; exits 2
   with a plain sentence for an empty text, a text over 4096 characters, an ambiguous or unknown WHO, a hidden
   `@lid` chat ("WhatsApp hides this chat's number, so MOTHER can't address it"), a chat with no message in
-  the database ("no cold contact"), or a JID that is neither `<digits>@s.whatsapp.net` nor `<digits>@g.us`.
-  A text file is read as UTF-8, trailing newlines dropped. To anyone but `self_jid` it appends the disclosure
-  signature (`rules/outbound.md`) on its own line after a blank one: `agent.signature`, else `*<name> (AI)* ·
+  the database ("no cold contact": a chat counts only once it holds a text message or one the manager sent;
+  system rows such as the encryption notice don't count), or a JID that is neither `<digits>@s.whatsapp.net`
+  nor `<digits>@g.us`. The text is sent as received (nothing stripped). To anyone but `self_jid` the
+  disclosure signature (`rules/outbound.md`) on its own line after a blank one: `agent.signature`, else `*<name> (AI)* ·
   on behalf of <manager_short>` led by `agent.emoji` when that is a real emoji (a `:shortcode:` is left out:
-  WhatsApp doesn't render it); not when the text already holds `<name> (AI)`. Then the bridge `send` op, and
+  WhatsApp doesn't render it) goes along as the `signature` the bridge appends, on its own line after a blank
+  one; none when the text already holds `<name> (AI)`. Then the bridge `send` op with `to` as typed, and
   JSON `{"ok": true, "to": <jid>, "name", "id": <message id or null>}`; a bridge refusal prints its reply
   and exits 2 with the code. One recipient per call; nothing is queued or retried.
 - **Bridge** (`bridge/whatsapp/`, Node 20+, Baileys pinned exactly in `package.json` and `package-lock.json`;
   optional, nothing else depends on it). `node bridge.mjs` serves on `<state>/whatsapp/bridge.sock` (0600, in
   a 0700 folder; a stale socket is replaced, a live one refused). One JSON request per connection, one JSON
   reply: `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "connecting"?}`; `{"op": "stop"}` →
-  `{"ok": true}`, then it exits; `{"op": "send", "jid", "text"}` → `{"ok": true, "stanza"}` or `{"ok": false,
-  "error"}`, one of `bad_request` (a JID that is not a user or group JID, an empty or over-4096-character
-  text), `off`, `paused`, `no_workspace`, `cap`, `gap`, `unlinked`, `wrong_account`, `self_mismatch`,
-  `send_failed`, `internal`. Messages go out one at a time. A send needs, in order: sending on and no
+  `{"ok": true}`, then it exits; `{"op": "send", "to", "jid", "text", "signature"?}` → `{"ok": true, "stanza"}`
+  or `{"ok": false, "error"}`, one of `bad_request` (a JID that is not a user or group JID, an empty text or a
+  signed text over 4096 characters, a `to` that isn't a string), `wrong_recipient` (`to` is `me` but `jid`
+  isn't `self_jid`, or `to` is a JID or number that isn't `jid`; a name can't be checked here), `no_ticket`,
+  `ticket_expired`, `off`, `paused`, `no_workspace`, `cap`, `gap`, `unlinked`, `wrong_account`,
+  `self_mismatch`, `send_failed`, `internal`. Messages go out one at a time. A send needs, in order: a well
+  formed request; the workspace's `config.json` (else `no_workspace`); **a ticket** at `<state>/whatsapp/tickets/<sha256(to NUL text)>` that is a regular file (not
+  a symlink) whose `at` is less than 120 s old, deleted before anything else happens, so it is used once (a
+  missing one is `no_ticket`, an old one `ticket_expired`; every send also deletes tickets older than 120 s);
+  the recipient check above; sending on and no
   `PAUSED` (it reads the workspace's `config.json`, resolved like `bin/mother`); a readable `sent.jsonl` with
   fewer than `max_per_day` (default 20, ceiling 50) sends on today's UTC date of `at`; at least
   `min_gap_seconds` × a random 0.7–1.3 (never below `min_gap_seconds`) since the last send, **waited out
@@ -404,7 +425,7 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   for `min(8 s, 40 ms × characters)` plus up to 1 s (not in the manager's own chat), sends, and appends one
   `sent.jsonl` line `{"at", "kind": "send", "chat", "sha256", "stanza"}` (one `O_APPEND` write, `at` UTC
   ISO-8601 with `Z`, `"stanza": null` when WhatsApp returned no id; a failed append is logged, the send
-  stands). Incoming events have no handler: nothing is stored, logged or forwarded. Logs (stderr, to
+  stands). The sent text is `text`, plus a blank line and `signature` when one is given. Incoming events have no handler: nothing is stored, logged or forwarded. Logs (stderr, to
   `bridge.log`) carry stanza ids and error codes only, never text or a JID; every `console.*` call is
   dropped (libsignal prints key material there). Everything it creates is the manager's alone (umask 077).
   `--link` prints the QR and exits once linked (`--link --phone <digits>` shows an 8-character pairing code
@@ -448,16 +469,20 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   stopped; nothing more was changed").
 - **Machine-local state.** `<state>/whatsapp/`: `session/` (device keys, 0700/0600), `bridge.sock`,
   `bridge.log`, `sent.jsonl` (time, chat JID, text hash, message id), `app/` (the installed bridge),
-  `start.lock`. Nothing WhatsApp lives in the workspace. `.mother/PAUSED` stops every send.
+  `tickets/` (the guard's one-use send tickets, 120 s), `start.lock`. Nothing WhatsApp lives in the workspace. `.mother/PAUSED` stops every send.
 - **What the guard stops, and what it doesn't.** The guard asks before every send to someone else and keeps
   the agent off the bridge socket, its state and the setup commands. It stops mistakes and injected
   instructions. It does not stop a deliberately evasive agent running as the manager on the same macOS
   account: such an agent can write a script file and run it (the guard sees `python3 x.py`, not what it
   does), build a command from variables set outside the Bash call, or read what the account can read,
-  including the session keys, and act outside MOTHER altogether. The bridge itself no longer re-checks an
-  approval: it trusts whoever can open its 0600 socket. In `bypassPermissions` a send asks nothing, as for
-  chat. A `--text-file` is read twice, by the guard for the prompt and by the CLI to send; an agent that
-  rewrites the file in between sends text the manager didn't see.
+  including the session keys, and act outside MOTHER altogether. The guard's reading of a command line is
+  lexical: it does not read script files or what a Write puts in one. The send ticket is the second lock:
+  the bridge sends only what the guard just decided on, once, within 120 s, so a script or inline code that
+  reaches the socket or calls `lib/whatsapp.py` without a guard decision is refused. An agent that forges a
+  ticket with its own code (the guard denies it the folder, but not a script it writes and runs) is out of
+  scope, by the manager's threat model: the locks are for mistakes and injected instructions. The bridge
+  checks that `to` matches `jid` for `me`, numbers and JIDs, not for a name. In `bypassPermissions` a send
+  asks nothing, as for chat.
 - **Never.** Storing a chat body in the workspace; a first message to someone with no history; sending by any
   path the guard cannot see; assessing a person from their messages.
 

@@ -58,20 +58,24 @@ A Unix socket, mode 0600, no TCP. One JSON request per connection, one JSON repl
 |---|---|
 | `{"op": "status"}` | `{"ok": true, "linked", "me", "sent_today"}`, plus `"connecting": true` while a paired session is still opening |
 | `{"op": "stop"}` | `{"ok": true}`, then the bridge exits (used by `mother whatsapp stop`, `link`, `unlink`) |
-| `{"op": "send", "jid", "text"}` | `{"ok": true, "stanza"}` or `{"ok": false, "error"}` |
+| `{"op": "send", "to", "jid", "text", "signature"?}` | `{"ok": true, "stanza"}` or `{"ok": false, "error"}` |
 
 Before every `send` the bridge checks, in order: `jid` is a user (`<digits>@s.whatsapp.net`) or group
-(`<digits>@g.us`) JID and `text` is 1-4096 characters (else `bad_request`); sending is on and the workspace
-isn't PAUSED; `sent.jsonl` is readable and today's sends (UTC day of `at`) are under `max_per_day`; the jittered
-`min_gap_seconds` since the last send has passed (waited out inside the request when 30 s or less, else
-`gap`); linked; the linked account is `whatsapp.self_jid` (`wrong_account`); and the manager's own number is
-addressed only as `self_jid` (`self_mismatch`). Then it shows "typing…" for `min(8 s, 40 ms × characters)` plus
-jitter (not in the manager's own chat), sends, and appends one line to `sent.jsonl`
-(`{"at", "kind": "send", "chat", "sha256", "stanza"}`, `"stanza": null` if WhatsApp returned no id). It holds no
-approval of its own: anything that can open the 0600 socket can send, which is why the guard keeps the agent off it.
+(`<digits>@g.us`) JID, `to` is a string, `text` isn't blank and the signed text is at most 4096 characters (else
+`bad_request`); the workspace config is readable (`no_workspace`); **the guard's ticket**
+`<state>/whatsapp/tickets/<sha256(to NUL text)>` exists as a regular file and is under 120 s old, and it is
+deleted right then, so it is used once (`no_ticket`, `ticket_expired`; older tickets are swept too); `to`
+names `jid` when it is `me`, a number or a JID (`wrong_recipient`); sending is on and the workspace isn't
+PAUSED; `sent.jsonl` is readable and today's sends are under `max_per_day`; the jittered `min_gap_seconds`
+since the last send (waited out inside the request when 30 s or less, else `gap`); linked; the linked account
+is `whatsapp.self_jid` (`wrong_account`); and the manager's own number is addressed only as `self_jid`
+(`self_mismatch`). Then it shows "typing…" (not in the manager's own chat), sends `text` plus a blank line and
+`signature` when one is given, and appends one line to `sent.jsonl` (`{"at", "kind": "send", "chat", "sha256",
+"stanza"}`). The ticket is what ties a send to the guard's decision: a script that reaches the socket without
+one is refused.
 
-Errors: `bad_request`, `off`, `paused`, `no_workspace`, `cap`, `gap`, `unlinked`, `wrong_account`,
-`self_mismatch`, `send_failed`, `internal`.
+Errors: `bad_request`, `no_workspace`, `no_ticket`, `ticket_expired`, `wrong_recipient`, `off`, `paused`,
+`cap`, `gap`, `unlinked`, `wrong_account`, `self_mismatch`, `send_failed`, `internal`.
 
 ## Test
 

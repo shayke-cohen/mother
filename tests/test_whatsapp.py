@@ -67,8 +67,8 @@ def core(iso):
     return whatsapp.to_core(iso)
 
 
-CHATS = [(1, DM, "Dana", 0), (2, GROUP, "PLAT team", 1), (3, OTHER, "Stranger", 0), (4, SELF, "You", 0),
-         (5, COLD, "Cold Caller", 0), (6, LID, "Hidden One", 0), (7, LEVI, "Dana Levi", 0),
+CHATS = [(1, DM, "Dana", 0), (2, GROUP, "PLAT team", 1), (3, OTHER, "Sam Roe", 0), (4, SELF, "You", 0),
+         (5, COLD, "Agnes", 0), (6, LID, "Hidden One", 0), (7, LEVI, "Dana Roe", 0),
          (8, "status@broadcast", "Status", 0)]
 MSGS = [
     {"chat": 1, "text": "hello from dana", "date": core("2026-10-26T08:00:00Z"), "stanza": "A1", "from": DM},
@@ -149,14 +149,14 @@ class TestChats(Base):
     def test_pinned_chats_show_pinned_and_come_first(self):
         self.build(lasts={7: PINNED, 3: PINNED + 100})
         got = [whatsapp.chat_out(c) for c in whatsapp.recent_chats()]
-        self.assertEqual([c["name"] for c in got[:2]], ["Stranger", "Dana Levi"])
+        self.assertEqual([c["name"] for c in got[:2]], ["Sam Roe", "Dana Roe"])
         self.assertEqual({c["last"] for c in got[:2]}, {"pinned"})
         self.assertNotIn("7026", json.dumps(got))
         self.assertEqual(got[2]["jid"], SELF)
 
     def test_query_and_limit(self):
         self.build()
-        self.assertEqual([c["name"] for c in whatsapp.recent_chats(query="dana")], ["Dana", "Dana Levi"])
+        self.assertEqual([c["name"] for c in whatsapp.recent_chats(query="dana")], ["Dana", "Dana Roe"])
         self.assertEqual([c["jid"] for c in whatsapp.recent_chats(query="000002")], [OTHER])
         self.assertEqual(whatsapp.recent_chats(query="100%"), [])  # LIKE wildcards are literal
         self.assertEqual(len(whatsapp.recent_chats(limit=2)), 2)
@@ -179,7 +179,7 @@ class TestChats(Base):
         env = dict(self.env, MOTHER_WORKSPACE=str(ws))
         r = cli(env, "chats", "--query", "Dana", "--limit", "5")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual([c["name"] for c in json.loads(r.stdout)], ["Dana", "Dana Levi"])
+        self.assertEqual([c["name"] for c in json.loads(r.stdout)], ["Dana", "Dana Roe"])
         self.assertEqual(cli(env, "chats", "--limit", "x").returncode, 1)
         self.assertEqual(cli(env, "chats", "--bogus").returncode, 1)
 
@@ -193,9 +193,8 @@ class TestResolve(Base):
         return whatsapp.resolve_chat(make_cfg(), w)
 
     def test_a_name_a_number_a_jid_or_me(self):
-        self.assertEqual(self.who("Dana")["jid"], DM)          # the exact name beats "Dana Levi"
-        self.assertEqual(self.who("dana levi")["jid"], LEVI)
-        self.assertEqual(self.who("Strang")["jid"], OTHER)      # one chat contains it
+        self.assertEqual(self.who("Dana")["jid"], DM)          # exact: "Dana Roe" is another chat
+        self.assertEqual(self.who("  dana roe ")["jid"], LEVI)
         self.assertEqual(self.who("+972 50-000-0001")["jid"], DM)
         self.assertEqual(self.who(GROUP)["jid"], GROUP)
         me = self.who("me")
@@ -206,9 +205,21 @@ class TestResolve(Base):
 
     def test_ambiguous_unknown_and_broadcast(self):
         with self.assertRaises(whatsapp.ChatError) as cm:
-            self.who("Dan")
-        self.assertIn("matches 2 chats", str(cm.exception))
+            self.who("Dan")  # no partial matches: the candidates are listed
+        self.assertIn("no WhatsApp chat is named 'Dan'", str(cm.exception))
         self.assertIn(LEVI, str(cm.exception))
+        with self.assertRaises(whatsapp.ChatError):
+            self.who("Sam")
+        db = sqlite3.connect(str(self.db))
+        for pk in range(10, 17):
+            db.execute("INSERT INTO ZWACHATSESSION VALUES (?, ?, 'PLAT team', 1, NULL, 1)",
+                       (pk, "1203630000000000%02d@g.us" % pk))
+        db.commit()
+        db.close()
+        with self.assertRaises(whatsapp.ChatError) as cm:
+            self.who("plat team")
+        self.assertIn("8 chats are named 'plat team'", str(cm.exception))
+        self.assertEqual(str(cm.exception).count("@g.us"), 5)  # up to 5 listed
         for w in ("Nobody", "Status", "+972 50 000 0077", "123@g.us", ""):
             with self.assertRaises(whatsapp.ChatError):
                 self.who(w)
@@ -312,15 +323,15 @@ class TestReader(Base):
     def test_cli_read(self):
         self.build()
         env = self.cli_env()
-        r = cli(env, "read", "--chat", "Dana Levi")
+        r = cli(env, "read", "--chat", "Dana Roe")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([i["text"] for i in json.loads(r.stdout)["items"]], ["levi here"])
         r = cli(env, "read", "--since", "2026-10-26T09:10:00Z", "--limit", "1")
         self.assertEqual([i["text"] for i in json.loads(r.stdout)["items"]], ["note to self"])
         r = cli(env, "read", "--chat", "Dan")
         self.assertEqual(r.returncode, 2)
-        self.assertIn("matches 2 chats", r.stderr)
-        self.assertIn("Dana Levi", r.stderr)
+        self.assertIn("no WhatsApp chat is named", r.stderr)
+        self.assertIn("Dana Roe", r.stderr)
         self.assertEqual(cli(env, "read", "--since", "yesterday").returncode, 1)
         self.assertEqual(cli(env, "read", "--chat").returncode, 1)
 
@@ -428,36 +439,48 @@ class TestCliSend(Cmd7):
         r = self.send("--to", "Dana", "--text", "see you at 3")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout), {"ok": True, "to": DM, "name": "Dana", "id": "STANZA1"})
-        self.assertEqual(b.requests, [{"op": "send", "jid": DM, "text": "see you at 3\n\n" + SIGNATURE}])
+        self.assertEqual(b.requests, [{"op": "send", "to": "Dana", "jid": DM, "text": "see you at 3",
+                                       "signature": SIGNATURE}])
 
-    def test_by_number_jid_group_and_text_file(self):
+    def test_by_number_jid_and_group_the_text_as_received(self):
         b = self.start_bridge()
-        msg = self.t / "msg.txt"
-        msg.write_text("line one\nline two\n\n", encoding="utf-8")
-        for args in (["--to", "+972-50-000-0001", "--text", "a"], ["--to=%s" % GROUP, "--text=b"],
-                     ["--text-file", str(msg), "--to", "PLAT team"]):
+        for args in (["--to", "+972-50-000-0001", "--text", "a\n\n"], ["--to=%s" % GROUP, "--text=b"],
+                     ["--text", "c", "--to", "PLAT team"]):
             r = self.send(*args)
             self.assertEqual(r.returncode, 0, (args, r.stderr))
-        self.assertEqual([q["jid"] for q in b.requests], [DM, GROUP, GROUP])
-        self.assertEqual(b.requests[2]["text"], "line one\nline two\n\n" + SIGNATURE)
+        self.assertEqual([(q["to"], q["jid"], q["text"]) for q in b.requests],
+                         [("+972-50-000-0001", DM, "a\n\n"), (GROUP, GROUP, "b"), ("PLAT team", GROUP, "c")])
 
     def test_me_is_the_own_chat_unsigned(self):
         b = self.start_bridge()
         r = self.send("--to", "me", "--text", "note to self")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["to"], SELF)
-        self.assertEqual(b.requests, [{"op": "send", "jid": SELF, "text": "note to self"}])
+        self.assertEqual(b.requests, [{"op": "send", "to": "me", "jid": SELF, "text": "note to self"}])
+
+    def test_a_chat_with_only_system_rows_is_cold(self):
+        db = sqlite3.connect(str(self.db))
+        db.execute("INSERT INTO ZWAMESSAGE (Z_PK, ZCHATSESSION, ZISFROMME, ZTEXT, ZMESSAGEDATE, ZSTANZAID, ZMESSAGETYPE) "
+                   "VALUES (99, 5, 0, NULL, 1, 'SYS1', 6)")
+        db.commit()
+        db.close()
+        b = self.start_bridge()
+        r = self.send("--to", "Agnes", "--text", "hi")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no cold contact", r.stderr)
+        self.assertEqual(b.requests, [])
 
     def test_refusals_call_no_bridge(self):
         b = self.start_bridge()
-        for args, words in ((["--to", "Cold Caller", "--text", "hi"], "no cold contact"),
+        for args, words in ((["--to", "Agnes", "--text", "hi"], "no cold contact"),
                             (["--to", "Hidden One", "--text", "hi"], "hides the number"),
-                            (["--to", "Dan", "--text", "hi"], "matches 2 chats"),
+                            (["--to", "Dan", "--text", "hi"], "no WhatsApp chat is named"),
                             (["--to", "Nobody", "--text", "hi"], "no WhatsApp chat is named"),
                             (["--to", "+972 50 000 0077", "--text", "hi"], "no WhatsApp chat with"),
                             (["--to", "Status", "--text", "hi"], "no WhatsApp chat is named"),
                             (["--to", "Dana", "--text", "  \n"], "empty"),
-                            (["--to", "Dana", "--text", "x" * 4097], "longer than")):
+                            (["--to", "Dana", "--text", "x" * 4097], "longer than"),
+                            (["--to", "Dana", "--text", "x" * 4090], "longer than")):  # with the signature
             r = self.send(*args)
             self.assertEqual(r.returncode, 2, (args, r.stderr))
             self.assertIn(words, r.stderr, args)
@@ -465,11 +488,10 @@ class TestCliSend(Cmd7):
         self.assertEqual(b.requests, [])
 
     def test_usage_errors(self):
-        for args in ([], ["--to", "Dana"], ["--text", "hi"], ["--to", "Dana", "--text", "a", "--text-file", "f"],
+        for args in ([], ["--to", "Dana"], ["--text", "hi"], ["--to", "Dana", "--text-file", "f"],
                      ["--to", "Dana", "--to", "Gil", "--text", "a"], ["--to", "Dana", "--text"],
                      ["--to", "Dana", "--text", "a", "--cc", "x"], ["w3kx"]):
             self.assertEqual(self.send(*args).returncode, 1, args)
-        self.assertEqual(self.send("--to", "Dana", "--text-file", str(self.t / "none.txt")).returncode, 1)
 
     def test_sending_off(self):
         for wa in ({"enabled": False}, {"send": False}):
@@ -508,8 +530,8 @@ class TestCliSend(Cmd7):
         cfg["agent"]["emoji"] = "✨"
         self.assertEqual(whatsapp.signature(cfg), "✨ " + SIGNATURE)
         cfg["agent"]["signature"] = "— Agnes (AI) for Dana"
-        self.assertEqual(whatsapp.signed(cfg, "hi"), "hi\n\n— Agnes (AI) for Dana")
-        self.assertEqual(whatsapp.signed(cfg, "hi\n— Agnes (AI)"), "hi\n— Agnes (AI)")  # never twice
+        self.assertEqual(whatsapp.signature_for(cfg, "hi"), "— Agnes (AI) for Dana")
+        self.assertIsNone(whatsapp.signature_for(cfg, "hi\n— Agnes (AI)"))  # never twice
 
     def test_gone_commands_say_what_to_do(self):
         for sub in ("draft", "list", "prompt", "allow", "pending", "verify"):
