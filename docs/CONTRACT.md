@@ -569,7 +569,7 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
     the manager to type their number (digits with country code), unless they already typed it to link by phone. No JID: stop, nothing written. (c) Config: set `whatsapp.enabled: true` and `self_jid` in one write, keep
     `allow` and every other key, set `approve_via: ["session"]` when absent, leave the caps alone. (d) Database:
     probe it; `denied` prints the Full Disk Access instruction and stops (exit 2), `missing` says to install and
-    sign in to WhatsApp desktop and stops. (e) Chats: show up to 15 recent chats from `ZWACHATSESSION` (name,
+    sign in to WhatsApp desktop and stops. (e) Chats: show up to 100 recent chats from `ZWACHATSESSION` (name,
     DM/group, last message date; never a message; not `self_jid`, only JIDs `validate` accepts, only chats with a
     last message), numbered, marking ones already allowed; chats WhatsApp keys by a private `@lid` id are
     listed "(id hidden by WhatsApp)" and skipped with a note when picked; the manager types numbers (`1 4`) or Enter to skip;
@@ -583,8 +583,9 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
     Ctrl-C ("setup stopped; nothing more was changed"; `allow` and `disallow` the same), which never leaves a
     half-written config.
   - **`mother whatsapp allow [<number>|<jid>|<n>] [--name NAME]`** adds one chat: a phone number (`+`, spaces,
-    `-`, `(`, `)` dropped; 6-15 digits) becomes `<digits>@s.whatsapp.net`; a 1-2 digit `<n>` is the n-th chat of
-    setup's list; with no argument it shows that list and asks. The name comes from `--name`, else the chat's
+    `-`, `(`, `)` dropped; 6-15 digits) becomes `<digits>@s.whatsapp.net`; a 1-3 digit `<n>` is the n-th chat of
+    setup's list; with no argument it shows that list and adds every number typed (hidden-id, already allowed
+    and self chats skipped, each named). The name comes from `--name`, else the chat's
     name in the database, else a prompt. It refuses (exit 2) a hidden-id (`@lid`) chat, before setup has set `self_jid`, `self_jid` itself, a JID `validate` rejects, and a chat
     the readable database holds no message in (no cold contact); an unreadable database adds it with a note.
     An already allowed JID is left as is. **`mother whatsapp disallow <jid|number>`** removes it (exit 1 if

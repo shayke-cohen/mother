@@ -20,8 +20,8 @@ Commands:
   setup                              the manager's guided setup, in their own terminal: install, link, learn
                                      self_jid, write the whatsapp block, check database access, pick chats,
                                      pick approval paths. Safe to re-run
-  allow [NUMBER|JID|N] [--name NAME] add one chat to whatsapp.allow (N = the n-th chat setup lists; no argument:
-                                     show that list and ask). Own terminal only
+  allow [NUMBER|JID|N] [--name NAME] add a chat to whatsapp.allow (N = the n-th chat setup lists; no argument:
+                                     show that list and add every number typed). Own terminal only
   disallow JID|NUMBER                remove a chat from whatsapp.allow. Own terminal only
   status                             bridge state and whether the local database is readable (JSON)
   verify ID [--sha256 HEX]           exit 0 only if approved/ID.json still proves a yes, on the path it
@@ -1348,7 +1348,7 @@ def cmd_status(cfg, args):
 # ---------------------------------------------------------------- setup, allow, disallow (the manager's terminal)
 
 ALLOW_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us", re.ASCII)  # = bin/mother WA_JID_RE
-SETUP_CHATS = 15
+SETUP_CHATS = 100
 PATH_ORDER = ("session", "self_chat", "slack_dm")
 
 
@@ -1711,7 +1711,7 @@ def _resolve_chat(cfg: dict, arg: str, io):
         chats = pickable_chats(cfg)
     except ReaderError:
         chats = None
-    if re.fullmatch(r"\d{1,2}", arg):
+    if re.fullmatch(r"\d{1,3}", arg):
         if not chats or not 1 <= int(arg) <= len(chats):
             raise SetupStop("%s is not a number on the list (run `mother whatsapp allow` to see it)" % arg)
         if chats[int(arg) - 1].get("hidden"):
@@ -1768,9 +1768,18 @@ def allow_chat(ws: Path, validate, io, args) -> int:
             if not picked:
                 return 0
             if len(picked) > 1:
-                for p in picked[1:]:
-                    io.say("One at a time: adding %s only; run it again for %s." % (_chat_name(picked[0]),
-                                                                                 _chat_name(p)))
+                me = _wa(cfg).get("self_jid")
+                new = [c for c in picked if c["jid"] not in allowed and c["jid"] != me]
+                if new:
+                    save_whatsapp(ws, validate, lambda wa: wa.setdefault("allow", []).extend(
+                        _allow_entry(c) for c in new))
+                    io.say("Allowed: %s." % ", ".join(_chat_name(c) for c in new))
+                if len(new) < len(picked):
+                    io.say("Skipped (already allowed or your own chat): %s." % ", ".join(
+                        _chat_name(c) for c in picked if c not in new))
+                if not _wa(cfg).get("enabled"):
+                    io.say("WhatsApp is still off: run `mother whatsapp setup`.")
+                return 0
             c = picked[0]
         if c["jid"] == _wa(cfg).get("self_jid"):
             raise SetupStop("that is your own self chat, which carries approvals; it can't be allowed")

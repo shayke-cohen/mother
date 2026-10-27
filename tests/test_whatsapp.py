@@ -2189,6 +2189,16 @@ class TestAllow(SetupCase):
         self.assertEqual(code, 0, io.text)
         self.assertEqual(self.allowed(), [{"jid": OTHER, "name": "Stranger"}])
 
+    def test_no_argument_adds_every_number_typed(self):
+        code, io = self.allow(answers=("1 2",))
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(len(self.allowed()), 2)
+        self.assertIn("Allowed:", io.text)
+        code, io = self.allow(answers=("1 2",))  # both already there
+        self.assertEqual(code, 0, io.text)
+        self.assertEqual(len(self.allowed()), 2)
+        self.assertIn("Skipped", io.text)
+
     def test_refusals(self):
         before = (self.ws / "config.json").read_text()
         for args in (["+972 50 000 0007"],  # no history: no cold contact
