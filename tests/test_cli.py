@@ -550,6 +550,21 @@ class CliTest(unittest.TestCase):
         self.assertEqual(tick_state("2026-10-26T06:30:00Z", "- 2026-10-23T21:05:00Z tick ok\n"), "ok")
         self.assertEqual(tick_state("2026-10-25T10:30:00Z", "- 2026-10-23T08:05:00Z tick ok\n"), "ok")
 
+    def test_routine_frontmatter_tick(self):
+        text = (Path(__file__).resolve().parent.parent / "routines" / "tick.md").read_text()
+        fm = text.split("---")[1]
+        lines = {l.split(":", 1)[0]: l.split(":", 1)[1].strip() for l in fm.splitlines() if ":" in l and not l.startswith(" ")}
+        self.assertEqual(lines["id"], "tick")
+        self.assertEqual(lines["sync"].split("#")[0].strip(), "false")
+        self.assertEqual(lines["team_scoped"].split("#")[0].strip(), "false")
+        for cap in ("chat.read", "tracker.read", "mail.read", "calendar.read", "code.read"):
+            self.assertIn(cap, lines["needs"])
+        self.assertIn('active_hours: "06:00-22:00"', lines["default"])
+        self.assertEqual(lines["config"].split("#")[0].strip(), "routines.tick")
+        disp = (Path(__file__).resolve().parent.parent / "skills" / "routine" / "SKILL.md").read_text()
+        self.assertIn("sync: false", disp)
+        self.assertIn("skipped — outside active hours", disp)
+
 
 if __name__ == "__main__":
     unittest.main()

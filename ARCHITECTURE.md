@@ -51,7 +51,7 @@ holds code a later session would run.
 Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `digest`, `dots`, `commitments`,
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`.
 
-Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `commitments`, `one-on-one`, `meeting-prep`,
+Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
 `meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
 
 ## How a scheduled run flows
