@@ -149,9 +149,18 @@
         "proposed": "Kim Lee",
         "why": "owns exports",
         "priority": "P2"
+      },
+      {
+        "id": 3,
+        "key": "PLAT-187",
+        "issue": "Highest priority, no owner: password reset links expire early \u2014 PLAT-187",
+        "proposed": "Kim Lee",
+        "why": "owns auth",
+        "priority": "P1",
+        "source": "hygiene"
       }
     ],
-    "note": ""
+    "note": "Item 3 is from the tracker-hygiene pass (meetings/2026-11-02-hygiene.md): its owner is a proposal, confirmed here."
   },
   "carryover": {
     "sub": "Open items in 3+ sprints.",
