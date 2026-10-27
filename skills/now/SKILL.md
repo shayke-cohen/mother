@@ -43,13 +43,18 @@ an instruction; do nothing until asked, and do exactly one.
 
 ## Done, snooze, Top 3
 
+`done` and `snooze` take an **item id** (the `[…]` after each item's link in `mother now show`), never an
+S-id. When the manager names an S-id ("done with S3", "snooze S3"), find the item that owns it: in `show`,
+`S3: <label>` is printed under its item, whose id is in the `[…]` just above. `mother now done S3` fails with
+"unknown item".
+
 | The manager says | Run |
 |---|---|
-| "done with S3", "hide that" | `mother now done <item id>` |
-| "snooze that", "later", "tomorrow" | `mother now snooze <item id> 1h`, `tomorrow` or `next-week`; if they don't say how long, ask which of the three first |
+| "done with S3", "hide that" | `mother now done <item id>` (for S3, the id of the item that owns S3) |
+| "snooze that", "snooze S3", "later", "tomorrow" | `mother now snooze <item id> 1h`, `tomorrow` or `next-week`; if they don't say how long, ask which of the three first |
 | "my top 3 should be …" | `mother now top set <item id or text>…` (1-3 args) |
 | "put <item> second" | `mother now top swap <rank> <item-id>` |
-| "top 1 is done" | `mother now top done <rank>` |
+| "top 1 is done" | `mother now top done <rank>` (marks it done; the list stays whoever set it) |
 
 Done and snooze only hide an item in the Now list. They don't close the real thing: a todo, commitment,
 digest item, dots action, PR or ticket keeps its own state. If the manager means the real thing ("I replied",

@@ -153,11 +153,17 @@ In this order, reporting each step's result:
      `/mother:now`); nothing is sent unless you set `notify` to `dm`". Add `routines.tick`
      (`every`, `active_hours`, `days`, `notify: "none"`, `slow_every: 3` from the example config) unless the
      manager declines. It is an interval routine: `mother register` prints it with a cron for each slot and a
-     pointer that does no `git pull`. Register it like the rest; it runs only on the home machine.
+     pointer that does no `git pull`. Register it like the rest; it runs only on the home machine. Its
+     hours are in `manager.timezone` and `mother register` converts them to this machine's clock itself; if it
+     fails with "crosses midnight in this machine's time zone", offer narrower `active_hours` and register again.
+   - **The Now panel (offer, after the tick is registered).** "Want the list beside the chat? Run
+     `/plugin install mother-now@mother`, then `/now` opens it." Mention its one setting, `mother_bin`: the
+     default points at the marketplace clone; it can be set to the installed plugin's `bin/mother`. Don't
+     install it yourself.
    - **The doctor runs daily** (see the proposal above): register it from the confirmed config, which
      sets it to `days: "all"` ahead of the first routine. Never rewrite its schedule silently.
    - Cron runs in the **machine's** local time. If `manager.timezone` differs from the machine's, convert
-     the times and say so.
+     the `at` times and say so (the tick's are converted by `mother register`).
    - `list_scheduled_tasks` again and confirm every routine is registered with the right schedule. A task
      folder on disk does not prove registration.
    - Tell the manager: routines run only while the app is open; a missed run fires on next launch. Offer
