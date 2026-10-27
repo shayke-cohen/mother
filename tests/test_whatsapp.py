@@ -448,7 +448,7 @@ class Cmd7(Base):
         return cli(self.wenv, *args)
 
 
-SIGNATURE = "*Agnes (AI)* · on behalf of Dana"
+SIGNATURE = "✨ *Agnes (AI)* · on behalf of Dana"  # the fixture's :sparkles: becomes the emoji
 
 
 class TestCliSend(Cmd7):
@@ -547,12 +547,16 @@ class TestCliSend(Cmd7):
 
     def test_the_signature(self):
         cfg = make_cfg()
-        self.assertEqual(whatsapp.signature(cfg), SIGNATURE)  # a :shortcode: is dropped: WhatsApp shows it raw
-        cfg["agent"]["emoji"] = "✨"
-        self.assertEqual(whatsapp.signature(cfg), "✨ " + SIGNATURE)
+        self.assertEqual(whatsapp.signature(cfg), SIGNATURE)  # a known :shortcode: becomes its emoji
+        cfg["agent"]["emoji"] = "🦉"
+        self.assertEqual(whatsapp.signature(cfg), "🦉 *Agnes (AI)* · on behalf of Dana")
         cfg["agent"]["signature"] = "— Agnes (AI) for Dana"
         self.assertEqual(whatsapp.signature_for(cfg, "hi"), "— Agnes (AI) for Dana")
         self.assertIsNone(whatsapp.signature_for(cfg, "hi\n— Agnes (AI)"))  # never twice
+        cfg["agent"]["signature"] = ":robot_face: <https://example.com/agent|Agnes (AI)> · on behalf of Dana"
+        self.assertEqual(whatsapp.signature(cfg), "🤖 Agnes (AI) · on behalf of Dana")  # Slack mrkdwn converted
+        cfg["agent"]["signature"] = ":no_such_code: *Agnes (AI)* · see <https://example.com>"
+        self.assertEqual(whatsapp.signature(cfg), "*Agnes (AI)* · see https://example.com")
 
     def test_gone_commands_say_what_to_do(self):
         for sub in ("draft", "list", "prompt", "allow", "pending", "verify"):

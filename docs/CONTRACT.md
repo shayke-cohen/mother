@@ -400,8 +400,9 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   system rows such as the encryption notice don't count), or a JID that is neither `<digits>@s.whatsapp.net`
   nor `<digits>@g.us`. The text is sent as received (nothing stripped). To anyone but `self_jid` the
   disclosure signature (`rules/outbound.md`) on its own line after a blank one: `agent.signature`, else `*<name> (AI)* ·
-  on behalf of <manager_short>` led by `agent.emoji` when that is a real emoji (a `:shortcode:` is left out:
-  WhatsApp doesn't render it) goes along as the `signature` the bridge appends, on its own line after a blank
+  on behalf of <manager_short>` led by `agent.emoji`, converted from Slack formatting (WhatsApp shows it raw):
+  `<url|label>` becomes `label`, `<url>` the url, a known `:shortcode:` its emoji (`robot_face` 🤖, `sparkles`
+  ✨, …), an unknown one is left out; it goes along as the `signature` the bridge appends, on its own line after a blank
   one; none when the text already holds `<name> (AI)`. Then the bridge `send` op with `to` as typed, and
   JSON `{"ok": true, "to": <jid>, "name", "id": <message id or null>}`; a bridge refusal prints its reply
   and exits 2 with the code. One recipient per call; nothing is queued or retried.

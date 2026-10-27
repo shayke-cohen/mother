@@ -387,13 +387,25 @@ def cmd_read(cfg, args):
 
 # ---------------------------------------------------------------- CLI: send
 
+SHORTCODES = {"robot_face": "🤖", "sparkles": "✨", "star": "⭐", "rocket": "🚀", "wave": "👋", "bulb": "💡",
+              "memo": "📝", "zap": "⚡", "brain": "🧠", "owl": "🦉", "crystal_ball": "🔮", "dove_of_peace": "🕊️"}
+
+
+def to_whatsapp(text: str) -> str:
+    """Slack mrkdwn as WhatsApp shows it: `<url|label>` -> label, `<url>` -> url, a known `:shortcode:` -> its
+    emoji, an unknown one left out. `*bold*` is the same in both."""
+    t = re.sub(r"<([^<>|]+)\|([^<>]+)>", r"\2", text)
+    t = re.sub(r"<((?:https?|mailto):[^<>]+)>", r"\1", t)
+    t = re.sub(r":([a-z0-9_+-]+):", lambda m: SHORTCODES.get(m.group(1), ""), t)
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
 def signature(cfg: dict) -> str:
-    """The disclosure line (rules/outbound.md) as WhatsApp shows it: a Slack `:shortcode:` emoji is left out."""
+    """The disclosure line (rules/outbound.md) as WhatsApp shows it (Slack formatting converted, to_whatsapp)."""
     a = cfg.get("agent") or {}
     if isinstance(a.get("signature"), str) and a["signature"].strip():
-        return a["signature"].strip()
-    emoji = a.get("emoji") if isinstance(a.get("emoji"), str) else ""
-    emoji = "" if re.fullmatch(r":[\w+-]+:", emoji.strip()) else emoji.strip()
+        return to_whatsapp(a["signature"])
+    emoji = to_whatsapp(a.get("emoji")) if isinstance(a.get("emoji"), str) else ""
     line = "*%s (AI)* · on behalf of %s" % (a.get("name") or "Agent",
                                              a.get("manager_short") or a.get("manager") or "the manager")
     return (emoji + " " + line) if emoji else line
