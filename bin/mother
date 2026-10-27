@@ -143,6 +143,7 @@ def _tick_slots(every: int, a: int, b: int) -> list:
             for m in ((5, 35) if every == 30 else (5,))]
 
 
+TICK_OFFSET_CHANGED = "re-run mother register (time-zone offset changed)"
 TICK_MIDNIGHT = ("routines.tick.active_hours crosses midnight in this machine's time zone; narrow active_hours, "
                  "or run tick on a machine whose time zone is nearer manager.timezone")
 
@@ -155,6 +156,15 @@ def _tick_crosses_midnight(r: dict, cfg: dict, now: _dt.datetime) -> bool:
     d = _tick_offset(cfg, now)
     slots = _tick_slots(every, *hours)
     return min([hours[0]] + slots) + d < 0 or max(hours[1], max(slots) + 1) + d > 24 * 60
+
+
+def _tick_registered_offset(ws: Path):
+    """The manager->machine offset (minutes) the registered tick cron was built with, or None if unknown."""
+    try:
+        v = json.loads((ws / ".mother" / "tick-register.json").read_text()).get("offset_minutes")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
 def validate(cfg: dict) -> list:
@@ -282,8 +292,6 @@ def validate(cfg: dict) -> list:
                 se = r.get("slow_every")
                 if se is not None and (not isinstance(se, int) or isinstance(se, bool) or not 1 <= se <= 6):
                     errs.append("routines.tick.slow_every must be an integer 1-6")
-                if _tick_crosses_midnight(r, cfg, _now()):
-                    errs.append(TICK_MIDNIGHT)
             if rid == "commitments":
                 for k, lo, hi in (("no_reply_days", 1, 30), ("lookback_days", 1, 60)):
                     v = r.get(k)
@@ -626,7 +634,11 @@ def cmd_status(args):
             print(f"  - {e}")
         sys.exit(1)
     print("config:      valid")
-    bad = [f"{r['id']} {r['state']}" for r in routine_health(ws, cfg) if r["state"] in ("missed", "failed")]
+    rows = routine_health(ws, cfg)
+    bad = [f"{r['id']} {r['state']}" for r in rows if r["state"] in ("missed", "failed")]
+    for r in rows:
+        if r["id"] == "tick" and r["note"] in (TICK_MIDNIGHT, TICK_OFFSET_CHANGED):
+            print(f"tick:        WARNING — {r['note']}")
     print(f"routines:    {'; '.join(bad) + ' — see `mother runs`' if bad else 'all scheduled runs logged'}")
 
 
@@ -671,18 +683,26 @@ def cmd_register(args):
     ws = workspace()
     cfg = load_config(ws)
     errs = validate(cfg)
-    if TICK_MIDNIGHT in errs:
-        die(TICK_MIDNIGHT)
     if errs:
         die("config invalid — run `mother status`")
     workdays = (cfg.get("manager") or {}).get("workdays") or DAYS[:5]
-    tasks = []
+    tasks, problems = [], []
     for rid, r in (cfg.get("routines") or {}).items():
         if rid == "tick" and isinstance(r, dict):
+            if _tick_crosses_midnight(r, cfg, _now()):
+                problems.append(TICK_MIDNIGHT)          # tick is not registered; the other routines are
+                continue
             every, active = r.get("every", 60), r.get("active_hours", "06:00-22:00")
+            offset = _tick_offset(cfg, _now())
             tasks.append({"taskId": "mother-tick", "title": f"Mother: tick (every {every} min, {active})",
-                          "cronExpression": _interval_cron(every, active, r.get("days"), workdays, _tick_offset(cfg, _now())),
-                          "prompt": _pointer(ws, "tick", pull=False)})
+                          "cronExpression": _interval_cron(every, active, r.get("days"), workdays, offset),
+                          "prompt": _pointer(ws, "tick", pull=False), "offset_minutes": offset})
+            try:
+                (ws / ".mother").mkdir(exist_ok=True)
+                (ws / ".mother" / "tick-register.json").write_text(
+                    json.dumps({"offset_minutes": offset, "registered_at": now_iso()}) + "\n")
+            except OSError:
+                pass
             continue
         if rid == "meeting" or not isinstance(r, dict) or "at" not in r:
             continue
@@ -702,7 +722,14 @@ def cmd_register(args):
             tasks.append({"taskId": f"mother-meeting-recap-{t['slug']}", "title": f"Mother: {t['name']} recap draft",
                           "cronExpression": _cron(recap, wk["day"], workdays),
                           "prompt": _pointer(ws, "meeting-recap", t["slug"])})
-    print(json.dumps({"home_machine": (cfg.get("workspace") or {}).get("home_machine"), "tasks": tasks}, indent=2))
+    out = {"home_machine": (cfg.get("workspace") or {}).get("home_machine"), "tasks": tasks}
+    if problems:
+        out["errors"] = problems
+    print(json.dumps(out, indent=2))
+    for m in problems:
+        print(f"mother register: {m}", file=sys.stderr)
+    if problems:
+        sys.exit(2)
 
 # ---------------------------------------------------------------- runs (watchdog)
 
@@ -763,7 +790,7 @@ def _log_start(ws: Path, runs: dict):
     return min(times) if times else None
 
 
-def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime, cfg: dict = None) -> dict:
+def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime, cfg: dict = None, registered=None) -> dict:
     """Tick row. Missed only inside active hours on a scheduled day, 2x every after the day's first slot, with no run in 2x every.
     Judged in manager.timezone, the clock lib/now.py and the dispatcher's active-hours gate use."""
     every = r.get("every", 60)
@@ -773,6 +800,14 @@ def _tick_health(r: dict, runs: dict, start, workdays, now: _dt.datetime, cfg: d
             or (isinstance(days, str) and days.startswith("monthly:"))):
         return {"id": "tick", "state": "failed", "expected": None, "last": None, "last_status": None,
                 "note": "invalid tick config — run mother status"}
+    problem = (TICK_MIDNIGHT if _tick_crosses_midnight(r, cfg or {}, now) else
+               TICK_OFFSET_CHANGED if registered is not None and registered != _tick_offset(cfg or {}, now) else None)
+    if problem:
+        hist = runs.get("tick") or []
+        last = hist[-1] if hist else None
+        return {"id": "tick", "state": "failed", "expected": None,
+                "last": last[0].strftime("%Y-%m-%dT%H:%MZ") if last else None,
+                "last_status": last[1] if last else None, "note": problem}
     a, b = hours
     local = now.astimezone(_manager_tz(cfg or {}))
     want = workdays if days in (None, "workdays") else DAYS if days == "all" else [days] if isinstance(days, str) else days
@@ -810,7 +845,7 @@ def routine_health(ws: Path, cfg: dict) -> list:
     rows = []
     for rid, r in (cfg.get("routines") or {}).items():
         if rid == "tick" and isinstance(r, dict):
-            rows.append(_tick_health(r, runs, start, workdays, now, cfg))
+            rows.append(_tick_health(r, runs, start, workdays, now, cfg, _tick_registered_offset(ws)))
             continue
         if not isinstance(r, dict) or "at" not in r:
             continue
@@ -848,7 +883,7 @@ def cmd_runs(args):
                 detail = "not due since logging began"
             else:
                 note = r["note"] if len(r["note"]) <= 90 else r["note"][:89] + "…"
-                detail = f"{r['last']}" + (f" — {note}" if note else "")
+                detail = f"{r['last'] or 'never ran'}" + (f" — {note}" if note else "")
             print(f"{r['id']:<16} {r['state'].upper() if r['state'] in ('missed', 'failed') else r['state']:<8} {detail}")
     sys.exit(2 if any(r["state"] in ("missed", "failed") for r in rows) else 0)
 

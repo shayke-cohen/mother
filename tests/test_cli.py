@@ -590,16 +590,55 @@ class CliTest(unittest.TestCase):
             r, tasks = cron(tz, tick)
             self.assertEqual(r.returncode, 0, (tz, tick, r.stderr))
             self.assertEqual({t["taskId"]: t for t in tasks}["mother-tick"]["cronExpression"], want, (tz, tick))
-        r, _ = cron("Asia/Kolkata", {"active_hours": "06:00-22:00", "every": 60})
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("routines.tick.active_hours crosses midnight in this machine's time zone", r.stderr)
-        r = run(["status"], dict(self.env, TZ="Asia/Kolkata", **pin))
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("routines.tick.active_hours crosses midnight in this machine's time zone", r.stdout + r.stderr)
+
+    def test_tick_crossing_machine_midnight_fails_tick_only(self):
+        self.init()
+        self.write_config()                                  # 06:00-22:00 London: 11:30-03:30 on a +05:30 machine
+        env = dict(self.env, TZ="Asia/Kolkata", MOTHER_NOW="2026-10-27T09:00:00Z")
+        msg = "routines.tick.active_hours crosses midnight in this machine's time zone"
+        r = run(["register"], env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn(msg, r.stderr)
+        out = json.loads(r.stdout)
+        ids = {t["taskId"] for t in out["tasks"]}
+        self.assertNotIn("mother-tick", ids)
+        self.assertIn("mother-brief", ids)                   # the other routines still register
+        self.assertIn(msg, out["errors"][0])
+        r = run(["status"], env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("config:      valid", r.stdout)
+        self.assertIn("tick:        WARNING — " + msg, r.stdout)
+        self.assertIn("tick failed", r.stdout)
+        r = run(["runs", "--json"], env)
+        self.assertEqual(r.returncode, 2)
+        row = [x for x in json.loads(r.stdout) if x["id"] == "tick"][0]
+        self.assertEqual(row["state"], "failed")
+        self.assertIn(msg, row["note"])
+
+    def test_runs_tick_reports_an_offset_change_since_register(self):
+        self.init()
+        self.write_config()
+        env = dict(self.env, TZ="UTC")
+        r = run(["register"], dict(env, MOTHER_NOW="2026-10-20T09:00:00Z"))   # London on BST: offset -60
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tick = {t["taskId"]: t for t in json.loads(r.stdout)["tasks"]}["mother-tick"]
+        self.assertEqual((tick["offset_minutes"], tick["cronExpression"]), (-60, "5 5-20 * * 1,2,3,4,5"))
+        (self.ws / "runs.md").write_text("- 2026-10-21T09:05:00Z tick ok — x\n- 2026-10-27T09:05:00Z tick ok — x\n")
+
+        def row(now):
+            out = run(["runs", "--json"], dict(env, MOTHER_NOW=now))
+            return [x for x in json.loads(out.stdout) if x["id"] == "tick"][0]
+        self.assertEqual(row("2026-10-21T09:30:00Z")["state"], "ok")              # same offset: judged as usual
+        after = row("2026-10-27T09:30:00Z")                                       # London back on GMT: offset 0
+        self.assertEqual((after["state"], after["note"]), ("failed", "re-run mother register (time-zone offset changed)"))
+        r = run(["register"], dict(env, MOTHER_NOW="2026-10-27T09:00:00Z"))
+        self.assertEqual(row("2026-10-27T09:30:00Z")["state"], "ok")
 
     def test_runs_tick_judged_in_manager_timezone(self):
         self.init()
-        self.write_config()                              # manager in Europe/London, GMT on these dates
+        cfg = self.write_config()                        # manager in Europe/London, GMT on these dates
+        cfg["routines"]["tick"]["active_hours"] = "06:00-18:00"   # 11:30-23:30 on the machine: no midnight
+        (self.ws / "config.json").write_text(json.dumps(cfg))
         env = dict(self.env, TZ="Asia/Kolkata")          # the machine is 5:30 ahead
 
         def row(now, lines):
@@ -610,8 +649,8 @@ class CliTest(unittest.TestCase):
         self.assertEqual((r["state"], r["expected"]), ("ok", "2026-10-26T10:05Z"))
         r = row("2026-10-26T10:30:00Z", "- 2026-10-26T08:05:00Z tick ok — 0 new\n")
         self.assertEqual(r["state"], "missed")
-        r = row("2026-10-26T21:30:00Z", "- 2026-10-26T21:05:00Z tick ok — 0 new\n")   # 03:00 next day on the machine
-        self.assertEqual((r["state"], r["expected"]), ("ok", "2026-10-26T21:05Z"))
+        r = row("2026-10-26T17:30:00Z", "- 2026-10-26T17:05:00Z tick ok — 0 new\n")   # 23:00 on the machine
+        self.assertEqual((r["state"], r["expected"]), ("ok", "2026-10-26T17:05Z"))
         r = row("2026-10-26T05:30:00Z", "- 2026-10-23T21:05:00Z tick ok\n")          # 11:00 on the machine, 05:30 London
         self.assertEqual((r["state"], r["expected"]), ("ok", None))
 

@@ -155,7 +155,9 @@ In this order, reporting each step's result:
      manager declines. It is an interval routine: `mother register` prints it with a cron for each slot and a
      pointer that does no `git pull`. Register it like the rest; it runs only on the home machine. Its
      hours are in `manager.timezone` and `mother register` converts them to this machine's clock itself; if it
-     fails with "crosses midnight in this machine's time zone", offer narrower `active_hours` and register again.
+     exits 2 with "crosses midnight in this machine's time zone" in `errors`, tick was left out: register the
+     tasks it did print, then offer narrower `active_hours` and register again. If `mother runs` later says
+     "re-run mother register (time-zone offset changed)", register again and update the tick task's cron.
    - **The Now panel (offer, after the tick is registered).** "Want the list beside the chat? Run
      `/plugin install mother-now@mother`, then `/now` opens it." Mention its one setting, `mother_bin`: the
      default points at the marketplace clone; it can be set to the installed plugin's `bin/mother`. Don't

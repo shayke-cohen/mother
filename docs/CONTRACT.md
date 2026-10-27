@@ -39,7 +39,7 @@ people/<slug>.md           work items only, never assessments
 one-on-ones/<slug>/        next.md (queued topics) + YYYY-MM-DD.md (prep, then notes: topics and commitments only)
 journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for connect-the-dots; journal/commitments/YYYY-MM-DD.md for the commitment tracker; journal/brief/YYYY-MM-DD.md for the brief's triage list
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
-.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs),
+.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs), tick-register.json (the offset the tick cron was built with, §2),
                            now.json (the tick's Now list: items, Top 3, coverage; ids and links, no message bodies, no per-person counts),
                            now-state.json (the manager's done/snooze/Top 3 edits), now.lock (serialises both); all written atomically. Each item's `actions[]` is `{id (S<n>), label, prompt, task}`: `prompt` is always `mother now do <id>` (what the panel pastes); `task` is the routine's original instruction (`dots do A3`, `digest ok 12`, `draft a nudge to …`) that `mother now do` prints for the `mother:now` skill. Top 3 entries are `{rank, title, why, link, item_id, set_by (agent|manager), set_at, state}`: `set_at` is the ISO time the list was set (the tick's `generated_at` when it first proposed it, carried on later ticks; the edit time for `mother now top set|swap`, kept as `at` in now-state.json). Only `top set` and `top swap` make the list the manager's (`set_by: manager` on every entry, and no swap hint); `top done` marks one entry done and keeps every entry's `set_by` and `set_at`, so an agent list stays the agent's (its swap hint too). The tick sends a fresh proposal on the first tick of each local day; merge ignores it while a manager list for today exists. Which toasts fired is per-device, in the mod's store (`toasted`, keyed `<item id>@<first_seen>`, so an item asked for again toasts again), not in the workspace. `swap_hint` is null or `{title, why, link, item_id?}`; merge keeps `item_id` only when it names an item of this run, else takes the one item with the same `link`, else drops it (the hint stays)
 ```
@@ -62,9 +62,14 @@ runs.md                    one line per routine run: `- <ISO> <routine> <ok|part
   turns :05 into :35): `5 6-21 * * 1,2,3,4,5` for the defaults when the zones agree, `35 11-22 …` for
   `06:00-18:00` in London on a +05:30 machine. With `every: 30` and a half-hour offset the cron can fire once
   more at either end; the dispatcher skips that fire as outside active hours. A window that would cross the
-  machine's midnight fails `mother register` and `mother status` with `routines.tick.active_hours crosses
-  midnight in this machine's time zone; …` (days are never shifted). Re-register after a DST change that moves
-  the offset. `mother runs` judges `tick` in `manager.timezone`: missed only inside active hours on a
+  machine's midnight is not a config error (`validate` doesn't depend on the machine's zone): `mother register`
+  leaves tick out, still prints every other routine, adds `"errors": ["routines.tick.active_hours crosses
+  midnight in this machine's time zone; …"]` to its JSON, says so on stderr and exits 2 (days are never
+  shifted). `mother runs` shows tick `failed` with that note (exit 2, as for an invalid tick config), and
+  `mother status` prints it as a `tick: WARNING` line with `config: valid`. The tick task entry carries
+  `offset_minutes`, also kept in `.mother/tick-register.json`; when today's offset differs from it (a DST
+  change in one of the two zones), `mother runs` shows tick `failed` with `re-run mother register (time-zone
+  offset changed)` instead of missed slots. `mother runs` judges `tick` in `manager.timezone`: missed only inside active hours on a
   scheduled day, once 2x `every` has passed after the day's first slot with no `runs.md` line in 2x `every`.
 - A routine whose frontmatter says `sync: false` (`tick`) is machine-local: its pointer **omits** the
   `git pull --rebase` (`_pointer(…, pull=False)`: just `cd "<workspace>"`, then the mother:routine skill), and
