@@ -210,7 +210,8 @@ def _state_effect(iid: str, since: Optional[datetime], st_items: dict, now: date
     return None
 
 
-def _top_entries(raw, set_by: str) -> list:
+def _top_entries(raw, set_by: str, set_at: Optional[str] = None) -> list:
+    """Normalise raw entries. `set_at` is when the list was set: an entry's own value wins, else this."""
     out = []
     for e in list(raw or [])[:TOP_MAX]:
         if not isinstance(e, dict) or not e.get("title"):
@@ -218,6 +219,7 @@ def _top_entries(raw, set_by: str) -> list:
         out.append({
             "rank": len(out) + 1, "title": e["title"], "why": e.get("why", ""), "link": e.get("link"),
             "item_id": e.get("item_id"), "set_by": e.get("set_by") or set_by,
+            "set_at": e.get("set_at") or set_at,
             "state": "done" if e.get("state") == "done" else "open",
         })
     return out
@@ -345,7 +347,8 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         status = "partial"
     nxt = next_slot(now, s)
     today = now.astimezone(s.tz).date().isoformat()
-    top, top_date, hint = _pick_top(inp, prev, state, today)
+    top, top_date, hint = _pick_top(inp, prev, state, today, _iso(now))
+    hint = _resolve_hint(hint, items)
     _mark_top_done(top, {i["id"] for i in items}, set(prev_items), st_items)
     return {
         "version": VERSION,
@@ -367,12 +370,29 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
     }
 
 
-def _pick_top(inp: dict, prev: Optional[dict], state: dict, today: str):
+def _resolve_hint(hint, items: list):
+    """Keep `item_id` on a swap hint only if it names an item in this run; else take the one item whose
+    link equals the hint's link; else drop it. The hint itself is always kept."""
+    if not isinstance(hint, dict) or "item_id" not in hint:
+        return hint
+    hint = dict(hint)
+    iid = hint.get("item_id")
+    if iid and any(i["id"] == iid for i in items):
+        return hint
+    same = [i for i in items if hint.get("link") and i.get("link") == hint["link"]]
+    if len(same) == 1:
+        hint["item_id"] = same[0]["id"]
+    else:
+        del hint["item_id"]
+    return hint
+
+
+def _pick_top(inp: dict, prev: Optional[dict], state: dict, today: str, stamp: Optional[str] = None):
     """Top 3 today: the manager's list for today wins; else the list already set today stays as it
     is; else the first tick of the day takes the agent's proposal."""
     st_top = state.get("top")
     if isinstance(st_top, dict) and st_top.get("date") == today:
-        top = _top_entries(st_top.get("entries"), "manager")
+        top = _top_entries(st_top.get("entries"), "manager", st_top.get("at"))
         if prev and prev.get("top_date") == today:
             _carry_done(top, prev.get("top"))
         return top, today, None
@@ -380,7 +400,7 @@ def _pick_top(inp: dict, prev: Optional[dict], state: dict, today: str):
         top = copy.deepcopy(prev["top"])
         agent = all(e.get("set_by") != "manager" for e in top)
         return top, today, (inp.get("swap_hint") if agent else None)
-    return _top_entries(inp.get("top"), "agent"), today, inp.get("swap_hint")
+    return _top_entries(inp.get("top"), "agent", stamp), today, inp.get("swap_hint")
 
 
 def write_now(ws: Path, doc: dict) -> None:
@@ -481,7 +501,7 @@ def apply_edit(doc: dict, st: dict) -> dict:
     out["counts"] = {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS}
     top = (st or {}).get("top")
     if isinstance(top, dict) and top.get("date") and top["date"] >= str(out.get("top_date") or ""):
-        out["top"] = _top_entries(top.get("entries"), "manager")
+        out["top"] = _top_entries(top.get("entries"), "manager", top.get("at"))
         if top["date"] == doc.get("top_date"):
             _carry_done(out["top"], doc.get("top"))
         out["top_date"] = top["date"]
@@ -656,6 +676,6 @@ def _edit(verb: str, rest: list, ws: Path, cfg: dict, at: datetime, s: Schedule)
                 entries[int(rest[0]) - 1]["state"] = "done"
             else:
                 _fail("usage: mother now top set|swap|done ...")
-            st["top"] = {"date": today, "set_by": "manager", "entries": entries}
+            st["top"] = {"date": today, "set_by": "manager", "at": _iso(at), "entries": entries}
         write_now(ws, apply_edit(doc, st))
         save_state(ws, st)

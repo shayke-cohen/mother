@@ -151,7 +151,7 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
      review"); `item_id` is the item's id when it is on the list. If the manager already set the top
      (`set_by: manager` in the previous document), leave `top` out: tick never changes it.
    - **Later ticks:** leave `top` out. When a new on-you item clearly outranks the agent-set top by the same
-     ranking, set `swap_hint` to `{"title","why","link"}` ("consider swapping"); otherwise `swap_hint` is
+     ranking, set `swap_hint` to `{"title","why","link","item_id"?}` ("consider swapping"; `item_id` is the on-you item's id, which lets the panel swap it in); otherwise `swap_hint` is
      `null`. Never reshuffle the top yourself.
 
 6. **Merge.** Build one JSON object and pipe it to `${CLAUDE_PLUGIN_ROOT}/bin/mother now merge`:

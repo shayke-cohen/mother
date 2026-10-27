@@ -16,6 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import now  # noqa: E402
 
+
 UTC = timezone.utc
 with open(os.path.join(ROOT, "templates", "workspace", "config.example.json")) as _f:
     CFG = json.load(_f)
@@ -461,6 +462,70 @@ class ManagerState(unittest.TestCase):
         st = {"items": {}, "top": {"date": "2026-10-27", "set_by": "manager", "entries": [t("A", "x")]}}
         e = now.apply_edit(a, st)
         self.assertEqual((e["top_date"], e["top"][0]["state"]), ("2026-10-27", "open"))
+
+
+class TopSetAtAndHint(unittest.TestCase):
+    def test_agent_proposal_gets_set_at_and_keeps_it(self):
+        a = now.merge(inp(top=[t("A")]), None, {}, CFG, MORNING)
+        self.assertEqual(a["top"][0]["set_at"], iso(MORNING))
+        b = now.merge(inp(top=[t("X")]), a, {}, CFG, MORNING + H)
+        self.assertEqual(b["top"][0]["set_at"], iso(MORNING))
+        self.assertEqual(b["generated_at"], iso(MORNING + H))
+
+    def test_late_filled_proposal_is_stamped_when_proposed(self):
+        a = now.merge(inp(), None, {}, CFG, MORNING)
+        b = now.merge(inp(top=[t("A")]), a, {}, CFG, MORNING + H)
+        self.assertEqual(b["top"][0]["set_at"], iso(MORNING + H))
+
+    def test_manager_edit_records_at_and_carries_it(self):
+        st = {"items": {}, "top": {"date": "2026-10-27", "set_by": "manager", "at": iso(MORNING + H), "entries": [t("Z")]}}
+        a = now.merge(inp(top=[t("A")]), None, st, CFG, MORNING + 2 * H)
+        self.assertEqual((a["top"][0]["set_by"], a["top"][0]["set_at"]), ("manager", iso(MORNING + H)))
+        base = now.merge(inp(top=[t("A")]), None, {}, CFG, MORNING)
+        out = now.apply_edit(base, st)
+        self.assertEqual(out["top"][0]["set_at"], iso(MORNING + H))
+
+    def test_cli_top_edit_writes_at(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            now.write_now(ws, now.merge(inp(top=[t("A")]), None, {}, CFG, MORNING))
+            with redirect_stdout(io.StringIO()):
+                now.main(["top", "done", "1"], ws, CFG, MORNING + H)
+            st = now.load_state(ws)
+            self.assertEqual(st["top"]["at"], iso(MORNING + H))
+            self.assertEqual(now.load_now(ws)["top"][0]["set_at"], iso(MORNING + H))
+
+    def _hint_run(self, hint, *cands):
+        return now.merge(inp(*cands, top=[t("A")], swap_hint=hint), None, {}, CFG, NOW)["swap_hint"]
+
+    def test_hint_item_id_kept_when_it_names_an_item(self):
+        c = cand("review_requested", since=hours_ago(5))
+        iid = now.merge(inp(c), None, {}, CFG, NOW)["items"][0]["id"]
+        h = self._hint_run({"title": "T", "why": "w", "link": "https://nowhere.example.com", "item_id": iid}, c)
+        self.assertEqual(h["item_id"], iid)
+
+    def test_hint_item_id_resolved_by_unique_link(self):
+        c = cand("review_requested", since=hours_ago(5))
+        out = now.merge(inp(c), None, {}, CFG, NOW)["items"][0]
+        h = self._hint_run({"title": "T", "why": "w", "link": out["link"], "item_id": "bogus"}, c)
+        self.assertEqual(h["item_id"], out["id"])
+
+    def test_hint_item_id_dropped_when_unknown_or_link_ambiguous(self):
+        c = cand("review_requested", since=hours_ago(5))
+        h = self._hint_run({"title": "T", "why": "w", "link": "https://nowhere.example.com", "item_id": "bogus"}, c)
+        self.assertEqual(h, {"title": "T", "why": "w", "link": "https://nowhere.example.com"})
+        c2 = cand("unanswered_mention", since=hours_ago(5))
+        both = now.merge(inp(c, c2), None, {}, CFG, NOW)["items"]
+        self.assertEqual(len(both), 2)
+        self.assertEqual(both[0]["link"], both[1]["link"])
+        h = self._hint_run({"title": "T", "why": "w", "link": both[0]["link"], "item_id": "bogus"}, c, c2)
+        self.assertNotIn("item_id", h)
+
+    def test_hint_without_item_id_is_untouched(self):
+        h = {"title": "T", "why": "w", "link": "https://example.com/x"}
+        self.assertEqual(self._hint_run(h), h)
 
 
 import subprocess  # noqa: E402

@@ -39,7 +39,7 @@ export type NowTop = {
   item_id: string | null
   set_by: 'agent' | 'manager'
   state: 'open' | 'done'
-  set_at?: string   // not written by lib/now.py today; shown as "at HH:MM" when a future writer adds it
+  set_at?: string | null   // ISO time the list was set: the tick that proposed it, or the manager's edit
 }
 
 // What the tick's step 6 writes (routines/tick.md): a suggestion to swap; item_id only when it names a list item.
@@ -72,6 +72,7 @@ declare module 'claude-code' {
       doc: NowDoc | null
       error: string | null
       workspace: string | null
+      selected: string | null   // row holding the d/s/t/x hotkeys: an item id or top:<rank>
       snoozing: string | null   // id of the row whose snooze Select is open
     }
   }

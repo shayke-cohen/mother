@@ -8,6 +8,7 @@ export const docAtom = atom({ plugin: 'mother-now', key: 'doc' } as const, null)
 export const errorAtom = atom({ plugin: 'mother-now', key: 'error' } as const, null)
 export const workspaceAtom = atom({ plugin: 'mother-now', key: 'workspace' } as const, null)
 export const snoozingAtom = atom({ plugin: 'mother-now', key: 'snoozing' } as const, null)
+export const selectedAtom = atom({ plugin: 'mother-now', key: 'selected' } as const, null)
 
 const PANE = 'mother-now'
 const SNOOZES = ['1h', 'tomorrow', 'next-week'] as const
@@ -149,7 +150,7 @@ export function age(firstSeen: string, nowMs: number): string {
 // ---- writes ----------------------------------------------------------------------------------------
 
 // Run one `mother now …` verb, then re-read now.json at once. A failure toasts the first line of stderr.
-async function run($: Dollar, bin: string, loader: Loader, args: string[]): Promise<void> {
+async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null): Promise<void> {
   try {
     const ran = await $.process.run(['python3', bin, 'now', ...args])
     if (ran.exitCode !== 0) {
@@ -160,7 +161,7 @@ async function run($: Dollar, bin: string, loader: Loader, args: string[]): Prom
     $.ui.toast(`mother now ${args[0]} failed: ${(err as Error).message ?? String(err)}`)
   }
   await load($, bin, loader).catch(() => undefined)
-  await update($, snoozingAtom, () => null)
+  if (rowId) await update($, snoozingAtom, cur => (cur === rowId ? null : cur))
 }
 
 // The rank a new Top 3 entry takes: the next free one, else the highest rank not done; null = none.
@@ -170,22 +171,37 @@ export function lowestOpenRank(top: NowTop[]): number | null {
   return null
 }
 
+// The row a focused element belongs to: an item id, or `top:<rank>` for a Top 3 entry; null for the
+// controls that are not a row's own (the snooze Select, the swap hint).
+export function rowOfElement(key: string | undefined): string | null {
+  if (!key || key.startsWith('snooze-pick-')) return null
+  const top = /^top-done-(\d+)$/.exec(key)
+  if (top) return 'top:' + top[1]
+  return /^(?:done|snooze|maketop|doit)-(.+)$/.exec(key)?.[1] ?? null
+}
+
 // ---- the pane --------------------------------------------------------------------------------------
 
 type Ui = ReturnType<Dollar['ui']['resolve']>
 
-function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, snoozing: string | null, nowMs: number,
-                  go: (args: string[]) => Promise<void>) {
+function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, snoozing: string | null, selected: string | null, nowMs: number,
+                  go: (args: string[], rowId?: string | null) => Promise<void>) {
   const { Box, Text, Button, Link, Select } = ui
-  if (!doc) return <Text dimColor>Tick runs on the home machine; nothing here yet.</Text>
+  if (!doc) {
+    return error
+      ? <Text color="yellow">Couldn't read now.json.</Text>
+      : <Text dimColor>Tick runs on the home machine; nothing here yet.</Text>
+  }
 
   const tz = doc.timezone
   const at = (iso: string | undefined | null) => clock(iso, tz)
   const items = doc.items ?? []
   const top = doc.top ?? []
-  const used = new Set<string>()
-  // A hotkey belongs to the first row that offers the action (two on one hotkey: the later wins).
-  const hot = (k: string): string | undefined => (used.has(k) ? undefined : (used.add(k), k))
+  // Hotkeys belong to the selected row alone: the one the ring is on (`ui.focus`), else the first row.
+  const rows = [...top.filter(e => e.state !== 'done').map(e => 'top:' + e.rank),
+                ...['on_you', 'neglected', 'suggestion'].flatMap(k => items.filter(i => i.section === k).map(i => i.id))]
+  const current = selected && rows.includes(selected) ? selected : rows[0]
+  const hot = (row: string, k: string): string | undefined => (row === current ? k : undefined)
   const inTop = new Set(top.map(e => e.item_id).filter(Boolean))
   const rank = lowestOpenRank(top)
   const gaps = Object.entries(doc.coverage ?? {}).filter(([, c]) => c && c.status !== 'ok') as [string, NowCoverage][]
@@ -200,19 +216,19 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
         {i.unverified_since ? <Text color="yellow">{' unverified'}</Text> : null}
       </Box>
       <Box>
-        <Button key={'done-' + i.id} hotkey={hot('d')} onPress={() => go(['done', i.id])}>Done</Button>
-        <Button key={'snooze-' + i.id} hotkey={hot('s')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
+        <Button key={'done-' + i.id} hotkey={hot(i.id, 'd')} autoFocus={i.id === rows[0] ? true : undefined} onPress={() => go(['done', i.id], i.id)}>Done</Button>
+        <Button key={'snooze-' + i.id} hotkey={hot(i.id, 's')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
         {rank !== null && !inTop.has(i.id)
-          ? <Button key={'maketop-' + i.id} hotkey={hot('t')} onPress={() => go(['top', 'swap', String(rank), i.id])}>Make top 3</Button>
+          ? <Button key={'maketop-' + i.id} hotkey={hot(i.id, 't')} onPress={() => go(['top', 'swap', String(rank), i.id], i.id)}>Make top 3</Button>
           : null}
         {i.section === 'suggestion' && i.actions?.[0]
-          ? <Button key={'doit-' + i.actions[0].id} hotkey={hot('x')}
+          ? <Button key={'doit-' + i.id} hotkey={hot(i.id, 'x')}
               onPress={() => { void $.prompt.fill({ text: i.actions[0].prompt || `mother now do ${i.actions[0].id}`, mode: 'replace' }) }}>Do it</Button>
           : null}
       </Box>
       {snoozing === i.id
         ? <Select key={'snooze-pick-' + i.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
-            onSelect={value => go(['snooze', i.id, value])} />
+            onSelect={value => go(['snooze', i.id, value], i.id)} />
         : null}
     </Box>
   )
@@ -230,7 +246,7 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
           <Text dimColor={done} strikethrough={done}>{`${e.rank}. ${e.title}`}</Text>
           {e.link ? <Link href={e.link}>{' ↗'}</Link> : null}
         </Box>
-        {done ? null : <Button key={'top-done-' + e.rank} hotkey={hot('d')} onPress={() => go(['top', 'done', String(e.rank)])}>Done</Button>}
+        {done ? null : <Button key={'top-done-' + e.rank} hotkey={hot('top:' + e.rank, 'd')} autoFocus={'top:' + e.rank === rows[0] ? true : undefined} onPress={() => go(['top', 'done', String(e.rank)])}>Done</Button>}
       </Box>
     )
   }
@@ -298,14 +314,30 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'now' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Now' })
-    return { text: 'Now panel opened.' }
+    const opened = await $.ui.open({ id: PANE, title: 'Now' })
+    if (opened.isPlaced) return { text: 'Now panel opened.' }
+    // No surface draws the pane here (a narrow terminal, a remote surface): say the list in chat instead.
+    try {
+      const ran = await $.process.run(['python3', await motherBin($, configured), 'now', 'show'])
+      const text = String(ran.stdout ?? '').trim()
+      if (ran.exitCode === 0 && text) return { text }
+    } catch {
+      // fall through to the short message
+    }
+    return { text: "The Now panel can't be drawn here and `mother now show` failed; run it in a terminal." }
+  })
+
+  on('ui.focus', async ($, e, next) => {
+    // The engine names the element in `element`; the test kit's `$.ui.focus` passes its `key` through as is.
+    const row = rowOfElement(e.element ?? (e as { key?: string }).key)
+    if (row) await update($, selectedAtom, () => row)
+    return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const bin = await motherBin($, configured)
-    const go = (args: string[]) => run($, bin, loader, args)
+    const go = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId)
     return paneTree($, $.ui.resolve(e), await read($, docAtom), await read($, errorAtom), await read($, snoozingAtom),
-      await $.clock.now(), go)
+      await read($, selectedAtom), await $.clock.now(), go)
   })
 }
