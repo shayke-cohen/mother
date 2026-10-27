@@ -1092,7 +1092,9 @@ class TestWhatsapp(WhatsappCase):
             self.assertIn("invisible", why, t)
         for t in ("$'family \\U0001F468\\u200d\\U0001F469\\u200d\\U0001F467'", "$'flag \\U0001F1EE\\U0001F1F1'",
                   "$'thumbs \\U0001F44D\\U0001F3FD'", "$'keycap 1\\ufe0f\\u20e3'", "$'heart \\u2764\\ufe0f'",
-                  "$'\\u05e9\\u05c1\\u05b8\\u05dc\\u05d5\\u05b9\\u05dd'"):
+                  "$'\\u05e9\\u05c1\\u05b8\\u05dc\\u05d5\\u05b9\\u05dd'",
+                  "$'melting \\U0001FAE0 salute \\U0001FAE1'",  # newer than Python 3.9's Unicode tables
+                  "$'england \\U0001F3F4\\U000E0067\\U000E0062\\U000E0065\\U000E006E\\U000E0067\\U000E007F'"):
             self.send("ask", "mother whatsapp send --to Sam --text %s" % t)
 
     def test_no_signature_note_when_the_text_is_already_signed(self):

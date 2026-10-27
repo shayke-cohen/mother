@@ -1557,11 +1557,23 @@ def _plugin_name(root):
     return data.get("name") if ok and isinstance(data, dict) and isinstance(data.get("name"), str) else None
 
 
+# A subdivision flag (England, Scotland, Wales): the black flag, tag letters, the cancel tag. It renders as one flag.
+WA_TAG_FLAG_RE = re.compile("\U0001F3F4[\U000E0061-\U000E007A]{2,7}\U000E007F")
+
+
+def wa_hidden(ch):
+    import unicodedata
+    if ch in WA_HIDDEN_EXTRA:
+        return True
+    cat = unicodedata.category(ch)
+    if cat == "Cn" and 0x1F000 <= ord(ch) <= 0x1FAFF:
+        return False  # an emoji newer than this Python's Unicode tables (3.9 stops at Unicode 13)
+    return ch not in WA_HIDDEN_OK and cat in WA_HIDDEN_CATS
+
+
 def wa_unshowable(text):
     """The text holds a character the prompt can't show as it is sent (CONTRACT §5)."""
-    import unicodedata
-    return any(ch in WA_HIDDEN_EXTRA or (ch not in WA_HIDDEN_OK and unicodedata.category(ch) in WA_HIDDEN_CATS)
-               for ch in text)
+    return any(wa_hidden(ch) for ch in WA_TAG_FLAG_RE.sub("", text))
 
 
 def wa_is_plugin_cli(exe, cwd):
