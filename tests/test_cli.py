@@ -711,5 +711,76 @@ class CliTest(unittest.TestCase):
         self.assertIn("skipped — outside active hours", disp)
 
 
+class TestWhatsappConfig(unittest.TestCase):
+    # Reuse CliTest's fixtures without inheriting (and re-running) its tests.
+    setUp, tearDown, init, write_config = CliTest.setUp, CliTest.tearDown, CliTest.init, CliTest.write_config
+
+    BLOCK = {
+        "enabled": True,
+        "self_jid": "972500000099@s.whatsapp.net",
+        "max_per_day": 20,
+        "min_gap_seconds": 5,
+        "read": True,
+        "send": True,
+    }
+
+    def status_with(self, mutate):
+        self.init()
+        block = json.loads(json.dumps(self.BLOCK))
+        mutate(block)
+        self.write_config(whatsapp=block)
+        return run(["status"], self.env)
+
+    def test_valid_block_passes_status(self):
+        r = self.status_with(lambda b: None)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_example_config_ships_a_disabled_block(self):
+        wa = json.loads((ROOT / "templates/workspace/config.example.json").read_text())["whatsapp"]
+        self.assertIs(wa["enabled"], False)
+        self.assertEqual(set(wa), {"enabled", "self_jid", "max_per_day", "min_gap_seconds", "read", "send"})
+        self.init()
+        self.write_config()
+        self.assertEqual(run(["status"], self.env).returncode, 0)
+
+    def test_the_earlier_designs_keys_are_accepted_and_ignored(self):
+        """The manager's live config still has allow and approve_via: any value passes."""
+        for legacy in ({"allow": [{"jid": "972500000001@s.whatsapp.net", "name": "Dana", "team": "platform"}],
+                        "approve_via": ["slack_dm", "self_chat", "session"], "max_prompts_per_day": 10},
+                       {"allow": 5, "approve_via": [], "max_prompts_per_day": "lots"}):
+            r = self.status_with(lambda b: b.update(legacy))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_unknown_key_rejected(self):
+        r = self.status_with(lambda b: b.update(foo=1))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("whatsapp.foo", r.stdout)
+
+    def test_max_per_day_above_ceiling_rejected(self):
+        r = self.status_with(lambda b: b.update(max_per_day=51))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("whatsapp.max_per_day", r.stdout)
+
+    def test_bad_self_jid_rejected(self):
+        r = self.status_with(lambda b: b.update(self_jid="12345@g.us"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("whatsapp.self_jid", r.stdout)
+
+    def test_self_jid_required_when_enabled(self):
+        r = self.status_with(lambda b: b.pop("self_jid"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("whatsapp.self_jid", r.stdout)
+
+    def test_self_jid_optional_when_disabled(self):
+        r = self.status_with(lambda b: (b.pop("self_jid"), b.update(enabled=False)))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_other_limits_rejected(self):
+        for key, val in (("max_per_day", 0), ("min_gap_seconds", -1), ("read", "yes"), ("send", 1)):
+            r = self.status_with(lambda b: b.update({key: val}))
+            self.assertEqual(r.returncode, 1, key)
+            self.assertIn(f"whatsapp.{key}", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -132,7 +132,9 @@ no message sent before that yes.** In Edit mode, show a diff of the changed keys
 
 In this order, reporting each step's result:
 
-1. **Write `config.json`** in the workspace. Then `mother status` — it validates against the schema and
+1. **Write `config.json`** in the workspace. Carry the `whatsapp` block over unchanged, byte for byte in
+   meaning: the guard denies a write that changes it (only `mother whatsapp setup` in the
+   manager's own terminal does). Then `mother status` — it validates against the schema and
    fails loudly; fix and re-show if it does. Do not hand-wave a validation error.
 2. **Persona.** If the workspace `AGENTS.md` still carries template placeholders for the agent's name or
    the manager, fill them from the config.
@@ -182,6 +184,36 @@ In this order, reporting each step's result:
    including the "not on your PATH" note if there is one.
 9. Sync happens automatically at the end of the turn (`mother sync`). If the workspace has a remote and the
    sync reports a secret hit or conflict, surface it verbatim.
+
+## WhatsApp (optional)
+
+The manager sets up WhatsApp, not you. Never write or edit the `whatsapp` block of `config.json`, and never
+run `mother whatsapp setup`, `link` or `unlink`: they link WhatsApp to MOTHER, so the guard denies them to you.
+Offer WhatsApp when the manager asks for it, or when a `mother whatsapp` command says "reading is off" or
+"sending is off".
+
+Tell the manager to run this in their own terminal (not in this session: it needs their keyboard and shows a
+QR), with `${CLAUDE_PLUGIN_ROOT}` expanded to the absolute path:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" whatsapp setup
+```
+
+If `mother link` already put `mother` on their PATH, `mother whatsapp setup` is enough. It runs only on the
+home machine. Tell them what it will do, step by step; each step is skipped when already done, so a re-run
+is safe:
+
+| Step | What the manager sees |
+|---|---|
+| Bridge | Installs it (Node 20 or later; a minute of npm) |
+| Link | A QR: WhatsApp on the phone > Settings > Linked devices > Link a device (or `p` for a code typed on the phone, when the QR won't scan) |
+| Config | Turns WhatsApp on for the linked account; nothing to type |
+| Database | If it can't read WhatsApp's database: how to grant Full Disk Access, then run it again |
+
+There is no chat list to pick from and no approval setup: MOTHER may read any chat, may message only chats
+the manager has already used, and every message to someone else asks the manager in the permission prompt.
+When it finishes, run `mother whatsapp status` and report whether the bridge is linked and the database is
+readable.
 
 ## Rules
 

@@ -126,6 +126,14 @@
       "days": "all"
     }
   },
+  "whatsapp": {
+    "enabled": false,
+    "self_jid": "972500000099@s.whatsapp.net",
+    "max_per_day": 20,
+    "min_gap_seconds": 5,
+    "read": true,
+    "send": true
+  },
   "policy": {
     "auto_without_asking": [
       "own_dm",

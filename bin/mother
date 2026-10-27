@@ -14,6 +14,10 @@ Commands:
   path                         print the active workspace path
   link [dir]                   put `mother` on your PATH: symlink into dir (default ~/.local/bin)
   channels <cmd>               reply modes for team channels (`mother channels help`)
+  whatsapp <cmd>               read WhatsApp chats from the local database (chats, read) and send through the
+                               bridge (send; the guard asks first), install/stop/status (`mother whatsapp help`); home machine only
+  whatsapp setup | link | unlink
+                               the manager's guided WhatsApp setup and device link; own terminal only (a TTY; the guard denies them to the agent)
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   now merge|show|done|snooze|top|do
@@ -101,10 +105,14 @@ def save_config(ws: Path, cfg: dict) -> None:
     (ws / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
 
 
-TOP_KEYS = {"version", "agent", "manager", "workspace", "connectors", "teams", "routines", "policy"}
+TOP_KEYS = {"version", "agent", "manager", "workspace", "connectors", "teams", "routines", "policy", "whatsapp"}
 MODES = {"off", "watch", "mention", "draft", "auto"}
 TRIGGERS = {"manager", "team", "anyone"}
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+WA_KEYS = {"enabled", "self_jid", "max_per_day", "min_gap_seconds", "read", "send"}
+WA_LEGACY_KEYS = {"allow", "approve_via", "max_prompts_per_day"}  # the earlier design: accepted, ignored
+WA_MAX_PER_DAY_CEILING = 50
+WA_USER_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net", re.ASCII)
 
 
 TICK_EVERY = (30, 60, 120, 180, 240)
@@ -302,6 +310,36 @@ def validate(cfg: dict) -> list:
                         errs.append(f"routines.commitments.{k} must be an integer {lo}-{hi}")
                 if "draft_nudges" in r and not isinstance(r["draft_nudges"], bool):
                     errs.append("routines.commitments.draft_nudges must be true or false")
+    if "whatsapp" in cfg:
+        errs.extend(validate_whatsapp(cfg["whatsapp"]))
+    return errs
+
+
+def validate_whatsapp(wa) -> list:
+    errs = []
+    if not isinstance(wa, dict):
+        return ["whatsapp must be an object"]
+    for k in wa:
+        if k not in WA_KEYS and k not in WA_LEGACY_KEYS:
+            errs.append(f"unknown key whatsapp.{k}")
+
+    def is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+    for k in ("enabled", "read", "send"):
+        if k in wa and not isinstance(wa[k], bool):
+            errs.append(f"whatsapp.{k} must be true or false")
+    sj = wa.get("self_jid")
+    if sj is None:
+        if wa.get("enabled") is True:
+            errs.append("missing whatsapp.self_jid (required when whatsapp.enabled is true)")
+    elif not (isinstance(sj, str) and WA_USER_JID_RE.fullmatch(sj)):
+        errs.append("whatsapp.self_jid must be <digits>@s.whatsapp.net")
+    v = wa.get("max_per_day")
+    if v is not None and (not is_int(v) or not 1 <= v <= WA_MAX_PER_DAY_CEILING):
+        errs.append(f"whatsapp.max_per_day must be an integer 1-{WA_MAX_PER_DAY_CEILING}")
+    v = wa.get("min_gap_seconds")
+    if v is not None and (not is_int(v) or v < 0):
+        errs.append("whatsapp.min_gap_seconds must be an integer >= 0")
     return errs
 
 # ---------------------------------------------------------------- secret scan
@@ -1075,6 +1113,15 @@ def cmd_channels(args):
     channels.main(args)
 
 
+def cmd_whatsapp(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import whatsapp
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        return whatsapp.main(args)
+    ws = workspace()
+    whatsapp.main(args, load_config(ws), ws, validate=validate)
+
+
 def cmd_items(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import items
@@ -1107,7 +1154,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "items": cmd_items, "now": cmd_now, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 
