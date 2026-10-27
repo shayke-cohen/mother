@@ -20,6 +20,7 @@ rules/                     default policy text skills cite: outbound.md, privacy
 templates/workspace/       files `mother init` copies into a new workspace
 mods/now/                  the Now panel, a second plugin in the same marketplace (`/plugin install mother-now@mother`):
                            .claude-plugin/plugin.json (userConfig `mother_bin`), hooks/register.tsx (+ tests), types/index.d.ts;
+                           opens with `/now-panel` (the engine reserves `/now` for the mother:now skill);
                            reads `.mother/now.json`, writes only through `mother now done|snooze|top`, no network or MCP calls
 tests/                     stdlib unittest; `python3 -m unittest discover tests`
 ```

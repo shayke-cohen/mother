@@ -34,6 +34,9 @@ function doc(over: Record<string, unknown> = {}) {
   }
 }
 
+// Set by one test: the engine refuses the command name, as it does for a name another plugin's skill holds.
+let refuseCommand = false
+
 for (const surface of ['terminal', 'desktop'] as const) {
   // The files the fake host holds: path -> { text, mtimeMs }.
   async function boot($: any, on: any, files: Record<string, { text: string; mtimeMs: number }>, pathFails = false, held: Record<string, unknown> = {}, statErr = 'ENOENT', cli?: (argv: string[]) => { exitCode: number; stderr?: string; stdout?: string }) {
@@ -48,7 +51,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('state.set', (_: any, e: any, next: any) => { if (e.key === 'error') out.errors.push(e.value); return next(e) })
     on('prompt.submit', (_: any, e: any, next: any) => { out.submits++; return next(e) })
     on('ui.focus', () => ({}))
-    on('command.register', (_: any, e: any) => { out.commands.push(e.name); return { value: { command: e.name } } })
+    on('command.register', (_: any, e: any) => { if (refuseCommand) return { deny: `"/${e.name}" refused` }; out.commands.push(e.name); return { value: { command: e.name } } })
     on('ui.open', (_: any, e: any) => { out.opened.push(e.id); return { value: out.open } })
     on('prompt.fill', (_: any, e: any) => { out.fills.push({ text: e.text, mode: e.mode }); return { isFilled: true } })
     on('process.run', (_: any, e: any) => {
@@ -216,19 +219,30 @@ for (const surface of ['terminal', 'desktop'] as const) {
     return all.filter((b: any) => b.props.hotkey).map((b: any) => `${b.props.hotkey}:${b.key}`)
   }
 
-  test(`/now registers and opens the pane, on ${surface}`, async ($, on) => {
+  test(`/now-panel registers and opens the pane, on ${surface}`, async ($, on) => {
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
-    expect(out.commands).toContain('now')
-    const res: any = await $.command.run({ command: 'now', args: '' } as any)
+    expect(out.commands).toContain('now-panel')
+    const res: any = await $.command.run({ command: 'now-panel', args: '' } as any)
     expect(out.opened).toContain('mother-now')
     expect(res.text).toBe('Now panel opened.')
     expect(nowCalls(out)).toEqual([])
   })
 
-  test(`/now falls back to mother now show in chat when the pane is not placed, on ${surface}`, async ($, on) => {
+  test(`a refused command name still starts the status line, on ${surface}`, async ($, on) => {
+    refuseCommand = true
+    try {
+      const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
+      expect(out.commands).toEqual([])
+      expect(out.status.at(-1)).toMatch(/on you/)
+    } finally {
+      refuseCommand = false
+    }
+  })
+
+  test(`/now-panel falls back to mother now show in chat when the pane is not placed, on ${surface}`, async ($, on) => {
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
     out.open = { isPlaced: false, reason: 'no surface places panes' }
-    const res: any = await $.command.run({ command: 'now', args: '' } as any)
+    const res: any = await $.command.run({ command: 'now-panel', args: '' } as any)
     expect(nowCalls(out)).toEqual([['show']])
     expect(res.text).toMatch(/can't be drawn/)   // empty stdout counts as a failed show
   })
@@ -237,14 +251,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }, false, {}, 'ENOENT',
       () => ({ exitCode: 0, stdout: 'Top 3 (2026-10-26)\nOn you (3)\n' }))
     out.open = { isPlaced: false, reason: 'narrow' }
-    const res: any = await $.command.run({ command: 'now', args: '' } as any)
+    const res: any = await $.command.run({ command: 'now-panel', args: '' } as any)
     expect(res.text).toBe('Top 3 (2026-10-26)\nOn you (3)')
   })
 
   test(`the chat fallback says so when show fails, on ${surface}`, async ($, on) => {
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 2, stderr: 'boom' }))
     out.open = { isPlaced: false, reason: 'narrow' }
-    const res: any = await $.command.run({ command: 'now', args: '' } as any)
+    const res: any = await $.command.run({ command: 'now-panel', args: '' } as any)
     expect(res.text).toMatch(/mother now show/)
   })
 

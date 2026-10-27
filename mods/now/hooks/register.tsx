@@ -319,6 +319,8 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
   )
 }
 
+export const COMMAND = 'now-panel'
+
 export const register: Register = (on, options) => {
   const configured = String(options.mother_bin ?? DEFAULT_BIN)
   const loader = newLoader()
@@ -326,7 +328,13 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const bin = await motherBin($, configured)
-    await $.command.register({ name: 'now', description: 'Open the Now panel' })
+    // `/now` itself belongs to MOTHER's mother:now skill, so the engine refuses it for a plugin command.
+    // A refused name must not stop the poll, the status line or the toasts below.
+    try {
+      await $.command.register({ name: COMMAND, description: 'Open the Now panel beside the chat' })
+    } catch {
+      // carry on without the command
+    }
     const poll = () => load($, bin, loader).catch(() => undefined)
     await poll()
     timer?.cancel()          // a repeated session.start must not stack a second poll
@@ -334,7 +342,7 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'now' }, async $ => {
+  on('command.run', { command: COMMAND }, async $ => {
     const opened = await $.ui.open({ id: PANE, title: 'Now' })
     if (opened.isPlaced) return { text: 'Now panel opened.' }
     // No surface draws the pane here (a narrow terminal, a remote surface): say the list in chat instead.
