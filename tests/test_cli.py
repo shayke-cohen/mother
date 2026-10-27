@@ -552,7 +552,9 @@ class CliTest(unittest.TestCase):
 
     def test_routine_frontmatter_tick(self):
         text = (Path(__file__).resolve().parent.parent / "routines" / "tick.md").read_text()
-        fm = text.split("---")[1]
+        ls = text.splitlines()
+        idx = [i for i, l in enumerate(ls) if l == "---"]
+        fm = "\n".join(ls[idx[0] + 1:idx[1]])
         lines = {l.split(":", 1)[0]: l.split(":", 1)[1].strip() for l in fm.splitlines() if ":" in l and not l.startswith(" ")}
         self.assertEqual(lines["id"], "tick")
         self.assertEqual(lines["sync"].split("#")[0].strip(), "false")
@@ -560,6 +562,10 @@ class CliTest(unittest.TestCase):
         for cap in ("chat.read", "tracker.read", "mail.read", "calendar.read", "code.read"):
             self.assertIn(cap, lines["needs"])
         self.assertIn('active_hours: "06:00-22:00"', lines["default"])
+        self.assertIn(".mother/now.json", lines["writes"])
+        self.assertIn("runs.md", lines["writes"])
+        self.assertIn("manager.chat_dm", lines["sends"])
+        self.assertIn("slow_every", text)
         self.assertEqual(lines["config"].split("#")[0].strip(), "routines.tick")
         disp = (Path(__file__).resolve().parent.parent / "skills" / "routine" / "SKILL.md").read_text()
         self.assertIn("sync: false", disp)

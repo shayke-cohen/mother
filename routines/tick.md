@@ -2,7 +2,7 @@
 id: tick
 team_scoped: false
 description: Hourly pass in active hours that finds what is blocked on the manager and what the team is neglecting, and writes the Now list for the panel and status line.
-config: routines.tick             # every (minutes, default 60), active_hours, days, notify (dm|off), signals, thresholds; absent = off
+config: routines.tick             # every (minutes, default 60), active_hours, days, notify (none|dm), signals, thresholds; absent = off
 default: { every: 60, active_hours: "06:00-22:00", days: workdays }
 needs: [chat.read, tracker.read, mail.read, calendar.read, code.read]
 writes: [.mother/now.json, runs.md]
@@ -33,17 +33,22 @@ counted in **working hours/days** (inside `manager.workdays` and active hours, i
 Signal names below are used verbatim; they are the keys `mother now merge` knows.
 
 1. **Slow or fast.** Read the previous document with `mother now show --json` (none yet = first tick ever).
-   Let `every` be `routines.tick.every` (default 60) and `start` the start of `active_hours`. This tick is
-   **slow** when there is no `now.json`, or when (local hour:minute now, minus `start`) is a multiple of
-   `3 × every` minutes, counting from the slot (for defaults: the 06:05, 09:05, 12:05, 15:05, 18:05 and
-   21:05 slots). Otherwise it is **fast**.
+   Let `every` be `routines.tick.every` (default 60), `slow_every` be `routines.tick.slow_every` (default 3;
+   valid 1-6) and `start` the start of `active_hours`, all in `manager.timezone`. The **slot index** is
+   floor((local now - `start`) in minutes / `every`). This tick is **slow** when any of these holds:
+   (a) the slot index mod `slow_every` is 0;
+   (b) there is no `now.json`;
+   (c) `runs.md` has no `tick` line ending in `· slow` dated today, or the latest such line is older than
+   `slow_every` x `every` minutes (this catches up after a missed slot).
+   Otherwise it is **fast**. Worked example with the defaults (start 06:00, every 60, slow_every 3): 06:05 is
+   slot 0, slow; 07:05 is slot 1, fast; 08:05 is slot 2, fast; 09:05 is slot 3, slow.
    - Fast scans only the **on-you** signals plus `default_branch_red`.
    - Slow scans every enabled signal.
-   Call the scanned set `checked_signals`: exactly the enabled signals (per the rule above) whose source is
-   in scope. Merge closes items only for signals in this list, so never list a signal you did not scan.
-   A signal whose source could not be read is still listed only if it was *attempted* and reported as
-   `couldnt_check`; list it so merge keeps its items "unverified" instead of closing them. Signals that are
-   off are not listed.
+   Call the scanned set `checked_signals`: the enabled signals for this tick's kind (fast or slow), including
+   those whose source is not readable. Per step 4, a source excluded because its read capability is not `ok`
+   is `couldnt_check`, and its signals still go in `checked_signals` so merge keeps their items as
+   "unverified" instead of closing them. Signals that are off (config, or connector `none`/absent) and
+   signals the tick kind does not scan are not listed.
    The **first tick of the local day** is the one where there is no previous document, or its `generated_at`
    is before today's local midnight in `manager.timezone`.
 
@@ -164,7 +169,9 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    `manager.chat_dm` with first line `agent.signature`, listing each as `title — why — link`, nothing
    already announced in an earlier tick. Inside `manager.quiet_hours`, do not post: skip it and add
    `DM held (quiet hours)` to the note. If `chat.post` isn't `ok` or the post fails, the run is `partial`.
-   With `notify` off or unset, send nothing.
+   With `notify` `none` or unset, send nothing.
+   An item that turns `new` on a tick where the DM was held (quiet hours) or the post failed is **not**
+   announced on a later tick; the panel still shows it. That is accepted for v1.
 
 **Runs note:** the line `mother now merge` printed, then ` · slow` or ` · fast` appended, plus
 `couldn't check: <sources>` for any source in `coverage` that was `couldnt_check`, and

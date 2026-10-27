@@ -124,7 +124,7 @@ Write the `runs.md` line(s) last — even after an unexpected error, catch it an
 Note examples: `ok — 4 sources, DM sent`, `partial — chat search missing_scope; tracker ok; DM sent`,
 `failed — DM post expired`.
 
-If the routine's frontmatter says `sync: false`, don't run `mother sync` (and skip the pull in §1): the
+If the routine's frontmatter says `sync: false`, don't run `mother sync`: the
 routine's output is machine-local. Otherwise run `${CLAUDE_PLUGIN_ROOT}/bin/mother sync` yourself. The Stop hook also syncs, but only while the
 plugin is enabled; a run that relies on it alone leaves its work uncommitted on this machine whenever the
 hook doesn't load, and the next run then skips its pull. Sync is safe to run twice.
