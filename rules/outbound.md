@@ -116,7 +116,8 @@ The hook honours a grant only when all of these hold. Anything else, including a
 and the call asks.
 
 - **Scope-limited.** `scope` is one of `chat-post` (top-level only), `chat-reply` (thread reply, no broadcast),
-  `tracker-create`, `tracker-comment`, `tracker-transition`. Nothing else can be granted: email, calendar,
+  `tracker-create`, `tracker-comment`, `tracker-transition`, and `whatsapp` (one approved WhatsApp draft, cap 1,
+  written only by `mother whatsapp pending` from the manager's `ok <id>` in the DM). Nothing else can be granted: email, calendar,
   code host, deletions and scheduled messages always need a live yes.
 - **Target-limited.** A chat target must be a channel listed under a team in `config.json`, not `external`,
   and not `mode: off`. A tracker target must be a team's `tracker.project`. All issues in the call must belong

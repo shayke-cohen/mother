@@ -9,6 +9,8 @@ Commands:
                                      write a draft for an allowlisted chat with history (JSON)
   list [--json]                      open drafts
   drop ID                            delete a draft
+  pending                            stdin {"dm": [manager DM messages]}: record Slack `ok`/`no` replies, then
+                                     print {"send": [ids with a proven yes], "dropped": [ids]}
 
 The database is opened read-only (`mode=ro`). The allowlist is applied in SQL, so rows from other chats are
 never fetched. Nothing is copied to disk. Python 3.9 stdlib only.
@@ -22,6 +24,7 @@ import re
 import socket
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_DB = "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"
@@ -291,6 +294,285 @@ def list_drafts(ws: Path) -> list:
     return sorted(out, key=lambda d: d["created"])
 
 
+# ---------------------------------------------------------------- approval proof
+
+PATHS = ("session", "self_chat", "slack_dm")
+REPLY_RE = re.compile(r"^(ok|no)((?:[ \t]+w[a-z0-9]+)+|[ \t]+all)$", re.I)
+SESSION_MAX_HOURS = DRAFT_TTL_HOURS
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_GUARD = []
+
+
+def _guard():
+    """hooks/guard.py, imported lazily (it imports this module lazily too; no cycle at load time)."""
+    if not _GUARD:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mother_guard", str(PLUGIN_ROOT / "hooks" / "guard.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _GUARD.append(mod)
+    return _GUARD[0]
+
+
+def _state_dir() -> Path:
+    return Path(os.environ.get("MOTHER_STATE_DIR") or "~/.mother").expanduser()
+
+
+def _epoch(iso):
+    try:
+        return _dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_reply(text):
+    """("ok"|"no", [ids] | "all") when the whole message is the command, else None."""
+    if not isinstance(text, str):
+        return None
+    m = REPLY_RE.match(text.strip())
+    if not m:
+        return None
+    rest = m.group(2).split()
+    if [r.lower() for r in rest] == ["all"]:
+        return m.group(1).lower(), "all"
+    return m.group(1).lower(), [r.lower() for r in rest]
+
+
+def approve_via(cfg: dict) -> list:
+    v = _wa(cfg).get("approve_via")
+    if v is None:
+        return list(PATHS)
+    return [p for p in v if p in PATHS] if isinstance(v, list) else []
+
+
+def _jsonl(path: Path):
+    """Parsed dict lines of a JSONL file; [] when missing. Raises OSError when it exists but can't be read."""
+    if not path.exists():
+        return []
+    out = []
+    with open(str(path), encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                v = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(v, dict):
+                out.append(v)
+    return out
+
+
+def _prompts(ws: Path, path: str) -> list:
+    """[(epoch, [ids])] of prompts.jsonl entries for one path, oldest first."""
+    try:
+        rows = _jsonl(Path(ws) / ".mother" / "whatsapp" / "prompts.jsonl")
+    except OSError:
+        return []
+    out = []
+    for r in rows:
+        t = _epoch(r.get("at"))
+        if r.get("path") == path and t is not None and isinstance(r.get("ids"), list):
+            out.append((t, [str(i) for i in r["ids"]]))
+    return sorted(out, key=lambda x: x[0])
+
+
+def resolve_all(ws: Path, path: str, at: float, floor: float) -> list:
+    """`all` = the ids of the latest prompt on this path sent at or before `at`. A prompt older than `floor` (the
+    draft's creation) named an earlier draft and resolves to nothing."""
+    before = [p for p in _prompts(ws, path) if p[0] <= at]
+    if not before or before[-1][0] < floor:
+        return []
+    return before[-1][1]
+
+
+def _names(word, reply, draft_id, ws, path, at, floor):
+    if not reply or reply[0] != word:
+        return False
+    if reply[1] == "all":
+        return path != "session" and draft_id in resolve_all(ws, path, at, floor)
+    return draft_id in reply[1]
+
+
+def _session_hit(word, ws, draft_id, created, transcript_path, now):
+    if not isinstance(transcript_path, str) or not os.path.isfile(transcript_path):
+        return None
+    g = _guard()
+    with open(transcript_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if draft_id not in line.lower():
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            text = g.user_text(e)  # genuine human messages only
+            ts = g.parse_time(e.get("timestamp")) if isinstance(e, dict) else None
+            if not text or ts is None or ts <= created or ts > now + 60 or now - ts > SESSION_MAX_HOURS * 3600:
+                continue
+            if _names(word, parse_reply(text), draft_id, ws, "session", ts, created):
+                return "session:%s" % (e.get("uuid") or e.get("timestamp"))
+    return None
+
+
+def _self_chat_hit(word, ws, cfg, draft_id, created):
+    try:
+        bridge = {str(r.get("stanza")) for r in _jsonl(_state_dir() / "whatsapp" / "sent.jsonl") if r.get("stanza")}
+    except OSError:
+        return None  # can't tell the bridge's own messages from the manager's: no proof
+    floor = created
+    shown = [t for t, ids in _prompts(ws, "self_chat") if draft_id in ids and t >= created]
+    if shown:
+        floor = max(floor, shown[0])
+    for m in self_messages(cfg, _fmt(_dt.datetime.fromtimestamp(floor, _dt.timezone.utc))):
+        if not m.get("stanza") or str(m["stanza"]) in bridge:
+            continue  # sent by the bridge (a prompt or a send): MOTHER cannot approve itself
+        at = _epoch(m.get("at"))
+        if at is None or at < floor:
+            continue
+        if _names(word, parse_reply(m.get("text")), draft_id, ws, "self_chat", at, created):
+            return "self_chat:%s" % m["stanza"]
+    return None
+
+
+def _slack_hit(ws, cfg, draft_id, created, now):
+    g = _guard()
+    scopes, max_age = g.grant_limits(cfg)
+    if "whatsapp" not in scopes:
+        return None
+    data, ok = g.read_json(str(Path(ws) / ".mother" / "grants.json"))
+    if not ok or not isinstance(data, dict) or not isinstance(data.get("grants"), list):
+        return None
+    dms = {str(d) for d in g.dm_ids(cfg)}
+    for gr in data["grants"]:
+        v = g.valid_grant(gr, "whatsapp", draft_id, cfg, scopes, max_age, now)
+        if not v:
+            continue
+        src = gr["source"]
+        ts = g.parse_time(src.get("ts"))
+        if str(src.get("channel")) not in dms or ts is None or ts <= created:
+            continue  # the manager's DM only, and a yes given after this draft existed
+        return "slack_dm:%s" % v[0]
+    return None
+
+
+def _decision(word, ws, cfg, draft_id, transcript_path, now):
+    d = load_draft(ws, draft_id)
+    created = _epoch((d or {}).get("created"))
+    if not d or created is None or d.get("id") != draft_id:
+        return None
+    now = time.time() if now is None else now
+    via = approve_via(cfg)
+    if "session" in via:
+        ev = _session_hit(word, ws, draft_id, created, transcript_path, now)
+        if ev:
+            return {"path": "session", "evidence": ev}
+    if "self_chat" in via:
+        ev = _self_chat_hit(word, ws, cfg, draft_id, created)
+        if ev:
+            return {"path": "self_chat", "evidence": ev}
+    if word == "ok" and "slack_dm" in via:  # a Slack `no` is applied by `pending` at once (the draft is dropped)
+        ev = _slack_hit(ws, cfg, draft_id, created, now)
+        if ev:
+            return {"path": "slack_dm", "evidence": ev}
+    return None
+
+
+def rejected(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None) -> bool:
+    """True when the manager said `no` to this draft on an enabled path (session or self chat)."""
+    try:
+        return _decision("no", ws, cfg, draft_id, transcript_path, now) is not None
+    except Exception:
+        return False
+
+
+def prove(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None):
+    """{"path", "evidence"} for the manager's yes to this draft on an enabled path, else None. Fails closed:
+    any error, a missing or expired draft, or a `no` on any path means None."""
+    try:
+        if _decision("no", ws, cfg, draft_id, transcript_path, now):
+            return None
+        return _decision("ok", ws, cfg, draft_id, transcript_path, now)
+    except Exception:
+        return None
+
+
+def _write_grant(ws: Path, cfg: dict, draft_id: str, channel: str, ts: str) -> None:
+    g = _guard()
+    path = Path(ws) / ".mother" / "grants.json"
+    data, ok = g.read_json(str(path))
+    if not ok or not isinstance(data, dict) or not isinstance(data.get("grants"), list):
+        data = {"grants": []}
+    for gr in data["grants"]:
+        src = gr.get("source") if isinstance(gr, dict) else None
+        if isinstance(src, dict) and gr.get("scope") == "whatsapp" and gr.get("target") == draft_id \
+                and str(src.get("channel")) == channel and str(src.get("ts")) == str(ts):
+            return  # this message already granted it
+    sent = g.parse_time(ts)
+    data["grants"].append({"scope": "whatsapp", "target": draft_id, "uses": 1, "run": "whatsapp",
+                           "expires": _fmt(_dt.datetime.fromtimestamp(sent + DRAFT_TTL_HOURS * 3600,
+                                                                      _dt.timezone.utc)),
+                           "source": {"channel": channel, "user": str(g.owner_id(cfg)), "ts": str(ts)}})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(str(tmp), str(path))
+
+
+def _own_post(cfg: dict, m: dict) -> bool:
+    """A bot/app post, or the agent's own post through the manager's token (signed on its first line)."""
+    if m.get("bot_id") or m.get("bot_profile") or m.get("app_id"):
+        return True
+    if m.get("subtype") not in (None, "", "thread_broadcast"):
+        return True
+    agent = cfg.get("agent") or {}
+    marks = ["%s (AI)" % agent["name"]] if agent.get("name") else []
+    if isinstance(agent.get("signature"), str) and agent["signature"].strip():
+        marks.append(agent["signature"].strip())
+    first = str(m.get("text") or "").lstrip().split("\n", 1)[0]
+    return any(mk in first for mk in marks)
+
+
+def pending(ws: Path, cfg: dict, dm: list) -> dict:
+    """Apply the manager's Slack DM replies (grants for `ok`, drops for `no`), then list drafts with a proof."""
+    g = _guard()
+    owner = g.owner_id(cfg)
+    chat_dm = g.as_list((cfg.get("manager") or {}).get("chat_dm"))
+    dropped = []
+    if "slack_dm" in approve_via(cfg) and owner and chat_dm:
+        decided = set()
+        msgs = [m for m in dm or [] if isinstance(m, dict) and g.parse_time(m.get("ts")) is not None]
+        for m in sorted(msgs, key=lambda m: g.parse_time(m.get("ts"))):
+            if str(m.get("user")) != str(owner) or _own_post(cfg, m):
+                continue  # only the manager approves, and never through the agent's own text
+            reply = parse_reply(m.get("text"))
+            if not reply:
+                continue
+            at = g.parse_time(m.get("ts"))
+            word, ids = reply
+            if ids == "all":
+                ids = [i for i in resolve_all(ws, "slack_dm", at, 0) if i not in decided]
+            for i in ids:
+                d = load_draft(ws, i)
+                created = _epoch((d or {}).get("created"))
+                if i in decided or not d or created is None or at <= created:
+                    continue  # one decision per draft per batch; an old reply can't approve a newer same-id draft
+                if reply[1] == "all" and i not in resolve_all(ws, "slack_dm", at, created):
+                    continue  # that prompt was about an earlier draft with the same id
+                decided.add(i)
+                if word == "no":
+                    if drop_draft(ws, i):
+                        dropped.append(i)
+                else:
+                    _write_grant(ws, cfg, i, str(chat_dm[0]), str(m.get("ts")))
+    send = []
+    for d in list_drafts(ws):
+        if rejected(ws, cfg, d["id"]):
+            if drop_draft(ws, d["id"]):
+                dropped.append(d["id"])
+        elif prove(ws, cfg, d["id"]):
+            send.append(d["id"])
+    return {"send": send, "dropped": dropped}
+
+
 # ---------------------------------------------------------------- CLI
 
 def _fail(msg, code=1):
@@ -363,6 +645,23 @@ def cmd_list(cfg, args, ws):
         print('%s  %s  %s  "%s"' % (d["id"], d["created"], d["chat_name"], one if len(one) <= 60 else one[:57] + "..."))
 
 
+def cmd_pending(cfg, args, ws):
+    if args:
+        _fail("usage: mother whatsapp pending  (stdin: {\"dm\": [chat messages]})")
+    raw = sys.stdin.read()
+    try:
+        inp = json.loads(raw) if raw.strip() else {}
+    except ValueError as e:
+        _fail("pending: bad JSON on stdin: %s" % e)
+    if not isinstance(inp, dict) or not isinstance(inp.get("dm", []), list):
+        _fail("pending: stdin must be {\"dm\": [chat messages]}")
+    wa = _wa(cfg)
+    if not (wa.get("enabled") and wa.get("send", True)):
+        print(json.dumps({"send": [], "dropped": []}))
+        return
+    print(json.dumps(pending(ws, cfg, inp.get("dm") or []), indent=2))
+
+
 def cmd_drop(cfg, args, ws):
     if len(args) != 1:
         _fail("usage: mother whatsapp drop ID")
@@ -372,7 +671,7 @@ def cmd_drop(cfg, args, ws):
 
 
 READ_COMMANDS = {"read": cmd_read, "chats": cmd_chats}
-DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop}
+DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop, "pending": cmd_pending}
 
 
 def main(argv, cfg=None, ws=None):

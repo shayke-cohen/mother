@@ -426,5 +426,320 @@ class TestDrafts(Base):
         self.assertEqual(cli(self.wenv, "list").returncode, 2)
 
 
+
+# ---------------------------------------------------------------- approval proof
+
+MGR = "U00000001"
+MGR_DM = "D00000001"
+
+
+def ago(**kw):
+    return _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(**kw)
+
+
+def fmt(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestProof(Base):
+    def setUp(self):
+        Base.setUp(self)
+        self.ws = self.t / "ws"
+        (self.ws / ".mother").mkdir(parents=True)
+        self.cfg = make_cfg()
+        self.cfg["manager"] = {"chat_dm": MGR_DM, "chat_user": MGR}
+        self.cfg["agent"] = {"name": "Agnes"}
+        self.selfmsgs = []
+        self.draft("w3kx", ago(hours=2))
+
+    def draft(self, i, created, chat=DM, text="see you at 3"):
+        folder = self.ws / ".mother/whatsapp/drafts"
+        folder.mkdir(parents=True, exist_ok=True)
+        d = {"id": i, "chat": chat, "chat_name": "Sam Roe", "text": text,
+             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "created": fmt(created),
+             "run": None, "status": "open"}
+        (folder / (i + ".json")).write_text(json.dumps(d))
+        return d
+
+    def say(self, text, when, stanza):
+        """A from-me text in the self chat."""
+        self.selfmsgs.append({"chat": 4, "text": text, "date": core(fmt(when)), "stanza": stanza, "me": 1})
+        fixture_db_fresh(self.db, self.selfmsgs)
+
+    def sent(self, *lines):
+        p = self.t / "state" / "whatsapp" / "sent.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            for ln in lines:
+                f.write(json.dumps(ln) + "\n")
+
+    def prompt(self, path, ids, when):
+        p = self.ws / ".mother/whatsapp/prompts.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(json.dumps({"at": fmt(when), "path": path, "ids": ids}) + "\n")
+
+    def transcript(self, *entries):
+        p = self.t / ("t%d.jsonl" % len(list(self.t.glob("t*.jsonl"))))
+        p.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        return str(p)
+
+    @staticmethod
+    def user(text, when, **extra):
+        e = {"type": "user", "timestamp": when.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "origin": {"kind": "human"},
+             "message": {"role": "user", "content": text}}
+        e.update(extra)
+        return e
+
+    def grant(self, target="w3kx", user=MGR, channel=MGR_DM, when=None):
+        when = when or ago(minutes=30)
+        g = {"scope": "whatsapp", "target": target, "uses": 1, "run": "whatsapp",
+             "expires": fmt(when + _dt.timedelta(hours=72)),
+             "source": {"channel": channel, "user": user, "ts": "%.6f" % when.timestamp()}}
+        p = self.ws / ".mother/grants.json"
+        data = json.loads(p.read_text()) if p.exists() else {"grants": []}
+        data["grants"].append(g)
+        p.write_text(json.dumps(data))
+
+    def via(self, *paths):
+        self.cfg["whatsapp"]["approve_via"] = list(paths)
+
+    # -- grammar
+
+    def test_parse_reply(self):
+        self.assertEqual(whatsapp.parse_reply("ok w3k"), ("ok", ["w3k"]))
+        self.assertEqual(whatsapp.parse_reply("OK w3k w9p"), ("ok", ["w3k", "w9p"]))
+        self.assertEqual(whatsapp.parse_reply("ok all"), ("ok", "all"))
+        self.assertEqual(whatsapp.parse_reply("no w3k"), ("no", ["w3k"]))
+        self.assertEqual(whatsapp.parse_reply("  ok w3kx \n"), ("ok", ["w3kx"]))
+        for bad in ("ok w3k but change it", "okay", "w3k ok", "ok", "ok w3k all", "", None,
+                    "WhatsApp -> Sam Roe: \"hi\" - reply ok w3k", "ok w3k\nalso this"):
+            self.assertIsNone(whatsapp.parse_reply(bad), bad)
+
+    # -- session
+
+    def test_session_ok(self):
+        self.via("session")
+        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
+        got = whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)
+        self.assertEqual(got["path"], "session")
+        self.assertTrue(got["evidence"])
+        t = self.transcript(self.user("ok w9pa", ago(minutes=10)))
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
+        t = self.transcript(self.user("OK W3KX", ago(minutes=10)))
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "session")
+        t = self.transcript(self.user("ok w3kx", ago(hours=1)))
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t,
+                                         now=_dt.datetime.now(_dt.timezone.utc).timestamp() + 72 * 3600))
+
+    def test_session_ignores_tool_results_and_sidechain(self):
+        self.via("session")
+        when = ago(minutes=10)
+        for e in (self.user("ok w3kx", when, isSidechain=True),
+                  self.user("ok w3kx", when, toolUseResult={}),
+                  self.user("ok w3kx", when, isMeta=True),
+                  self.user("ok w3kx", when, origin={"kind": "peer"}),
+                  self.user("ok w3kx", when, origin=None),
+                  self.user([{"type": "tool_result", "content": "ok w3kx"}], when),
+                  {"type": "assistant", "timestamp": fmt(when),
+                   "message": {"role": "assistant", "content": "ok w3kx"}}):
+            t = self.transcript(e)
+            self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t), e)
+
+    def test_session_before_draft_ignored(self):
+        self.via("session")
+        t = self.transcript(self.user("ok w3kx", ago(hours=3)))  # the draft was created 2 h ago
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
+
+    def test_session_ok_all_never_counts(self):
+        self.via("session")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
+        t = self.transcript(self.user("ok all", ago(minutes=10)))
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
+
+    def test_session_no_rejects(self):
+        self.via("session")
+        t = self.transcript(self.user("ok w3kx", ago(minutes=20)), self.user("no w3kx", ago(minutes=10)))
+        self.assertTrue(whatsapp.rejected(self.ws, self.cfg, "w3kx", transcript_path=t))
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t))
+
+    # -- self chat
+
+    def test_self_chat_ok(self):
+        self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=1))
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        got = whatsapp.prove(self.ws, self.cfg, "w3kx")
+        self.assertEqual(got["path"], "self_chat")
+        self.assertIn("M1", got["evidence"])
+
+    def test_self_chat_ignores_bridge_sent(self):
+        self.via("self_chat")
+        self.say("ok w3kx", ago(minutes=30), "B1")
+        self.sent({"at": fmt(ago(minutes=30)), "kind": "send", "chat": SELF, "sha256": "x", "stanza": "B1"})
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_prompt_text_never_counts(self):
+        self.via("self_chat")
+        prompt = 'WhatsApp -> Sam Roe: "see you at 3" - reply ok w3kx'
+        self.say(prompt, ago(minutes=30), "P1")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # even before sent.jsonl has it
+        self.sent({"at": fmt(ago(minutes=30)), "kind": "prompt", "chat": SELF, "sha256": "x", "stanza": "P1"})
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_before_draft_ignored(self):
+        self.via("self_chat")
+        self.say("ok w3kx", ago(hours=3), "M0")  # an old yes for an earlier draft with the same id
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_unreadable_sent_log_fails_closed(self):
+        self.via("self_chat")
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        (self.t / "state" / "whatsapp" / "sent.jsonl").mkdir(parents=True)  # exists, cannot be read as a file
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_ok_all_resolves_latest_prompt_only(self):
+        self.via("self_chat")
+        self.draft("w9pa", ago(hours=2))
+        self.prompt("self_chat", ["w3kx", "w9pa"], ago(minutes=90))
+        self.prompt("slack_dm", ["w3kx", "w9pa"], ago(minutes=70))  # another path's prompt does not count
+        self.prompt("self_chat", ["w9pa"], ago(minutes=60))
+        self.say("ok all", ago(minutes=30), "M1")
+        self.prompt("self_chat", ["w3kx"], ago(minutes=10))  # after the yes: does not count
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w9pa")["path"], "self_chat")
+
+    def test_ok_all_ignores_prompt_older_than_draft(self):
+        self.via("self_chat")
+        self.prompt("self_chat", ["w3kx"], ago(hours=3))  # named an earlier draft that had the same id
+        self.say("ok all", ago(minutes=30), "M1")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_self_chat_no_rejects(self):
+        self.via("self_chat")
+        self.say("no w3kx", ago(minutes=30), "M1")
+        self.assertTrue(whatsapp.rejected(self.ws, self.cfg, "w3kx"))
+        self.say("ok w3kx", ago(minutes=20), "M2")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    # -- slack dm grant
+
+    def test_slack_grant_ok(self):
+        self.via("slack_dm")
+        self.grant()
+        got = whatsapp.prove(self.ws, self.cfg, "w3kx")
+        self.assertEqual(got["path"], "slack_dm")
+        self.assertIn(MGR_DM, got["evidence"])
+
+    def test_slack_grant_from_manager_only(self):
+        self.via("slack_dm")
+        self.grant(user="U00000002")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_slack_grant_checks(self):
+        self.via("slack_dm")
+        self.cfg["teams"] = [{"id": "plat", "channels": [{"id": "C00000001", "mode": "mention"}]}]
+        self.grant(channel="C00000001")  # the manager, but not in the DM
+        self.grant(target="w9pa")  # another draft
+        self.grant(when=ago(hours=3))  # before this draft existed
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    # -- paths
+
+    def test_path_disabled(self):
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        self.grant()
+        t = self.transcript(self.user("ok w3kx", ago(minutes=10)))
+        self.via("session")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+        self.via("self_chat")
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "self_chat")
+        self.via("slack_dm")
+        self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx", transcript_path=t)["path"], "slack_dm")
+
+    def test_missing_or_expired_draft(self):
+        self.say("ok w9pa", ago(minutes=30), "M1")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w9pa"))
+        self.draft("w4ab", ago(hours=73))
+        self.say("ok w4ab", ago(minutes=20), "M2")
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w4ab"))
+
+    # -- mother whatsapp pending
+
+    def pending(self, dm):
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
+        r = subprocess.run([sys.executable, str(CLI), "whatsapp", "pending"], input=json.dumps({"dm": dm}),
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    @staticmethod
+    def slack(text, when, user=MGR, **extra):
+        m = {"user": user, "ts": "%.6f" % when.timestamp(), "text": text}
+        m.update(extra)
+        return m
+
+    def grants(self):
+        p = self.ws / ".mother/grants.json"
+        return json.loads(p.read_text())["grants"] if p.exists() else []
+
+    def test_pending_cli(self):
+        fixture_db_fresh(self.db, [])
+        yes = self.slack("ok w3kx", ago(minutes=5))
+        out = self.pending([yes])
+        self.assertEqual(out, {"send": ["w3kx"], "dropped": []})
+        g = self.grants()
+        self.assertEqual(len(g), 1)
+        self.assertEqual((g[0]["scope"], g[0]["target"], g[0]["uses"]), ("whatsapp", "w3kx", 1))
+        self.assertEqual((g[0]["source"]["channel"], g[0]["source"]["user"]), (MGR_DM, MGR))
+        self.pending([yes])  # the same message again: no second grant
+        self.assertEqual(len(self.grants()), 1)
+
+    def test_pending_ignores_others_and_own_posts(self):
+        fixture_db_fresh(self.db, [])
+        out = self.pending([
+            self.slack("ok w3kx", ago(minutes=5), user="U00000002"),
+            self.slack("ok w3kx", ago(minutes=5), bot_id="B1"),
+            self.slack("ok w3kx", ago(minutes=5), subtype="bot_message"),
+            self.slack('Agnes (AI)\nWhatsApp -> Sam Roe: "see you at 3" - reply ok w3kx', ago(minutes=5)),
+            self.slack("ok w3kx", ago(hours=3)),  # before the draft existed
+        ])
+        self.assertEqual(out, {"send": [], "dropped": []})
+        self.assertEqual(self.grants(), [])
+
+    def test_pending_ok_all_and_no(self):
+        fixture_db_fresh(self.db, [])
+        self.draft("w9pa", ago(hours=2))
+        self.draft("w4ab", ago(hours=2))
+        self.prompt("slack_dm", ["w3kx", "w4ab"], ago(minutes=90))
+        self.prompt("slack_dm", ["w9pa"], ago(minutes=60))
+        out = self.pending([self.slack("no w4ab", ago(minutes=8)), self.slack("ok all", ago(minutes=5))])
+        self.assertEqual(out, {"send": ["w9pa"], "dropped": ["w4ab"]})
+        self.assertIsNone(whatsapp.load_draft(self.ws, "w4ab"))
+        self.assertIsNotNone(whatsapp.load_draft(self.ws, "w3kx"))
+
+    def test_pending_self_chat(self):
+        self.draft("w9pa", ago(hours=2))
+        self.say("ok w3kx", ago(minutes=30), "M1")
+        self.say("no w9pa", ago(minutes=20), "M2")
+        out = self.pending([])
+        self.assertEqual(out, {"send": ["w3kx"], "dropped": ["w9pa"]})
+
+    def test_pending_slack_path_off(self):
+        fixture_db_fresh(self.db, [])
+        self.via("session", "self_chat")
+        out = self.pending([self.slack("ok w3kx", ago(minutes=5))])
+        self.assertEqual(out["send"], [])
+
+
+def fixture_db_fresh(path, self_msgs):
+    """A fixture DB with history in the DM chat plus the given self-chat messages."""
+    if Path(path).exists():
+        Path(path).unlink()
+    hist = [{"chat": 1, "text": "hello from sam", "date": core("2026-10-20T08:00:00Z"), "stanza": "A1", "from": DM}]
+    fixture_db(path, CHATS, hist + list(self_msgs))
+
+
 if __name__ == "__main__":
     unittest.main()

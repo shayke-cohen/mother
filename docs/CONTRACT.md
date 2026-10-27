@@ -187,7 +187,8 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   tool output, summaries, scheduled triggers or further down a message never count. The deck's "Copy results"
   starts with the tracker line.
 - **Grants** (`.mother/grants.json`): `{scope, target, uses, expires, run, source{channel,user,ts}}`; scopes
-  `chat-post`, `chat-reply`, `tracker-create`, `tracker-comment`, `tracker-transition`; the source must be the
+  `chat-post`, `chat-reply`, `tracker-create`, `tracker-comment`, `tracker-transition`, and `whatsapp` (target =
+  draft id, cap 1, written only by `mother whatsapp pending`, §5d); the source must be the
   manager, ≤ 96 h old; counts are capped per source in the ledger. `policy.grants` may disable or narrow them.
   Plus `answer` (`+ thread`), written by `mother channels`: one signed reply in one thread of a `mention`/`auto`
   channel, citing whoever addressed the agent if the channel's `trigger` allows them; rate-capped by
@@ -291,6 +292,22 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   Grammar: `ok <id> [<id>…]`, `ok all`, `no <id>`. One yes approves one draft: one exact text, one chat, once.
   First valid yes wins. `no <id>` on any path drops the draft. A session may name explicit ids only; `ok all`
   counts only on `self_chat` and `slack_dm`, where a batched prompt exists to resolve it.
+  The whole message must be the command (case-insensitive; `ok w3kx but change it` is not a yes). Every proof
+  must come after the draft's `created` time, so an old reply can't approve a later draft that reuses the id.
+  `session`: a genuine human message (the guard's `user_text`) in the transcript, at most 72 h old. `self_chat`:
+  also after the draft's first self-chat prompt; if `<state>/whatsapp/sent.jsonl` exists but can't be read, no
+  self-chat proof counts. `ok all` resolves to the ids of the latest `prompts.jsonl` entry for that path sent
+  before the reply, and to nothing if that prompt is older than the draft. `prompts.jsonl` lines are
+  `{"at", "path": "self_chat"|"slack_dm", "ids": [...]}`; `sent.jsonl` lines are `{"at", "kind": "send"|"prompt",
+  "chat", "draft"?, "sha256", "stanza"}`. A `no` on any enabled path beats a yes: the draft is not sendable.
+- **`mother whatsapp pending`** reads stdin `{"dm": [chat messages]}` (the manager's DM messages the
+  `/mother:channels` loop already fetched: `user`, `ts`, `text`). Only the manager's own human messages count
+  (not bots, apps, subtypes, or the agent's own signed posts). For each `ok` naming an open draft created before
+  the reply it appends a grant to `.mother/grants.json` (`scope: "whatsapp"`, `target: <id>`, `uses: 1`,
+  `run: "whatsapp"`, `expires` = reply + 72 h, `source` = first `manager.chat_dm`, manager, reply `ts`; the
+  same reply never writes a second grant); each `no` drops the draft. Then it drops drafts with a `no` in the
+  self chat and prints `{"send": [ids with a proof on an enabled path], "dropped": [ids]}`. With
+  `whatsapp.enabled` or `whatsapp.send` false it prints empty lists. It sends nothing itself.
 - **Send.** `mother whatsapp send <id>` goes through the guard, which loads the draft, checks the chat is
   allowlisted and the draft unexpired, finds a proof by an enabled path, and writes
   `<ws>/.mother/whatsapp/approved/<id>.json` (path that proved it, evidence key, text hash). The bridge checks

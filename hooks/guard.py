@@ -50,7 +50,7 @@ ALWAYS_NEVER = ["credentials", "deletions", "payments"]
 
 # Grant scopes an unattended run may hold, with the ceiling on uses per cited source message.
 GRANT_SCOPES = {"chat-post": 3, "chat-reply": 3, "answer": 1, "tracker-create": 5, "tracker-comment": 5,
-                "tracker-transition": 10}
+                "tracker-transition": 10, "whatsapp": 1}  # whatsapp: written by `mother whatsapp pending` (§5d)
 GRANT_MAX_AGE_HOURS = 96
 
 # ------------------------------------------------------------------ small helpers
