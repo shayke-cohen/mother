@@ -254,7 +254,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     `prove()` returned, and the reason names that file.
   - `mother whatsapp prompt <id> [<id>…]` (a single command, ids only) is allowed when every id is an open draft
     and the PAUSED/config/enabled/home checks above pass (it reaches only the manager's own self chat), else
-    denied. `mother whatsapp read|chats|draft|list|drop|status|pending|link|unlink|help` pass the guard (not
+    denied. `mother whatsapp read|chats|draft|list|drop|status|pending|verify|link|unlink|help` pass the guard (not
     outbound; `link` shows a local QR, `drop` and `unlink` only reduce), alone or in a pipeline.
   - **State is off-limits to the agent.** The protected folders are `<ws>/.mother/whatsapp/`,
     `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`) and `~/.mother/whatsapp/`; every path
@@ -418,8 +418,15 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
 - **Send.** `mother whatsapp send <id>` goes through the guard (§5), which loads the draft, checks the chat is
   allowlisted and the draft unexpired, the daily cap and that it was not already sent, finds a proof by an
   enabled path, and writes `<ws>/.mother/whatsapp/approved/<id>.json` (`{"id", "chat", "sha256", "path",
-  "evidence", "at"}`: path that proved it, evidence key, text hash). The bridge checks
-  again: allowlist, approval file whose hash matches the draft, daily cap. **Approval lifecycle:** the guard
+  "evidence", "at", "transcript"?}`: path that proved it, evidence key, text hash, and the session transcript
+  the guard read when it had one). The bridge checks again: allowlist, approval file whose hash matches the
+  draft, daily cap, and the yes itself: before every send it runs `python3 <plugin>/bin/mother whatsapp verify
+  <id>` (no shell) and refuses with `no_approval` unless it exits 0. **`mother whatsapp verify <id>`** is
+  read-only and passes the guard: it loads `approved/<id>.json`, re-runs the proof on the evidence it records
+  (the recorded transcript for `session`, the local database for `self_chat`, the signed grant for `slack_dm`,
+  whose use the guard already consumed), and exits 0 only if a yes is found (no `no` on any path) and the
+  proof's sha256 equals both the approval's and `sha256` of the draft's current text; else exit 1 with the
+  reason on stderr (exit 2 when sending is off, like `draft`). **Approval lifecycle:** the guard
   creates `approved/<id>.json` (exclusive); the bridge renames it to `approved/<id>.used` after a send and to
   `approved/<id>.failed` on a definite failure. `.json` present = in flight (the guard denies another send);
   `.used` = sent (denied for good); `.failed` = a fresh `send` re-proves and approves again. `mother whatsapp

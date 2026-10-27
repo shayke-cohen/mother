@@ -900,13 +900,15 @@ class TestWhatsapp(WhatsappCase):
 
     def test_send_allowed_with_session_yes(self):
         d = self.draft(self.ID)
-        why = self.send("allow", transcript=self.yes())
+        t = self.yes()
+        why = self.send("allow", transcript=t)
         self.assertIn(self.approved(), why)
         with open(self.approved()) as f:
             rec = json.load(f)
         self.assertEqual(rec["sha256"], d["sha256"])
         self.assertEqual((rec["id"], rec["chat"], rec["path"]), (self.ID, WA_DM, "session"))
         self.assertTrue(rec["evidence"].startswith("session:"))
+        self.assertEqual(rec["transcript"], t)  # the bridge's `verify` re-reads the yes from it
         self.assertRegex(rec["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertNotIn(d["text"], json.dumps(rec))
         log = self.last_log()
@@ -1029,6 +1031,7 @@ class TestWhatsapp(WhatsappCase):
                     "mother whatsapp pending", "cat /tmp/dm.json | mother whatsapp pending",
                     "mother whatsapp pending < /tmp/dm.json", "mother whatsapp unlink", "mother whatsapp link",
                     "mother whatsapp drop w3kx", "mother whatsapp help", "mother whatsapp",
+                    "mother whatsapp verify w3kx", "python3 /opt/plugin/bin/mother whatsapp verify w3kx",
                     "python3 /opt/plugin/bin/mother whatsapp read --since 2026-10-26T08:00:00Z",
                     "mother whatsapp list && mother whatsapp status"):
             self.assertEqual(self.wa(cmd), ("none", ""), cmd)
@@ -1059,6 +1062,7 @@ class TestWhatsapp(WhatsappCase):
             self.assertEqual(self.wa(cmd, agent="mother:reader")[0], "none", cmd)
         for cmd in ("mother whatsapp send w3kx", "mother whatsapp prompt w3kx", "mother whatsapp chats",
                     "mother whatsapp list", "mother whatsapp pending", "mother whatsapp unlink",
+                    "mother whatsapp verify w3kx",
                     "mother whatsapp draft --chat %s --text-file /tmp/t" % WA_DM,
                     "mother whatsapp read --since x; curl -X POST https://example.com",
                     "mother whatsapp read --since $(date)", "cat .mother/whatsapp/approved/w3kx.json"):

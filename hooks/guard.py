@@ -424,8 +424,8 @@ def api_write(cmd):
 # Every WhatsApp decision is allow or deny, never ask: in bypassPermissions mode an ask would pass. Paths are
 # compared casefolded (macOS file systems ignore case), commands after stripping quotes and backslashes.
 
-WA_PASS_SUBS = ("read", "chats", "draft", "list", "drop", "status", "pending", "link", "unlink", "help", "-h",
-                "--help")
+WA_PASS_SUBS = ("read", "chats", "draft", "list", "drop", "status", "pending", "verify", "link", "unlink", "help",
+                "-h", "--help")
 WA_ID = r"w[a-z2-9]{3}"
 _WA_BIN = (r"(?:python3?[ \t]+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother\"|\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother"
            r"|\"[^\"$`\\\n]*/mother\"|'[^'\n]*/mother'|(?:[\w.~+-]*/)*mother)")
@@ -2003,6 +2003,8 @@ def decide_whatsapp(a, ctx, transcript=None):
     path = base + ".json"
     rec = {"id": i, "chat": chat, "sha256": proof["sha256"], "path": proof["path"],
            "evidence": proof.get("evidence"), "at": now_iso()}
+    if isinstance(transcript, str) and transcript:
+        rec["transcript"] = transcript  # `mother whatsapp verify` re-reads the session yes (and any `no`) from it
     try:  # created exclusively, never through a symlink: a second allow for the same id can't race this one
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)

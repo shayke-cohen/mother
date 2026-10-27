@@ -182,7 +182,8 @@ WhatsApp call is allow or deny, in every permission mode, bypass included (an as
   send. A second `send` while it is in flight, or after it was sent, is denied. A Slack `ok` counts only
   through the signed grant `mother whatsapp pending` writes; never write a `whatsapp` grant yourself.
 - `mother whatsapp prompt <ids>` (the self-chat ask) is allowed only for open drafts. Reading (`read`,
-  `chats`, `list`, `pending`, `status`) is not outbound. MOTHER's sub-agents may run only `mother whatsapp
+  `chats`, `list`, `pending`, `verify`, `status`) is not outbound. The bridge runs `mother whatsapp verify <id>`
+  before every send and refuses unless the yes still stands for the draft's current text. MOTHER's sub-agents may run only `mother whatsapp
   read`; channel sessions run no WhatsApp command.
 - **What this stops, and what it doesn't.** The guard and the bridge stop mistakes and injected instructions.
   They do not stop a deliberately evasive agent on the manager's own macOS account: such an agent could run a

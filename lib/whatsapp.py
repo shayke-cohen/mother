@@ -11,6 +11,8 @@ Commands:
   drop ID                            delete a draft
   pending                            stdin {"dm": [manager DM messages]}: record Slack `ok`/`no` replies, then
                                      print {"send": [ids with a proven yes], "dropped": [ids]}
+  verify ID                          exit 0 only if approved/ID.json still proves a yes for the draft's
+                                     current text (the bridge runs it before every send); else exit 1
 
 The database is opened read-only (`mode=ro`). The allowlist is applied in SQL, so rows from other chats are
 never fetched. Nothing is copied to disk. Python 3.9 stdlib only.
@@ -564,6 +566,36 @@ def prove(ws: Path, cfg: dict, draft_id: str, transcript_path=None, now=None):
         return None
 
 
+def verify(ws: Path, cfg: dict, draft_id: str):
+    """(True, why) when approved/<id>.json still stands: prove() run again on the evidence it records (the
+    transcript the guard read, the self chat, the signed DM grant) finds a yes for the draft's current text,
+    and that text's sha256 equals both the draft's stored hash and the approval's. Else (False, reason).
+    Read-only; the bridge runs it before every send."""
+    if not isinstance(draft_id, str) or not ID_RE.match(draft_id):
+        return False, "%s: not a draft id" % draft_id
+    p = Path(ws) / ".mother" / "whatsapp" / "approved" / (draft_id + ".json")
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, "%s: no approval record" % draft_id
+    if not isinstance(rec, dict) or rec.get("id") != draft_id or rec.get("path") not in PATHS \
+            or not isinstance(rec.get("sha256"), str):
+        return False, "%s: malformed approval record" % draft_id
+    d = load_draft(ws, draft_id)
+    if not d or not isinstance(d.get("text"), str):
+        return False, "%s: no open draft (missing or expired)" % draft_id
+    if rec.get("chat") != d.get("chat"):
+        return False, "%s: the approval names another chat" % draft_id
+    sha = hashlib.sha256(d["text"].encode("utf-8")).hexdigest()
+    transcript = rec.get("transcript") if isinstance(rec.get("transcript"), str) else None
+    proof = prove(ws, cfg, draft_id, transcript_path=transcript)
+    if not proof:
+        return False, "%s: no proven yes on re-check" % draft_id
+    if not (proof.get("sha256") == rec["sha256"] == d.get("sha256") == sha):
+        return False, "%s: text hash differs between draft, approval and proof" % draft_id
+    return True, "%s: verified via %s" % (draft_id, proof["path"])
+
+
 class _GrantsLock(object):
     """Exclusive lock on <ws>/.mother/grants.lock around a read-modify-write of grants.json."""
 
@@ -829,8 +861,18 @@ def cmd_drop(cfg, args, ws):
     print("dropped %s" % args[0])
 
 
+def cmd_verify(cfg, args, ws):
+    if len(args) != 1:
+        _fail("usage: mother whatsapp verify ID")
+    ok, why = verify(ws, cfg, args[0])
+    if not ok:
+        _fail("verify %s" % why)
+    print(why)
+
+
 READ_COMMANDS = {"read": cmd_read, "chats": cmd_chats}
-DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop, "pending": cmd_pending}
+DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop, "pending": cmd_pending,
+                  "verify": cmd_verify}
 
 
 def main(argv, cfg=None, ws=None):
@@ -844,7 +886,7 @@ def main(argv, cfg=None, ws=None):
     wa = _wa(cfg)
     if argv[0] in READ_COMMANDS and not (wa.get("enabled") and wa.get("read", True)):
         _fail("whatsapp reading is off (whatsapp.enabled / whatsapp.read in config.json)", 2)
-    if argv[0] == "draft" and not (wa.get("enabled") and wa.get("send", True)):
+    if argv[0] in ("draft", "verify") and not (wa.get("enabled") and wa.get("send", True)):
         _fail("whatsapp sending is off (whatsapp.enabled / whatsapp.send in config.json)", 2)
     if argv[0] in READ_COMMANDS:
         READ_COMMANDS[argv[0]](cfg, argv[1:])

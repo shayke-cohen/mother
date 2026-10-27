@@ -958,6 +958,130 @@ class TestProof(Base):
         self.assertEqual(out["send"], [])
 
 
+class TestVerify(Base):
+    """`mother whatsapp verify <id>`: the bridge's own re-check of the yes, from the evidence in approved/<id>.json."""
+
+    def setUp(self):
+        Base.setUp(self)
+        self.p = TestProof("test_parse_reply")  # borrow its fixture helpers on this workspace
+        self.p.t, self.p.db, self.p.env = self.t, self.db, self.env
+        self.ws = self.p.ws = self.t / "ws"
+        (self.ws / ".mother").mkdir(parents=True)
+        self.cfg = self.p.cfg = make_cfg()
+        self.cfg["manager"] = {"chat_dm": MGR_DM, "chat_user": MGR}
+        self.cfg["agent"] = {"name": "Agnes"}
+        self.p.selfmsgs = []
+        fixture_db_fresh(self.db, [])
+        self.d = self.p.draft("w3kx", ago(hours=2))
+        self.t_ok = self.p.transcript(self.p.user("ok w3kx", ago(minutes=10)))
+
+    def approve(self, path="session", sha=None, transcript=True, **extra):
+        """approved/<id>.json as the guard writes it."""
+        rec = {"id": "w3kx", "chat": DM, "sha256": sha or self.d["sha256"], "path": path,
+               "evidence": "%s:x" % path, "at": fmt(ago(minutes=5))}
+        if transcript is True:
+            rec["transcript"] = self.t_ok
+        elif transcript:
+            rec["transcript"] = transcript
+        rec.update(extra)
+        folder = self.ws / ".mother/whatsapp/approved"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "w3kx.json").write_text(json.dumps(rec))
+        return rec
+
+    def verify(self, i="w3kx"):
+        return whatsapp.verify(self.ws, self.cfg, i)
+
+    def test_session_yes_verifies(self):
+        self.approve()
+        self.assertEqual(self.verify(), (True, "w3kx: verified via session"))
+
+    def test_no_record(self):
+        ok, why = self.verify()
+        self.assertFalse(ok)
+        self.assertIn("no approval", why)
+        (self.ws / ".mother/whatsapp/approved").mkdir(parents=True)
+        (self.ws / ".mother/whatsapp/approved/w3kx.json").write_text("{not json")
+        self.assertFalse(self.verify()[0])
+        self.approve()
+        self.assertFalse(self.verify("w9pa")[0])  # a record for another id proves nothing
+        self.assertFalse(self.verify("../w3kx")[0])
+
+    def test_record_for_other_id_or_chat(self):
+        self.approve(id="w9pa")
+        self.assertFalse(self.verify()[0])
+        self.approve(chat=GROUP)
+        self.assertFalse(self.verify()[0])
+        self.approve(path="email")
+        self.assertFalse(self.verify()[0])
+
+    def test_draft_text_changed_after_approval(self):
+        self.approve()
+        text = "see you at 4"
+        d = dict(self.d, text=text, sha256=hashlib.sha256(text.encode("utf-8")).hexdigest())
+        (self.ws / ".mother/whatsapp/drafts/w3kx.json").write_text(json.dumps(d))  # consistent, but not what was approved
+        ok, why = self.verify()
+        self.assertFalse(ok)
+        d["sha256"] = self.d["sha256"]  # text edited, stored hash left alone
+        (self.ws / ".mother/whatsapp/drafts/w3kx.json").write_text(json.dumps(d))
+        self.assertFalse(self.verify()[0])
+
+    def test_record_hash_differs(self):
+        self.approve(sha="0" * 64)
+        ok, why = self.verify()
+        self.assertFalse(ok)
+        self.assertIn("hash", why)
+
+    def test_session_needs_recorded_transcript(self):
+        self.approve(transcript=False)
+        self.assertFalse(self.verify()[0])
+        self.approve(transcript=self.p.transcript(self.p.user("ok w9pa", ago(minutes=10))))
+        self.assertFalse(self.verify()[0])
+        self.approve(transcript=str(self.t / "gone.jsonl"))
+        self.assertFalse(self.verify()[0])
+
+    def test_no_after_yes(self):
+        t = self.p.transcript(self.p.user("ok w3kx", ago(minutes=20)), self.p.user("no w3kx", ago(minutes=5)))
+        self.approve(transcript=t)
+        self.assertFalse(self.verify()[0])
+
+    def test_expired_or_dropped_draft(self):
+        self.approve()
+        whatsapp.drop_draft(self.ws, "w3kx")
+        self.assertFalse(self.verify()[0])
+
+    def test_self_chat_yes_verifies(self):
+        self.p.prompt("self_chat", ["w3kx"], ago(hours=1))
+        self.p.say("ok w3kx", ago(minutes=30), "M1")
+        self.approve(path="self_chat", transcript=False)
+        self.assertEqual(self.verify(), (True, "w3kx: verified via self_chat"))
+
+    def test_slack_yes_verifies_after_its_grant_is_used(self):
+        self.p.grant()
+        self.approve(path="slack_dm", transcript=False)
+        self.assertTrue(self.verify()[0])  # the guard consumed the grant's one use; the proof still stands
+
+    def test_cli(self):
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
+        r = cli(env, "verify", "w3kx")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no approval", r.stderr)
+        self.approve()
+        r = cli(env, "verify", "w3kx")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(self.d["text"], r.stdout + r.stderr)
+        self.assertEqual(cli(env, "verify").returncode, 1)
+        self.assertEqual(cli(env, "verify", "w3kx", "w9pa").returncode, 1)
+        self.cfg["whatsapp"]["send"] = False
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        self.assertEqual(cli(env, "verify", "w3kx").returncode, 2)
+        self.cfg["whatsapp"]["send"] = True
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        r = cli(dict(env, MOTHER_HOSTNAME="laptop-b"), "verify", "w3kx")
+        self.assertNotEqual(r.returncode, 0)
+
+
 def fixture_db_fresh(path, self_msgs):
     """A fixture DB with history in the DM chat plus the given self-chat messages."""
     if Path(path).exists():
