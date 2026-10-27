@@ -1379,5 +1379,76 @@ class TestWhatsappFixRound2(WhatsappCase):
             self.assertTrue(a is None or a["kind"] in ("whatsapp", "config", "code", "credential", "deletion"), line)
 
 
+class TestWhatsappFixRound4(WhatsappCase):
+    """Review fix round 4: plain globs, many wildcards, env-prefixed subcommands, git clean."""
+
+    deny_all = TestWhatsappFixRound2.deny_all
+    pass_all = TestWhatsappFixRound2.pass_all
+
+    def test_plain_globs_pass(self):
+        """A pattern that is only wildcards and / names nothing in particular, even for rm -rf or cp -R."""
+        os.makedirs(os.path.join(self.ws, "memory"))
+        self.pass_all(['rm -rf "$D"/*', 'cp -R "$A"/* "$B"/', 'chmod -R u+w "$DIR"/*', 'rm -rf "$TMPDIR"/*/*',
+                       'mv "$A"/* "$B"'], cwd=os.path.join(self.ws, "memory"))
+        # literal text still counts
+        self.deny_all(["rm -rf ~/*", 'rm -rf "$HOME"/*', "rm -rf ~/.mother/what*", "rm -rf %s/*" % self.ws,
+                       'cd "$X" && rm -rf .mother'])
+
+    def in_process(self, line):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("guard_rx", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        old = {k: os.environ.get(k) for k in ("HOME", "MOTHER_STATE_DIR")}
+        os.environ.update(HOME=self.home, MOTHER_STATE_DIR=self.sdir)
+        try:
+            spec.loader.exec_module(g)
+            ctx = g.Ctx()
+            ctx.ws = self.ws
+            t = time.time()
+            a = g.classify_bash(line, self.tmp, ctx)
+            return a, time.time() - t
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_many_wildcards_are_fast(self):
+        """Runs of wildcards can't make the matcher backtrack past the hook's timeout."""
+        for word in ["*" * 33 + "x", "?*" * 30 + "x", "*a" * 30 + "x", "*[a-z]" * 30 + "x", "{a,b}*" * 20 + "x"]:
+            a, took = self.in_process("ls ~/.mother/%s; rm ~/.mother/whatsapp/sent.jsonl" % word)
+            self.assertEqual((a or {}).get("op"), "state", word)
+            self.assertLess(took, 1.0, word)
+            a, took = self.in_process("rm -rf %s/%s" % (self.ws, word))
+            self.assertLess(took, 1.0, word)
+
+    def test_env_prefixed_subcommands(self):
+        """A literal NAME=value prefix is read like `export …;`: passing subcommands pass, sends still need proof."""
+        self.pass_all(["MOTHER_STATE_DIR=/tmp/x python3 bin/mother whatsapp status",
+                       "MOTHER_STATE_DIR=/tmp/x mother whatsapp read", "A=1 B='two' mother whatsapp list", "NO_COLOR= mother whatsapp status",
+                       'MOTHER_STATE_DIR="/tmp/x y" mother whatsapp chats 2>&1',
+                       'T=$(mktemp -d); MOTHER_STATE_DIR=$T python3 bin/mother whatsapp status; rm -rf "$T"'])
+        ok = self.yes()
+        self.deny_all(["MOTHER_STATE_DIR=/tmp/x mother whatsapp send w3kx",
+                       "MOTHER_STATE_DIR=/tmp/x python3 bin/mother whatsapp prompt w3kx",
+                       "PYTHONPATH=/tmp/x python3 bin/mother whatsapp status",
+                       "DYLD_INSERT_LIBRARIES=/tmp/x.dylib mother whatsapp status",
+                       "X=$(true) mother whatsapp status"], transcript=ok)
+        self.assertFalse(os.path.exists(self.approved()))
+
+    def test_git_clean_on_protected_folders_denied(self):
+        ws, st = self.ws, self.sdir
+        os.makedirs(st)
+        os.makedirs(os.path.join(ws, "memory"))
+        self.deny_all(["git -C %s clean -fdx" % ws, "git -C %s/.mother clean -fdX" % ws, "cd %s && git clean -fdx" % ws,
+                       "git --work-tree=%s clean -fd" % ws, "git -C %s clean -ffdx" % st])
+        self.deny_all(["git clean -fdx", "git clean -xdf -- ."], cwd=ws)
+        self.deny_all(["git clean -fdx"], cwd=st)
+        self.pass_all(["git -C /src/repo clean -fdx", "git -C %s status" % ws, "git -C %s clean -n" % ws,
+                       "git clean --dry-run -dx", "git log --grep clean"], cwd=ws)
+        self.pass_all(["git clean -fdx"], cwd=os.path.join(ws, "memory"))
+
+
 if __name__ == "__main__":
     unittest.main()

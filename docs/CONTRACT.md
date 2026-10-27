@@ -223,7 +223,11 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     - a `mother` command (resolved) whose first argument is `whatsapp` and whose subcommand is `send` or
       `prompt` is `compound` (deny); any other `whatsapp` subcommand must be a passing one, with its raw
       simple command plain, `$VAR` or quoted arguments and redirections (`>`, `>>`, `<`, `<<`, `2>&1`, `&>`; no
-      `$( )` or backticks), run directly (not under a wrapper), else `unknown` (deny). A computed first
+      `$( )` or backticks), run directly (not under a wrapper), else `unknown` (deny). Leading `NAME=value`
+      prefixes with such a value read like `export NAME=value;` (`MOTHER_STATE_DIR=/tmp/x mother whatsapp
+      status` passes), except `PATH`, `ENV`, `BASH_ENV`, `PYTHON*`, `DYLD_*`, `LD_*`, `PERL5*` and
+      `NODE_OPTIONS`, which change what code runs (`unknown`); a prefixed `send` or `prompt` is still `compound`
+      (it is not the exact shape). A computed first
       argument or subcommand, or `mother` under `xargs`, is `unknown`;
     - unquoted words spelling `mother whatsapp send|prompt` anywhere in the line (`mother whatsapp⏎send w3kx`),
       or that text anywhere in a line where a shell or interpreter reads code from a pipe or heredoc, are
@@ -266,8 +270,10 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
       hold a `/`), each `*` `?` `[…]` a glob within one folder (quoted ones too). It is denied when it, or a
       prefix of it ending at a `/`, matches a protected path case-insensitively (`~/.mo${E}ther/wh*`,
       `"$W"/.mot${E}her/whats${E}app/…`, `~/.mother/*`). A word, or prefix, that is only wildcards and `/`
-      names nothing in particular and is skipped (`cd "$W"`, `rm -rf "$D"/*`). After a `cd` to an unresolved
-      folder, later relative words are matched as `.*/word`;
+      names nothing in particular and is skipped, here and in the destructive check below (`cd "$W"`,
+      `rm -rf "$D"/*`, `cp -R "$A"/* "$B"/`). After a `cd` to an unresolved folder, later relative words are
+      matched as `.*/word`. Matching takes time linear in the word and the path, however many wildcards it
+      holds (runs of them collapse to one);
     - a word with an unresolved part next to the text `.mother`, `whatsapp`, `bridge.sock` or `grant.key` (no
       spaces in it): `cat $UNKNOWN/.mother/x`.
     Destructive or copying commands (`rm`, `rmdir`, `unlink`, `mv`, `cp`, `rsync`, `tar`, `ditto`, `zip`,
@@ -275,7 +281,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     are also **denied** when an argument names a folder that holds the state: `~/.mother`, `<state>`, `<ws>`,
     `<ws>/.mother`; and, for a recursive one (`rm`, `rmdir`, `mv`, `tar`, `zip`, `unzip`, `rsync`, `ditto`,
     `shred`, `trash`, `find`, and `cp`/`chmod`/`chown`/`chflags` with `-r`/`-R`/`-a`), any folder above them
-    except `/` (`find ~ … -delete`, `tar cf x.tar .` in the workspace, `cp -r <state> /tmp`). Reading and
+    except `/` (`find ~ … -delete`, `tar cf x.tar .` in the workspace, `cp -r <state> /tmp`). `git clean`
+    (not `-n`/`--dry-run`) is recursive the same way: denied when it runs in any of those folders (its cwd,
+    a `cd`, `-C`, `--work-tree` or a pathspec: `git -C <ws> clean -fdx`, `git clean -fdx` in `<state>`). Reading and
     listing those folders, and work inside the workspace, pass (`ls ~/.mother`, `cd "$W" && git status`,
     `cp a.md "$W"/memory/`).
     Write/Edit/MultiEdit/NotebookEdit anywhere under a protected folder is **denied** (not asked). Only

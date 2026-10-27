@@ -436,6 +436,8 @@ WA_SEND_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+send[ \t]+(%s)\Z" % (_WA_BIN, W
 WA_PROMPT_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+prompt((?:[ \t]+%s)+)\Z" % (_WA_BIN, WA_ID))
 WA_PASS_RE = re.compile(r"^%s[ \t]+whatsapp(?:[ \t]+(?:%s)(?:[ \t]+%s)*)?(?:%s)*\Z" % (
     _WA_BIN, "|".join(re.escape(x) for x in WA_PASS_SUBS), _WA_ARG, _WA_REDIR))
+WA_ENV_PREFIX_RE = re.compile(r"([A-Za-z_]\w*)=(?:%s)?[ \t]+" % _WA_ARG)  # a value as a passing argument
+WA_ENV_CODE_RE = re.compile(r"(?:PATH|ENV|BASH_ENV|PYTHON\w*|DYLD_\w*|LD_\w*|PERL5\w*|NODE_OPTIONS)\Z", re.I)
 WA_READ_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+read(?:[ \t]+[^\s;&|<>`$()\\'\"]+)*\Z" % _WA_BIN)
 WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:approved|drafts|session)(?=/|$|[\s;&|)])"
                          r"|whatsapp/(?:sent|prompts)\.jsonl|whatsapp/grant\.key", re.I)
@@ -797,28 +799,67 @@ def _wa_glob_atoms(text, active, braces):
     return out
 
 
-def _wa_rx(atoms):
-    out = []
-    for a in atoms:
-        if a[0] == "c":
-            out.append(re.escape(a[1].casefold()))
-        elif a[0] == "seg":
-            out.append("[^/]*")
-        elif a[0] == "one":
-            out.append("[^/]")
-        elif a[0] == "any":
-            out.append(".*")
-        else:
-            body = a[1].casefold()
-            neg = body[:1] in ("!", "^")
-            body = (body[1:] if neg else body).replace("\\", "\\\\").replace("[", "\\[")
-            cls = "[%s%s]" % ("^" if neg else "", body or "\\]")
-            try:
-                re.compile(cls)
-            except re.error:
-                cls = "[^/]"
-            out.append(cls)
-    return "".join(out)
+class _WaGlob(object):
+    """A path pattern from _wa_glob_atoms, matched casefolded in time linear in the pattern times the text (a
+    regex of many wildcards backtracks past the hook's timeout). Runs of wildcards are collapsed first."""
+
+    def __init__(self, atoms):
+        self.atoms = []
+        for a in atoms:
+            if a[0] == "c":
+                self.atoms += [("c", ch) for ch in a[1].casefold()]
+            elif a[0] == "cls":
+                body = a[1].casefold()
+                neg = body[:1] in ("!", "^")
+                body = (body[1:] if neg else body).replace("\\", "\\\\").replace("[", "\\[")
+                try:
+                    rx = re.compile("[%s%s]" % ("^" if neg else "", body or "\\]"), re.S)
+                except re.error:
+                    rx = re.compile("[^/]")
+                self.atoms.append(("cls", rx))
+            elif a[0] in ("seg", "any") and self.atoms and self.atoms[-1][0] in ("seg", "any"):
+                if a[0] == "any":
+                    self.atoms[-1] = ("any",)  # ** or *{a,b}: one wildcard that may cross a /
+            else:
+                self.atoms.append((a[0],))
+        self.n = len(self.atoms)
+
+    def _close(self, states):
+        out, todo = set(), list(states)
+        while todo:
+            k = todo.pop()
+            if k in out:
+                continue
+            out.add(k)
+            if k < self.n and self.atoms[k][0] in ("seg", "any"):
+                todo.append(k + 1)
+        return out
+
+    def fullmatch(self, text):
+        states = self._close({0})
+        for ch in text:
+            nxt = set()
+            for k in states:
+                if k == self.n:
+                    continue
+                a = self.atoms[k]
+                if a[0] == "c":
+                    if a[1] == ch:
+                        nxt.add(k + 1)
+                elif a[0] == "one":
+                    if ch != "/":
+                        nxt.add(k + 1)
+                elif a[0] == "seg":
+                    if ch != "/":
+                        nxt.add(k)
+                elif a[0] == "any":
+                    nxt.add(k)
+                elif a[1].match(ch):
+                    nxt.add(k + 1)
+            if not nxt:
+                return False
+            states = self._close(nxt)
+        return self.n in states
 
 
 class _WaHit(Exception):
@@ -984,7 +1025,7 @@ class _WaScan(object):
         atoms = self.atoms(toks)
         if all(a[0] in ("any", "seg") for a in atoms):
             return
-        if re.compile(_wa_rx(atoms), re.S).fullmatch("whatsapp"):
+        if _WaGlob(atoms).fullmatch("whatsapp"):
             self.wa_word = True
 
     def maybe_mother(self, toks):
@@ -994,7 +1035,7 @@ class _WaScan(object):
             return False
         atoms = self.atoms(toks)
         cut = max([k + 1 for k, a in enumerate(atoms) if a == ("c", "/")] or [0])
-        return bool(re.compile(_wa_rx(atoms[cut:]), re.S).fullmatch("mother"))
+        return _WaGlob(atoms[cut:]).fullmatch("mother")
 
     def unreadable(self, toks_list, what):
         """Text that runs (an eval or -c string) but can't be computed: denied when its literal part names
@@ -1079,10 +1120,14 @@ class _WaScan(object):
         name = pieces[0].rstrip("/").split("/")[-1].casefold()
         args = [[("L", p, True)] for p in pieces[1:]] + argv[1:]
         vals = [self.value(a) for a in args]
-        destructive = self.reach(name, vals)
+        clean = name == "git" and self.git_clean(vals)
+        destructive = self.far if clean else self.reach(name, vals)
         for a in args:
             self.arg(a, destructive)
         self.track_dirs(name, vals)
+        # git clean empties the folder it runs in (-C, --work-tree and pathspecs were checked as arguments above)
+        if clean and self.bases and self.bases[-1] is not None and _cf(self.bases[-1]) in self.far:
+            self.hit("state", "a git clean of a folder that holds WhatsApp's state")
         if name in WA_WRAPPERS:
             self.unwrap(name, args, vals, seg, text)
         elif name == "eval":
@@ -1119,6 +1164,16 @@ class _WaScan(object):
                 name in ("cp", "chmod", "chown", "chflags") and recursive):
             return self.far
         return self.near if name in WA_DESTRUCTIVE else None
+
+    @staticmethod
+    def git_clean(vals):
+        """git's subcommand is `clean`, and not a dry run (an uncomputed word counts as one that could be)."""
+        k = 0
+        while k < len(vals) and (vals[k] is None or vals[k].startswith("-")):
+            k += 2 if vals[k] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") else 1
+        if k >= len(vals) or vals[k].casefold() != "clean":
+            return False
+        return not any(v in ("-n", "--dry-run") for v in vals[k + 1:])
 
     def unwrap(self, name, args, vals, seg, text):
         opts, k, duration = WA_WRAPPERS[name], 0, name in ("timeout", "gtimeout")
@@ -1224,7 +1279,13 @@ class _WaScan(object):
                 self.hit("unknown", "a whatsapp subcommand that is computed")
             if vals[1].casefold() in ("send", "prompt"):
                 self.hit("compound", "a whatsapp send or prompt that is not a command of its own")
-        if wrapped or not WA_PASS_RE.match(text[seg["start"]:seg["end"]].strip()):
+        own = text[seg["start"]:seg["end"]].strip()
+        while True:  # literal NAME=value prefixes read like `export …;` (not ones that change what code runs)
+            m = WA_ENV_PREFIX_RE.match(own)
+            if not m or WA_ENV_CODE_RE.match(m.group(1)):
+                break
+            own = own[m.end():]
+        if wrapped or not WA_PASS_RE.match(own):
             self.hit("unknown", "an unrecognised whatsapp command")
 
     def track_dirs(self, name, vals):
@@ -1312,16 +1373,18 @@ class _WaScan(object):
         if head.startswith("/") and cut >= 0:  # resolve the literal folders (/var → /private/var)
             real = os.path.realpath(head[:cut] or "/").rstrip("/")
             atoms = [("c", ch) for ch in real] + atoms[cut:]
+        def vague(pre):  # only wildcards and /: it names anything, so it names nothing in particular
+            return all(a[0] != "c" or a[1] == "/" for a in pre)
         ends = [k for k, a in enumerate(atoms) if a == ("c", "/") and k] + [len(atoms)]
         for end in ends:
             pre = atoms[:end]
-            if all(a[0] != "c" or a[1] == "/" for a in pre):
-                continue  # only wildcards: it names anything, so it names nothing in particular
-            rx = re.compile(_wa_rx(pre), re.S)
+            if vague(pre):
+                continue
+            rx = _WaGlob(pre)
             if any(rx.fullmatch(p) for p in self.protected):
                 self.hit("state", "a shell command on WhatsApp's bridge socket or its state folders")
-        if destructive:
-            rx = re.compile(_wa_rx(atoms), re.S)
+        if destructive and not vague(atoms):
+            rx = _WaGlob(atoms)
             if any(rx.fullmatch(p) for p in destructive):
                 self.hit("state", "a destructive or copying command on a folder that holds WhatsApp's state")
 
