@@ -372,8 +372,9 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
 
 def _resolve_hint(hint, items: list):
     """Keep `item_id` on a swap hint only if it names an item in this run; else take the one item whose
-    link equals the hint's link; else drop it. The hint itself is always kept."""
-    if not isinstance(hint, dict) or "item_id" not in hint:
+    link equals the hint's link (also when the hint came without an `item_id`); else drop it. The hint
+    itself is always kept."""
+    if not isinstance(hint, dict):
         return hint
     hint = dict(hint)
     iid = hint.get("item_id")
@@ -383,23 +384,28 @@ def _resolve_hint(hint, items: list):
     if len(same) == 1:
         hint["item_id"] = same[0]["id"]
     else:
-        del hint["item_id"]
+        hint.pop("item_id", None)
     return hint
 
 
+def _agent_owned(top: list) -> bool:
+    """True when no entry was set by the manager: such a list may carry a swap hint."""
+    return all(e.get("set_by") != "manager" for e in top or [])
+
+
 def _pick_top(inp: dict, prev: Optional[dict], state: dict, today: str, stamp: Optional[str] = None):
-    """Top 3 today: the manager's list for today wins; else the list already set today stays as it
-    is; else the first tick of the day takes the agent's proposal."""
+    """Top 3 today: the list kept in state for today wins (the manager's, or the agent's with the
+    manager's done marks); else the list already set today stays as it is; else the first tick of the
+    day takes the agent's proposal. A swap hint is kept only while no entry is the manager's."""
     st_top = state.get("top")
     if isinstance(st_top, dict) and st_top.get("date") == today:
         top = _top_entries(st_top.get("entries"), "manager", st_top.get("at"))
         if prev and prev.get("top_date") == today:
             _carry_done(top, prev.get("top"))
-        return top, today, None
+        return top, today, (inp.get("swap_hint") if _agent_owned(top) else None)
     if prev and prev.get("top_date") == today and prev.get("top"):
         top = copy.deepcopy(prev["top"])
-        agent = all(e.get("set_by") != "manager" for e in top)
-        return top, today, (inp.get("swap_hint") if agent else None)
+        return top, today, (inp.get("swap_hint") if _agent_owned(top) else None)
     return _top_entries(inp.get("top"), "agent", stamp), today, inp.get("swap_hint")
 
 
@@ -505,7 +511,8 @@ def apply_edit(doc: dict, st: dict) -> dict:
         if top["date"] == doc.get("top_date"):
             _carry_done(out["top"], doc.get("top"))
         out["top_date"] = top["date"]
-        out["swap_hint"] = None
+        if not _agent_owned(out["top"]):
+            out["swap_hint"] = None
     _mark_top_done(out.get("top") or [], {i["id"] for i in items}, before, (st or {}).get("items") or {})
     return out
 
@@ -566,14 +573,18 @@ def _show(doc: dict) -> str:
     return "\n".join(out)
 
 
+TOP_KEYS = ("title", "why", "link", "item_id", "state", "set_by", "set_at")
+
+
 def _manager_top(doc: Optional[dict], st: dict, today: str) -> list:
-    """Entries of the manager's list for today, seeded from the current list when none is set yet."""
+    """Today's entries as state should hold them: the list already in state, else the current list.
+    Each entry keeps its own `set_by` and `set_at`, so a done mark does not change who set it."""
     top = st.get("top")
     if isinstance(top, dict) and top.get("date") == today:
-        return [dict(e) for e in top.get("entries") or []]
+        return [dict(e, set_by=e.get("set_by") or top.get("set_by") or "manager",
+                     set_at=e.get("set_at") or top.get("at")) for e in top.get("entries") or []]
     if doc and doc.get("top_date") == today:
-        return [{k: e.get(k) for k in ("title", "why", "link", "item_id", "state") if k in e}
-                for e in doc.get("top") or []]
+        return [{k: e.get(k) for k in TOP_KEYS if k in e} for e in doc.get("top") or []]
     return []
 
 
@@ -652,6 +663,7 @@ def _edit(verb: str, rest: list, ws: Path, cfg: dict, at: datetime, s: Schedule)
         else:
             sub, rest = (rest[0], rest[1:]) if rest else ("", [])
             entries = _manager_top(doc, st, today)
+            stamp = _iso(at)
             if sub == "set":
                 if not 1 <= len(rest) <= TOP_MAX:
                     _fail("usage: mother now top set <item-id|text>... (1-%d)" % TOP_MAX)
@@ -676,6 +688,13 @@ def _edit(verb: str, rest: list, ws: Path, cfg: dict, at: datetime, s: Schedule)
                 entries[int(rest[0]) - 1]["state"] = "done"
             else:
                 _fail("usage: mother now top set|swap|done ...")
-            st["top"] = {"date": today, "set_by": "manager", "at": _iso(at), "entries": entries}
+            if sub in ("set", "swap"):           # only these make the list the manager's
+                for e in entries:
+                    e["set_by"], e["set_at"] = "manager", stamp
+            owner = "agent" if _agent_owned(entries) else "manager"
+            was = st.get("top") if isinstance(st.get("top"), dict) and st["top"].get("date") == today else {}
+            set_at = stamp if sub in ("set", "swap") else (was.get("at") or next(
+                (e.get("set_at") for e in entries if e.get("set_at")), None))
+            st["top"] = {"date": today, "set_by": owner, "at": set_at, "entries": entries}
         write_now(ws, apply_edit(doc, st))
         save_state(ws, st)

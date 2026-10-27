@@ -38,8 +38,9 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    floor((local now - `start`) in minutes / `every`). This tick is **slow** when any of these holds:
    (a) the slot index mod `slow_every` is 0;
    (b) there is no `now.json`;
-   (c) `runs.md` has no `tick` line ending in `· slow` dated today, or the latest such line is older than
-   `slow_every` x `every` minutes (this catches up after a missed slot).
+   (c) `runs.md` has no `tick` line **containing** ` · slow` dated today, or the latest such line is older
+   than `slow_every` x `every` minutes (this catches up after a missed slot). Match the marker anywhere in
+   the line, not only at its end: a note can carry text after it.
    Otherwise it is **fast**. Worked example with the defaults (start 06:00, every 60, slow_every 3): 06:05 is
    slot 0, slow; 07:05 is slot 1, fast; 08:05 is slot 2, fast; 09:05 is slot 3, slow.
    - Fast scans only the **on-you** signals plus `default_branch_red`.
@@ -57,16 +58,21 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    the source is `ok`; skip anything answered, merged, closed or done.
    - `journal/brief/<today>.md` (latest): its triage lines bucketed `me` and still unanswered become
      `mail_needs_reply` (mail) or `unanswered_mention` (chat) candidates.
-   - `journal/dots/<today>.md`: each open `A…` action (agent actions awaiting the manager's yes) becomes a
+   - The latest `journal/dots/` file (today's, else the most recent before it, so yesterday's open actions
+     count before dots runs today): each open `A…` action (agent actions awaiting the manager's yes) becomes a
      `suggestion_waiting` candidate whose action prompt names the original, e.g.
      `{"label": "Run dots action A3", "prompt": "dots do A3"}`. Dots `M…` manager actions that are still open
      fold in under the signal that fits (`promise_due`, `mail_needs_reply`, …) or are left to dots.
    - `journal/commitments/<today>.md`: promises the manager made that are past due become `promise_due`;
      promises others made to the manager stay with commitments. Team follow-ups never become on-you.
-   - The digest's open decision queue (latest `journal/digest/` file for each team, and its thread when chat
-     is `ok`): a decision unanswered for more than the threshold becomes `decision_open`. A digest ask the
-     manager hasn't approved becomes `suggestion_waiting` with a prompt such as `digest ok 12`, naming the
-     digest item.
+   - The decision queue, `teams/<slug>/intake.md` for each team (format in `rules/teams.md`): each item whose
+     status is `proposed` (queued for the manager's call) and unanswered for more than the threshold becomes
+     `decision_open`, with its `added <date>` as `since` and the intake line (`teams/<slug>/intake.md#<id>`)
+     or its source link as `link`. When `chat.read` is `ok`, also read the latest digest DM thread in
+     `manager.chat_dm`: an item the manager already answered there (`12 ticket`, `13 drop`, `14 mine`, `ok`)
+     but the digest hasn't applied yet is not open, so skip it. An item the digest showed under 🗳 Decide
+     with a recommendation the manager hasn't approved becomes `suggestion_waiting` with a prompt such as
+     `digest ok 12`, naming the intake item.
    - `todos/open.md`: Yours items due today or overdue feed `top` only (step 5), not the list.
    - `mother runs --json`: each row whose state is `missed` or `failed` goes into `routines` as
      `{"id","state","expected"}`; `ok` and `pending` rows are left out.
@@ -143,13 +149,14 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
      panel adds `mother now do`), e.g. `"draft a nudge to the reviewer of platform-api#412"`. An action
      folded from another routine keeps that routine's handler in the prompt (`dots do A3`). An item no listed
      kind fits gets no action.
-   - **Top 3 today.** On the **first tick of the local day**, also set `top` (at most three):
+   - **Top 3 today.** On the **first tick of the local day**, always set `top` (at most three):
      `{"title","why","link","item_id"?}`. Choose from today's on-you items, todos due today or overdue
      (`todos/open.md`, Yours), promises due today (`journal/commitments/`), prep for today's important
      meetings (1:1s, the weekly) and the brief's `me` triage. Rank by: someone is blocked on it, it is due
      today, it is tied to a meeting today. Each carries a one-line reason ("Sam can't merge until you
-     review"); `item_id` is the item's id when it is on the list. If the manager already set the top
-     (`set_by: manager` in the previous document), leave `top` out: tick never changes it.
+     review"); `item_id` is the item's id when it is on the list. Send it even when the previous document
+     shows a list `set_by: manager`: that list is yesterday's unless its `top_date` is today, and merge
+     already keeps a manager's list for today over your proposal, so tick never changes it.
    - **Later ticks:** leave `top` out. When a new on-you item clearly outranks the agent-set top by the same
      ranking, set `swap_hint` to `{"title","why","link","item_id"?}` ("consider swapping"; `item_id` is the on-you item's id, which lets the panel swap it in); otherwise `swap_hint` is
      `null`. Never reshuffle the top yourself.
@@ -173,9 +180,9 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    An item that turns `new` on a tick where the DM was held (quiet hours) or the post failed is **not**
    announced on a later tick; the panel still shows it. That is accepted for v1.
 
-**Runs note:** the line `mother now merge` printed, then ` · slow` or ` · fast` appended, plus
-`couldn't check: <sources>` for any source in `coverage` that was `couldnt_check`, and
-`DM held (quiet hours)` where it applies. Status: `ok` if every scanned source was `ok`, `partial` if any
+**Runs note:** the line `mother now merge` printed (it already ends with `couldn't check: <sources>`; don't
+repeat it), then ` · slow` or ` · fast`, then ` · DM held (quiet hours)` where it applies. For example
+`3 on you (1 new), 2 neglected, 0 suggestions; couldn't check: tracker · slow · DM held (quiet hours)`. Status: `ok` if every scanned source was `ok`, `partial` if any
 was `partial` or `couldnt_check` or the DM failed, `failed` only for malformed merge input or no output.
 
 ## Hard rules

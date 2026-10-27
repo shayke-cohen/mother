@@ -485,17 +485,53 @@ class TopSetAtAndHint(unittest.TestCase):
         out = now.apply_edit(base, st)
         self.assertEqual(out["top"][0]["set_at"], iso(MORNING + H))
 
-    def test_cli_top_edit_writes_at(self):
+    def _cli(self, ws, *args, at):
         import io
         from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            now.main(list(args), ws, CFG, at)
+
+    def test_cli_top_swap_writes_at_and_takes_ownership(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            c = cand("review_requested", since="2026-10-26T12:00:00Z")
+            now.write_now(ws, now.merge(inp(c, top=[t("A"), t("B")], swap_hint="consider X"), None, {}, CFG, MORNING))
+            self._cli(ws, "top", "swap", "2", ID, at=MORNING + H)
+            st = now.load_state(ws)
+            self.assertEqual((st["top"]["at"], st["top"]["set_by"]), (iso(MORNING + H), "manager"))
+            doc = now.load_now(ws)
+            self.assertEqual({(e["set_by"], e["set_at"]) for e in doc["top"]}, {("manager", iso(MORNING + H))})
+            self.assertIsNone(doc["swap_hint"])
+
+    def test_cli_top_done_on_agent_list_keeps_owner_and_swap_hint(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            now.write_now(ws, now.merge(inp(top=[t("A"), t("B")], swap_hint="consider X"), None, {}, CFG, MORNING))
+            self._cli(ws, "top", "done", "1", at=MORNING + H)
+            st = now.load_state(ws)
+            self.assertEqual((st["top"]["set_by"], st["top"]["at"]), ("agent", iso(MORNING)))
+            doc = now.load_now(ws)
+            self.assertEqual([(e["state"], e["set_by"], e["set_at"]) for e in doc["top"]],
+                             [("done", "agent", iso(MORNING)), ("open", "agent", iso(MORNING))])
+            self.assertEqual(doc["swap_hint"], "consider X")
+            nxt = now.merge(inp(swap_hint="consider Y"), doc, st, CFG, MORNING + 2 * H)
+            self.assertEqual([(e["state"], e["set_by"]) for e in nxt["top"]], [("done", "agent"), ("open", "agent")])
+            self.assertEqual(nxt["swap_hint"], "consider Y")
+
+    def test_next_days_first_tick_proposes_fresh_top_after_a_manager_day(self):
         with tempfile.TemporaryDirectory() as d:
             ws = Path(d)
             now.write_now(ws, now.merge(inp(top=[t("A")]), None, {}, CFG, MORNING))
-            with redirect_stdout(io.StringIO()):
-                now.main(["top", "done", "1"], ws, CFG, MORNING + H)
-            st = now.load_state(ws)
-            self.assertEqual(st["top"]["at"], iso(MORNING + H))
-            self.assertEqual(now.load_now(ws)["top"][0]["set_at"], iso(MORNING + H))
+            self._cli(ws, "top", "set", "Mine", at=MORNING + H)
+            yday, st = now.load_now(ws), now.load_state(ws)
+            self.assertEqual(yday["top"][0]["set_by"], "manager")
+            tomorrow = MORNING + 24 * H
+            fresh = now.merge(inp(top=[t("N")], swap_hint="consider Z"), yday, st, CFG, tomorrow)
+            self.assertEqual((titles(fresh), fresh["top_date"]), (["N"], "2026-10-28"))
+            self.assertEqual((fresh["top"][0]["set_by"], fresh["swap_hint"]), ("agent", "consider Z"))
+        text = Path(ROOT, "routines", "tick.md").read_text()
+        self.assertIn("always set `top`", text)
+        self.assertNotIn("(`set_by: manager` in the previous document), leave `top` out", text)
 
     def _hint_run(self, hint, *cands):
         return now.merge(inp(*cands, top=[t("A")], swap_hint=hint), None, {}, CFG, NOW)["swap_hint"]
@@ -523,6 +559,12 @@ class TopSetAtAndHint(unittest.TestCase):
         h = self._hint_run({"title": "T", "why": "w", "link": both[0]["link"], "item_id": "bogus"}, c, c2)
         self.assertNotIn("item_id", h)
 
+    def test_hint_without_item_id_gets_one_by_unique_link(self):
+        c = cand("review_requested", since=hours_ago(5))
+        out = now.merge(inp(c), None, {}, CFG, NOW)["items"][0]
+        h = self._hint_run({"title": "T", "why": "w", "link": out["link"]}, c)
+        self.assertEqual(h["item_id"], out["id"])
+
     def test_hint_without_item_id_is_untouched(self):
         h = {"title": "T", "why": "w", "link": "https://example.com/x"}
         self.assertEqual(self._hint_run(h), h)
@@ -542,7 +584,8 @@ class NowCli(unittest.TestCase):
         self.ws = Path(self._tmp.name) / "ws"
         self.ws.mkdir()
         cfg = copy.deepcopy(CFG)
-        cfg.setdefault("connectors", {}).update({"code": "github", "chat": "slack", "tracker": "jira"})
+        cfg["connectors"] = {"code": "code-host", "chat": "chat-app", "tracker": "tracker-app", "mail": "mail-app",
+                             "calendar": "calendar-app"}
         (self.ws / "config.json").write_text(json.dumps(cfg))
         self.env = dict(os.environ, MOTHER_WORKSPACE=str(self.ws), MOTHER_STATE_DIR=str(Path(self._tmp.name) / "st"),
                         MOTHER_NOW=NOW_PIN)
