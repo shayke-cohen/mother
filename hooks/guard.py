@@ -1558,13 +1558,17 @@ def _plugin_name(root):
 
 
 # A subdivision flag (England, Scotland, Wales): the black flag, tag letters, the cancel tag. It renders as one flag.
-WA_TAG_FLAG_RE = re.compile("\U0001F3F4[\U000E0061-\U000E007A]{2,7}\U000E007F")
+WA_TAG_FLAG_RE = re.compile("\U0001F3F4(?:%s)\U000E007F" % "|".join(
+    "".join(chr(0xE0000 + ord(c)) for c in code) for code in ("gbeng", "gbsct", "gbwls")))
 
 
 def wa_hidden(ch):
     import unicodedata
     if ch in WA_HIDDEN_EXTRA:
         return True
+    o = ord(ch)
+    if 0xFE00 <= o <= 0xFE0D or 0xE0100 <= o <= 0xE01EF or 0x180B <= o <= 0x180F:
+        return True  # variation selectors (all but text/emoji presentation) render as nothing and carry bytes
     cat = unicodedata.category(ch)
     if cat == "Cn" and 0x1F000 <= ord(ch) <= 0x1FAFF:
         return False  # an emoji newer than this Python's Unicode tables (3.9 stops at Unicode 13)

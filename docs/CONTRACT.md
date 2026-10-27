@@ -234,7 +234,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     `\n` and `\t`), `Cf` (format: bidi controls, zero-width spaces, word joiners, tag characters, soft hyphen;
     except U+200D, the zero-width joiner emoji sequences use), `Co` (private use), `Cs` (surrogates) or `Cn`
     (unassigned in the guard's Python, except in the emoji blocks U+1F000–U+1FAFF, where it is an emoji newer than
-    the guard's Unicode tables; a subdivision flag — U+1F3F4, tag letters, U+E007F — passes as a whole), plus the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, U+00AD,
+    the guard's Unicode tables; the England, Scotland and Wales flags — U+1F3F4, the tag letters `gbeng`/`gbsct`/`gbwls`, U+E007F — pass as a
+    whole, and no other tag sequence; variation selectors other than U+FE0E/U+FE0F (U+FE00–U+FE0D,
+    U+E0100–U+E01EF) and the Mongolian ones U+180B–U+180F are denied, since they render as nothing), plus the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, U+00AD,
     U+034F (combining grapheme joiner) and the line and paragraph separators U+2028, U+2029. Variation
     selectors U+FE0E/U+FE0F are marks, not format characters, and pass. So is a form the shell would rewrite: an unquoted `~`, glob (`*`, `?`, `[`)
     or brace list, and a `$'…'` escape for a raw byte (`\x80`–`\xff`, octal 200–377) or `\c`. A text shaped like a credential is on the never-list. Then: PAUSED denies; an

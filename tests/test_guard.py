@@ -1087,7 +1087,10 @@ class TestWhatsapp(WhatsappCase):
     def test_invisible_characters_by_category_are_denied(self):
         for t in ("$'hi\\U000E0041\\U000E0042'", "$'soft\\u00adhyphen'", "$'f\\u2061x'", "$'a\\u115fb'",
                   "$'a\\u1160b'", "$'a\\u3164b'", "$'a\\uffa0b'", "$'a\\u034fb'", "$'a\\u180eb'", "$'a\\ufff9b'",
-                  "$'a\\ue000b'", "$'a\\U000F0000b'"):
+                  "$'a\\ue000b'", "$'a\\U000F0000b'",
+                  "$'hi \\U0001F600\\ufe00\\ufe01'", "$'hi\\U000E0100\\U000E01EF'", "$'a\\u180bb'",
+                  # a black flag with made-up tag letters carries hidden text; only the three real flags pass
+                  "$'\\U0001F3F4\\U000E0073\\U000E0065\\U000E0063\\U000E0072\\U000E0065\\U000E0074\\U000E007F'"):
             why = self.send("deny", "mother whatsapp send --to Sam --text %s" % t)
             self.assertIn("invisible", why, t)
         for t in ("$'family \\U0001F468\\u200d\\U0001F469\\u200d\\U0001F467'", "$'flag \\U0001F1EE\\U0001F1F1'",
