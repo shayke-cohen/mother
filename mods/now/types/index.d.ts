@@ -39,7 +39,13 @@ export type NowTop = {
   item_id: string | null
   set_by: 'agent' | 'manager'
   state: 'open' | 'done'
+  set_at?: string   // not written by lib/now.py today; shown as "at HH:MM" when a future writer adds it
 }
+
+// What the tick's step 6 writes (routines/tick.md): a suggestion to swap; item_id only when it names a list item.
+export type NowSwapHint = { title: string; why: string; link: string | null; item_id?: string | null }
+
+export type NowRoutine = { id: string; state: string; expected: string }
 
 export type NowDoc = {
   version: 1
@@ -50,13 +56,13 @@ export type NowDoc = {
   stale_after: string
   status: 'ok' | 'partial' | 'failed'
   coverage: Record<string, NowCoverage>
-  routines: unknown[]
+  routines: NowRoutine[]
   counts: { on_you: number; neglected: number; suggestion: number }
   next_action: number
   dropped: number
   top: NowTop[]
   top_date: string
-  swap_hint: string | null
+  swap_hint: NowSwapHint | null
   items: NowItem[]
 }
 
@@ -66,6 +72,7 @@ declare module 'claude-code' {
       doc: NowDoc | null
       error: string | null
       workspace: string | null
+      snoozing: string | null   // id of the row whose snooze Select is open
     }
   }
 }
