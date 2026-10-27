@@ -8,13 +8,13 @@ Every part of v0 is built against this file. Change it first, then the code.
 
 ```
 .claude-plugin/plugin.json, marketplace.json
-bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval
+bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now
 hooks/hooks.json           PreToolUse → hooks/guard.py; Stop + SessionEnd → `mother sync --quiet`
 hooks/guard.py             approval guard (see §5)
 skills/<name>/SKILL.md     user- and routine-facing skills, invoked as `mother:<name>`
 agents/<name>.md           read-only sub-agents MOTHER dispatches: `mother:reader`, `mother:critic` (see §5c)
 routines/<id>.md           routine definitions: what a scheduled run does (reads config, calls skills)
-lib/                       channels.py (§5b), items.py (reader evidence check), evals.py (A/B harness)
+lib/                       channels.py (§5b), items.py (reader evidence check), evals.py (A/B harness), now.py (tick's Now list)
 assets/deck/               meeting deck template.html + build.py
 rules/                     default policy text skills cite: outbound.md, privacy.md, memory.md, todos.md, projects.md, teams.md
 templates/workspace/       files `mother init` copies into a new workspace
@@ -36,7 +36,9 @@ people/<slug>.md           work items only, never assessments
 one-on-ones/<slug>/        next.md (queued topics) + YYYY-MM-DD.md (prep, then notes: topics and commitments only)
 journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for connect-the-dots; journal/commitments/YYYY-MM-DD.md for the commitment tracker; journal/brief/YYYY-MM-DD.md for the brief's triage list
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
-.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs)
+.mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs),
+                           now.json (the tick's Now list: items, Top 3, coverage; ids and links, no message bodies, no per-person counts),
+                           now-state.json (the manager's done/snooze/Top 3 edits and which toasts fired), now.lock (serialises both); all written atomically
 ```
 
 ## 2. Finding each other
@@ -50,6 +52,14 @@ runs.md                    one line per routine run: `- <ISO> <routine> <ok|part
 - `mother register` prints `{"home_machine": …, "tasks": [{taskId, title, cronExpression, prompt}]}`. Crons are
   in the **machine's local time** (the scheduler's convention); setup warns when that differs from
   `manager.timezone`.
+- **Interval routines** (only `tick`) have `every` (minutes) and `active_hours` instead of `at`. `mother register`
+  emits a cron with slots at minute :05 (and :35 for `every: 30`), one per `every` inside `active_hours`
+  (`5 6-21 * * 1-5` for the defaults), in the machine's local time. `mother runs` judges `tick` missed only
+  inside active hours on a scheduled day, once 2x `every` has passed after the day's first slot with no `runs.md`
+  line in 2x `every`.
+- A routine whose frontmatter says `sync: false` (`tick`) is machine-local: its pointer **omits** the
+  `git pull --rebase` (`_pointer(…, pull=False)`: just `cd "<workspace>"`, then the mother:routine skill), and
+  the dispatcher skips the final `mother sync`.
 - Routine files start with frontmatter: `id`, `needs` (capabilities, e.g. `[chat.read, tracker.read]`) and
   `team_scoped`. The dispatcher pre-marks a run `partial` when a needed capability isn't `ok`.
 
@@ -75,6 +85,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.brief.audio` | bool or map, optional | spoken brief: `true`, or `{voice, voice_he, rate (90-360 wpm), language: en|he, save_to, engine: say|kokoro, kokoro_voice (default af_heart)}`; rendered by `mother speak` with macOS `say` or, for English with `engine: kokoro`, local Kokoro (`mother tts setup` → `~/.mother/tts`; falls back to `say` for Hebrew or when missing) into `.mother/audio/` (last 14 kept), copied to `save_to` or iCloud Drive `Mother/` when present |
 | `routines.brief.draft_replies` | bool, optional | default false; true = the brief routine saves mail **drafts** for To-respond mail it triaged as `prep` (never sends) |
 | `routines.commitments` | map, optional | `at`, `days`, `no_reply_days` (1-30, default 3), `lookback_days` (1-60, default 14), `draft_nudges` (bool, default false: mail drafts for no-reply asks only on the manager's `nudge <n>`) |
+| `routines.tick` | map, optional | the hourly pulse behind the Now list (`mother now`); absent = off. `every` (minutes, one of 30, 60, 120, 180, 240; default 60), `active_hours` (`"HH:MM-HH:MM"`, start before end, default `"06:00-22:00"`, in `manager.timezone`; no tick runs outside it), `days` (`workdays` / `all` / a day / list of days; not `monthly:`), `thresholds` (map signal -> `Nh`, `Nd` or `0`, counted in working time; default per signal), `signals` (map signal -> `true`/`false`; all on by default, and a signal whose source connector is `none` is off), `notify` (`none` default, or `dm` = one DM to `manager.chat_dm` for a new on-you item; never while `now.json.quiet`), `slow_every` (integer 1-6, default 3: every Nth slot scans every signal, the others only the on-you signals and `default_branch_red`). Signals: on you `review_requested`, `unanswered_mention`, `decision_open`, `ticket_waiting_on_you`, `mail_needs_reply`, `invite_unanswered`, `promise_due`, `suggestion_waiting`; neglected `pr_no_reviewer`, `pr_approved_unmerged`, `pr_changes_silent`, `default_branch_red`, `ticket_stalled`, `bug_unowned`, `blocker_cleared`, `sprint_at_risk`, `outside_question`, `action_item_no_ticket`, `one_on_one_drift`. Unknown keys or signals fail `mother status`. |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
@@ -247,7 +258,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 
 `setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
 (connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap), `reflect`, `todo`, `project`,
-`team`, `remember`. Descriptions stay short and specific: they are matched against every request.
+`team`, `remember`, `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
 
 ## 8. Writing rules for everything in this repo
 

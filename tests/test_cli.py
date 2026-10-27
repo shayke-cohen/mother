@@ -475,7 +475,8 @@ class CliTest(unittest.TestCase):
     def test_tick_config_validates(self):
         self.init()
         cfg = self.write_config()
-        self.assertEqual(cfg["routines"]["tick"], {"every": 60, "active_hours": "06:00-22:00", "days": "workdays"})
+        self.assertEqual(cfg["routines"]["tick"], {"every": 60, "active_hours": "06:00-22:00", "days": "workdays",
+                                                  "notify": "none", "slow_every": 3})
         self.assertEqual(run(["status"], self.env).returncode, 0)
 
         def status_with(tick):

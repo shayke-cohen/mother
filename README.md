@@ -109,11 +109,12 @@ Day to day you mostly read what it sends you and answer in one line. The default
 | one-on-one | 07:30 workdays | Prep for each of today's 1:1s (a shareable agenda kept apart from private prep) and a note when a report's 1:1s have lapsed |
 | reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
 | doctor | daily | Re-tests every connector, heals what it can (retry, reconnect, switch to a backup server) and alerts once per broken connector |
+| tick | hourly 06:05-21:05 workdays | A short Now list, kept quiet: what is blocked on you, what the team is neglecting, suggestions waiting for a yes, and your Top 3 today. Read it with `/mother:now`; it sends nothing unless `routines.tick.notify` is `dm` |
 | meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |
 
 You can also just ask: "brief me", "what's open", "remember that …", "add a todo …", "take notes on the
-design review", "prep my 1:1 with Sam", "what did I promise", "set up a new project". Each one routes to a
-skill: `brief`, `todo`, `remember`, `one-on-one`, `commitments`,
+design review", "prep my 1:1 with Sam", "what did I promise", "set up a new project", "what's on me now" (`/mother:now`: the tick's list; say "mother now do S3" to run one suggestion, or "snooze that"). Each one routes to a
+skill: `brief`, `now`, `todo`, `remember`, `one-on-one`, `commitments`,
 `meeting`, `project`, `team` and so on.
 
 ### Replying in team channels
@@ -144,6 +145,7 @@ Useful commands in your terminal:
 | `mother register` | Print the scheduled-task definitions for the enabled routines |
 | `mother health` | Connector health: which server serves each capability, the failure log and a 7-day summary (`mother health help`) |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
+| `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
 | `mother channels pause` / `resume` | Stop or restart replies in every channel |
@@ -161,11 +163,11 @@ Useful commands in your terminal:
 
 | Path | What |
 |---|---|
-| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `runs`, `path`, `link`, `speak`, `tts`, `channels`, `items`, `eval`, `health` (Python 3.9 stdlib) |
+| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `runs`, `path`, `link`, `speak`, `tts`, `channels`, `items`, `eval`, `health`, `now` (Python 3.9 stdlib) |
 | `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
-| `skills/` | `setup`, `doctor`, `routine`, `brief`, `digest`, `dots`, `commitments`, `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember` |
+| `skills/` | `setup`, `doctor`, `routine`, `brief`, `now`, `digest`, `dots`, `commitments`, `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember` |
 | `agents/` | Read-only sub-agents: `reader` (one source) and `critic` (one draft) |
-| `lib/` | `channels.py` (reply-mode engine), `health.py` (per-server connector health, the only writer of `capabilities.json`), `items.py` (reader evidence check), `evals.py` (A/B harness) |
+| `lib/` | `channels.py` (reply-mode engine), `now.py` (the Now list), `health.py` (per-server connector health, the only writer of `capabilities.json`), `items.py` (reader evidence check), `evals.py` (A/B harness) |
 | `routines/` | What each scheduled run does |
 | `assets/deck/`, `assets/plan/` | Weekly meeting deck with meeting mode; sprint plan page |
 | `rules/` | Default policies: outbound, privacy, memory, todos, projects, teams |

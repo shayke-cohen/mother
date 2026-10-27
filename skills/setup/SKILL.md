@@ -117,7 +117,7 @@ Present, in this order:
    projects, <K> repos, and run: brief 08:45, digest 09:00 …".
 2. The roster table with evidence per person.
 3. Channels with proposed modes.
-4. Routines with times in the manager's time zone (defaults from `templates/workspace/config.example.json`;
+4. Routines (the tick shown as "hourly, 06:05-21:05") with times in the manager's time zone (defaults from `templates/workspace/config.example.json`;
    omit routines whose sources don't exist — no `digest` sprint section without a tracker, etc.). The
    `doctor` routine is `days: "all"` with `at` 30 minutes before the earliest `routines.*.at` other than the doctor's own, never before
    05:00. In Edit mode on an existing install whose doctor is weekly or differently timed, show that as a
@@ -148,6 +148,12 @@ In this order, reporting each step's result:
      new ids → `create_scheduled_task` with the printed `taskId`, `cronExpression`, `prompt` (verbatim)
      and a one-line `description`. A routine removed from config → `update_scheduled_task` with
      `enabled: false` (never delete).
+   - **Tick (default on).** Offer the hourly tick in step 5's draft: "every hour 06:05-21:05 on workdays I'll
+     refresh a short list of what is waiting on you and what the team is neglecting (the Now panel and
+     `/mother:now`); nothing is sent unless you set `notify` to `dm`". Add `routines.tick`
+     (`every`, `active_hours`, `days`, `notify: "none"`, `slow_every: 3` from the example config) unless the
+     manager declines. It is an interval routine: `mother register` prints it with a cron for each slot and a
+     pointer that does no `git pull`. Register it like the rest; it runs only on the home machine.
    - **The doctor runs daily** (see the proposal above): register it from the confirmed config, which
      sets it to `days: "all"` ahead of the first routine. Never rewrite its schedule silently.
    - Cron runs in the **machine's** local time. If `manager.timezone` differs from the machine's, convert
