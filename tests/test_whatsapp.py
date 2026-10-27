@@ -59,7 +59,7 @@ def core(iso):
     return whatsapp.to_core(iso)
 
 
-CHATS = [(1, DM, "Sam Roe", 0), (2, GROUP, "Platform team", 1), (3, OTHER, "Stranger", 0), (4, SELF, "You", 0)]
+CHATS = [(1, DM, "Dana", 0), (2, GROUP, "PLAT team", 1), (3, OTHER, "Stranger", 0), (4, SELF, "You", 0)]
 MSGS = [
     {"chat": 1, "text": "hello from sam", "date": core("2026-10-26T08:00:00Z"), "stanza": "A1", "from": DM},
     {"chat": 1, "text": "I replied", "date": core("2026-10-26T08:05:00Z"), "stanza": "A2", "me": 1},
@@ -76,8 +76,8 @@ SINCE = "2026-10-25T00:00:00Z"
 def make_cfg(home="laptop-a"):
     return {"workspace": {"home_machine": home},
             "whatsapp": {"enabled": True, "self_jid": SELF, "read": True,
-                         "allow": [{"jid": DM, "name": "Sam Roe"},
-                                   {"jid": GROUP, "name": "Platform team", "group": True}]}}
+                         "allow": [{"jid": DM, "name": "Dana"},
+                                   {"jid": GROUP, "name": "PLAT team", "group": True}]}}
 
 
 class Base(unittest.TestCase):
@@ -145,7 +145,7 @@ class TestReader(Base):
         self.assertEqual(texts, ["hello from sam", "I replied", "[media]", "ship it"])
         first = out["items"][0]
         self.assertEqual(first["link"], "whatsapp://%s/A1" % DM)
-        self.assertEqual(first["chat_name"], "Sam Roe")
+        self.assertEqual(first["chat_name"], "Dana")
         self.assertEqual(first["at"], "2026-10-26T08:00:00Z")
         self.assertFalse(first["from_me"])
         self.assertTrue(out["items"][1]["from_me"])
@@ -274,7 +274,7 @@ class TestReader(Base):
         self.assertEqual(got[0]["jid"], SELF)  # newest first
         grp = [c for c in got if c["jid"] == GROUP][0]
         self.assertTrue(grp["group"])
-        self.assertEqual(grp["name"], "Platform team")
+        self.assertEqual(grp["name"], "PLAT team")
         blob = json.dumps(got)
         for text in ("hello from sam", "secret", "ship it", "ok w3k", "note to self"):
             self.assertNotIn(text, blob)
@@ -339,7 +339,7 @@ class TestDrafts(Base):
         self.assertRegex(d["id"], r"^w[a-z2-9]{3}$")
         self.assertEqual(d["sha256"], hashlib.sha256("héllo".encode("utf-8")).hexdigest())
         self.assertEqual((d["chat"], d["chat_name"], d["text"], d["run"], d["status"]),
-                         (DM, "Sam Roe", "héllo", "brief-1", "open"))
+                         (DM, "Dana", "héllo", "brief-1", "open"))
         self.assertRegex(d["created"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual(whatsapp.load_draft(self.ws, d["id"]), d)
         self.assertTrue((self.ws / ".mother/whatsapp/drafts" / (d["id"] + ".json")).exists())
@@ -413,7 +413,7 @@ class TestDrafts(Base):
         self.assertEqual([x["id"] for x in json.loads(r.stdout)], [d["id"]])
         r = cli(self.wenv, "list")
         self.assertIn(d["id"], r.stdout)
-        self.assertIn("Sam Roe", r.stdout)
+        self.assertIn("Dana", r.stdout)
         r = cli(self.wenv, "drop", d["id"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(cli(self.wenv, "list", "--json").stdout), [])
@@ -464,7 +464,7 @@ class TestProof(Base):
     def draft(self, i, created, chat=DM, text="see you at 3"):
         folder = self.ws / ".mother/whatsapp/drafts"
         folder.mkdir(parents=True, exist_ok=True)
-        d = {"id": i, "chat": chat, "chat_name": "Sam Roe", "text": text,
+        d = {"id": i, "chat": chat, "chat_name": "Dana", "text": text,
              "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "created": fmt(created),
              "run": None, "status": "open"}
         (folder / (i + ".json")).write_text(json.dumps(d))
@@ -495,7 +495,7 @@ class TestProof(Base):
             f.write(json.dumps({"at": fmt(when), "path": path, "ids": ids, "sha256": shas}) + "\n")
         if path == "self_chat":
             stanza = "PR%d" % len(self.selfmsgs)
-            self.say('WhatsApp -> Sam Roe: "see you at 3" - reply ok %s' % " ".join(ids), when, stanza)
+            self.say('WhatsApp -> Dana: "see you at 3" - reply ok %s' % " ".join(ids), when, stanza)
             if log:
                 self.sent({"at": fmt(when), "kind": "prompt", "chat": SELF, "sha256": "x", "stanza": stanza})
 
@@ -540,7 +540,7 @@ class TestProof(Base):
         self.assertEqual(whatsapp.parse_reply("no w3k"), ("no", ["w3k"]))
         self.assertEqual(whatsapp.parse_reply("  ok w3kx \n"), ("ok", ["w3kx"]))
         for bad in ("ok w3k but change it", "okay", "w3k ok", "ok", "ok w3k all", "", None,
-                    "WhatsApp -> Sam Roe: \"hi\" - reply ok w3k", "ok w3k\nalso this"):
+                    "WhatsApp -> Dana: \"hi\" - reply ok w3k", "ok w3k\nalso this"):
             self.assertIsNone(whatsapp.parse_reply(bad), bad)
 
     # -- session
@@ -610,7 +610,7 @@ class TestProof(Base):
     def test_self_chat_prompt_text_never_counts(self):
         self.via("self_chat")
         self.prompt("self_chat", ["w3kx"], ago(hours=1))
-        prompt = 'WhatsApp -> Sam Roe: "see you at 3" - reply ok w3kx'
+        prompt = 'WhatsApp -> Dana: "see you at 3" - reply ok w3kx'
         self.say(prompt, ago(minutes=30), "P1")
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))  # even before sent.jsonl has it
         self.sent({"at": fmt(ago(minutes=30)), "kind": "prompt", "chat": SELF, "sha256": "x", "stanza": "P1"})
@@ -680,6 +680,16 @@ class TestProof(Base):
         self.assertEqual(oct(key.stat().st_mode & 0o777), "0o600")
         self.assertEqual(whatsapp.prove(self.ws, self.cfg, "w3kx")["path"], "slack_dm")
         key.unlink()  # no key, no valid signature
+        self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
+
+    def test_malformed_signature_is_unsigned(self):
+        self.via("slack_dm")
+        self.grant()
+        g = json.loads((self.ws / ".mother/grants.json").read_text())["grants"][0]
+        for bad in ("é" * 64, "\x00" * 64, 123, None, ["a"], {"a": 1}, ""):
+            self.assertFalse(whatsapp.grant_sig_ok(dict(g, sig=bad)), repr(bad))
+        (self.ws / ".mother/grants.json").unlink()
+        self.grant(sig="é" * 64)  # one bad grant in the agent-writable file must not take `prove` down
         self.assertIsNone(whatsapp.prove(self.ws, self.cfg, "w3kx"))
 
     def test_slack_grant_from_manager_only(self):
@@ -916,7 +926,7 @@ class TestProof(Base):
             self.slack("ok w3kx", ago(minutes=5), user="U00000002"),
             self.slack("ok w3kx", ago(minutes=5), bot_id="B1"),
             self.slack("ok w3kx", ago(minutes=5), subtype="bot_message"),
-            self.slack('Agnes (AI)\nWhatsApp -> Sam Roe: "see you at 3" - reply ok w3kx', ago(minutes=5)),
+            self.slack('Agnes (AI)\nWhatsApp -> Dana: "see you at 3" - reply ok w3kx', ago(minutes=5)),
             self.slack("ok w3kx", ago(hours=3)),  # before the draft existed
         ])
         self.assertEqual(out, {"send": [], "dropped": []})

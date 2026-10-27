@@ -171,14 +171,25 @@ WhatsApp call is allow or deny, in every permission mode, bypass included (an as
   yes in the DM is spent on the first send.
 - **Hands off the bridge and its state.** Never touch the bridge socket, `<state>/whatsapp/` or
   `.mother/whatsapp/` by any other means: no `curl --unix-socket`, `nc -U`, `socat`, script, `cat`, `cp`,
-  `rm`, Write or Edit, in any case, glob or variable spelling. The guard denies all of it. To change a draft,
-  drop it and draft again. Write the `mother whatsapp` commands plainly: a quoted or capitalised form is denied.
+  `rm`, Write or Edit, in any case, glob or variable spelling. The guard denies all of it, and also denies
+  deleting, moving or copying the folders that hold that state (`~/.mother`, the workspace, its `.mother/`).
+  To change a draft, drop it and draft again.
+- **Write commands plainly.** Write the `mother whatsapp` commands as they are: a quoted, capitalised or
+  computed form is denied. On any Bash line, a command name built from a variable, `$( )`, a glob or `$'…'`
+  is denied (the guard can't tell what it runs); set the variable earlier in the same line (`CH=…; $CH plan`)
+  or write the name out.
 - **One approval per send.** The guard writes `approved/<id>.json` once; the bridge marks it `.used` after the
   send. A second `send` while it is in flight, or after it was sent, is denied. A Slack `ok` counts only
   through the signed grant `mother whatsapp pending` writes; never write a `whatsapp` grant yourself.
 - `mother whatsapp prompt <ids>` (the self-chat ask) is allowed only for open drafts. Reading (`read`,
   `chats`, `list`, `pending`, `status`) is not outbound. MOTHER's sub-agents may run only `mother whatsapp
   read`; channel sessions run no WhatsApp command.
+- **What this stops, and what it doesn't.** The guard and the bridge stop mistakes and injected instructions.
+  They do not stop a deliberately evasive agent on the manager's own macOS account: such an agent could run a
+  script the guard can't read, or read the bridge's session keys, which the account can read. On the Slack
+  path, `mother whatsapp pending` signs whatever DM messages it is handed, and the signing key is readable by
+  the account, so that path trusts your report of the manager's DM: hand `pending` only the messages the chat
+  tool returned, unedited. The bridge re-checks the yes itself, which narrows this but does not remove it.
 
 ## Kill switch
 

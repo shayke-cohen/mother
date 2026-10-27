@@ -431,7 +431,7 @@ _WA_BIN = (r"(?:python3?[ \t]+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother\"|\$\{C
            r"|\"[^\"$`\\\n]*/mother\"|'[^'\n]*/mother'|(?:[\w.~+-]*/)*mother)")
 # One argument of a passing subcommand: plain text, $VAR / ${VAR}, or a quoted string without $( ) or backticks.
 _WA_ARG = r"""(?:[^\s;&|<>`$()\\'"]|\$\{?[A-Za-z_]\w*\}?|"(?:[^"`$\\\n]|\$\{?[A-Za-z_]\w*\}?)*"|'[^'\n]*')+"""
-_WA_REDIR = r"[ \t]*[0-9]?(?:<|>>?)[ \t]*%s" % _WA_ARG
+_WA_REDIR = r"[ \t]*(?:[0-9]?(?:<<<|<<-?|<|>>?|>\|)|&>>?)[ \t]*%s|[ \t]*[0-9]?[<>]&[ \t]*(?:[0-9]+|-)" % _WA_ARG
 WA_SEND_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+send[ \t]+(%s)\Z" % (_WA_BIN, WA_ID))
 WA_PROMPT_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+prompt((?:[ \t]+%s)+)\Z" % (_WA_BIN, WA_ID))
 WA_PASS_RE = re.compile(r"^%s[ \t]+whatsapp(?:[ \t]+(?:%s)(?:[ \t]+%s)*)?(?:%s)*\Z" % (
@@ -439,8 +439,6 @@ WA_PASS_RE = re.compile(r"^%s[ \t]+whatsapp(?:[ \t]+(?:%s)(?:[ \t]+%s)*)?(?:%s)*
 WA_READ_RE = re.compile(r"^%s[ \t]+whatsapp[ \t]+read(?:[ \t]+[^\s;&|<>`$()\\'\"]+)*\Z" % _WA_BIN)
 WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:approved|drafts|session)(?=/|$|[\s;&|)])"
                          r"|whatsapp/(?:sent|prompts)\.jsonl|whatsapp/grant\.key", re.I)
-WA_SOCKET_WORDS = ("bridge", ".sock", "--unix-socket", "socat", "af_unix")
-WA_WORKSPACE_IDIOM = re.compile(r"\$\{MOTHER_WORKSPACE:-\$\(cat[ \t]+~/\.mother/workspace\)\}")
 WA_STATE_FILES = ("sent.jsonl", "bridge.sock", "session", "grant.key")
 WA_WS_FILES = ("drafts", "approved", "prompts.jsonl")
 
@@ -493,86 +491,797 @@ def wa_protected(ctx):
     return found
 
 
-def _glob_hits(pattern, protected):
-    """A glob path hits a protected path when their leading components match (case-insensitive fnmatch): a
-    deeper glob names something inside it, a shallower one an ancestor of it."""
-    import fnmatch
-    comps = pattern.split("/")
-    lit = 0
-    while lit < len(comps) and not any(ch in comps[lit] for ch in "*?["):
-        lit += 1
-    head = "/".join(comps[:lit]) or "/"
-    pattern = os.path.join(os.path.realpath(head), *comps[lit:])  # resolve the literal part (/var → /private/var)
-    pat = [c for c in pattern.casefold().split("/") if c]
-    for p in protected:
-        comps = [c for c in p.split("/") if c]
-        n = min(len(pat), len(comps))
-        if n and all(fnmatch.fnmatchcase(comps[k], pat[k]) for k in range(n)):
-            return True
-    return False
+# -- Reading a shell line (T5-h): the gate keys on shapes, not spellings. A command name the guard can't compute
+# is denied; every argument has its unresolved expansions read as wildcards and is matched against the protected
+# paths; destructive or copying commands are also matched against the folders that hold them. A deliberately
+# evasive agent can still get past a reader like this one: the bridge re-checks the yes itself (CONTRACT §5d).
+
+WA_RESERVED = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "esac"}
+WA_WRAPPERS = {  # commands that run the rest of their arguments as a command; the options that take a value
+    "env": ("-u", "--unset", "-C", "--chdir", "-P"), "command": (), "exec": ("-a",), "nohup": (), "time": (),
+    "sudo": ("-u", "-g", "-h", "-p", "-C", "-D", "-U", "-r", "-t", "-T"), "doas": ("-u", "-C"), "nice": ("-n",),
+    "timeout": ("-s", "-k", "--signal", "--kill-after"), "gtimeout": ("-s", "-k", "--signal", "--kill-after"),
+    "xargs": ("-I", "-n", "-L", "-P", "-s", "-E", "-d", "-a", "-J", "-R", "-S"), "builtin": (),
+    "stdbuf": ("-i", "-o", "-e"), "caffeinate": ("-t", "-w"), "unbuffer": (), "chronic": (),
+    "watch": ("-n", "--interval"), "ionice": ("-c", "-n", "-p"), "taskpolicy": ("-c", "-d", "-g", "-b")}
+WA_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"}
+WA_INTERPS = {"python", "python2", "python3", "perl", "ruby", "node", "nodejs", "deno", "bun", "osascript", "php",
+              "lua", "swift", "tclsh", "pwsh", "rscript", "awk", "gawk", "nawk", "mawk"}
+WA_CODE_FLAGS = {"-c", "-e", "-E", "--eval", "-p", "--print", "-r"}
+WA_SOCKET_CMDS = {"nc", "ncat", "netcat", "socat"}
+WA_DESTRUCTIVE = {"rm", "rmdir", "unlink", "mv", "cp", "rsync", "tar", "ditto", "zip", "unzip", "ln", "chmod",
+                  "chown", "chflags", "shred", "trash", "srm"}
+WA_FIND_ACTIONS = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+_WA_REDIR_OP = re.compile(r"(\d*)(&>>|&>|<<<|<<-|<<|<>|<&|>&|>>|>\||<|>)")
+_WA_SEP = re.compile(r"[()=:,'\"`;\s]+")
+_WA_GLOB = re.compile(r"[*?]|\[.*\]|\{[^{}]*(?:,|\.\.)[^{}]*\}")
+_WA_SEND_WORDS = re.compile(r"(?:^|[\s/])mother\s+whatsapp\s+(?:send|prompt)\b")
 
 
-def wa_paths_hit(cmd, cwd, ctx):
-    """True when the command names a WhatsApp state path: literally, by a glob, through ~, $HOME,
-    $MOTHER_STATE_DIR, $MOTHER_WORKSPACE or a NAME=… set earlier in the line, relative to its cwd or a `cd`; or
-    through anything left unresolved ($var, $( ), backticks) next to `.mother` or `whatsapp`."""
-    home = os.path.expanduser("~")
-    ws = ctx.ws or os.environ.get("MOTHER_WORKSPACE", "").strip() or None
-    known = {"HOME": home, "MOTHER_STATE_DIR": wa_state_root()}
-    if ws:
-        known["MOTHER_WORKSPACE"] = ws
-    s = WA_WORKSPACE_IDIOM.sub(lambda m: ws or "$MOTHER_WORKSPACE", cmd)
-    s = re.sub(r"[\"'\\]", "", s)
+def _wa_ansi_c(t):
+    """The text of a $'…' string."""
+    simple = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v", "e": "\x1b",
+              "E": "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?"}
 
-    def expand(text):
-        text = re.sub(r"\$\{(\w+):-[^}$`]*\}", lambda m: known.get(m.group(1), m.group(0)), text)
-        return re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda m: known.get(m.group(1) or m.group(2), m.group(0)), text)
+    def rep(m):
+        e = m.group(1)
+        if e in simple:
+            return simple[e]
+        try:
+            if e[0] in "xuU" and len(e) > 1:
+                return chr(int(e[1:], 16))
+            if e[0] in "01234567":
+                return chr(int(e, 8))
+        except (ValueError, OverflowError):
+            return ""
+        return "" if e[0] == "c" else "\\" + e
+    return re.sub(r"\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c.|.)", rep, t, flags=re.S)
 
-    for m in re.finditer(r"(?:^|[\s;&|(])([A-Za-z_]\w*)=([^\s;&|]*)", s):
-        v = expand(m.group(2))
-        if "$" not in v and "`" not in v:
-            known[m.group(1)] = v
-    s = expand(s)
-    bases = [os.path.realpath(cwd)] if cwd else []
-    for m in re.finditer(r"(?:^|[\s;&|(])cd[ \t]+([^\s;&|]+)", s):
-        t = os.path.expanduser(m.group(1))
-        bases.append(t if os.path.isabs(t) else os.path.join(bases[0] if bases else home, t))
-    protected = wa_protected(ctx)
-    for tok in re.split(r"[\s;&|<>]+", s):
-        low = tok.casefold()
-        if ("$" in tok or "`" in tok) and (".mother" in low or "whatsapp" in low):
-            return True
-        for piece in re.split(r"[()=:,`]+", tok):
-            if not piece or piece.startswith("-") or piece.startswith("$"):
+
+class _ShLex(object):
+    """Reads one shell line into simple commands: {"words", "redirs", "heredocs", "start", "end"}. A word is a
+    list of parts: ("t", text, q) literal text, q False unquoted, True quoted, "e" backslash-escaped; ("v", name,
+    default, q) a variable; ("s", text, q) a command or process substitution; ("x", text, q) any other expansion.
+    Never raises: anything unterminated runs to the end of the line."""
+
+    STOP = " \t\n;&|()<>"
+
+    def __init__(self, s, depth=0):
+        self.s, self.i, self.n, self.depth = s, 0, len(s), depth
+
+    @staticmethod
+    def _new():
+        return {"words": [], "redirs": [], "heredocs": [], "start": None, "end": None}
+
+    def _close(self, segs, cur):
+        if cur["words"] or cur["redirs"]:
+            segs.append(cur)
+        return self._new()
+
+    def commands(self, stop_paren=False):
+        s, segs, heredocs, depth = self.s, [], [], 0
+        cur = self._new()
+        while self.i < self.n:
+            c = s[self.i]
+            if c in " \t":
+                self.i += 1
+            elif c == "\\" and s.startswith("\n", self.i + 1):
+                self.i += 2
+            elif c == "\n":
+                self.i += 1
+                cur = self._close(segs, cur)
+                for h in heredocs:
+                    self._body(*h)
+                heredocs = []
+            elif c == "#":
+                j = s.find("\n", self.i)
+                self.i = self.n if j < 0 else j
+            elif c in "<>" and s.startswith("(", self.i + 1):
+                cur["start"] = self.i if cur["start"] is None else cur["start"]
+                cur["words"].append(self._word())
+                cur["end"] = self.i
+            else:
+                m = _WA_REDIR_OP.match(s, self.i) if (c in "<>&" or c.isdigit()) else None
+                if m:
+                    cur["start"] = self.i if cur["start"] is None else cur["start"]
+                    self.i = m.end()
+                    while self.i < self.n and s[self.i] in " \t":
+                        self.i += 1
+                    w = self._word() if self.i < self.n and s[self.i] not in self.STOP else []
+                    cur["end"] = self.i
+                    if m.group(2) in ("<<", "<<-"):
+                        heredocs.append((cur, w, m.group(2) == "<<-"))
+                    else:
+                        cur["redirs"].append((m.group(2), w))
+                elif c == "(":
+                    depth += 1
+                    self.i += 1
+                    cur = self._close(segs, cur)
+                elif c == ")":
+                    if stop_paren and depth == 0:
+                        break
+                    depth = max(depth - 1, 0)
+                    self.i += 1
+                    cur = self._close(segs, cur)
+                elif c in ";&|":
+                    while self.i < self.n and s[self.i] in ";&|":
+                        self.i += 1
+                    cur = self._close(segs, cur)
+                else:
+                    cur["start"] = self.i if cur["start"] is None else cur["start"]
+                    cur["words"].append(self._word())
+                    cur["end"] = self.i
+        self._close(segs, cur)
+        return segs
+
+    def _body(self, seg, delim, strip):
+        """A heredoc body: the lines up to its delimiter."""
+        word = "".join(p[1] for p in delim if p[0] == "t")
+        quoted = any(p[0] == "t" and p[2] for p in delim)
+        lines = []
+        while self.i < self.n:
+            j = self.s.find("\n", self.i)
+            j = self.n if j < 0 else j
+            ln = self.s[self.i:j]
+            self.i = min(j + 1, self.n)
+            if (ln.lstrip("\t") if strip else ln) == word:
+                break
+            lines.append(ln)
+        seg["heredocs"].append(("\n".join(lines), quoted))
+
+    def _word(self):
+        s, parts, buf = self.s, [], []
+
+        def flush():
+            if buf:
+                parts.append(("t", "".join(buf), False))
+                del buf[:]
+        while self.i < self.n:
+            c = s[self.i]
+            if c in "<>" and s.startswith("(", self.i + 1) and not parts and not buf:
+                self.i += 2
+                parts.append(("s", self._paren(), False))
+            elif c in self.STOP:
+                break
+            elif c == "\\":
+                flush()
+                if self.i + 1 < self.n and s[self.i + 1] != "\n":
+                    parts.append(("t", s[self.i + 1], "e"))
+                self.i += 2
+            elif c == "'":
+                flush()
+                j = s.find("'", self.i + 1)
+                j = self.n if j < 0 else j
+                parts.append(("t", s[self.i + 1:j], True))
+                self.i = j + 1
+            elif c == '"':
+                flush()
+                self.i += 1
+                self.dquote(parts, '"')
+            elif c == "$":
+                flush()
+                self._dollar(parts, False)
+            elif c == "`":
+                flush()
+                parts.append(("s", self._backtick(), False))
+            else:
+                buf.append(c)
+                self.i += 1
+        flush()
+        return parts
+
+    def dquote(self, parts, end):
+        """Double-quoted text up to `end` (None: to the end, as in a heredoc body)."""
+        s, buf = self.s, []
+
+        def flush():
+            if buf:
+                parts.append(("t", "".join(buf), True))
+                del buf[:]
+        while self.i < self.n:
+            c = s[self.i]
+            if c == end:
+                self.i += 1
+                break
+            if c == "\\" and self.i + 1 < self.n and s[self.i + 1] in '$`"\\\n':
+                if s[self.i + 1] != "\n":
+                    buf.append(s[self.i + 1])
+                self.i += 2
+            elif c == "$":
+                flush()
+                self._dollar(parts, True)
+            elif c == "`":
+                flush()
+                parts.append(("s", self._backtick(), True))
+            else:
+                buf.append(c)
+                self.i += 1
+        flush()
+
+    def _dollar(self, parts, q):
+        s, i = self.s, self.i
+        nx = s[i + 1:i + 2]
+        if nx == "'" and not q:
+            j = i + 2
+            while j < self.n and s[j] != "'":
+                j += 2 if s[j] == "\\" else 1
+            parts.append(("t", _wa_ansi_c(s[i + 2:min(j, self.n)]), True))
+            self.i = j + 1
+        elif nx == '"' and not q:
+            self.i = i + 2
+            self.dquote(parts, '"')
+        elif s.startswith("((", i + 1):
+            self.i, d = i + 3, 2
+            while self.i < self.n and d:
+                d += {"(": 1, ")": -1}.get(s[self.i], 0)
+                self.i += 1
+            parts.append(("x", s[i + 3:self.i], q))
+        elif nx == "(":
+            self.i = i + 2
+            parts.append(("s", self._paren(), q))
+        elif nx == "{":
+            j, d = i + 2, 1
+            while j < self.n:
+                ch = s[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch in "'\"":
+                    k = s.find(ch, j + 1)
+                    j = self.n if k < 0 else k + 1
+                    continue
+                d += {"{": 1, "}": -1}.get(ch, 0)
+                if not d:
+                    break
+                j += 1
+            body = s[i + 2:min(j, self.n)]
+            self.i = min(j + 1, self.n)
+            m = re.match(r"([A-Za-z_]\w*)(?:(:?[-=])(.*))?\Z", body, re.S)
+            parts.append(("v", m.group(1), m.group(3), q) if m else ("x", body, q))
+        else:
+            m = re.compile(r"[A-Za-z_]\w*").match(s, i + 1)
+            if m:
+                parts.append(("v", m.group(0), None, q))
+                self.i = m.end()
+            elif nx and nx in "0123456789@*#?$!-":
+                parts.append(("x", nx, q))
+                self.i = i + 2
+            else:
+                parts.append(("t", "$", q))
+                self.i = i + 1
+
+    def _paren(self):
+        """The text of a $( … ) (self.i just past the opening paren), read with heredocs and quotes."""
+        start = self.i
+        if self.depth > 40:
+            self.i = self.n
+            return self.s[start:]
+        sub = _ShLex(self.s, self.depth + 1)
+        sub.i = start
+        sub.commands(stop_paren=True)
+        self.i = min(sub.i + 1, self.n)
+        return self.s[start:sub.i]
+
+    def _backtick(self):
+        j = self.i + 1
+        while j < self.n and self.s[j] != "`":
+            j += 2 if self.s[j] == "\\" else 1
+        inner = self.s[self.i + 1:min(j, self.n)].replace("\\`", "`")
+        self.i = j + 1
+        return inner
+
+
+def _wa_glob_atoms(text, active, braces):
+    """Path-pattern atoms for literal text: ("c", ch); ("seg",) a * within one folder; ("one",) a ?;
+    ("cls", body) a [..]; ("any",) a brace group (it may hold a /)."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if active and ch == "*":
+            out.append(("seg",))
+        elif active and ch == "?":
+            out.append(("one",))
+        elif active and ch == "[" and "]" in text[i + 2:]:
+            j = text.index("]", i + 2)
+            out.append(("cls", text[i + 1:j]))
+            i = j + 1
+            continue
+        elif braces and ch == "{" and "}" in text[i + 1:] and re.match(r"[^{}]*(?:,|\.\.)", text[i + 1:]):
+            j = text.index("}", i + 1)
+            out.append(("any",))
+            i = j + 1
+            continue
+        else:
+            out.append(("c", ch))
+        i += 1
+    return out
+
+
+def _wa_rx(atoms):
+    out = []
+    for a in atoms:
+        if a[0] == "c":
+            out.append(re.escape(a[1].casefold()))
+        elif a[0] == "seg":
+            out.append("[^/]*")
+        elif a[0] == "one":
+            out.append("[^/]")
+        elif a[0] == "any":
+            out.append(".*")
+        else:
+            body = a[1].casefold()
+            neg = body[:1] in ("!", "^")
+            body = (body[1:] if neg else body).replace("\\", "\\\\").replace("[", "\\[")
+            cls = "[%s%s]" % ("^" if neg else "", body or "\\]")
+            try:
+                re.compile(cls)
+            except re.error:
+                cls = "[^/]"
+            out.append(cls)
+    return "".join(out)
+
+
+class _WaHit(Exception):
+    def __init__(self, action):
+        Exception.__init__(self, action["what"])
+        self.action = action
+
+
+class _WaScan(object):
+    """The WhatsApp gate's reading of one Bash command (CONTRACT §5d). run() raises _WaHit on the first problem.
+    A resolved word is a list of tokens: ("L", text, q) literal text (q as in _ShLex, plus "v": from an unquoted
+    variable, so split and globbed) or ("W",) something the guard can't compute."""
+
+    def __init__(self, cmd, cwd, ctx):
+        self.cmd, self.ctx = cmd, ctx
+        self.home = os.path.expanduser("~")
+        self.ws = ctx.ws or os.environ.get("MOTHER_WORKSPACE", "").strip() or None
+        self.known = {"HOME": [("L", self.home, True)], "MOTHER_STATE_DIR": [("L", wa_state_root(), True)],
+                      "CLAUDE_PLUGIN_ROOT": [("L", os.path.dirname(HERE), True)]}
+        if self.ws:
+            self.known["MOTHER_WORKSPACE"] = [("L", self.ws, True)]
+        self.bases = [os.path.realpath(cwd)] if cwd else []  # None: a folder the guard can't compute
+        self.protected = sorted(wa_protected(ctx))
+        anc = [os.path.join(self.home, ".mother"), wa_state_root()]
+        if self.ws:
+            anc += [self.ws, os.path.join(self.ws, ".mother")]
+        self.near = {f(p).casefold() for p in anc for f in (os.path.abspath, os.path.realpath)}
+        far = set()
+        for d in wa_dirs(ctx) + anc:
+            for f in (os.path.abspath, os.path.realpath):
+                p = os.path.dirname(f(d))
+                while p and p != os.path.dirname(p):
+                    far.add(p.casefold())
+                    p = os.path.dirname(p)
+        self.far = self.near | far  # every folder above the protected ones, but not /
+        self.depth = 0
+        self.runner = False   # a shell or interpreter reads code from a pipe or heredoc
+        self.skeleton = []    # the line's unquoted words
+
+    def hit(self, op, what):
+        raise _WaHit(wa_act(op, what))
+
+    def run(self):
+        self.line(self.cmd, top=True)
+        if _WA_SEND_WORDS.search(" ".join(self.skeleton).casefold()):
+            self.hit("compound", "a whatsapp send or prompt that is not a command of its own")
+        if self.runner:
+            n = wa_norm(self.cmd)
+            if _WA_SEND_WORDS.search(n):
+                self.hit("compound", "a whatsapp send or prompt fed to a shell or interpreter")
+            if WA_STATE_RE.search(n):
+                self.hit("state", "WhatsApp's state paths fed to a shell or interpreter")
+
+    def line(self, text, top=False):
+        self.depth += 1
+        if self.depth > 12:
+            self.hit("unknown", "a shell line nested too deeply to read")
+        for seg in _ShLex(text).commands():
+            self.segment(seg, text, top)
+        self.depth -= 1
+
+    def subs_in(self, text):
+        """Run the substitutions inside free text (a ${…} body, an unquoted heredoc) through line()."""
+        self.depth += 1
+        if self.depth > 12:
+            self.hit("unknown", "a shell line nested too deeply to read")
+        lx, parts = _ShLex(text), []
+        lx.dquote(parts, None)
+        for p in parts:
+            if p[0] == "s":
+                self.line(p[1])
+            elif p[0] == "x" or (p[0] == "v" and p[2]):
+                self.subs_in(p[1] if p[0] == "x" else p[2])
+        self.depth -= 1
+
+    # -- words
+
+    @staticmethod
+    def plain(word):
+        return "".join(p[1] for p in word) if word and all(p[0] == "t" and p[2] is False for p in word) else None
+
+    def resolve(self, word):
+        out = []
+        for k, p in enumerate(word):
+            kind, q = p[0], p[-1]
+            if kind == "t":
+                text = p[1]
+                if k == 0 and q is False and (text == "~" or text.startswith("~/")):
+                    out.append(("L", self.home, True))
+                    text = text[1:]
+                if text:
+                    out.append(("L", text, q))
+            elif kind == "v":
+                if p[2]:
+                    self.subs_in(p[2])
+                val = self.known.get(p[1])
+                if val is None:
+                    out.append(("W",))
+                else:
+                    out.extend(("L", t[1], True if q else "v") if t[0] == "L" else t for t in val)
+            elif kind == "s":
+                self.line(p[1])  # a substitution runs: it is a command line of its own
+                v = self.subst_value(p[1])
+                out.append(("L", v, True) if v else ("W",))
+            else:
+                self.subs_in(p[1])
+                out.append(("W",))
+        return out
+
+    def subst_value(self, inner):
+        """$(cat ~/.mother/workspace) and $(mother path) are the workspace; nothing else is computed."""
+        t = " ".join(inner.split())
+        if self.ws and (re.match(r"cat (?:~|\$HOME|\$\{HOME\})/\.mother/workspace\Z", t)
+                        or re.match(r"(?:python3? )?\S*mother path\Z", t)):
+            return self.ws
+        return None
+
+    @staticmethod
+    def split(toks):
+        """Word splitting: only the text an unquoted variable brought in splits."""
+        if not any(t[0] == "L" and t[2] == "v" and re.search(r"\s", t[1]) for t in toks):
+            return [toks]
+        words, cur = [], []
+        for t in toks:
+            if t[0] == "L" and t[2] == "v":
+                for b in re.split(r"(\s+)", t[1]):
+                    if b and b.isspace():
+                        if cur:
+                            words.append(cur)
+                        cur = []
+                    elif b:
+                        cur.append(("L", b, "v"))
+            else:
+                cur.append(t)
+        if cur:
+            words.append(cur)
+        return words
+
+    @staticmethod
+    def value(toks):
+        return None if any(t[0] == "W" for t in toks) else "".join(t[1] for t in toks)
+
+    @staticmethod
+    def computed(toks):
+        return any(t[0] == "W" or (t[2] in (False, "v") and _WA_GLOB.search(t[1])) for t in toks)
+
+    def assignment(self, toks):
+        if not toks or toks[0][0] != "L" or toks[0][2] is not False:
+            return False
+        m = re.match(r"([A-Za-z_]\w*)\+?=", toks[0][1])
+        if not m:
+            return False
+        rest = toks[0][1][m.end():]
+        val = []
+        if rest.startswith("~") and (len(rest) == 1 or rest[1] == "/"):
+            val, rest = [("L", self.home, True)], rest[1:]
+        val += ([("L", rest, False)] if rest else []) + [("L", t[1], True) if t[0] == "L" and t[2] == "v" else t
+                                                        for t in toks[1:]]
+        self.arg(val, False)
+        self.known[m.group(1)] = val
+        return True
+
+    # -- commands
+
+    def segment(self, seg, text, top):
+        words = seg["words"]
+        if top:
+            self.skeleton += ["".join(p[1] for p in w if p[0] == "t" and p[2] in (False, "e")) for w in words]
+        i = 0
+        while i < len(words) and self.plain(words[i]) in WA_RESERVED:
+            i += 1
+        head = self.plain(words[i]) if i < len(words) else None
+        if head in ("for", "select", "case", "function"):
+            for w in words[i + 1:]:
+                for t in self.split(self.resolve(w)):
+                    self.arg(t, False)
+            if head in ("for", "select") and i + 1 < len(words):
+                self.known.pop(self.plain(words[i + 1]) or "", None)
+        else:
+            argv, assigning = [], True
+            for w in words[i:]:
+                toks = self.resolve(w)
+                if assigning and self.assignment(toks):
+                    continue
+                assigning = False
+                argv.extend(self.split(toks))
+            self.command(argv, seg, text, None)
+        for op, w in seg["redirs"]:
+            toks = self.resolve(w)
+            if op in (">&", "<&") and re.match(r"(?:\d+|-)?\Z", self.value(toks) or "x"):
                 continue
-            piece = os.path.expanduser(piece)
-            cands = [piece] if os.path.isabs(piece) else [os.path.join(b, piece) for b in bases]
-            for c in cands:
-                if any(ch in c for ch in "*?["):
-                    if _glob_hits(os.path.normpath(c), protected):
-                        return True
-                elif wa_inside(c, ctx):
-                    return True
-    return False
+            self.arg(toks, False)
+        for body, quoted in seg["heredocs"]:
+            if not quoted:
+                self.subs_in(body)
+
+    def command(self, argv, seg, text, wrapped):
+        if not argv:
+            return
+        if self.computed(argv[0]):
+            self.hit("computed", "a command whose name is computed (a variable, $( ), a glob or $'…' quoting)")
+        pieces = self.value(argv[0]).split()
+        if not pieces:
+            return
+        name = pieces[0].rstrip("/").split("/")[-1].casefold()
+        args = [[("L", p, True)] for p in pieces[1:]] + argv[1:]
+        vals = [self.value(a) for a in args]
+        destructive = self.reach(name, vals)
+        for a in args:
+            self.arg(a, destructive)
+        self.track_dirs(name, vals)
+        if name in WA_WRAPPERS:
+            self.unwrap(name, args, vals, seg, text)
+        elif name == "eval":
+            if any(v is None for v in vals):
+                self.hit("computed", "an eval of text the guard can't compute")
+            self.line(" ".join(vals))
+        elif name in WA_SHELLS:
+            self.shell(args, vals, seg)
+        elif name in WA_INTERPS:
+            self.interp(name, args, vals, seg, text, wrapped)
+        elif name in WA_SOCKET_CMDS or (name == "curl" and any(
+                v and v.startswith(("--unix-socket", "--abstract-unix-socket")) for v in vals)):
+            if re.search(r"whatsapp|bridge", wa_norm(self.cmd)) or any(v is None for v in vals):
+                self.hit("state", "a socket client on a line about WhatsApp or its bridge")
+        elif name == "find":
+            for k, v in enumerate(vals):
+                if v in ("-exec", "-execdir", "-ok", "-okdir"):
+                    inner = []
+                    for a, w in zip(args[k + 1:], vals[k + 1:]):
+                        if w in (";", "+"):
+                            break
+                        inner.append(a)
+                    self.command(inner, seg, text, "find")
+        elif name == "mother":
+            self.mother(args, vals, seg, text, wrapped)
+
+    def reach(self, name, vals):
+        """The folders a destructive or copying command must not name: None (not such a command), the folders
+        that directly hold WhatsApp's state, or every folder above it (a recursive delete, move or copy)."""
+        recursive = any(v and re.match(r"(?:-[A-Za-z]*[rRa][A-Za-z]*|--recursive|--archive)\Z", v) for v in vals)
+        if (name == "find" and any(v in WA_FIND_ACTIONS for v in vals)) or name in (
+                "rm", "rmdir", "mv", "tar", "zip", "unzip", "rsync", "ditto", "shred", "trash", "srm") or (
+                name in ("cp", "chmod", "chown", "chflags") and recursive):
+            return self.far
+        return self.near if name in WA_DESTRUCTIVE else None
+
+    def unwrap(self, name, args, vals, seg, text):
+        opts, k, duration = WA_WRAPPERS[name], 0, name in ("timeout", "gtimeout")
+        while k < len(args) and vals[k] is not None:
+            v = vals[k]
+            if name == "env" and v in ("-S", "--split-string") and k + 1 < len(args):
+                if vals[k + 1] is None:
+                    self.hit("computed", "an env -S string the guard can't compute")
+                self.line(vals[k + 1])
+                return
+            if v == "--":
+                k += 1
+                break
+            if (name == "env" and re.match(r"[A-Za-z_]\w*=", v)) or (v.startswith("-") and len(v) > 1):
+                k += 2 if v in opts else 1
+                continue
+            if duration:
+                duration = False
+                k += 1
+                continue
+            break
+        self.command(args[k:], seg, text, name)
+
+    def shell(self, args, vals, seg):
+        for k, v in enumerate(vals):
+            if v is None:
+                return
+            if v.startswith(("-", "+")) and len(v) > 1 and not v.startswith("--"):
+                if "c" in v[1:]:
+                    if k + 1 < len(args):
+                        if vals[k + 1] is None:
+                            self.hit("computed", "a shell -c string the guard can't compute")
+                        self.line(vals[k + 1])
+                    return
+                continue
+            if v.startswith("--"):
+                continue
+            return  # a script file: its path was checked like any argument
+        self.runner = True  # no -c and no script: it reads commands from stdin
+        for body, _ in seg["heredocs"]:
+            self.line(body)
+
+    def interp(self, name, args, vals, seg, text, wrapped):
+        awk = name.endswith("awk")
+        k = 0
+        while k < len(args):
+            v = vals[k]
+            if v is None:
+                return
+            if awk:
+                if v in ("-F", "-v"):
+                    k += 2
+                    continue
+                if v == "-f":
+                    return
+                if v.startswith("-") and len(v) > 1:
+                    k += 1
+                    continue
+                return self.code(v)
+            if v in WA_CODE_FLAGS:
+                if k + 1 < len(args):
+                    if vals[k + 1] is None:
+                        self.hit("computed", "inline code the guard can't compute")
+                    self.code(vals[k + 1])
+                return
+            if v == "-m" and name.startswith("python"):
+                return
+            if v == "-":
+                break
+            if v.startswith("-") and len(v) > 1:
+                k += 1
+                continue
+            if name.startswith("python") and v.rstrip("/").split("/")[-1].casefold() == "mother":
+                return self.mother(args[k + 1:], vals[k + 1:], seg, text, wrapped)
+            if "bridge" in v.casefold().split("/") and "whatsapp" in wa_norm(self.cmd):
+                self.hit("state", "a script from the WhatsApp bridge")
+            return
+        self.runner = True  # no inline code and no script: it reads code from stdin
+        for body, _ in seg["heredocs"]:
+            self.code(body)
+
+    def code(self, text):
+        n = wa_norm(text)
+        if WA_STATE_RE.search(n):
+            self.hit("state", "a script that names WhatsApp's bridge socket or its state folders")
+        if "whatsapp" in n and re.search(r"mother\W+whatsapp|af_unix|unix[-_]connect|\.sock\b|createconnection", n):
+            self.hit("unknown", "a script that runs the mother whatsapp CLI or reaches the bridge")
+
+    def mother(self, args, vals, seg, text, wrapped):
+        if not args:
+            return
+        if vals[0] is None:
+            self.hit("unknown", "a mother command whose subcommand is computed")
+        if vals[0].casefold() != "whatsapp":
+            if wrapped == "xargs":
+                self.hit("unknown", "a mother command that takes its arguments from xargs")
+            return
+        if len(args) > 1:
+            if vals[1] is None:
+                self.hit("unknown", "a whatsapp subcommand that is computed")
+            if vals[1].casefold() in ("send", "prompt"):
+                self.hit("compound", "a whatsapp send or prompt that is not a command of its own")
+        if wrapped or not WA_PASS_RE.match(text[seg["start"]:seg["end"]].strip()):
+            self.hit("unknown", "an unrecognised whatsapp command")
+
+    def track_dirs(self, name, vals):
+        """cd, pushd and -C/--directory move the folder relative paths resolve against."""
+        def add(v):
+            if v is None:
+                self.bases.append(None)
+                return
+            p = os.path.expanduser(v)
+            last = next((b for b in reversed(self.bases) if b), self.home)
+            self.bases.append(os.path.normpath(p if os.path.isabs(p) else os.path.join(last, p)))
+        if name in ("cd", "pushd"):
+            rest = [v for v in vals if not (v and v.startswith("-") and len(v) > 1)]
+            if not rest:
+                self.bases.append(self.home)
+            elif rest[0] != "-":
+                add(rest[0])
+        for k, v in enumerate(vals):
+            if v in ("-C", "--directory") and k + 1 < len(vals):
+                add(vals[k + 1])
+            elif v and v.startswith("--directory="):
+                add(v[len("--directory="):])
+
+    # -- paths
+
+    def arg(self, toks, destructive):
+        """An argument that names a protected path (or, for a destructive command, a folder holding one) hits.
+        Unresolved expansions are wildcards; a word that is only an expansion names nothing the guard can see."""
+        if not toks or all(t[0] == "W" for t in toks):
+            return
+        lits = "".join(t[1] for t in toks if t[0] == "L")
+        spaced = bool(re.search(r"\s", lits))
+        if any(t[0] == "W" for t in toks) and not spaced and \
+                re.search(r"\.mother|whatsapp|bridge\.sock|grant\.key", lits, re.I):
+            self.hit("state", "a path next to WhatsApp's state built from something the guard can't resolve")
+        out, cur = [], []
+        for t in toks:  # pieces: --file=PATH, UNIX-CONNECT:PATH, code like open('PATH')
+            if t[0] != "L":
+                cur.append(t)
+                continue
+            for n, b in enumerate(_WA_SEP.split(t[1])):
+                if n and cur:
+                    out.append(cur)
+                    cur = []
+                if b:
+                    cur.append(("L", b, t[2]))
+        if cur:
+            out.append(cur)
+        for c in [toks] + (out if len(out) > 1 else []):
+            self.path(c, destructive, not spaced)
+
+    def path(self, toks, destructive, statere):
+        if not toks or all(t[0] == "W" for t in toks) or (toks[0][0] == "L" and toks[0][1].startswith("-")):
+            return
+        atoms = []
+        for t in toks:
+            atoms += [("any",)] if t[0] == "W" else _wa_glob_atoms(t[1], True, t[2] in (False, "v"))
+        if all(a[0] == "c" for a in atoms):
+            p = "".join(a[1] for a in atoms)
+            if statere and WA_STATE_RE.search(p):
+                self.hit("state", "a shell command on WhatsApp's bridge socket or its state folders")
+            p = os.path.expanduser(p)
+            for base in ([""] if os.path.isabs(p) else self.bases):
+                if base is None:
+                    self.match([("any",), ("c", "/")] + [("c", ch) for ch in p], destructive)
+                    continue
+                c = os.path.normpath(os.path.join(base, p))
+                if wa_inside(c, self.ctx) or (destructive and _cf(c) in destructive):
+                    self.hit("state", "a shell command on WhatsApp's bridge socket or its state folders")
+            return
+        if atoms[0] == ("c", "~") and (len(atoms) == 1 or atoms[1] == ("c", "/")):
+            atoms = [("c", ch) for ch in self.home] + atoms[1:]
+        if atoms[0] in (("any",), ("c", "/")):
+            cands = [atoms]
+        else:
+            cands = [([("any",)] if b is None else [("c", ch) for ch in b]) + [("c", "/")] + atoms
+                     for b in self.bases]
+        for c in cands:
+            self.match(c, destructive)
+
+    def match(self, atoms, destructive):
+        first = next((k for k, a in enumerate(atoms) if a[0] != "c"), len(atoms))
+        head = "".join(a[1] for a in atoms[:first])
+        cut = head.rfind("/")
+        if head.startswith("/") and cut >= 0:  # resolve the literal folders (/var → /private/var)
+            real = os.path.realpath(head[:cut] or "/").rstrip("/")
+            atoms = [("c", ch) for ch in real] + atoms[cut:]
+        ends = [k for k, a in enumerate(atoms) if a == ("c", "/") and k] + [len(atoms)]
+        for end in ends:
+            pre = atoms[:end]
+            if all(a[0] != "c" or a[1] == "/" for a in pre):
+                continue  # only wildcards: it names anything, so it names nothing in particular
+            rx = re.compile(_wa_rx(pre), re.S)
+            if any(rx.fullmatch(p) for p in self.protected):
+                self.hit("state", "a shell command on WhatsApp's bridge socket or its state folders")
+        if destructive:
+            rx = re.compile(_wa_rx(atoms), re.S)
+            if any(rx.fullmatch(p) for p in destructive):
+                self.hit("state", "a destructive or copying command on a folder that holds WhatsApp's state")
 
 
 def wa_act(op, what, **kw):
-    return act("whatsapp", "whatsapp_state" if op == "state" else "any_message_to_others", what, op=op, **kw)
+    cat = {"state": "whatsapp_state", "computed": "computed_command"}.get(op, "any_message_to_others")
+    return act("whatsapp", cat, what, op=op, **kw)
 
 
 def classify_whatsapp(cmd, cwd, ctx):
     """A WhatsApp action for a Bash command, or None when the command is not WhatsApp's business or is one of
-    the passing subcommands (read, chats, draft, list, …). Ops: send, prompt (decided on proof), state,
-    compound, unknown (always denied). Any mention of the CLI with `whatsapp`, in any quoting or case, must be
-    one of the exact shapes on the raw text (CONTRACT §5)."""
-    norm = wa_norm(cmd)
-    if WA_STATE_RE.search(norm) or ("whatsapp" in norm and (any(w in norm for w in WA_SOCKET_WORDS)
-                                                            or "nc" in wa_tokens(norm))) \
-            or (cwd and wa_inside(cwd, ctx)) or wa_paths_hit(cmd, cwd, ctx):
-        # The command itself stays out of the reason: guard.log never holds message text.
-        return wa_act("state", "a shell command on WhatsApp's bridge socket or its state folders")
-    if not wa_names_cli(norm):
-        return None
+    the passing subcommands (read, chats, draft, list, …). Ops: send, prompt (decided on proof); state,
+    compound, unknown, computed (always denied). A send or prompt must be the exact shape on the raw text; any
+    other line is read by _WaScan (CONTRACT §5, §5d). Reasons never quote the command: guard.log holds no
+    message text."""
+    if cwd and wa_inside(cwd, ctx):
+        return wa_act("state", "a shell command run inside WhatsApp's state folders")
     line = cmd.strip()
     m = WA_SEND_RE.match(line)
     if m:
@@ -581,13 +1290,10 @@ def classify_whatsapp(cmd, cwd, ctx):
     if m:
         ids = m.group(1).split()
         return wa_act("prompt", "a WhatsApp self-chat prompt for " + " ".join(ids), draft=",".join(ids), drafts=ids)
-    if re.search(r"(?:^|[\s/])mother\s+whatsapp\s+(?:send|prompt)\b", norm):
-        return wa_act("compound", "a whatsapp send or prompt that is not a command of its own")
-    for seg in CMD_SPLIT_RE.split(cmd):
-        if wa_names_cli(wa_norm(seg)) or any(t.rstrip("/").split("/")[-1] == "mother"
-                                             for t in wa_tokens(wa_norm(seg))):
-            if not WA_PASS_RE.match(seg.strip()):
-                return wa_act("unknown", "an unrecognised whatsapp command")
+    try:
+        _WaScan(cmd, cwd, ctx).run()
+    except _WaHit as h:
+        return h.action
     return None
 
 
@@ -1108,6 +1814,9 @@ def decide_whatsapp(a, ctx, transcript=None):
         return "deny", "%s. See `mother whatsapp help`." % what
     if op == "compound":
         return "deny", "%s. Run `mother whatsapp send <id>` (or `prompt <ids>`) alone." % what
+    if op == "computed":
+        return "deny", "%s: the guard can't tell what it runs. Write the command name out plainly (a variable " \
+                       "is fine as an argument, or set it earlier in the same line)." % what
     p = paused(ctx)
     if p:
         return "deny", "Outbound is PAUSED (%s exists). Blocked: %s." % (p, what)

@@ -195,19 +195,39 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `max_replies_per_hour` in the ledger (`rules/outbound.md`).
 - **WhatsApp (`whatsapp.send`, §5d)** is never `ask`: every WhatsApp decision is `allow` or `deny`, in every
   permission mode (including `bypassPermissions`, where an ask would pass), and a guard error on a WhatsApp
-  call denies. Action: `{"kind": "whatsapp", "op": "send"|"prompt"|"state"|"compound"|"unknown",
-  "category": "any_message_to_others" | "whatsapp_state" (for `state`), "draft": <id>}` (`prompt` adds
-  `"drafts": [ids]`; `state`, `compound` and `unknown` always deny); `guard.log` names the draft id as the
-  target, never a JID, and never echoes the command.
-  - **Recognition, fail closed.** The guard normalises each Bash command (quotes and backslashes removed,
-    casefolded). If it then names the CLI (a word whose last path part is `mother`) and the word `whatsapp`,
-    the **raw** command must be one of the exact shapes below, else deny ("unrecognised whatsapp command"):
-    `mother whatsapp send <id>` as the **whole** command: the `mother` CLI (bare, a path ending in `/mother`,
+  call denies. Action: `{"kind": "whatsapp", "op": "send"|"prompt"|"state"|"compound"|"unknown"|"computed",
+  "category": "any_message_to_others" | "whatsapp_state" (for `state`) | "computed_command" (for `computed`),
+  "draft": <id>}` (`prompt` adds `"drafts": [ids]`; `state`, `compound`, `unknown` and `computed` always
+  deny); `guard.log` names the draft id as the target, never a JID, and never echoes the command.
+  - **Recognition: shapes, not spellings.** A `send` or `prompt` is recognised only on the **raw** command:
+    `mother whatsapp send <id>` as the **whole** command — the `mother` CLI (bare, a path ending in `/mother`,
     `"${CLAUDE_PLUGIN_ROOT}/bin/mother"`, optionally after `python3`), lower-case unquoted `whatsapp send`, one
-    id, nothing else (no `;`, `&&`, `|`, `$( )`, backticks, redirection, env prefix, quoting, second id);
-    `mother whatsapp prompt <id> [<id>…]` the same way; or, per pipeline segment, a passing subcommand with
-    plain, `$VAR` or quoted arguments and redirections (no `$( )` or backticks). A repo path that merely
-    contains the words (`mother-whatsapp/`) is not a mention.
+    id, nothing else (no `;`, `&&`, `|`, `$( )`, backticks, redirection, env prefix, quoting, second id) — or
+    `mother whatsapp prompt <id> [<id>…]` the same way. Every other Bash command is read as shell: simple
+    commands split on `;`, `&&`, `||`, `|`, `&`, newlines and parentheses; quotes, `$'…'`, `$"…"` and
+    backslashes resolved; comments and quoted heredoc bodies are data; `$( )`, backticks, `<( )`, the strings
+    given to `eval`, `sh|bash|zsh -c`, `env -S` and `find -exec`, and a heredoc fed to a shell are read as
+    commands too. Variables resolve from `HOME`, `MOTHER_STATE_DIR`, `MOTHER_WORKSPACE`, `CLAUDE_PLUGIN_ROOT`
+    (the plugin root), `NAME=…` set earlier in the line, and `$(cat ~/.mother/workspace)` / `$(mother path)`
+    (the workspace); everything else is unresolved. Then:
+    - a command name (after `env`, `command`, `exec`, `xargs`, `sudo`, `nohup`, `time`, `timeout`, `nice` and
+      the like) that holds an unresolved variable, a substitution or an unquoted glob or brace (`$M`,
+      `mo$(true)ther`, `bin/mo?her`, `{mother,x}`) is **denied** as `computed`, on any Bash line, WhatsApp or
+      not. `$CH plan` works when `CH=…` is set earlier in the same line;
+    - a `mother` command (resolved) whose first argument is `whatsapp` and whose subcommand is `send` or
+      `prompt` is `compound` (deny); any other `whatsapp` subcommand must be a passing one, with its raw
+      simple command plain, `$VAR` or quoted arguments and redirections (`>`, `>>`, `<`, `<<`, `2>&1`, `&>`; no
+      `$( )` or backticks), run directly (not under a wrapper), else `unknown` (deny). A computed first
+      argument or subcommand, or `mother` under `xargs`, is `unknown`;
+    - unquoted words spelling `mother whatsapp send|prompt` anywhere in the line (`mother whatsapp⏎send w3kx`),
+      or that text anywhere in a line where a shell or interpreter reads code from a pipe or heredoc, are
+      `compound`; inline code (`python3 -c`, `node -e`, `awk '…'`, …) naming the state paths below, or
+      `mother … whatsapp`, or `whatsapp` with `AF_UNIX`, `UNIX-CONNECT` or `.sock`, is denied; so is a script
+      under a `bridge/` folder on a line that mentions `whatsapp`, and `nc`, `ncat`, `socat` or
+      `curl --unix-socket` on a line that mentions `whatsapp` or `bridge` or has an unresolved argument.
+    A repo path, `grep` pattern or commit message that merely contains the words (`git -C …/mother log --grep
+    whatsapp`, `git commit -m "whatsapp: …"`) is not a mention: the rules key on command names and resolved
+    paths.
   - `send` is allowed only when all hold, else denied: not PAUSED; `config.json` valid; `policy.never` lacks
     `any_message_to_others`; `lib/whatsapp.py` imports (else deny "whatsapp module unavailable");
     `whatsapp.enabled` and `whatsapp.send`; this is `workspace.home_machine`; the draft is open (exists,
@@ -229,19 +249,32 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   - **State is off-limits to the agent.** The protected folders are `<ws>/.mother/whatsapp/`,
     `<state>/whatsapp/` (`<state>` = `$MOTHER_STATE_DIR` or `~/.mother`) and `~/.mother/whatsapp/`; every path
     comparison is case-insensitive (casefolded after `realpath`), here and for the guard's own files below.
-    A Bash command is **denied** — reads included — when, after normalising: it names `bridge.sock`,
-    `.mother/whatsapp`, `whatsapp/{approved,drafts,session}`, `whatsapp/{sent,prompts}.jsonl` or
-    `whatsapp/grant.key`; it mentions `whatsapp` with `bridge`, `.sock`, `--unix-socket`, `nc`, `socat` or
-    `AF_UNIX`; its cwd, or a path in it, lies inside a protected folder after expanding `~`, `$HOME`,
-    `${HOME}`, `$MOTHER_STATE_DIR`, `$MOTHER_WORKSPACE`, `NAME=…` set earlier in the line (the workspace idiom
-    `W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"` resolves to the workspace) and resolving relative
-    paths against the cwd and any `cd` in the line; a glob (`*`, `?`, `[`) whose leading path parts match a
-    protected path or one of its ancestors (case-insensitive `fnmatch`: `~/.mother/what*`, `~/.mother/*`); or
-    a word containing `.mother` or `whatsapp` still holds an unresolved `$var`, `$( )` or backtick.
+    A Bash command is **denied** (`state`) — reads included — when its cwd lies inside a protected folder, or
+    when an argument, a redirection target, an assignment value or a piece of one (split at `=`, `:`, `,`,
+    quotes and parentheses, so `--file=PATH`, `UNIX-CONNECT:PATH` and `open('PATH')` count) names one:
+    - a word with no unresolved part, after `~` and the variables above, resolved against the cwd and every
+      `cd`, `pushd`, `-C` and `--directory` in the line, that lies inside a protected folder; or a word
+      without spaces that contains `bridge.sock`, `.mother/whatsapp`, `whatsapp/{approved,drafts,session}`,
+      `whatsapp/{sent,prompts}.jsonl` or `whatsapp/grant.key`;
+    - a word with wildcards: each unresolved expansion and each brace group (`{a,b}`) becomes `.*` (it may
+      hold a `/`), each `*` `?` `[…]` a glob within one folder (quoted ones too). It is denied when it, or a
+      prefix of it ending at a `/`, matches a protected path case-insensitively (`~/.mo${E}ther/wh*`,
+      `"$W"/.mot${E}her/whats${E}app/…`, `~/.mother/*`). A word, or prefix, that is only wildcards and `/`
+      names nothing in particular and is skipped (`cd "$W"`, `rm -rf "$D"/*`). After a `cd` to an unresolved
+      folder, later relative words are matched as `.*/word`;
+    - a word with an unresolved part next to the text `.mother`, `whatsapp`, `bridge.sock` or `grant.key` (no
+      spaces in it): `cat $UNKNOWN/.mother/x`.
+    Destructive or copying commands (`rm`, `rmdir`, `unlink`, `mv`, `cp`, `rsync`, `tar`, `ditto`, `zip`,
+    `unzip`, `ln`, `chmod`, `chown`, `chflags`, `shred`, `trash`, and `find` with `-delete`/`-exec`/`-ok`)
+    are also **denied** when an argument names a folder that holds the state: `~/.mother`, `<state>`, `<ws>`,
+    `<ws>/.mother`; and, for a recursive one (`rm`, `rmdir`, `mv`, `tar`, `zip`, `unzip`, `rsync`, `ditto`,
+    `shred`, `trash`, `find`, and `cp`/`chmod`/`chown`/`chflags` with `-r`/`-R`/`-a`), any folder above them
+    except `/` (`find ~ … -delete`, `tar cf x.tar .` in the workspace, `cp -r <state> /tmp`). Reading and
+    listing those folders, and work inside the workspace, pass (`ls ~/.mother`, `cd "$W" && git status`,
+    `cp a.md "$W"/memory/`).
     Write/Edit/MultiEdit/NotebookEdit anywhere under a protected folder is **denied** (not asked). Only
     `mother whatsapp` subcommands write there. The Read tool may read drafts.
-    Residual: a path the guard can't see at all (built inside a script file, a symlink made elsewhere) is not
-    caught; the bridge's re-check guards against a guard bug, not against a process with the manager's rights.
+    Residuals, stated plainly: see §5d "What the locks stop".
   - Channel sessions (`MOTHER_CHANNEL_ROLE`) run no Bash at all, so no `mother whatsapp` command. The
     `mother:reader` sub-agent may run only a single `mother whatsapp read …` command (no shell operators);
     every other `mother whatsapp` command is denied to sub-agents. `MOTHER_DRY_RUN=1` denies `send` and `prompt`.
@@ -363,7 +396,8 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   `manager.chat_dm`, manager, reply `ts`, and `sig` = HMAC-SHA256 hex over `scope\ntarget\nts\nsha256` keyed
   by `<state>/whatsapp/grant.key` (32 random bytes as hex, created 0600 with `O_EXCL` on first use); the same
   reply never writes a second grant). `grants.json` stays agent-writable (the digest writes run grants with
-  agent tools), so a `whatsapp` grant without a valid `sig` proves nothing and is never consumed; each `no` drops the
+  agent tools), so a `whatsapp` grant without a valid `sig` (missing, wrong, not a string, non-ASCII) proves
+  nothing and is never consumed; a malformed one never stops the others being checked. Each `no` drops the
   draft. Then it drops drafts with a `no` in the self chat and prints
   `{"send": [ids with a proof on an enabled path], "dropped": [ids]}`. With `whatsapp.enabled` or
   `whatsapp.send` false it prints empty lists. It sends nothing itself.
@@ -388,6 +422,17 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   draft id, text hash, stanza id). Workspace, git-ignored: `.mother/whatsapp/drafts/`, `approved/`,
   `prompts.jsonl`. `mother whatsapp link` shows the QR; `unlink` logs the device out and deletes the keys.
   `.mother/PAUSED` stops all sends.
+- **What the locks stop.** The guard and the bridge stop mistakes and injected instructions: an agent that
+  misreads a yes, a message or page that tells it to send, a command written in an odd way. They do not stop
+  a deliberately evasive agent running as the manager on the same macOS account. Such an agent can write a
+  script file and run it (the guard sees `python3 x.py`, not what it does), build a path in a way no shell
+  reader resolves, or read what the account can read — including the bridge's session keys in
+  `<state>/whatsapp/session/` — and act outside MOTHER altogether. Two narrower residuals on the `slack_dm`
+  path: `mother whatsapp pending` signs whatever DM messages the agent passes it on stdin, and
+  `<state>/whatsapp/grant.key` is readable by the account (the guard denies it to Bash, but the Read tool
+  runs unchecked outside channel sessions). So the Slack path trusts the agent's report of the manager's DM.
+  The bridge re-checking the original yes itself narrows this; it does not remove it. The `session` and
+  `self_chat` proofs read the transcript and the local database, not agent input.
 - **Never.** Reading or storing a chat that is not on the allowlist; sending text the manager did not approve
   word for word; sending by any path the guard cannot see; assessing a person from their messages.
 

@@ -51,6 +51,9 @@ W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
 CH="python3 ${CLAUDE_PLUGIN_ROOT}/bin/mother channels"
 ```
 
+Shell variables don't carry over between Bash calls, and the guard denies a command name it can't compute:
+start each command with the `CH=` line (`CH="…"; $CH plan`) or write the command out.
+
 Chat tools: `${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind chat --cap read|search|post [--target dm|other]`
 gives the server prefix to call for each. If `chat.read` isn't `ok` (pick exits 3), say so and stop: a loop that can't read is
 not "all quiet".

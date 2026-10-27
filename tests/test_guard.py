@@ -1163,13 +1163,12 @@ class TestWhatsappFixRound1(WhatsappCase):
                     'mother whatsapp read; mother whatsapp "send" w3kx', 'm"other" whatsapp send w3kx',
                     "mother\\ whatsapp send w3kx", "mother whatsapp s\\end w3kx", 'eval "mother whatsapp send w3kx"',
                     "mother WhatsApp send w3kx", "mother whatsapp SEND w3kx", "mother whatsapp list $(echo x)",
-                    "mother whatsapp list `echo x`", "mother whatsapp frobnicate", "bin/Mother whatsapp list",
-                    "grep -n whatsapp bin/mother"):
+                    "mother whatsapp list `echo x`", "mother whatsapp frobnicate", "bin/Mother whatsapp list"):
             for mode in (None, self.BY):
                 got, why = self.wa(cmd, transcript=ok, mode=mode)
                 self.assertEqual(got, "deny", "%r %s -> %s (%s)" % (cmd, mode, got, why))
         self.assertFalse(os.path.exists(self.approved()))
-        for cmd in ("echo hi | nc -l 9 whatsapp", "socat - x # whatsapp", "ls bridge/whatsapp",
+        for cmd in ("echo hi | nc -l 9 whatsapp", "socat - x # whatsapp", "node bridge/whatsapp/index.js",
                     "curl --unix-socket /tmp/a http://x/whatsapp"):
             self.assertEqual(self.wa(cmd)[0], "deny", cmd)
         # still fine: quoted arguments to a passing subcommand, and a repo path that merely contains the words
@@ -1261,6 +1260,109 @@ class TestWhatsappFixRound1(WhatsappCase):
         self.send("allow")
         # digest still writes grants.json with agent tools, so the file itself stays writable
         self.assertEqual(self.run_guard("Write", {"file_path": self.state("grants.json")}, env=self.env)[0], "none")
+
+
+class TestWhatsappFixRound2(WhatsappCase):
+    """Review fix round 2 (T5-h): shapes, not spellings. A computed command name is denied; every argument has
+    its expansions read as wildcards; destructive or copying ops on the state folders' ancestors are denied."""
+
+    def deny_all(self, cmds, **kw):
+        for cmd in cmds:
+            for mode in (None, self.BY):
+                got, why = self.wa(cmd, mode=mode, **kw)
+                self.assertEqual(got, "deny", "%r %s -> %s (%s)" % (cmd, mode, got, why))
+
+    def pass_all(self, cmds, **kw):
+        for cmd in cmds:
+            got, why = self.wa(cmd, mode=self.BY, **kw)
+            self.assertEqual(got, "none", "%r -> %s (%s)" % (cmd, got, why))
+
+    def test_computed_command_name_denied(self):
+        ok = self.yes()
+        self.deny_all(["$'mother' whatsapp send w3kx", '$"mother" whatsapp send w3kx',
+                       "M=mother; $M whatsapp send w3kx", "${X:-mother} whatsapp send w3kx",
+                       "mo$(true)ther whatsapp send w3kx", "bin/mo?her whatsapp send w3kx",
+                       "bin/mothe[r] whatsapp send w3kx", "{mother,x} whatsapp send w3kx",
+                       "mother what${U}sapp send w3kx", "mother whats$'app' send w3kx", "mother $W send w3kx",
+                       "`echo mother` whatsapp send w3kx", "M='mother whatsapp'; $M send w3kx", "$X",
+                       "env $M whatsapp send w3kx", 'eval "$M whatsapp send w3kx"', "bash -c '$M whatsapp send w3kx'",
+                       "echo $($M whatsapp send w3kx)", "xargs -I {} $M whatsapp send {}",
+                       "cat <<EOF | bash\nmother whatsapp send w3kx\nEOF", "bash <<'EOF'\nmother whatsapp send w3kx\nEOF",
+                       "echo 'mother whatsapp send w3kx' | sh", "$EDITOR notes.md", '"$(git rev-parse --show-toplevel)"/x'],
+                      transcript=ok)
+        self.assertFalse(os.path.exists(self.approved()))
+        self.assertIn("computed", self.wa("$M whatsapp send w3kx")[1])
+
+    def test_computed_state_paths_denied(self):
+        ws, st = self.ws, self.sdir
+        self.deny_all(['cat > "$W"/.mot${E}her/whats${E}app/drafts/w3kx.json',
+                       "cd ~/.mo$'ther'/what$'sapp'/approved && touch w3kx.used",
+                       "rm ~/.mo${E}ther/wh${E}atsapp/sent.jsonl",
+                       "rm %s/.mo${E}ther/wh${E}atsapp/approved/w3kx.used" % ws,
+                       "rm %s/.mother/whats{app,x}/approved/w3kx.used" % ws,
+                       "rm %s/{.mother,x}/whatsapp/approved/w3kx.used" % ws,
+                       'X=~/.mo${E}ther/whatsapp; rm -r "$X"', "cp /tmp/x %s/.mother/what''sapp/approved/w3kx.json" % ws,
+                       "cat %s/what$'sapp'/grant.key" % st, "cat $(echo %s)/whatsapp/grant.key" % st,
+                       "echo x > `pwd`/.mother/whatsapp/approved/w3kx.json"])
+
+    def test_destructive_ops_on_ancestors_denied(self):
+        ws, st = self.ws, self.sdir
+        self.deny_all(["rm -rf ~/.mother", "rm -rf %s/.mother" % ws, "rm -rf %s" % ws, "mv %s/.mother %s/m2" % (ws, ws),
+                       "find %s -name w3kx.used -delete" % ws, "find ~ -path '*approved*' -delete",
+                       "find %s -exec rm {} +" % st, "pushd %s/.mother >/dev/null; rm -r whats?pp" % ws,
+                       "tar cf - -C %s whatsapp" % st, "cd %s; tar cf /tmp/x.tar ." % st, "cp -r %s /tmp/s" % st,
+                       "zip -r /tmp/x.zip %s" % st, "rsync -a %s/ /tmp/s/" % st, "ln -s %s /tmp/sl" % st,
+                       "ditto %s/.mother /tmp/m" % ws, "rm -rf ~/.m*", 'cd "$X" && rm -rf .mother',
+                       "cp -r /tmp/whatsapp %s/.mother/" % ws, "chmod -R 777 %s/.mother" % ws])
+        # reading or listing them, and ordinary work in the workspace, still pass
+        os.makedirs(os.path.join(ws, "memory"))
+        self.pass_all(["ls ~/.mother", "ls %s/.mother" % ws, "ls -la %s" % st, "cd %s && ls" % ws,
+                       'W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W" && git status',
+                       "cp %s/t.txt %s/memory/t.md" % (self.tmp, ws), "rm %s/memory/old.md" % ws,
+                       "find %s/memory -name '*.md'" % ws, "mv %s/todos/a.md %s/todos/b.md" % (ws, ws),
+                       "tar tf /tmp/x.tar", "find . -name '*.pyc' -delete"], cwd=os.path.join(ws, "memory"))
+
+    def test_common_shapes_pass(self):
+        """N6: the false denies of round 1."""
+        self.pass_all(["mother whatsapp list 2>&1", "mother whatsapp list >/dev/null", "mother whatsapp status 2>/dev/null",
+                       "mother whatsapp read --since x 2>&1 | head -5", "mother whatsapp chats &>/dev/null",
+                       'S="${MOTHER_STATE_DIR:-$HOME/.mother}"; ls "$S"',
+                       'W=$(cat ~/.mother/workspace); cat "$W/.mother/runs.md"',
+                       'W=$(cat ~/.mother/workspace); tail -5 $W/.mother/guard.log',
+                       "git -C /src/mother log --grep whatsapp", "cd /src/mother && git branch feat/whatsapp",
+                       "git commit -m 'whatsapp: let mother read chats'", 'git commit -m "guard: whatsapp bridge checks"',
+                       "git log --oneline -- lib/whatsapp.py bridge/", "grep -n whatsapp bin/mother", "ls bridge/whatsapp",
+                       "git commit -m \"$(cat <<'EOF'\nwhatsapp: the bridge won't send twice\n\nmother whatsapp send "
+                       "stays alone (it's checked)\nEOF\n)\" && git log -1",
+                       "python3 -m unittest tests.test_whatsapp", "echo $PATH", "ls *.md"])
+
+    def test_plugin_shell_lines_pass(self):
+        """Shell lines the plugin's own skills and routines write (variables as command names among them)."""
+        os.makedirs(os.path.join(self.ws, "memory"))
+        self.pass_all(['W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"',
+                       'cd "$W"\nCH="python3 /opt/plugin/bin/mother channels"\n$CH plan',
+                       'CH="python3 ${CLAUDE_PLUGIN_ROOT}/bin/mother channels"; $CH done --action a1 --error "guard said no"',
+                       'for f in memory/*.md; do b=${f#memory/}; [ "$b" = MEMORY.md ] && continue; '
+                       'grep -q "($b)" memory/MEMORY.md || echo "unindexed: $b"; done',
+                       '"${CLAUDE_PLUGIN_ROOT}/bin/mother" eval brief', "${CLAUDE_PLUGIN_ROOT}/bin/mother health summary",
+                       "${CLAUDE_PLUGIN_ROOT}/bin/mother items check <<'EOF'\n{\"a\": \"$(x)\"}\nEOF",
+                       'D="$(date -u +%F)"; echo "$D"'], cwd=self.ws)
+
+    def test_any_shell_line_gets_a_decision(self):
+        """The shell reader never raises: odd or broken lines still get allow, deny or no decision."""
+        import importlib.util
+        import random
+        spec = importlib.util.spec_from_file_location("guard_fuzz", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        ctx = g.Ctx()
+        ctx.ws = self.ws
+        rnd = random.Random(5)
+        alphabet = list("ab $'\"\\`(){}[]*?;&|<>#=~/\n\t-") + ["$(", "${", "<<", "<<'E'\n", "\nE\n", "mother", "whatsapp"]
+        for _ in range(3000):
+            line = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 30)))
+            a = g.classify_bash(line, self.tmp, ctx)
+            self.assertTrue(a is None or a["kind"] in ("whatsapp", "config", "code", "credential", "deletion"), line)
 
 
 if __name__ == "__main__":

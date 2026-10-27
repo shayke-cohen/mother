@@ -587,8 +587,10 @@ class _GrantsLock(object):
 
 
 def _grant_key(create: bool = False):
-    """The HMAC key in <state>/whatsapp/grant.key (0600), or None. Only `mother whatsapp` creates it; the guard
-    denies the agent any access to <state>/whatsapp/ through its tools."""
+    """The HMAC key in <state>/whatsapp/grant.key (0600), or None. Only `mother whatsapp` creates it. The guard
+    denies shell access to <state>/whatsapp/, but the macOS account (and so the agent's Read tool) can read the
+    key: the signature stops a grant written by mistake or by an injected instruction, not a deliberately
+    evasive agent (CONTRACT §5d)."""
     p = _state_dir() / "whatsapp" / "grant.key"
     if create and not p.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -625,7 +627,12 @@ def grant_sig_ok(g) -> bool:
     if not isinstance(g, dict) or not isinstance(g.get("sig"), str) or not isinstance(g.get("source"), dict):
         return False
     want = grant_sig(g.get("scope"), g.get("target"), g["source"].get("ts"), g.get("sha256"), create=False)
-    return want is not None and hmac.compare_digest(want, g["sig"])
+    if want is None:
+        return False
+    try:  # bytes, so a non-ASCII sig compares unequal instead of raising: a malformed sig is no sig
+        return hmac.compare_digest(want.encode("utf-8"), g["sig"].encode("utf-8", "surrogatepass"))
+    except (TypeError, ValueError):
+        return False
 
 
 def _write_grant(ws: Path, cfg: dict, draft_id: str, sha: str, channel: str, ts: str) -> None:
