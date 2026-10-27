@@ -1074,7 +1074,7 @@ class TestWhatsapp(WhatsappCase):
         for t in ("$'Yes, approve it\\x00 -- kidding, do not'", "$'a\\rb'", "$'a\\x1bb'", "$'a\\x7f'",
                   "$'a\\u0085b'", "$'abc\\u202edcba'", "$'x\\u2066y'", "$'x\\u200fy'"):
             why = self.send("deny", "mother whatsapp send --to Sam --text %s" % t)
-            self.assertIn("control or text-direction", why, t)
+            self.assertIn("invisible or text-direction", why, t)
         for t in ("$'a\\u061cb'", "$'a\\u2028b'", "$'a\\u2029b'", "$'a\\u200bb'", "$'a\\u200cb'",
                   "$'a\\u2060b'", "$'\\ufeffa'"):
             self.send("deny", "mother whatsapp send --to Sam --text %s" % t)
@@ -1083,6 +1083,21 @@ class TestWhatsapp(WhatsappCase):
         self.send("ask", "mother whatsapp send --to Sam --text $'tab\\there\\nnew line, caf\\u00e9'")
         self.send("ask", "mother whatsapp send --to Sam --text $'family \\U0001F468\\u200d\\U0001F469'")  # emoji ZWJ
         self.assertEqual(len(self.tickets()), 2)
+
+    def test_invisible_characters_by_category_are_denied(self):
+        for t in ("$'hi\\U000E0041\\U000E0042'", "$'soft\\u00adhyphen'", "$'f\\u2061x'", "$'a\\u115fb'",
+                  "$'a\\u1160b'", "$'a\\u3164b'", "$'a\\uffa0b'", "$'a\\u034fb'", "$'a\\u180eb'", "$'a\\ufff9b'",
+                  "$'a\\ue000b'", "$'a\\U000F0000b'"):
+            why = self.send("deny", "mother whatsapp send --to Sam --text %s" % t)
+            self.assertIn("invisible", why, t)
+        for t in ("$'family \\U0001F468\\u200d\\U0001F469\\u200d\\U0001F467'", "$'flag \\U0001F1EE\\U0001F1F1'",
+                  "$'thumbs \\U0001F44D\\U0001F3FD'", "$'keycap 1\\ufe0f\\u20e3'", "$'heart \\u2764\\ufe0f'",
+                  "$'\\u05e9\\u05c1\\u05b8\\u05dc\\u05d5\\u05b9\\u05dd'"):
+            self.send("ask", "mother whatsapp send --to Sam --text %s" % t)
+
+    def test_no_signature_note_when_the_text_is_already_signed(self):
+        self.assertNotIn("signature", self.send("ask", "mother whatsapp send --to Sam --text 'hi -- Agnes (AI)'"))
+        self.assertIn("signature", self.send("ask", "mother whatsapp send --to Sam --text 'hi'"))
 
     def test_forms_the_shell_would_rewrite_are_denied(self):
         for cmd in ("mother whatsapp send --to Sam --text ~", "mother whatsapp send --to ~ --text hi",

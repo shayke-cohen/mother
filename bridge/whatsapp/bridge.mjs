@@ -127,6 +127,7 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
     let names = [];
     try { names = fs.readdirSync(loc.tickets); } catch { return; }
     for (const n of names) {
+      if (n.startsWith(".")) continue;  // the guard's temp file, about to be renamed into place
       const p = path.join(loc.tickets, n);
       const at = ticketAt(p);
       if (at === null || now() - at >= TICKET_MAX_AGE_MS) {
@@ -212,10 +213,14 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
     const lines = readSent();
     const day = utcDay(now());
     const linked = !!(client && client.linked());
+    const ats = (lines || []).map((x) => String(x.at || "")).filter(Boolean).sort();
     const out = { ok: true, linked, me: linked ? client.me() || null : null,
                   sent_today: lines ? lines.filter((x) => x.kind === "send"
-                    && String(x.at || "").slice(0, 10) === day).length : null };
-    if (!linked && client && client.paired && !(client.loggedOut && client.loggedOut())) out.connecting = true;
+                    && String(x.at || "").slice(0, 10) === day).length : null,
+                  last_sent_at: ats.length ? ats[ats.length - 1] : null };
+    const loggedOut = !!(client && client.loggedOut && client.loggedOut());
+    if (loggedOut) out.logged_out = true;
+    if (!linked && client && client.paired && !loggedOut) out.connecting = true;
     return out;
   }
 
@@ -471,7 +476,7 @@ export function bareJid(jid) {
  */
 export const LINK_WORDS = {
   qr_expired: "The QR code expired before it was scanned.",
-  logged_out: "WhatsApp logged this device out.",
+  logged_out: "WhatsApp logged this device out; its old session is cleared.",
   replaced: "Another device replaced this link.",
   network: "The connection to WhatsApp dropped.",
   timeout: "Nothing was scanned within 3 minutes.",
@@ -512,7 +517,11 @@ export async function runLink(loc, { connect = connectWhatsApp, qr = null, out =
   const reason = ok ? null : (client.closeReason && client.closeReason()) || "timeout";
   await new Promise((r) => setTimeout(r, settleMs));  // let the last creds.update land on disk
   client.close();
-  if (fs.existsSync(loc.session)) tighten(loc.session);
+  if (reason === "logged_out") {
+    fs.rmSync(loc.session, { recursive: true, force: true });  // dead keys: the next attempt starts clean
+  } else if (fs.existsSync(loc.session)) {
+    tighten(loc.session);
+  }
   if (!ok) out(LINK_WORDS[reason] || LINK_WORDS.network);
   out(JSON.stringify(ok && me ? { linked: true, me } : { linked: false, reason: ok ? "no_account" : reason }));
   return ok && me ? 0 : 1;

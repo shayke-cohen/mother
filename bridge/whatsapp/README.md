@@ -32,7 +32,7 @@ Known risks of the dependency:
 
 | Command | Does |
 |---|---|
-| `node bridge.mjs --link` | Prints the QR in the terminal; scan it in WhatsApp > Settings > Linked devices. Exits once linked. |
+| `node bridge.mjs --link` | Prints the QR in the terminal; scan it in WhatsApp > Settings > Linked devices. Exits once linked. If WhatsApp logged the old session out (401), it deletes `session/` so the next run starts clean. |
 | `node bridge.mjs --link --phone <digits>` | The same with a pairing code instead of a QR: Link a device > Link with phone number instead, and type it. |
 | `node bridge.mjs` | Serves on `<state>/whatsapp/bridge.sock`. An unlinked bridge stays unlinked and refuses every send. |
 | `node bridge.mjs --unlink` | Logs the device out and deletes `<state>/whatsapp/session/`: the kill switch. |
@@ -56,7 +56,7 @@ A Unix socket, mode 0600, no TCP. One JSON request per connection, one JSON repl
 
 | Request | Reply |
 |---|---|
-| `{"op": "status"}` | `{"ok": true, "linked", "me", "sent_today"}`, plus `"connecting": true` while a paired session is still opening |
+| `{"op": "status"}` | `{"ok": true, "linked", "me", "sent_today", "last_sent_at"}`, plus `"connecting": true` while a paired session is still opening and `"logged_out": true` when WhatsApp logged the device out |
 | `{"op": "stop"}` | `{"ok": true}`, then the bridge exits (used by `mother whatsapp stop`, `link`, `unlink`) |
 | `{"op": "send", "to", "jid", "text", "signature"?}` | `{"ok": true, "stanza"}` or `{"ok": false, "error"}` |
 
@@ -75,7 +75,7 @@ is `whatsapp.self_jid` (`wrong_account`); and the manager's own number is addres
 one is refused.
 
 Errors: `bad_request`, `no_workspace`, `no_ticket`, `ticket_expired`, `wrong_recipient`, `off`, `paused`,
-`cap`, `gap`, `unlinked`, `wrong_account`, `self_mismatch`, `send_failed`, `internal`.
+`cap`, `sent_log_unreadable`, `gap`, `unlinked`, `wrong_account`, `self_mismatch`, `send_failed`, `internal`.
 
 ## Test
 

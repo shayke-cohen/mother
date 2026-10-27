@@ -105,7 +105,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.commitments` | map, optional | `at`, `days`, `no_reply_days` (1-30, default 3), `lookback_days` (1-60, default 14), `draft_nudges` (bool, default false: mail drafts for no-reply asks only on the manager's `nudge <n>`) |
 | `routines.tick` | map, optional | the hourly pulse behind the Now list (`mother now`); absent = off. `every` (minutes, one of 30, 60, 120, 180, 240; default 60), `active_hours` (`"HH:MM-HH:MM"`, start before end, default `"06:00-22:00"`, in `manager.timezone`; no tick runs outside it), `days` (`workdays` / `all` / a day / list of days; not `monthly:`), `thresholds` (map signal -> `Nh`, `Nd` or `0`, counted in working time; default per signal), `signals` (map signal -> `true`/`false`; all on by default, and a signal whose source connector is `none` is off), `notify` (`none` default, or `dm` = one DM to `manager.chat_dm` for a new on-you item; never while `now.json.quiet`), `slow_every` (integer 1-6, default 3: every Nth slot scans every signal, the others only the on-you signals and `default_branch_red`), `max_age_days` (integer 0-365, default 30: work whose `since` is older is left off the list, except workspace signals; `0` = no cap). Default thresholds: `review_requested` 4h, `unanswered_mention` 2h, `decision_open` 1d, `mail_needs_reply` 4h, `pr_no_reviewer` 1d, `pr_approved_unmerged` 2d, `pr_changes_silent` 3d, `default_branch_red` 2h, `ticket_stalled` 3d, `bug_unowned` 1d, `blocker_cleared` 1d, `outside_question` 4h, `action_item_no_ticket` 1d, the rest 0. Signals: on you `review_requested`, `unanswered_mention`, `decision_open`, `ticket_waiting_on_you`, `mail_needs_reply`, `invite_unanswered`, `promise_due`, `suggestion_waiting`; neglected `pr_no_reviewer`, `pr_approved_unmerged`, `pr_changes_silent`, `default_branch_red`, `ticket_stalled`, `bug_unowned`, `blocker_cleared`, `sprint_at_risk`, `outside_question`, `action_item_no_ticket`, `one_on_one_drift`. Unknown keys or signals fail `mother status`. |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
-| `whatsapp` | map, optional | WhatsApp read and send from the manager's own number (§5d). `enabled` (bool), `self_jid` (the manager's own JID, `<digits>@s.whatsapp.net`; required when `enabled`), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `read`, `send` (bool). Other unknown keys fail. The keys of the earlier design, `allow`, `approve_via` and `max_prompts_per_day`, are accepted with any value and ignored; `mother whatsapp setup` drops them the next time it writes the block. The block is written by `mother whatsapp setup`, run by the manager in their own terminal (§5d); the agent never edits it. JIDs are phone numbers: they live in `config.json` and tool output only, never in memory, journal or people files. |
+| `whatsapp` | map, optional | WhatsApp read and send from the manager's own number (§5d). `enabled` (bool), `self_jid` (the manager's own JID, `<digits>@s.whatsapp.net`; required when `enabled`), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `read`, `send` (bool). Other unknown keys fail. The keys of the earlier design, `allow`, `approve_via` and `max_prompts_per_day`, are accepted with any value and ignored; `mother whatsapp setup` drops them the next time it writes the block, and they are removed one release after WhatsApp ships. The block is written by `mother whatsapp setup`, run by the manager in their own terminal (§5d); the agent never edits it. JIDs are phone numbers: they live in `config.json` and tool output only, never in memory, journal or people files. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 
@@ -181,13 +181,6 @@ class `→ fallback`, whatever the backup's own previous status.
 (`"<kind>.<cap>": "<prefix>"`); a string `token` (read as `{server: value}` for the connector's main
 server); a connector without `health` (seeded from its top-level capability values).
 
-**`whatsapp`** is a tool-based connector with no MCP server: `{"tool": "mother whatsapp", "read": "ok",
-"send": "untested", "checked_at": "…"}`. The doctor tests `read` for real (opens the local WhatsApp database
-read-only, runs the schema check; `error:schema` if the tables changed,
-`denied` without Full Disk Access). For `send` it only checks the bridge is running and linked
-(`untested` if linked, `error:unlinked` if not); it never sends a test message unprompted. A write capability,
-so `mother health pick` treats `send` like the others.
-
 Optional extra capabilities: `tracker.comment`, `mail.draft`, `mail.send`, `code.write`, and a `directory`
 connector (org lookups). A routine that hits an auth failure mid-run records it with `mother health record`
 (status `expired`), so later runs that day don't retry it blindly.
@@ -236,16 +229,20 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     nothing else on the line except a `2>&1`-style redirection (no `;`, `&&`, `|`, `&`, other redirection,
     heredoc, env prefix or comment). Every word must be literal text: quotes, `$'…'` and backslashes are fine,
     a `$VAR`, `$( )` or backtick in any word but the CLI path is not (deny: "write the text literally, in
-    single quotes"). A recipient or text holding a NUL, any other C0 or C1 control character except `\n` and
-    `\t`, a Unicode bidi or invisible formatting character (U+061C, U+200B, U+200C, U+200E, U+200F,
-    U+2028, U+2029, U+202A–U+202E, U+2060, U+2066–U+2069, U+FEFF; U+200D stays, emoji use it) is denied, so the
-    prompt shows exactly what is sent. So is a form the shell would rewrite: an unquoted `~`, glob (`*`, `?`, `[`)
+    single quotes"). A recipient or text holding a character the prompt can't show is denied, so the prompt
+    shows exactly what is sent: any character whose Unicode category (Python's `unicodedata`) is `Cc` (except
+    `\n` and `\t`), `Cf` (format: bidi controls, zero-width spaces, word joiners, tag characters, soft hyphen;
+    except U+200D, the zero-width joiner emoji sequences use), `Co` (private use), `Cs` (surrogates) or `Cn`
+    (unassigned in the guard's Python), plus the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, U+00AD,
+    U+034F (combining grapheme joiner) and the line and paragraph separators U+2028, U+2029. Variation
+    selectors U+FE0E/U+FE0F are marks, not format characters, and pass. So is a form the shell would rewrite: an unquoted `~`, glob (`*`, `?`, `[`)
     or brace list, and a `$'…'` escape for a raw byte (`\x80`–`\xff`, octal 200–377) or `\c`. A text shaped like a credential is on the never-list. Then: PAUSED denies; an
     invalid `config.json` denies; `whatsapp.enabled` or `whatsapp.send` false denies ("sending is off"); the
     category in `policy.never` denies. `--to me`, `--to <self_jid>` or the manager's own number (only while
     `self_jid` is set) is `own_dm`: **allow** while `own_dm` is in the auto list, else ask. Any other recipient
     is **ask**, with the reason `WhatsApp to <WHO as JSON>: <text as JSON>` (a number or JID gets ` (number)`
-    after it; the guard looks nothing up) and a note that MOTHER adds its signature line.
+    after it; the guard looks nothing up) and, unless the text already holds `<agent.name> (AI)`, a note that
+    MOTHER adds its signature line.
   - **The send ticket.** On every ask or allow of a send, before answering, the guard writes
     `<state>/whatsapp/tickets/<hex>`, `hex` = sha256 of the recipient as typed, a NUL, and the text, both as
     the CLI receives them (UTF-8), hex-encoded; content `{"at": <epoch seconds>}`. The folder is created 0700
@@ -404,8 +401,11 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 
 Read and send from the manager's own number, like chat: reading is local and free, every send to someone else
 asks in Claude's normal permission prompt (§5). Two independent parts: a read-only reader of the local macOS
-WhatsApp database, and a send-only bridge (a linked device). Every `mother whatsapp` command except `status`
-refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home is set).
+WhatsApp database, and a send-only bridge (a linked device). Every `mother whatsapp` command except `status` and
+`help` (or no argument) refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home is set).
+The guard finds the workspace as for every other rule (`$MOTHER_WORKSPACE`, else `~/.mother/workspace`); the
+bridge and the CLI use `$MOTHER_WORKSPACE`, else `<state>/workspace`. They differ only when `MOTHER_STATE_DIR`
+is set without `MOTHER_WORKSPACE`, as in throwaway test workspaces.
 
 - **Which chats.** Any chat in the local database may be read. A send may go to any chat that already has a
   message with the manager in the database (no cold contact: never a stranger), and to the manager's own
@@ -446,20 +446,28 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   ✨, …), an unknown one is left out; it goes along as the `signature` the bridge appends, on its own line after a blank
   one; none when the text already holds `<name> (AI)`. Then the bridge `send` op with `to` as typed, and
   JSON `{"ok": true, "to": <jid>, "name", "id": <message id or null>}`; a bridge refusal prints its reply
-  and exits 2 with the code. One recipient per call; nothing is queued or retried.
+  and exits 2 with the code, saying nothing was sent. When the CLI gets no answer (`bridge_timeout`, or
+  `bridge_bad_reply` from a dropped connection) it can't tell: it prints the reply and exits 2 with "the bridge
+  may still send it; check `mother whatsapp status` before retrying", never "nothing was sent". One recipient
+  per call; nothing is queued or retried.
 - **Bridge** (`bridge/whatsapp/`, Node 20+, Baileys pinned exactly in `package.json` and `package-lock.json`;
   optional, nothing else depends on it). `node bridge.mjs` serves on `<state>/whatsapp/bridge.sock` (0600, in
   a 0700 folder; a stale socket is replaced, a live one refused). One JSON request per connection, one JSON
-  reply: `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "connecting"?}`; `{"op": "stop"}` →
+  reply: `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "last_sent_at", "connecting"?,
+  "logged_out"?}` (`last_sent_at`: the `at` of the newest `sent.jsonl` line, or null; `logged_out`: WhatsApp
+  logged this device out); `{"op": "stop"}` →
   `{"ok": true}`, then it exits; `{"op": "send", "to", "jid", "text", "signature"?}` → `{"ok": true, "stanza"}`
   or `{"ok": false, "error"}`, one of `bad_request` (a JID that is not a user or group JID, an empty text or a
   signed text over 4096 characters, a `to` that isn't a string), `wrong_recipient` (`to` is `me` but `jid`
   isn't `self_jid`, or `to` is a JID or number that isn't `jid`; a name can't be checked here), `no_ticket`,
-  `ticket_expired`, `off`, `paused`, `no_workspace`, `cap`, `gap`, `unlinked`, `wrong_account`,
+  `ticket_expired`, `off`, `paused`, `no_workspace`, `cap`, `sent_log_unreadable` (`sent.jsonl` has a torn or
+  malformed line, so today's sends can't be counted; the manager fixes or moves the file), `gap`, `unlinked`,
+  `wrong_account`,
   `self_mismatch`, `send_failed`, `internal`. Messages go out one at a time. A send needs, in order: a well
   formed request; the workspace's `config.json` (else `no_workspace`); **a ticket** at `<state>/whatsapp/tickets/<sha256(to NUL text)>` that is a regular file (not
   a symlink) whose `at` is less than 600 s old, deleted before anything else happens, so it is used once (a
-  missing one is `no_ticket`, an old one `ticket_expired`; every send also deletes tickets older than 600 s);
+  missing one is `no_ticket`, an old one, or one dated more than 60 s ahead, `ticket_expired`; every send also
+  deletes tickets older than 600 s, skipping names that start with `.`, which are the guard's temp files);
   the recipient check above; sending on and no
   `PAUSED` (it reads the workspace's `config.json`, resolved like `bin/mother`); a readable `sent.jsonl` with
   fewer than `max_per_day` (default 20, ceiling 50) sends on today's UTC date of `at`; at least
@@ -481,7 +489,8 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
 - **The client** is `whatsapp.bridge_call(req, timeout=None, start=True)`: it never raises, it returns `{"ok":
   false, "error"}` with `bridge_down`, `bridge_not_installed` (no Node, or no install; carries a `hint` with
   an absolute path), `node_too_old` (below 20), `bridge_start_failed`, `bridge_timeout` or `bridge_bad_reply`.
-  Timeout 60 s for `send` (the bridge may wait 30 s for the gap, then type), 5 s for `status`. When the socket
+  Timeout 120 s for `send` (the bridge's worst case: a send queued behind another, up to 30 s for the gap, 20 s
+  for a reconnect, 9 s of typing, then WhatsApp's own reply), 5 s for `status`. When the socket
   is missing or refuses, it starts `node <state>/whatsapp/app/bridge.mjs` detached (new session, stdin closed,
   output appended to `<state>/whatsapp/bridge.log`, rotated to `bridge.log.1` past 1 MiB) under an exclusive
   `flock` on `<state>/whatsapp/start.lock`, waits up to 15 s for the socket, then up to 20 s while `status`
@@ -502,8 +511,11 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   agent) is one guided flow, safe to re-run: (a) install when not installed or `reinstall_needed` (a Node
   problem stops with its hint), then stop a running bridge; (b) ask the bridge whether it is linked; if not,
   "Link by scanning a QR code (Enter), or type p to link with your phone number instead:" and link, offering a
-  new QR or code after `qr_expired`, `timeout` or `network`, stopping with a plain sentence on `logged_out`,
-  `replaced`, `no_account`; (c) `self_jid` is the linked account, suffix stripped; when WhatsApp gives only a
+  new QR or code after `qr_expired`, `timeout` or `network`, stopping with a plain sentence on `replaced` or
+  `no_account`. When WhatsApp logged the device out (the manager removed it under Linked devices, or it expired:
+  a 401, or `status` says `logged_out`), `bridge.mjs --link` deletes `session/` and the same run says "WhatsApp
+  logged this device out; showing a fresh code" and links again without asking; a second `logged_out` in a row
+  stops. `link` does the same; (c) `self_jid` is the linked account, suffix stripped; when WhatsApp gives only a
   private `@lid` id, setup asks for the manager's number (unless they typed it to link by phone); (d) one
   config write: `enabled: true`, `self_jid`, every other key kept except `allow`, `approve_via` and
   `max_prompts_per_day`, which are dropped; (e) probe the database: `denied` prints the Full Disk Access

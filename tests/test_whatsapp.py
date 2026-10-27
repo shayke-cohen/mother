@@ -523,6 +523,24 @@ class TestCliSend(Cmd7):
             self.assertIn("whatsapp sending is off", r.stderr)
             self.cfg = make_cfg()
 
+    def test_a_timed_out_send_never_claims_nothing_was_sent(self):
+        for err in ("bridge_timeout", "bridge_bad_reply"):
+            out, errout = _io.StringIO(), _io.StringIO()
+            with mock.patch.object(whatsapp, "bridge_call", return_value={"ok": False, "error": err}), \
+                    mock.patch("sys.stdout", new=out), mock.patch("sys.stderr", new=errout), \
+                    self.assertRaises(SystemExit) as cm:
+                whatsapp.main(["send", "--to", "Dana", "--text", "hi"], self.cfg, self.ws)
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("the bridge may still send it; check `mother whatsapp status`", errout.getvalue())
+            self.assertNotIn("nothing was sent", errout.getvalue())
+
+    def test_length_is_counted_like_the_bridge(self):
+        b = self.start_bridge()
+        r = self.send("--to", "me", "--text", "\U0001F600" * 2049)  # 2049 code points, 4098 UTF-16 units
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("longer than", r.stderr)
+        self.assertEqual(b.requests, [])
+
     def test_bridge_refusal_exits_2_with_the_code(self):
         self.start_bridge(send={"ok": False, "error": "cap"})
         r = self.send("--to", "Dana", "--text", "hi")
@@ -620,7 +638,7 @@ class TestBridgeCall(Cmd7):
         self.assertEqual(kw["stdout"].name, str(self.t / "state/whatsapp/bridge.log"))
         self.assertEqual(oct((self.t / "state/whatsapp").stat().st_mode & 0o777), "0o700")
 
-    def test_timeouts_default_60_for_send_5_for_status(self):
+    def test_timeouts_120_for_send_5_for_status(self):
         seen = []
 
         def fake(req, timeout):
@@ -631,7 +649,7 @@ class TestBridgeCall(Cmd7):
             for op in ("send", "status"):
                 whatsapp.bridge_call({"op": op})
             whatsapp.bridge_call({"op": "send"}, timeout=7)
-        self.assertEqual(seen, [("send", 60.0), ("status", 5.0), ("send", 7)])
+        self.assertEqual(seen, [("send", 120.0), ("status", 5.0), ("send", 7)])
 
     def test_slow_bridge_is_a_timeout_reply(self):
         self.start_bridge(status=lambda req: (__import__("time").sleep(1.0), {"ok": True})[1])
@@ -943,7 +961,7 @@ class SetupCase(Base):
                 mock.patch.object(whatsapp, "_link_phone", return_value=by_phone), \
                 mock.patch.object(whatsapp, "link_once", side_effect=list(link) if isinstance(link, list) else
                                   [{"linked": True, "me": link} if link else {"linked": False,
-                                                                                "reason": "logged_out"}]) as lk:
+                                                                                "reason": "replaced"}]) as lk:
             code = whatsapp.setup(self.ws, VALIDATE, io)
         return code, io, {"install": inst, "stop": stop, "link": lk}
 
@@ -978,6 +996,17 @@ class TestSetup(SetupCase):
         m["link"].assert_not_called()
         self.assertEqual(self.read_cfg()["whatsapp"], {"enabled": True, "self_jid": SELF, "max_per_day": 12,
                                                        "min_gap_seconds": 9, "read": True})
+
+    def test_a_logged_out_status_is_said_before_linking_again(self):
+        code, io, m = self.setup(linked=None)
+        self.assertEqual(code, 0, io.text)
+        with mock.patch.object(whatsapp, "bridge_call", return_value={"ok": True, "linked": False, "logged_out": True}), \
+                mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "_link_phone", return_value=None), \
+                mock.patch.object(whatsapp, "link_once", return_value={"linked": True, "me": SELF}):
+            io = FakeIO()
+            self.assertEqual(whatsapp._step_link(io), SELF)
+        self.assertIn("WhatsApp logged this device out", io.text)
 
     def test_the_linked_accounts_device_suffix_is_dropped(self):
         code, io, m = self.setup(linked="972500000099:5@s.whatsapp.net")
@@ -1146,8 +1175,18 @@ class TestLinkLoop(Cmd7):
         e, io, lk = self.loop([{"linked": False, "reason": "qr_expired"}], "", "n")
         self.assertIsInstance(e, whatsapp.SetupStop)
 
-    def test_logged_out_or_replaced_stop_in_plain_words(self):
-        for reason, words in (("logged_out", "logged"), ("replaced", "another device")):
+    def test_logged_out_shows_a_fresh_code_in_the_same_run(self):
+        me, io, lk = self.loop([{"linked": False, "reason": "logged_out"}, {"linked": True, "me": SELF}], "")
+        self.assertEqual(me, SELF)
+        self.assertEqual(lk.call_count, 2)
+        self.assertIn("WhatsApp logged this device out; showing a fresh code", io.text)
+        self.assertEqual(len(io.asked), 1)  # only how to link: no "try again?" question
+        e, io, lk = self.loop([{"linked": False, "reason": "logged_out"}, {"linked": False, "reason": "logged_out"}], "")
+        self.assertIsInstance(e, whatsapp.SetupStop)  # twice in a row: stop, don't loop forever
+        self.assertIn("Linked devices", str(e))
+
+    def test_replaced_or_no_account_stop_in_plain_words(self):
+        for reason, words in (("replaced", "another device"), ("no_account", "which account")):
             e, io, lk = self.loop([{"linked": False, "reason": reason}], "")
             self.assertIsInstance(e, whatsapp.SetupStop)
             self.assertIn(words, str(e).lower())

@@ -479,9 +479,11 @@ WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:session|
 WA_STATE_FILES = ("sent.jsonl", "bridge.sock", "session", "app")
 WA_SEND_OPTS = ("--to", "--text")
 # A recipient or text with these can't be shown as it is sent: NUL cuts an argv string, the rest hide or reorder.
-# U+200D (zero-width joiner) stays allowed: emoji sequences use it.
-WA_UNSHOWABLE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200c\u200e\u200f\u2028\u2029"
-                              "\u202a-\u202e\u2060\u2066-\u2069\ufeff\ud800-\udfff]")
+# Characters the prompt can't show as sent: categories Cc (but \n, \t), Cf (but U+200D, the joiner emoji
+# sequences use), Co, Cs, Cn, and the Hangul fillers, which render blank. U+FE0E/U+FE0F are Mn and pass.
+WA_HIDDEN_CATS = ("Cc", "Cf", "Co", "Cs", "Cn")
+WA_HIDDEN_OK = frozenset("\n\t\u200d")
+WA_HIDDEN_EXTRA = frozenset("\u115f\u1160\u3164\uffa0\u00ad\u034f\u2028\u2029")  # + grapheme joiner, line/para separators
 # Shell forms the guard would read differently from the shell: unquoted ~, globs and brace lists; $'…' escapes
 # that make raw bytes (\x80-\xff, octal 200-377) or cut the string (\c).
 WA_UNQUOTED_RISK_RE = re.compile(r"[*?\[]|\{[^{}]*(?:,|\.\.)[^{}]*\}")
@@ -855,6 +857,8 @@ class _WaGlob(object):
                 body = a[1].casefold()
                 neg = body[:1] in ("!", "^")
                 body = (body[1:] if neg else body).replace("\\", "\\\\").replace("[", "\\[")
+                for pair in ("--", "&&", "~~", "||"):  # set operations to a future re: read them literally
+                    body = body.replace(pair, pair[0] + "\\" + pair[1])
                 try:
                     rx = re.compile("[%s%s]" % ("^" if neg else "", body or "\\]"), re.S)
                 except re.error:
@@ -1541,8 +1545,8 @@ def wa_send_parse(cmd, cwd=None):
     if "--to" not in opts or "--text" not in opts:
         return {"error": "use --to WHO and --text TEXT"}
     for name in WA_SEND_OPTS:
-        if WA_UNSHOWABLE_RE.search(opts[name]):
-            return {"error": "%s holds a control or text-direction character, so the prompt couldn't show exactly "
+        if wa_unshowable(opts[name]):
+            return {"error": "%s holds a control, invisible or text-direction character, so the prompt couldn't show exactly "
                              "what is sent; write it without one" % name}
     return {"to": opts["--to"], "text": opts["--text"]}
 
@@ -1551,6 +1555,13 @@ def _plugin_name(root):
     """The `name` in <root>/.claude-plugin/plugin.json, or None."""
     data, ok = read_json(os.path.join(root, ".claude-plugin", "plugin.json"))
     return data.get("name") if ok and isinstance(data, dict) and isinstance(data.get("name"), str) else None
+
+
+def wa_unshowable(text):
+    """The text holds a character the prompt can't show as it is sent (CONTRACT §5)."""
+    import unicodedata
+    return any(ch in WA_HIDDEN_EXTRA or (ch not in WA_HIDDEN_OK and unicodedata.category(ch) in WA_HIDDEN_CATS)
+               for ch in text)
 
 
 def wa_is_plugin_cli(exe, cwd):
@@ -1673,8 +1684,10 @@ def wa_block_now(ctx):
     try:
         with open(os.path.join(ctx.ws, "config.json"), encoding="utf-8") as f:
             text = f.read()
+    except FileNotFoundError:
+        return False  # no config.json: no block
     except OSError:
-        return False
+        return True  # unreadable: fail closed
     old = _wa_block(text)
     return old is None or old is not _ABSENT
 
@@ -2320,7 +2333,9 @@ def decide_whatsapp(a, ctx):
     to = a.get("to") or ""
     shown = "WhatsApp to %s%s: %s" % (json.dumps(to, ensure_ascii=False), " (number)" if wa_is_number(to) else "",
                                        json.dumps(a.get("text") or "", ensure_ascii=False))
-    note = "" if a["category"] == "own_dm" else " (MOTHER adds its signature line)"
+    name = (ctx.cfg.get("agent") or {}).get("name") or "Agent"
+    signs = a["category"] != "own_dm" and "%s (AI)" % name not in (a.get("text") or "")
+    note = " (MOTHER adds its signature line)" if signs else ""
     a["log_reason"] = "%s needs a yes (%s)." % (what, a["category"])  # guard.log never holds the text
     return "ask", "%s%s. Confirm it." % (shown, note)
 

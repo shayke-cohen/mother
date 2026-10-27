@@ -74,8 +74,8 @@ test("last send 2 s ago: gap, with the time left to wait", () => {
   assert.deepEqual(check({ cfg: cfg({ min_gap_seconds: 0 }), sentLines: sends(1, 10) }), { ok: true });
 });
 
-test("unreadable sent.jsonl blocks: the cap can't be checked", () => {
-  assert.deepEqual(check({ sentLines: null }), { ok: false, error: "cap" });
+test("unreadable sent.jsonl blocks with its own code: the cap can't be checked", () => {
+  assert.deepEqual(check({ sentLines: null }), { ok: false, error: "sent_log_unreadable" });
 });
 
 test("parseSent: one record per line; a torn or malformed line makes it unreadable", () => {

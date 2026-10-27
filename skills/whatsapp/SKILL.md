@@ -68,6 +68,13 @@ python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" whatsapp send --to "Dana Roe" --text 
   send: `no_ticket` or `ticket_expired` means run the same `send` command again (it will ask again).
 - **If a send is refused, denied or fails, never retry it by another path** (a script, the bridge socket,
   another tool). Report what it said. `cap` means today's limit (`whatsapp.max_per_day`) is reached; `gap`
-  means wait a few seconds and try once more.
+  means wait a few seconds and try once more; `sent_log_unreadable` means the bridge's send log is damaged:
+  tell the manager (it's `~/.mother/whatsapp/sent.jsonl`), don't touch it yourself.
+- **"The bridge may still send it"** (`bridge_timeout`, `bridge_bad_reply`) means the CLI stopped waiting, not
+  that the send failed. **Don't send it again** until you've checked: run `whatsapp status` (`last_sent_at`)
+  and `whatsapp read --chat … --limit 5` (your own message shows with `from_me`). Re-send only if it's clearly
+  not there, and tell the manager what happened.
+- `unlinked` or a status with `logged_out` means WhatsApp dropped the device: tell the manager to run
+  `mother whatsapp setup` in their own terminal; it shows a fresh code.
 
 On success it prints `{"ok": true, "to", "name", "id"}`; tell the manager it went to `name`.

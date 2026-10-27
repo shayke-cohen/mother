@@ -109,9 +109,11 @@ afterEach(async () => {
 
 test("status", async () => {
   await start();
-  assert.deepEqual(await request({ op: "status" }), { ok: true, linked: true, me: SELF, sent_today: 0 });
+  assert.deepEqual(await request({ op: "status" }), { ok: true, linked: true, me: SELF, sent_today: 0, last_sent_at: null });
   client.isLinked = false;
-  assert.deepEqual(await request({ op: "status" }), { ok: true, linked: false, me: null, sent_today: 0 });
+  assert.deepEqual(await request({ op: "status" }), { ok: true, linked: false, me: null, sent_today: 0, last_sent_at: null });
+  client.loggedOut = () => true;
+  assert.equal((await request({ op: "status" })).logged_out, true);
 });
 
 test("a send to someone else: typing, the text, one sent.jsonl line", async () => {
@@ -159,7 +161,7 @@ test("refusals send nothing", async () => {
     ["paused", () => fs.writeFileSync(path.join(ws, ".mother", "PAUSED"), "")],
     ["cap", () => writeSent(Array.from({ length: 20 }, (_, i) => ({ at: isoZ(clock - 3600_000), kind: "send",
                                                                     chat: DM, sha256: "x", stanza: "Q" + i })))],
-    ["cap", () => fs.writeFileSync(sentPath(), "not json\n")],
+    ["sent_log_unreadable", () => fs.writeFileSync(sentPath(), "not json\n")],
     ["unlinked", () => { client.isLinked = false; }],
     ["send_failed", () => { client.failSend = true; }],
   ];
@@ -571,4 +573,33 @@ test("the signature goes on its own line after a blank one", async () => {
   assert.equal((await send(DM, "see you", DM, { signature: "*Agnes (AI)* · on behalf of Dana" })).ok, true);
   assert.deepEqual(client.calls.at(-1), ["send", DM, "see you\n\n*Agnes (AI)* · on behalf of Dana"]);
   assert.equal(sentLines()[0].sha256, createHash("sha256").update("see you\n\n*Agnes (AI)* · on behalf of Dana").digest("hex"));
+});
+
+test("status names the time of the last send, so a timed-out send can be checked", async () => {
+  await start();
+  assert.equal((await send()).ok, true);
+  assert.equal((await request({ op: "status" })).last_sent_at, sentLines()[0].at);
+});
+
+test("the sweep leaves the guard's temp files alone", async () => {
+  await start();
+  const dir = locations(env).tickets;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".abc.123.tmp"), "");  // the guard, between create and write
+  assert.equal((await send()).ok, true);
+  assert.ok(fs.existsSync(path.join(dir, ".abc.123.tmp")));
+});
+
+test("--link after WhatsApp logged the device out: the dead session is deleted for a clean retry", async () => {
+  const loc = locations(env);
+  fs.mkdirSync(loc.session, { recursive: true });
+  fs.writeFileSync(path.join(loc.session, "creds.json"), JSON.stringify({ me: { id: SELF }, account: {} }));
+  const out = [];
+  const c = fakeLinkClient({ open: false });
+  c.closeReason = () => "logged_out";
+  const code = await runLink(loc, { connect: async () => c, qr: { generate() {} }, out: (l) => out.push(l),
+                                    err: () => {}, settleMs: 0 });
+  assert.equal(code, 1);
+  assert.deepEqual(JSON.parse(out[out.length - 1]), { linked: false, reason: "logged_out" });
+  assert.equal(fs.existsSync(loc.session), false);
 });

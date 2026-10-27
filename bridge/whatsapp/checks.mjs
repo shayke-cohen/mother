@@ -1,6 +1,6 @@
 // Pure checks the bridge runs before every message it sends. No I/O, no clock, no randomness of their own:
 // the bridge passes `now` (ms since epoch) and random numbers in, so every rule is testable without WhatsApp.
-// docs/CONTRACT.md §5d. Errors: off, bad_request, cap, gap (with waitMs).
+// docs/CONTRACT.md §5d. Errors: off, bad_request, sent_log_unreadable, cap, gap (with waitMs).
 import { createHash } from "node:crypto";
 
 export const MAX_PER_DAY = 20;
@@ -72,7 +72,7 @@ export function checkSend({ cfg, jid, text, sentLines, now, gapSeconds }) {
   if (!sendableJid(jid)) return fail("bad_request");
   if (typeof text !== "string" || !text.trim() || text.length > MAX_TEXT) return fail("bad_request");
   if (!sendingOn(wa(cfg))) return fail("off");
-  if (!Array.isArray(sentLines)) return fail("cap");  // can't count today's sends: don't send
+  if (!Array.isArray(sentLines)) return fail("sent_log_unreadable");  // can't count today's sends: don't send
   if (sendsToday(sentLines, now) >= sendCap(cfg)) return fail("cap");
   const last = lastAt(sentLines);
   const waitMs = last === null ? 0 : Math.max(0, Math.ceil(last + (gapSeconds ?? minGapSeconds(cfg)) * 1000 - now));

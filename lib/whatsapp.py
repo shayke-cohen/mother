@@ -411,6 +411,11 @@ def signature(cfg: dict) -> str:
     return (emoji + " " + line) if emoji else line
 
 
+def _units(text: str) -> int:
+    """Length as the bridge (JavaScript) counts it: UTF-16 code units, so an emoji counts 2."""
+    return len(text.encode("utf-16-le")) // 2
+
+
 def signature_for(cfg: dict, text: str):
     """The signature the bridge appends to `text`, or None when the text already carries `<name> (AI)`."""
     name = (cfg.get("agent") or {}).get("name") or "Agent"
@@ -442,7 +447,7 @@ def cmd_send(cfg, args):
             _fail("no cold contact: you have no messages with %s yet; start that chat yourself; nothing was sent"
                   % chat_name(c), 2)
         sig = signature_for(cfg, text)
-    if len(text) + (len(sig) + 2 if sig else 0) > MAX_TEXT:
+    if _units(text) + (_units(sig) + 2 if sig else 0) > MAX_TEXT:
         _fail("the message is longer than %d characters; nothing was sent" % MAX_TEXT, 2)
     req = {"op": "send", "to": to, "jid": c["jid"], "text": text}
     if sig:
@@ -450,6 +455,9 @@ def cmd_send(cfg, args):
     r = bridge_call(req)
     if not r.get("ok"):
         print(json.dumps(r))
+        if r.get("error") in UNKNOWN_OUTCOME:
+            _fail("the bridge didn't answer in time (%s): the bridge may still send it; check `mother whatsapp "
+                  "status` (last_sent_at) before retrying" % r["error"], 2)
         _fail("the send failed: %s; nothing was sent" % (r.get("error") or "error"), 2)
     print(json.dumps({"ok": True, "to": c["jid"], "name": chat_name(c), "id": r.get("stanza")},
                      ensure_ascii=False))
@@ -460,8 +468,11 @@ def cmd_send(cfg, args):
 BRIDGE_SRC = PLUGIN_ROOT / "bridge" / "whatsapp"  # the plugin's copy; `install` copies it out of the plugin
 START_WAIT = 15.0  # seconds to wait for a bridge we just started to open its socket
 READY_WAIT = 20.0  # then up to this long for its WhatsApp connection to open
-CALL_TIMEOUT = {"status": 5.0}
-DEFAULT_TIMEOUT = 60.0  # send: up to 30 s for the gap, plus typing
+# send: the bridge's worst case is a send queued behind another, then up to 30 s for the gap, 20 s for a
+# reconnect, 9 s of typing and WhatsApp's own reply. A CLI timeout can't tell whether it went out.
+CALL_TIMEOUT = {"status": 5.0, "send": 120.0}
+DEFAULT_TIMEOUT = 60.0
+UNKNOWN_OUTCOME = ("bridge_timeout", "bridge_bad_reply")
 MIN_NODE = 20
 NODE_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
@@ -876,8 +887,8 @@ def strip_device(jid):
     return re.sub(r":\d+(?=@)", "", jid.strip()) if isinstance(jid, str) and jid.strip() else None
 
 
-LINK_STOPS = {"logged_out": "WhatsApp logged this device out while linking; run it again for a fresh code.",
-              "replaced": "another device replaced this link; run it again for a fresh code.",
+LOGGED_OUT_WORDS = "WhatsApp logged this device out; showing a fresh code."
+LINK_STOPS = {"replaced": "another device replaced this link; run it again for a fresh code.",
               "no_account": "the device linked but WhatsApp didn't say which account; run it again."}
 
 
@@ -930,11 +941,20 @@ def link_loop(io, want=None) -> str:
     if want is not None:
         want["phone"] = phone
     what = "code" if phone else "QR"
+    relinked = False
     while True:
         r = link_once(io.say, phone)
         if r.get("linked") and r.get("me"):
             return r["me"]
         reason = r.get("reason")
+        if reason == "logged_out":  # the manager removed the device, or it expired: the bridge cleared it
+            if relinked:
+                raise SetupStop("WhatsApp logged the new link out too; check Linked devices on your phone, then "
+                                "run `mother whatsapp setup` again.")
+            relinked = True
+            io.say(LOGGED_OUT_WORDS)
+            continue
+        relinked = False
         if reason in LINK_STOPS:
             raise SetupStop(LINK_STOPS[reason])
         q = "%s expired — show a new one?" % what if reason in ("qr_expired", "timeout") else \
@@ -975,6 +995,8 @@ def _step_install(io) -> None:
 def _step_link(io) -> str:
     r = bridge_call({"op": "status"})
     got = strip_device(r.get("me")) if r.get("ok") and r.get("linked") else None
+    if not got and r.get("logged_out"):
+        io.say("WhatsApp logged this device out (it was removed under Linked devices, or it expired).")
     if not got:
         io.say("Link MOTHER as a device on your phone: WhatsApp > Settings > Linked devices > Link a device.")
         want = {}
