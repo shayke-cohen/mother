@@ -433,6 +433,27 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   draft` never reuses an id that has any file in `approved/`. The guard is the first lock, the
   bridge the second. Unattended sends happen only in the `/mother:channels` poll, which runs
   `mother whatsapp pending` (open drafts with a proven yes) and sends each.
+- **Bridge** (`bridge/whatsapp/`, Node 20+, Baileys pinned exactly in `package.json` and `package-lock.json`;
+  optional, nothing else depends on it). `node bridge.mjs` serves on `<state>/whatsapp/bridge.sock` (0600, in
+  a 0700 folder; a stale socket is replaced, a live one refused); `--link` prints the QR and exits once
+  linked; `--unlink` logs out and deletes `session/`. It resolves the workspace as `bin/mother` does
+  (`$MOTHER_WORKSPACE`, else `<state>/workspace`). One JSON request per connection, one JSON reply:
+  `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "prompts_today"}`;
+  `{"op": "send", "draft": "<id>"}` → `{"ok": true, "stanza"}`; `{"op": "prompt", "text"}` → the same, sent
+  to `whatsapp.self_jid` only. A refusal is `{"ok": false, "error"}`, one of `not_allowlisted`, `no_approval`,
+  `hash_mismatch`, `cap`, `gap`, `unlinked`, `no_draft`, `already_sent`, `off`, `paused`, `no_workspace`,
+  `send_failed`, `bad_request`, `internal`. Messages go out one at a time. A send needs, in order: sending on,
+  no `PAUSED`; the draft's chat in `whatsapp.allow` and not `self_jid`; `approved/<id>.json` for that id and
+  chat; `sha256(text)` equal to the draft's and the approval's hash; no `sent.jsonl` send of that id and hash;
+  fewer than `max_per_day` sends and (for a prompt) `max_prompts_per_day` prompts on today's UTC date of
+  `at`; at least `min_gap_seconds` × a random 0.7–1.3 (never below `min_gap_seconds`) since the last message
+  of either kind; an unreadable `sent.jsonl` refuses as `cap`; linked; then `mother whatsapp verify <id>`
+  exit 0. It shows "typing…" for `min(8 s, 40 ms × characters)` plus up to 1 s (not for a prompt), sends,
+  appends one `sent.jsonl` line (one `O_APPEND` write, `at` UTC ISO-8601 with `Z`; a prompt has no `draft`),
+  and renames the approval `.used`; a send that throws renames it `.failed`; any refusal leaves it in place.
+  Incoming events have no handler: nothing is stored, logged or forwarded. Logs (stderr) carry draft ids,
+  stanza ids and error codes only, never text or a JID. Everything it creates is the manager's alone (umask
+  077; session files 0600).
 - **Limits.** `max_per_day` (default 20, ceiling 50) counts every send; `min_gap_seconds` (default 5, jittered)
   between sends; one recipient per call; no first message to a JID with no prior message in the local
   database. Self-chat prompts go to the manager's own number: they do not count toward `max_per_day`; they count only toward

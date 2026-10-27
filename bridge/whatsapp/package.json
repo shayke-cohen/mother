@@ -1,0 +1,18 @@
+{
+  "name": "mother-whatsapp-bridge",
+  "version": "0.0.0",
+  "private": true,
+  "description": "MOTHER's send-only WhatsApp bridge (a linked device). See README.md and docs/CONTRACT.md §5d.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "qrcode-terminal": "0.12.0"
+  }
+}
