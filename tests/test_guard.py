@@ -1030,6 +1030,7 @@ class TestWhatsapp(WhatsappCase):
                     "mother whatsapp list", "mother whatsapp list --json", "mother whatsapp status",
                     "mother whatsapp pending", "cat /tmp/dm.json | mother whatsapp pending",
                     "mother whatsapp pending < /tmp/dm.json", "mother whatsapp unlink", "mother whatsapp link",
+                    "mother whatsapp stop", "mother whatsapp install",
                     "mother whatsapp drop w3kx", "mother whatsapp help", "mother whatsapp",
                     "mother whatsapp verify w3kx", "python3 /opt/plugin/bin/mother whatsapp verify w3kx",
                     "mother whatsapp verify w3kx --sha256 %s" % ("ab" * 32),
@@ -1043,6 +1044,17 @@ class TestWhatsapp(WhatsappCase):
                     "mother whatsapp prompt w3kx; echo", "mother whatsapp prompt w3kx --to %s" % WA_DM):
             self.assertEqual(self.wa(cmd)[0], "deny", cmd)
             self.assertEqual(self.wa(cmd, mode=self.BY)[0], "deny", cmd)
+
+    def test_prompt_needs_open_unsent_drafts(self):
+        d = self.draft("wnop")
+        self.assertEqual(self.wa("mother whatsapp prompt wnop")[0], "allow")
+        d["status"] = "sent"
+        with open(os.path.join(self.wdir, "drafts", "wnop.json"), "w") as f:
+            json.dump(d, f)
+        got, why = self.wa("mother whatsapp prompt wnop")
+        self.assertEqual(got, "deny")
+        self.assertIn("wnop", why)
+        self.assertEqual(self.wa("mother whatsapp prompt w3kx wnop")[0], "deny")
 
     def test_channel_session_runs_no_whatsapp(self):
         ok = self.yes()

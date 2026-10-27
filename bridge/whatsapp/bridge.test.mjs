@@ -7,7 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs } from "./bridge.mjs";
+import { createBridge, locations, workspace, verifyWithCli, tighten, serve, idleMs, silenceConsole } from "./bridge.mjs";
 
 const SELF = "972500000099@s.whatsapp.net";
 const DM = "972500000001@s.whatsapp.net";
@@ -436,4 +436,86 @@ test("serve exits cleanly after the idle time with no request, removing its sock
   } finally {
     stop();
   }
+});
+
+// A paired client whose connection opens after `delayMs` (or never, when delayMs is null).
+function connectingClient(delayMs) {
+  client.isLinked = false;
+  client.paired = true;
+  client.waitOpen = (ms) => new Promise((resolve) => {
+    if (delayMs !== null && delayMs <= ms) setTimeout(() => { client.isLinked = true; resolve(true); }, delayMs);
+    else setTimeout(() => resolve(false), ms);
+  });
+}
+
+test("a paired client that is still connecting: status says so, send and prompt wait for the open", async () => {
+  connectingClient(150);
+  await start({ bridge: { connectWaitMs: 2000 } });
+  const st = await request({ op: "status" });
+  assert.equal(st.linked, false);
+  assert.equal(st.connecting, true);
+  const d = draft();
+  approve(d);
+  assert.deepEqual(await request({ op: "send", draft: "w3kx" }), { ok: true, stanza: "STANZA1" });
+  assert.deepEqual(settled("w3kx"), ["used"]);
+  assert.equal((await request({ op: "status" })).connecting, undefined);
+});
+
+test("a paired client whose connection never opens: unlinked after the window, approval settles failed", async () => {
+  connectingClient(null);
+  await start({ bridge: { connectWaitMs: 100 } });
+  const d = draft();
+  approve(d);
+  assert.deepEqual(await request({ op: "send", draft: "w3kx" }), { ok: false, error: "unlinked" });
+  assert.deepEqual(settled("w3kx"), ["failed"]);
+  assert.deepEqual(await request({ op: "prompt", text: "hello" }), { ok: false, error: "unlinked" });
+});
+
+test("an unpaired client is unlinked at once, without waiting", async () => {
+  client.isLinked = false;
+  client.paired = false;
+  client.waitOpen = () => { throw new Error("must not wait"); };
+  await start({ bridge: { connectWaitMs: 60_000 } });
+  assert.equal((await request({ op: "status" })).connecting, undefined);
+  assert.deepEqual(await request({ op: "prompt", text: "hello" }), { ok: false, error: "unlinked" });
+});
+
+test("stop: replies ok, then serve exits cleanly and removes its own socket", async () => {
+  const codes = [];
+  const loc = locations(env);
+  const { stop } = await serve({ client: { ...client, close() {} }, loc, ms: 60_000, exit: (c) => codes.push(c),
+                                 signals: false, env });
+  assert.deepEqual(await request({ op: "stop" }), { ok: true });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(codes, [0]);
+  assert.equal(fs.existsSync(loc.sock), false);
+  stop();
+});
+
+test("verifyWithCli uses MOTHER_PLUGIN_ROOT when the bridge runs outside the plugin", async () => {
+  const fake = path.join(tmp, "plugin");
+  fs.mkdirSync(path.join(fake, "bin"), { recursive: true });
+  fs.writeFileSync(path.join(fake, "bin", "mother"), "import sys\nsys.exit(0 if sys.argv[1:3] == ['whatsapp', 'verify'] else 1)\n");
+  const hash = sha("x");
+  assert.equal(await verifyWithCli("w3kx", { env: { ...env, MOTHER_PLUGIN_ROOT: fake }, sha256: hash }), true);
+});
+
+test("silenceConsole drops console.* output (libsignal prints session objects there)", () => {
+  const writes = [];
+  const so = process.stdout.write, se = process.stderr.write;
+  process.stdout.write = (...a) => { writes.push(String(a[0])); return true; };
+  process.stderr.write = (...a) => { writes.push(String(a[0])); return true; };
+  const restore = silenceConsole();
+  try {
+    console.log("a", { key: "SECRET" });
+    console.info("Closing session:", { privKey: "SECRET" });
+    console.warn("SECRET");
+    console.error("SECRET");
+    console.debug("SECRET");
+  } finally {
+    restore();
+    process.stdout.write = so;
+    process.stderr.write = se;
+  }
+  assert.deepEqual(writes, []);
 });

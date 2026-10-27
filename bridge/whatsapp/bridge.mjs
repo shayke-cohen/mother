@@ -49,9 +49,10 @@ export function workspace(env = process.env) {
 /** `mother whatsapp verify <id> --sha256 <hash>` (no shell): true only on exit 0, i.e. the recorded yes still
  * stands for exactly the text whose hash is `sha256`. */
 export function verifyWithCli(id, { env = process.env, python = "python3", sha256: hash } = {}) {
+  const root = (env.MOTHER_PLUGIN_ROOT || "").trim() || PLUGIN_ROOT;  // the installed copy runs outside the plugin
   if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return Promise.resolve(false);
   return new Promise((resolve) => {
-    execFile(python, [path.join(PLUGIN_ROOT, "bin", "mother"), "whatsapp", "verify", id, "--sha256", hash],
+    execFile(python, [path.join(root, "bin", "mother"), "whatsapp", "verify", id, "--sha256", hash],
       { env, timeout: 30_000, maxBuffer: 64 * 1024 }, (err) => resolve(!err));
   });
 }
@@ -66,7 +67,10 @@ const errCode = (e) => String((e && (e.code || e.output?.statusCode || e.name)) 
  * The request handler and socket server, independent of WhatsApp: `client` is anything with
  * linked(), me(), presence(jid, "composing"|"paused"), sendText(jid, text) -> stanza id.
  */
-export function createBridge({ env = process.env, client, onActivity = () => {}, verify = (id, hash) => verifyWithCli(id, { env, sha256: hash }),
+export const CONNECT_WAIT_MS = 20_000;  // a send/prompt waits this long for a paired client's connection to open
+
+export function createBridge({ env = process.env, client, onActivity = () => {}, onStop = () => {},
+                               connectWaitMs = CONNECT_WAIT_MS, verify = (id, hash) => verifyWithCli(id, { env, sha256: hash }),
                                now = Date.now, rand = Math.random,
                                sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = defaultLog }) {
   const loc = locations(env);
@@ -77,6 +81,14 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
     return p;
   };
   const fail = (error) => ({ ok: false, error });
+
+  /** Linked now, or paired and connecting: wait for the connection to open. Unpaired or closed: not linked. */
+  async function ensureLinked() {
+    if (!client) return false;
+    if (client.linked()) return true;
+    if (client.paired && typeof client.waitOpen === "function") return !!(await client.waitOpen(connectWaitMs));
+    return false;
+  }
 
   const readJson = (p) => {
     try {
@@ -157,7 +169,7 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
     const r = await checkWithGap(() => checkSend({ cfg: c.cfg, draft, approval, sentLines: readSent(), now: now(),
                                                    gapSeconds }));
     if (!r.ok) return refuse(r.error);
-    if (!client || !client.linked()) return refuse("unlinked");
+    if (!(await ensureLinked())) return refuse("unlinked");
     if (!rightAccount(c.cfg)) return refuse("wrong_account");
     const hash = sha256(draft.text);  // the bytes about to go out
     if (!(await verify(id, hash))) return refuse("no_approval");  // the second lock re-proves the yes itself
@@ -192,7 +204,7 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
       log({ op: "prompt", error: r.error });
       return r;
     }
-    if (!client || !client.linked()) return fail("unlinked");
+    if (!(await ensureLinked())) return fail("unlinked");
     if (!rightAccount(c.cfg)) {
       log({ op: "prompt", error: "wrong_account" });
       return fail("wrong_account");
@@ -222,13 +234,19 @@ export function createBridge({ env = process.env, client, onActivity = () => {},
     const n = (kind) => (lines ? lines.filter((x) => x.kind === kind && String(x.at || "").slice(0, 10) === day).length
       : null);
     const linked = !!(client && client.linked());
-    return { ok: true, linked, me: linked ? client.me() || null : null, sent_today: n("send"),
-             prompts_today: n("prompt") };
+    const out = { ok: true, linked, me: linked ? client.me() || null : null, sent_today: n("send"),
+                  prompts_today: n("prompt") };
+    if (!linked && client && client.paired && !(client.loggedOut && client.loggedOut())) out.connecting = true;
+    return out;
   }
 
   async function handle(req) {
     if (!req || typeof req !== "object" || Array.isArray(req)) return fail("bad_request");
     if (req.op === "status") return status();
+    if (req.op === "stop") {  // only makes the bridge exit; the socket is 0600
+      setTimeout(onStop, 50);
+      return { ok: true };
+    }
     if (req.op === "send") return serial(() => send(req.draft));
     if (req.op === "prompt") return serial(() => prompt(req.text));
     return fail("bad_request");
@@ -443,22 +461,26 @@ export function idleMs(env = process.env) {
 }
 
 /**
- * Serve on loc.sock until SIGINT/SIGTERM or `ms` without a request, then close the client and the socket and
- * call `exit(0)`. `client` is the WhatsApp client (anything with close()); the socket file is removed on exit.
+ * Serve on loc.sock until SIGINT/SIGTERM, a `stop` request, or `ms` without a request, then close the client
+ * and the socket and call `exit(0)`. `client` is the WhatsApp client (anything with close()).
  */
 export async function serve({ client, loc, ms = idleMs(), exit = (c) => process.exit(c), signals = true,
-                              env = process.env }) {
+                              env = process.env, connectWaitMs }) {
   let last = Date.now();
-  const bridge = createBridge({ env, client, onActivity: () => { last = Date.now(); } });
-  const server = await bridge.listen(loc.sock);
   let timer = null;
+  let stopping = false;
   const stop = () => {
+    if (stopping) return;
+    stopping = true;
     if (timer) clearInterval(timer);
     try { client.close(); } catch { /* already closed */ }
     server.close();
-    try { fs.unlinkSync(loc.sock); } catch { /* gone */ }
+    try { fs.unlinkSync(loc.sock); } catch { /* gone: closing the server removes it too */ }
     exit(0);
   };
+  const bridge = createBridge({ env, client, onActivity: () => { last = Date.now(); }, onStop: stop,
+                                ...(connectWaitMs ? { connectWaitMs } : {}) });
+  const server = await bridge.listen(loc.sock);
   timer = setInterval(() => {
     if (Date.now() - last >= ms) {
       defaultLog({ op: "idle_exit" });
@@ -472,7 +494,20 @@ export async function serve({ client, loc, ms = idleMs(), exit = (c) => process.
   return { server, stop };
 }
 
+/** Drop every console.* call: libraries (libsignal) print session objects there, key material included.
+ * The bridge's own lines go through defaultLog (stderr, ids and codes only). Returns a restore function. */
+export function silenceConsole() {
+  const keep = {};
+  for (const m of ["log", "info", "warn", "debug", "error", "trace"]) {
+    keep[m] = console[m];
+    console[m] = () => {};
+  }
+  return () => { for (const m of Object.keys(keep)) console[m] = keep[m]; };
+}
+
 async function runServe(loc) {
+  silenceConsole();
+  if (fs.existsSync(loc.sock) && await alive(loc.sock)) return 0;  // another bridge answers: don't connect twice
   const client = await connectWhatsApp({ sessionDir: loc.session, mode: "serve" });
   if (!client.paired) defaultLog({ op: "connection", state: "unlinked" });
   await serve({ client, loc });
@@ -493,5 +528,5 @@ export async function main(argv = process.argv.slice(2)) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().then((code) => { if (typeof code === "number") process.exit(code); },
-    (e) => { console.error("bridge: " + errCode(e)); process.exit(1); });
+    (e) => { process.stderr.write("bridge: " + errCode(e) + "\n"); process.exit(1); });
 }

@@ -425,7 +425,7 @@ def api_write(cmd):
 # compared casefolded (macOS file systems ignore case), commands after stripping quotes and backslashes.
 
 WA_PASS_SUBS = ("read", "chats", "draft", "list", "drop", "status", "pending", "verify", "link", "unlink", "help",
-                "-h", "--help")
+                "install", "stop", "-h", "--help")
 WA_ID = r"w[a-z2-9]{3}"
 _WA_BIN = (r"(?:python3?[ \t]+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother\"|\$\{CLAUDE_PLUGIN_ROOT\}/bin/mother"
            r"|\"[^\"$`\\\n]*/mother\"|'[^'\n]*/mother'|(?:[\w.~+-]*/)*mother)")
@@ -1960,7 +1960,11 @@ def decide_whatsapp(a, ctx, transcript=None):
     except SystemExit:
         return "deny", "%s: WhatsApp runs only on workspace.home_machine." % what
     if op == "prompt":
-        missing = [i for i in a.get("drafts") or [] if not wa.load_draft(ctx.ws, i)]
+        missing = []
+        for i in a.get("drafts") or []:
+            d = wa.load_draft(ctx.ws, i)
+            if not d or d.get("status") == "sent":  # a sent draft is no longer open
+                missing.append(i)
         if missing or not a.get("drafts"):
             return "deny", "%s: not an open draft: %s." % (what, ", ".join(missing) or "none named")
         return "allow", "%s: every id is an open draft; the prompt reaches only the manager." % what

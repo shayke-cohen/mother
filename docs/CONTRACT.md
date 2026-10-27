@@ -381,8 +381,10 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   | `session` | `ok <id>` in the Claude session | the guard's `session_approvals` (genuine user messages only) |
 
   Grammar: `ok <id> [<id>…]`, `ok all`, `no <id>`. One yes approves one draft: one exact text, one chat, once.
-  First valid yes wins. `no <id>` on any path drops the draft. A session may name explicit ids only; `ok all`
-  counts only on `self_chat` and `slack_dm`, where a batched prompt exists to resolve it.
+  First valid yes wins. `no <id>` on any path drops the draft. A session and the Slack DM name explicit ids
+  only (`ok all` on Slack proves nothing: the agent's Slack post can't be tied to the prompt record, so `all`
+  could cover a draft the manager never saw); `ok all` counts only on `self_chat`, where the bridge logs a
+  prompt only after it was sent.
   The whole message must be the command (case-insensitive; `ok w3kx but change it` is not a yes). Every proof
   must come after the draft's `created` time, so an old reply can't approve a later draft that reuses the id.
   **Bound to the text:** the draft file keeps `sha256` of its text; a proof needs `sha256(text)` to still equal
@@ -390,8 +392,9 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   carries the hash (`prove()` returns `{path, evidence, sha256}`); the guard writes that hash into
   `approved/<id>.json`. `prompts.jsonl` lines (written when a prompt goes out) are
   `{"at", "path": "self_chat"|"slack_dm", "ids": [...], "sha256": {"<id>": "<text sha256>"}}`; a line without
-  the `sha256` map shows nothing. `ok all` resolves to the latest prompt for that path sent at or before the
-  reply, and covers a draft only if that prompt came after the draft and carries its current hash.
+  the `sha256` map shows nothing. On `self_chat`, `ok all` resolves to the latest prompt for that path sent at
+  or before the reply, and covers a draft only if that prompt came after the draft and carries its current hash.
+  (`no all` still drops on Slack: dropping is the safe side.)
   `session`: a genuine human message (the guard's `user_text`) in the transcript, at most 72 h old, explicit ids.
   `self_chat`: an `ok`/`no` counts only after a self-chat prompt that showed the draft with its current hash (no
   prompt, no self-chat proof). A message with an empty stanza id never counts. A yes needs
@@ -441,7 +444,8 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   a 0700 folder; a stale socket is replaced, a live one refused); `--link` prints the QR and exits once
   linked; `--unlink` logs out and deletes `session/`. It resolves the workspace as `bin/mother` does
   (`$MOTHER_WORKSPACE`, else `<state>/workspace`). One JSON request per connection, one JSON reply:
-  `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "prompts_today"}`;
+  `{"op": "status"}` → `{"ok": true, "linked", "me", "sent_today", "prompts_today", "connecting"?}`;
+  `{"op": "stop"}` → `{"ok": true}`, then the bridge exits;
   `{"op": "send", "draft": "<id>"}` → `{"ok": true, "stanza"}`; `{"op": "prompt", "text"}` → the same, sent
   to `whatsapp.self_jid` only. A refusal is `{"ok": false, "error"}`, one of `not_allowlisted`, `no_approval`,
   `hash_mismatch`, `cap`, `gap`, `unlinked`, `no_draft`, `already_sent`, `off`, `paused`, `wrong_account`,
@@ -468,34 +472,57 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
 - **Commands that talk to the bridge** (all refuse off the home machine except `status`; `send` and `prompt` exit 2
   "whatsapp sending is off" when `enabled` or `send` is false). The client is `whatsapp.bridge_call(req,
   timeout=None, start=True)`: it never raises, it returns `{"ok": false, "error": …}` with `bridge_down` (not
-  running and not started, or no socket within 15 s), `bridge_not_installed` (no `node` on PATH or no
-  `bridge/whatsapp/node_modules`; carries a `hint` to run `npm ci --ignore-scripts --omit=dev` there),
-  `bridge_start_failed`, `bridge_timeout` or `bridge_bad_reply`. Default timeout 60 s for `send`/`prompt` (the bridge
-  may wait 30 s for the gap, then type and verify), 5 s for `status`.
+  running and not started, or no socket within 15 s), `bridge_not_installed` (no Node, or the bridge is not
+  installed; carries a `hint` with an absolute path), `node_too_old` (Node below 20), `bridge_start_failed`,
+  `bridge_timeout` or `bridge_bad_reply`. Default timeout 60 s for `send`/`prompt` (the bridge may wait 30 s for
+  the gap, then type and verify), 5 s for `status`.
+  - **`mother whatsapp install`** installs the bridge outside the plugin (a plugin update replaces the plugin
+    folder): it copies `package.json`, `package-lock.json` and the non-test `*.mjs` of `bridge/whatsapp/` into
+    `<state>/whatsapp/app/` and runs `npm ci --ignore-scripts --omit=dev` there (network). `bridge_call`, `link`
+    and `unlink` run `<state>/whatsapp/app/bridge.mjs`, with `MOTHER_PLUGIN_ROOT` set so the bridge can run the
+    plugin's `mother whatsapp verify`. `status` adds `"reinstall_needed": true` when the plugin's bridge files
+    differ (sha256) from the installed copy. Node is looked up on PATH, then `/opt/homebrew/bin`,
+    `/usr/local/bin`, then the newest `~/.nvm/versions/node/*/bin`. The session keys live under `<state>`, so
+    they survive a plugin update. Exit 2 with `npm_failed`, `bridge_not_installed` (no Node) or `node_too_old`.
+  - **`mother whatsapp stop`** asks a running bridge to exit (`{"op": "stop"}`) and waits for its socket to go;
+    prints `{"ok": true, "stopped": bool}`.
   - **`mother whatsapp send <id>`** exits 2 without calling the bridge unless `approved/<id>.json` exists. On a
     bridge `ok` it sets the draft's `status` to `sent` (a sent draft is no longer listed, prompted or
-    returned by `pending`) and prints `{"ok": true, "stanza"}`; any bridge error prints the reply as JSON and
-    exits 2 with the code. It never touches `approved/`: the bridge settles the approval.
+    returned by `pending`) and prints `{"ok": true, "stanza"}`; a bridge `already_sent` also marks it sent and
+    exits 0 with `{"ok": true, "already_sent": true, "note"}`; any other bridge error prints the reply as JSON
+    and exits 2 with the code. It never touches `approved/`: the bridge settles the approval.
   - **`mother whatsapp prompt <id> [<id>…]`** (ids only: the guard accepts nothing else) needs every id to be
     an open draft (exit 2 otherwise) and runs every path in `whatsapp.approve_via` that can prompt, as one
     batched text. `self_chat`: the bridge `prompt` op. `slack_dm`: no call; the output carries
     `{"slack_dm": {"ok": true, "channel": <first manager.chat_dm>, "text"}}` for the skill to post (no
-    `chat_dm`: `{"ok": false, "error": "no_chat_dm"}`). Output `{"ids", "self_chat"?, "slack_dm"?}`; exit 2 when no
-    path delivered. Each path that delivered appends one `prompts.jsonl` line (`{"at", "path", "ids", "sha256"}`,
+    `chat_dm`: `{"ok": false, "error": "no_chat_dm"}`). Output `{"ids", "self_chat"?, "slack_dm"?}`; exit 2 when any
+    enabled path failed (the per-path results are in the JSON, and a path that did deliver is still recorded). Each path that delivered appends one `prompts.jsonl` line (`{"at", "path", "ids", "sha256"}`,
     one `O_APPEND` write; a bridge `log_failed` counts as delivered because the message went out; a bridge refusal
     records nothing). During `manager.quiet_hours` it prints `{"held": true}`, records nothing and calls nothing. The
     text is `<id> WhatsApp -> <chat name>: "<text>"` per draft (continuation lines of the text quoted with `> `),
-    a blank line, then `Reply with: ok <ids>  |  ok all  |  no <id>`; no line can read as an approval reply, which the
-    bridge would refuse as `bad_request`.
-  - **`mother whatsapp link` / `unlink`** run `node bridge/whatsapp/bridge.mjs --link|--unlink` in the foreground,
-    inheriting the terminal (the QR shows there). **`status`** prints `{"bridge": <status reply or error>, "read":
-    {"db_reachable": bool}}`; it never starts the bridge and never reads a message.
+    a blank line, then `Reply with: ok <ids>  |  ok all  |  no <id>` (self chat) or `Reply with explicit ids: ok
+    <ids>  |  no <id>` (Slack); no line can read as an approval reply, which the bridge would refuse as
+    `bad_request`. The guard allows `prompt` only when every id is an open draft that is not `sent`.
+  - **`mother whatsapp link` / `unlink`** first stop a running bridge, then run the installed `bridge.mjs
+    --link|--unlink` in the foreground, inheriting the terminal. `link` exits 2 unless stdout is a TTY ("run
+    `mother whatsapp link` in your own terminal (the QR needs one)"): the manager runs it, not the agent; it waits up
+    to 180 s for the scan. **`status`** prints `{"bridge": <status reply or error>, "read": {"db_reachable": bool,
+    "reason"?, "hint"?}, "reinstall_needed"?}`; `reason` is `missing`, `denied` (hint: grant Full Disk Access to the
+    app that runs Claude Code), `locked` or `schema_changed`. It never starts the bridge and never reads a message,
+    and it probes the database even when `whatsapp.enabled` is false.
   - **Bridge supervision.** No launchd agent. When the socket is missing or refuses a connection, `bridge_call`
-    starts `node bridge.mjs` detached (new session, stdin closed, stdout and stderr appended to
-    `<state>/whatsapp/bridge.log`, which holds ids and codes only) and waits up to 15 s for the socket. The bridge exits
-    cleanly (socket removed) after 30 minutes with no request (`$MOTHER_BRIDGE_IDLE_MS` overrides it, for tests), so
-    the first send after a quiet spell takes a few seconds longer. The guard already classifies `send` (proof
-    required), `prompt` (ids only, each an open draft) and `link`, `unlink`, `status` (pass).
+    starts `node <state>/whatsapp/app/bridge.mjs` detached (new session, stdin closed, stdout and stderr appended
+    to `<state>/whatsapp/bridge.log`, ids and codes only, no key material: the bridge drops every `console.*` call;
+    the log is rotated to `bridge.log.1` past 1 MiB), under an exclusive `flock` on `<state>/whatsapp/start.lock`, so
+    two callers start one bridge; it waits up to 15 s for the socket, then up to 20 s while `status` says
+    `"connecting": true`. A bridge that finds its socket already answering exits without connecting. The bridge
+    exits cleanly (socket removed) after 30 minutes with no request (`$MOTHER_BRIDGE_IDLE_MS` overrides it, for
+    tests) or on a `stop` request, so the first send after a quiet spell takes a few seconds longer. **A freshly
+    started bridge answers `send` and `prompt` only after its WhatsApp connection is open**: with a session on
+    disk it waits up to 20 s for that, and replies `unlinked` only when there is no session or the connection does
+    not open in the window. `status` answers at once with `"connecting": true` while it waits. The guard
+    classifies `send` (proof required), `prompt` (ids only, each an open unsent draft) and `link`, `unlink`,
+    `status`, `install`, `stop` (pass).
 - **Limits.** `max_per_day` (default 20, ceiling 50) counts every send; `min_gap_seconds` (default 5, jittered)
   between sends; one recipient per call; no first message to a JID with no prior message in the local
   database. Self-chat prompts go to the manager's own number: they do not count toward `max_per_day`; they count only toward

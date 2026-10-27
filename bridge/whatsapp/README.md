@@ -11,8 +11,12 @@ Optional. Nothing else in MOTHER depends on Node or on this folder. Node 20 or l
 ## Install
 
 ```bash
-cd "${CLAUDE_PLUGIN_ROOT}/bridge/whatsapp" && npm ci --ignore-scripts --omit=dev
+mother whatsapp install
 ```
+
+This copies the bridge into `<state>/whatsapp/app/` (outside the plugin, which a plugin update replaces) and runs
+`npm ci --ignore-scripts --omit=dev` there. Run it again after a plugin update that changes this folder
+(`mother whatsapp status` says `reinstall_needed`). Node 20 or later: found on PATH, in Homebrew, or the newest nvm.
 
 Versions are pinned exactly in `package.json` and `package-lock.json`. `node_modules/` is never committed.
 
@@ -37,7 +41,9 @@ Known risks of the dependency:
 outside the workspace, never synced. The agent never runs these directly or talks to the socket: it goes
 through `mother whatsapp …`, and the guard denies anything else that touches the socket or the state.
 
-Normally nobody starts it by hand: `mother whatsapp send|prompt` start `node bridge.mjs` detached (log in
+A freshly started bridge answers `send` and `prompt` only once its WhatsApp connection is open (it waits up to
+20 s; `unlinked` only with no session or when the connection fails in that window). It drops every `console.*`
+call (libsignal prints session objects there), so `bridge.log` holds ids and codes only. Normally nobody starts it by hand: `mother whatsapp send|prompt` start `node bridge.mjs` detached (log in
 `<state>/whatsapp/bridge.log`, ids and codes only) when the socket is missing or refuses, and the bridge exits
 by itself after 30 minutes with no request (`MOTHER_BRIDGE_IDLE_MS` overrides it, in ms; the socket is removed).
 `mother whatsapp link|unlink` run `--link|--unlink` in your terminal.
@@ -48,7 +54,8 @@ A Unix socket, mode 0600, no TCP. One JSON request per connection, one JSON repl
 
 | Request | Reply |
 |---|---|
-| `{"op": "status"}` | `{"ok": true, "linked", "me", "sent_today", "prompts_today"}` |
+| `{"op": "status"}` | `{"ok": true, "linked", "me", "sent_today", "prompts_today"}`, plus `"connecting": true` while a paired session is still opening |
+| `{"op": "stop"}` | `{"ok": true}`, then the bridge exits (used by `mother whatsapp stop`, `link`, `unlink`) |
 | `{"op": "send", "draft": "<id>"}` | `{"ok": true, "stanza"}` or `{"ok": false, "error"}` |
 | `{"op": "prompt", "text": "…"}` | the same; goes to `whatsapp.self_jid` only |
 
@@ -68,6 +75,7 @@ If the bridge dies between sending and logging, the approval stays `.json`: the 
 (the safe side) and the outcome is unrecorded.
 
 A `prompt` must not read as the manager's reply (`ok <id>`, `ok all`, `no <id>` on any line: `bad_request`).
+`MOTHER_PLUGIN_ROOT` (set by the CLI) tells an installed copy where the plugin's `bin/mother` is, for `verify`.
 If its `sent.jsonl` line can't be written it returns `{"ok": false, "error": "log_failed", "stanza",
 "detail"}`: the message went out but isn't recorded as the bridge's own.
 

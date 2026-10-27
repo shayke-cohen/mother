@@ -14,6 +14,8 @@ Commands:
   send ID                            send an approved draft through the bridge (the guard requires a proven yes)
   prompt ID [ID]...                  ask the manager to approve open drafts: self-chat via the bridge, Slack DM
                                      text returned for the skill to post; held during quiet hours
+  install                            copy the bridge out of the plugin into <state>/whatsapp/app and npm ci there
+  stop                               stop a running bridge (link and unlink do it first)
   link | unlink                      pair the bridge with WhatsApp (QR in this terminal) | log it out, delete keys
   status                             bridge state and whether the local database is readable (JSON)
   verify ID [--sha256 HEX]           exit 0 only if approved/ID.json still proves a yes, on the path it
@@ -763,7 +765,9 @@ def pending(ws: Path, cfg: dict, dm: list) -> dict:
                 at = g.parse_time(m.get("ts"))
                 word, ids = reply
                 if ids == "all":
-                    ids = resolve_all(ws, "slack_dm", at)
+                    if word == "ok":
+                        continue  # a Slack yes names explicit ids: no post can be proven to be what `all` meant
+                    ids = resolve_all(ws, "slack_dm", at)  # `no all` only drops, so the latest prompt is fine
                 for i in ids:
                     d = load_draft(ws, i)
                     created = _epoch((d or {}).get("created"))
@@ -777,11 +781,7 @@ def pending(ws: Path, cfg: dict, dm: list) -> dict:
                     sha = hashlib.sha256(str(d.get("text")).encode("utf-8")).hexdigest()
                     if d.get("sha256") != sha:
                         continue
-                    if reply[1] == "all":
-                        shown = _all_covers(ws, "slack_dm", at, i, sha, created)
-                    else:
-                        shown = bool(_shown(ws, "slack_dm", i, sha, created, until=at))
-                    if not shown:
+                    if not _shown(ws, "slack_dm", i, sha, created, until=at):
                         continue  # the DM never showed this text before the yes
                     decided.add(i)
                     try:
@@ -911,24 +911,124 @@ def cmd_verify(cfg, args, ws):
 
 # ---------------------------------------------------------------- bridge client
 
-BRIDGE_DIR = PLUGIN_ROOT / "bridge" / "whatsapp"
+BRIDGE_SRC = PLUGIN_ROOT / "bridge" / "whatsapp"  # the plugin's copy; `install` copies it out of the plugin
 START_WAIT = 15.0  # seconds to wait for a bridge we just started to open its socket
+READY_WAIT = 20.0  # then up to this long for its WhatsApp connection to open
 CALL_TIMEOUT = {"status": 5.0}
 DEFAULT_TIMEOUT = 60.0  # send/prompt: up to 30 s for the gap, plus typing and verify
-NOT_INSTALLED_HINT = "run `npm ci --ignore-scripts --omit=dev` in bridge/whatsapp of the plugin"
+MIN_NODE = 20
+NODE_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def wa_state() -> Path:
+    return _state_dir() / "whatsapp"
 
 
 def bridge_sock() -> Path:
-    return _state_dir() / "whatsapp" / "bridge.sock"
+    return wa_state() / "bridge.sock"
+
+
+def app_dir() -> Path:
+    """Where the bridge runs from: outside the plugin, which a plugin update replaces."""
+    return wa_state() / "app"
 
 
 def _node():
+    """node from PATH, else Homebrew, else the newest nvm install; None when there is none."""
+    import glob
     import shutil
-    return shutil.which("node")
+    found = shutil.which("node")
+    if found:
+        return found
+    for d in NODE_DIRS:
+        c = os.path.join(d, "node")
+        if os.access(c, os.X_OK):
+            return c
+
+    def key(path):
+        m = re.search(r"/v?(\d+)\.(\d+)\.(\d+)/bin/node$", path)
+        return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+    cands = [c for c in glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/node")) if os.access(c, os.X_OK)]
+    return max(cands, key=key) if cands else None
+
+
+def _node_major(node):
+    import subprocess
+    try:
+        out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10).stdout
+        return int(out.strip().lstrip("v").split(".")[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def bridge_problem():
+    """None when the bridge can be started, else (code, hint) with an absolute path in the hint."""
+    node = _node()
+    if not node:
+        return "bridge_not_installed", "install Node %d or later (nodejs.org or Homebrew), then run `mother whatsapp install`" % MIN_NODE
+    if _node_major(node) < MIN_NODE:
+        return "node_too_old", "%s is older than Node %d; install a newer one, then run `mother whatsapp install`" % (
+            node, MIN_NODE)
+    if not (app_dir() / "bridge.mjs").is_file() or not (app_dir() / "node_modules").is_dir():
+        return "bridge_not_installed", "run `mother whatsapp install` (installs the bridge into %s)" % app_dir()
+    return None
 
 
 def bridge_installed() -> bool:
-    return bool(_node()) and (BRIDGE_DIR / "node_modules").is_dir() and (BRIDGE_DIR / "bridge.mjs").is_file()
+    return bridge_problem() is None
+
+
+def _problem_reply(prob):
+    return {"ok": False, "error": prob[0], "hint": prob[1]}
+
+
+def _bridge_files(folder: Path) -> list:
+    names = ["package.json", "package-lock.json"]
+    names += sorted(p.name for p in folder.glob("*.mjs") if not p.name.endswith(".test.mjs"))
+    return [n for n in names if (folder / n).is_file()]
+
+
+def _files_sha(folder: Path) -> str:
+    h = hashlib.sha256()
+    for n in _bridge_files(folder):
+        h.update(n.encode("utf-8") + b"\0" + (folder / n).read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def reinstall_needed() -> bool:
+    """True when an installed copy exists and differs from the plugin's bridge files."""
+    if not (app_dir() / "bridge.mjs").is_file():
+        return False
+    return _files_sha(app_dir()) != _files_sha(BRIDGE_SRC)
+
+
+def _run_npm(folder: Path, node: str) -> int:
+    import subprocess
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(node) + os.pathsep + env.get("PATH", "")
+    return subprocess.call(["npm", "ci", "--ignore-scripts", "--omit=dev"], cwd=str(folder), env=env)
+
+
+def cmd_install(cfg, args, ws):
+    import shutil
+    if args:
+        _fail("usage: mother whatsapp install")
+    node = _node()
+    if not node or _node_major(node) < MIN_NODE:
+        prob = bridge_problem() or ("node_too_old", "")
+        print(json.dumps(_problem_reply(prob)))
+        sys.exit(2)
+    dest = app_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(dest.parent), 0o700)
+    for n in _bridge_files(BRIDGE_SRC):
+        shutil.copyfile(str(BRIDGE_SRC / n), str(dest / n))
+    code = _run_npm(dest, node)
+    if code != 0:
+        print(json.dumps({"ok": False, "error": "npm_failed", "code": code}))
+        sys.exit(2)
+    print(json.dumps({"ok": True, "app": str(dest)}))
 
 
 def _exchange(req: dict, timeout: float) -> dict:
@@ -950,15 +1050,23 @@ def _exchange(req: dict, timeout: float) -> dict:
 
 
 def _start_bridge():
-    """Start `node bridge.mjs` detached (stdin closed, output to bridge.log: ids and codes only)."""
+    """Start `node app/bridge.mjs` detached (stdin closed, output to bridge.log: ids and codes only)."""
     import subprocess
-    d = _state_dir() / "whatsapp"
+    d = wa_state()
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(str(d), 0o700)
-    log = open(str(d / "bridge.log"), "ab")
+    logp = d / "bridge.log"
     try:
-        return subprocess.Popen([_node(), str(BRIDGE_DIR / "bridge.mjs")], stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=log, start_new_session=True, cwd=str(BRIDGE_DIR), env=dict(os.environ))
+        if logp.stat().st_size > 1024 * 1024:
+            os.replace(str(logp), str(d / "bridge.log.1"))  # keep the log bounded
+    except OSError:
+        pass
+    log = open(str(logp), "ab")
+    try:
+        env = dict(os.environ)
+        env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)  # the bridge runs outside the plugin but verifies with it
+        return subprocess.Popen([_node(), str(app_dir() / "bridge.mjs")], stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=log, start_new_session=True, cwd=str(app_dir()), env=env)
     finally:
         log.close()
 
@@ -975,32 +1083,80 @@ def _try(req: dict, timeout: float):
         return {"ok": False, "error": "bridge_bad_reply"}, None
 
 
+def _start_and_wait() -> dict:
+    """Under start.lock: start the bridge unless another caller already did, wait for its socket, then for its
+    WhatsApp connection. Returns {} when ready (or settled unlinked), else an error reply."""
+    import fcntl
+    wa_state().mkdir(parents=True, exist_ok=True)
+    os.chmod(str(wa_state()), 0o700)
+    fd = os.open(str(wa_state() / "start.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        r, down = _try({"op": "status"}, CALL_TIMEOUT["status"])
+        if down:
+            try:
+                _start_bridge()
+            except OSError:
+                return {"ok": False, "error": "bridge_start_failed"}
+            deadline = time.time() + START_WAIT
+            while down and time.time() < deadline:
+                time.sleep(0.2)
+                r, down = _try({"op": "status"}, CALL_TIMEOUT["status"])
+            if down:
+                return {"ok": False, "error": "bridge_down",
+                        "hint": "the bridge did not open its socket in %d s; see %s" % (
+                            START_WAIT, wa_state() / "bridge.log")}
+        deadline = time.time() + READY_WAIT
+        while r and r.get("ok") and r.get("connecting") and time.time() < deadline:
+            time.sleep(0.3)
+            r, down = _try({"op": "status"}, CALL_TIMEOUT["status"])
+            if down:
+                break
+        return {}
+    finally:
+        os.close(fd)  # releases the lock
+
+
 def bridge_call(req: dict, timeout=None, start: bool = True) -> dict:
     """Send one request to the bridge and return its reply. A missing or refusing socket starts the bridge on
-    demand (`start`), waits up to 15 s for it, then calls. Errors are replies, never exceptions: bridge_down
-    (not running and `start` off, or it never opened its socket), bridge_not_installed, bridge_start_failed,
-    bridge_timeout, bridge_bad_reply."""
+    demand (`start`), under a lock, waits up to 15 s for the socket and up to 20 s for its WhatsApp connection,
+    then calls. Errors are replies, never exceptions: bridge_down (not running and `start` off, or it never
+    opened its socket), bridge_not_installed, node_too_old, bridge_start_failed, bridge_timeout,
+    bridge_bad_reply."""
     t = timeout if timeout is not None else CALL_TIMEOUT.get(req.get("op"), DEFAULT_TIMEOUT)
     r, down = _try(req, t)
     if not down:
         return r
-    if not bridge_installed():
-        return {"ok": False, "error": "bridge_not_installed", "hint": NOT_INSTALLED_HINT}
+    prob = bridge_problem()
+    if prob:
+        return _problem_reply(prob)
     if not start:
         return {"ok": False, "error": "bridge_down"}
-    try:
-        _start_bridge()
-    except OSError:
-        return {"ok": False, "error": "bridge_start_failed"}
-    deadline = time.time() + START_WAIT
+    err = _start_and_wait()
+    if err:
+        return err
+    r, down = _try(req, t)
+    return r if not down else {"ok": False, "error": "bridge_down"}
+
+
+def stop_bridge(wait: float = 5.0) -> bool:
+    """Ask a running bridge to exit and wait for its socket to go. True when it was running."""
+    r, down = _try({"op": "stop"}, CALL_TIMEOUT["status"])
+    if down:
+        return False
+    deadline = time.time() + wait
     while time.time() < deadline:
-        time.sleep(0.2)
-        r, down = _try(req, t)
-        if not down:
-            return r
-    return {"ok": False, "error": "bridge_down",
-            "hint": "the bridge did not open its socket in %d s; see whatsapp/bridge.log in the state folder"
-                    % START_WAIT}
+        _, down = _try({"op": "status"}, 1.0)
+        if down:
+            break
+        time.sleep(0.1)
+    return True
+
+
+def cmd_stop(cfg, args, ws):
+    if args:
+        _fail("usage: mother whatsapp stop")
+    print(json.dumps({"ok": True, "stopped": stop_bridge()}))
 
 
 # ---------------------------------------------------------------- send, prompt, link, status
@@ -1027,11 +1183,17 @@ def cmd_send(cfg, args, ws):
     if not (_approved_dir(ws) / (i + ".json")).is_file():
         _fail("no approval for %s: it needs the manager's yes first (the guard records it)" % i, 2)
     r = bridge_call({"op": "send", "draft": i})
-    if not r.get("ok"):
+    if not r.get("ok") and r.get("error") != "already_sent":
         print(json.dumps(r))
         _fail("send %s failed: %s" % (i, r.get("error") or "error"), 2)
-    _mark_sent(ws, i)
-    print(json.dumps({"ok": True, "stanza": r.get("stanza")}))
+    try:
+        _mark_sent(ws, i)
+    except OSError as e:
+        print("mother: sent, but couldn't mark %s sent: %s" % (i, e), file=sys.stderr)
+    if r.get("ok"):
+        print(json.dumps({"ok": True, "stanza": r.get("stanza")}))
+    else:  # already sent earlier: it can't go twice, and it must not be prompted again
+        print(json.dumps({"ok": True, "already_sent": True, "note": "this draft was already sent"}))
 
 
 def _in_quiet_hours(cfg: dict) -> bool:
@@ -1039,10 +1201,11 @@ def _in_quiet_hours(cfg: dict) -> bool:
     return channels.quiet_now(cfg)
 
 
-def prompt_text(drafts: list) -> str:
+def prompt_text(drafts: list, allow_all: bool = True) -> str:
     """The batched approval prompt. No line of it may read as an approval reply (the bridge refuses such text):
     every draft starts `<id> WhatsApp ->`, text continuation lines are quoted with `> `, and the hint starts
-    `Reply with`."""
+    `Reply with`. The Slack path takes explicit ids only (`allow_all` False): its post can't be proven to be
+    the prompt `all` would resolve to."""
     lines = []
     for d in drafts:
         body = str(d["text"]).split("\n")
@@ -1050,7 +1213,11 @@ def prompt_text(drafts: list) -> str:
         lines.extend("> " + b for b in body[1:])
         lines[-1] += '"'
     lines.append("")
-    lines.append("Reply with: ok %s  |  ok all  |  no <id>" % " ".join(d["id"] for d in drafts))
+    ids = " ".join(d["id"] for d in drafts)
+    if allow_all:
+        lines.append("Reply with: ok %s  |  ok all  |  no <id>" % ids)
+    else:
+        lines.append("Reply with explicit ids: ok %s  |  no <id>" % ids)
     return "\n".join(lines)
 
 
@@ -1080,59 +1247,76 @@ def cmd_prompt(cfg, args, ws):
     if _in_quiet_hours(cfg):
         print(json.dumps({"held": True}))
         return
-    text = prompt_text(drafts)
     out = {"ids": [d["id"] for d in drafts]}
-    delivered = False
+    failed = False
     for path in approve_via(cfg):
         if path == "self_chat":
-            r = bridge_call({"op": "prompt", "text": text})
+            r = bridge_call({"op": "prompt", "text": prompt_text(drafts)})
             out["self_chat"] = r
             if r.get("ok") or r.get("error") == "log_failed":  # log_failed: the message did go out
                 _record_prompt(ws, "self_chat", drafts)
-                delivered = True
+            if not r.get("ok"):
+                failed = True
         elif path == "slack_dm":
             dms = _dm_channels(cfg)
             if not dms:
                 out["slack_dm"] = {"ok": False, "error": "no_chat_dm"}
+                failed = True
                 continue
-            out["slack_dm"] = {"ok": True, "channel": dms[0], "text": text}
+            out["slack_dm"] = {"ok": True, "channel": dms[0], "text": prompt_text(drafts, allow_all=False)}
             _record_prompt(ws, "slack_dm", drafts)
-            delivered = True
     print(json.dumps(out, indent=2, ensure_ascii=False))
-    if not delivered:
+    if failed:  # per-path results are in the JSON; the caller must read them
         sys.exit(2)
 
 
 def _bridge_argv(flag: str) -> list:
-    return [_node(), str(BRIDGE_DIR / "bridge.mjs"), flag]
+    return [_node(), str(app_dir() / "bridge.mjs"), flag]
 
 
 def cmd_link(sub, args) -> int:
-    """`link` / `unlink`: run the bridge in this terminal (the QR shows here). Returns the exit code."""
+    """`link` / `unlink`: stop a running bridge, then run the installed bridge in this terminal (the QR shows
+    here). Returns the exit code."""
     import subprocess
     if args:
         _fail("usage: mother whatsapp %s" % sub)
-    if not bridge_installed():
-        print(json.dumps({"ok": False, "error": "bridge_not_installed", "hint": NOT_INSTALLED_HINT}))
+    if sub == "link" and not sys.stdout.isatty():
+        print("mother: run `mother whatsapp link` in your own terminal (the QR needs one)", file=sys.stderr)
         return 2
-    return subprocess.call(_bridge_argv("--" + sub))
+    prob = bridge_problem()
+    if prob:
+        print(json.dumps(_problem_reply(prob)))
+        return 2
+    stop_bridge()  # a running bridge would hold the old session (and block the link)
+    env = dict(os.environ)
+    env["MOTHER_PLUGIN_ROOT"] = str(PLUGIN_ROOT)
+    return subprocess.call(_bridge_argv("--" + sub), env=env)
 
 
 def cmd_status(cfg, args):
     if args:
         _fail("usage: mother whatsapp status")
+    read = {"db_reachable": True}
     try:
         _query("SELECT 1 FROM ZWACHATSESSION LIMIT 1")
-        readable = True
+    except ReaderError as e:
+        read = {"db_reachable": False, "reason": e.reason}
+        if e.reason == "denied":
+            read["hint"] = ("grant Full Disk Access to the app that runs Claude Code (your terminal or the "
+                            "desktop app) in System Settings > Privacy & Security > Full Disk Access")
     except Exception:
-        readable = False
-    print(json.dumps({"bridge": bridge_call({"op": "status"}, start=False),
-                      "read": {"db_reachable": readable}}, indent=2))
+        read = {"db_reachable": False, "reason": "error"}
+    out = {"bridge": bridge_call({"op": "status"}, start=False), "read": read}
+    if reinstall_needed():
+        out["reinstall_needed"] = True
+        out["hint"] = "the plugin's bridge changed; run `mother whatsapp install`"
+    print(json.dumps(out, indent=2))
 
 
 READ_COMMANDS = {"read": cmd_read, "chats": cmd_chats}
 DRAFT_COMMANDS = {"draft": cmd_draft, "list": cmd_list, "drop": cmd_drop, "pending": cmd_pending,
-                  "verify": cmd_verify, "send": cmd_send, "prompt": cmd_prompt}
+                  "verify": cmd_verify, "send": cmd_send, "prompt": cmd_prompt, "install": cmd_install,
+                  "stop": cmd_stop}
 
 
 def main(argv, cfg=None, ws=None):

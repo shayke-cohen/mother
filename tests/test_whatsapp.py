@@ -949,9 +949,17 @@ class TestProof(Base):
         self.prompt("slack_dm", ["w3kx", "w4ab"], ago(minutes=90))
         self.prompt("slack_dm", ["w9pa"], ago(minutes=60))
         out = self.pending([self.slack("no w4ab", ago(minutes=8)), self.slack("ok all", ago(minutes=5))])
-        self.assertEqual(out, {"send": ["w9pa"], "dropped": ["w4ab"]})
+        self.assertEqual(out, {"send": [], "dropped": ["w4ab"]})  # `ok all` never counts on Slack (I3)
+        self.assertEqual(self.grants(), [])
         self.assertIsNone(whatsapp.load_draft(self.ws, "w4ab"))
         self.assertIsNotNone(whatsapp.load_draft(self.ws, "w3kx"))
+
+    def test_pending_slack_explicit_ids_still_count(self):
+        fixture_db_fresh(self.db, [])
+        self.draft("w9pa", ago(hours=2))
+        self.prompt("slack_dm", ["w3kx", "w9pa"], ago(minutes=60))
+        out = self.pending([self.slack("ok w9pa", ago(minutes=5))])
+        self.assertEqual(out, {"send": ["w9pa"], "dropped": []})
 
     def test_pending_self_chat(self):
         self.draft("w9pa", ago(hours=2))
@@ -1137,14 +1145,12 @@ def fixture_db_fresh(path, self_msgs):
     fixture_db(path, CHATS, hist + list(self_msgs))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # ---------------------------------------------------------------- Task 7: send, prompt, link, status
 
 import socket as _socket  # noqa: E402
 import threading  # noqa: E402
+import time  # noqa: E402
 
 
 class FakeBridge(object):
@@ -1249,20 +1255,54 @@ class TestCliSend(Cmd7):
         # the CLI leaves the approval to the bridge
         self.assertTrue((self.ws / ".mother/whatsapp/approved" / (d["id"] + ".json")).exists())
 
-    def test_bridge_down_exits_2_and_keeps_the_draft_open(self):
+    def test_not_installed_exits_2_and_keeps_the_draft_open(self):
         d = self.draft()
         self.approve(d)
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=False):
-            r = whatsapp.bridge_call({"op": "send", "draft": d["id"]})
-        self.assertEqual(r["error"], "bridge_not_installed")
-        self.assertIn("npm ci --ignore-scripts", r["hint"])
         empty = self.t / "nobin"
         empty.mkdir()
         self.wenv["PATH"] = str(empty)  # no node on PATH: the CLI can't start a bridge, and must not try
+        with mock.patch.object(whatsapp, "NODE_DIRS", ()), mock.patch("glob.glob", return_value=[]):
+            r = whatsapp.bridge_call({"op": "send", "draft": d["id"]})
+        self.assertEqual(r["error"], "bridge_not_installed")
+        self.assertIn("mother whatsapp install", r["hint"])
         r = self.run_cli("send", d["id"])
         self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertEqual(json.loads(r.stdout)["error"], "bridge_not_installed")
+        self.assertIn(json.loads(r.stdout)["error"], ("bridge_not_installed", "bridge_down"))
         self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "open")
+
+    def test_dead_socket_is_bridge_down(self):
+        d = self.draft()
+        self.approve(d)
+        self.sock.parent.mkdir(parents=True)
+        s = _socket.socket(_socket.AF_UNIX)
+        s.bind(str(self.sock))
+        s.close()  # a socket file nobody listens on
+        out = __import__("io").StringIO()
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "_start_bridge"), mock.patch.object(whatsapp, "START_WAIT", 0.4), \
+                mock.patch("sys.stdout", new=out), self.assertRaises(SystemExit) as cm:
+            whatsapp.main(["send", d["id"]], self.cfg, self.ws)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(json.loads(out.getvalue())["error"], "bridge_down")
+        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "open")
+
+    def test_already_sent_marks_the_draft_sent_and_exits_0(self):
+        self.start_bridge(send={"ok": False, "error": "already_sent"})
+        d = self.draft()
+        self.approve(d)
+        r = self.run_cli("send", d["id"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["already_sent"], True)
+        self.assertEqual(whatsapp.load_draft(self.ws, d["id"])["status"], "sent")
+
+    def test_a_failed_mark_still_reports_the_send(self):
+        self.start_bridge()
+        d = self.draft()
+        self.approve(d)
+        with mock.patch.object(whatsapp, "_mark_sent", side_effect=OSError("disk")), \
+                mock.patch("sys.stdout", new=__import__("io").StringIO()) as out:
+            whatsapp.cmd_send(self.cfg, [d["id"]], self.ws)
+        self.assertEqual(json.loads(out.getvalue()), {"ok": True, "stanza": "STANZA1"})
 
     def test_bridge_refusal_exits_2_with_the_code(self):
         self.start_bridge(send={"ok": False, "error": "cap"})
@@ -1286,14 +1326,14 @@ class TestCliSend(Cmd7):
 
 class TestBridgeCall(Cmd7):
     def test_missing_socket_not_installed_and_no_start(self):
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=False), \
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=("bridge_not_installed", "run `mother whatsapp install`")), \
                 mock.patch.object(whatsapp, "_start_bridge") as st:
             r = whatsapp.bridge_call({"op": "status"})
         self.assertEqual(r["error"], "bridge_not_installed")
         st.assert_not_called()
 
     def test_start_false_reports_bridge_down(self):
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=True), \
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
                 mock.patch.object(whatsapp, "_start_bridge") as st:
             r = whatsapp.bridge_call({"op": "status"}, start=False)
         self.assertEqual(r, {"ok": False, "error": "bridge_down"})
@@ -1304,7 +1344,7 @@ class TestBridgeCall(Cmd7):
         s = _socket.socket(_socket.AF_UNIX)
         s.bind(str(self.sock))
         s.close()  # a socket file nobody listens on: connection refused
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=False):
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=("bridge_not_installed", "run `mother whatsapp install`")):
             self.assertEqual(whatsapp.bridge_call({"op": "status"})["error"], "bridge_not_installed")
 
     def test_starts_the_bridge_on_demand_and_waits_for_the_socket(self):
@@ -1314,14 +1354,14 @@ class TestBridgeCall(Cmd7):
             started.append(1)
             threading.Timer(0.5, lambda: self.start_bridge(status={"ok": True, "linked": True})).start()
 
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=True), \
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
                 mock.patch.object(whatsapp, "_start_bridge", side_effect=fake_start):
             r = whatsapp.bridge_call({"op": "status"})
         self.assertEqual(started, [1])
         self.assertEqual(r, {"ok": True, "linked": True})
 
     def test_gives_up_after_the_wait(self):
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=True), \
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
                 mock.patch.object(whatsapp, "_start_bridge"), mock.patch.object(whatsapp, "START_WAIT", 0.5):
             r = whatsapp.bridge_call({"op": "send", "draft": "w3kx"})
         self.assertEqual(r["error"], "bridge_down")
@@ -1332,7 +1372,8 @@ class TestBridgeCall(Cmd7):
             whatsapp._start_bridge()
         argv = popen.call_args[0][0]
         kw = popen.call_args[1]
-        self.assertEqual(argv, ["/usr/bin/node", str(ROOT / "bridge/whatsapp/bridge.mjs")])
+        self.assertEqual(argv, ["/usr/bin/node", str(self.t / "state/whatsapp/app/bridge.mjs")])  # outside the plugin
+        self.assertEqual(kw["env"]["MOTHER_PLUGIN_ROOT"], str(ROOT))
         self.assertEqual(kw["stdin"], subprocess.DEVNULL)
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(kw["stdout"].name, str(self.t / "state/whatsapp/bridge.log"))
@@ -1372,8 +1413,11 @@ class TestCliPrompt(Cmd7):
         self.assertEqual(out["ids"], [d1["id"], d2["id"]])
         self.assertEqual(out["self_chat"], {"ok": True, "stanza": "STANZA1"})
         self.assertEqual(out["slack_dm"]["channel"], "D00000001")
-        text = out["slack_dm"]["text"]
+        stext = out["slack_dm"]["text"]
+        text = b.requests[0]["text"]
         self.assertEqual(b.requests, [{"op": "prompt", "text": text}])
+        self.assertEqual(stext.splitlines()[-1], "Reply with explicit ids: ok %s %s  |  no <id>" % (d1["id"], d2["id"]))
+        self.assertNotIn("ok all", stext)  # Slack takes explicit ids only (I3)
         for d in (d1, d2):
             self.assertIn(d["id"], text)
         self.assertIn('%s WhatsApp -> Dana: "see you at 3"' % d1["id"], text)
@@ -1435,9 +1479,10 @@ class TestCliPrompt(Cmd7):
         self.start_bridge(prompt={"ok": False, "error": "cap"})
         d = self.draft()
         r = self.run_cli("prompt", d["id"])
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.returncode, 2, r.stderr)  # any enabled path failing exits 2; results are in the JSON
         out = json.loads(r.stdout)
         self.assertEqual(out["self_chat"], {"ok": False, "error": "cap"})
+        self.assertEqual(out["slack_dm"]["ok"], True)
         self.assertEqual([x["path"] for x in self.prompts()], ["slack_dm"])
 
     def test_all_paths_failing_exits_2(self):
@@ -1462,7 +1507,9 @@ class TestCliPrompt(Cmd7):
         self.write_cfg()
         self.start_bridge()
         d = self.draft()
-        out = json.loads(self.run_cli("prompt", d["id"]).stdout)
+        r = self.run_cli("prompt", d["id"])
+        self.assertEqual(r.returncode, 2)
+        out = json.loads(r.stdout)
         self.assertEqual(out["slack_dm"], {"ok": False, "error": "no_chat_dm"})
         self.assertEqual([x["path"] for x in self.prompts()], ["self_chat"])
 
@@ -1481,7 +1528,7 @@ class TestCliPrompt(Cmd7):
             self.skipTest("node is not installed")
         drafts = [self.draft("see you at 3"), self.draft("ok w3kx\nok all\nno w3kx"),
                   self.draft("multi\nline text")]
-        text = whatsapp.prompt_text(drafts)
+        text = whatsapp.prompt_text(drafts) + "\n" + whatsapp.prompt_text(drafts, allow_all=False)
         script = ("import {looksLikeReply} from %s; "
                   "process.stdout.write(String(looksLikeReply(process.argv[1])))"
                   % json.dumps((ROOT / "bridge/whatsapp/checks.mjs").as_uri()))
@@ -1493,23 +1540,40 @@ class TestCliPrompt(Cmd7):
 
 
 class TestCliLinkStatus(Cmd7):
-    def test_link_and_unlink_run_the_bridge_in_the_foreground(self):
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=True), \
-                mock.patch.object(whatsapp, "_node", return_value="/usr/bin/node"), \
-                mock.patch("subprocess.call", return_value=0) as call:
-            self.assertEqual(whatsapp.cmd_link("link", []), 0)
-            self.assertEqual(whatsapp.cmd_link("unlink", []), 0)
-        self.assertEqual([c[0][0] for c in call.call_args_list],
-                         [["/usr/bin/node", str(ROOT / "bridge/whatsapp/bridge.mjs"), "--link"],
-                          ["/usr/bin/node", str(ROOT / "bridge/whatsapp/bridge.mjs"), "--unlink"]])
-        for c in call.call_args_list:  # inherits the terminal: no pipes
-            self.assertEqual(c[1], {})
+    APP = "state/whatsapp/app/bridge.mjs"
 
-    def test_link_without_node_modules_says_how_to_install(self):
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=False), \
-                mock.patch("subprocess.call") as call:
-            self.assertEqual(whatsapp.cmd_link("link", []), 2)
+    def link(self, sub, tty=True):
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "_node", return_value="/usr/bin/node"), \
+                mock.patch.object(whatsapp, "stop_bridge") as stop, \
+                mock.patch("sys.stdout.isatty", return_value=tty), \
+                mock.patch("subprocess.call", return_value=0) as call:
+            code = whatsapp.cmd_link(sub, [])
+        return code, call, stop
+
+    def test_link_and_unlink_stop_the_bridge_then_run_the_installed_copy_in_the_foreground(self):
+        for sub in ("link", "unlink"):
+            code, call, stop = self.link(sub)
+            self.assertEqual(code, 0)
+            stop.assert_called_once()
+            self.assertEqual(call.call_args[0][0], ["/usr/bin/node", str(self.t / self.APP), "--" + sub])
+            self.assertEqual(call.call_args[1]["env"]["MOTHER_PLUGIN_ROOT"], str(ROOT))
+            self.assertNotIn("stdout", call.call_args[1])  # inherits the terminal: no pipes
+
+    def test_link_needs_a_terminal(self):
+        code, call, stop = self.link("link", tty=False)
+        self.assertEqual(code, 2)
         call.assert_not_called()
+        stop.assert_not_called()
+
+    def test_link_without_an_install_says_how(self):
+        out = __import__("io").StringIO()
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=("bridge_not_installed", "run `mother whatsapp install`")), \
+                mock.patch("sys.stdout.isatty", return_value=True), mock.patch("sys.stdout", new=out), \
+                mock.patch("subprocess.call") as call:
+            self.assertEqual(whatsapp.cmd_link("unlink", []), 2)
+        call.assert_not_called()
+        self.assertEqual(json.loads(out.getvalue())["error"], "bridge_not_installed")
 
     def test_status_reports_the_bridge_and_a_read_check(self):
         self.start_bridge(status={"ok": True, "linked": True, "me": SELF, "sent_today": 1, "prompts_today": 0})
@@ -1524,13 +1588,185 @@ class TestCliLinkStatus(Cmd7):
         self.db.unlink()
         r = self.run_cli("status")
         out = json.loads(r.stdout)
-        self.assertIn(out["bridge"]["error"], ("bridge_down", "bridge_not_installed"))
-        self.assertEqual(out["read"], {"db_reachable": False})
+        self.assertIn(out["bridge"]["error"], ("bridge_down", "bridge_not_installed", "node_too_old"))
+        self.assertEqual(out["read"], {"db_reachable": False, "reason": "missing"})
+
+    def test_status_says_when_the_database_is_denied(self):
+        out = __import__("io").StringIO()
+        with mock.patch.object(whatsapp, "_query", side_effect=whatsapp.ReaderError("denied")), \
+                mock.patch.object(whatsapp, "bridge_call", return_value={"ok": False, "error": "bridge_down"}), \
+                mock.patch("sys.stdout", new=out):
+            whatsapp.main(["status"], self.cfg, self.ws)
+        read = json.loads(out.getvalue())["read"]
+        self.assertEqual(read["reason"], "denied")
+        self.assertIn("Full Disk Access", read["hint"])
 
     def test_status_never_starts_the_bridge(self):
-        with mock.patch.object(whatsapp, "bridge_installed", return_value=True), \
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
                 mock.patch.object(whatsapp, "_start_bridge") as st, \
                 mock.patch.object(whatsapp, "_query", return_value=[(1,)]), \
                 mock.patch("sys.stdout", new=__import__("io").StringIO()):
             whatsapp.main(["status"], self.cfg, self.ws)
         st.assert_not_called()
+
+
+class TestStopInstall(Cmd7):
+    def test_stop_asks_the_bridge_and_waits_for_the_socket_to_go(self):
+        b = self.start_bridge()
+
+        def stop(req):
+            threading.Timer(0.2, b.stop).start()
+            return {"ok": True}
+
+        b.replies["stop"] = stop
+        self.assertTrue(whatsapp.stop_bridge())
+        self.assertEqual([r["op"] for r in b.requests][0], "stop")
+        self.assertFalse(whatsapp.stop_bridge())  # nothing running
+
+    def test_stop_command(self):
+        r = self.run_cli("stop")
+        self.assertEqual((r.returncode, json.loads(r.stdout)), (0, {"ok": True, "stopped": False}))
+
+    def fake_node(self, major=24):
+        return mock.patch.multiple(whatsapp, _node=mock.Mock(return_value="/opt/homebrew/bin/node"),
+                                   _node_major=mock.Mock(return_value=major))
+
+    def test_install_copies_the_bridge_out_of_the_plugin_and_runs_npm_ci_there(self):
+        calls = []
+        out = __import__("io").StringIO()
+        with self.fake_node(), mock.patch.object(whatsapp, "_run_npm", side_effect=lambda d, n: calls.append((d, n)) or 0), \
+                mock.patch("sys.stdout", new=out):
+            whatsapp.main(["install"], self.cfg, self.ws)
+        app = self.t / "state/whatsapp/app"
+        self.assertEqual(calls, [(app, "/opt/homebrew/bin/node")])
+        names = sorted(p.name for p in app.iterdir())
+        self.assertIn("bridge.mjs", names)
+        self.assertIn("checks.mjs", names)
+        self.assertIn("package-lock.json", names)
+        self.assertFalse([n for n in names if n.endswith(".test.mjs")])
+        self.assertEqual(json.loads(out.getvalue()), {"ok": True, "app": str(app)})
+        self.assertFalse(whatsapp.reinstall_needed())
+
+    def test_install_npm_failure_and_old_node(self):
+        out = __import__("io").StringIO()
+        with self.fake_node(), mock.patch.object(whatsapp, "_run_npm", return_value=1), \
+                mock.patch("sys.stdout", new=out), self.assertRaises(SystemExit) as cm:
+            whatsapp.main(["install"], self.cfg, self.ws)
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(json.loads(out.getvalue())["error"], "npm_failed")
+        out = __import__("io").StringIO()
+        with self.fake_node(major=18), mock.patch.object(whatsapp, "_run_npm") as npm, \
+                mock.patch("sys.stdout", new=out), self.assertRaises(SystemExit):
+            whatsapp.main(["install"], self.cfg, self.ws)
+        npm.assert_not_called()
+        self.assertEqual(json.loads(out.getvalue())["error"], "node_too_old")
+
+    def test_reinstall_needed_when_the_plugins_files_differ(self):
+        with self.fake_node(), mock.patch.object(whatsapp, "_run_npm", return_value=0), \
+                mock.patch("sys.stdout", new=__import__("io").StringIO()):
+            whatsapp.main(["install"], self.cfg, self.ws)
+        app = self.t / "state/whatsapp/app"
+        self.assertFalse(whatsapp.reinstall_needed())
+        (app / "checks.mjs").write_text("// changed\n")
+        self.assertTrue(whatsapp.reinstall_needed())
+        out = __import__("io").StringIO()
+        with mock.patch.object(whatsapp, "bridge_call", return_value={"ok": False, "error": "bridge_down"}), \
+                mock.patch("sys.stdout", new=out):
+            whatsapp.main(["status"], self.cfg, self.ws)
+        self.assertTrue(json.loads(out.getvalue())["reinstall_needed"])
+
+    def test_problem_codes_use_absolute_paths_and_check_the_node_version(self):
+        with mock.patch.object(whatsapp, "_node", return_value=None):
+            code, hint = whatsapp.bridge_problem()
+        self.assertEqual(code, "bridge_not_installed")
+        with self.fake_node(major=18):
+            code, hint = whatsapp.bridge_problem()
+        self.assertEqual(code, "node_too_old")
+        with self.fake_node():
+            code, hint = whatsapp.bridge_problem()
+        self.assertEqual(code, "bridge_not_installed")
+        self.assertIn(str(self.t / "state/whatsapp/app"), hint)
+
+    def test_node_lookup_path_then_homebrew_then_newest_nvm(self):
+        with mock.patch("shutil.which", return_value="/p/node"):
+            self.assertEqual(whatsapp._node(), "/p/node")
+        brew = self.t / "brew"
+        brew.mkdir()
+        (brew / "node").write_text("#!/bin/sh\n")
+        (brew / "node").chmod(0o755)
+        with mock.patch("shutil.which", return_value=None), mock.patch.object(whatsapp, "NODE_DIRS", (str(brew),)):
+            self.assertEqual(whatsapp._node(), str(brew / "node"))
+        nvm = [self.t / ("nvm/v%s/bin/node" % v) for v in ("18.20.0", "20.9.0", "22.1.0", "9.0.0")]
+        for n in nvm:
+            n.parent.mkdir(parents=True)
+            n.write_text("#!/bin/sh\n")
+            n.chmod(0o755)
+        with mock.patch("shutil.which", return_value=None), mock.patch.object(whatsapp, "NODE_DIRS", ()), \
+                mock.patch("glob.glob", return_value=[str(n) for n in nvm]):
+            self.assertEqual(whatsapp._node(), str(nvm[2]))  # newest by version, not by name
+        with mock.patch("shutil.which", return_value=None), mock.patch.object(whatsapp, "NODE_DIRS", ()), \
+                mock.patch("glob.glob", return_value=[]):
+            self.assertIsNone(whatsapp._node())
+
+
+class TestColdStart(Cmd7):
+    def test_a_connecting_bridge_is_waited_for_before_the_request(self):
+        seen = []
+        state = {"n": 0}
+
+        def status(req):
+            state["n"] += 1
+            return {"ok": True, "linked": state["n"] > 3, "connecting": state["n"] <= 3}
+
+        def started():
+            threading.Timer(0.3, lambda: self.start_bridge(status=status,
+                                                           send=lambda r: seen.append(state["n"]) or {"ok": True, "stanza": "S"})).start()
+
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "_start_bridge", side_effect=started):
+            r = whatsapp.bridge_call({"op": "send", "draft": "w3kx"})
+        self.assertEqual(r, {"ok": True, "stanza": "S"})
+        self.assertGreater(seen[0], 3)  # the send came only after status stopped saying connecting
+
+    def test_unlinked_bridge_is_not_waited_for(self):
+        self.start_bridge(status={"ok": True, "linked": False}, send={"ok": False, "error": "unlinked"})
+        # already running: no start, no wait
+        with mock.patch.object(whatsapp, "_start_bridge") as st:
+            self.assertEqual(whatsapp.bridge_call({"op": "send", "draft": "w3kx"})["error"], "unlinked")
+        st.assert_not_called()
+
+    def test_two_callers_start_one_bridge(self):
+        started = []
+
+        def fake_start():
+            started.append(1)
+            time.sleep(0.3)
+            self.start_bridge()
+
+        results = []
+        with mock.patch.object(whatsapp, "bridge_problem", return_value=None), \
+                mock.patch.object(whatsapp, "_start_bridge", side_effect=fake_start):
+            ts = [threading.Thread(target=lambda: results.append(whatsapp.bridge_call({"op": "status"})))
+                  for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r.get("ok") for r in results), results)
+        mode = (self.t / "state/whatsapp/start.lock").stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_log_is_bounded(self):
+        d = self.t / "state/whatsapp"
+        d.mkdir(parents=True)
+        (d / "bridge.log").write_bytes(b"x" * (1024 * 1024 + 1))
+        with mock.patch.object(whatsapp, "_node", return_value="/usr/bin/node"), mock.patch("subprocess.Popen"):
+            whatsapp._start_bridge()
+        self.assertTrue((d / "bridge.log.1").exists())
+        self.assertEqual((d / "bridge.log").stat().st_size, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
