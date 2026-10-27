@@ -200,15 +200,18 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `guard.log` names the recipient as given (a number or JID is logged as `a number`), never the text, never
   the command.
   - **A send.** A Bash command that is exactly one `mother whatsapp send …` command — the plugin's own CLI
-    (`"${CLAUDE_PLUGIN_ROOT}/bin/mother"` or any path whose realpath is the plugin's `bin/mother`, or a bare
-    `mother` that `PATH` resolves to it, optionally after `python3`; any other executable named `mother` is
-    `unknown`, deny), then literal `whatsapp send`, then `--to WHO` and `--text TEXT` (`--opt=value` too), and
+    (a path, or a bare `mother` found on `PATH`, optionally after `python3`, whose realpath is `<root>/bin/mother`
+    where `<root>/.claude-plugin/plugin.json` names this plugin and `<root>/lib/whatsapp.py` exists: the versioned
+    cache copy, the marketplace clone `mother link` points at, or a `--plugin-dir` checkout; any other executable
+    named `mother` is `unknown`, deny), then literal `whatsapp send`, then `--to WHO` and `--text TEXT` (`--opt=value` too), and
     nothing else on the line except a `2>&1`-style redirection (no `;`, `&&`, `|`, `&`, other redirection,
     heredoc, env prefix or comment). Every word must be literal text: quotes, `$'…'` and backslashes are fine,
     a `$VAR`, `$( )` or backtick in any word but the CLI path is not (deny: "write the text literally, in
     single quotes"). A recipient or text holding a NUL, any other C0 or C1 control character except `\n` and
-    `\t`, or a Unicode bidi control (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069) is denied, so the prompt
-    shows exactly what is sent. A text shaped like a credential is on the never-list. Then: PAUSED denies; an
+    `\t`, a Unicode bidi or invisible formatting character (U+061C, U+200B, U+200C, U+200E, U+200F,
+    U+2028, U+2029, U+202A–U+202E, U+2060, U+2066–U+2069, U+FEFF; U+200D stays, emoji use it) is denied, so the
+    prompt shows exactly what is sent. So is a form the shell would rewrite: an unquoted `~`, glob (`*`, `?`, `[`)
+    or brace list, and a `$'…'` escape for a raw byte (`\x80`–`\xff`, octal 200–377) or `\c`. A text shaped like a credential is on the never-list. Then: PAUSED denies; an
     invalid `config.json` denies; `whatsapp.enabled` or `whatsapp.send` false denies ("sending is off"); the
     category in `policy.never` denies. `--to me`, `--to <self_jid>` or the manager's own number (only while
     `self_jid` is set) is `own_dm`: **allow** while `own_dm` is in the auto list, else ask. Any other recipient
@@ -220,7 +223,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     (a symlink there denies); the file is written to a temp name with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600,
     then renamed over any old ticket of that name. If it can't be written the send is denied with a plain
     reason. The bridge needs a fresh ticket for every send (§5d), so a send that never got a guard decision
-    is refused. A ticket left by a prompt the manager declined expires after 120 s. In `bypassPermissions`
+    is refused. A ticket left by a prompt the manager declined expires after 600 s (10 minutes, counted from the prompt, so a slow yes still sends). In `bypassPermissions`
     the ask passes like any other (logged `pass`), the ticket still written: the same caveat as chat, stated
     in `rules/outbound.md`.
   - **Everything else is read as shell.** Simple commands split on `;`, `&&`, `||`, `|`, `&`, newlines and
@@ -413,8 +416,8 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   `ticket_expired`, `off`, `paused`, `no_workspace`, `cap`, `gap`, `unlinked`, `wrong_account`,
   `self_mismatch`, `send_failed`, `internal`. Messages go out one at a time. A send needs, in order: a well
   formed request; the workspace's `config.json` (else `no_workspace`); **a ticket** at `<state>/whatsapp/tickets/<sha256(to NUL text)>` that is a regular file (not
-  a symlink) whose `at` is less than 120 s old, deleted before anything else happens, so it is used once (a
-  missing one is `no_ticket`, an old one `ticket_expired`; every send also deletes tickets older than 120 s);
+  a symlink) whose `at` is less than 600 s old, deleted before anything else happens, so it is used once (a
+  missing one is `no_ticket`, an old one `ticket_expired`; every send also deletes tickets older than 600 s);
   the recipient check above; sending on and no
   `PAUSED` (it reads the workspace's `config.json`, resolved like `bin/mother`); a readable `sent.jsonl` with
   fewer than `max_per_day` (default 20, ceiling 50) sends on today's UTC date of `at`; at least
@@ -469,7 +472,7 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   stopped; nothing more was changed").
 - **Machine-local state.** `<state>/whatsapp/`: `session/` (device keys, 0700/0600), `bridge.sock`,
   `bridge.log`, `sent.jsonl` (time, chat JID, text hash, message id), `app/` (the installed bridge),
-  `tickets/` (the guard's one-use send tickets, 120 s), `start.lock`. Nothing WhatsApp lives in the workspace. `.mother/PAUSED` stops every send.
+  `tickets/` (the guard's one-use send tickets, 600 s), `start.lock`. Nothing WhatsApp lives in the workspace. `.mother/PAUSED` stops every send.
 - **What the guard stops, and what it doesn't.** The guard asks before every send to someone else and keeps
   the agent off the bridge socket, its state and the setup commands. It stops mistakes and injected
   instructions. It does not stop a deliberately evasive agent running as the manager on the same macOS
@@ -477,7 +480,7 @@ refuses to run anywhere but `workspace.home_machine` (exit 2; exit 3 if no home 
   does), build a command from variables set outside the Bash call, or read what the account can read,
   including the session keys, and act outside MOTHER altogether. The guard's reading of a command line is
   lexical: it does not read script files or what a Write puts in one. The send ticket is the second lock:
-  the bridge sends only what the guard just decided on, once, within 120 s, so a script or inline code that
+  the bridge sends only what the guard just decided on, once, within 600 s, so a script or inline code that
   reaches the socket or calls `lib/whatsapp.py` without a guard decision is refused. An agent that forges a
   ticket with its own code (the guard denies it the folder, but not a script it writes and runs) is out of
   scope, by the manager's threat model: the locks are for mistakes and injected instructions. The bridge

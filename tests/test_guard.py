@@ -874,6 +874,41 @@ class TestWhatsapp(WhatsappCase):
                   env={"PATH": fake + os.pathsep + os.environ.get("PATH", "")})  # another `mother` first on PATH
         self.assertEqual(self.tickets(), [])
 
+    def plugin_copy(self, root, name="mother"):
+        """A minimal copy of the plugin: the hook, the CLI, the whatsapp module and a plugin.json naming it."""
+        for rel in ("hooks/guard.py", "bin/mother", "lib/whatsapp.py"):
+            os.makedirs(os.path.join(root, os.path.dirname(rel)), exist_ok=True)
+            shutil.copy2(os.path.join(ROOT, rel), os.path.join(root, rel))
+        os.makedirs(os.path.join(root, ".claude-plugin"), exist_ok=True)
+        with open(os.path.join(root, ".claude-plugin", "plugin.json"), "w") as f:
+            json.dump({"name": name, "version": "0.0.0"}, f)
+        return root
+
+    def test_the_cache_hook_accepts_the_marketplace_cli_mother_link_points_at(self):
+        plugins = os.path.join(self.home, ".claude", "plugins")
+        cache = self.plugin_copy(os.path.join(plugins, "cache", "mother", "mother", "0.8.0"))
+        market = self.plugin_copy(os.path.join(plugins, "marketplaces", "mother"))
+        other = self.plugin_copy(os.path.join(self.tmp, "other"), name="not-mother")
+        local = os.path.join(self.home, ".local", "bin")
+        os.makedirs(local)
+        os.symlink(os.path.join(market, "bin", "mother"), os.path.join(local, "mother"))
+
+        def run(cmd, path_dir):
+            env = dict(os.environ, HOME=self.home, MOTHER_WORKSPACE=self.ws, MOTHER_STATE_DIR=self.sdir,
+                       PATH=path_dir + os.pathsep + os.environ.get("PATH", ""))
+            payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": self.tmp}
+            p = subprocess.run([sys.executable, os.path.join(cache, "hooks", "guard.py")], input=json.dumps(payload),
+                               capture_output=True, text=True, env=env)
+            o = json.loads(p.stdout)["hookSpecificOutput"] if p.stdout.strip() else {"permissionDecision": "none"}
+            return o["permissionDecision"]
+
+        self.assertEqual(run("mother whatsapp send --to Sam --text hi", local), "ask")
+        self.assertEqual(run("mother whatsapp send --to me --text hi", local), "allow")
+        self.assertEqual(run("python3 %s/bin/mother whatsapp send --to Sam --text hi" % cache, local), "ask")
+        self.assertEqual(run("%s/bin/mother whatsapp send --to Sam --text hi" % other, local), "deny")
+        os.remove(os.path.join(market, "lib", "whatsapp.py"))
+        self.assertEqual(run("mother whatsapp send --to Sam --text hi", local), "deny")
+
     def test_the_whole_text_is_shown_as_json_quotes_and_lines_included(self):
         why = self.send("ask", "mother whatsapp send --to 'Dana Roe' --text \"it's 3\nsee you\"")
         self.assertIn('WhatsApp to "Dana Roe": "it\'s 3\\nsee you"', why)
@@ -968,9 +1003,27 @@ class TestWhatsapp(WhatsappCase):
                   "$'a\\u0085b'", "$'abc\\u202edcba'", "$'x\\u2066y'", "$'x\\u200fy'"):
             why = self.send("deny", "mother whatsapp send --to Sam --text %s" % t)
             self.assertIn("control or text-direction", why, t)
+        for t in ("$'a\\u061cb'", "$'a\\u2028b'", "$'a\\u2029b'", "$'a\\u200bb'", "$'a\\u200cb'",
+                  "$'a\\u2060b'", "$'\\ufeffa'"):
+            self.send("deny", "mother whatsapp send --to Sam --text %s" % t)
         self.send("deny", "mother whatsapp send --to $'Sam\\u202e' --text hi")
+        self.send("deny", "mother whatsapp send --to $'Sam\\u200b' --text hi")
         self.send("ask", "mother whatsapp send --to Sam --text $'tab\\there\\nnew line, caf\\u00e9'")
-        self.assertEqual(len(self.tickets()), 1)
+        self.send("ask", "mother whatsapp send --to Sam --text $'family \\U0001F468\\u200d\\U0001F469'")  # emoji ZWJ
+        self.assertEqual(len(self.tickets()), 2)
+
+    def test_forms_the_shell_would_rewrite_are_denied(self):
+        for cmd in ("mother whatsapp send --to Sam --text ~", "mother whatsapp send --to ~ --text hi",
+                    "mother whatsapp send --to Sam --text ~/notes", "mother whatsapp send --to Sam --text {a,b}",
+                    "mother whatsapp send --to Sam --text hi*", "mother whatsapp send --to Sam --text 'a b'?",
+                    "mother whatsapp send --to Sam --text [x]", "mother whatsapp send --to Sam --text $'\\xc3\\xa9'",
+                    "mother whatsapp send --to Sam --text $'\\xff'", "mother whatsapp send --to Sam --text $'\\303\\251'",
+                    "mother whatsapp send --to Sam --text $'a\\c@b'"):
+            why = self.send("deny", cmd)
+            self.assertTrue("quote" in why or "character itself" in why, why)
+        for cmd in ("mother whatsapp send --to Sam --text '~ {a,b} hi* [x]'", 'mother whatsapp send --to Sam --text "~"',
+                    "mother whatsapp send --to Sam --text $'caf\\u00e9 \\x41\\101'", "mother whatsapp send --to Sam --text a~b"):
+            self.send("ask", cmd)
 
     def test_malformed_sends_are_denied(self):
         for cmd in ("mother whatsapp send", "mother whatsapp send --to Sam",

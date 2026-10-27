@@ -251,13 +251,14 @@ def resolve_chat(cfg: dict, who: str) -> dict:
         if not c:
             raise ChatError("there is no WhatsApp chat with %s on this Mac" % who)
         return dict(c, self=(jid == me))
-    rows = _query("SELECT %s FROM ZWACHATSESSION WHERE %s AND ZPARTNERNAME LIKE ? ESCAPE '\\' "
-                  "ORDER BY ZLASTMESSAGEDATE DESC LIMIT 200" % (CHAT_COLS, NOT_BROADCAST),
-                  ["%" + re.sub(r"([%_\\])", r"\\\1", who) + "%"])
+    # Every named chat, compared in Python: casefold handles any script, and no row cap can hide an exact name.
+    rows = _query("SELECT %s FROM ZWACHATSESSION WHERE %s AND ZPARTNERNAME IS NOT NULL" % (CHAT_COLS, NOT_BROADCAST))
     found = _sort_chats([_chat(r) for r in rows])
-    exact = [c for c in found if c["name"].strip().casefold() == who.casefold()]
+    key = who.casefold()
+    exact = [c for c in found if c["name"].strip().casefold() == key]
     if not exact:
-        hint = (":\n%s\nName one exactly, or give its number or JID" % _listing(found[:5])) if found else \
+        near = [c for c in found if key in c["name"].casefold()][:5]
+        hint = (":\n%s\nName one exactly, or give its number or JID" % _listing(near)) if near else \
             "; `mother whatsapp chats --query` lists chats"
         raise ChatError("no WhatsApp chat is named %r%s" % (who, hint))
     if len(exact) > 1:

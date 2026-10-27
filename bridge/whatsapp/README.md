@@ -63,7 +63,7 @@ A Unix socket, mode 0600, no TCP. One JSON request per connection, one JSON repl
 Before every `send` the bridge checks, in order: `jid` is a user (`<digits>@s.whatsapp.net`) or group
 (`<digits>@g.us`) JID, `to` is a string, `text` isn't blank and the signed text is at most 4096 characters (else
 `bad_request`); the workspace config is readable (`no_workspace`); **the guard's ticket**
-`<state>/whatsapp/tickets/<sha256(to NUL text)>` exists as a regular file and is under 120 s old, and it is
+`<state>/whatsapp/tickets/<sha256(to NUL text)>` exists as a regular file and is under 600 s (10 minutes) old, and it is
 deleted right then, so it is used once (`no_ticket`, `ticket_expired`; older tickets are swept too); `to`
 names `jid` when it is `me`, a number or a JID (`wrong_recipient`); sending is on and the workspace isn't
 PAUSED; `sent.jsonl` is readable and today's sends are under `max_per_day`; the jittered `min_gap_seconds`

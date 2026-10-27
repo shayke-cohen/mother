@@ -22,7 +22,7 @@ import {
 const MAX_REQUEST = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_GAP_WAIT_MS = 30_000;  // a request waits out at most this much of min_gap_seconds, then refuses `gap`
-export const TICKET_MAX_AGE_MS = 120_000;  // a guard ticket is good for one send within this long
+export const TICKET_MAX_AGE_MS = 600_000;  // a guard ticket is good for one send within 10 minutes of the prompt
 
 /** The guard's ticket name for a send: sha256 of the recipient as typed, a NUL, and the text (CONTRACT §5d). */
 export const ticketName = (to, text) => sha256(to + "\0" + text);

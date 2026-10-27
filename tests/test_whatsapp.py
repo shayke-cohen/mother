@@ -229,6 +229,27 @@ class TestResolve(Base):
             whatsapp.resolve_chat(cfg, "me")
 
 
+class TestExactName(Base):
+    def test_an_exact_name_resolves_however_many_chats_contain_it_and_in_any_script(self):
+        self.build()
+        db = sqlite3.connect(str(self.db))
+        for pk in range(100, 400):  # 300 newer chats whose names contain "Dan"
+            db.execute("INSERT INTO ZWACHATSESSION VALUES (?, ?, ?, 0, NULL, ?)",
+                       (pk, "9725%08d@s.whatsapp.net" % pk, "Dan %d" % pk, core("2026-10-27T00:00:00Z")))
+        db.execute("INSERT INTO ZWACHATSESSION VALUES (500, '972500000500@s.whatsapp.net', 'Dan', 0, NULL, 1)")
+        db.execute("INSERT INTO ZWACHATSESSION VALUES (501, '972500000501@s.whatsapp.net', 'Éva', 0, NULL, 1)")
+        db.execute("INSERT INTO ZWACHATSESSION VALUES (502, '972500000502@s.whatsapp.net', 'דנה', 0, NULL, 1)")
+        db.commit()
+        db.close()
+        cfg = make_cfg()
+        self.assertEqual(whatsapp.resolve_chat(cfg, "dan")["jid"], "972500000500@s.whatsapp.net")
+        self.assertEqual(whatsapp.resolve_chat(cfg, "éva")["jid"], "972500000501@s.whatsapp.net")
+        self.assertEqual(whatsapp.resolve_chat(cfg, " דנה ")["jid"], "972500000502@s.whatsapp.net")
+        with self.assertRaises(whatsapp.ChatError) as cm:
+            whatsapp.resolve_chat(cfg, "Da")
+        self.assertLessEqual(str(cm.exception).count("@s.whatsapp.net"), 5)
+
+
 class TestReader(Base):
     def test_one_chat_by_name_oldest_first(self):
         self.build()

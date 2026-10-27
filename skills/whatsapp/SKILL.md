@@ -64,7 +64,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" whatsapp send --to "Dana Roe" --text 
 - It sends only to a chat that already has messages with the manager. A new contact, a chat WhatsApp shows
   without a number, or a name that isn't exact exits 2 with a plain sentence: tell the manager; don't look for
   another way.
-- The guard's decision leaves a one-use ticket that the bridge needs within 2 minutes, so nothing else can
+- The guard's decision leaves a one-use ticket that the bridge needs within 10 minutes of the prompt, so nothing else can
   send: `no_ticket` or `ticket_expired` means run the same `send` command again (it will ask again).
 - **If a send is refused, denied or fails, never retry it by another path** (a script, the bridge socket,
   another tool). Report what it said. `cap` means today's limit (`whatsapp.max_per_day`) is reached; `gap`

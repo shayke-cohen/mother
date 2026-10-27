@@ -445,8 +445,14 @@ WA_STATE_RE = re.compile(r"bridge\.sock|\.mother/whatsapp\b|whatsapp/(?:session|
 WA_STATE_FILES = ("sent.jsonl", "bridge.sock", "session", "app")
 WA_SEND_OPTS = ("--to", "--text")
 # A recipient or text with these can't be shown as it is sent: NUL cuts an argv string, the rest hide or reorder.
-WA_UNSHOWABLE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]")
-WA_TICKET_MAX_AGE = 120  # seconds; the bridge refuses an older ticket (CONTRACT §5d)
+# U+200D (zero-width joiner) stays allowed: emoji sequences use it.
+WA_UNSHOWABLE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b\u200c\u200e\u200f\u2028\u2029"
+                              "\u202a-\u202e\u2060\u2066-\u2069\ufeff\ud800-\udfff]")
+# Shell forms the guard would read differently from the shell: unquoted ~, globs and brace lists; $'…' escapes
+# that make raw bytes (\x80-\xff, octal 200-377) or cut the string (\c).
+WA_UNQUOTED_RISK_RE = re.compile(r"[*?\[]|\{[^{}]*(?:,|\.\.)[^{}]*\}")
+WA_ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
+WA_ANSI_C_RISK_RE = re.compile(r"\\(?:x[89a-fA-F][0-9a-fA-F]?|[23][0-7]{2}|c)")
 WA_SEND_HEAD_RE = re.compile(r"%s[ \t]+whatsapp[ \t]+send(?:[ \t]|\Z)" % _WA_BIN)
 
 
@@ -1470,6 +1476,13 @@ def wa_send_parse(cmd, cwd=None):
     if not wa_is_plugin_cli(exe, cwd):
         return {"error": "%s is not this plugin's mother CLI" % exe}
     opts, rest = {}, words[k + 3:]
+    for w in rest:
+        for n, p in enumerate(w):
+            if p[0] == "t" and p[2] is False and ((n == 0 and p[1].startswith("~")) or WA_UNQUOTED_RISK_RE.search(p[1])):
+                return {"error": "an unquoted ~, glob or {a,b} the shell would expand; put the text in quotes"}
+    if any(WA_ANSI_C_RISK_RE.search(m.group(1)) for m in WA_ANSI_C_RE.finditer(line)):
+        return {"error": "a $'…' escape for a raw byte or \\c, which the shell turns into something else; write "
+                         "the character itself, in quotes"}
     i = 0
     while i < len(rest):
         name = _wa_literal(rest[i])
@@ -1500,14 +1513,28 @@ def wa_send_parse(cmd, cwd=None):
     return {"to": opts["--to"], "text": opts["--text"]}
 
 
+def _plugin_name(root):
+    """The `name` in <root>/.claude-plugin/plugin.json, or None."""
+    data, ok = read_json(os.path.join(root, ".claude-plugin", "plugin.json"))
+    return data.get("name") if ok and isinstance(data, dict) and isinstance(data.get("name"), str) else None
+
+
 def wa_is_plugin_cli(exe, cwd):
-    """The executable is this plugin's bin/mother: by path (realpath), or a bare `mother` on PATH that is it."""
+    """The executable is a copy of this plugin's CLI: its realpath is <root>/bin/mother in a folder whose
+    plugin.json names this plugin and which holds lib/whatsapp.py. That covers the versioned cache copy, the
+    marketplace clone `mother link` points at, and a --plugin-dir checkout. A bare `mother` is looked up on PATH."""
     import shutil
-    mine = os.path.realpath(os.path.join(os.path.dirname(HERE), "bin", "mother"))
     if "/" not in exe:
-        found = shutil.which(exe)
-        return bool(found) and os.path.realpath(found) == mine
-    return os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(exe))) == mine
+        exe = shutil.which(exe) or ""
+        if not exe:
+            return False
+    real = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(exe)))
+    if os.path.basename(real) != "mother" or os.path.basename(os.path.dirname(real)) != "bin" \
+            or not os.path.isfile(real):
+        return False
+    root = os.path.dirname(os.path.dirname(real))
+    mine = _plugin_name(os.path.dirname(HERE))
+    return bool(mine) and _plugin_name(root) == mine and os.path.isfile(os.path.join(root, "lib", "whatsapp.py"))
 
 
 def wa_is_self(to, cfg):

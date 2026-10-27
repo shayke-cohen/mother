@@ -167,7 +167,7 @@ every send to someone else needs the manager's yes in the permission prompt.
   `mother` that isn't this plugin's CLI, or a command name built from a variable, is denied. Name the chat
   exactly (or by number or JID): a partial name is refused.
 - **One guard decision, one send.** When the guard asks (or allows `--to me`) it leaves a one-use ticket for
-  exactly that recipient and text; the bridge refuses a send without a fresh one (2 minutes). A send that
+  exactly that recipient and text; the bridge refuses a send without a fresh one (10 minutes from the prompt; a yes given later expires, and the send is asked again). A send that
   went around the guard, from a script or inline code, gets `no_ticket`.
 - **Only chats with history.** The CLI refuses a chat with no message between the manager and that person
   (no cold contact), a chat WhatsApp shows without a number, and a name that matches more than one chat. The
