@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { Hook, Register, Timer } from 'claude-code'
 
 import type { NowDoc } from '../types'
 
@@ -11,6 +11,9 @@ export const workspaceAtom = atom({ plugin: 'mother-now', key: 'workspace' } as 
 export const POLL_MS = 60_000
 export const TOASTED_CAP = 500
 const DEFAULT_BIN = '~/.claude/plugins/marketplaces/mother/bin/mother'
+
+// The engine interface a hook receives; the helpers below take it so Task 9 can pass its own `$`.
+export type Dollar = Parameters<Hook<'session.start'>>[0]
 
 // What `load` remembers between polls: the mtime it last read, so an unchanged file is not re-read.
 export type Loader = { mtimeMs: number | null }
@@ -26,13 +29,13 @@ export function statusText(doc: NowDoc | null, nowMs: number): string {
   return text
 }
 
-async function motherBin($: any, configured: string): Promise<string> {
+async function motherBin($: Dollar, configured: string): Promise<string> {
   if (configured !== '~' && !configured.startsWith('~/')) return configured
   const home = (await $.env.get('HOME')) ?? ''
   return home + configured.slice(1)
 }
 
-async function workspace($: any, bin: string): Promise<string | null> {
+async function workspace($: Dollar, bin: string): Promise<string | null> {
   const known = await read($, workspaceAtom)
   if (known) return known
   try {
@@ -47,7 +50,7 @@ async function workspace($: any, bin: string): Promise<string | null> {
   }
 }
 
-async function toastNew($: any, doc: NowDoc): Promise<void> {
+async function toastNew($: Dollar, doc: NowDoc): Promise<void> {
   if (doc.quiet) return
   const seen: string[] = ((await $.store.get('toasted')) as string[] | undefined) ?? []
   const fresh = (doc.items ?? []).filter(i => i.section === 'on_you' && i.state === 'new' && !seen.includes(i.id))
@@ -58,7 +61,7 @@ async function toastNew($: any, doc: NowDoc): Promise<void> {
 
 // One pass: resolve the workspace, re-read now.json when its mtime moved, toast what is new, draw the
 // status line. A file that fails to parse (or has another version) sets `error` and keeps the old doc.
-export async function load($: any, bin: string, loader: Loader): Promise<void> {
+export async function load($: Dollar, bin: string, loader: Loader): Promise<void> {
   const ws = await workspace($, bin)
   if (!ws) {
     await update($, docAtom, () => null)
@@ -68,38 +71,53 @@ export async function load($: any, bin: string, loader: Loader): Promise<void> {
   $.ui.status(statusText(await read($, docAtom), await $.clock.now()))
 }
 
-async function readDoc($: any, path: string, loader: Loader): Promise<void> {
+// Only a missing file means "no tick here"; any other failure keeps the previous doc and sets `error`.
+const isMissing = (err: unknown): boolean => {
+  const e = err as { code?: unknown; message?: unknown }
+  return e?.code === 'ENOENT' || /ENOENT|no such file|not found/i.test(String(e?.message ?? err))
+}
+
+async function readDoc($: Dollar, path: string, loader: Loader): Promise<void> {
   let mtimeMs: number
   try {
     mtimeMs = (await $.fs.stat(path)).mtimeMs
-  } catch {
-    loader.mtimeMs = null
-    await update($, docAtom, () => null)
-    await update($, errorAtom, () => null)
+  } catch (err) {
+    if (isMissing(err)) {
+      loader.mtimeMs = null
+      await update($, docAtom, () => null)
+      await update($, errorAtom, () => null)
+    } else {
+      await update($, errorAtom, () => `now.json unreadable: ${(err as Error).message ?? String(err)}`)
+    }
     return
   }
   if (mtimeMs === loader.mtimeMs) return
   loader.mtimeMs = mtimeMs
+  let parsed: NowDoc
   try {
-    const parsed = JSON.parse(await $.fs.read(path))
-    if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) throw new Error('unsupported version')
-    await update($, docAtom, () => parsed as NowDoc)
-    await update($, errorAtom, () => null)
-    await toastNew($, parsed as NowDoc)
+    const raw = JSON.parse(await $.fs.read(path))
+    if (!raw || typeof raw !== 'object' || raw.version !== 1) throw new Error('unsupported version')
+    parsed = raw as NowDoc
   } catch (err) {
     await update($, errorAtom, () => `now.json unreadable: ${(err as Error).message}`)
+    return
   }
+  await update($, docAtom, () => parsed)
+  await update($, errorAtom, () => null)
+  await toastNew($, parsed).catch(() => undefined)   // a toast or store failure never un-reads a good doc
 }
 
 export const register: Register = (on, options) => {
   const configured = String(options.mother_bin ?? DEFAULT_BIN)
   const loader = newLoader()
+  let timer: Timer | undefined
 
   on('session.start', async ($, e, next) => {
     const bin = await motherBin($, configured)
     const poll = () => load($, bin, loader).catch(() => undefined)
     await poll()
-    $.clock.every(POLL_MS, poll)
+    timer?.cancel()          // a repeated session.start must not stack a second poll
+    timer = $.clock.every(POLL_MS, poll)
     return next(e)
   })
 }

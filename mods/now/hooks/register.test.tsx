@@ -36,11 +36,12 @@ function doc(over: Record<string, unknown> = {}) {
 
 for (const surface of ['terminal', 'desktop'] as const) {
   // The files the fake host holds: path -> { text, mtimeMs }.
-  async function boot($: any, on: any, files: Record<string, { text: string; mtimeMs: number }>, pathFails = false) {
+  async function boot($: any, on: any, files: Record<string, { text: string; mtimeMs: number }>, pathFails = false, held: Record<string, unknown> = {}, statErr = 'ENOENT') {
     const clock = mock.clock(on, { now: NOW })
-    mock.store(on)
+    on('store.get', (_: any, e: any) => ({ value: held[e.key] }))
+    on('store.set', (_: any, e: any) => { held[e.key] = e.value; return { value: undefined } })
     mock.env(on, { HOME: '/home/m' })
-    const out = { errors: [] as unknown[], status: [] as (string | undefined)[], toasts: [] as string[], argv: [] as string[][] }
+    const out = { stats: 0, reads: 0, errors: [] as unknown[], status: [] as (string | undefined)[], toasts: [] as string[], argv: [] as string[][] }
     on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
     on('ui.status', (_: any, e: any) => { out.status.push(e.text); return { value: undefined } })
     on('ui.toast', (_: any, e: any) => { out.toasts.push(e.text); return { value: undefined } })
@@ -51,11 +52,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
       return { value: { exitCode: 0, stdout: WS + '\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     on('fs.stat', (_: any, e: any) => {
+      out.stats++
       const f = files[e.path]
-      if (!f) return { deny: 'ENOENT' }
+      if (!f) return { deny: statErr }
       return { value: { kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs } }
     })
     on('fs.read', (_: any, e: any) => {
+      out.reads++
       const f = files[e.path]
       if (!f) return { deny: 'ENOENT' }
       return { value: f.text }
@@ -124,5 +127,58 @@ for (const surface of ['terminal', 'desktop'] as const) {
     files[PATH] = { text: JSON.stringify(doc({ version: 2 })), mtimeMs: 3 }
     await clock.advance(60_000)
     expect(last(out)).toBe(before)
+    expect(String(out.errors[out.errors.length - 1])).toContain('unsupported version')
+  })
+
+  test(`a corrupt file recovers once it is fixed, on ${surface}`, async ($, on) => {
+    const files = { [PATH]: { text: '{not json', mtimeMs: 1 } }
+    const { clock, out } = await boot($, on, files)
+    expect(last(out)).toBe('◆ no tick here')
+    expect(String(out.errors[out.errors.length - 1])).toContain('now.json')
+    files[PATH] = { text: JSON.stringify(doc()), mtimeMs: 2 }
+    await clock.advance(60_000)
+    expect(last(out)).toBe('◆ 3 on you · 2 neglected · tracker ✗')
+    expect(out.errors[out.errors.length - 1]).toBe(null)
+  })
+
+  test(`an unchanged mtime is not re-read, on ${surface}`, async ($, on) => {
+    const files = { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }
+    const { clock, out } = await boot($, on, files)
+    expect(out.reads).toBe(1)
+    await clock.advance(60_000)
+    await clock.advance(60_000)
+    expect(out.reads).toBe(1)
+    expect(out.stats).toBe(3)
+  })
+
+  test(`two session.starts give one poll per tick, on ${surface}`, async ($, on) => {
+    const files = { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }
+    const { clock, out } = await boot($, on, files)
+    await $.session.start({ cwd: '/', surface, isInteractive: true })
+    await clock.settle()
+    const before = out.stats
+    await clock.advance(60_000)
+    expect(out.stats - before).toBe(1)
+  })
+
+  test(`EACCES on stat keeps the previous doc and sets error, on ${surface}`, async ($, on) => {
+    const files: Record<string, { text: string; mtimeMs: number }> = { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }
+    const { clock, out } = await boot($, on, files, false, {}, 'EACCES: permission denied')
+    const before = last(out)
+    delete files[PATH]
+    await clock.advance(60_000)
+    expect(last(out)).toBe(before)
+    expect(String(out.errors[out.errors.length - 1])).toContain('EACCES')
+  })
+
+  test(`the toasted list keeps the last 500 ids, on ${surface}`, async ($, on) => {
+    const old = Array.from({ length: 499 }, (_, i) => 'old' + i)
+    const d = doc({ items: ['x1', 'x2', 'x3'].map(id => item(id, 'on_you', 'new')) })
+    const held: Record<string, unknown> = { toasted: old }
+    await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, held)
+    const stored = held.toasted as string[]
+    expect(stored.length).toBe(500)
+    expect(stored.slice(-3)).toEqual(['x1', 'x2', 'x3'])
+    expect(stored[0]).toBe('old2')
   })
 }
