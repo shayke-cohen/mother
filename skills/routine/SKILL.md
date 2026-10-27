@@ -37,7 +37,7 @@ there is nowhere to log: print the error and stop.
 |---|---|
 | `${CLAUDE_PLUGIN_ROOT}/bin/mother home check` exits 0 | `failed — not home machine (<host>)`, stop. If the home machine is unset: `failed — home machine not set; run mother home set`, stop |
 | `.mother/PAUSED` does not exist | `failed — paused`, stop |
-| Remote set, and the routine isn't `sync: false`: `git pull --rebase -q` | Continue on the local copy; note `pull failed` |
+| Remote set, and the routine isn't `sync: false`: `git pull --rebase --autostash -q` | Continue on the local copy; note `pull failed` |
 | `mother status` validates `config.json` | `failed — config invalid: <first error>`, stop |
 | `config.json` has `routines.<id>` | `failed — routine not configured (disabled?)`, stop |
 | Today is in `routines.<id>.days` in `manager.timezone` (`workdays` = `manager.workdays`, `all`) | `ok — not a scheduled day`, stop |

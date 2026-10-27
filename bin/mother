@@ -672,7 +672,7 @@ def _interval_cron(every: int, active: str, days, workdays, offset: int = 0) -> 
 
 def _pointer(ws: Path, rid: str, team: str = None, pull: bool = True) -> str:
     who = f" for team {team}" if team else ""
-    lead = (f'cd "{ws}" and run `git pull --rebase -q` if the workspace has a remote (on failure, continue with the '
+    lead = (f'cd "{ws}" and run `git pull --rebase --autostash -q` if the workspace has a remote (on failure, continue with the '
             f"local copy and say so). Then invoke" if pull else f'cd "{ws}". Invoke')
     return (f"{lead} the mother:routine skill with routine id `{rid}`{who}. "
             "All behaviour lives in the mother plugin's routines/ files and the workspace config; this pointer "

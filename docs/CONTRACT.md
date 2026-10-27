@@ -49,7 +49,7 @@ runs.md                    one line per routine run: `- <ISO> <routine> <ok|part
 - `~/.mother/workspace` — one line: absolute path of the active workspace. Written by `mother init` / `join`.
   The hook, the CLI and every skill resolve the workspace from `$MOTHER_WORKSPACE`, else this file.
 - Skills reference plugin files via `${CLAUDE_PLUGIN_ROOT}`; routines never hard-code a path.
-- A registered scheduled task's prompt is a **thin pointer**: `cd "<workspace>"`, `git pull --rebase -q` when there
+- A registered scheduled task's prompt is a **thin pointer**: `cd "<workspace>"`, `git pull --rebase --autostash -q` when there
   is a remote (on failure continue with the local copy and say so), then run the mother:routine skill with id
   `<id>`. Behaviour lives in `routines/<id>.md`.
 - `mother register` prints `{"home_machine": …, "tasks": [{taskId, title, cronExpression, prompt}]}`. Crons are

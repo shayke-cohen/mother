@@ -562,7 +562,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("mother:routine", t["prompt"])
         self.assertIn("`tick`", t["prompt"])
         self.assertNotIn("git pull", t["prompt"])
-        self.assertIn("git pull", by_id["mother-brief"]["prompt"])
+        self.assertIn("git pull --rebase --autostash", by_id["mother-brief"]["prompt"])
         cfg = json.loads((self.ws / "config.json").read_text())
         cfg["routines"]["tick"]["every"] = 120
         (self.ws / "config.json").write_text(json.dumps(cfg))
