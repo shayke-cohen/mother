@@ -211,9 +211,15 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     (the plugin root), `NAME=…` set earlier in the line, and `$(cat ~/.mother/workspace)` / `$(mother path)`
     (the workspace); everything else is unresolved. Then:
     - a command name (after `env`, `command`, `exec`, `xargs`, `sudo`, `nohup`, `time`, `timeout`, `nice` and
-      the like) that holds an unresolved variable, a substitution or an unquoted glob or brace (`$M`,
-      `mo$(true)ther`, `bin/mo?her`, `{mother,x}`) is **denied** as `computed`, on any Bash line, WhatsApp or
-      not. `$CH plan` works when `CH=…` is set earlier in the same line;
+      the like) is first resolved as above and then from the guard's own environment (`$EDITOR`). One that
+      still holds an unresolved variable, a substitution or an unquoted glob or brace is **denied** as
+      `computed` only when (a) with each unresolved part as `*` its last path part could be `mother`
+      (`mo$(true)ther`, `bin/mo?her`, `${D}/mother`; a name that is only one expansion, `$X`, doesn't count
+      here), or (b) some word in the line, with expansions as `*` and not a lone `*`, could be `whatsapp`
+      (`$X whatsapp send …`, `$X wh${a}atsapp …`). Otherwise it gets no decision (`$EDITOR notes.md`,
+      `"$(git rev-parse --show-toplevel)"/x.sh`). An `eval`, `sh -c`, `env -S` or inline-code string the guard
+      can't compute is treated the same way, and is also denied when its literal text names `mother` or
+      `whatsapp` (`eval "$(ssh-agent -s)"` passes). `$CH plan` resolves when `CH=…` is set earlier in the line;
     - a `mother` command (resolved) whose first argument is `whatsapp` and whose subcommand is `send` or
       `prompt` is `compound` (deny); any other `whatsapp` subcommand must be a passing one, with its raw
       simple command plain, `$VAR` or quoted arguments and redirections (`>`, `>>`, `<`, `<<`, `2>&1`, `&>`; no
@@ -431,6 +437,9 @@ home-machine-only: every `mother whatsapp` command except `status` refuses to ru
   path: `mother whatsapp pending` signs whatever DM messages the agent passes it on stdin, and
   `<state>/whatsapp/grant.key` is readable by the account (the guard denies it to Bash, but the Read tool
   runs unchecked outside channel sessions). So the Slack path trusts the agent's report of the manager's DM.
+  A send built entirely from variables set outside the Bash call (`$A $B $C $D`, every word computed, none
+  that could read as `mother` or `whatsapp`) gets no guard decision: that is the evasive case too, and only
+  the bridge's own checks stand in its way.
   The bridge re-checking the original yes itself narrows this; it does not remove it. The `session` and
   `self_chat` proofs read the transcript and the local database, not agent input.
 - **Never.** Reading or storing a chat that is not on the allowlist; sending text the manager did not approve

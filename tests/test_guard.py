@@ -1284,14 +1284,28 @@ class TestWhatsappFixRound2(WhatsappCase):
                        "mo$(true)ther whatsapp send w3kx", "bin/mo?her whatsapp send w3kx",
                        "bin/mothe[r] whatsapp send w3kx", "{mother,x} whatsapp send w3kx",
                        "mother what${U}sapp send w3kx", "mother whats$'app' send w3kx", "mother $W send w3kx",
-                       "`echo mother` whatsapp send w3kx", "M='mother whatsapp'; $M send w3kx", "$X",
+                       "`echo mother` whatsapp send w3kx", "M='mother whatsapp'; $M send w3kx",
                        "env $M whatsapp send w3kx", 'eval "$M whatsapp send w3kx"', "bash -c '$M whatsapp send w3kx'",
                        "echo $($M whatsapp send w3kx)", "xargs -I {} $M whatsapp send {}",
                        "cat <<EOF | bash\nmother whatsapp send w3kx\nEOF", "bash <<'EOF'\nmother whatsapp send w3kx\nEOF",
-                       "echo 'mother whatsapp send w3kx' | sh", "$EDITOR notes.md", '"$(git rev-parse --show-toplevel)"/x'],
-                      transcript=ok)
+                       "echo 'mother whatsapp send w3kx' | sh",
+                       # T5-j: the coordinator's cases
+                       "mo$(true)ther whatsapp send wabc", "$X whatsapp send wabc", "$X wh${a}atsapp send wabc",
+                       "$'mother' whatsapp send wabc", "bin/mo?her whatsapp send wabc", "${D}/mother list",
+                       "$X ok; echo whatsapp"], transcript=ok)
         self.assertFalse(os.path.exists(self.approved()))
-        self.assertIn("computed", self.wa("$M whatsapp send w3kx")[1])
+        self.assertIn("can't tell what it runs", self.wa("$M whatsapp send w3kx")[1])
+
+    def test_computed_command_name_elsewhere_passes(self):
+        """T5-j: a computed command name far from WhatsApp gets no decision (the manager's everyday shell)."""
+        self.pass_all(["$EDITOR notes.md", 'eval "$(ssh-agent -s)"', '"$(git rev-parse --show-toplevel)"/scripts/x.sh',
+                       "$PY -m pytest -q", "$X", 'bash -c "$CMD"', "$(which python3) -m pip list",
+                       "$EDITOR lib/whatsapp.py"], env={"EDITOR": "vim"})
+        self.pass_all(["$EDITOR notes.md"], env={"EDITOR": ""})
+        # resolved from the guard's environment: then it is a plain command name
+        got, why = self.wa("$MY_CLI whatsapp send w3kx", env={"MY_CLI": "mother"}, transcript=self.yes())
+        self.assertEqual(got, "deny", why)
+        self.assertIn("not a command of its own", why)
 
     def test_computed_state_paths_denied(self):
         ws, st = self.ws, self.sdir

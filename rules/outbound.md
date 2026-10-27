@@ -175,9 +175,9 @@ WhatsApp call is allow or deny, in every permission mode, bypass included (an as
   deleting, moving or copying the folders that hold that state (`~/.mother`, the workspace, its `.mother/`).
   To change a draft, drop it and draft again.
 - **Write commands plainly.** Write the `mother whatsapp` commands as they are: a quoted, capitalised or
-  computed form is denied. On any Bash line, a command name built from a variable, `$( )`, a glob or `$'…'`
-  is denied (the guard can't tell what it runs); set the variable earlier in the same line (`CH=…; $CH plan`)
-  or write the name out.
+  computed form is denied. A command name built from a variable, `$( )` or a glob is denied when it could be
+  `mother` or the line could be a WhatsApp command (the guard can't tell what it runs); set the variable
+  earlier in the same line (`CH=…; $CH plan`) or write the name out.
 - **One approval per send.** The guard writes `approved/<id>.json` once; the bridge marks it `.used` after the
   send. A second `send` while it is in flight, or after it was sent, is denied. A Slack `ok` counts only
   through the signed grant `mother whatsapp pending` writes; never write a `whatsapp` grant yourself.

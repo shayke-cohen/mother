@@ -856,6 +856,8 @@ class _WaScan(object):
         self.far = self.near | far  # every folder above the protected ones, but not /
         self.depth = 0
         self.runner = False   # a shell or interpreter reads code from a pipe or heredoc
+        self.opaque = False   # something runs that the guard can't compute (a command name, an eval string)
+        self.wa_word = False  # some word, expansions as *, could be `whatsapp`
         self.skeleton = []    # the line's unquoted words
 
     def hit(self, op, what):
@@ -863,6 +865,8 @@ class _WaScan(object):
 
     def run(self):
         self.line(self.cmd, top=True)
+        if self.opaque and self.wa_word:
+            self.hit("computed", "a command the guard can't compute on a line that could be a whatsapp command")
         if _WA_SEND_WORDS.search(" ".join(self.skeleton).casefold()):
             self.hit("compound", "a whatsapp send or prompt that is not a command of its own")
         if self.runner:
@@ -916,7 +920,7 @@ class _WaScan(object):
                     self.subs_in(p[2])
                 val = self.known.get(p[1])
                 if val is None:
-                    out.append(("W",))
+                    out.append(("W", p[1], q))  # the name, so a command name can still come from os.environ
                 else:
                     out.extend(("L", t[1], True if q else "v") if t[0] == "L" else t for t in val)
             elif kind == "s":
@@ -965,6 +969,41 @@ class _WaScan(object):
     def computed(toks):
         return any(t[0] == "W" or (t[2] in (False, "v") and _WA_GLOB.search(t[1])) for t in toks)
 
+    @staticmethod
+    def atoms(toks):
+        """Path-pattern atoms for a resolved word: unresolved parts are ("any",)."""
+        out = []
+        for t in toks:
+            out += [("any",)] if t[0] == "W" else _wa_glob_atoms(t[1], True, t[2] in (False, "v"))
+        return out
+
+    def note_word(self, toks):
+        """T5-j (b): a word that, expansions as wildcards, could be `whatsapp` (a lone wildcard can't)."""
+        if self.wa_word or not toks or all(t[0] == "W" for t in toks):
+            return
+        atoms = self.atoms(toks)
+        if all(a[0] in ("any", "seg") for a in atoms):
+            return
+        if re.compile(_wa_rx(atoms), re.S).fullmatch("whatsapp"):
+            self.wa_word = True
+
+    def maybe_mother(self, toks):
+        """T5-j (a): a computed command name whose last path part could be `mother`. A name that is only one
+        expansion doesn't count (that is `$EDITOR`, decided by (b))."""
+        if len(toks) == 1 and toks[0][0] == "W":
+            return False
+        atoms = self.atoms(toks)
+        cut = max([k + 1 for k, a in enumerate(atoms) if a == ("c", "/")] or [0])
+        return bool(re.compile(_wa_rx(atoms[cut:]), re.S).fullmatch("mother"))
+
+    def unreadable(self, toks_list, what):
+        """Text that runs (an eval or -c string) but can't be computed: denied when its literal part names
+        mother or whatsapp, else it counts as something opaque on the line."""
+        lits = "".join(t[1] for toks in toks_list for t in toks if t[0] == "L")
+        if re.search(r"mother|whatsapp", lits, re.I):
+            self.hit("computed", what)
+        self.opaque = True
+
     def assignment(self, toks):
         if not toks or toks[0][0] != "L" or toks[0][2] is not False:
             return False
@@ -994,6 +1033,7 @@ class _WaScan(object):
         if head in ("for", "select", "case", "function"):
             for w in words[i + 1:]:
                 for t in self.split(self.resolve(w)):
+                    self.note_word(t)
                     self.arg(t, False)
             if head in ("for", "select") and i + 1 < len(words):
                 self.known.pop(self.plain(words[i + 1]) or "", None)
@@ -1005,6 +1045,8 @@ class _WaScan(object):
                     continue
                 assigning = False
                 argv.extend(self.split(toks))
+            for t in argv:
+                self.note_word(t)
             self.command(argv, seg, text, None)
         for op, w in seg["redirs"]:
             toks = self.resolve(w)
@@ -1018,8 +1060,19 @@ class _WaScan(object):
     def command(self, argv, seg, text, wrapped):
         if not argv:
             return
+        if self.computed(argv[0]):  # T5-j: try the guard's own environment ($EDITOR), then decide narrowly
+            cw = [("L", os.environ[t[1]], True if t[2] else "v") if t[0] == "W" and len(t) > 1 and t[1] in os.environ
+                  else t for t in argv[0]]
+            argv = self.split(cw) + argv[1:]
+            if not argv:
+                return
         if self.computed(argv[0]):
-            self.hit("computed", "a command whose name is computed (a variable, $( ), a glob or $'…' quoting)")
+            if self.maybe_mother(argv[0]):
+                self.hit("computed", "a computed command name that could be the mother CLI")
+            self.opaque = True  # denied in run() only if the line could be a whatsapp command
+            for a in argv[1:]:
+                self.arg(a, None)
+            return
         pieces = self.value(argv[0]).split()
         if not pieces:
             return
@@ -1034,8 +1087,9 @@ class _WaScan(object):
             self.unwrap(name, args, vals, seg, text)
         elif name == "eval":
             if any(v is None for v in vals):
-                self.hit("computed", "an eval of text the guard can't compute")
-            self.line(" ".join(vals))
+                self.unreadable(args, "an eval of text the guard can't compute")
+            else:
+                self.line(" ".join(vals))
         elif name in WA_SHELLS:
             self.shell(args, vals, seg)
         elif name in WA_INTERPS:
@@ -1072,8 +1126,9 @@ class _WaScan(object):
             v = vals[k]
             if name == "env" and v in ("-S", "--split-string") and k + 1 < len(args):
                 if vals[k + 1] is None:
-                    self.hit("computed", "an env -S string the guard can't compute")
-                self.line(vals[k + 1])
+                    self.unreadable([args[k + 1]], "an env -S string the guard can't compute")
+                else:
+                    self.line(vals[k + 1])
                 return
             if v == "--":
                 k += 1
@@ -1096,8 +1151,9 @@ class _WaScan(object):
                 if "c" in v[1:]:
                     if k + 1 < len(args):
                         if vals[k + 1] is None:
-                            self.hit("computed", "a shell -c string the guard can't compute")
-                        self.line(vals[k + 1])
+                            self.unreadable([args[k + 1]], "a shell -c string the guard can't compute")
+                        else:
+                            self.line(vals[k + 1])
                     return
                 continue
             if v.startswith("--"):
@@ -1127,8 +1183,9 @@ class _WaScan(object):
             if v in WA_CODE_FLAGS:
                 if k + 1 < len(args):
                     if vals[k + 1] is None:
-                        self.hit("computed", "inline code the guard can't compute")
-                    self.code(vals[k + 1])
+                        self.unreadable([args[k + 1]], "inline code the guard can't compute")
+                    else:
+                        self.code(vals[k + 1])
                 return
             if v == "-m" and name.startswith("python"):
                 return
