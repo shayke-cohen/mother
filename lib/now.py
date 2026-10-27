@@ -38,7 +38,7 @@ SIGNALS = {
     "pr_changes_silent": ("neglected", "code", "3d"),
     "default_branch_red": ("neglected", "code", "2h"),
     "ticket_stalled": ("neglected", "tracker", "3d"),
-    "bug_unowned": ("neglected", "tracker", "4h"),
+    "bug_unowned": ("neglected", "tracker", "1d"),
     "blocker_cleared": ("neglected", "tracker", "1d"),
     "sprint_at_risk": ("neglected", "tracker", "0"),
     "outside_question": ("neglected", "chat", "4h"),
@@ -46,6 +46,10 @@ SIGNALS = {
     "one_on_one_drift": ("neglected", "workspace", "0"),
 }
 SLOW_SIGNALS = {k for k, v in SIGNALS.items() if v[0] == "neglected" and k != "default_branch_red"}
+# Work that hasn't moved in this many days is backlog, not a pulse item. Workspace signals (promises,
+# decisions, suggestions) carry their own lifecycle and never age out here.
+DEFAULT_MAX_AGE_DAYS = 30
+AGELESS = {k for k, v in SIGNALS.items() if v[1] == "workspace"}
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 DEFAULT_HOURS = "06:00-22:00"
@@ -126,6 +130,22 @@ SECTIONS = ["on_you", "neglected", "suggestion"]
 SUGGESTION_LAPSE_DAYS = 3
 VERSION = 1
 TOP_MAX = 3
+
+
+def max_age_days(cfg: dict) -> int:
+    """`routines.tick.max_age_days`, default 30; 0 turns the cap off."""
+    v = ((cfg.get("routines") or {}).get("tick") or {}).get("max_age_days")
+    return DEFAULT_MAX_AGE_DAYS if v is None else int(v)
+
+
+def _too_old(sig: str, since: datetime, cfg: dict, now: datetime) -> bool:
+    cap = max_age_days(cfg)
+    return bool(cap) and sig not in AGELESS and now - since > timedelta(days=cap)
+
+
+def _keys(sig: str, link: str, also) -> set:
+    """Every (signal, link) pair that names the same work: the item's link and its `also` links."""
+    return {(sig, k) for k in [link] + list(also or []) if k}
 
 
 def item_id(c: dict) -> str:
@@ -265,11 +285,17 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
                 next_action = max(next_action, int(m.group(1)) + 1)
     lapse = SUGGESTION_LAPSE_DAYS * day_hours(s)
     st_items = state.setdefault("items", {})
+    # The same work found under another link (a build page one tick, a commit the next) keeps its old id,
+    # so the manager's done and snooze still apply and the list shows it once.
+    prev_by_key = {}
+    for pi in prev_items.values():
+        for k in _keys(pi.get("signal"), pi.get("link"), pi.get("also")):
+            prev_by_key.setdefault(k, pi["id"])
 
-    items, seen, dropped = [], set(), 0
+    items, seen, taken, dropped = [], set(), set(), 0
     for c in inp.get("candidates") or []:
         try:
-            if not isinstance(c, dict) or any(not c.get(k) for k in ("kind", "link", "signal", "since", "title")):
+            if not isinstance(c, dict) or any(not c.get(k) for k in ("kind", "link", "signal", "since", "title", "why")):
                 raise KeyError("candidate")
             sig = c["signal"]
             since = _parse_iso(c["since"])
@@ -279,12 +305,18 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         if sig not in SIGNALS:
             continue
         th = threshold_hours(sig, cfg, s)
-        if th is None or working_hours(since, now, s) < th:
+        if th is None or working_hours(since, now, s) < th or _too_old(sig, since, cfg, now):
             continue
+        keys = _keys(sig, c["link"], c.get("also"))
+        if keys & taken:
+            continue                       # already listed under another of its links
         iid = item_id(c)
+        if iid not in prev_items:
+            iid = next((prev_by_key[k] for k in sorted(keys) if k in prev_by_key), iid)
         if iid in seen:
             continue
         seen.add(iid)
+        taken |= keys
         section = SIGNALS[sig][0]
         if c.get("actions") and sig == "suggestion_waiting":
             section = "suggestion"
@@ -324,6 +356,10 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         effect = _state_effect(iid, None, st_items, now)
         if effect == "hide":
             continue
+        if _keys(sig, pi.get("link"), pi.get("also")) & taken:
+            continue                       # this tick lists the same work under another link
+        if _too_old(sig, _parse_iso(pi["since"]), cfg, now):
+            continue
         row = coverage.get(SIGNALS[sig][1]) if sig in SIGNALS else None
         if sig in checked and row is not None and row["status"] == "ok":
             continue                       # looked, and it is gone: closed
@@ -349,6 +385,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
     today = now.astimezone(s.tz).date().isoformat()
     top, top_date, hint = _pick_top(inp, prev, state, today, _iso(now))
     hint = _resolve_hint(hint, items)
+    _link_top(top, items)
     _mark_top_done(top, {i["id"] for i in items}, set(prev_items), st_items)
     return {
         "version": VERSION,
@@ -386,6 +423,18 @@ def _resolve_hint(hint, items: list):
     else:
         hint.pop("item_id", None)
     return hint
+
+
+def _link_top(top: list, items: list) -> list:
+    """Give a Top 3 entry without an `item_id` the id of the one item whose link equals its link, so
+    the panel can tie them together and closing the item marks the entry done."""
+    for e in top:
+        if e.get("item_id") or not e.get("link"):
+            continue
+        same = [i["id"] for i in items if i.get("link") == e["link"]]
+        if len(same) == 1:
+            e["item_id"] = same[0]
+    return top
 
 
 def _agent_owned(top: list) -> bool:
@@ -549,9 +598,11 @@ def _find_item(doc: Optional[dict], iid: str) -> dict:
 def _note(doc: dict) -> str:
     c = doc["counts"]
     new = sum(1 for i in doc["items"] if i["section"] == "on_you" and i["state"] == "new")
-    bad = sorted(k for k, v in doc["coverage"].items() if v.get("status") != "ok")
-    return "%d on you (%d new), %d neglected, %d suggestions; couldn't check: %s" % (
-        c["on_you"], new, c["neglected"], c["suggestion"], ", ".join(bad) or "none")
+    bad = sorted(k for k, v in doc["coverage"].items() if v.get("status") not in ("ok", "partial"))
+    part = sorted(k for k, v in doc["coverage"].items() if v.get("status") == "partial")
+    return "%d on you (%d new), %d neglected, %d suggestions; couldn't check: %s%s" % (
+        c["on_you"], new, c["neglected"], c["suggestion"], ", ".join(bad) or "none",
+        "; partial: %s" % ", ".join(part) if part else "")
 
 
 def _show(doc: dict) -> str:

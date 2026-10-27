@@ -89,6 +89,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(out.argv[0]).toEqual(['python3', '/home/m/.claude/plugins/marketplaces/mother/bin/mother', 'path'])
   })
 
+  test(`a partly checked source shows ~, not ✗, on ${surface}`, async ($, on) => {
+    const d = doc({ coverage: { chat: { status: 'ok' }, code: { status: 'partial' }, tracker: { status: 'couldnt_check' } } })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    expect(last(out)).toBe('◆ 3 on you · 2 neglected · code ~ · tracker ✗')
+  })
+
   test(`stale after stale_after, on ${surface}`, async ($, on) => {
     const files = { [PATH]: { text: JSON.stringify(doc({ stale_after: '2026-10-26T09:30:00Z' })), mtimeMs: 1 } }
     const { out } = await boot($, on, files)

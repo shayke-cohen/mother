@@ -2,7 +2,7 @@
 id: tick
 team_scoped: false
 description: Hourly pass in active hours that finds what is blocked on the manager and what the team is neglecting, and writes the Now list for the panel and status line.
-config: routines.tick             # every (minutes, default 60), active_hours, days, notify (none|dm), signals, thresholds; absent = off
+config: routines.tick             # every (minutes, default 60), active_hours, days, notify (none|dm), signals, thresholds, slow_every, max_age_days; absent = off
 default: { every: 60, active_hours: "06:00-22:00", days: workdays }
 needs: [chat.read, tracker.read, mail.read, calendar.read, code.read]
 writes: [.mother/now.json, runs.md]
@@ -68,7 +68,9 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    - The decision queue, `teams/<slug>/intake.md` for each team (format in `rules/teams.md`): each item whose
      status is `proposed` (queued for the manager's call) and unanswered for more than the threshold becomes
      `decision_open`, with its `added <date>` as `since` and the intake line (`teams/<slug>/intake.md#<id>`)
-     or its source link as `link`. When `chat.read` is `ok`, also read the latest digest DM thread in
+     or its source link as `link`. Its `why` carries the item's recommendation and the reason for it from
+     the intake line (`Rec: drop — merged 10-25`, `Rec: ticket for the shell owner`), so the manager can
+     answer from the panel without opening the file. When `chat.read` is `ok`, also read the latest digest DM thread in
      `manager.chat_dm`: an item the manager already answered there (`12 ticket`, `13 drop`, `14 mine`, `ok`)
      but the digest hasn't applied yet is not open, so skip it. An item the digest showed under 🗳 Decide
      with a recommendation the manager hasn't approved becomes `suggestion_waiting` with a prompt such as
@@ -88,6 +90,19 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
      so old neglect is seen.
    - Tell each reader to return, per item, the `link`, the signal name, a `state` and a one-line `note` of
      facts. No message bodies, no per-person counts.
+   - **Relevance.** Give each reader these scope rules with its signals; an item outside them is not the
+     manager's and is left out, however true it is:
+
+     | Signal | Only when |
+     |---|---|
+     | `review_requested` | the manager is requested **by name**; a request to a team they are in is not on them |
+     | `pr_no_reviewer`, `pr_approved_unmerged`, `pr_changes_silent` | the repo is in a team's `repos` **and** the author is in that team's `people` (by `code` handle); never a bot's or an automation's PR (author ending `[bot]`, a dependency or security bump, a PR opened by a report) |
+     | `default_branch_red` | the repo is in a team's `repos`; **one item per repo**, `link` the default branch's commit list (`https://<host>/<owner>/<repo>/commits/<branch>`), the failing check or build in `also` |
+     | `ticket_stalled`, `bug_unowned`, `blocker_cleared`, `sprint_at_risk` | the ticket is in a team's `tracker.project` |
+     | `ticket_waiting_on_you` | it moved within `max_age_days`; an older one is backlog, not a wait |
+
+     `since` is when the work **last moved** (status, priority, assignee, comment, commit), so an old ticket
+     that was just raised to High counts from that change.
 
    **On you (blocked on the manager)**
 
@@ -111,7 +126,7 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    | `pr_changes_silent` | code | PR with changes requested, author silent | > 3 working days |
    | `default_branch_red` | code | Default branch checks red, as the code host reports them (e.g. `gh` check runs). Also scanned on fast ticks | > 2 h |
    | `ticket_stalled` | tracker | Ticket in progress with no movement (status, comment, linked PR) | > 3 working days |
-   | `bug_unowned` | tracker | High-priority bug with no owner | > 4 working h |
+   | `bug_unowned` | tracker | High-priority bug with no owner | > 1 working day |
    | `blocker_cleared` | tracker | Ticket whose blocker closed, but it didn't restart | > 1 working day |
    | `sprint_at_risk` | tracker | Sprint ends within 2 working days with untouched work | none |
    | `outside_question` | chat (configured team channels) | Question from outside the team in a team channel, no reply | > 4 working h |
@@ -139,10 +154,21 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
      `chat`, `event`, `todo`, `digest`, …); `since` is an ISO time from the source (when the review was
      requested, the mention sent, the ticket last moved), never "now"; `team` is the team slug or `""`.
    - `title` is a short paraphrase naming the work; `why` is **one line of facts, no message bodies** ("Asked 6
-     working hours ago; the release is blocked on it"). A person is named only as the work needs, never with a
+     working hours ago; the release is blocked on it"). It says what is needed and from whom by role (you,
+     the author, an owner), how long it has waited in working time, and what it blocks or risks. "High, To
+     Do, no assignee" or "Approved and still open" is not enough: say what the bug breaks or what the merge
+     ships. An item you can't write that line for is not relevant: leave it out. `why` is required; merge
+     drops a candidate without one.
+   - **No floods.** At most 5 items per neglect signal per team: keep the highest priority, then the newest,
+     and end the 5th's `why` with how many more there are ("; 6 more unowned High bugs in PLAT").
+   - **Old work.** Merge leaves out an item whose `since` is older than `routines.tick.max_age_days`
+     (default 30, `0` = off), except the workspace signals (`decision_open`, `promise_due`,
+     `suggestion_waiting`, `action_item_no_ticket`, `one_on_one_drift`). Don't send those; they are backlog. A person is named only as the work needs, never with a
      count, score or judgement. `also` holds other keys for the same work (a ticket for a PR).
    - `actions` are `{"label","prompt"}` (merge stores your `prompt` as the action's `task` and gives the panel its own `mother now do <S-id>` prompt). They come only from these kinds, each a tick-owned suggestion the `mother:now` skill will run on
-     the manager's yes: a nudge **draft** in the manager's DM or a mail draft (never sent); a proposed
+     the manager's yes: a nudge **draft** in the manager's DM or a mail draft (never sent); a reply **draft**
+     for `mail_needs_reply`, `unanswered_mention` and `outside_question`, in the manager's DM or as a mail
+     draft (never sent); a proposed
      reviewer for an unreviewed PR as a draft comment; a ticket for a meeting action item (tracker create,
      via grant or approval); a draft question to the person out today about reassigning their in-progress
      ticket. Give each a short `label` and a `prompt` that says what to do in the action's own words (the
@@ -180,9 +206,9 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    An item that turns `new` on a tick where the DM was held (quiet hours) or the post failed is **not**
    announced on a later tick; the panel still shows it. That is accepted for v1.
 
-**Runs note:** the line `mother now merge` printed (it already ends with `couldn't check: <sources>`; don't
-repeat it), then ` · slow` or ` · fast`, then ` · DM held (quiet hours)` where it applies. For example
-`3 on you (1 new), 2 neglected, 0 suggestions; couldn't check: tracker · slow · DM held (quiet hours)`. Status: `ok` if every scanned source was `ok`, `partial` if any
+**Runs note:** the line `mother now merge` printed (it already ends with `couldn't check: <sources>`, plus
+`; partial: <sources>` when some were only partly read; don't repeat them), then ` · slow` or ` · fast`, then ` · DM held (quiet hours)` where it applies. For example
+`3 on you (1 new), 2 neglected, 0 suggestions; couldn't check: tracker; partial: code · slow · DM held (quiet hours)`. Status: `ok` if every scanned source was `ok`, `partial` if any
 was `partial` or `couldnt_check` or the DM failed, `failed` only for malformed merge input or no output.
 
 ## Hard rules

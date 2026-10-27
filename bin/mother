@@ -108,7 +108,7 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 TICK_EVERY = (30, 60, 120, 180, 240)
-TICK_KEYS = {"every", "active_hours", "days", "thresholds", "signals", "notify", "slow_every"}
+TICK_KEYS = {"every", "active_hours", "days", "thresholds", "signals", "notify", "slow_every", "max_age_days"}
 
 
 def _tick_hours(active):
@@ -292,6 +292,9 @@ def validate(cfg: dict) -> list:
                 se = r.get("slow_every")
                 if se is not None and (not isinstance(se, int) or isinstance(se, bool) or not 1 <= se <= 6):
                     errs.append("routines.tick.slow_every must be an integer 1-6")
+                ma = r.get("max_age_days")
+                if ma is not None and (not isinstance(ma, int) or isinstance(ma, bool) or not 0 <= ma <= 365):
+                    errs.append("routines.tick.max_age_days must be an integer 0-365")
             if rid == "commitments":
                 for k, lo, hi in (("no_reply_days", 1, 30), ("lookback_days", 1, 60)):
                     v = r.get(k)

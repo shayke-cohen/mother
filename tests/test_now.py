@@ -277,6 +277,71 @@ def titles(doc):
     return [x["title"] for x in doc["top"]]
 
 
+class Relevance(unittest.TestCase):
+    """Items that name the same work, old work, thin items and the run note's coverage words."""
+
+    def test_same_work_under_two_links_is_listed_once(self):
+        out = now.merge(inp(
+            cand("default_branch_red", kind="repo", link="https://example.com/r/commits/main", since=days_ago(3)),
+            cand("default_branch_red", kind="build", link="https://example.com/r/build/9", since=days_ago(3),
+                 also=["https://example.com/r/commits/main"]),
+        ), None, {}, CFG, NOW)
+        self.assertEqual([i["link"] for i in out["items"]], ["https://example.com/r/commits/main"])
+
+    def test_same_work_under_a_new_link_keeps_the_old_id_and_state(self):
+        old = cand("default_branch_red", kind="build", link="https://example.com/r/build/9", since=days_ago(3),
+                   also=["https://example.com/r/commits/main"])
+        first = now.merge(inp(old), None, {}, CFG, NOW)
+        oid = first["items"][0]["id"]
+        new = cand("default_branch_red", kind="repo", link="https://example.com/r/commits/main", since=days_ago(3))
+        st = {"items": {oid: {"state": "done", "since": days_ago(3)}}}
+        out = now.merge(inp(new, checked=["default_branch_red"], coverage={"code": "ok"}), first, st, CFG, NOW + H)
+        self.assertEqual(out["items"], [])          # the manager's done still hides it
+        out = now.merge(inp(new, checked=["default_branch_red"], coverage={"code": "ok"}), first, {}, CFG, NOW + H)
+        self.assertEqual([(i["id"], i["state"]) for i in out["items"]], [(oid, "open")])
+
+    def test_work_older_than_max_age_is_left_out(self):
+        out = now.merge(inp(cand("bug_unowned", kind="ticket", link="old", since=days_ago(45)),
+                            cand("bug_unowned", kind="ticket", link="recent", since=days_ago(10))),
+                        None, {}, CFG, NOW)
+        self.assertEqual([i["link"] for i in out["items"]], ["recent"])
+
+    def test_max_age_zero_turns_the_cap_off_and_workspace_signals_never_age(self):
+        old = cand("bug_unowned", kind="ticket", link="old", since=days_ago(45))
+        out = now.merge(inp(old), None, {}, with_tick(CFG, max_age_days=0), NOW)
+        self.assertEqual(len(out["items"]), 1)
+        promise = cand("promise_due", kind="chat", link="p", since=days_ago(45))
+        self.assertEqual(len(now.merge(inp(promise), None, {}, CFG, NOW)["items"]), 1)
+
+    def test_kept_item_that_ages_past_the_cap_is_dropped(self):
+        first = now.merge(inp(cand("bug_unowned", kind="ticket", since=days_ago(29))), None, {}, CFG, NOW)
+        self.assertEqual(len(first["items"]), 1)
+        out = now.merge(inp(coverage={"tracker": "couldnt_check"}, checked=["bug_unowned"]), first, {}, CFG,
+                        NOW + timedelta(days=2))
+        self.assertEqual(out["items"], [])
+
+    def test_candidate_without_why_is_dropped(self):
+        out = now.merge(inp(cand("review_requested", why="")), None, {}, CFG, NOW)
+        self.assertEqual((out["items"], out["dropped"]), ([], 1))
+
+    def test_bug_unowned_waits_a_working_day(self):
+        self.assertEqual(now.merge(inp(cand("bug_unowned", kind="ticket", since=hours_ago(5))), None, {}, CFG,
+                                   NOW)["items"], [])
+
+    def test_top_entry_gets_the_item_id_of_its_link(self):
+        out = now.merge(inp(cand("review_requested", link="https://example.com/pr/7"),
+                            top=[{"title": "Review #7", "link": "https://example.com/pr/7"},
+                                 {"title": "Prep the 1:1", "link": "https://example.com/cal/1"}]),
+                        None, {}, CFG, NOW)
+        self.assertEqual(out["top"][0]["item_id"], out["items"][0]["id"])
+        self.assertIsNone(out["top"][1]["item_id"])
+
+    def test_note_names_partial_sources_apart(self):
+        doc = now.merge(inp(coverage={"code": "partial", "chat": "couldnt_check", "mail": "ok"}), None, {},
+                        with_connectors(CFG, code="gh", chat="x", mail="y"), NOW)
+        self.assertTrue(now._note(doc).endswith("couldn't check: chat; partial: code"))
+
+
 class ManagerState(unittest.TestCase):
     def first(self):
         return now.merge(inp(cand("review_requested", since=hours_ago(6))), None, {}, CFG, NOW)
