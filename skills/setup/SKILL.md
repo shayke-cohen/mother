@@ -159,7 +159,7 @@ In this order, reporting each step's result:
      tasks it did print, then offer narrower `active_hours` and register again. If `mother runs` later says
      "re-run mother register (time-zone offset changed)", register again and update the tick task's cron.
    - **The Now panel (offer, after the tick is registered).** "Want the list beside the chat? Run
-     `/plugin install mother-now@mother`, then `/now` opens it." Mention its one setting, `mother_bin`: the
+     `/plugin install mother-now@mother`, then `/now-panel` opens it." Mention its one setting, `mother_bin`: the
      default points at the marketplace clone; it can be set to the installed plugin's `bin/mother`. Don't
      install it yourself.
    - **The doctor runs daily** (see the proposal above): register it from the confirmed config, which

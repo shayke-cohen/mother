@@ -1,6 +1,6 @@
 {
   "name": "mother-now",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The Now panel for MOTHER: what's on you and what the team is neglecting, beside the chat. Reads the tick's now.json; makes no network or MCP calls.",
   "author": { "name": "Shay Cohen", "url": "https://github.com/shayke-cohen" },
   "license": "MIT",

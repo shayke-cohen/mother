@@ -98,7 +98,7 @@ marketplace:
 /plugin install mother-now@mother
 ```
 
-Open it with `/now`. It reads `.mother/now.json` on the machine the tick runs on and makes no network calls.
+Open it with `/now-panel` (`/now` is MOTHER's chat skill, which prints the same list in the conversation). It reads `.mother/now.json` on the machine the tick runs on and makes no network calls.
 Its one setting, `mother_bin` (userConfig), is the path to the `mother` script it calls for `mother path` and
 the `mother now` edits. The default, `~/.claude/plugins/marketplaces/mother/bin/mother`, is the marketplace
 clone; set it to the installed plugin's `bin/mother` (the versioned copy under `~/.claude/plugins/`) if you want
