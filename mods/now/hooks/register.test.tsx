@@ -215,7 +215,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     plugin: 'mother-now', component: 'Pane', requestId: 'mother-now',
     props: { title: 'Now', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
   } as const
-  const texts = async (ui: any) => (await ui.findAll({ type: 'Text' })).map((t: any) => t.text as string)
+  const texts = async (ui: any) => [...await ui.findAll({ type: 'Text' }), ...await ui.findAll({ type: 'Button' })].map((t: any) => t.text as string)
   const hasText = async (ui: any, re: RegExp) => (await texts(ui)).some((t: string) => re.test(t))
   const nowCalls = (out: { argv: string[][] }) => out.argv.filter(a => a[2] === 'now').map(a => a.slice(3))
   const TOP1 = [{ rank: 1, title: 'T1', why: '', link: null, item_id: null, set_by: 'agent', state: 'open' }]
@@ -281,12 +281,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     const all = await texts(ui)
     const at = (re: RegExp) => all.findIndex(t => re.test(t))
-    const order = [/Top 3 today/, /On you \(1\)/, /Neglected \(1\)/, /Suggestions \(1\)/, /Couldn't check/, /Routines/].map(at)
+    const order = [/^⚠ .*1 routine missed.*couldn't check tracker/, /^Ask Mother$/, /Top 3 today/, /^On you 1$/, /^Neglected 1$/, /^Suggestions 1$/].map(at)
     expect(order.every(i => i >= 0)).toBe(true)
     expect([...order].sort((a, b) => a - b)).toEqual(order)
     expect(all.some(t => /^Now · 09:05 · next 10:05$/.test(t))).toBe(true)
     expect(all.some(t => /set by agent/.test(t))).toBe(true)
-    expect(all.some(t => /dots missed at 13:00/.test(t))).toBe(true)
+    expect(all.some(t => /dots missed at 13:00/.test(t))).toBe(false)   // detail waits behind Details
+    await ui.press({ key: 'health-toggle' })
+    expect(await hasText(ui, /^dots missed at 13:00$/)).toBe(true)
     await ui.unmount()
   })
 
@@ -294,7 +296,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const d = doc({ items: [item('a', 'on_you', 'open', 'Review A')], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: { chat: { status: 'ok' } } })
     await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hasText(ui, /On you \(1\)/)).toBe(true)
+    expect(await hasText(ui, /^On you 1$/)).toBe(true)
     expect(await hasText(ui, /Neglected|Suggestions|Top 3|Couldn't check|Routines|Nothing on you/)).toBe(false)
     await ui.unmount()
   })
@@ -336,7 +338,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'done-a' })
     expect(out.toasts).toContain('mother: unknown id')
-    expect(await hasText(ui, /On you \(3\)/)).toBe(true)
+    expect(await hasText(ui, /^On you 3$/)).toBe(true)
     await ui.unmount()
   })
 
@@ -368,7 +370,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     d.items[0].actions = [{ id: 'S2', label: 'Draft a nudge', prompt: 'mother now do S2', task: 'draft a nudge to the reviewer' }]
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hotkeys(ui)).toEqual(['d:done-a', 's:snooze-a', 't:maketop-a', 'x:doit-a'])
+    expect(await hotkeys(ui)).toEqual(['x:doit-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect((await ui.find({ key: 'doit-a' }))?.text).toBe('Draft a nudge')   // the action's own label
     await ui.press({ key: 'doit-a' })
     expect(out.fills).toEqual([{ text: 'mother now do S2', mode: 'replace' }])
     expect(await ui.find({ key: 'doit-b' })).toBeUndefined()           // no action, no Do it
@@ -380,7 +383,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc({ top, top_date: '2026-10-25' })), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hasText(ui, /Top 3 today|Old one/)).toBe(false)
-    expect(await hotkeys(ui)).toEqual(['d:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     await ui.unmount()
   })
 
@@ -406,7 +409,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(gap), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hasText(ui, /Nothing on you/)).toBe(false)
-    expect(await hasText(ui, /Couldn't check/)).toBe(true)
+    expect(await hasText(ui, /couldn't check tracker/)).toBe(true)
+    await ui.press({ key: 'health-toggle' })
     expect(await hasText(ui, /tracker.*since 08:05/i)).toBe(true)
     await ui.unmount()
   })
@@ -425,7 +429,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await clock.advance(60_000)
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hasText(ui, /^Couldn't read now\.json — showing the 11:05 list\.$/)).toBe(true)
-    expect(await hasText(ui, /On you \(3\)/)).toBe(true)
+    expect(await hasText(ui, /^On you 3$/)).toBe(true)
     await ui.unmount()
   })
 
@@ -454,6 +458,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ key: 'top-done-3' })).toBeUndefined()      // a done entry has no Done
     expect(await ui.find({ key: 'maketop-a' })).toBeUndefined()         // already in Top 3: no Make top 3
     await ui.press({ key: 'top-done-1' })
+    await ui.press({ key: 'row-c' })
     await ui.press({ key: 'maketop-c' })
     expect(nowCalls(out)).toEqual([['top', 'done', '1'], ['top', 'swap', '2', 'c']])
     await ui.unmount()
@@ -488,8 +493,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`with no focus event the first row holds the hotkeys, on ${surface}`, async ($, on) => {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hotkeys(ui)).toEqual(['d:done-a', 's:snooze-a', 't:maketop-a'])
-    expect((await ui.find({ key: 'done-a' }))?.props.autoFocus).toBe(true)
+    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect((await ui.find({ key: 'row-a' }))?.props.autoFocus).toBe(true)
+    expect(await ui.find({ key: 'done-b' })).toBeUndefined()     // only the selected row draws its buttons
     await ui.unmount()
   })
 
@@ -497,7 +503,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
     await $.ui.focus({ requestId: 'mother-now', key: 'snooze-b' } as any)
-    expect(await hotkeys(ui)).toEqual(['d:done-b', 's:snooze-b', 't:maketop-b'])
+    expect(await hotkeys(ui)).toEqual(['a:ask-b', 'd:done-b', 's:snooze-b', 't:maketop-b'])
     await ui.unmount()
   })
 
@@ -520,9 +526,9 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const top = [1, 2].map(r => ({ rank: r, title: 'T' + r, why: '', link: null, item_id: null, set_by: 'agent', state: 'open' }))
     await boot($, on, { [PATH]: { text: JSON.stringify(doc({ top })), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hotkeys(ui)).toEqual(['d:top-done-1'])
-    await $.ui.focus({ requestId: 'mother-now', key: 'done-a' } as any)
-    expect(await hotkeys(ui)).toEqual(['d:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['a:top-ask-1', 'd:top-done-1'])
+    await $.ui.focus({ requestId: 'mother-now', key: 'row-a' } as any)
+    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     await ui.unmount()
   })
 
@@ -530,22 +536,25 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const top = [{ rank: 1, title: 'T1', why: '', link: null, item_id: null, set_by: 'manager', set_at: '2026-10-26T09:40:00Z', state: 'open' }]
     await boot($, on, { [PATH]: { text: JSON.stringify(doc({ top })), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hasText(ui, /^set by you at 09:40$/)).toBe(true)
+    expect(await hasText(ui, /^ set by you at 09:40$/)).toBe(true)
     await ui.unmount()
   })
 
   test(`an agent-set Top 3 shows its set_at, on ${surface}`, async ($, on) => {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc({ top: [{ ...TOP1[0], set_at: '2026-10-26T07:05:00Z' }] })), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hasText(ui, /^set by agent at 07:05$/)).toBe(true)
+    expect(await hasText(ui, /^ set by agent at 07:05$/)).toBe(true)
     await ui.unmount()
   })
 
   test(`a snooze only closes the Select of the row it acted on, on ${surface}`, async ($, on) => {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
     const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'row-b' })
     await ui.press({ key: 'snooze-b' })
+    await ui.press({ key: 'row-a' })
     await ui.press({ key: 'done-a' })          // acts on another row while b's Select is open
+    await ui.press({ key: 'row-b' })
     expect(await ui.find({ type: 'Select', key: 'snooze-pick-b' })).toBeDefined()
     await ui.select({ key: 'snooze-pick-b', value: '1h' })
     expect(await ui.find({ type: 'Select', key: 'snooze-pick-b' })).toBeUndefined()
@@ -562,5 +571,74 @@ for (const surface of ['terminal', 'desktop'] as const) {
     files[PATH] = saved[PATH]
     await clock.advance(60_000)
     expect(out.errors[out.errors.length - 1]).toBe(null)
+  })
+
+  test(`Ask Mother chips fill the prompt from the list, never submit, on ${surface}`, async ($, on) => {
+    const d: any = doc({ routines: [{ id: 'brief', state: 'failed', expected: '2026-10-26T06:47:00Z' }] })
+    d.items[0] = { ...d.items[0], id: 'mail:x', signal: 'mail_needs_reply', title: 'Reply to Dana' }
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const chips = (await ui.findAll({ type: 'Button' })).filter((b: any) => String(b.key).startsWith('prompt-')).map((b: any) => b.key)
+    expect(chips).toEqual(['prompt-next', 'prompt-routines', 'prompt-recheck', 'prompt-replies', 'prompt-neglected'])
+    await ui.press({ key: 'prompt-routines' })
+    await ui.press({ key: 'prompt-replies' })
+    expect(out.fills[0].text).toMatch(/brief \(failed\).*mother:doctor/)
+    expect(out.fills[1].mode).toBe('replace')
+    expect(out.fills[1].text).toContain('"Reply to Dana"')
+    expect(out.fills[1].text).toMatch(/never send/)
+    expect(out.submits).toBe(0)
+    expect(nowCalls(out)).toEqual([])
+    await ui.unmount()
+  })
+
+  test(`Ask Mother on a row fills a prompt with its title, why and link, on ${surface}`, async ($, on) => {
+    const d: any = doc()
+    d.items[0].why = 'waiting since Monday'
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /^waiting since Monday$/)).toBe(true)
+    await ui.press({ key: 'ask-a' })
+    expect(out.fills[0].text).toBe('Help me close this out: "a" — waiting since Monday (https://example.com/a). What is the fastest next step? Draft anything that reaches another person; don\'t send.')
+    expect(out.submits).toBe(0)
+    await ui.unmount()
+  })
+
+  test(`every action of a row gets its own button, on ${surface}`, async ($, on) => {
+    const d: any = doc({ coverage: {} })
+    d.items[0].actions = [{ id: 'S1', label: 'Draft a reply', prompt: 'mother now do S1', task: 't' },
+                          { id: 'S2', label: 'Nudge owner', prompt: 'mother now do S2', task: 't' }]
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'act1-a' }))?.text).toBe('Nudge owner')
+    await ui.press({ key: 'act1-a' })
+    expect(out.fills).toEqual([{ text: 'mother now do S2', mode: 'replace' }])
+    await ui.unmount()
+  })
+
+  test(`a long section shows its first rows and a Show more toggle, on ${surface}`, async ($, on) => {
+    const many = Array.from({ length: 8 }, (_, n) => item('m' + n, 'on_you', 'open', 'Item ' + n))
+    await boot($, on, { [PATH]: { text: JSON.stringify(doc({ items: many })), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /^On you 8$/)).toBe(true)
+    expect(await ui.find({ key: 'row-m4' })).toBeDefined()
+    expect(await ui.find({ key: 'row-m5' })).toBeUndefined()
+    expect((await ui.find({ key: 'more-on_you' }))?.text).toBe('Show 3 more')
+    await ui.press({ key: 'more-on_you' })
+    expect(await ui.find({ key: 'row-m7' })).toBeDefined()
+    expect((await ui.find({ key: 'more-on_you' }))?.text).toBe('Show fewer')
+    await ui.unmount()
+  })
+
+  test(`a Top 3 entry shows its why and the linked item's action, on ${surface}`, async ($, on) => {
+    const d: any = doc({ top: [{ rank: 1, title: 'Ship it', why: 'due today', link: null, item_id: 'b', set_by: 'agent', state: 'open' }] })
+    d.items[1].actions = [{ id: 'S9', label: 'Draft the post', prompt: 'mother now do S9', task: 't' }]
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /^due today$/)).toBe(true)
+    expect(await hotkeys(ui)).toEqual(['x:top-doit-1', 'a:top-ask-1', 'd:top-done-1'])
+    await ui.press({ key: 'top-doit-1' })
+    expect(out.fills).toEqual([{ text: 'mother now do S9', mode: 'replace' }])
+    expect(await hasText(ui, /^▸ ★ b$/)).toBe(true)                 // the item marks that it is in Top 3
+    await ui.unmount()
   })
 }

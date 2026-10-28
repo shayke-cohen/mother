@@ -28,6 +28,7 @@ export type NowItem = {
 
 export type NowCoverage = {
   status: 'ok' | 'partial' | 'couldnt_check'
+  reason?: string
   since?: string
 }
 
@@ -74,6 +75,7 @@ declare module 'claude-code' {
       workspace: string | null
       selected: string | null   // row holding the d/s/t/x hotkeys: an item id or top:<rank>
       snoozing: string | null   // id of the row whose snooze Select is open
+      expanded: string[] | null // sections drawn in full (`on_you`, `neglected`, `suggestion`) and `health`
     }
   }
 }
