@@ -42,7 +42,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
