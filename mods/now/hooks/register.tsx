@@ -9,6 +9,7 @@ export const errorAtom = atom({ plugin: 'mother-now', key: 'error' } as const, n
 export const workspaceAtom = atom({ plugin: 'mother-now', key: 'workspace' } as const, null)
 export const snoozingAtom = atom({ plugin: 'mother-now', key: 'snoozing' } as const, null)
 export const selectedAtom = atom({ plugin: 'mother-now', key: 'selected' } as const, null)
+export const expandedAtom = atom({ plugin: 'mother-now', key: 'expanded' } as const, null)
 
 const PANE = 'mother-now'
 const SNOOZES = ['1h', 'tomorrow', 'next-week'] as const
@@ -196,100 +197,270 @@ export function lowestOpenRank(top: NowTop[]): number | null {
 // controls that are not a row's own (the snooze Select, the swap hint).
 export function rowOfElement(key: string | undefined): string | null {
   if (!key || key.startsWith('snooze-pick-')) return null
-  const top = /^top-done-(\d+)$/.exec(key)
+  const top = /^top-(?:row|done|doit|ask)-(\d+)$/.exec(key)
   if (top) return 'top:' + top[1]
-  return /^(?:done|snooze|maketop|doit)-(.+)$/.exec(key)?.[1] ?? null
+  return /^(?:row|done|snooze|maketop|doit|ask|act\d+)-(.+)$/.exec(key)?.[1] ?? null
+}
+
+// ---- suggested prompts -----------------------------------------------------------------------------
+
+// A prompt the panel offers to put in the prompt box. The panel only fills; the manager presses Enter.
+export type Suggested = { id: string; label: string; text: string }
+
+const PROMPTS_MAX = 5
+const STALE_DAYS = 3
+const LIST_MAX = 8
+
+const listed = (titles: string[]): string =>
+  titles.slice(0, LIST_MAX).map(t => `"${t}"`).join(', ') + (titles.length > LIST_MAX ? `, and ${titles.length - LIST_MAX} more` : '')
+
+// What to ask MOTHER next, built from the list alone: no model call, no network.
+export function suggestedPrompts(doc: NowDoc, top: NowTop[], nowMs: number): Suggested[] {
+  const items = doc.items ?? []
+  const onYou = items.filter(i => i.section === 'on_you')
+  const neglected = items.filter(i => i.section === 'neglected')
+  const out: Suggested[] = []
+  const openTop = top.filter(e => e.state !== 'done')
+  out.push({
+    id: 'next', label: "What's next?",
+    text: `Looking at my Now list (${onYou.length} on me, ${neglected.length} neglected`
+      + (openTop.length ? `; Top 3: ${listed(openTop.map(e => e.title))}` : '')
+      + '), what should I do in the next hour, and what can you take off my plate? Draft anything that reaches another person; don\'t send.',
+  })
+  const routines = doc.routines ?? []
+  if (routines.length > 0) {
+    out.push({
+      id: 'routines', label: `Fix ${routines.length} routine${routines.length === 1 ? '' : 's'}`,
+      text: `These MOTHER routines did not run cleanly: ${routines.map(r => `${r.id} (${r.state})`).join(', ')}. Run mother:doctor, tell me why each one failed, and fix what you can.`,
+    })
+  }
+  const gaps = Object.entries(doc.coverage ?? {}).filter(([, c]) => c && c.status !== 'ok')
+  if (gaps.length > 0) {
+    out.push({
+      id: 'recheck', label: `Re-check ${gaps.map(([s]) => s).join(', ')}`,
+      text: `The last tick couldn't fully check ${gaps.map(([s, c]) => s + (c.reason ? ` (${c.reason})` : '')).join('; ')}. Re-check ${gaps.map(([s]) => s).join(' and ')} now and tell me what's new on me.`,
+    })
+  }
+  const mail = onYou.filter(i => i.signal.startsWith('mail') || i.id.startsWith('mail:'))
+  if (mail.length > 0) {
+    out.push({
+      id: 'replies', label: `Draft ${mail.length} repl${mail.length === 1 ? 'y' : 'ies'}`,
+      text: `Draft replies (Gmail drafts only, never send) for the mail on me in the Now list: ${listed(mail.map(i => i.title))}.`,
+    })
+  }
+  if (neglected.length > 0) {
+    out.push({
+      id: 'neglected', label: `Triage ${neglected.length} neglected`,
+      text: `Go through the ${neglected.length} neglected items in the Now list. For each, propose one of: drop, delegate (name who), or make it mine. Change nothing until I say yes.`,
+    })
+  }
+  const stale = onYou.filter(i => nowMs - Date.parse(i.since) >= STALE_DAYS * 86_400_000)
+  if (stale.length >= 2) {
+    out.push({
+      id: 'stale', label: `Clear ${stale.length} stale`,
+      text: `${stale.length} items have been on me for ${STALE_DAYS}+ days: ${listed(stale.map(i => i.title))}. For each, tell me whether it's still real and what closes it; I'll mark the dead ones done.`,
+    })
+  }
+  return out.slice(0, PROMPTS_MAX)
+}
+
+// The prompt an item's or a Top 3 entry's "Ask" button fills: the item in full, ready to send as is.
+export function askPrompt(title: string, why: string | null | undefined, link: string | null | undefined): string {
+  return `Help me close this out: "${title}"` + (why ? ` — ${why}` : '') + (link ? ` (${link})` : '')
+    + '. What is the fastest next step? Draft anything that reaches another person; don\'t send.'
 }
 
 // ---- the pane --------------------------------------------------------------------------------------
 
 type Ui = ReturnType<Dollar['ui']['resolve']>
 
-function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, snoozing: string | null, selected: string | null, nowMs: number,
-                  go: (args: string[], rowId?: string | null) => Promise<void>) {
+// A link the surface can open; a workspace path (`teams/x/intake.md#1`) stays in the Ask prompt instead.
+const isUrl = (link: string | null | undefined): link is string => !!link && /^https?:\/\//.test(link)
+
+// Rows a section draws before "Show all"; the rest wait behind the toggle.
+const LIMITS: Record<NowItem['section'], number> = { on_you: 5, neglected: 3, suggestion: 3 }
+const SECTIONS: [NowItem['section'], string][] = [['on_you', 'On you'], ['neglected', 'Neglected'], ['suggestion', 'Suggestions']]
+
+function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, snoozing: string | null, selected: string | null,
+                  expandedList: string[] | null, nowMs: number, go: (args: string[], rowId?: string | null) => Promise<void>) {
   const { Box, Text, Button, Link, Select } = ui
   if (!doc) {
     return error
-      ? <Text color="yellow">Couldn't read now.json.</Text>
+      ? <Text color="warning">Couldn't read now.json.</Text>
       : <Text dimColor>Tick runs on the home machine; nothing here yet.</Text>
   }
 
   const tz = doc.timezone
   const at = (iso: string | undefined | null) => clock(iso, tz)
   const items = doc.items ?? []
+  const expanded = new Set(expandedList ?? [])
+  const toggle = (name: string) => update($, expandedAtom, cur => {
+    const set = new Set(cur ?? [])
+    if (set.has(name)) set.delete(name); else set.add(name)
+    return [...set]
+  })
+  const fill = (text: string) => { void $.prompt.fill({ text, mode: 'replace' }) }
   // Top 3 is today's list only: yesterday's (or Friday's) is not shown, and the next day starts fresh.
   const top = doc.top_date === localDate(nowMs, tz) ? doc.top ?? [] : []
-  // Hotkeys belong to the selected row alone: the one the ring is on (`ui.focus`), else the first row.
+  const visible = (kind: NowItem['section']) => {
+    const list = items.filter(i => i.section === kind)
+    return expanded.has(kind) ? list : list.slice(0, LIMITS[kind])
+  }
+  // Hotkeys and the open detail belong to the selected row alone: the one the ring is on (`ui.focus`), else the first.
   const rows = [...top.filter(e => e.state !== 'done').map(e => 'top:' + e.rank),
-                ...['on_you', 'neglected', 'suggestion'].flatMap(k => items.filter(i => i.section === k).map(i => i.id))]
+                ...SECTIONS.flatMap(([k]) => visible(k).map(i => i.id))]
   const current = selected && rows.includes(selected) ? selected : rows[0]
   const hot = (row: string, k: string): string | undefined => (row === current ? k : undefined)
+  const select = (row: string) => update($, selectedAtom, () => row)
   const inTop = new Set(top.map(e => e.item_id).filter(Boolean))
+  const byId = new Map(items.map(i => [i.id, i]))
   const rank = lowestOpenRank(top)
   const gaps = Object.entries(doc.coverage ?? {}).filter(([, c]) => c && c.status !== 'ok') as [string, NowCoverage][]
-  const heading = (text: string) => <Text bold>{text}</Text>
-
-  const row = (i: NowItem) => (
-    <Box key={'row-' + i.id} flexDirection="column">
-      <Box>
-        <Text>{'• ' + i.title}</Text>
-        <Text dimColor>{' ' + age(i.since, nowMs) + ' '}</Text>
-        {i.link ? <Link href={i.link}>↗</Link> : null}
-        {i.unverified_since ? <Text color="yellow">{' unverified'}</Text> : null}
-      </Box>
-      <Box>
-        <Button key={'done-' + i.id} hotkey={hot(i.id, 'd')} autoFocus={i.id === rows[0] ? true : undefined} onPress={() => go(['done', i.id], i.id)}>Done</Button>
-        <Button key={'snooze-' + i.id} hotkey={hot(i.id, 's')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
-        {rank !== null && !inTop.has(i.id)
-          ? <Button key={'maketop-' + i.id} hotkey={hot(i.id, 't')} onPress={() => go(['top', 'swap', String(rank), i.id], i.id)}>Make top 3</Button>
-          : null}
-        {i.actions?.[0]
-          ? <Button key={'doit-' + i.id} hotkey={hot(i.id, 'x')}
-              onPress={() => { void $.prompt.fill({ text: i.actions[0].prompt || `mother now do ${i.actions[0].id}`, mode: 'replace' }) }}>Do it</Button>
-          : null}
-      </Box>
-      {snoozing === i.id
-        ? <Select key={'snooze-pick-' + i.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
-            onSelect={value => go(['snooze', i.id, value], i.id)} />
-        : null}
+  const routines = doc.routines ?? []
+  const stale = nowMs > Date.parse(doc.stale_after)
+  const heading = (text: string, count?: number) => (
+    <Box key={'h-' + text} marginTop={1}>
+      <Text weight="semibold" size="heading">{text}{count !== undefined ? <Text dimColor weight="regular">{` ${count}`}</Text> : null}</Text>
     </Box>
   )
 
-  const section = (name: string, kind: NowItem['section']) => {
-    const list = items.filter(i => i.section === kind)
-    return list.length === 0 ? null : <Box key={kind} flexDirection="column">{heading(`${name} (${list.length})`)}{list.map(row)}</Box>
-  }
-
-  const topEntry = (e: NowTop) => {
-    const done = e.state === 'done'
+  const row = (i: NowItem) => {
+    const open = i.id === current
+    const meta = [i.team, age(i.since, nowMs)].filter(Boolean).join(' · ')
     return (
-      <Box key={'top-row-' + e.rank} flexDirection="column">
+      <Box key={'item-' + i.id} flexDirection="column">
         <Box>
-          <Text dimColor={done} strikethrough={done}>{`${e.rank}. ${e.title}`}</Text>
-          {e.link ? <Link href={e.link}>{' ↗'}</Link> : null}
+          <Button key={'row-' + i.id} plain dimColor={!open} autoFocus={i.id === rows[0] ? true : undefined}
+            onPress={() => select(i.id)}>{(open ? '▾ ' : '▸ ') + (inTop.has(i.id) ? '★ ' : '') + i.title}</Button>
+          <Text dimColor>{' ' + meta + ' '}</Text>
+          {isUrl(i.link) ? <Link href={i.link}>↗</Link> : null}
+          {i.unverified_since ? <Text color="warning">{' unverified'}</Text> : null}
         </Box>
-        {done ? null : <Button key={'top-done-' + e.rank} hotkey={hot('top:' + e.rank, 'd')} autoFocus={'top:' + e.rank === rows[0] ? true : undefined} onPress={() => go(['top', 'done', String(e.rank)])}>Done</Button>}
+        {open ? (
+          <Box flexDirection="column" paddingLeft={2}>
+            {i.why ? <Text dimColor wrap="wrap">{i.why}</Text> : null}
+            <Box flexWrap="wrap" gap="xs">
+              {(i.actions ?? []).map((a, n) => (
+                <Button key={n === 0 ? 'doit-' + i.id : `act${n}-` + i.id} variant={n === 0 ? 'primary' : undefined}
+                  hotkey={n === 0 ? hot(i.id, 'x') : undefined}
+                  onPress={() => fill(a.prompt || `mother now do ${a.id}`)}>{n === 0 && !a.label ? 'Do it' : a.label || a.id}</Button>
+              ))}
+              <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => fill(askPrompt(i.title, i.why, i.link))}>Ask Mother</Button>
+              <Button key={'done-' + i.id} hotkey={hot(i.id, 'd')} onPress={() => go(['done', i.id], i.id)}>Done</Button>
+              <Button key={'snooze-' + i.id} hotkey={hot(i.id, 's')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
+              {rank !== null && !inTop.has(i.id)
+                ? <Button key={'maketop-' + i.id} hotkey={hot(i.id, 't')} onPress={() => go(['top', 'swap', String(rank), i.id], i.id)}>Make top 3</Button>
+                : null}
+            </Box>
+            {snoozing === i.id
+              ? <Select key={'snooze-pick-' + i.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
+                  onSelect={value => go(['snooze', i.id, value], i.id)} />
+              : null}
+          </Box>
+        ) : null}
       </Box>
     )
   }
 
+  const section = (kind: NowItem['section'], name: string) => {
+    const all = items.filter(i => i.section === kind)
+    if (all.length === 0) return null
+    const hidden = all.length - visible(kind).length
+    return (
+      <Box key={kind} flexDirection="column">
+        {heading(name, all.length)}
+        {visible(kind).map(row)}
+        {all.length > LIMITS[kind]
+          ? <Button key={'more-' + kind} plain dimColor onPress={() => toggle(kind)}>{hidden > 0 ? `Show ${hidden} more` : 'Show fewer'}</Button>
+          : null}
+      </Box>
+    )
+  }
+
+  const topEntry = (e: NowTop) => {
+    const done = e.state === 'done'
+    const id = 'top:' + e.rank
+    const action = e.item_id ? byId.get(e.item_id)?.actions?.[0] : undefined
+    return (
+      <Box key={'top-' + e.rank} flexDirection="column">
+        <Box>
+          <Button key={'top-row-' + e.rank} plain dimColor={done} onPress={() => select(id)}>
+            <Text dimColor={done} strikethrough={done}>{`${e.rank}. ${e.title}`}</Text>
+          </Button>
+          {isUrl(e.link) ? <Link href={e.link}>{' ↗'}</Link> : null}
+        </Box>
+        {done ? null : (
+          <Box flexDirection="column" paddingLeft={3}>
+            {e.why ? <Text dimColor wrap="wrap">{e.why}</Text> : null}
+            <Box flexWrap="wrap" gap="xs">
+              {action
+                ? <Button key={'top-doit-' + e.rank} variant="primary" hotkey={hot(id, 'x')}
+                    onPress={() => fill(action.prompt || `mother now do ${action.id}`)}>{action.label || 'Do it'}</Button>
+                : null}
+              <Button key={'top-ask-' + e.rank} hotkey={hot(id, 'a')} onPress={() => fill(askPrompt(e.title, e.why, e.link))}>Ask Mother</Button>
+              <Button key={'top-done-' + e.rank} hotkey={hot(id, 'd')} autoFocus={id === rows[0] ? true : undefined}
+                onPress={() => go(['top', 'done', String(e.rank)])}>Done</Button>
+            </Box>
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  // One line for everything that makes the list less trustworthy; the detail waits behind a toggle.
+  const health = [
+    ...(stale ? [`stale since ${at(doc.stale_after)}`] : []),
+    ...(routines.length ? [`${routines.length} routine${routines.length === 1 ? '' : 's'} ${new Set(routines.map(r => r.state)).size === 1 ? routines[0]?.state : 'not ok'}`] : []),
+    ...(gaps.some(([, c]) => c.status === 'couldnt_check') ? [`couldn't check ${gaps.filter(([, c]) => c.status === 'couldnt_check').map(([s]) => s).join(', ')}`] : []),
+    ...(gaps.some(([, c]) => c.status === 'partial') ? [`partly checked ${gaps.filter(([, c]) => c.status === 'partial').map(([s]) => s).join(', ')}`] : []),
+  ]
+  const healthOpen = expanded.has('health')
+  const prompts = suggestedPrompts(doc, top, nowMs)
   const hint = doc.swap_hint
   const setBy = top[0]?.set_by === 'manager' ? 'you' : 'agent'
   const setAt = top[0]?.set_at ? ` at ${at(top[0].set_at)}` : ''
-  const noItems = items.every(i => !['on_you', 'neglected', 'suggestion'].includes(i.section))
+  const noItems = items.every(i => !SECTIONS.some(([k]) => k === i.section))
 
   return (
     <Box flexDirection="column">
-      <Text bold>{`Now · ${at(doc.generated_at)} · next ${at(doc.next_at)}`}</Text>
-      {error ? <Text color="yellow">{`Couldn't read now.json — showing the ${at(doc.generated_at)} list.`}</Text> : null}
+      <Box>
+        <Text weight="semibold">{`Now · ${at(doc.generated_at)} · next ${at(doc.next_at)}`}</Text>
+      </Box>
+      {error ? <Text color="warning">{`Couldn't read now.json — showing the ${at(doc.generated_at)} list.`}</Text> : null}
+      {health.length > 0 ? (
+        <Box key="health" flexDirection="column">
+          <Box>
+            <Text color="warning">{'⚠ ' + health.join(' · ') + ' '}</Text>
+            <Button key="health-toggle" plain dimColor onPress={() => toggle('health')}>{healthOpen ? 'Hide' : 'Details'}</Button>
+          </Box>
+          {healthOpen ? (
+            <Box flexDirection="column" paddingLeft={2}>
+              {gaps.map(([source, c]) => (
+                <Text key={'gap-' + source} dimColor wrap="wrap">{`${source}: ${c.status === 'partial' ? 'partly checked' : "couldn't check"}${c.since ? ' since ' + at(c.since) : ''}${c.reason ? ' — ' + c.reason : ''}`}</Text>
+              ))}
+              {routines.map(r => <Text key={'routine-' + r.id} dimColor>{`${r.id} ${r.state} at ${at(r.expected)}`}</Text>)}
+            </Box>
+          ) : null}
+        </Box>
+      ) : null}
+      {prompts.length > 0 && !(noItems && top.length === 0 && health.length === 0) ? (
+        <Box key="prompts" flexDirection="column">
+          {heading('Ask Mother')}
+          <Box flexWrap="wrap" gap="xs">
+            {prompts.map((p, n) => <Button key={'prompt-' + p.id} variant={n === 0 ? 'primary' : undefined} onPress={() => fill(p.text)}>{p.label}</Button>)}
+          </Box>
+        </Box>
+      ) : null}
       {top.length > 0 ? (
         <Box key="top" flexDirection="column">
-          {heading('Top 3 today')}
-          <Text dimColor>{`set by ${setBy}${setAt}`}</Text>
+          <Box marginTop={1}>
+            <Text weight="semibold" size="heading">Top 3 today</Text>
+            <Text dimColor>{` set by ${setBy}${setAt}`}</Text>
+          </Box>
           {top.map(topEntry)}
           {hint && hint.title ? (
             <Box>
-              <Text dimColor>{`Consider swapping: ${hint.title}`}</Text>
+              <Text dimColor>{`Consider swapping: ${hint.title} `}</Text>
               {hint.item_id
                 ? <Button key="swap-hint" onPress={() => go(['top', 'swap', String(TOP_MAX), String(hint.item_id)])}>Swap</Button>
                 : null}
@@ -297,24 +468,8 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
           ) : null}
         </Box>
       ) : null}
-      {section('On you', 'on_you')}
-      {section('Neglected', 'neglected')}
-      {section('Suggestions', 'suggestion')}
-      {gaps.length > 0 ? (
-        <Box key="gaps" flexDirection="column">
-          {heading("Couldn't check")}
-          {gaps.map(([source, c]) => (
-            <Text key={'gap-' + source}>{`• ${source}: ${c.status === 'partial' ? 'partly checked' : "couldn't check"}${c.since ? ' since ' + at(c.since) : ''}`}</Text>
-          ))}
-        </Box>
-      ) : null}
-      {(doc.routines ?? []).length > 0 ? (
-        <Box key="routines" flexDirection="column">
-          {heading('Routines')}
-          {doc.routines.map(r => <Text key={'routine-' + r.id}>{`• ${r.id} ${r.state} at ${at(r.expected)}`}</Text>)}
-        </Box>
-      ) : null}
-      {noItems && gaps.length === 0 && top.length === 0 && (doc.routines ?? []).length === 0
+      {SECTIONS.map(([kind, name]) => section(kind, name))}
+      {noItems && health.length === 0 && top.length === 0
         ? <Text>{`Nothing on you. Next check ${at(doc.next_at)}.`}</Text> : null}
     </Box>
   )
@@ -368,6 +523,6 @@ export const register: Register = (on, options) => {
     const bin = await motherBin($, configured)
     const go = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId)
     return paneTree($, $.ui.resolve(e), await read($, docAtom), await read($, errorAtom), await read($, snoozingAtom),
-      await read($, selectedAtom), await $.clock.now(), go)
+      await read($, selectedAtom), await read($, expandedAtom), await $.clock.now(), go)
   })
 }
