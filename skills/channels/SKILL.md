@@ -48,11 +48,11 @@ starts. Start it with `/loop /mother:channels`; it paces itself.
 
 ```bash
 W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
-CH="python3 ${CLAUDE_PLUGIN_ROOT}/bin/mother channels"
 ```
 
-Shell variables don't carry over between Bash calls, and the guard denies a command name it can't compute:
-start each command with the `CH=` line (`CH="…"; $CH plan`) or write the command out.
+`$CH` below is shorthand for `python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels`: write it out in every command
+(`python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels plan`). Never put it in a shell variable: in the workspace
+the guard asks before any command whose name comes from a variable.
 
 Chat tools: `${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind chat --cap read|search|post [--target dm|other]`
 gives the server prefix to call for each. If `chat.read` isn't `ok` (pick exits 3), say so and stop: a loop that can't read is

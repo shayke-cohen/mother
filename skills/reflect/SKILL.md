@@ -45,7 +45,8 @@ a project constraint, a pointer, a verified connector quirk — and above all **
 to how the agent works** (`type: feedback`, with **Why:** and **How to apply:**). Those are the
 highest-value memories and the easiest to lose.
 
-Apply `mother:remember`'s rules: dedupe first, distil, absolute dates, one index line each.
+Apply `mother:remember`'s rules: dedupe first, distil, absolute dates, one index line each, added with
+`mother memory index memory/<slug>.md` (never by editing `MEMORY.md`: the guard asks for that).
 
 ## 3. Sweep the open loops
 
@@ -87,7 +88,8 @@ and meeting files. Flag:
   ```bash
   for f in memory/*.md; do b=${f#memory/}; [ "$b" = MEMORY.md ] && continue; grep -q "($b)" memory/MEMORY.md || echo "unindexed: $b"; done
   ```
-  plus index lines pointing at missing files.
+  plus index lines pointing at missing files. Index each unindexed file with `mother memory index
+  memory/<file>`; a line pointing at a missing file is reported to the manager, not edited away.
 - **People files** — `people/*.md` must hold work items only. Flag any line that reads as an assessment,
   mood or personal detail, and propose removing it.
 - **Blocked items** — anything in **Blocked** for 3+ weeks: the blocker may be gone, or it should go.

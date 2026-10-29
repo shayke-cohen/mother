@@ -203,25 +203,49 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `bypassPermissions`, an ask gets no output and is logged as `pass` only when the session's cwd is outside the
   workspace, or `policy.bypass_passes_asks` is `true` (an invalid config counts as `false`). An ask for the guard's
   own files, `grants.json` or a persona file never passes.
-- **ask, every mode** (`kind: "grants"`): a Write/Edit/MultiEdit/NotebookEdit of `<workspace>/.mother/grants.json`,
-  or a shell command that writes and names `grants.json` by a path that reaches the workspace (the same reach test
-  as the guard's own files). **deny** under PAUSED. `mother grant add|remove` is the one writer (below).
-- **ask, every mode** (`kind: "persona"`): an edit (Write/Edit/MultiEdit/NotebookEdit, or a shell write naming it)
-  of the workspace's `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `memory/MEMORY.md`, or anything under `.claude/`
-  (names compared casefolded). PAUSED leaves it an ask. A channel session for the manager asks for
-  `memory/MEMORY.md` too.
+- **ask, every session and mode** (`kind: "grants"`, `op: "cli"`): a shell command whose text, with quotes and
+  backslashes dropped and casefolded, has `grant add` (or `grant` followed by a word holding `$` or a backtick):
+  `mother grant add` in any form. Never passed by bypass, whatever `policy.bypass_passes_asks` says; **deny** under
+  PAUSED and `MOTHER_DRY_RUN`. `mother grant remove|list` get no decision.
+- **ask, every mode** (`kind: "grants"`): a Write/Edit/MultiEdit/NotebookEdit of `<workspace>/.mother/grants.json`;
+  a shell command that writes (the self-edit write test, plus `tar`, `unzip`, `ditto`, `patch`, `cpio`, `pax`,
+  `mkdir`, and `git checkout|restore|reset|apply|am|stash|clone|pull|merge|cherry-pick|rebase|worktree`) and whose
+  normalised text (heredoc bodies of plain commands blanked, quotes and backslashes dropped, casefolded) names
+  `grants.json` or `.mother` (not after a home directory: `~/`, `$HOME/`, `/Users/<x>/`), when it reaches the
+  workspace (run from inside it and not first `cd`-ing to an absolute or home path, or naming the workspace path,
+  `$W/` or `$MOTHER_WORKSPACE`). **deny** under PAUSED. `mother grant add|remove` is the one writer (below).
+- **ask, every mode** (`kind: "persona"`): an edit (Write/Edit/MultiEdit/NotebookEdit) of the workspace's
+  `AGENTS.md`, `.mcp.json`, `memory/MEMORY.md`, any `CLAUDE.md` in it, or anything under a `.claude/` folder in it
+  (casefolded); a shell write, under the same normalisation and reach test, naming `agents.md`, `claude.md`,
+  `.mcp.json`, `.claude` (not after a home directory), `memory.md`, or a glob or `$` right after `memory/`.
+  PAUSED leaves it an ask. A channel session for the manager asks for `memory/MEMORY.md` too. `mother memory
+  index` is the unprompted writer of the index (§7).
 - **deny** (`kind: "approve-line"`): an in-app session tool (`start_session`, `send_message`, `SendMessage`, …)
-  whose input has, in any string, a line that starts `mother approve` (any case, any whitespace between the words,
-  Unicode format characters ignored). Only the manager types approvals.
+  whose input has, in any string, a line that starts `mother approve` (any case, any or no whitespace between the
+  words, Unicode format characters dropped; CR, VT, FF, U+001C-U+001E, U+0085, U+2028 and U+2029 end a line too).
+  Only the manager types approvals.
 - **ask** (`kind: "outbound_unknown"`), only in a session whose cwd is the workspace or under it (any role; outside
   the workspace these get no decision, as before): a shell command (Bash, a `Monitor` `command`, or an MCP
-  `run_in_terminal` `command`) that runs, at a command position after quotes and backslashes are dropped, `curl`,
-  `wget`, `nc`, `ncat`, `netcat`, `socat`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `telnet`, `http`, `https`,
-  `httpie` or `xh`, whatever the arguments; `python*`/`node` with `-c`/`-e`/`-p`/`--eval`/`-` or a heredoc, `-m`
-  of a network module (`http.server`, `urllib`, `smtplib`, …) or a `://` argument; `gh`/`glab api` with
-  `--hostname` or a `://` endpoint; `WebFetch`; `WebSearch` whose query holds a URL (`://`, `www.`, or
-  `host.tld/…`); an MCP tool whose name has a `navigate` part, or a `…batch` tool whose input names one; a
-  `Monitor` with a `ws` target; and an MCP call the domain rules give no decision whose operation is not a read
+  `run_in_terminal` `command`; heredoc bodies of plain commands and of a `mother` invocation are data) that has
+  `/dev/tcp/` or `/dev/udp/` anywhere, or any simple command (split on `;&|()` and newlines, `$( )`, `<( )` and
+  backticks included, words after assignments, redirects and the wrappers `env sudo doas command builtin exec
+  nohup time nice xargs timeout watch caffeinate parallel stdbuf …` and keywords `if then do else …` skipped)
+  whose program word starts with `$` (but not `${CLAUDE_PLUGIN_ROOT}/…` unless the line assigns it) or holds
+  `$(` or a backtick; or whose program, quotes and backslashes dropped, is `curl`, `wget`, `nc`, `ncat`, `netcat`,
+  `socat`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `telnet`, `http`, `https`, `httpie` or `xh` (also as the word
+  after `-exec`/`-execdir`/`-ok`, or behind xargs/parallel/watch/env/sudo); `sh|bash|zsh|… -c TEXT` and `eval`
+  with TEXT classified the same way; `python*`, `node`, `perl`, `ruby`, `php`, `deno`, `bun`, `swift` or
+  `osascript` with a `://` argument, `-m` of a network module (`http.server`, `urllib`, `smtplib`, …), or inline
+  code (`-c`, `-e`, `-E`, `-r`, `-p`, `--eval`, `--print`, `-`, a heredoc) whose text matches a network or process
+  marker (`socket`, `urllib`, `http`, `requests`, `httpx`, `fetch`, `subprocess`, `system`, `popen`, `pty`,
+  `/dev/tcp`, `curl`, `wget`, `smtplib`, `ftplib`, `telnet`, `net::`, `lwp`, `open-uri`, `child_process`,
+  `spawn`, `exec`, a backtick; osascript inline always counts), never when the script is the `mother` CLI;
+  `git push` with a URL or `user@host:` argument, `git remote add|set-url`; `open` with a URL; `nslookup`,
+  `dig`, `host` or `drill` with `$(` or a backtick; `gh`/`glab api` with `--hostname` or a `://` endpoint;
+  `WebFetch`; `WebSearch` whose query holds a URL (`://`, `www.`, or `host.tld/…`); an MCP tool whose name has a
+  `navigate` part, or a `…batch` tool whose input names one; an MCP tool whose name has a `javascript`,
+  `evaluate`, `eval` or `js` part; an MCP tool whose name has a `fetch` part and whose input has a url-like field
+  or a `://` value; a `Monitor` with a `ws` target; and an MCP call the domain rules give no decision whose operation is not a read
   verb but has a write verb (the write list plus `copy`, `batch`, `save`, `store`, `import`, `sync`, `deploy`,
   `notify`, `broadcast`, `duplicate`, `clone`, `emit`, `dispatch`, `enqueue`, `commit`, `release`) and whose
   server is not the app's own (`mcp__ccd_…`). PAUSED and `MOTHER_DRY_RUN` deny it.
@@ -261,8 +285,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   url, http, browse or navigate part and whose input has no `url`, `uri`, `href`, `path`, `file`, `dest` or
   `destination` field; `set_session_model` and `set_session_effort` on the session itself; the in-app session
   tools, which keep the rules above (so a send to a non-hub session still asks, a line starting `mother approve`
-  is denied, and in bypass an ask stays an ask in the workspace); `Skill`, `CronCreate` (only a `prompt` that,
-  stripped, starts `/mother:hub` or `mother hub tail --once`, with no control or format character), `CronDelete`, `CronList`, `TaskStop`, `ToolSearch`, `TodoWrite`. Everything else (`Write`, `Edit`, `WebFetch`,
+  is denied, and in bypass an ask stays an ask in the workspace); `Skill`, `CronCreate` (only a `prompt` exactly equal to
+  one of `HUB_CRON_PROMPTS` in the guard: `/mother:hub`, or the skill's cron prompt `mother hub tail --once — run
+  it and handle the lines; if it prints nothing, end the turn at once`), `CronDelete`, `CronList`, `TaskStop`, `ToolSearch`, `TodoWrite`. Everything else (`Write`, `Edit`, `WebFetch`,
   `WebSearch`, `Agent`, other commands, other MCP calls) is denied with "the hub session can only do hub work; ask
   the manager to open a session for this". Other sessions are unchanged.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
@@ -809,6 +834,14 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   stop on conflict and say so. Never force-push.
 - `mother home set|check|move` manages `workspace.home_machine`; `mother:routine` calls `home check` first
   and exits with a `runs.md` line when this isn't the home machine.
+
+**`mother memory index <memory-file> [--title T] [--hook H]`** is the unprompted writer of `memory/MEMORY.md`:
+for an existing `memory/<name>.md` (not `MEMORY.md`; name of letters, digits, `.`, `_`, `-`) it appends one line
+`- [Title](<name>.md) — hook` (title from `--title`, else the file's frontmatter `name`, else the file stem; hook from
+`--hook`, else `description`; both one line, control and format characters dropped, `[ ]` in the title become
+`( )`, at most 80 / 150 characters), creating the index from the workspace template when missing. Idempotent: no
+change when a line already links `(<name>.md)`. Atomic, under `.mother/memory.lock`. Exit 1 for anything else,
+2 for usage. Prints `{ok, changed, line}`.
 
 ## 7. Skills in v0
 

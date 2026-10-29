@@ -29,7 +29,8 @@ reported as "no link".
 Run the **`mother:dots`** skill. It:
 - runs the agent actions the manager approved on the previous dots message (`do A1 A3`, `ok`), replies
   authored by the manager only; anything reaching a team channel or the tracker goes through a grant, and
-  anything a grant can't cover stays a draft for the manager;
+  anything a grant can't cover stays a draft for the manager; a `mother grant add` waits for the manager's
+  approval (the guard asks), so unattended it is reported as waiting in the runs note;
 - gathers the window across every source with an `ok` read capability, plus todos, intake, projects and
   memory;
 - finds cross-source links, cites each, keeps conflicts visible;

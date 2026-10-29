@@ -108,9 +108,13 @@ headless run nobody answers and the call doesn't happen. Messages to the manager
 that acts on something the manager said adds a **grant** to `<workspace>/.mother/grants.json` first, with
 `mother grant add <scope> <target> --by <manager chat id> --cites <message link or ts> [--channel ID] [--uses N]
 [--hours H] [--run ID]` (and `mother grant remove --run ID` when done). That CLI is the only writer: it checks the
-grant exactly as the hook will and refuses one the hook would ignore, and refuses everything while `PAUSED`. Any
-other write to `grants.json` (Write, Edit, a shell command) **asks in every mode, bypass included, and is denied
-under PAUSED**, so text in a message can't have a session forge a grant silently. What it writes:
+grant exactly as the hook will and refuses one the hook would ignore, and refuses to add or remove while `PAUSED`.
+**The hook asks the manager before every `mother grant add`**, in every session and mode (bypass included,
+whatever `policy.bypass_passes_asks` says), and denies it under PAUSED or a dry run: a session that obeyed a
+message could otherwise mint its own grant. So in an unattended run the grant step waits for the manager's
+approval, and the routine reports it as waiting in its runs note. `mother grant remove` and `list` pass. Any other
+write to `grants.json` or anything under `.mother/` (Write, Edit, a shell command) asks the same way. What it
+writes:
 
 ```json
 { "grants": [ {
@@ -205,23 +209,32 @@ touch <workspace>/.mother/PAUSED
 While that file exists the hook denies every outbound call, including the manager's own DM and drafts. Reads
 are unaffected. It lives in `.mother/`, which is gitignored, so a sync can neither spread nor remove it.
 Removing it is the manager's call: the agent's attempt to delete it, or to edit `config.json`, the ledger, the
-log, the hook itself or `~/.mother/workspace`, is an ask. While it exists, any write to `.mother/grants.json`
-(`mother grant` included) and any `outbound_unknown` call (below) is denied too.
+log, the hook itself or `~/.mother/workspace`, is an ask. While it exists the hook also denies a direct write
+to `.mother/grants.json` (or anything under `.mother/`), `mother grant add`, and any `outbound_unknown` call
+(below); `mother grant` itself refuses to add or remove.
 
 ## Standing instructions and outbound the hook can't place
 
-- **Persona files.** An edit to the workspace's `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, anything under `.claude/`,
-  or `memory/MEMORY.md` (by Write, Edit or a shell command) **asks in every mode, bypass included**: later sessions
-  obey these files, so a message must not be able to plant a rule in them.
+- **Persona files.** An edit to the workspace's `AGENTS.md`, `.mcp.json` or `memory/MEMORY.md`, any `CLAUDE.md`
+  or anything under a `.claude/` folder in it (by Write, Edit or a shell command; names compared without case,
+  quotes or backslashes, and a glob or `$` right after `.mother/`, `memory/` or `.claude/` counts) **asks in every
+  mode, bypass included**: later sessions obey these files, so a message must not be able to plant a rule in
+  them. The memory index has one unprompted writer, `mother memory index memory/<file>.md`, which adds one
+  `- [Title](file.md) — hook` line for an existing memory file.
 - **Approve lines in session messages.** A card brief (`start_session` prompt) or a message into a session whose
   text has a line starting `mother approve` is **denied**. Only the manager types approvals.
 - **`outbound_unknown`.** In a session that runs in the workspace (any role), these ask, and PAUSED or a dry run
-  denies them: a shell command (Bash, a Monitor `command`, the terminal panel) that runs `curl`, `wget`, `nc`,
-  `ncat`, `netcat`, `socat`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `telnet`, `http`/`https` (httpie) or `xh`, or
-  `python`/`node` with inline code (`-c`, `-e`, stdin, a heredoc), a network module (`-m http.server`) or a URL
-  argument; `WebFetch`; a `WebSearch` whose query names a URL; a browser navigation tool; a Monitor `ws`
-  target; and an MCP call whose operation writes but that the hook can't place in a domain. Outside the
-  workspace these are unchanged (normal permissions).
+  denies them: a shell command (Bash, a Monitor `command`, the terminal panel, and the text of `sh -c` or
+  `eval`) that runs `curl`, `wget`, `nc`, `ncat`, `netcat`, `socat`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`,
+  `telnet`, `http`/`https` (httpie) or `xh`; whose command name comes from a variable, `$( )` or backticks
+  (`${CLAUDE_PLUGIN_ROOT}/…` excepted); that touches `/dev/tcp` or `/dev/udp`; `git push <url>`, `git remote
+  add|set-url`; `open <url>`; `nslookup|dig|host` with a computed name; python, node, perl, ruby, php or
+  osascript with inline code that names the network or a process (`socket`, `urllib`, `http`, `requests`,
+  `fetch`, `subprocess`, `system`, `popen`, `curl` …; osascript always), a network module (`-m http.server`)
+  or a URL argument (the `mother` CLI fed a heredoc never counts); `WebFetch`; a `WebSearch` whose query names a
+  URL; a browser navigation tool or a tool that runs script in a page (`javascript`, `evaluate`); an MCP
+  `fetch` tool given a URL; a Monitor `ws` target; and an MCP call whose operation writes but that the hook can't
+  place in a domain. Outside the workspace these are unchanged (normal permissions).
 
 ## Bypass mode
 

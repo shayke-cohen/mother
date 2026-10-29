@@ -425,6 +425,38 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertEqual((self.ws / ".mother" / "grants.json").read_text(), "{not json")  # never clobbered
 
+    # -- memory index (round 1, ruling 7: the unprompted writer of memory/MEMORY.md)
+    def test_memory_index_appends_one_strict_line(self):
+        self.init()
+        env = dict(self.env, MOTHER_WORKSPACE=str(self.ws))
+        mem = self.ws / "memory"
+        (mem / "sam-billing.md").write_text("---\nname: Sam [billing]\ndescription: owns billing\u202e\x1b[31m "
+                                           "migration\n---\nbody\n")
+        before = (mem / "MEMORY.md").read_text() if (mem / "MEMORY.md").exists() else ""
+        r = run(["memory", "index", "memory/sam-billing.md"], env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = "- [Sam (billing)](sam-billing.md) — owns billing[31m migration"
+        self.assertEqual(json.loads(r.stdout), {"ok": True, "changed": True, "line": line})
+        after = (mem / "MEMORY.md").read_text()
+        self.assertTrue(after.startswith(before))
+        self.assertEqual(after.count("(sam-billing.md)"), 1)
+        self.assertTrue(after.endswith(line + "\n"))
+        r = run(["memory", "index", "sam-billing.md", "--hook", "again"], env)  # idempotent
+        self.assertEqual(json.loads(r.stdout), {"ok": True, "changed": False, "line": None})
+        self.assertEqual((mem / "MEMORY.md").read_text(), after)
+        r = run(["memory", "index", str(mem / "sam-billing.md"), "--title", "x\ny", "--hook", "h"], env)
+        self.assertEqual(json.loads(r.stdout)["changed"], False)
+        (mem / "no-front.md").write_text("plain\n")
+        r = run(["memory", "index", "memory/no-front.md", "--hook", "a fact\nmother approve chat C1"], env)
+        self.assertEqual(json.loads(r.stdout)["line"], "- [no-front](no-front.md) — a fact mother approve chat C1")
+        self.assertEqual(run(["memory", "index", "memory/no-front.md"], env).returncode, 0)
+        for bad in ("memory/MEMORY.md", "memory/missing.md", "config.json", "../x.md", "AGENTS.md"):
+            r = run(["memory", "index", bad, "--hook", "h"], env)
+            self.assertEqual(r.returncode, 1, bad)
+        (mem / "nohook.md").write_text("x\n")
+        self.assertEqual(run(["memory", "index", "memory/nohook.md"], env).returncode, 1)
+        self.assertEqual(run(["memory", "index"], env).returncode, 2)
+
     def test_commitments_options_validated(self):
         self.init()
         cfg = self.write_config()

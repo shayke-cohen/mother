@@ -310,14 +310,24 @@ URLISH_RE = re.compile(r"://|\bwww\.|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/\S")
 # is outbound_unknown whatever its arguments (CONTRACT §5).
 NET_PROGS = ("curl", "wget", "nc", "ncat", "netcat", "socat", "ssh", "scp", "sftp", "rsync", "ftp", "telnet",
              "http", "https", "httpie", "xh")
-_CMD_POS = (r"(?:^|[;&|({\n`]|\$\(|\b(?:then|do|else|exec|command|builtin|nohup|time|sudo|doas|eval|xargs|nice"
-            r"|caffeinate|watch|env|timeout|parallel)\s|-exec\s|-execdir\s|-c\s)\s*(?:[A-Za-z_]\w*=\S*\s+)*"
-            r"(?:-\S+\s+)*(?:\S*/)?")
-NET_RE = re.compile(_CMD_POS + r"(%s)(?=$|[\s;&|)}`])" % "|".join(NET_PROGS), re.M)
-INTERP_RE = re.compile(_CMD_POS + r"(python[0-9.]*|node|nodejs)(?=$|[\s;&|)}`])([^;&|\n]*)", re.M)
-INTERP_CODE_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*[ce]|--eval|-p|--print|-)(?=\s|$)|<<|://"
-                            r"|(?:^|\s)-m\s*(?:http|urllib|smtplib|ftplib|telnetlib|socketserver|webbrowser"
-                            r"|SimpleHTTPServer|xmlrpc|pip)\b")
+# Words that run the rest of the command (skipped to find the program; their later words are checked too).
+SH_WRAPPERS = {"env", "sudo", "doas", "command", "builtin", "exec", "nohup", "time", "nice", "xargs", "timeout",
+               "watch", "caffeinate", "parallel", "then", "do", "else", "elif", "if", "while", "until", "!", "{",
+               "}", "stdbuf", "unbuffer", "ionice", "chronic", "noglob", "nocorrect"}
+SH_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"}
+SH_INTERP_RE = re.compile(r"^(?:python[0-9.]*|node|nodejs|perl[0-9.]*|ruby|php[0-9.]*|osascript|deno|bun|swift)$")
+# Inline interpreter code counts only when it can reach the network or start a process (CONTRACT §5).
+NET_MARKERS_RE = re.compile(r"socket|urllib|http|requests|httpx|fetch|subprocess|system|popen|pty|/dev/(?:tcp|udp)"
+                            r"|curl|wget|smtplib|ftplib|telnet|net::|lwp|open-uri|child_process|spawn|exec|`", re.I)
+NET_MODULES_RE = re.compile(r"^(?:http|urllib|smtplib|ftplib|telnetlib|socketserver|webbrowser|SimpleHTTPServer"
+                            r"|xmlrpc|pip)\b")
+MOTHER_ARG_RE = re.compile(r"(?:^|/)(?:bin/)?mother$")
+MOTHER_HEREDOC_RE = re.compile(r"(?:^|[\s;&|(\"'])(?:\$\{?CLAUDE_PLUGIN_ROOT\}?/bin/|[\w./-]*/bin/)?mother[\"']?\s[^\n]*<<")
+PLUGIN_CMD_RE = re.compile(r"^\"?\$\{?CLAUDE_PLUGIN_ROOT\}?\"?/")
+# Shell writes beyond SHELL_WRITE_RE that can land a protected file (archives, patches, git checkouts).
+EXTRA_WRITE_RE = re.compile(r"\b(?:tar|bsdtar|unzip|ditto|patch|cpio|pax|mkdir|git\s+(?:checkout|restore|reset"
+                            r"|apply|am|stash|clone|pull|merge|cherry-pick|rebase|worktree))\b")
+GRANTS_CLI_RE = re.compile(r"\bgrant\s+(?:add\b|\S*[$`])")
 SECRET_RE = re.compile(
     r"xox[abposr]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}"
     r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bsk-[A-Za-z0-9_-]{20,}")
@@ -444,7 +454,6 @@ def protected_paths(ctx):
 
 
 # Files a later session obeys as standing instructions (CONTRACT §5): an edit to one always asks, bypass included.
-PERSONA_NAMES = ("AGENTS.md", "CLAUDE.md", ".mcp.json", "MEMORY.md", ".claude")
 
 
 def grants_path(ctx):
@@ -460,8 +469,8 @@ def persona_path(fp, ctx):
     if not inside(f, ws) or f == ws:
         return False
     rel = os.path.relpath(f, ws).replace(os.sep, "/")
-    return rel in ("agents.md", "claude.md", ".mcp.json", "memory/memory.md") or rel == ".claude" \
-        or rel.startswith(".claude/")
+    parts = rel.split("/")
+    return rel in ("agents.md", ".mcp.json", "memory/memory.md") or parts[-1] == "claude.md" or ".claude" in parts
 
 
 def graphql_file_is_query(seg, cwd):
@@ -1865,8 +1874,6 @@ def shell_self_edit(cmd, run, cwd, ctx):
         test_ws = re.search(r"\b(?:mother_workspace|mother_state_dir)=", shell)
         marks = [] if test_ws else [r"\$\{?mother_workspace\b", r"\.mother/workspace\b"]
         homes.append((ctx.ws, marks, ["config.json", "PAUSED", "ledger.json", "guard.log"], "config"))
-        homes.append((ctx.ws, marks, ["grants.json"], "grants"))
-        homes.append((ctx.ws, marks, list(PERSONA_NAMES), "persona"))
     for base, marks, names, kind in homes:
         # exact case as a bare word (so prose "paused" is not PAUSED), any case after a slash (macOS ignores case)
         if not any(re.search(r"(?<![\w.-])" + re.escape(x) + r"(?![\w.-])", text) or
@@ -1884,6 +1891,44 @@ def shell_self_edit(cmd, run, cwd, ctx):
     return "config" if POINTER_RE.search(POINTER_READ_RE.sub(" ", text)) else False
 
 
+def _home_prefixed(t, pos):
+    """The match at t[pos] sits right after a home directory (`~/`, `$home/`, `/users/<x>/`): not the workspace."""
+    pre = t[max(0, pos - 64):pos]
+    return bool(re.search(r"(?:~|\$\{?home\}?|/users/[^/\s]+|/home/[^/\s]+)/$", pre))
+
+
+def shell_protected(cmd, run, cwd, ctx):
+    """"grants" or "persona" when a shell command writes and names a protected workspace file, on a normalised
+    text (quotes and backslashes dropped, casefolded): grants.json or anything under .mother/; AGENTS.md,
+    CLAUDE.md (anywhere in the workspace), .mcp.json, .claude/, MEMORY.md; or a glob or `$` right after
+    `.mother/`, `memory/` or `.claude/`. A `cd` into those followed by a write, and `git checkout|restore|reset …
+    -- <them>`, count. `~/.claude` (home, not the workspace) does not. The command must reach the workspace: run
+    from inside it (unless it first cds to an absolute path), or name it, `$W/` or `$MOTHER_WORKSPACE`."""
+    if not ctx.ws or not (shell_writes(cmd, run) or EXTRA_WRITE_RE.search(run)):
+        return None
+    t = re.sub(r"[\"'\\]", "", run_text(cmd, quotes=False)).casefold()
+    ws = os.path.realpath(ctx.ws).casefold()
+    home = os.path.expanduser("~").casefold()
+    forms = [ws] + (["~" + ws[len(home):], "$home" + ws[len(home):], "${home}" + ws[len(home):]]
+                    if ws.startswith(home + os.sep) else []) + ([ws[len("/private"):]] if ws.startswith("/private/") else [])
+    here = os.path.realpath(cwd).casefold() if cwd else ""
+    leaves = re.search(r"(?:^|[\s;&|(])cd\s+(?:/|~|\$\{?home)", t)
+    reach = ((here == ws or here.startswith(ws + os.sep)) and not leaves) or any(f in t for f in forms) \
+        or re.search(r"\$\{?(?:w|mother_workspace)\}?/", t)
+    if not reach:
+        return None
+
+    def hit(pattern):
+        return any(not _home_prefixed(t, m.start()) for m in re.finditer(pattern, t))
+
+    if hit(r"grants\.json|(?<![\w-])\.mother(?![\w-])"):
+        return "grants"
+    if hit(r"(?<![\w.-])(?:agents|claude)\.md(?![\w.-])|\.mcp\.json|(?<![\w-])\.claude(?![\w-])|memory\.md"
+           r"|(?:^|[\s/=])memory/\S*[*?\[$]"):
+        return "persona"
+    return None
+
+
 def wa_shell_names_config(cmd):
     """A shell write that shell_self_edit already matched also names config.json (quoted paths included)."""
     text = run_text(cmd, quotes=False)
@@ -1895,12 +1940,20 @@ def classify_bash(cmd, cwd, ctx):
     if wa:
         return wa
     run = run_text(cmd)
+    norm = re.sub(r"[\"'\\]", "", run_text(cmd, quotes=False)).casefold()
+    if GRANTS_CLI_RE.search(norm):
+        return act("grants", "grants_file", "`mother grant add`: a new grant lets later writes through without a "
+                                            "question", op="cli")
     touched = shell_self_edit(cmd, run, cwd, ctx)
-    if touched == "grants":
-        return act("grants", "grants_file", "a shell command that could change .mother/grants.json")
-    if touched == "persona":
-        return act("persona", "persona_files", "a shell command that could change the workspace's standing "
-                                               "instructions (AGENTS.md, CLAUDE.md, .mcp.json, .claude/, MEMORY.md)")
+    if not touched:
+        prot = shell_protected(cmd, run, cwd, ctx)
+        if prot == "grants":
+            return act("grants", "grants_file", "a shell command that could change .mother/ (grants, ledger, "
+                                                "guard state)")
+        if prot == "persona":
+            return act("persona", "persona_files", "a shell command that could change the workspace's standing "
+                                                   "instructions (AGENTS.md, CLAUDE.md, .mcp.json, .claude/, "
+                                                   "MEMORY.md)")
     if touched:
         # config.json holds the whatsapp block: only `mother whatsapp setup`, in the manager's terminal, changes it
         if wa_shell_names_config(cmd) and wa_block_now(ctx):
@@ -2108,20 +2161,213 @@ def classify_mcp(tool, inp):
                board=first(flat, "originBoardId", "boardId", "board_id"), creates=n, text=text_of(flat))
 
 
-def net_command(cmd):
-    """The network-capable program a shell command runs, or None: one of NET_PROGS at a command position (quotes
-    and backslashes ignored, so `c'u'rl` is curl), or python/node with inline code (-c, -e, stdin, a heredoc), a
-    network module (-m http.server) or a URL argument. Heredoc bodies fed to a plain command are data."""
-    text = re.sub(r"[\"'\\\\]", "", run_text(cmd, quotes=False))
-    m = NET_RE.search(text)
-    if m:
-        return m.group(1)
-    for seg in CMD_SPLIT_RE.split(text):  # a code-host API call aimed at another host or a full URL
-        if API_RE.search(seg) and re.search(r"--hostname\b|://", seg):
-            return "gh/glab api to another host"
-    for m in INTERP_RE.finditer(text):
-        if INTERP_CODE_RE.search(m.group(2)):
-            return m.group(1)
+def _match_close(s, i, open_ch="(", close_ch=")"):
+    """Index of the bracket closing the one at s[i] (quotes respected), or len(s) - 1."""
+    depth, j, n = 0, i, len(s)
+    while j < n:
+        c = s[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "'":
+            k = s.find("'", j + 1)
+            j = n if k < 0 else k + 1
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return n - 1
+
+
+def sh_commands(s):
+    """The simple commands of a shell line, each a list of raw words (quotes kept), nested `$( )`, `<( )` and
+    backtick commands included as commands of their own. A rough lexer: enough to find command names."""
+    cmds, words, cur, i, n = [], [], [], 0, len(s)
+
+    def end_word():
+        if cur:
+            words.append("".join(cur))
+            del cur[:]
+
+    def end_cmd():
+        end_word()
+        if words:
+            cmds.append(list(words))
+            del words[:]
+
+    while i < n:
+        c = s[i]
+        if c in " \t":
+            end_word()
+            i += 1
+        elif c in "\n;&|()":
+            end_cmd()
+            i += 1
+        elif c == "\\":
+            cur.append(s[i:i + 2])
+            i += 2
+        elif c == "'":
+            j = s.find("'", i + 1)
+            j = n - 1 if j < 0 else j
+            cur.append(s[i:j + 1])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                if s[j] == "\\":
+                    j += 2
+                    continue
+                if s.startswith("$(", j):
+                    k = _match_close(s, j + 1)
+                    cmds.extend(sh_commands(s[j + 2:k]))
+                    j = k + 1
+                    continue
+                if s[j] == "`":
+                    k = s.find("`", j + 1)
+                    k = n - 1 if k < 0 else k
+                    cmds.extend(sh_commands(s[j + 1:k]))
+                    j = k + 1
+                    continue
+                j += 1
+            cur.append(s[i:j + 1])
+            i = j + 1
+        elif s.startswith(("$(", "<(", ">("), i):
+            k = _match_close(s, i + 1)
+            cmds.extend(sh_commands(s[i + 2:k]))
+            cur.append(s[i:k + 1])
+            i = k + 1
+        elif c == "`":
+            k = s.find("`", i + 1)
+            k = n - 1 if k < 0 else k
+            cmds.extend(sh_commands(s[i + 1:k]))
+            cur.append(s[i:k + 1])
+            i = k + 1
+        else:
+            cur.append(c)
+            i += 1
+    end_cmd()
+    return cmds
+
+
+def _unq(w):
+    return re.sub(r"[\"'\\]", "", w)
+
+
+def _prog_index(words):
+    """(index of the program word, wrappers skipped) for one simple command; index None when there is none."""
+    i, wrappers, n = 0, [], len(words)
+    while i < n:
+        w = words[i]
+        u = _unq(w)
+        if re.match(r"^[A-Za-z_]\w*=", w):
+            i += 1
+        elif re.match(r"^\d*(?:[<>]|&>)", w):
+            i += 1 if re.search(r"[<>]\S", w) else 2
+        elif u in SH_WRAPPERS:
+            wrappers.append(u)
+            i += 1
+            while i < n and _unq(words[i]).startswith("-") and len(_unq(words[i])) > 1:
+                i += 1
+            if u == "timeout" and i < n and re.match(r"^\d", _unq(words[i])):
+                i += 1
+        else:
+            return i, wrappers
+    return None, wrappers
+
+
+def _interp_reason(base, args, text):
+    """Why an interpreter call counts (inline code with network or process markers, a network module, a URL), or
+    None. A `mother` CLI path as the script never counts."""
+    ua = [_unq(a) for a in args]
+    if ua and MOTHER_ARG_RE.search(ua[0]):
+        return None
+    if any("://" in a for a in ua):
+        return "%s with a URL" % base
+    for k, a in enumerate(ua):
+        if a == "-m" and k + 1 < len(ua) and NET_MODULES_RE.match(ua[k + 1]):
+            return "%s -m %s" % (base, ua[k + 1])
+        if a.startswith("-m") and NET_MODULES_RE.match(a[2:]):
+            return "%s %s" % (base, a)
+    inline = any(a in ("-", "--eval", "--print", "-p") or re.match(r"^-[A-Za-z]*[ceEr]$", a) for a in ua) \
+        or any(a.startswith("<<") for a in args)
+    if not inline:
+        return None
+    if base == "osascript":
+        return "osascript with inline script"  # AppleScript drives Mail and Messages with no network words
+    body = " ".join(ua) + (text if any(a.startswith("<<") for a in args) else "")
+    m = NET_MARKERS_RE.search(body)
+    return "%s inline code using %s" % (base, m.group(0)) if m else None
+
+
+def _cmd_reason(words, text, depth):
+    i, wrappers = _prog_index(words)
+    if i is None:
+        return None
+    raw = words[i]
+    if (raw.lstrip("\"'").startswith("$") and not (PLUGIN_CMD_RE.match(raw) and "CLAUDE_PLUGIN_ROOT=" not in text)) \
+            or "$(" in raw or "`" in raw:
+        return "a command name built from a variable or substitution"
+    prog = _unq(raw)
+    base = os.path.basename(prog)
+    args = words[i + 1:]
+    ua = [_unq(a) for a in args]
+    if base in NET_PROGS:
+        return base
+    if {"xargs", "parallel", "watch", "env", "sudo", "doas", "timeout", "nice"} & set(wrappers):
+        for a in ua:  # these take option values the lexer can't tell from the program: any later word counts
+            if os.path.basename(a) in NET_PROGS:
+                return os.path.basename(a)
+    for k, a in enumerate(ua):  # find -exec runs the next word
+        if a in ("-exec", "-execdir", "-ok", "-okdir") and k + 1 < len(ua) and os.path.basename(ua[k + 1]) in NET_PROGS:
+            return os.path.basename(ua[k + 1])
+    if base in SH_SHELLS or base == "eval":
+        inner = None
+        if base == "eval":
+            inner = " ".join(ua)
+        else:
+            for k, a in enumerate(ua):
+                if re.match(r"^-[A-Za-z]*c[A-Za-z]*$", a) and k + 1 < len(ua):
+                    inner = ua[k + 1]
+                    break
+        if inner and depth < 3:
+            return net_command(inner, depth + 1)
+        return None
+    if SH_INTERP_RE.match(base):
+        return _interp_reason(base, args, text)
+    if base == "git":
+        sub = [a for a in ua if not a.startswith("-")]
+        if sub[:1] == ["push"] and any("://" in a or re.match(r"^[\w.-]+@[\w.-]+:", a) for a in sub[1:]):
+            return "git push to a URL"
+        if sub[:1] == ["remote"] and sub[1:2] and sub[1] in ("add", "set-url"):
+            return "git remote %s" % sub[1]
+    if base == "open" and any("://" in a or a.startswith("www.") for a in ua):
+        return "open with a URL"
+    if base in ("nslookup", "dig", "host", "drill") and any("$(" in a or "`" in a for a in args):
+        return "%s with a computed name" % base
+    if base in ("gh", "glab") and ua[:1] == ["api"] and any(a.startswith("--hostname") or "://" in a for a in ua):
+        return "gh/glab api to another host"
+    return None
+
+
+def net_command(cmd, depth=0):
+    """Why a shell command can send data off this machine, or None: /dev/tcp or /dev/udp anywhere; a command name
+    built from `$VAR`, `$( )` or backticks (`${CLAUDE_PLUGIN_ROOT}/…` excepted); a program in NET_PROGS (quotes and
+    backslashes ignored, so `c'u'rl` is curl), also behind env/sudo/xargs/find -exec; `sh -c` / `eval` text,
+    classified the same way; python/node/perl/ruby/php/osascript inline code with a network or process marker, a
+    network module or a URL argument (the `mother` CLI never counts); `git push <url>`, `git remote add|set-url`;
+    `open <url>`; `nslookup|dig|host` with a computed name; gh/glab api to another host. Heredoc bodies fed to a
+    plain command, or to `mother`, are data."""
+    text = run_text(cmd, quotes=False, bodies=bool(MOTHER_HEREDOC_RE.search(cmd)))
+    if re.search(r"/dev/(?:tcp|udp)/", _unq(text)):
+        return "/dev/tcp or /dev/udp"
+    for words in sh_commands(text):
+        why = _cmd_reason(words, text, depth)
+        if why:
+            return why
     return None
 
 
@@ -2152,7 +2398,7 @@ def approve_line(inp):
                     yield s
     import unicodedata
     for s in strings(inp):
-        s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+        s = LINE_BREAKS_RE.sub("\n", "".join(ch for ch in s if unicodedata.category(ch) != "Cf"))
         if APPROVE_ANY_RE.search(s):
             return True
     return False
@@ -2239,6 +2485,11 @@ def classify(tool, inp, cwd, ctx):
     if a is None and in_workspace(cwd, ctx):
         if mcp_navigates(tool, inp):
             return act("outbound_unknown", "outbound_unknown", "a browser navigation (%s)" % tool)
+        toks = set(tokens_of(tool.split("__")[-1]))
+        if toks & {"javascript", "evaluate", "eval", "js"}:
+            return act("outbound_unknown", "outbound_unknown", "script run in a page (%s)" % tool)
+        if "fetch" in toks and (hub_bad_field(inp) or "://" in json.dumps(inp)):
+            return act("outbound_unknown", "outbound_unknown", "a fetch of a URL (%s)" % tool)
         if mcp_unknown_write(tool, inp):
             return act("outbound_unknown", "outbound_unknown", "a write through %s, which the guard can't place "
                                                               "(chat, mail, calendar, tracker, code, docs)" % tool)
@@ -2270,7 +2521,8 @@ def green(a, ctx, auto):
 # ------------------------------------------------------------------ session approvals (attended runs)
 
 APPROVE_RE = re.compile(r"^\s*mother approve (tracker|chat) ([A-Za-z0-9_-]+)\s*$", re.I)
-APPROVE_ANY_RE = re.compile(r"^\s*mother\s+approve\b", re.I | re.M)
+APPROVE_ANY_RE = re.compile(r"^\s*mother\s*approve\b", re.I | re.M)
+LINE_BREAKS_RE = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 SESSION_APPROVAL_MAX_HOURS = 12
 
 
@@ -2616,6 +2868,8 @@ def decide(a, ctx, transcript=None):
     p = paused(ctx)
     if p and a["kind"] == "grants":
         return "deny", "Outbound is PAUSED (%s exists). Blocked: %s." % (p, a["what"])
+    if a["kind"] == "grants" and a.get("op") == "cli":
+        return "ask", "%s. Confirm the manager asked for this grant." % a["what"]
     if a["kind"] == "grants":
         return "ask", "%s. Grants are written by `mother grant add`, which checks them; a direct edit could forge " \
                       "one. Confirm this is you." % a["what"]
@@ -2812,7 +3066,7 @@ def reader_argv(cmd):
                 return None
             word.append(cmd[i + 1:j])
             have, i = True, j + 1
-        elif re.match(r"[A-Za-z0-9_.:/@=,+%^#-]", c) and not (c == "#" and not have):
+        elif re.match(r"[A-Za-z0-9_.:/@=,+%^#?-]", c) and not (c == "#" and not have):
             word.append(c)
             have, i = True, i + 1
         else:
@@ -2892,6 +3146,9 @@ HUB_SELF_TOOLS = {"mcp__ccd_session_mgmt__set_session_model", "mcp__ccd_session_
 HUB_NET_TOKENS = {"fetch", "download", "upload", "export", "url", "http", "browse", "navigate"}
 HUB_NET_FIELDS = {"url", "uri", "href", "path", "file", "dest", "destination"}
 HUB_ID_CAP = 5
+# The hub skill's only cron prompts (skills/hub/SKILL.md quotes them; tests check the two agree).
+HUB_CRON_PROMPTS = ("/mother:hub",
+                    "mother hub tail --once — run it and handle the lines; if it prints nothing, end the turn at once")
 
 
 def hub_session_path(ws):
@@ -3069,9 +3326,7 @@ def hub_session(tool, inp, cwd, ctx, sid=None):
     no further check, or "normal" to run the normal rules (the in-app session tools keep their ask)."""
     deny = "deny", "%s (%s)." % (HUB_DENY, tool)
     if tool == "CronCreate":  # the cron fallback wake only: a standing prompt could carry anything
-        prompt = str(inp.get("prompt") or "").strip()
-        return None if not hub_odd_chars(prompt) and (prompt.startswith("/mother:hub") or
-                                                      prompt.startswith("mother hub tail --once")) else deny
+        return None if str(inp.get("prompt") or "") in HUB_CRON_PROMPTS else deny
     if tool in HUB_TOOLS:
         return None
     if tool == "Monitor":
