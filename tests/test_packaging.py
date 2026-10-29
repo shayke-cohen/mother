@@ -133,9 +133,12 @@ class HookRegistrationTest(unittest.TestCase):
             self.assertEqual(len(hits), 1, "%r matched by %s" % (tool, hits))
         # what guard.py has a rule for in every session goes to it directly; the fast path takes only the tools
         # whose rules are its four cases (Read/Grep/Glob/LS, the hub's and the sub-agents' allow-lists)
-        fast_ok = {"Read", "Grep", "Glob", "LS"} | set(g.HUB_PASS_TOOLS) | set(g.SUBAGENT_TOOLS["reader"])
+        fast_ok = {"Read", "Grep", "Glob", "LS", "ToolSearch"} | set(g.HUB_PASS_TOOLS)
         for tool in sorted(names - fast_ok):
             self.assertTrue(matcher_hits(main[0], tool), tool)
+        for tool in ("Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch", "Monitor", "Skill",
+                     "Agent", "Task", "CronCreate", "CronDelete", "TaskStop", "SendMessage", "ListAgents"):
+            self.assertTrue(matcher_hits(main[0], tool), "%s has rules in every session: it must go to guard.py" % tool)
 
     def test_the_fast_path_knows_the_guards_sub_agents_and_hub_files(self):
         import importlib.util

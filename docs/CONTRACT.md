@@ -9,9 +9,10 @@ Every part of v0 is built against this file. Change it first, then the code.
 ```
 .claude-plugin/plugin.json, marketplace.json
 bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now
-hooks/hooks.json           PreToolUse → hooks/guard.py (Read/Grep/Glob/LS via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`
+hooks/hooks.json           PreToolUse → hooks/guard.py (every other tool via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`
 hooks/guard.py             approval guard (see §5)
-hooks/guard_fast.py        the guard's fast path for Read/Grep/Glob/LS (see §5, hook registration)
+hooks/guard_fast.py        the guard's fast path: every tool the main matcher doesn't take; escalates to guard.py for
+                           channel roles, MOTHER's sub-agents, hub and hub-fed sessions and the grant key (see §5)
 skills/<name>/SKILL.md     user- and routine-facing skills, invoked as `mother:<name>`
 agents/<name>.md           read-only sub-agents MOTHER dispatches: `mother:reader`, `mother:critic` (see §5c)
 routines/<id>.md           routine definitions: what a scheduled run does (reads config, calls skills)
@@ -601,7 +602,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **Accepted risks.** These are known and left open on purpose:
   - A session outside the workspace keeps Claude Code's normal permissions. The guard's shell allow-list applies
     only in the workspace, so there `python3 lib/channels.py …` or a `python3 -c` that calls `grants.main` runs
-    with no question from the guard; Claude Code's own permission prompt is the only check there.
+    with no question from the guard; Claude Code's own permission prompt is the only check there. Likewise a
+    session there can still rewrite its own transcript through the shell when the command hides the path (a
+    variable, a computed name, a script) from the guard's text check.
   - From a hub-fed session (other than the hub session itself, which denies them), `Agent` with remote
     isolation, `Skill schedule`, `CronCreate`, `mcp__ccd_session_mgmt__clear_session` /
     `unarchive_session` and `set_session_permission_mode` are not fenced beyond the hub role: they keep their
