@@ -2007,6 +2007,12 @@ def classify(tool, inp, cwd, ctx):
             if fp.casefold() in protected_paths(ctx):
                 return act("config", "guard_config", "an edit to the guard's own files: " + fp)
         return None
+    if tool in IN_APP_SESSION_TOOLS:
+        # not outbound, but a token pasted into a message or card brief is still caught
+        if SECRET_RE.search(json.dumps(inp)):
+            return act("credential", "credentials", "a session message or brief whose content looks like a "
+                                                    "credential (%s)" % tool)
+        return None
     if not tool.startswith("mcp__"):
         return None
     if any(SENSITIVE_KEYS.match(str(k)) for k in inp.keys()):
@@ -2461,7 +2467,7 @@ def channel_session(tool, inp, cwd, ctx, role):
         return "deny", "%s has no workspace: refusing %s." % (who, tool)
     ws = os.path.realpath(ctx.ws)
     plugin = os.path.realpath(os.path.dirname(HERE))
-    if tool in CHANNEL_NO_TOOLS:
+    if tool in CHANNEL_NO_TOOLS or tool in IN_APP_SESSION_TOOLS:
         return "deny", "%s can't use %s." % (who, tool)
     if tool in ("Write", "Edit", "MultiEdit"):
         fp = os.path.realpath(os.path.join(cwd or ws, os.path.expanduser(str(inp.get("file_path") or ""))))
@@ -2534,6 +2540,8 @@ def subagent_session(kind, tool, inp, cwd, ctx):
     manager's own DM and drafts included — and so is any tool outside the agent's list. Returns
     (decision, reason) or None (not outbound: normal permissions)."""
     who = "the %s sub-agent" % kind
+    if tool in IN_APP_SESSION_TOOLS:
+        return "deny", "%s can't use %s: it reaches the manager's sessions." % (who, tool)
     if tool.startswith("mcp__"):
         if kind == "critic":
             return "deny", "%s reads only the files it is given, not %s." % (who, tool)

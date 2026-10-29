@@ -201,6 +201,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
   server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
   different targets in one call, is denied too (`rules/outbound.md`).
+- **deny**: the desktop app's own session tools in a reader/critic sub-agent or a channel session (§5c).
 - **allow**: the desktop app's own session tools (`start_session`, `dismiss_task`, `send_message`, `list_sessions` on the `ccd_session` / `ccd_session_mgmt` servers, `SendMessage`, `ListAgents`), by exact name; they reach only the manager's own sessions (§5e). Look-alikes on other servers are classified normally.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
@@ -569,7 +570,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `also` = other keys found in the text. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
   file from a crash into the dated file, and deletes dated files 7 or more days old.
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
-  connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `done`, `snooze`, `show` (below).
+  connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below).
   `mother hub help` works without a workspace. `--json` gives machine output; without it the output is short text.
 - **launchd job.** Label `com.mother.hub`, plist `~/Library/LaunchAgents/com.mother.hub.plist`.
   `ProgramArguments` = absolute python, absolute `bin/mother`, `hub`, `watch`; `EnvironmentVariables` =
@@ -608,8 +609,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   unreadable one counts as nothing pending.
 - **`hub.json`.** `{version: 1, last_wake, inbox_cursor (an inbox line id), next_update (counter behind the U ids),
   routed: [at most 50 {line_id, key, decision, session_id?, at}], pending: [{key, title, link, read, next_step,
-  raised_at, name}], updates: [{id (U<n>), key, title, why, link, at, state: open|done|snoozed, snooze_until?}]}`.
+  proposed_at, raised_at (null until a card is raised), name}], updates: [{id (U<n>), key, title, why, link, at, state: open|done|snoozed, snooze_until?}]}`.
   Readers must tolerate any field missing.
+- **`pending raised <key> --name <slug>`.** Stamps `raised_at` (now) and `name` on that `pending` entry; exit 1 when there is no such pending key, 2 on bad usage. `decide` `propose` leaves `raised_at` null (keeping an earlier stamp for the same key); the hub raises a card for each entry without `raised_at`, oldest `proposed_at` first, within its card budget, then stamps it. An unraised entry keeps the watcher's sweep firing. The sweep matches started cards by the stamped `name`.
 - **`sessions.json`.** `{version: 1, sessions: {<key>: {session_id, name, title, link (a `claude://` URL or null,
   stored as given), also: [key], opened_at, last_routed_at, unseen (int), state: live|dropped}}}`. A key maps to a
   session when it, or any key in the line's `also`, is a session key or is in a session's `also`; only `live`
@@ -640,7 +642,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `snooze_until`; an ended snooze is open again at the next write. Exit 1 for an unknown id, 2 for a bad word.
 - **Update expiry.** On every write an update goes when it is older than `hub.update_ttl_hours` **working** hours
   (`now.working_hours`, counted from the later of `at` and `snooze_until`) or when its key has a live session.
-- **Guard.** The desktop app's own session tools reach only the manager's sessions: `mcp__ccd_session__start_session`, `mcp__ccd_session__dismiss_task`, `mcp__ccd_session_mgmt__send_message`, `mcp__ccd_session_mgmt__list_sessions`, `SendMessage` and `ListAgents` are not outbound, so the guard allows them with no ask (§5). Exact names only: a same-named tool on another server (`mcp__other__send_message`) is classified like any other tool. The credential checks still apply to them.
+- **Guard.** The desktop app's own session tools reach only the manager's sessions: `mcp__ccd_session__start_session`, `mcp__ccd_session__dismiss_task`, `mcp__ccd_session_mgmt__send_message`, `mcp__ccd_session_mgmt__list_sessions`, `SendMessage` and `ListAgents` are not outbound, so the guard allows them with no ask (§5). Exact names only: a same-named tool on another server (`mcp__other__send_message`) is classified like any other tool. The credential-shaped-content check (`SECRET_RE`) still applies to their input, so a token pasted into a message or card brief is denied. A reader or critic sub-agent and a channel session (either role) are denied all six.
 - **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
   posts or writes to a tracker.
   Adapters (`lib/hub_sources.py`) are keyed `<cap>:<connector>` (`chat:slack`, `mail:gmail`, `tracker:jira`,

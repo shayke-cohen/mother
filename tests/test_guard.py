@@ -1588,9 +1588,6 @@ class TestWhatsappConfigBlock(WhatsappCase):
         self.assertEqual(self.wa("script -q /tmp/session.log")[0], "none")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class InAppSessions(GuardCase):
     """The desktop app's session tools reach only the manager's own sessions, so they are not outbound."""
@@ -1612,3 +1609,20 @@ class InAppSessions(GuardCase):
         self.assertEqual(got, "ask")
         got, _ = self.run_guard("mcp__ccd_session_mgmt__send_message_to_channel", {"channel": TEAM, "text": "hi"})
         self.assertEqual(got, "ask")
+
+    def test_token_in_session_message_still_caught(self):
+        for name in self.NAMES[:3]:
+            got, why = self.run_guard(name, {"session_id": "s1", "message": "use ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"})
+            self.assertEqual(got, "deny", "%s %s" % (name, why))
+
+    def test_restricted_sessions_cannot_use_session_tools(self):
+        inp = {"session_id": "s1", "message": "hi", "prompt": "x"}
+        for name in self.NAMES:
+            for agent in ("reader", "critic"):
+                self.expect("deny", name, inp, agent=agent)
+            for role in ("manager", "team"):
+                self.expect("deny", name, inp, env={"MOTHER_CHANNEL_ROLE": role})
+
+
+if __name__ == "__main__":
+    unittest.main()

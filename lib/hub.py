@@ -944,10 +944,13 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
             title = it.get("title") or line.get("title") or key
             link = it.get("link") or line.get("link") or ""
             if dec == "propose":
+                prev = next((p for p in h["pending"] if p.get("key") == key), {})
                 h["pending"] = [p for p in h["pending"] if p.get("key") != key]
                 h["pending"].append({"key": key, "title": title, "link": link, "read": it.get("read") or "",
-                                     "next_step": it.get("next_step") or "", "raised_at": stamp,
-                                     "name": it.get("name") or ""})
+                                     "next_step": it.get("next_step") or "",
+                                     "proposed_at": prev.get("proposed_at") or stamp,
+                                     "raised_at": prev.get("raised_at"),
+                                     "name": it.get("name") or prev.get("name") or ""})
             elif dec == "now":
                 old = [u for u in h["updates"] if u.get("key") == key and u.get("state") != "done"]
                 if old:
@@ -1045,6 +1048,29 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
         save_json(ws, "sessions.json", sess)
         _save_hub(ws, h, sess, cfg, at)
     print(json.dumps({"ok": True, "key": key, "action": sub}) if as_json else "%s: %s" % (sub, key), file=out)
+    return 0
+
+
+def pending_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> int:
+    try:
+        pos, o = _parse_flags(args, ("name",))
+    except ValueError as e:
+        print("mother hub pending: %s" % e, file=sys.stderr)
+        return 2
+    if len(pos) != 2 or pos[0] != "raised" or not isinstance(o.get("name"), str) or not o["name"]:
+        print("usage: mother hub pending raised <key> --name <slug>", file=sys.stderr)
+        return 2
+    key, stamp = pos[1], _iso(at)
+    with locked(ws):
+        h, sess = _hub_doc(ws), _sessions_doc(ws)
+        hit = next((p for p in h["pending"] if p.get("key") == key), None)
+        if hit is None:
+            print("no pending proposal for %s" % key, file=sys.stderr)
+            return 1
+        hit["raised_at"], hit["name"] = stamp, o["name"]
+        _save_hub(ws, h, sess, cfg, at)
+    print(json.dumps({"ok": True, "key": key, "name": o["name"], "raised_at": stamp}) if as_json
+          else "raised: %s as %s" % (key, o["name"]), file=out)
     return 0
 
 
@@ -1164,6 +1190,8 @@ def main(args, ws, cfg, at) -> int:
         return 0
     if verb == "session":
         return session_cmd(ws, cfg, at, rest, as_json, sys.stdout)
+    if verb == "pending":
+        return pending_cmd(ws, cfg, at, rest, as_json, sys.stdout)
     if verb in ("done", "snooze"):
         return update_cmd(ws, cfg, at, verb, rest, as_json, sys.stdout)
     if verb == "show":

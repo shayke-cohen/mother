@@ -646,6 +646,27 @@ class Verbs(unittest.TestCase):
         rc = hub.session_cmd(self.ws, self.cfg, kw.get("at", self.AT), list(args), False, buf)
         return rc, buf.getvalue()
 
+    def pending(self, *args, **kw):
+        import io
+        buf = io.StringIO()
+        rc = hub.pending_cmd(self.ws, self.cfg, kw.get("at", self.AT), list(args), False, buf)
+        return rc, buf.getvalue()
+
+    def test_pending_raised_stamps_name_and_time(self):
+        self.decide({"line_id": "x:1", "key": "PLAT-2", "decision": "propose", "title": "P"})
+        self.assertEqual(self.hub_doc()["pending"][0]["name"], "")
+        later = datetime(2026, 10, 29, 10, 30, tzinfo=UTC)
+        rc, _ = self.pending("raised", "PLAT-2", "--name", "plat-2", at=later)
+        self.assertEqual(rc, 0)
+        p = self.hub_doc()["pending"][0]
+        self.assertEqual((p["name"], p["raised_at"]), ("plat-2", "2026-10-29T10:30:00Z"))
+        self.assertEqual(p["proposed_at"], "2026-10-29T10:00:00Z")
+
+    def test_pending_raised_unknown_key_exits_1(self):
+        rc, _ = self.pending("raised", "PLAT-404", "--name", "x")
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.pending("raised", "PLAT-404")[0], 2)
+
     def test_tail_collapses_by_key_and_skips_resolved(self):
         self.add(line(key="PLAT-1", at="2026-10-29T09:00:00Z", title="old"),
                  line(key="PLAT-1", at="2026-10-29T09:05:00Z", title="new", also=["PLAT-9"]),
@@ -699,7 +720,8 @@ class Verbs(unittest.TestCase):
         self.assertEqual(h["updates"][0]["state"], "open")
         self.assertEqual(h["updates"][0]["why"], "w")
         self.assertEqual(h["pending"][0]["key"], "PLAT-2")
-        self.assertEqual(h["pending"][0]["raised_at"], "2026-10-29T10:00:00Z")
+        self.assertEqual(h["pending"][0]["proposed_at"], "2026-10-29T10:00:00Z")
+        self.assertIsNone(h["pending"][0]["raised_at"])
         self.assertEqual(h["pending"][0]["name"], "plat-2")
         self.decide({"line_id": "x:3", "key": "PLAT-1", "decision": "now", "title": "T2"})
         self.assertEqual(len(self.hub_doc()["updates"]), 1)
