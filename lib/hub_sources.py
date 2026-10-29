@@ -100,19 +100,19 @@ class ChatSlack(Adapter):
             for m in (res or {}).get("messages") or []:
                 add(ch, m)
 
-        for key, seen in list(threads.items())[:MAX_THREADS * 2]:
+        for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
             if "/" not in key:
                 continue
             ch, tts = key.split("/", 1)
-            if float(seen) < at.timestamp() - THREAD_DAYS * 86400:
+            if float(tseen) < at.timestamp() - THREAD_DAYS * 86400:
                 del threads[key]
                 continue
             res = client.call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
             for m in (res or {}).get("messages") or []:
                 if m.get("ts") == tts:
                     continue
-                if float(m.get("ts", 0)) > float(seen):
-                    add(ch, dict(m, thread_ts=tts), floor=float(seen))
+                if float(m.get("ts", 0)) > float(tseen):
+                    add(ch, dict(m, thread_ts=tts), floor=float(tseen))
                     threads[key] = max(float(threads[key]), float(m["ts"]))
 
         # Search indexes late and `after` is exclusive by day: look back a day, overlap 10 minutes, dedupe by ts.
