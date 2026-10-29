@@ -711,6 +711,15 @@ class CliTest(unittest.TestCase):
         self.assertIn("skipped — outside active hours", disp)
 
 
+class HubHelp(unittest.TestCase):
+    def test_hub_help(self):
+        env = dict(os.environ, MOTHER_STATE_DIR=tempfile.mkdtemp())
+        env.pop("MOTHER_WORKSPACE", None)
+        r = run(["hub", "help"], env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("install", r.stdout)
+
+
 class TestWhatsappConfig(unittest.TestCase):
     # Reuse CliTest's fixtures without inheriting (and re-running) its tests.
     setUp, tearDown, init, write_config = CliTest.setUp, CliTest.tearDown, CliTest.init, CliTest.write_config

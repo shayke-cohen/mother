@@ -463,6 +463,139 @@ class Loop(unittest.TestCase):
         self.assertTrue(self.made[0].closed)  # cleanup still ran
 
 
+class Install(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name) / "ws"
+        self.ws.mkdir()
+        self.plist = Path(self.tmp.name) / "LaunchAgents" / "com.mother.hub.plist"
+        self.cfg = {"version": 1, "manager": {"email": "dana@example.com", "timezone": "UTC",
+                                              "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"]},
+                    "connectors": {"tracker": "jira", "code": "github"}, "workspace": {"home_machine": "laptop"},
+                    "hub": {"enabled": True, "connections": {
+                        "tracker": {"command": "example-server", "args": [], "env": {}},
+                        "code": {"cli": "gh", "command": "ignored"}}}}
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        self.calls = []
+        self.which = {"example-server": "/opt/x/bin/example-server", "gh": "/opt/homebrew/bin/gh"}.get
+
+    def ctl(self, *a):
+        self.calls.append(a)
+        return 0, ""
+
+    def run_install(self):
+        return hub.install(self.ws, self.cfg, plist_path=self.plist, ctl=self.ctl, which=self.which,
+                           python="/usr/bin/python3", mother="/plug/bin/mother")
+
+    def test_plist_has_absolute_paths_and_path_env(self):
+        import plistlib
+        self.assertEqual(self.run_install(), 0)
+        d = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(d["Label"], "com.mother.hub")
+        self.assertEqual(d["ProgramArguments"], ["/usr/bin/python3", "/plug/bin/mother", "hub", "watch"])
+        env = d["EnvironmentVariables"]
+        self.assertEqual(env["MOTHER_WORKSPACE"], str(self.ws))
+        self.assertEqual(env["PATH"], "/opt/x/bin:/opt/homebrew/bin:/usr/bin:/bin")
+        self.assertTrue(d["KeepAlive"])
+        self.assertTrue(d["StandardOutPath"].endswith(".mother/hub/watcher.log"))
+        self.assertTrue(any(c[0] == "bootstrap" for c in self.calls))
+
+    def test_install_fails_on_missing_command(self):
+        self.which = {"gh": "/opt/homebrew/bin/gh"}.get
+        self.assertEqual(self.run_install(), 1)
+        self.assertFalse(self.plist.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_install_refuses_off_home(self):
+        self.cfg["workspace"]["home_machine"] = "elsewhere"
+        self.assertEqual(self.run_install(), 2)
+        self.assertFalse(self.plist.exists())
+
+    def test_uninstall_boots_out_and_removes(self):
+        self.run_install()
+        self.calls.clear()
+        self.assertEqual(hub.uninstall(plist_path=self.plist, ctl=self.ctl), 0)
+        self.assertFalse(self.plist.exists())
+        self.assertEqual(self.calls[0][0], "bootout")
+
+    def test_check_table(self):
+        import io
+        import hub_mcp
+
+        class C:
+            tools = ["mcp__x__get-issues", "mcp__x__create-issue"]
+            closed = False
+
+            def close(self):
+                self.closed = True
+        c = C()
+        buf = io.StringIO()
+        rc = hub.check(self.cfg, factory=lambda cfg, have: {"tracker": c}, gh_user=lambda: None,
+                       which=self.which, out=buf)
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertIn("tracker | ok |", buf.getvalue())
+        self.assertIn("code | ok |", buf.getvalue())
+        self.assertTrue(c.closed)
+        c.tools = ["mcp__x__create-issue"]
+        buf = io.StringIO()
+        self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"tracker": c}, gh_user=lambda: None,
+                                   which=self.which, out=buf), 1)
+        self.assertIn("tracker | \u2717 | no read tool", buf.getvalue())
+        buf = io.StringIO()
+
+        def bad():
+            raise RuntimeError("not logged in")
+        hub.check(self.cfg, factory=lambda cfg, have: {"tracker": hub_mcp.McpError("other", "boom")}, gh_user=bad,
+                  which=self.which, out=buf)
+        self.assertIn("tracker | \u2717 | other: boom", buf.getvalue())
+        self.assertIn("code | \u2717 | not logged in", buf.getvalue())
+
+
+class Status(unittest.TestCase):
+    AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+
+    def run_status(self):
+        import io
+        buf = io.StringIO()
+        return hub.status(self.ws, self.AT, out=buf), buf.getvalue()
+
+    def beat(self, secs_ago, active=True):
+        hub.save_json(self.ws, "watcher.json", {"at": hub_sources.iso(self.AT - timedelta(seconds=secs_ago)),
+                                                "every_seconds": 120, "active": active,
+                                                "sources": {"tracker": {"status": "ok"}}, "errors": []})
+
+    def test_status_stale_exit_2(self):
+        self.beat(300)
+        rc, out = self.run_status()
+        self.assertEqual(rc, 2)
+        self.assertIn("STALE", out)
+
+    def test_missing_watcher_exit_2(self):
+        self.assertEqual(self.run_status()[0], 2)
+
+    def test_fresh_watcher_without_hub_is_ok_and_says_never_woke(self):
+        self.beat(60)
+        rc, out = self.run_status()
+        self.assertEqual(rc, 0)
+        self.assertIn("hub: never woke", out)
+
+    def test_old_beat_outside_active_hours_is_not_stale(self):
+        self.beat(5000, active=False)
+        self.assertEqual(self.run_status()[0], 0)
+
+    def test_stale_hub_wake_exit_2(self):
+        self.beat(60)
+        hub.save_json(self.ws, "hub.json", {"last_wake": hub_sources.iso(self.AT - timedelta(seconds=900))})
+        self.assertEqual(self.run_status()[0], 2)
+
+
 class FakeClient:
     tools = []
 

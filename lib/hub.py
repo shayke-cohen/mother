@@ -481,6 +481,253 @@ def _close(c) -> None:
         pass
 
 
-def main(args, ws, cfg, at) -> int:
-    print("mother hub: state core only (watch, status and the rest land with later tasks)")
+LABEL = "com.mother.hub"
+USAGE = """mother hub <verb>
+  watch       run the watcher in the foreground (what the launchd job runs); home machine only
+  install     write ~/Library/LaunchAgents/com.mother.hub.plist and load it (home machine only)
+  uninstall   unload the job and remove the plist
+  check       one read per hub.connections entry, under the plist's environment: cap | ok/✗ | reason; exit 1 if any fails
+  status      watcher and hub heartbeats; exit 2 if either is stale or the watcher never ran
+(tail, decide, session, done, snooze, show: later)"""
+
+
+def default_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / (LABEL + ".plist")
+
+
+def _conns(cfg: dict) -> dict:
+    c = _hub_cfg(cfg).get("connections")
+    return {k: v for k, v in (c if isinstance(c, dict) else {}).items() if k in CAPS and isinstance(v, dict)}
+
+
+def _program(conn: dict) -> str:
+    """The executable a connection needs: `gh` when `cli` is set (it wins over `command`), else `command`."""
+    return conn.get("cli") or conn.get("command") or ""
+
+
+def resolve_programs(cfg: dict, which=None) -> Tuple[Dict[str, str], List[str]]:
+    """({cap: absolute path}, [names that were not found])."""
+    import shutil
+    which = which or shutil.which
+    found, missing = {}, []
+    for cap, conn in _conns(cfg).items():
+        name = _program(conn)
+        path = which(name) if name else None
+        if path:
+            found[cap] = os.path.abspath(path)
+        else:
+            missing.append(name or "(%s: no command)" % cap)
+    return found, missing
+
+
+def launch_path(found: Dict[str, str]) -> str:
+    dirs = []  # type: List[str]
+    for p in found.values():
+        d = os.path.dirname(p)
+        if d not in dirs:
+            dirs.append(d)
+    for d in ("/usr/bin", "/bin"):
+        if d not in dirs:
+            dirs.append(d)
+    return ":".join(dirs)
+
+
+def plist(ws: Path, cfg: dict, python: str, mother: str, found: Optional[Dict[str, str]] = None) -> str:
+    """The launchd job: absolute python and bin/mother, MOTHER_WORKSPACE and a PATH from the connection commands."""
+    import plistlib
+    if found is None:
+        found, _ = resolve_programs(cfg)
+    doc = {"Label": LABEL,
+           "ProgramArguments": [python, mother, "hub", "watch"],
+           "EnvironmentVariables": {"MOTHER_WORKSPACE": str(ws), "PATH": launch_path(found)},
+           "KeepAlive": True,
+           "RunAtLoad": True,
+           "StandardOutPath": str(hub_dir(ws) / "watcher.log"),
+           "StandardErrorPath": str(hub_dir(ws) / "watcher.log")}
+    return plistlib.dumps(doc).decode("utf-8")
+
+
+def launchctl(*args) -> Tuple[int, str]:
+    import subprocess
+    try:
+        p = subprocess.run(["launchctl"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return p.returncode, (p.stdout or "").strip()
+
+
+def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=None, mother=None) -> int:
+    ctl = ctl or launchctl
+    plist_path = Path(plist_path or default_plist_path())
+    code = home_status(cfg)
+    if code:
+        print("mother hub install: not the home machine (see `mother home check`)", file=sys.stderr)
+        return code
+    if not _conns(cfg):
+        print("mother hub install: hub.connections is empty; nothing to watch", file=sys.stderr)
+        return 1
+    found, missing = resolve_programs(cfg, which)
+    if missing:
+        print("mother hub install: not found on PATH: %s" % ", ".join(missing), file=sys.stderr)
+        return 1
+    python = python or os.path.abspath(sys.executable)
+    mother = mother or os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin", "mother"))
+    hub_dir(ws).mkdir(parents=True, exist_ok=True)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(plist(ws, cfg, python, mother, found))
+    domain = "gui/%d" % os.getuid()
+    ctl("bootout", "%s/%s" % (domain, LABEL))  # a reinstall replaces the loaded job; not loaded is fine
+    rc, out = ctl("bootstrap", domain, str(plist_path))
+    if rc:
+        print("mother hub install: launchctl bootstrap failed: %s" % out, file=sys.stderr)
+        return 1
+    print("installed %s (logs: %s)" % (plist_path, hub_dir(ws) / "watcher.log"))
     return 0
+
+
+def uninstall(plist_path=None, ctl=None) -> int:
+    ctl = ctl or launchctl
+    plist_path = Path(plist_path or default_plist_path())
+    ctl("bootout", "gui/%d/%s" % (os.getuid(), LABEL))
+    existed = plist_path.exists()
+    if existed:
+        plist_path.unlink()
+    print("removed %s" % plist_path if existed else "not installed")
+    return 0
+
+
+def _gh_user() -> None:
+    import subprocess
+    try:
+        p = subprocess.run(["gh", "api", "user"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(str(e))
+    if p.returncode:
+        raise RuntimeError((p.stderr or "gh api user failed").strip()[:200])
+
+
+def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
+    """One read per connection, under the PATH the plist sets: an MCP server must start and answer `tools/list`
+    with at least one tool on its adapter's read allow-list; `gh` must answer `gh api user`. Never calls a write
+    tool. Prints `cap | ok/✗ | reason`; exit 1 if any fails."""
+    import hub_mcp
+    import hub_sources
+    out = out or sys.stdout
+    factory = factory or build_clients
+    gh_user = gh_user or _gh_user
+    conns = _conns(cfg)
+    if not conns:
+        print("mother hub check: hub.connections is empty", file=sys.stderr)
+        return 1
+    found, _ = resolve_programs(cfg, which)
+    saved = os.environ.get("PATH")
+    os.environ["PATH"] = launch_path(found)
+    rows = []
+    try:
+        for cap in CAPS:
+            conn = conns.get(cap)
+            if conn is None:
+                continue
+            adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, ((cfg or {}).get("connectors") or {}).get(cap)))
+            if adapter is None:
+                rows.append((cap, False, "no adapter for connectors.%s" % cap))
+                continue
+            if conn.get("cli"):
+                try:
+                    if conn["cli"] != "gh":
+                        raise RuntimeError("unsupported cli: %s" % conn["cli"])
+                    gh_user()
+                    rows.append((cap, True, "gh api user"))
+                except Exception as e:
+                    rows.append((cap, False, str(e)))
+                continue
+            got = factory({"hub": {"connections": {cap: conn}}, "connectors": (cfg or {}).get("connectors")}, {})
+            c = got.get(cap)
+            try:
+                if c is None or isinstance(c, Exception):
+                    rows.append((cap, False, str(c) if c is not None else "no client"))
+                elif not hub_mcp.resolve_tools(c.tools, adapter.READ_TOOLS):
+                    rows.append((cap, False, "no read tool (%s) in tools/list" % ", ".join(sorted(adapter.READ_TOOLS))))
+                else:
+                    rows.append((cap, True, "tools/list: %d tools" % len(c.tools)))
+            finally:
+                if c is not None and not isinstance(c, Exception):
+                    _close(c)
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+    for cap, ok, why in rows:
+        print("%s | %s | %s" % (cap, "ok" if ok else "\u2717", why), file=out)
+    return 0 if all(r[1] for r in rows) else 1
+
+
+def _age(stamp, at: datetime):
+    import hub_sources
+    try:
+        return (at - hub_sources.parse_iso(stamp)).total_seconds()
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def status(ws: Path, at: datetime, out=None) -> int:
+    """Heartbeats of the watcher and the hub. Exit 2 when the watcher never ran or is stale (`at` older than
+    2x `every_seconds` while `active`); a stale hub (`last_wake`) counts too. A missing hub.json only says the
+    hub never woke."""
+    out = out or sys.stdout
+    w = load_json(ws, "watcher.json", {})
+    h = load_json(ws, "hub.json", {})
+    w = w if isinstance(w, dict) else {}
+    h = h if isinstance(h, dict) else {}
+    if not w.get("at"):
+        print("watcher: never ran (no watcher.json)", file=out)
+        print("hub: never woke" if not h.get("last_wake") else "hub: last wake %s" % h["last_wake"], file=out)
+        return 2
+    try:
+        every = int(w.get("every_seconds") or DEFAULTS["every_seconds"])
+    except (TypeError, ValueError):
+        every = DEFAULTS["every_seconds"]
+    active = bool(w.get("active"))
+    stale = False
+    age = _age(w.get("at"), at)
+    wstale = active and (age is None or age > 2 * every)
+    stale = stale or wstale
+    print("watcher: last poll %s (%s), every %ds, %s%s" % (
+        w["at"], "unreadable time" if age is None else "%ds ago" % age, every,
+        "active hours" if active else "outside active hours", ", STALE" if wstale else ""), file=out)
+    for cap, ent in sorted((w.get("sources") or {}).items()):
+        why = ent.get("reason")
+        print("  %s: %s%s" % (cap, ent.get("status"), " (%s)" % why if why else ""), file=out)
+    if h.get("last_wake"):
+        hage = _age(h["last_wake"], at)
+        hstale = active and (hage is None or hage > 2 * every)
+        stale = stale or hstale
+        print("hub: last wake %s (%s)%s" % (h["last_wake"], "unreadable time" if hage is None else "%ds ago" % hage,
+                                           ", STALE" if hstale else ""), file=out)
+    else:
+        print("hub: never woke", file=out)
+    return 2 if stale else 0
+
+
+def main(args, ws, cfg, at) -> int:
+    verb, rest = (args[0], args[1:]) if args else ("", [])
+    if verb in ("", "help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    ws = Path(ws)
+    if verb == "watch":
+        watch(ws, cfg)
+        return 0
+    if verb == "install":
+        return install(ws, cfg)
+    if verb == "uninstall":
+        return uninstall()
+    if verb == "check":
+        return check(cfg)
+    if verb == "status":
+        return status(ws, at)
+    print("mother hub: unknown or not yet built verb %r; see `mother hub help`" % verb, file=sys.stderr)
+    return 1

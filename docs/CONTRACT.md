@@ -567,9 +567,23 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   kind (update|resolved|error|sweep), key, also, title, who, link, summary}`, `id` = `<source>:<key>:<at>`,
   `also` = other keys found in the text. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
   file from a crash into the dated file, and deletes dated files 7 or more days old.
-- **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one
-  poll, no write), `status`, `tail` (recent inbox), `decide` (the hub's one write path for a decision),
-  `session add|drop|seen|for` (the session registry), `done`, `snooze`, `show`.
+- **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
+  connection), `status`, and, landing later, `tail` (recent inbox), `decide` (the hub's one write path for a
+  decision), `session add|drop|seen|for` (the session registry), `done`, `snooze`, `show`. `mother hub help` works
+  without a workspace.
+- **launchd job.** Label `com.mother.hub`, plist `~/Library/LaunchAgents/com.mother.hub.plist`.
+  `ProgramArguments` = absolute python, absolute `bin/mother`, `hub`, `watch`; `EnvironmentVariables` =
+  `MOTHER_WORKSPACE` and a `PATH` of the directories of every resolved connection program (`cli` wins over
+  `command`) plus `/usr/bin:/bin`; `KeepAlive` and `RunAtLoad` true; stdout and stderr go to
+  `.mother/hub/watcher.log`. `install` exits 2 or 3 off the home machine (as `home check`), exits 1 naming any
+  program `shutil.which` cannot find or when `hub.connections` is empty, then writes the plist and runs
+  `launchctl bootstrap gui/<uid>` (a `bootout` first, so a reinstall replaces the job); `uninstall` is `bootout`
+  plus removing the plist. `check` runs under that same `PATH`: an MCP connection must start and list at least one
+  tool on its adapter's read allow-list (`tools/list` is the read; no tool is called), `gh` must answer `gh api
+  user`; it prints `cap | ok/✗ | reason` and exits 1 if any fails. `status` prints the `watcher.json` and
+  `hub.json` (`last_wake`) heartbeats and exits 2 when the watcher never ran, or when either is older than 2x
+  `watcher.json` `every_seconds` while `active`; a missing `hub.json` prints `hub: never woke` and does not by itself
+  fail.
 - **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It exits 2 when `workspace.home_machine`
   names another machine (3 when none is set, as `mother home check`) and returns, so the process exits 0, on SIGTERM.
   Each pass (`hub.poll_once`) polls every capability in `connectors` that has an adapter, appends the coalesced

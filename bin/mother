@@ -18,8 +18,9 @@ Commands:
                                bridge (send; the guard asks first), install/stop/status (`mother whatsapp help`); home machine only
   whatsapp setup | link | unlink
                                the manager's guided WhatsApp setup and device link; own terminal only (a TTY; the guard denies them to the agent)
-  hub <cmd>                    the watcher and hub: watch, install, uninstall, check, status, tail, decide,
-                               session add|drop|seen|for, done, snooze, show (docs/CONTRACT.md §5e)
+  hub watch|install|uninstall|check|status
+                               the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e);
+                               tail, decide, session, done, snooze, show land with the hub session
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   now merge|show|done|snooze|top|do
@@ -1222,6 +1223,15 @@ def cmd_now(args):
     now.main(args, ws, load_config(ws), _now())
 
 
+def cmd_hub(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import hub
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        sys.exit(hub.main(args, None, {}, _now()))
+    ws = workspace()
+    sys.exit(hub.main(args, ws, load_config(ws), _now()))
+
+
 def cmd_eval(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import evals
@@ -1238,7 +1248,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 
