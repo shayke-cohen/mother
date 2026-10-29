@@ -10,8 +10,10 @@ next prep better. It is about **topics and commitments**, never about how a pers
 `${CLAUDE_PLUGIN_ROOT}/rules/teams.md` → Privacy applies here more than anywhere.
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 ## Files
 

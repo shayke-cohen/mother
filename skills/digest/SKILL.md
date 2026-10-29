@@ -18,8 +18,10 @@ Policy: `${CLAUDE_PLUGIN_ROOT}/rules/teams.md` (intake lifecycle, privacy),
 ## 0. Workspace, config, capabilities
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 Read `config.json` and `capabilities.json`. Get each source's server from `${CLAUDE_PLUGIN_ROOT}/bin/mother
 health pick --kind K --cap C [--target dm|other]`: `server` is the tool prefix to call; a tool-based connector
@@ -57,7 +59,8 @@ Before building today's digest, apply what the manager decided on the last one.
    grant with `${CLAUDE_PLUGIN_ROOT}/bin/mother grant add tracker-create <tracker.project> --by <manager chat
    user id> --cites <the reply's ts> --channel <manager.chat_dm> --uses <the creates that reply names> --hours 2
    --run digest` (per `rules/outbound.md` → Unattended runs: grants; the guard caps uses at 5 per message: more
-   than 5 → apply the first 5, oldest first, and say the rest wait). Never edit `.mother/grants.json` itself.
+   than 5 → apply the first 5, oldest first, and say the rest wait). Never edit `.mother/grants.json` itself: the CLI signs it, and the guard ignores unsigned grants
+   (grants written before signing existed included).
    **The guard asks the manager before every `mother grant add`**, in every mode. In an unattended run that
    step waits for the manager's approval: don't retry it or work around it; leave those items `waiting:
    grant approval` in `intake.md`, apply the rest, and say `grant waiting for approval` in the runs note. Write a grant

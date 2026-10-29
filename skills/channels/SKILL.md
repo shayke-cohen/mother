@@ -47,8 +47,10 @@ starts. Start it with `/loop /mother:channels`; it paces itself.
 ## Each tick
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 `$CH` below is shorthand for `python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels`: write it out in every command
 (`python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels plan`). Never put it in a shell variable: in the workspace

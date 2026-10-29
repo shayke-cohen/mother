@@ -250,6 +250,53 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `notify`, `broadcast`, `duplicate`, `clone`, `emit`, `dispatch`, `enqueue`, `commit`, `release`) and whose
   server is not the app's own (`mcp__ccd_…`). PAUSED and `MOTHER_DRY_RUN` deny it.
 - **Monitor** in every session: its `command` is classified exactly like a Bash command (§5 rules above).
+- **The workspace shell allow-list** (`shell_unlisted`). In a session whose cwd is the workspace or under it, other
+  than the hub (its own templates), a channel session and MOTHER's sub-agents (their own rules), a Bash command, a
+  Monitor `command` and an MCP `run_in_terminal` `command` get **no decision** only when the strict reader takes
+  every stage. Order: WhatsApp rules; `mother grant add` (above); the allow-list; when it refuses, the other Bash
+  rules (guard files, protected names, code-host writes), then `outbound_unknown` for a network program, then the
+  kind of protected path it named (`grants` for `.mother/` or `~/.mother/`, `persona`, `home_settings` for a write
+  under `~/.claude`), else **ask** `shell_unlisted` naming the first part refused. `shell_unlisted` asks under
+  PAUSED, is denied by `MOTHER_DRY_RUN`, and passes in bypass only with `policy.bypass_passes_asks`.
+  - **Reader.** Stages split on newline, `;`, `&&`, `||`, `|`. Refused anywhere: `$` other than
+    `$CLAUDE_PLUGIN_ROOT`, `${CLAUDE_PLUGIN_ROOT}` and `$HOME` (expanded; a line that assigns either is refused);
+    backticks; `*?[]{}!` outside quotes (a lone `[`/`]` word excepted); a `#` comment; `(`/`)` (subshells,
+    process substitution); a lone `&`; `|&`; `<<<`; `<>`; `>|`; a `\` line continuation; an unclosed quote; an
+    assignment word; a program given by path (except the plugin's `bin/mother`); a heredoc unless into `mother`
+    with a quoted delimiter (its body is skipped exactly to its end line, so it hides nothing after it).
+    Redirections: `/dev/null`, `N>&M`, or a literal path; output only inside the workspace and not protected.
+  - **Programs.** `mother` (bare, the plugin's `bin/mother` by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` +
+    that path): any verb but `grant` other than `remove|list|help` (→ `grants`, `op: cli`) and `hub
+    install|uninstall`. Read-only: `ls cat head tail wc sort uniq cut tr grep egrep rg jq diff cmp stat file
+    basename dirname realpath date pwd echo printf true false test [ sleep which`; `sed` without `-i`/`-I`/
+    `--in-place`/`-f` and with each script part an address plus `p`, `d`, `q`, `=` or `s///` with flags from
+    `gpIi0-9`; `find` without `-exec -execdir -ok -okdir -delete -fprint* -fls`; not `sort -o/-T/
+    --compress-program`, `uniq` with an output file, `date -s`, `rg --pre/-z`, `jq --rawfile/--slurpfile/-L/-f`.
+    `cd` to a literal path inside the workspace (later relative paths resolve from there). File ops `mkdir touch
+    cp mv rm` with every operand inside the workspace and not protected (a `cp`/`mv` into a folder checks
+    folder/name), no recursive `cp`/`mv`, and `rm -r` only of a folder that holds no protected path (at most 2000
+    entries). `gh`/`glab`: the reader's reads (§5c) and `auth status`. `git`: global options only `-C <workspace
+    path>`, `--no-pager`, `--no-optional-locks`; subcommands `status log diff show add commit pull push fetch
+    rev-parse branch ls-files blame` and `stash list`; no argument starting `-c`, `--exec`, `--upload-pack`,
+    `--receive-pack`, `--repo`, `--output`, `--ext-diff`, `--textconv`, `--config`, holding `://` or shaped
+    `user@host:`; `push|pull|fetch` with no remote or a remote named in the workspace's `.git/config`.
+  - **Paths.** Every operand of every allowed program (not the text of `echo`, `printf`, `test`, `[`, `sleep`,
+    `date`, `true`, `false`, `which`, `tr`, `cut`, nor a grep or sed script) and every redirection target is
+    resolved from the stage's cwd (symlinks followed) and refused when it is in `~/.mother` (reading
+    `~/.mother/workspace` excepted), in `~/.claude` or is `~/.claude.json`, or is protected in the workspace:
+    `.mother/` and `.git/`, any `.claude/` folder, any `CLAUDE.md`, `.mcp.json` or `grants.json`, `AGENTS.md`
+    and `memory/MEMORY.md` at the top, and the workspace root itself as a write target.
+- **ask, every session and mode** (`kind: "home_settings"`): a Write/Edit/MultiEdit/NotebookEdit of
+  `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json` or anything under
+  `~/.claude/plugins/` (they decide which plugins and hooks run). Never passed by bypass.
+- **deny, every session** (`kind: "grant-key"`, checked before any role): `Read`, `Edit`, `Write`, `MultiEdit`,
+  `NotebookEdit` of the grant key (`<state>/grant.key`, state = `$MOTHER_STATE_DIR` or `~/.mother`), and `Grep`,
+  `Glob`, `LS` whose root is the key or a folder holding it.
+- **MCP web tools** (`outbound_unknown`, workspace sessions, any server but `mcp__ccd_…`, when the domain rules
+  give no decision): a tool name with a `url`, `http`, `https`, `fetch`, `download`, `web`, `scrape`, `page`,
+  `request`, `browse`, `navigate` or `crawl` part; an input field `url`, `uri`, `target`, `href`, `endpoint`,
+  `link` or `…_url`/`…_uri` (nested too) whose value looks like a host (`[scheme://]name.tld[:port][/…]`) or
+  holds `://`; a tool named `form_input`, and `computer` with `action` `type` or `key`.
 - **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
   server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
   different targets in one call, is denied too (`rules/outbound.md`).
@@ -300,7 +347,11 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   it now (exit 1 and nothing written otherwise, for `answer`, while PAUSED, or when `grants.json` is unreadable,
   which it never overwrites). `--cites` is a message link holding `/<CHANNEL>/p<16 digits>` or a ts (channel from
   `--channel`, else the first `manager.chat_dm`). `remove --run ID` drops that run's grants; `list [--json]`.
-  Atomic, under `.mother/grants.lock`. Exit 2 on usage errors.
+  Atomic, under `.mother/grants.lock`. Exit 2 on usage errors. Every write (theirs and `mother channels'`) is
+  **signed**: `sig` = HMAC-SHA256, hex, over the `grants` list serialised as JSON with sorted keys, `,`/`:`
+  separators and UTF-8 kept, keyed with the bytes of `<state>/grant.key` (32 random bytes hex-encoded, made 0600
+  on first use; state = `$MOTHER_STATE_DIR` or `~/.mother`, outside the workspace). The guard honours no grant
+  in a file whose `sig` is missing or doesn't verify: unsigned grants written before this change are ignored.
 - Every outbound decision is appended to `.mother/guard.log` (tool, category, target, decision, reason — never message text).
 - **Session approval:** a human-typed message whose *leading* lines are `mother approve tracker <PROJECT>` or
   `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours. Lines from
@@ -839,7 +890,10 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 for an existing `memory/<name>.md` (not `MEMORY.md`; name of letters, digits, `.`, `_`, `-`) it appends one line
 `- [Title](<name>.md) — hook` (title from `--title`, else the file's frontmatter `name`, else the file stem; hook from
 `--hook`, else `description`; both one line, control and format characters dropped, `[ ]` in the title become
-`( )`, at most 80 / 150 characters), creating the index from the workspace template when missing. Idempotent: no
+`( )`, `[`, `]`, `(`, `)` removed from the hook, at most 80 / 100 characters), creating the index from the workspace
+template when missing. An already-indexed file returns `{changed: false, line: null}` before any other check.
+`mother memory check` prints `{unindexed: [names], missing: [names]}`: memory files with no index line, and index
+links (outside code spans) to files that don't exist. Idempotent: no
 change when a line already links `(<name>.md)`. Atomic, under `.mother/memory.lock`. Exit 1 for anything else,
 2 for usage. Prints `{ok, changed, line}`.
 

@@ -22,8 +22,9 @@ Commands:
                                the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e)
   grant add <scope> <target> --by <user-id> --cites <link|ts> [--uses N] [--hours H] [--run ID] | remove --run ID | list
                                the only writer of .mother/grants.json for unattended runs (checked like the guard)
-  memory index <memory-file> [--title T] [--hook H]
-                               add one `- [Title](file.md) — hook` line to memory/MEMORY.md (idempotent)
+  memory index <memory-file> [--title T] [--hook H] | check
+                               add one `- [Title](file.md) — hook` line to memory/MEMORY.md (idempotent); check
+                               lists unindexed memory files and index lines pointing at missing ones (JSON)
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   now merge|show|done|snooze|top|do
@@ -1254,7 +1255,7 @@ def cmd_grant(args):
 
 # ---------------------------------------------------------------- memory index
 
-MEMORY_TITLE_MAX, MEMORY_HOOK_MAX = 80, 150
+MEMORY_TITLE_MAX, MEMORY_HOOK_MAX = 80, 100
 
 
 def _one_line(text: str) -> str:
@@ -1303,7 +1304,7 @@ def memory_index(ws: Path, target: str, title=None, hook=None):
         return False, None  # already indexed: nothing to check or write
     fm = _frontmatter(f)
     t = _one_line(title if title is not None else fm.get("name") or f.stem).replace("[", "(").replace("]", ")")
-    h = _one_line(hook if hook is not None else fm.get("description") or "")
+    h = re.sub(r"[\[\]()]", "", _one_line(hook if hook is not None else fm.get("description") or "")).strip()
     if not t or not h:
         raise ValueError("needs a title and a hook (--title/--hook, or name/description in the file's frontmatter)")
     t, h = t[:MEMORY_TITLE_MAX], h[:MEMORY_HOOK_MAX]
@@ -1327,8 +1328,22 @@ def memory_index(ws: Path, target: str, title=None, hook=None):
     return True, line
 
 
+def memory_check(ws: Path) -> dict:
+    """Index drift: memory files with no index line, and index lines that link a missing file."""
+    mem = ws / "memory"
+    idx = mem / "MEMORY.md"
+    text = re.sub(r"`[^`\n]*`", "", idx.read_text()) if idx.exists() else ""  # not the examples in code spans
+    linked = set(re.findall(r"\]\(([^()\s]+\.md)\)", text))
+    files = sorted(f.name for f in mem.glob("*.md") if f.name != "MEMORY.md") if mem.is_dir() else []
+    return {"unindexed": [f for f in files if f not in linked],
+            "missing": sorted(x for x in linked if not (mem / x).is_file())}
+
+
 def cmd_memory(args):
-    usage = "usage: mother memory index <memory-file> [--title T] [--hook H]"
+    usage = "usage: mother memory index <memory-file> [--title T] [--hook H] | check"
+    if args == ["check"]:
+        print(json.dumps(memory_check(workspace())))
+        return
     if args[:1] != ["index"] or len(args) < 2:
         print(usage, file=sys.stderr)
         sys.exit(2)

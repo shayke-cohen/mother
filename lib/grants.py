@@ -8,7 +8,9 @@ The guard asks before any other write to grants.json (Write, Edit or a shell com
 so a session that obeys a message cannot forge a grant by editing the file. `add` checks the grant exactly as the
 guard will (`valid_grant`): the scope, the target (a team channel or a team's tracker project), the author (the
 manager's own chat id), the cited message's age, the uses and the expiry. It writes nothing it would not honour.
-`answer` grants are written only by `mother channels`. Python 3.9 stdlib only.
+`answer` grants are written only by `mother channels`. Every write signs the grants (HMAC-SHA256, key at
+<state>/grant.key, outside the workspace); the guard ignores a grants file whose signature doesn't verify, so an
+unsigned or hand-edited file grants nothing. Python 3.9 stdlib only.
 """
 import contextlib
 import importlib.util
@@ -63,9 +65,18 @@ def read(ws: Path):
 
 
 def write(ws: Path, doc) -> None:
-    p = ws / ".mother" / "grants.json"
+    """Sign the grants with the key at <state>/grant.key (made 0600 on first use) and write them atomically."""
+    write_signed(ws / ".mother" / "grants.json", doc)
+
+
+def write_signed(path, doc) -> None:
+    key = guard.grant_key(create=True)
+    if not key:
+        raise OSError("can't read or create the grant key at %s" % guard.grant_key_path())
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(".grants.%d.tmp" % os.getpid())
-    tmp.write_text(json.dumps(doc, indent=1))
+    tmp.write_text(json.dumps(guard.sign_grants(doc, key), indent=1))
     os.replace(tmp, p)
 
 

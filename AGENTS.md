@@ -87,7 +87,7 @@ To try an unreleased change end to end in Claude Code: `claude --plugin-dir /pat
 
 Read two neighbouring files before writing a new one and match them: plain second-person instructions,
 short sections, tables for anything with more than three cases, `${CLAUDE_PLUGIN_ROOT}` for plugin paths,
-`W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"` for the workspace. A scheduled run starts with no
+`"${CLAUDE_PLUGIN_ROOT}/bin/mother" path` for the workspace (its output written out literally: in the workspace the guard's shell allow-list asks before any `$` expansion, `$(…)`, glob or unlisted program, CONTRACT §5). A scheduled run starts with no
 memory of any conversation, so a routine file must carry everything it needs.
 
 ## Commits, PRs and releases

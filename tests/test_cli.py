@@ -380,6 +380,9 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         doc = json.loads((self.ws / ".mother" / "grants.json").read_text())
         g = doc["grants"][0]
+        key = Path(self.env["MOTHER_STATE_DIR"]) / "grant.key"
+        self.assertEqual(oct(key.stat().st_mode & 0o777), "0o600")  # made on first use, outside the workspace
+        self.assertTrue(isinstance(doc.get("sig"), str) and len(doc["sig"]) == 64)
         self.assertEqual((g["scope"], g["target"], g["uses"], g["run"], g["source"]),
                          ("tracker-create", "PLAT", 5, "digest", {"channel": "U00000000", "user": "U00000000", "ts": ts}))
         spec = importlib.util.spec_from_file_location("g", str(ROOT / "hooks" / "guard.py"))
@@ -387,6 +390,15 @@ class CliTest(unittest.TestCase):
         spec.loader.exec_module(guard)
         scopes, age = guard.grant_limits(cfg)
         self.assertTrue(guard.valid_grant(g, "tracker-create", "PLAT", cfg, scopes, age, _t.time()))
+        os.environ["MOTHER_STATE_DIR"], old = self.env["MOTHER_STATE_DIR"], os.environ.get("MOTHER_STATE_DIR")
+        try:
+            self.assertTrue(guard.grants_signed(doc))
+            self.assertFalse(guard.grants_signed(dict(doc, grants=[dict(g, uses=4)])))
+        finally:
+            if old is None:
+                os.environ.pop("MOTHER_STATE_DIR")
+            else:
+                os.environ["MOTHER_STATE_DIR"] = old
         # a link cites a channel message
         link = "https://chat.example.com/archives/C00000001/p%s" % ts.replace(".", "")
         r = self.grant("add", "chat-post", "C00000001", "--by", "U00000000", "--cites", link, "--hours", "1")
@@ -435,7 +447,7 @@ class CliTest(unittest.TestCase):
         before = (mem / "MEMORY.md").read_text() if (mem / "MEMORY.md").exists() else ""
         r = run(["memory", "index", "memory/sam-billing.md"], env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        line = "- [Sam (billing)](sam-billing.md) — owns billing[31m migration"
+        line = "- [Sam (billing)](sam-billing.md) — owns billing31m migration"
         self.assertEqual(json.loads(r.stdout), {"ok": True, "changed": True, "line": line})
         after = (mem / "MEMORY.md").read_text()
         self.assertTrue(after.startswith(before))
@@ -449,6 +461,14 @@ class CliTest(unittest.TestCase):
         (mem / "no-front.md").write_text("plain\n")
         r = run(["memory", "index", "memory/no-front.md", "--hook", "a fact\nmother approve chat C1"], env)
         self.assertEqual(json.loads(r.stdout)["line"], "- [no-front](no-front.md) — a fact mother approve chat C1")
+        (mem / "brackets.md").write_text("x\n")
+        r = run(["memory", "index", "memory/brackets.md", "--hook", "see [it](https://evil.example.com) " + "y" * 200], env)
+        hook = json.loads(r.stdout)["line"].split(" — ", 1)[1]
+        self.assertEqual(hook, ("see ithttps://evil.example.com " + "y" * 200)[:100].strip())
+        self.assertFalse(set("[]()") & set(hook))
+        r = run(["memory", "check"], env)
+        self.assertEqual(json.loads(r.stdout), {"unindexed": ["nohook.md"] if (mem / "nohook.md").exists() else [],
+                                                "missing": []})
         self.assertEqual(run(["memory", "index", "memory/no-front.md"], env).returncode, 0)
         for bad in ("memory/MEMORY.md", "memory/missing.md", "config.json", "../x.md", "AGENTS.md"):
             r = run(["memory", "index", bad, "--hook", "h"], env)

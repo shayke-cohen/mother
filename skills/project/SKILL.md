@@ -8,8 +8,10 @@ description: Use when the manager starts or discusses work that spans sessions �
 The container for work that spans sessions. Full protocol: `${CLAUDE_PLUGIN_ROOT}/rules/projects.md`.
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 **After every write, check the store against `rules/projects.md` → Validation** and fix it before
 replying.

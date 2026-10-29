@@ -236,6 +236,34 @@ to `.mother/grants.json` (or anything under `.mother/`), `mother grant add`, and
   `fetch` tool given a URL; a Monitor `ws` target; and an MCP call whose operation writes but that the hook can't
   place in a domain. Outside the workspace these are unchanged (normal permissions).
 
+## The workspace shell allow-list
+
+In a session that runs in the workspace (cards, routines, the manager's own sessions there; not the hub, a
+channel session or MOTHER's sub-agents, which have stricter rules of their own), a shell command runs without a
+question only when every stage of it is on a short list: the `mother` CLI (but `grant add`, which always asks,
+and `hub install|uninstall`), read-only tools (`ls`, `cat`, `grep`, `jq`, `sed` without `-i`, `find` without
+`-exec`/`-delete`, …), `mkdir`/`touch`/`cp`/`mv`/`rm` on literal paths inside the workspace, `cd` inside it, the
+code host's reads, and `git status|log|diff|show|add|commit|pull|push|fetch|…` to the workspace's own remotes.
+Anything else asks, PAUSED or not: `$` expansions and `$(…)`, backticks, globs and braces outside quotes,
+subshells, `eval`/`source`/`exec`, here-strings, a heredoc into anything but `mother` (with a quoted delimiter),
+other programs (interpreters, `awk`, `xargs`, shells, network tools), and any path in `~/.mother`, `~/.claude` or
+a protected workspace file (`.mother/`, `.git/`, `.claude/`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`,
+`memory/MEMORY.md`). A network program is still `outbound_unknown` (PAUSED denies it). Skills write commands to
+fit: the workspace path written out (from `mother path`), no shell variables, files read with the Read tool.
+
+## Signed grants, the grant key and Claude Code's settings
+
+- `mother grant` signs `grants.json` (HMAC-SHA256 with `~/.mother/grant.key`, made 0600 on first use, outside the
+  workspace). The hook ignores a grants file whose signature doesn't verify, so a hand-written or edited grant
+  grants nothing; grants written before signing existed are ignored too.
+- The key is off limits: any Read, Edit, Write, Grep, Glob or LS of it is denied in every session, and the shell
+  allow-list asks before any command that names `~/.mother`.
+- An edit to `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json` or anything under
+  `~/.claude/plugins/` asks in every session and mode: those files decide which plugins and hooks run.
+- In a workspace session an MCP tool whose name says url, http, fetch, download, web, scrape, page, request,
+  browse, navigate or crawl, or whose input names a web address in a url/target/href-style field, is
+  `outbound_unknown`; so is typing into a page (`computer` type/key, `form_input`).
+
 ## Bypass mode
 
 When the manager runs a session in bypass permissions mode (`permission_mode` is `bypassPermissions` in the

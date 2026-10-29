@@ -715,6 +715,14 @@ def run_claude(ctx, a, prompt, session, resume):
     return result or "\n".join(texts), None
 
 
+def write_grants(path, data):
+    """Signed with the grant key, as `mother grant` writes them; the guard ignores unsigned grants."""
+    key = guard.grant_key(create=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(guard.sign_grants(data, key) if key else data, indent=1))
+    os.replace(tmp, path)
+
+
 def write_answer_grant(ctx, a):
     path = ctx.dir / "grants.json"
     try:
@@ -729,9 +737,7 @@ def write_answer_grant(ctx, a):
     data["grants"].append({"scope": "answer", "target": a["channel"], "thread": a["thread"], "uses": 1,
                            "expires": iso(t + 3600), "run": "channels",
                            "source": {"channel": a["channel"], "user": a["user"], "ts": a["source_ts"]}})
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1))
-    os.replace(tmp, path)
+    write_grants(path, data)
 
 
 def revoke_grants(ctx, channel, thread):
@@ -746,9 +752,7 @@ def revoke_grants(ctx, channel, thread):
                                               and g.get("target") == channel and g.get("thread") == thread)]
     if len(keep) != len(data["grants"]):
         data["grants"] = keep
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=1))
-        os.replace(tmp, path)
+        write_grants(path, data)
 
 
 def write_reply_grant(ctx, target, thread, source_channel, source_ts):
@@ -763,9 +767,7 @@ def write_reply_grant(ctx, target, thread, source_channel, source_ts):
     data["grants"].append({"scope": "chat-reply", "target": target, "thread": thread, "uses": 1,
                            "expires": iso(t + 3600), "run": "channels",
                            "source": {"channel": source_channel, "user": ctx.owner(), "ts": source_ts}})
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1))
-    os.replace(tmp, path)
+    write_grants(path, data)
 
 
 def ch_name(ctx, cid):

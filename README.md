@@ -165,8 +165,8 @@ Useful commands in your terminal:
 | `mother sync` | Commit and push the workspace now (also runs automatically at the end of each turn) |
 | `mother register` | Print the scheduled-task definitions for the enabled routines |
 | `mother health` | Connector health: which server serves each capability, the failure log and a 7-day summary (`mother health help`) |
-| `mother grant add` | Add a guard grant for an unattended run, checked exactly as the guard will (`remove --run ID`, `list`); the only writer of `.mother/grants.json`; the guard asks you before each `add` |
-| `mother memory index <file>` | Add one index line for `memory/<file>.md` to `memory/MEMORY.md` (idempotent); the only unprompted writer of the index |
+| `mother grant add` | Add a guard grant for an unattended run, checked exactly as the guard will (`remove --run ID`, `list`); the only writer of `.mother/grants.json`; the guard asks you before each `add`; grants are signed with `~/.mother/grant.key` |
+| `mother memory index <file>` | Add one index line for `memory/<file>.md` to `memory/MEMORY.md` (idempotent); the only unprompted writer of the index. `memory check` lists drift |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
 | `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `watch` runs it in the foreground |
