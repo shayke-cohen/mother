@@ -590,10 +590,13 @@ class Status(unittest.TestCase):
         self.beat(5000, active=False)
         self.assertEqual(self.run_status()[0], 0)
 
-    def test_stale_hub_wake_exit_2(self):
+    def test_stale_hub_wake_is_shown_but_exit_0(self):
         self.beat(60)
         hub.save_json(self.ws, "hub.json", {"last_wake": hub_sources.iso(self.AT - timedelta(seconds=900))})
-        self.assertEqual(self.run_status()[0], 2)
+        rc, out = self.run_status()
+        self.assertEqual(rc, 0)
+        self.assertIn("hub: last wake", out)
+        self.assertIn("STALE", out.split("hub:")[1])
 
 
 class FakeClient:

@@ -581,9 +581,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   plus removing the plist. `check` runs under that same `PATH`: an MCP connection must start and list at least one
   tool on its adapter's read allow-list (`tools/list` is the read; no tool is called), `gh` must answer `gh api
   user`; it prints `cap | ok/✗ | reason` and exits 1 if any fails. `status` prints the `watcher.json` and
-  `hub.json` (`last_wake`) heartbeats and exits 2 when the watcher never ran, or when either is older than 2x
-  `watcher.json` `every_seconds` while `active`; a missing `hub.json` prints `hub: never woke` and does not by itself
-  fail.
+  `hub.json` (`last_wake`) heartbeats and exits 2 only when the watcher never ran or its `at` is older than 2x
+  `watcher.json` `every_seconds` while `active`. The hub wakes on events, so an old `last_wake` is printed with
+  `STALE` but does not fail; a missing `hub.json` prints `hub: never woke`.
 - **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It exits 2 when `workspace.home_machine`
   names another machine (3 when none is set, as `mother home check`) and returns, so the process exits 0, on SIGTERM.
   Each pass (`hub.poll_once`) polls every capability in `connectors` that has an adapter, appends the coalesced

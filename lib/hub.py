@@ -674,9 +674,9 @@ def _age(stamp, at: datetime):
 
 
 def status(ws: Path, at: datetime, out=None) -> int:
-    """Heartbeats of the watcher and the hub. Exit 2 when the watcher never ran or is stale (`at` older than
-    2x `every_seconds` while `active`); a stale hub (`last_wake`) counts too. A missing hub.json only says the
-    hub never woke."""
+    """Heartbeats of the watcher and the hub. Exit 2 only when the watcher never ran or is stale (`at` older than
+    2x `every_seconds` while `active`). The hub wakes on events, so an old `last_wake` is printed as STALE but
+    does not fail; a missing hub.json only says the hub never woke."""
     out = out or sys.stdout
     w = load_json(ws, "watcher.json", {})
     h = load_json(ws, "hub.json", {})
@@ -704,7 +704,6 @@ def status(ws: Path, at: datetime, out=None) -> int:
     if h.get("last_wake"):
         hage = _age(h["last_wake"], at)
         hstale = active and (hage is None or hage > 2 * every)
-        stale = stale or hstale
         print("hub: last wake %s (%s)%s" % (h["last_wake"], "unreadable time" if hage is None else "%ds ago" % hage,
                                            ", STALE" if hstale else ""), file=out)
     else:
