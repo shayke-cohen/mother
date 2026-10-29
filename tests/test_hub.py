@@ -349,6 +349,27 @@ class Watcher(unittest.TestCase):
         self.addCleanup(setattr, FakeAdapter, "poll", real)
         self.assertEqual(self.poll(6)["last_append_at"], "2026-10-29T10:02:00Z")  # resolved never wakes the hub
 
+    def test_pass_that_only_resolves_a_key_does_not_mark_the_hub_behind(self):
+        FakeAdapter.items = ["PLAT-1"]
+        self.poll()
+        self.assertEqual(self.poll(2)["last_append_at"], "2026-10-29T10:02:00Z")
+        real = FakeAdapter.poll
+        self.addCleanup(setattr, FakeAdapter, "poll", real)
+        lines = []
+        FakeAdapter.poll = classmethod(lambda cls, *a: {"lines": list(lines), "cursor": {"n": 1}, "partial": []})
+        # an update and its resolution in one pass: tail prints nothing for the key, so the hub must not look behind
+        lines[:] = [line(key="PLAT-2", at="2026-10-29T10:00:00Z"),
+                    line(key="PLAT-2", kind="resolved", at="2026-10-29T10:01:00Z")]
+        self.assertEqual(self.poll(4)["last_append_at"], "2026-10-29T10:02:00Z")
+        # one key resolved, another updated: the update is printed, so it moves
+        lines[:] = [line(key="PLAT-3", kind="resolved", at="2026-10-29T10:05:00Z"),
+                    line(key="PLAT-4", at="2026-10-29T10:05:00Z")]
+        self.assertEqual(self.poll(6)["last_append_at"], "2026-10-29T10:06:00Z")
+        # a resolution that does not win (same `at` as the update) leaves the update standing: it moves
+        lines[:] = [line(key="PLAT-5", at="2026-10-29T10:07:00Z"),
+                    line(key="PLAT-5", kind="resolved", at="2026-10-29T10:07:00Z")]
+        self.assertEqual(self.poll(8)["last_append_at"], "2026-10-29T10:08:00Z")
+
     def test_sweep_for_unseen_live_sessions(self):
         with hub.locked(self.ws):
             hub.save_json(self.ws, "sessions.json", {"version": 1, "sessions": {

@@ -116,6 +116,19 @@ def _wins(new: dict, cur: dict) -> bool:
     return not (new.get("kind") == "resolved" and cur.get("kind") == "update")
 
 
+def _must_decide(lines: List[dict]) -> bool:
+    """A pass's lines include one `tail` will print: a sweep or error line, or a key whose winning line (`_wins`,
+    as `digest` picks it) is not `resolved`. An update and its resolution in one pass print nothing."""
+    latest = {}
+    for l in lines:
+        if l.get("kind") in ("sweep", "error"):
+            return True
+        k = l.get("key")
+        if k not in latest or _wins(l, latest[k]):
+            latest[k] = l
+    return any(l.get("kind") != "resolved" for l in latest.values())
+
+
 def coalesce(lines: List[dict]) -> List[dict]:
     """One line per key: the latest `at` wins (`_wins`), `also` is the union (order kept). First-seen key order."""
     best = {}
@@ -360,7 +373,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             errors.append("%s: %s" % (cap, ent["reason"]))
             continue
         append_inbox(ws, res["lines"])
-        woke = woke or any(l.get("kind") != "resolved" for l in res["lines"])
+        woke = _must_decide(res["lines"]) or woke
         with locked(ws):
             cursors = load_json(ws, "cursors.json", {})
             cursors = cursors if isinstance(cursors, dict) else {}

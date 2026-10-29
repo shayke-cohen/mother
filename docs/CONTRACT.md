@@ -622,7 +622,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   why (`no connection` when `hub.connections` has no entry for the capability, or the failure), `since` is when
   the status began, and `errors` lists `<cap>: <reason>` for every source not `ok`. `last_append_at` is the poll
   time of the last pass that appended a line the hub must decide (`update`, `error` or `sweep`; a `resolved` line
-  is never printed to the hub, so it does not count); it is carried over from the previous heartbeat otherwise.
+  is never printed to the hub, so it does not count, and a key whose winning line in that pass, by the same rule
+  `tail` collapses with, is `resolved` does not count either); it is carried over from the previous heartbeat otherwise.
 - **Error transition.** On the first failing pass of a source since it last worked, the watcher appends one `error`
   line (key `watcher:<cap>`); `cursors.json` `_errored` ([cap]) remembers that it was emitted, so further failing
   passes add nothing and a restart does not repeat it; a successful pass clears it. The watcher never writes
