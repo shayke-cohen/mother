@@ -145,6 +145,7 @@ class Ctx(object):
         self.ok = False
         self.problem = "no workspace"
         self.stamps = set()
+        self.sid = None  # the session id of the call, set by run()
 
 
 def resolve_workspace():
@@ -481,7 +482,8 @@ def persona_path(fp, ctx):
         return False
     rel = os.path.relpath(f, ws).replace(os.sep, "/")
     parts = rel.split("/")
-    return rel in ("agents.md", ".mcp.json", "memory/memory.md") or parts[-1] == "claude.md" or ".claude" in parts
+    return rel in ("agents.md", ".mcp.json", "memory/memory.md") or parts[-1] == "claude.md" or ".claude" in parts \
+        or ".git" in parts  # git runs hooks and config (fsmonitor, aliases) from any .git folder
 
 
 def graphql_file_is_query(seg, cwd):
@@ -2388,12 +2390,21 @@ def classify_shell(cmd, cwd, ctx):
     In a workspace session: WhatsApp and `mother grant add` first; a command every stage of which is on the
     allow-list then gets no decision; anything else gets the Bash rules, then outbound_unknown for a program that
     can reach the network, else the protected-path kind or shell_unlisted (CONTRACT §5)."""
+    norm = re.sub(r"[\"'\\]", "", cmd).casefold()
+    if CHANNELS_MGR_RE.search(norm):
+        return act("manager_only", "manager_only", "`mother channels resume|start` turns the channel reply loop "
+                                                   "back on: %s" % cmd.strip()[:160])
+    if hub_fed(ctx):
+        why = hub_fed_shell(norm)
+        if why:
+            return act("grants", "grants_file", "%s in a session that reads hub lines: it reads replies as the "
+                                                "manager's or makes a grant, and the text it was fed comes from "
+                                                "other people (%s)" % (why, cmd.strip()[:160]), op="hub_fed")
     if not in_workspace(cwd, ctx):
         return classify_bash(cmd, cwd, ctx)
     wa = classify_whatsapp(cmd, cwd, ctx)
     if wa:
         return wa
-    norm = re.sub(r"[\"'\\]", "", cmd).casefold()
     if GRANTS_CLI_RE.search(norm):
         return act("grants", "grants_file", "`mother grant add`: a new grant lets later writes through without a "
                                             "question", op="cli")
@@ -2435,7 +2446,6 @@ SL_FILE = {"mkdir", "touch", "cp", "mv", "rm"}
 SL_GIT = {"status", "log", "diff", "show", "add", "commit", "pull", "push", "fetch", "rev-parse", "branch",
           "ls-files", "blame", "stash"}
 SL_GH = {"gh", "glab"}
-SL_FIND_BAD = re.compile(r"^-(?:exec|execdir|ok|okdir|delete|fprint\w*|fls)$")
 SL_SED_PART = re.compile(r"^\s*(?:(?:\d+|\$|/(?:[^/\\]|\\.)*/)(?:\s*,\s*(?:\d+|\$|/(?:[^/\\]|\\.)*/))?\s*!?\s*)?"
                          r"(?:[pdq=]|s(.)(?:(?!\1)[^\\]|\\.)*\1(?:(?!\1)[^\\]|\\.)*\1[gpIi0-9]*)\s*$", re.S)
 
@@ -2625,15 +2635,33 @@ def _home_dirs():
 
 
 def ws_protected(p, ws):
-    """A real path inside the workspace that only a question may change: .mother/ and .git/, any .claude/ folder,
+    """A real path inside the workspace that only a question may change: .mother/, any .git or .claude folder,
     CLAUDE.md, .mcp.json or grants.json anywhere, AGENTS.md and memory/MEMORY.md at the top, or the root."""
     if not inside(p.casefold(), ws.casefold()):
         return False
     rel = os.path.relpath(p, ws).replace(os.sep, "/")
     parts = rel.casefold().split("/")
-    return rel == "." or parts[0] in (".mother", ".git") or ".claude" in parts \
+    return rel == "." or parts[0] == ".mother" or ".claude" in parts or ".git" in parts \
         or parts[-1] in ("claude.md", ".mcp.json", "grants.json") \
         or "/".join(parts) in ("agents.md", "memory/memory.md", "config.json", "capabilities.json")
+
+
+def ws_protected_tree(p, ws):
+    """A path a cp/mv/rm/mkdir may not take as source or destination: a protected path, a folder above one
+    (`memory`, the root) or a folder that holds one (checked on disk), so renaming folders can't swap one in."""
+    if not inside(p.casefold(), ws.casefold()):
+        return False
+    rel = os.path.relpath(p, ws).replace(os.sep, "/").casefold()
+    if ws_protected(p, ws) or rel == "memory":
+        return True
+    if os.path.isdir(p) and not os.path.islink(p):
+        count = 0
+        for root, dirs, files in os.walk(p):
+            for x in dirs + files:
+                count += 1
+                if count > 2000 or ws_protected(os.path.join(root, x), ws):
+                    return True
+    return False
 
 
 def sl_path(word, cwd, ws, write=False):
@@ -2767,6 +2795,7 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
                 sl_path(w, cwd, ws, write=w.endswith(".html"))
         for op, target in st["redirs"]:
             if not target.startswith("&"):
+                sl_hidden_paths([target], cwd, ws, plugin)
                 sl_path(target, cwd, ws, write=">" in op)
         return cwd
     else:
@@ -2781,6 +2810,7 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
     for op, target in st["redirs"]:
         if target.startswith("&"):
             continue
+        sl_hidden_paths([target], cwd, ws, plugin)  # a `<` source too: outside the workspace, plugin and temp asks
         sl_path(target, cwd, ws, write=">" in op)
     if prog == "cd":
         if not st.get("first") or st.get("sep") not in ("&&", ""):
@@ -2805,21 +2835,40 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
         _sl_git(args, cwd, ws)
         return cwd
     if prog == "find":
-        if any(SL_FIND_BAD.match(w) for w in args):
-            _sl_fail("find with an action that runs or writes")
-        for w in args:
-            if not w.startswith("-") and not w.startswith("("):
-                sl_path(w, cwd, ws)
+        _sl_find(args, cwd, ws)
         return cwd
-    if prog == "sed":
-        _sl_sed(args)
-    if prog == "sort" and any(o.startswith(("-o", "--output", "--compress-program", "-T", "--temporary"))
-                              for o in opts):
-        _sl_fail("sort with an output or helper program")
-    if prog in ("rg",) and any(o.startswith(("--pre", "--search-zip", "-z")) for o in opts):
-        _sl_fail("rg with a preprocessor")
-    if prog == "uniq" and len(ops) > 1:
-        _sl_fail("uniq with an output file")
+    if prog in SL_OPTS:
+        vals, ops = _sl_opts(prog, args)
+        opts = [f for f, _ in vals]
+        if prog == "sed":
+            _sl_sed([v for f, v in vals if f == "-e"] or ops[:1])
+            for w in (ops if any(f == "-e" for f in opts) else ops[1:]):
+                sl_path(w, cwd, ws)
+            return cwd
+        if prog in ("grep", "egrep", "rg"):
+            for f, v in vals:
+                if f in ("-f", "--file"):
+                    sl_path(v, cwd, ws)
+            patterned = any(f in ("-e", "--regexp", "-f", "--file") for f in opts) or "--files" in opts
+            for w in (ops if patterned else ops[1:]):
+                sl_path(w, cwd, ws)
+            return cwd
+        if prog == "jq":
+            if not ops and not any(f in ("-n", "--null-input") for f in opts):
+                return cwd
+            filt = ops[0] if ops else ""
+            if re.search(r"\$ENV\b|(?<![.\w$])(?:env|import|include|input_filename|\$__loc__)\b", filt):
+                _sl_fail("a jq filter that reads the environment or modules")
+            for w in ops[1:]:
+                sl_path(w, cwd, ws)
+            return cwd
+        if prog == "uniq" and len(ops) > 1:
+            _sl_fail("uniq with an output file")
+        if prog == "tr":
+            return cwd
+        for w in ops:
+            sl_path(w, cwd, ws)
+        return cwd
     if prog == "date" and any(o in ("-s", "--set") or o.startswith("--set=") for o in opts):
         _sl_fail("date -s")
     if prog in SL_FILE:
@@ -2828,6 +2877,11 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
         if prog in ("cp", "mv") and any(re.match(r"^-[A-Za-z]*[rRa]", o) or o in ("--recursive", "--archive")
                                         for o in opts):
             _sl_fail("a recursive %s" % prog)
+        if prog in ("cp", "mv") and any(not re.fullmatch(r"-[finvp]+", o) for o in opts):
+            _sl_fail("%s with an option other than -f -i -n -v -p" % prog)
+        if prog in ("mkdir", "rm", "touch") and any(not re.fullmatch({"mkdir": r"-[pv]+", "rm": r"-[rRfiv]+",
+                                                                       "touch": r"-[c]+"}[prog], o) for o in opts):
+            _sl_fail("%s with an option the allow-list doesn't take" % prog)
         targets = list(ops)
         if prog in ("cp", "mv") and len(ops) >= 2:
             dst = os.path.realpath(os.path.join(cwd, ops[-1]))
@@ -2835,26 +2889,127 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
                 targets = ops[:-1] + [os.path.join(ops[-1], os.path.basename(x.rstrip("/"))) for x in ops[:-1]]
         for w in targets:
             sl_path(w, cwd, ws, write=True)
+        # sources, destinations and (mkdir -p) the folders that would be made: none may be, hold or sit above a
+        # protected path, or a rename could swap a new memory/ or .git in
+        checks = list(ops) + list(targets)
+        if prog == "mkdir":
+            for w in ops:
+                d = os.path.realpath(os.path.join(cwd, w))
+                while inside(d, ws) and d != ws and not os.path.exists(d):
+                    checks.append(d)
+                    d = os.path.dirname(d)
+        for w in checks:
+            p = os.path.realpath(os.path.join(cwd, w))
+            if ws_protected_tree(p, ws):
+                top = os.path.relpath(p, ws).split(os.sep)[0].casefold()
+                _sl_fail("%s of a protected path, a folder above one or a folder holding one (%s)" % (prog, w),
+                         "grants" if top == ".mother" else "persona")
         if prog == "rm" and any(re.match(r"^-[A-Za-z]*[rR]", o) or o == "--recursive" for o in opts):
             for w in ops:
                 _sl_rm_tree(os.path.realpath(os.path.join(cwd, w)), ws)
         return cwd
     for w in ops:
-        if prog in ("echo", "printf", "test", "[", "sleep", "date", "true", "false", "which", "jq", "tr", "cut"):
-            continue  # text, not paths (jq's and grep's file operands are checked below)
-        if prog in ("grep", "egrep", "rg") and w == next((x for x in ops), None) \
-                and not any(o in ("-e", "-f", "--regexp", "--file") or o.startswith(("-e", "--regexp=")) for o in opts):
-            continue  # the pattern
-        if prog == "sed" and w == ops[0] and not any(o.startswith(("-e", "--expression", "-f", "--file")) for o in opts):
-            continue  # the script
+        if prog in ("echo", "printf", "test", "[", "sleep", "date", "true", "false", "which"):
+            continue  # text, not paths
         sl_path(w, cwd, ws)
-    if prog == "jq":
-        files = [w for w in ops[1:]] if not any(o in ("-n", "--null-input") for o in opts) else ops[1:]
-        for w in files:
-            sl_path(w, cwd, ws)
-        if any(o in ("--rawfile", "--slurpfile", "-L", "--from-file", "-f") for o in opts):
-            _sl_fail("jq reading extra files or modules")
     return cwd
+
+
+# Options each read program may take (CONTRACT §5): (flags with no value, flags that take one). A short-option
+# cluster is read letter by letter; a value-taking letter takes the rest of the cluster or the next word. Anything
+# else asks: rg --pre/--hostname-bin, grep/sed/sort file and program options, tail -f, wc --files0-from, and so on.
+SL_OPTS = {
+    "rg": ({"-n", "-i", "-l", "-c", "-w", "-v", "-F", "-S", "--files", "--hidden", "--json", "--no-heading",
+            "--line-number", "--ignore-case", "--files-with-matches", "--count", "--word-regexp", "--invert-match",
+            "--fixed-strings", "--smart-case"},
+           {"-e", "-g", "--glob", "-t", "--type", "-A", "-B", "-C", "--max-count", "-m", "--regexp"}),
+    "grep": ({"-n", "-i", "-l", "-c", "-w", "-v", "-E", "-F", "-r", "-R", "-h", "-H", "-o", "-q", "-s"},
+             {"-e", "-A", "-B", "-C", "-m", "--include", "--exclude", "-f"}),
+    "sed": ({"-n", "-E"}, {"-e"}),
+    "sort": ({"-n", "-r", "-u", "-f", "-V"}, {"-k", "-t"}),
+    "jq": ({"-r", "-c", "-s", "-n", "-e", "-S", "--raw-output", "--compact-output", "--slurp", "--null-input",
+            "--exit-status", "--sort-keys"}, {"--arg", "--argjson"}),
+    "cut": ({"-s"}, {"-f", "-d", "-c", "-b"}),
+    "tr": ({"-d", "-s", "-c", "-C"}, set()),
+    "head": (set(), {"-n", "-c"}),
+    "tail": ({"-r", "-f", "-F"}, {"-n", "-c"}),  # -f: a Monitor follows a log
+    "wc": ({"-l", "-w", "-c", "-m"}, set()),
+    "uniq": ({"-c", "-d", "-u", "-i"}, {"-f", "-s"}),
+    "diff": ({"-u", "-q", "-r", "-N", "-i", "-w", "-b", "-B", "-a", "--brief"}, {"-U"}),
+    "file": ({"-b", "-i", "-I", "-L", "-h", "--brief", "--mime", "--mime-type"}, set()),
+}
+SL_OPTS["egrep"] = SL_OPTS["grep"]
+SL_FIND_FLAGS = {"-empty", "-print", "-print0", "-prune", "-not", "!", "-o", "-or", "-a", "-and", "(", ")", "-depth"}
+SL_FIND_VALUES = {"-name", "-iname", "-path", "-ipath", "-type", "-maxdepth", "-mindepth", "-mtime", "-mmin", "-newer",
+                  "-size"}
+
+
+def _sl_opts(prog, args):
+    """([(flag, value or None)], operands) for an SL_OPTS program; fails on any flag not in its table."""
+    flags, valued = SL_OPTS[prog]
+    vals, ops, k, ended = [], [], 0, False
+    while k < len(args):
+        a = args[k]
+        k += 1
+        if ended or a == "-" or not a.startswith("-"):
+            ops.append(a)
+        elif a == "--":
+            ended = True
+        elif prog in ("head", "tail") and re.fullmatch(r"-\d+", a):
+            vals.append(("-n", a[1:]))
+        elif a.startswith("--"):
+            name, eq, v = a.partition("=")
+            if name in flags and not eq:
+                vals.append((name, None))
+            elif name in valued:
+                if not eq:
+                    if k >= len(args):
+                        _sl_fail("%s %s with no value" % (prog, name))
+                    v, k = args[k], k + 1
+                if name in ("--arg", "--argjson"):  # jq: a name and a value
+                    if k >= len(args):
+                        _sl_fail("jq %s with no value" % name)
+                    v, k = v + "=" + args[k], k + 1
+                vals.append((name, v))
+            else:
+                _sl_fail("%s %s is not an option the allow-list takes" % (prog, name))
+        else:
+            j = 1
+            while j < len(a):
+                f = "-" + a[j]
+                if f in flags:
+                    vals.append((f, None))
+                    j += 1
+                elif f in valued:
+                    v = a[j + 1:]
+                    if not v:
+                        if k >= len(args):
+                            _sl_fail("%s %s with no value" % (prog, f))
+                        v, k = args[k], k + 1
+                    vals.append((f, v))
+                    break
+                else:
+                    _sl_fail("%s %s is not an option the allow-list takes" % (prog, f))
+    return vals, ops
+
+
+def _sl_find(args, cwd, ws):
+    """find: start paths, then only the predicates in SL_FIND_FLAGS / SL_FIND_VALUES (no -exec, -delete, -rm,
+    -fprint, -files0-from, ...)."""
+    k = 0
+    while k < len(args) and not (args[k].startswith("-") or args[k] in ("!", "(", ")")):
+        sl_path(args[k], cwd, ws)
+        k += 1
+    while k < len(args):
+        a = args[k]
+        if a in SL_FIND_FLAGS:
+            k += 1
+        elif a in SL_FIND_VALUES and k + 1 < len(args):
+            if a == "-newer":
+                sl_path(args[k + 1], cwd, ws)
+            k += 2
+        else:
+            _sl_fail("find %s is not a predicate the allow-list takes" % a)
 
 
 def _sl_rm_tree(p, ws):
@@ -2868,26 +3023,8 @@ def _sl_rm_tree(p, ws):
                 _sl_fail("rm -r of a folder that holds a protected path")
 
 
-def _sl_sed(args):
-    if any(re.match(r"^-[A-Za-z]*[iI]", a) or a.startswith("--in-place") for a in args if a.startswith("-")):
-        _sl_fail("sed -i")
-    if any(a in ("-f", "--file") or a.startswith("--file=") for a in args):
-        _sl_fail("sed -f")
-    scripts, k = [], 0
-    while k < len(args):
-        a = args[k]
-        if a in ("-e", "--expression"):
-            scripts.append(args[k + 1] if k + 1 < len(args) else "")
-            k += 2
-            continue
-        if a.startswith("--expression="):
-            scripts.append(a.split("=", 1)[1])
-        elif a.startswith("-") and a != "-":
-            pass
-        elif not scripts:
-            scripts.append(a)
-            break
-        k += 1
+def _sl_sed(scripts):
+    """Each script may only print, delete, quit or substitute (no w/W/r/R/e commands, no s///w or s///e)."""
     for sc in scripts:
         for part in re.split(r";|\n", sc):
             if part.strip() and not SL_SED_PART.match(part):
@@ -2895,17 +3032,18 @@ def _sl_sed(args):
 
 
 def _sl_git(args, cwd, ws):
-    k = 0
+    k, gitdir = 0, os.path.realpath(cwd)
     while k < len(args) and args[k].startswith("-"):
         a = args[k]
         if a == "-C" and k + 1 < len(args):
-            if not inside(os.path.realpath(os.path.join(cwd, args[k + 1])), ws):
-                _sl_fail("git -C outside the workspace")
+            gitdir = os.path.realpath(os.path.join(gitdir, args[k + 1]))
             k += 2
         elif a in ("--no-pager", "--no-optional-locks"):
             k += 1
         else:
             _sl_fail("the git option %s" % a)
+    if gitdir != ws:  # a .git below the root brings its own config (fsmonitor, hooks, aliases)
+        _sl_fail("git run anywhere but the workspace root (%s)" % gitdir)
     sub, rest = (args[k], args[k + 1:]) if k < len(args) else ("", [])
     if sub not in SL_GIT:
         _sl_fail("git %s is not on the allow-list" % (sub or "with no subcommand"))
@@ -2923,9 +3061,21 @@ def _sl_git(args, cwd, ws):
                            "--textconv", "--config")) or "://" in a or re.match(r"^[\w.-]+@[\w.-]+:", a):
             _sl_fail("the git argument %s" % a)
     opts, ops = _sl_args(rest)
+    if sub == "commit" and any(o.startswith("--amend") for o in opts):
+        _sl_fail("git commit --amend (rewrites a commit that may be pushed)")
     if sub in ("push", "pull", "fetch"):
         if ops and ops[0] not in _git_remotes(ws):
             _sl_fail("git %s to %s, which is not a remote of the workspace" % (sub, ops[0]))
+        for o in opts:  # rewriting or deleting what is on the remote, or every ref at once
+            if (sub == "push" and (re.match(r"^-[A-Za-z]*[fd]", o) or o.split("=", 1)[0] in (
+                    "--force", "--force-with-lease", "--force-if-includes", "--mirror", "--all", "--branches",
+                    "--tags", "--delete", "--prune"))) or (sub != "push" and o.split("=", 1)[0] in (
+                    "--force", "--prune", "--prune-tags", "--refmap", "--update-head-ok")) or \
+                    (sub != "push" and re.match(r"^-[A-Za-z]*[fpPu]", o) and o not in ("-q", "-v")):
+                _sl_fail("git %s %s" % (sub, o))
+        for r in ops[1:]:
+            if r.startswith(("+", ":")) or (sub != "push" and ":" in r):
+                _sl_fail("git %s with the refspec %s" % (sub, r))
         return
     if sub in ("add", "blame", "ls-files", "diff", "log", "show"):
         for w in ops:
@@ -3544,6 +3694,8 @@ def decide(a, ctx, transcript=None):
     if a["kind"] == "approve-line":
         return "deny", "%s. Only the manager types `mother approve`; a session message or card brief never " \
                        "carries one. Leave the line out." % a["what"]
+    if a["kind"] == "manager_only":  # the manager turns these on; a question even under PAUSED
+        return "ask", "%s. Only the manager runs this; confirm this is you." % a["what"]
     if a["kind"] == "session":  # the manager's own sessions: always a question, never PAUSED or the never-list
         return "ask", "%s. Confirm it." % a["what"]
     if a["kind"] == "shell_unlisted":  # not outbound by itself: a question, PAUSED or not
@@ -3554,6 +3706,9 @@ def decide(a, ctx, transcript=None):
     p = paused(ctx)
     if p and a["kind"] == "grants":
         return "deny", "Outbound is PAUSED (%s exists). Blocked: %s." % (p, a["what"])
+    if a["kind"] == "grants" and a.get("op") == "hub_fed":
+        return "ask", "%s. The channels loop runs in its own session, never one that reads hub lines; confirm this " \
+                      "is you." % a["what"]
     if a["kind"] == "grants" and a.get("op") == "cli":
         return "ask", "%s. Confirm the manager asked for this grant." % a["what"]
     if a["kind"] == "grants":
@@ -3883,6 +4038,77 @@ def record_hub_session(ws, session_id, at):
         pass
 
 
+HUB_FED_CAP = 50
+HUB_CMD_RE = re.compile(r"(?:^|[^\w.-])mother\s+hub\b")
+
+
+def hub_fed_path(ws):
+    return os.path.join(ws, ".mother", "hub", "fed-sessions.json")
+
+
+def hub_fed_ids(ws):
+    """Session ids that ran a `mother hub …` command (fed-sessions.json `session_ids`, newest first)."""
+    doc, ok = read_json(hub_fed_path(ws)) if ws else ({}, False)
+    ids = doc.get("session_ids") if ok and isinstance(doc, dict) else None
+    return [i for i in ids if isinstance(i, str) and i] if isinstance(ids, list) else []
+
+
+def record_hub_fed(ws, session_id):
+    """Add session_id to fed-sessions.json (newest first, at most HUB_FED_CAP), atomically under hub.lock.
+    Never raises."""
+    if session_id in hub_fed_ids(ws):
+        return
+    try:
+        d = os.path.join(ws, ".mother", "hub")
+        os.makedirs(d, exist_ok=True)
+        lock = open(os.path.join(d, "hub.lock"), "a")
+        try:
+            try:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except ImportError:
+                pass
+            ids = [session_id] + [i for i in hub_fed_ids(ws) if i != session_id]
+            tmp = os.path.join(d, ".fed-sessions.%d.tmp" % os.getpid())
+            with open(tmp, "w") as f:
+                json.dump({"session_ids": ids[:HUB_FED_CAP]}, f)
+            os.replace(tmp, hub_fed_path(ws))
+        finally:
+            lock.close()
+    except Exception:
+        pass
+
+
+def hub_fed(ctx):
+    """The call's session reads hub lines (text from people who can message the manager): an id in
+    sessions.json in any state, a hub session, or a session that ran `mother hub …` (CONTRACT §5e)."""
+    sid = ctx.sid
+    if not (ctx.ws and sid):
+        return False
+    if sid in hub_session_ids(ctx.ws) or sid in hub_fed_ids(ctx.ws):
+        return True
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "hub", "sessions.json"))
+    items = doc.get("sessions") if ok and isinstance(doc, dict) else None
+    return any(isinstance(e, dict) and str(e.get("session_id") or "") == sid
+               for e in (items.values() if isinstance(items, dict) else []))
+
+
+# `mother channels` verbs that read the manager's replies or make or use a grant, and the ones only the manager runs
+CHANNELS_SAFE_VERBS = {"plan", "status", "mute", "unmute", "stop", "pause", "prune", "help", "-h", "--help"}
+CHANNELS_REPLY_RE = re.compile(r"\bchannels\s+(?:approvals|triage|run|answer|done|send)\b")
+CHANNELS_MGR_RE = re.compile(r"(?:^|[^\w.-])mother\s+channels\s+(?:resume|start)\b")
+
+
+def hub_fed_shell(norm):
+    """Why a shell command (quotes and backslashes dropped, casefolded) may not run unasked in a hub-fed session."""
+    if re.search(r"(?:^|[^\w.-])mother\s+grant\b", norm):
+        return "`mother grant`"
+    m = re.search(r"(?:^|[^\w.-])mother\s+channels\b\s*(\S*)", norm)
+    if (m and m.group(1) not in CHANNELS_SAFE_VERBS) or CHANNELS_REPLY_RE.search(norm):
+        return "`mother channels %s`" % (m.group(1) if m else "…")
+    return None
+
+
 def hub_odd_chars(text):
     """True for a control character other than newline and tab, or a Unicode space, line/paragraph separator or
     format character: the shell and a regex can disagree about where a line ends."""
@@ -4099,7 +4325,12 @@ def run(raw):
             log(ctx, tool, {"kind": "subagent", "category": sub}, r[0], r[1])
             return r
         sid = payload.get("session_id")
+        ctx.sid = sid if isinstance(sid, str) and sid else None
         if ctx.ws and isinstance(sid, str) and sid:
+            text = str(inp.get("command") or "") if tool == "Bash" or tool == "Monitor" or \
+                tool.split("__")[-1] == "run_in_terminal" else ""
+            if text and HUB_CMD_RE.search(re.sub(r"[\"'\\]", "", text).casefold()):
+                record_hub_fed(ctx.ws, sid)
             if hub_is_tail(tool, inp) and not payload.get("agent_type") and payload.get("cwd") \
                     and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)):
                 record_hub_session(ctx.ws, sid, now_iso())
@@ -4122,7 +4353,7 @@ def run(raw):
         # WhatsApp state and setup rules) and the guard's self-edit check still hold.
         # In the workspace an ask stays an ask unless the manager set policy.bypass_passes_asks; the guard's own
         # files, grants.json and the persona files always ask.
-        if r[0] == "ask" and a["kind"] not in ("config", "grants", "persona", "home_settings") \
+        if r[0] == "ask" and a["kind"] not in ("config", "grants", "persona", "home_settings", "manager_only") \
                 and payload.get("permission_mode") == "bypassPermissions" \
                 and (bypass_passes(ctx) or not in_workspace(payload.get("cwd"), ctx)):
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])

@@ -132,8 +132,6 @@ mother hub pending drop C00000001/1.0 --json
 ----
 mother whatsapp status
 ----
-mother channels resume
-----
 python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels approvals <<'APPROVALS'
 {"drafts": {"a1": ["ok"]}}
 APPROVALS

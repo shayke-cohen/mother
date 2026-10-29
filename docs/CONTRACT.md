@@ -206,7 +206,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **ask, every session and mode** (`kind: "grants"`, `op: "cli"`): a shell command whose text, with quotes and
   backslashes dropped and casefolded, has `grant add` (or `grant` followed by a word holding `$` or a backtick):
   `mother grant add` in any form. Never passed by bypass, whatever `policy.bypass_passes_asks` says; **deny** under
-  PAUSED and `MOTHER_DRY_RUN`. `mother grant remove|list` get no decision.
+  PAUSED and `MOTHER_DRY_RUN`. `mother grant remove|list` get no decision, except in a hub-fed session (below).
 - **ask, every mode** (`kind: "grants"`): a Write/Edit/MultiEdit/NotebookEdit of `<workspace>/.mother/grants.json`;
   a shell command that writes (the self-edit write test, plus `tar`, `unzip`, `ditto`, `patch`, `cpio`, `pax`,
   `mkdir`, and `git checkout|restore|reset|apply|am|stash|clone|pull|merge|cherry-pick|rebase|worktree`) and whose
@@ -268,7 +268,8 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     `mother` with an operator exactly `<<'WORD'`, `<<"WORD"`, `<<-'WORD'` or `<<-"WORD"`, WORD
     `[A-Za-z_][A-Za-z0-9_]*`, followed by whitespace or the end of the line (its body is skipped exactly to its end
     line, so it hides nothing after it).
-    Redirections: `/dev/null`, `N>&M`, or a literal path; output only inside the workspace and not protected.
+    Redirections: `/dev/null`, `N>&M`, or a literal path; output only inside the workspace and not protected; an
+    input (`<`) source gets the same path checks as an operand, hidden-path rule included.
   - **Programs.** `mother` (bare, the plugin's `bin/mother` by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` +
     that path) with a verb from `path version help status runs scan sync now hub health items memory speak
     channels whatsapp grant home eval register`, except `grant` other than `remove|list|help` (→ `grants`,
@@ -276,25 +277,46 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     `--skip-permissions`, and `register` with any argument; any other verb (`init`, `join`, `link`, `tts`, …)
     asks. `claude mcp list` (exactly). `python3 <plugin>/assets/plan/build.py …` and `…/assets/deck/build.py …`
     with literal arguments (an `.html` operand is a write target). Read-only: `ls cat head tail wc sort uniq cut tr grep egrep rg jq diff cmp stat file
-    basename dirname realpath date pwd echo printf true false test [ sleep which`; `sed` without `-i`/`-I`/
-    `--in-place`/`-f` and with each script part an address plus `p`, `d`, `q`, `=` or `s///` with flags from
-    `gpIi0-9`; `find` without `-exec -execdir -ok -okdir -delete -fprint* -fls`; not `sort -o/-T/
-    --compress-program`, `uniq` with an output file, `date -s`, `rg --pre/-z`, `jq --rawfile/--slurpfile/-L/-f`.
+    basename dirname realpath date pwd echo printf true false test [ sleep which`, not `date -s`. **Options:** these
+    take only the options listed (a short cluster is read letter by letter; a value-taking letter takes the rest of
+    the cluster or the next word; anything else asks):
+    `rg` `-n -i -l -c -w -v -F -S --files --hidden --json --no-heading` (and their long names) and `-e -g --glob
+    -t --type -A -B -C -m --max-count --regexp` with a value (so no `--pre`, `-z`, `--search-zip`, `--hostname-bin`,
+    `--hyperlink-format`, `-f`, `--follow`); `grep`/`egrep` `-n -i -l -c -w -v -E -F -r -R -h -H -o -q -s` and
+    `-e -A -B -C -m --include --exclude -f` (`-f` only with a workspace path); `sed` `-n -E` and `-e SCRIPT`, with
+    each script part an address plus `p`, `d`, `q`, `=` or `s///` with flags from `gpIi0-9` (no `w W r R e`); `sort`
+    `-n -r -u -f -V -k -t`; `jq` `-r -c -s -n -e -S` (and long names), `--arg`/`--argjson NAME VALUE`, with a
+    filter that doesn't name `$ENV`, `env`, `import`, `include` or `input_filename`; `cut` `-s -f -d -c -b`; `tr`
+    `-d -s -c -C`; `head` `-n -c -N`; `tail` `-r -n -c -N` (no `-f`); `wc` `-l -w -c -m`; `uniq` `-c -d -u -i -f -s`
+    with at most one file; `diff` `-u -q -r -N -i -w -b -B -a --brief -U`; `file` `-b -i -I -L -h --brief --mime
+    --mime-type`. `find`: start paths, then only `-name -iname -path -ipath -type -maxdepth -mindepth -mtime -mmin
+    -newer -size` (each with a value; `-newer`'s is a path) and `-empty -print -print0 -prune -not ! -o -or -a -and
+    ( ) -depth` (no `-exec`, `-delete`, `-rm`, `-fprint*`, `-files0-from`, …). The operands of these programs
+    (files, not the grep/rg pattern, the sed script or the jq filter) are paths (below).
     `cd` only as the first stage, to a literal existing folder inside the workspace, and joined to the rest only
-    by `&&` (later relative paths resolve from there). File ops `mkdir touch
-    cp mv rm` with every operand inside the workspace and not protected (a `cp`/`mv` into a folder checks
-    folder/name), no recursive `cp`/`mv`, and `rm -r` only of a folder that holds no protected path (at most 2000
-    entries). `gh`/`glab`: the reader's reads (§5c) and `auth status`. `git`: global options only `-C <workspace
-    path>`, `--no-pager`, `--no-optional-locks`; subcommands `status log diff show add commit pull push fetch
-    rev-parse branch ls-files blame` and `stash list`; not `commit -F/--file/-t/--template`, `blame --contents`,
-    `diff|log|show -o`; no argument starting `-c`, `--exec`, `--upload-pack`,
-    `--receive-pack`, `--repo`, `--output`, `--ext-diff`, `--textconv`, `--config`, holding `://` or shaped
-    `user@host:`; `push|pull|fetch` with no remote or a remote named in the workspace's `.git/config`.
+    by `&&` (later relative paths resolve from there). File ops `mkdir` (`-p -v`), `touch` (`-c`), `cp`/`mv`
+    (`-f -i -n -v -p`), `rm` (`-r -R -f -i -v`) with every operand inside the workspace and not protected (a
+    `cp`/`mv` into a folder checks folder/name), no recursive `cp`/`mv`, and `rm -r` only of a folder that holds no
+    protected path (at most 2000 entries). **No folder swaps:** no source, destination (as written and as
+    folder/name) or, for `mkdir`, folder it would create may be a protected path, a folder above one (`memory`, the
+    root) or a folder that holds one on disk (at most 2000 entries), so `mv memory memory.old && mv m3 memory`
+    asks. `gh`/`glab`: the reader's reads (§5c) and `auth status`. `git`: global options only `-C`, `--no-pager`,
+    `--no-optional-locks`, and it runs **only at the workspace root** (the stage's cwd after any `cd` and `-C` must
+    be the root: a `.git` below it brings its own config, such as `core.fsmonitor`); subcommands `status log diff
+    show add commit pull push fetch rev-parse branch ls-files blame` and `stash list`; not `commit -F/--file/-t/
+    --template/--amend`, `blame --contents`, `diff|log|show -o`; no argument starting `-c`, `--exec`,
+    `--upload-pack`, `--receive-pack`, `--repo`, `--output`, `--ext-diff`, `--textconv`, `--config`, holding `://`
+    or shaped `user@host:`; `push|pull|fetch` with no remote or a remote named in the workspace's `.git/config`;
+    `push` without `-f`/`-d` (in any short cluster), `--force`, `--force-with-lease`, `--force-if-includes`,
+    `--mirror`, `--all`, `--branches`, `--tags`, `--delete`, `--prune`, or a refspec starting `+` or `:`;
+    `pull|fetch` without `-f -p -P -u` (in any short cluster), `--force`, `--prune`, `--prune-tags`, `--refmap`,
+    `--update-head-ok`, or a refspec starting `+` or holding `:`. Plain `git push`, `git push origin`, `git pull`
+    stay quiet.
   - **Paths.** Every operand of every allowed program (not the text of `echo`, `printf`, `test`, `[`, `sleep`,
     `date`, `true`, `false`, `which`, `tr`, `cut`, nor a grep or sed script) and every redirection target is
     resolved from the stage's cwd (symlinks followed) and refused when it is in `~/.mother` (reading
     `~/.mother/workspace` excepted), in `~/.claude` or is `~/.claude.json`, or is protected in the workspace:
-    `.mother/` and `.git/`, any `.claude/` folder, any `CLAUDE.md`, `.mcp.json` or `grants.json`, `AGENTS.md`
+    `.mother/`, any `.git` or `.claude` path component, any `CLAUDE.md`, `.mcp.json` or `grants.json`, `AGENTS.md`
     and `memory/MEMORY.md`, `config.json` and `capabilities.json` at the top (any case), and the workspace root
     itself as a write target. A write to `config.json` or `capabilities.json` is `kind: config`.
     **Hidden paths:** for every word of every allowed program, the word, the text after its first `=`, and the
@@ -303,6 +325,17 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     temp folders (`tempfile.gettempdir()`, `/tmp`, `/var/tmp`), or be `/dev/null`.
 - **ask, every mode** (`kind: "config"`): a Write/Edit/MultiEdit/NotebookEdit of the workspace's
   `capabilities.json` (written only by `mother health`), like `config.json`.
+- **ask, every mode** (`kind: "persona"`): a Write/Edit/MultiEdit/NotebookEdit of anything with a `.git` path
+  component in the workspace, at any depth (git runs hooks and config such as `core.fsmonitor` from it).
+- **Hub-fed sessions** (`kind: "grants"`, `op: "hub_fed"`; checked first for a Bash, Monitor or `run_in_terminal`
+  command, in or out of the workspace): a session whose id is in `.mother/hub/sessions.json` (any state), in
+  `hub-session.json`, or in `.mother/hub/fed-sessions.json` (the hook adds the id, before deciding, whenever a
+  command names `mother hub`) reads text from people who can message the manager. In it, `mother grant` (every
+  verb), `mother channels` with any verb but `plan status mute unmute stop pause prune help`, and any
+  `channels approvals|triage|run|answer|done|send` **ask**; PAUSED and `MOTHER_DRY_RUN` deny; bypass never passes
+  it. The channels loop runs in its own session (§5b).
+- **ask, every session and mode** (`kind: "manager_only"`, PAUSED included; never passed by bypass;
+  `MOTHER_DRY_RUN` denies): `mother channels resume` and `mother channels start`.
 - **ask, every session and mode** (`kind: "home_settings"`): a Write/Edit/MultiEdit/NotebookEdit of
   `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json` or anything under
   `~/.claude/plugins/` (they decide which plugins and hooks run). Never passed by bypass.
@@ -543,6 +576,10 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   The `--allowedTools`/`--disallowedTools` flags repeat the same limits as a first fence. One session per thread
   and role (`--session-id`, then `--resume`); a teammate never joins a session the manager drove.
   `MOTHER_NO_SYNC=1` makes `mother sync` a no-op inside them.
+- **The loop runs in its own session, never a hub-fed one** (§5). `approvals` and `triage` read replies on stdin
+  as the manager's and `run`/`answer` write grants, so in a session that reads hub lines (a card the hub routes to,
+  the hub itself, or any session that ran `mother hub …`) the guard asks before each of them. `mother channels
+  start` and `resume` always ask: only the manager turns the loop back on.
 - State: `.mother/channels.json` (cursors, threads, pending actions, drafts, streaks, demotions, stop/pause);
   audit: `.mother/channels.log` (jsonl, one line per post, draft, skip, mute, stop, error). Both machine-local.
 - A first look at a channel only sets its cursor to now. Quiet hours and rate limits hold messages (the cursor
@@ -739,7 +776,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   without reading config), `hub.json` (what the hub session last did and what is pending), `sessions.json`
   (the manager's sessions the hub may route to), `hub-session.json` (`{session_id, session_ids, at}`: the sessions that ran
   `mother hub tail` in the workspace, newest first, at most 5; the guard fences every id in `session_ids`, so a
-  newer `tail` adds a hub session and never unfences an older one, §5), `hub.lock`. Readers treat a missing file as "nothing pending" or
+  newer `tail` adds a hub session and never unfences an older one, §5), `fed-sessions.json` (`{session_ids}`: the
+  sessions that ran any `mother hub …` command, newest first, at most 50; written by the guard under `hub.lock`, §5
+  hub-fed sessions), `hub.lock`. Readers treat a missing file as "nothing pending" or
   "the hub never woke".
 - **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
   (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,

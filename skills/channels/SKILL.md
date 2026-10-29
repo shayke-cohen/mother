@@ -109,7 +109,8 @@ not "all quiet".
 `<name>, mute` in a thread mutes that thread · a 👎 on any reply mutes the thread and sends its topic back
 to draft · `<name>, stop` stops that channel · `<name>, pause` stops every channel. Anyone may make the
 agent quieter. Only the manager turns it back on: `<name>, start` / `<name>, resume`, or
-`mother channels start --channel <id>` / `mother channels resume`.
+`mother channels start --channel <id>` / `mother channels resume`, which the guard always asks about
+(the manager runs them).
 
 ## Earned autonomy
 

@@ -254,6 +254,17 @@ a protected workspace file (`.mother/`, `.git/`, `.claude/`, `CLAUDE.md`, `AGENT
 `memory/MEMORY.md`, `config.json`, `capabilities.json`). A network program is still `outbound_unknown` (PAUSED denies it). Skills write commands to
 fit: the workspace path written out (from `mother path`), no shell variables, files read with the Read tool.
 
+Within that list, read tools take only their common read options (`find` only name/path/type/time/
+size tests, `rg`/`grep`/`sed`/`sort`/`jq`/`tail`/… no option that runs a program, reads a file list or writes);
+a `.git` folder anywhere is protected and `git` runs only at the workspace root; `git push` never forces,
+deletes, mirrors or pushes every ref, and `commit --amend` asks; no `cp`/`mv`/`rm`/`mkdir` may take, make or
+empty a folder that is or holds a protected path (no swapping in a new `memory/`); a `<` input file gets the same
+path checks as an operand.
+
+A session that reads hub lines (a card the hub routes to, the hub, any session that ran `mother hub …`) asks
+before `mother grant` and before the `mother channels` verbs that read replies or use grants; the channels loop
+runs in its own session. `mother channels start|resume` always ask: only the manager turns the loop back on.
+
 ## Signed grants, the grant key and Claude Code's settings
 
 - `mother grant` signs `grants.json` (HMAC-SHA256 with `~/.mother/grant.key`, made 0600 on first use, outside the
