@@ -715,6 +715,12 @@ def run_claude(ctx, a, prompt, session, resume):
     return result or "\n".join(texts), None
 
 
+def signed_grants(ctx, path):
+    """The grants to build on: only a correctly signed file counts; anything else starts from none (logged)."""
+    data, problem = guard.read_grants_for_write(str(path), str(ctx.dir.parent), who="mother channels")
+    return data if data is not None else {"grants": []}
+
+
 def write_grants(path, data):
     """Signed with the grant key, as `mother grant` writes them; the guard ignores unsigned grants."""
     key = guard.grant_key(create=True)
@@ -725,12 +731,7 @@ def write_grants(path, data):
 
 def write_answer_grant(ctx, a):
     path = ctx.dir / "grants.json"
-    try:
-        data = json.loads(path.read_text())
-        if not isinstance(data, dict) or not isinstance(data.get("grants"), list):
-            data = {"grants": []}
-    except (OSError, ValueError):
-        data = {"grants": []}
+    data = signed_grants(ctx, path)
     t = now()
     data["grants"] = [g for g in data["grants"] if not (isinstance(g, dict) and g.get("run") == "channels"
                                                         and (guard.parse_time(g.get("expires")) or 0) < t)]
@@ -742,12 +743,9 @@ def write_answer_grant(ctx, a):
 
 def revoke_grants(ctx, channel, thread):
     path = ctx.dir / "grants.json"
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
+    if not path.exists():
         return
-    if not isinstance(data, dict) or not isinstance(data.get("grants"), list):
-        return
+    data = signed_grants(ctx, path)
     keep = [g for g in data["grants"] if not (isinstance(g, dict) and g.get("run") == "channels"
                                               and g.get("target") == channel and g.get("thread") == thread)]
     if len(keep) != len(data["grants"]):
@@ -757,12 +755,7 @@ def revoke_grants(ctx, channel, thread):
 
 def write_reply_grant(ctx, target, thread, source_channel, source_ts):
     path = ctx.dir / "grants.json"
-    try:
-        data = json.loads(path.read_text())
-        if not isinstance(data, dict) or not isinstance(data.get("grants"), list):
-            data = {"grants": []}
-    except (OSError, ValueError):
-        data = {"grants": []}
+    data = signed_grants(ctx, path)
     t = now()
     data["grants"].append({"scope": "chat-reply", "target": target, "thread": thread, "uses": 1,
                            "expires": iso(t + 3600), "run": "channels",

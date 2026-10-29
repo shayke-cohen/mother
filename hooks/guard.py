@@ -2417,6 +2417,9 @@ def classify_shell(cmd, cwd, ctx):
     if kind == "persona":
         return act("persona", "persona_files", "a shell command on the workspace's standing instructions (%s): %s"
                    % (why, short))
+    if kind == "config":
+        return act("config", "guard_config", "a shell command on config.json or capabilities.json (%s): %s"
+                   % (why, short))
     if kind == "home_settings":
         return act("home_settings", "home_settings", "a shell command on ~/.claude (%s): %s" % (why, short))
     return act("shell_unlisted", "shell_unlisted", "a shell command outside the workspace allow-list (%s): %s"
@@ -2504,10 +2507,7 @@ def sl_lex(cmd, plugin):
                     _sl_fail("a heredoc with no end line")
                 i = m.end() + 1
         elif c == "\\":
-            if i + 1 < n and cmd[i + 1] == "\n":
-                _sl_fail("a line continuation")
-            word.append(cmd[i + 1:i + 2])
-            have, i = True, i + 2
+            _sl_fail("a backslash outside single quotes")
         elif c == "'":
             j = cmd.find("'", i + 1)
             if j < 0:
@@ -2517,9 +2517,8 @@ def sl_lex(cmd, plugin):
         elif c == '"':
             j, buf = i + 1, []
             while j < n and cmd[j] != '"':
-                if cmd[j] == "\\" and j + 1 < n:
-                    buf.append(cmd[j + 1] if cmd[j + 1] in '"\\$`' else cmd[j:j + 2])
-                    j += 2
+                if cmd[j] == "\\":
+                    _sl_fail("a backslash inside double quotes")
                 elif cmd[j] == "$":
                     val, k = var_at(j)
                     if val is None:
@@ -2544,8 +2543,12 @@ def sl_lex(cmd, plugin):
         elif c == "`":
             _sl_fail("a backtick")
         elif c == "~" and not have:
-            word.append(home if cmd[i + 1:i + 2] in ("", "/", " ", "\t", "\n") else _sl_fail("a ~user path"))
+            if cmd[i + 1:i + 2] != "/":
+                _sl_fail("a `~` not followed by `/`")
+            word.append(home)
             have, i = True, i + 1
+        elif c == "=" and not have:
+            _sl_fail("a word starting with `=` (zsh expands it to a program path)")
         elif c in "*?[]{}!" and not (c in "[]" and not have and cmd[i + 1:i + 2] in (" ", "\t", "\n", "")):
             _sl_fail("a glob, brace or `!` outside quotes (%s)" % c)
         elif c == "#" and not have:
@@ -2575,6 +2578,8 @@ def sl_lex(cmd, plugin):
                 end_stage("|")
                 i += 1
         elif c in "<>":
+            if re.match(r"<\d*-\d*>", cmd[i:]):
+                _sl_fail("a zsh numeric glob")
             m = re.match(r"(<<<|<<-|<<|<>|>>|>\||>&|<&|<|>)", cmd[i:])
             op = m.group(1)
             fd = "".join(word) if have and re.fullmatch(r"\d", "".join(word)) else ""
@@ -2588,11 +2593,9 @@ def sl_lex(cmd, plugin):
                 _sl_fail("the redirection %s" % op)
             i += len(op)
             if op in ("<<", "<<-"):
-                m2 = re.match(r"[ \t]*(['\"]?)([A-Za-z_][\w-]*)\1", cmd[i:])
+                m2 = re.match(r"(['\"])([A-Za-z_][A-Za-z0-9_]*)\1(?=[ \t\n]|$)", cmd[i:])
                 if not m2:
-                    _sl_fail("a heredoc delimiter the guard can't read")
-                if not m2.group(1):
-                    _sl_fail("a heredoc with an unquoted delimiter")
+                    _sl_fail("a heredoc that isn't exactly <<'WORD' (a quoted delimiter of letters, digits and _)")
                 cur["heredocs"].append(m2.group(2))
                 pending_docs.append((m2.group(2), op == "<<-"))
                 i += m2.end()
@@ -2629,7 +2632,8 @@ def ws_protected(p, ws):
     rel = os.path.relpath(p, ws).replace(os.sep, "/")
     parts = rel.casefold().split("/")
     return rel == "." or parts[0] in (".mother", ".git") or ".claude" in parts \
-        or parts[-1] in ("claude.md", ".mcp.json", "grants.json") or "/".join(parts) in ("agents.md", "memory/memory.md")
+        or parts[-1] in ("claude.md", ".mcp.json", "grants.json") \
+        or "/".join(parts) in ("agents.md", "memory/memory.md", "config.json", "capabilities.json")
 
 
 def sl_path(word, cwd, ws, write=False):
@@ -2646,8 +2650,8 @@ def sl_path(word, cwd, ws, write=False):
         _sl_fail("a path in ~/.claude (%s)" % word, "home_settings" if write else None)
     if ws_protected(p, ws) and (write or p != ws):
         top = os.path.relpath(p, ws).split(os.sep)[0].casefold()
-        kind = ("grants" if top == ".mother" or os.path.basename(p).casefold() == "grants.json" else "persona") \
-            if write else None  # reading a protected file is a question, not a protected-file write
+        kind = ("grants" if top == ".mother" or os.path.basename(p).casefold() == "grants.json" else
+                "config" if top in ("config.json", "capabilities.json") else "persona") if write else None  # reading a protected file is a question, not a protected-file write
         _sl_fail("a protected workspace path (%s)" % word, kind)
     if write and not inside(p, ws):
         _sl_fail("a write outside the workspace (%s)" % word)
@@ -2676,6 +2680,67 @@ def _sl_args(words):
     return opts, ops
 
 
+SL_TEMP_ROOTS = None
+
+
+def _sl_roots(ws, plugin):
+    """Where an absolute path argument may point: the workspace, the plugin, the system temp folders."""
+    global SL_TEMP_ROOTS
+    if SL_TEMP_ROOTS is None:
+        import tempfile
+        SL_TEMP_ROOTS = sorted({os.path.realpath(x) for x in (tempfile.gettempdir(), "/tmp", "/var/tmp")})
+    return [ws, os.path.realpath(plugin)] + SL_TEMP_ROOTS
+
+
+def sl_hidden_paths(words, cwd, ws, plugin):
+    """Every path a word may carry (the word, the text after `=`, the text after a short-option cluster such as
+    `-f` or `-m`): one starting with `/` or `~` or holding `..` must resolve inside the workspace, the plugin or the
+    temp folders (`/dev/null` too), and never to a protected place."""
+    for w in words:
+        cands = [w]
+        if "=" in w:
+            cands.append(w.split("=", 1)[1])
+        m = re.match(r"^-[A-Za-z]+(.+)$", w)
+        if m:
+            cands.append(m.group(1))
+        for c in cands:
+            if not (c.startswith(("/", "~")) or ".." in c):
+                continue
+            c2 = os.path.expanduser(c) if c.startswith("~/") else c
+            if c2.startswith("~"):
+                _sl_fail("a `~` path the guard can't read (%s)" % c)
+            sl_path(c2, cwd, ws)
+            if c2 == "/dev/null":
+                continue
+            p = os.path.realpath(os.path.join(cwd, c2))
+            if not any(inside(p, r) for r in _sl_roots(ws, plugin)):
+                _sl_fail("a path outside the workspace, the plugin and the temp folder (%s)" % c)
+
+
+MOTHER_VERBS = {"path", "version", "help", "-h", "--help", "status", "runs", "scan", "sync", "now", "hub", "health",
+                "items", "memory", "speak", "channels", "whatsapp", "grant", "home", "eval", "register"}
+
+
+def _sl_mother(args):
+    """The `mother` verbs a workspace session may run unasked (CONTRACT §5)."""
+    verb, sub = (args + ["", ""])[:2]
+    if verb not in MOTHER_VERBS:
+        _sl_fail("mother %s is not on the allow-list" % (verb or "with no verb"))
+    if verb == "grant" and sub not in ("remove", "list", "help", "-h", "--help"):
+        raise _Unlisted("grant")
+    if verb == "hub" and sub in ("install", "uninstall"):
+        _sl_fail("mother hub %s" % sub)
+    if verb == "home" and sub not in ("check", "show"):
+        _sl_fail("mother home %s" % (sub or "with no subcommand"))
+    if verb == "eval" and any(a.split("=", 1)[0] in ("--plugin-dir", "--skip-permissions") for a in args):
+        _sl_fail("mother eval with --plugin-dir or --skip-permissions")
+    if verb == "register" and len(args) > 1:
+        _sl_fail("mother register with arguments")
+
+
+PLUGIN_SCRIPTS = ("assets/plan/build.py", "assets/deck/build.py")
+
+
 def _sl_stage(st, cwd, ws, ctx, plugin):
     """Check one stage; returns the new cwd (for `cd`)."""
     words = st["words"]
@@ -2687,14 +2752,23 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
     mother_bin = os.path.realpath(os.path.join(plugin, "bin", "mother"))
     is_mother = prog == "mother" or ("/" in prog and os.path.realpath(prog) == mother_bin) or (
         prog in ("python3", "python") and args and "/" in args[0] and os.path.realpath(args[0]) == mother_bin)
+    plugin_script = prog in ("python3", "python") and args and "/" in args[0] and os.path.realpath(args[0]) in \
+        {os.path.realpath(os.path.join(plugin, x)) for x in PLUGIN_SCRIPTS}
     if is_mother:
         if prog in ("python3", "python"):
             args = args[1:]
-        verb = args[:2]
-        if verb[:1] == ["grant"] and verb[1:2] not in (["remove"], ["list"], ["help"], ["-h"], ["--help"]):
-            raise _Unlisted("grant")
-        if verb[:1] == ["hub"] and verb[1:2] in (["install"], ["uninstall"]):
-            _sl_fail("mother hub %s" % verb[1])
+        _sl_mother(args)
+    elif plugin_script or (prog == "claude" and args == ["mcp", "list"]):
+        if st["heredocs"]:
+            _sl_fail("a heredoc into %s" % prog)
+        sl_hidden_paths(args[1:] if plugin_script else [], cwd, ws, plugin)
+        for w in (args[1:] if plugin_script else []):
+            if not w.startswith("-"):
+                sl_path(w, cwd, ws, write=w.endswith(".html"))
+        for op, target in st["redirs"]:
+            if not target.startswith("&"):
+                sl_path(target, cwd, ws, write=">" in op)
+        return cwd
     else:
         if st["heredocs"]:
             _sl_fail("a heredoc into %s (only `mother` reads one)" % prog)
@@ -2703,16 +2777,19 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
         if prog not in SL_READ | SL_FILE | SL_GH | {"git", "cd"}:
             _sl_fail("%s is not on the allow-list" % prog)
     opts, ops = _sl_args(args)
+    sl_hidden_paths(args, cwd, ws, plugin)
     for op, target in st["redirs"]:
         if target.startswith("&"):
             continue
         sl_path(target, cwd, ws, write=">" in op)
     if prog == "cd":
+        if not st.get("first") or st.get("sep") not in ("&&", ""):
+            _sl_fail("cd other than as the first stage, joined by &&")
         if len(args) != 1:
             _sl_fail("cd needs one literal path")
         dest = os.path.realpath(os.path.join(cwd, args[0]))
-        if not inside(dest, ws):
-            _sl_fail("cd out of the workspace")
+        if not inside(dest, ws) or not os.path.isdir(dest):
+            _sl_fail("cd out of the workspace or into a folder that doesn't exist")
         sl_path(args[0], cwd, ws)
         return dest
     if is_mother:
@@ -2835,6 +2912,12 @@ def _sl_git(args, cwd, ws):
     if sub == "stash" and rest != ["list"]:
         _sl_fail("git stash other than list")
     for a in rest:
+        if (sub in ("diff", "log", "show") and re.match(r"^-o", a)) or \
+                (sub == "commit" and (a in ("-F", "-t") or re.match(r"^-[A-Za-z]*[Ft]", a) or
+                                 a.startswith(("--file", "--template")))) or \
+                (sub == "blame" and a.startswith("--contents")):
+            _sl_fail("git %s %s (reads a file into the commit)" % (sub, a))
+    for a in rest:
         low = a.lower()
         if low.startswith(("-c", "--exec", "--upload-pack", "--receive-pack", "--repo", "--output", "--ext-diff",
                            "--textconv", "--config")) or "://" in a or re.match(r"^[\w.-]+@[\w.-]+:", a):
@@ -2858,7 +2941,8 @@ def shell_unlisted(cmd, cwd, ctx):
     try:
         stages = sl_lex(cmd, plugin)
         here = os.path.realpath(cwd or ws)
-        for st in stages:
+        for k, st in enumerate(stages):
+            st["first"] = k == 0
             here = _sl_stage(st, here, ws, ctx, plugin)
     except _Unlisted as e:
         return str(e), e.kind
@@ -2902,13 +2986,18 @@ MCP_NET_TOKENS = {"url", "http", "https", "fetch", "download", "web", "scrape", 
 HOST_LIKE_RE = re.compile(r"^(?:[a-z][\w+.-]*://|//)?(?:[\w-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]|$)", re.I)
 
 
+URL_FIELDS = {"url", "uri", "target", "href", "endpoint", "link", "urls", "uris", "targets", "hrefs", "endpoints",
+              "links", "host", "hosts", "server", "servers", "hook", "hooks", "webhook", "webhooks", "webhook_url"}
+
+
 def mcp_host_field(v):
     """A url/target/href (or …_url) field whose value looks like a host, with or without a scheme."""
     if isinstance(v, dict):
         for k, x in v.items():
             name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(k)).lower()
-            if (name in ("url", "uri", "target", "href", "endpoint", "link") or name.endswith(("_url", "_uri")))\
-                    and isinstance(x, str) and (HOST_LIKE_RE.match(x.strip()) or "://" in x):
+            urlish = name in URL_FIELDS or name.endswith(("_url", "_uri", "_urls", "_uris", "_link", "_links"))
+            vals = x if isinstance(x, list) else [x]
+            if urlish and any(isinstance(y, str) and (HOST_LIKE_RE.match(y.strip()) or "://" in y) for y in vals):
                 return True
             if mcp_host_field(x):
                 return True
@@ -2947,6 +3036,9 @@ def classify(tool, inp, cwd, ctx):
                                           "WhatsApp setup)")
             if fp.casefold() in protected_paths(ctx):
                 return act("config", "guard_config", "an edit to the guard's own files: " + fp)
+            if ctx.ws and fp.casefold() == _cf(os.path.join(ctx.ws, "capabilities.json")):
+                return act("config", "guard_config", "an edit to capabilities.json (written only by `mother health`): "
+                           + fp)
             if home_settings_path(fp):
                 return act("home_settings", "home_settings", "an edit to Claude Code's settings: " + fp)
             if fp.casefold() == grants_path(ctx):
@@ -3163,6 +3255,28 @@ def grants_signed(doc):
     key = grant_key()
     sig = doc.get("sig") if isinstance(doc, dict) else None
     return bool(key) and isinstance(sig, str) and hmac.compare_digest(sig, grants_mac(doc.get("grants"), key))
+
+
+def read_grants_for_write(path, ws=None, who="mother grant"):
+    """(doc, problem) for a writer that is about to change grants.json: a missing file is empty; a file that parses
+    but whose signature doesn't verify is treated as empty too (its grants are dropped, never re-signed) and one
+    line goes to guard.log; an unparseable file is a problem the caller reports, never overwrites."""
+    if not os.path.exists(path):
+        return {"grants": []}, None
+    data, ok = read_json(path)
+    if not ok:
+        return None, "grants.json is unreadable; fix or remove it by hand"
+    if isinstance(data, dict) and isinstance(data.get("grants"), list) and grants_signed(data):
+        return {"grants": list(data["grants"])}, None
+    if ws:
+        try:
+            with open(os.path.join(ws, ".mother", "guard.log"), "a") as f:
+                f.write(json.dumps({"at": now_iso(), "tool": who, "kind": "grants", "category": "grants_file",
+                                    "target": None, "decision": "reset",
+                                    "reason": "grants.json had no valid signature: its grants were dropped"}) + "\n")
+        except Exception:
+            pass
+    return {"grants": []}, None
 
 
 def grant_scope_of(a):

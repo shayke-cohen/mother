@@ -245,17 +245,21 @@ and `hub install|uninstall`), read-only tools (`ls`, `cat`, `grep`, `jq`, `sed` 
 `-exec`/`-delete`, …), `mkdir`/`touch`/`cp`/`mv`/`rm` on literal paths inside the workspace, `cd` inside it, the
 code host's reads, and `git status|log|diff|show|add|commit|pull|push|fetch|…` to the workspace's own remotes.
 Anything else asks, PAUSED or not: `$` expansions and `$(…)`, backticks, globs and braces outside quotes,
-subshells, `eval`/`source`/`exec`, here-strings, a heredoc into anything but `mother` (with a quoted delimiter),
+any backslash outside single quotes, a word starting with `=`, `cd` anywhere but first (and then only with `&&`),
+subshells, `eval`/`source`/`exec`, here-strings, a heredoc into anything but `mother` (exactly `<<'WORD'`),
+`mother` verbs that set up or move things (`init`, `join`, `link`, `home set|move`, `tts`, `eval --plugin-dir`),
+a path hidden in an option (`--file=…`, `-f…`) that leaves the workspace, the plugin and the temp folder,
 other programs (interpreters, `awk`, `xargs`, shells, network tools), and any path in `~/.mother`, `~/.claude` or
 a protected workspace file (`.mother/`, `.git/`, `.claude/`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`,
-`memory/MEMORY.md`). A network program is still `outbound_unknown` (PAUSED denies it). Skills write commands to
+`memory/MEMORY.md`, `config.json`, `capabilities.json`). A network program is still `outbound_unknown` (PAUSED denies it). Skills write commands to
 fit: the workspace path written out (from `mother path`), no shell variables, files read with the Read tool.
 
 ## Signed grants, the grant key and Claude Code's settings
 
 - `mother grant` signs `grants.json` (HMAC-SHA256 with `~/.mother/grant.key`, made 0600 on first use, outside the
   workspace). The hook ignores a grants file whose signature doesn't verify, so a hand-written or edited grant
-  grants nothing; grants written before signing existed are ignored too.
+  grants nothing; grants written before signing existed are ignored too. Every grant writer checks the
+  signature of the file it is about to change and drops unsigned grants rather than re-signing them.
 - The key is off limits: any Read, Edit, Write, Grep, Glob or LS of it is denied in every session, and the shell
   allow-list asks before any command that names `~/.mother`.
 - An edit to `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json` or anything under

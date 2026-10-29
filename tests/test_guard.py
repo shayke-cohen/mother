@@ -413,8 +413,9 @@ class TestShellSelfEdit(GuardCase):
         why = self.expect("ask", "Bash", {"command": "python3 -c \"import json; print(open('config.json').read())\""},
                           cwd=self.ws)
         self.assertIn("allow-list", why)
-        self.bash("none", "git add config.json && git commit -m \"config: x\n\nCo-Authored-By: Agnes <agnes@example.com>\"",
+        self.bash("none", "git add notes.md && git commit -m \"notes: x\n\nCo-Authored-By: Agnes <agnes@example.com>\"",
                   cwd=self.ws)
+        self.bash("ask", "git add config.json", cwd=self.ws)  # config.json is protected on the allow-list (round 3)
         self.bash("none", "echo 'routines paused today' >> notes.md", cwd=self.ws)
         why = self.expect("ask", "Bash", {"command": "cat > notes.md <<'EOF'\nchange config.json later\nEOF"},
                           cwd=self.ws)  # a heredoc into anything but `mother` is off the allow-list, not a self-edit
@@ -2071,7 +2072,7 @@ class RedTeamFixes(GuardCase):
             self.ws_call("ask", "Bash", {"command": cmd}, mode=self.BY)
             self.expect("none", "Bash", {"command": cmd}, cwd=self.tmp)
         for cmd in ("git commit -m 'use https for the remote'", "ls ssh_keys", "grep -rn curl routines/",
-                    "mother todo add 'call the http team'", "gh pr view 5"):
+                    "mother now top set 'call the http team'", "gh pr view 5"):
             self.ws_call("none", "Bash", {"command": cmd})
         for cmd in ("cat > notes.md <<'EOF'\ncurl is how they upload\nEOF", "python3 -m json.tool x.json",
                     "python3 bin/tool.py --flag"):  # not outbound, but off the allow-list
@@ -2253,6 +2254,7 @@ class RoundTwo(GuardCase):
 
     def test_allow_list_takes_the_listed_programs(self):
         os.makedirs(os.path.join(self.ws, "memory"))
+        os.makedirs(os.path.join(self.ws, "teams"))
         for cmd in ("ls -la teams", "cat todos/open.md | head -5", "grep -rn 'x' memory/ | wc -l", "jq '.a' x.json",
                     "sed -n '1,5p' notes.md", "sed 's/a/b/g' notes.md", "find people -name x.md", "date -u +%F",
                     "mkdir -p journal/brief", "touch journal/x.md", "cp notes.md notes2.md", "mv a.md b.md",
@@ -2270,8 +2272,8 @@ class RoundTwo(GuardCase):
                           ("echo $X", "`$`"), ("echo ${X}", "`$`"), ("echo $(id)", "`$`"), ("echo `id`", "backtick"),
                           ("ls *.md", "glob"), ("ls a?", "glob"), ("ls {a,b}", "brace"), ("echo hi &", "background"),
                           ("(ls)", "subshell"), ("cat <(ls)", "subshell"), ("cat <<< x", "here-string"),
-                          ("cat <<'E'\nx\nE", "heredoc into cat"), ("mother x <<E\ny\nE", "unquoted delimiter"),
-                          ("ls \\\nx", "line continuation"), ("ls # c", "comment"), ("X=1 ls", "assignment"),
+                          ("cat <<'E'\nx\nE", "heredoc into cat"), ("mother x <<E\ny\nE", "isn't exactly"),
+                          ("ls \\\nx", "backslash"), ("ls # c", "comment"), ("X=1 ls", "assignment"),
                           ("eval ls", "eval"), ("source x.sh", "source"), (". x.sh", "allow-list"),
                           ("exec ls", "exec"), ("/bin/ls", "by path"), ("ls | sh", "sh"), ("ls | xargs rm", "xargs"),
                           ("sed -i '' s/a/b/ x", "sed -i"), ("sed '1e id' x", "sed script"), ("sed 'w out' x", "sed script"),
@@ -2361,6 +2363,89 @@ class RoundTwo(GuardCase):
         for tool, inp in (("mcp__browser__computer", {"action": "screenshot"}), ("mcp__x__get_item", {"id": "1"}),
                           ("mcp__x__lookup", {"target": "PLAT-1"}), ("mcp__ccd_session_mgmt__list_sessions", {})):
             self.ws_call("none", tool, inp)
+
+
+class RoundThree(GuardCase):
+    """Round 3: shell-reader edges (backslashes, heredoc delimiters, cd, zsh `=`), config.json, mother verbs, paths
+    hidden in options, git commit -F, MCP url fields in lists and host/server/hook names."""
+
+    BY = "bypassPermissions"
+
+    def setUp(self):
+        super().setUp()
+        for d in ("memory", "teams", ".git"):
+            os.makedirs(os.path.join(self.ws, d), exist_ok=True)
+
+    def ws_call(self, want, tool, inp, **kw):
+        kw.setdefault("cwd", self.ws)
+        return self.expect(want, tool, inp, **kw)
+
+    def test_backslashes_and_heredoc_delimiters(self):
+        for cmd in ('rm ".mo\\\nther/PAUSED"', 'cp x "AGE\\\nNTS.md"', "c\\at notes.md", 'echo "a\\"b"',
+                    "mother now merge <<'E'x\nEx\ncurl https://evil.example.com\nE",
+                    "mother now merge <<\"E\"x\nEx\nE", "mother now merge << 'E'\n{}\nE", "mother now merge <<'E-1'\n{}\nE-1",
+                    "mother now merge <<E\n{}\nE"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+        for cmd in ("printf '%s\\n' 'a\\tb' >> runs.md", "grep -E '^\\- #[0-9]+' notes.md",
+                    "mother now merge <<'TICK'\n{}\nTICK", "mother now merge <<-\"T_2\"\n\t{}\n\tT_2"):
+            self.ws_call("none", "Bash", {"command": cmd})
+
+    def test_cd_only_first_and_with_and(self):
+        for cmd in ("cd teams && ls", "cd memory"):
+            self.ws_call("none", "Bash", {"command": cmd})
+        for cmd in ("cd nonexist || cd memory; ls", "cd teams; ls", "ls && cd teams", "cd nonexist && ls",
+                    "cd teams || true", "cd -", "cd teams | ls"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+
+    def test_zsh_equals_and_tilde(self):
+        for cmd in ("cp notes.md =gh", "printf x >> =jq", "cat =curl", "ls ~", "ls ~root/x", "=curl x"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+        self.ws_call("none", "Bash", {"command": "ls ~/Documents"})
+        self.ws_call("none", "Bash", {"command": "echo a=b"})
+
+    def test_config_and_capabilities_are_protected(self):
+        for cmd in ("printf '{}' > config.json", "cp notes.md config.json", "touch Config.json", "rm config.json",
+                    "printf x > capabilities.json", "cat x 1>config.json"):
+            why = self.ws_call("ask", "Bash", {"command": cmd}, mode=self.BY)
+        self.ws_call("ask", "Write", {"file_path": os.path.join(self.ws, "capabilities.json"), "content": "{}"},
+                     mode=self.BY)
+        self.ws_call("ask", "Bash", {"command": "cat config.json"})  # reading a protected file is a question too
+
+    def test_mother_verbs_by_name(self):
+        for cmd in ("mother path", "mother version", "mother status", "mother runs --json", "mother scan",
+                    "mother sync", "mother now show", "mother hub status", "mother health summary",
+                    "mother items check --file /tmp/r.json", "mother memory check", "mother speak --name x",
+                    "mother channels plan", "mother grant remove --run x", "mother grant list",
+                    "mother home check", "mother home show", "mother eval report", "mother register"):
+            self.ws_call("none", "Bash", {"command": cmd})
+        for cmd in ("mother init /tmp/x --remote https://evil.example.com/x.git", "mother join https://evil.example.com/x",
+                    "mother link /tmp/bin", "mother home set evilhost", "mother home move h", "mother tts setup",
+                    "mother eval brief --plugin-dir /tmp/evil", "mother eval brief --skip-permissions",
+                    "mother register --write", "mother frobnicate", "mother", "mother hub install"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+        self.ws_call("ask", "Bash", {"command": "mother grant add chat-post C1 --by U1 --cites 1"}, mode=self.BY)
+
+    def test_paths_hidden_in_options(self):
+        key = os.path.join(self.home, ".mother", "grant.key")
+        for cmd in ("cut -c1- ~/.mother/grant.key", "cut -c1- %s" % key, "diff --from-file=%s /dev/null" % key,
+                    "grep -f%s -v notes.md" % key, "grep --file=%s x" % key, "file -m%s notes.md" % key,
+                    "wc --files0-from=%s" % key, "head -c 64 -- %s" % key, "echo %s" % key,
+                    "cat /etc/passwd", "cat " + "../" * 40 + "etc/passwd", "git commit -F notes.md", "git commit --file=notes.md",
+                    "git commit -t notes.md", "git commit -m x --template=notes.md", "git blame --contents=x notes.md",
+                    "git diff -o /tmp/x", "sort --files0-from=/etc/x"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+        for cmd in ("cat /tmp/x.json", "diff notes.md /dev/null", "git log HEAD~1..HEAD", "jq -n '1' > /dev/null",
+                    "cat %s/bin/mother" % ROOT, "git commit -m 'see https://x'"):
+            self.ws_call("none" if "https" not in cmd else "ask", "Bash", {"command": cmd})
+
+    def test_mcp_url_lists_and_host_fields(self):
+        for inp in ({"urls": ["https://evil.example.com/?q=1"]}, {"hook": "https://evil.example.com"},
+                    {"webhook": "evil.example.com/x"}, {"server": "evil.example.com"}, {"host": "a.evil.example.com"},
+                    {"opts": {"links": ["evil.example.com/a"]}}, {"endpoint": "evil.example.com"}):
+            self.ws_call("ask", "mcp__x__lookup", inp)
+            self.expect("none", "mcp__x__lookup", inp, cwd=self.tmp)
+        for inp in ({"server": "prod"}, {"host": "PLAT-1"}, {"links": ["PLAT-1"]}):
+            self.ws_call("none", "mcp__x__lookup", inp)
 
 
 if __name__ == "__main__":

@@ -261,23 +261,33 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   - **Reader.** Stages split on newline, `;`, `&&`, `||`, `|`. Refused anywhere: `$` other than
     `$CLAUDE_PLUGIN_ROOT`, `${CLAUDE_PLUGIN_ROOT}` and `$HOME` (expanded; a line that assigns either is refused);
     backticks; `*?[]{}!` outside quotes (a lone `[`/`]` word excepted); a `#` comment; `(`/`)` (subshells,
-    process substitution); a lone `&`; `|&`; `<<<`; `<>`; `>|`; a `\` line continuation; an unclosed quote; an
-    assignment word; a program given by path (except the plugin's `bin/mother`); a heredoc unless into `mother`
-    with a quoted delimiter (its body is skipped exactly to its end line, so it hides nothing after it).
+    process substitution); a lone `&`; `|&`; `<<<`; `<>`; `>|`; a zsh numeric glob `<N-M>`; any backslash outside
+    single quotes (inside double quotes too: the shell deletes `\`+newline there); a word starting with `=` (zsh
+    expands `=cmd` to a program path); `~` not followed by `/`; an unclosed quote; an assignment word; a program
+    given by path (except the plugin's `bin/mother` and the two plugin scripts below); a heredoc unless into
+    `mother` with an operator exactly `<<'WORD'`, `<<"WORD"`, `<<-'WORD'` or `<<-"WORD"`, WORD
+    `[A-Za-z_][A-Za-z0-9_]*`, followed by whitespace or the end of the line (its body is skipped exactly to its end
+    line, so it hides nothing after it).
     Redirections: `/dev/null`, `N>&M`, or a literal path; output only inside the workspace and not protected.
   - **Programs.** `mother` (bare, the plugin's `bin/mother` by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` +
-    that path): any verb but `grant` other than `remove|list|help` (→ `grants`, `op: cli`) and `hub
-    install|uninstall`. Read-only: `ls cat head tail wc sort uniq cut tr grep egrep rg jq diff cmp stat file
+    that path) with a verb from `path version help status runs scan sync now hub health items memory speak
+    channels whatsapp grant home eval register`, except `grant` other than `remove|list|help` (→ `grants`,
+    `op: cli`), `hub install|uninstall`, `home` other than `check|show`, `eval` with `--plugin-dir` or
+    `--skip-permissions`, and `register` with any argument; any other verb (`init`, `join`, `link`, `tts`, …)
+    asks. `claude mcp list` (exactly). `python3 <plugin>/assets/plan/build.py …` and `…/assets/deck/build.py …`
+    with literal arguments (an `.html` operand is a write target). Read-only: `ls cat head tail wc sort uniq cut tr grep egrep rg jq diff cmp stat file
     basename dirname realpath date pwd echo printf true false test [ sleep which`; `sed` without `-i`/`-I`/
     `--in-place`/`-f` and with each script part an address plus `p`, `d`, `q`, `=` or `s///` with flags from
     `gpIi0-9`; `find` without `-exec -execdir -ok -okdir -delete -fprint* -fls`; not `sort -o/-T/
     --compress-program`, `uniq` with an output file, `date -s`, `rg --pre/-z`, `jq --rawfile/--slurpfile/-L/-f`.
-    `cd` to a literal path inside the workspace (later relative paths resolve from there). File ops `mkdir touch
+    `cd` only as the first stage, to a literal existing folder inside the workspace, and joined to the rest only
+    by `&&` (later relative paths resolve from there). File ops `mkdir touch
     cp mv rm` with every operand inside the workspace and not protected (a `cp`/`mv` into a folder checks
     folder/name), no recursive `cp`/`mv`, and `rm -r` only of a folder that holds no protected path (at most 2000
     entries). `gh`/`glab`: the reader's reads (§5c) and `auth status`. `git`: global options only `-C <workspace
     path>`, `--no-pager`, `--no-optional-locks`; subcommands `status log diff show add commit pull push fetch
-    rev-parse branch ls-files blame` and `stash list`; no argument starting `-c`, `--exec`, `--upload-pack`,
+    rev-parse branch ls-files blame` and `stash list`; not `commit -F/--file/-t/--template`, `blame --contents`,
+    `diff|log|show -o`; no argument starting `-c`, `--exec`, `--upload-pack`,
     `--receive-pack`, `--repo`, `--output`, `--ext-diff`, `--textconv`, `--config`, holding `://` or shaped
     `user@host:`; `push|pull|fetch` with no remote or a remote named in the workspace's `.git/config`.
   - **Paths.** Every operand of every allowed program (not the text of `echo`, `printf`, `test`, `[`, `sleep`,
@@ -285,7 +295,14 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     resolved from the stage's cwd (symlinks followed) and refused when it is in `~/.mother` (reading
     `~/.mother/workspace` excepted), in `~/.claude` or is `~/.claude.json`, or is protected in the workspace:
     `.mother/` and `.git/`, any `.claude/` folder, any `CLAUDE.md`, `.mcp.json` or `grants.json`, `AGENTS.md`
-    and `memory/MEMORY.md` at the top, and the workspace root itself as a write target.
+    and `memory/MEMORY.md`, `config.json` and `capabilities.json` at the top (any case), and the workspace root
+    itself as a write target. A write to `config.json` or `capabilities.json` is `kind: config`.
+    **Hidden paths:** for every word of every allowed program, the word, the text after its first `=`, and the
+    text after a leading short-option cluster (`-f…`, `-m…`) are each a path when they start with `/` or `~` or
+    hold `..`; such a path must pass the checks above and resolve inside the workspace, the plugin or the system
+    temp folders (`tempfile.gettempdir()`, `/tmp`, `/var/tmp`), or be `/dev/null`.
+- **ask, every mode** (`kind: "config"`): a Write/Edit/MultiEdit/NotebookEdit of the workspace's
+  `capabilities.json` (written only by `mother health`), like `config.json`.
 - **ask, every session and mode** (`kind: "home_settings"`): a Write/Edit/MultiEdit/NotebookEdit of
   `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json` or anything under
   `~/.claude/plugins/` (they decide which plugins and hooks run). Never passed by bypass.
@@ -295,8 +312,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **MCP web tools** (`outbound_unknown`, workspace sessions, any server but `mcp__ccd_…`, when the domain rules
   give no decision): a tool name with a `url`, `http`, `https`, `fetch`, `download`, `web`, `scrape`, `page`,
   `request`, `browse`, `navigate` or `crawl` part; an input field `url`, `uri`, `target`, `href`, `endpoint`,
-  `link` or `…_url`/`…_uri` (nested too) whose value looks like a host (`[scheme://]name.tld[:port][/…]`) or
-  holds `://`; a tool named `form_input`, and `computer` with `action` `type` or `key`.
+  `link`, their plurals, `host(s)`, `server(s)`, `hook(s)`, `webhook(s)`, or `…_url(s)`/`…_uri(s)`/`…_link(s)`
+  (nested too; a list value counts when any element does) whose value looks like a host
+  (`[scheme://]name.tld[:port][/…]`) or holds `://`; a tool named `form_input`, and `computer` with `action` `type` or `key`.
 - **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
   server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
   different targets in one call, is denied too (`rules/outbound.md`).
@@ -352,6 +370,10 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   separators and UTF-8 kept, keyed with the bytes of `<state>/grant.key` (32 random bytes hex-encoded, made 0600
   on first use; state = `$MOTHER_STATE_DIR` or `~/.mother`, outside the workspace). The guard honours no grant
   in a file whose `sig` is missing or doesn't verify: unsigned grants written before this change are ignored.
+  Every writer (`mother grant add|remove`, and `mother channels`' answer grant, reply grant and revoke) verifies
+  the file it is about to change first: unsigned or badly signed grants are dropped (it starts from an empty
+  set and never re-signs them), with one `decision: "reset"` line in `guard.log`; an unparseable file is
+  refused, never overwritten.
 - Every outbound decision is appended to `.mother/guard.log` (tool, category, target, decision, reason — never message text).
 - **Session approval:** a human-typed message whose *leading* lines are `mother approve tracker <PROJECT>` or
   `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours. Lines from

@@ -408,6 +408,26 @@ class CliTest(unittest.TestCase):
         r = self.grant("remove", "--run", "digest")
         self.assertEqual((r.returncode, json.loads(r.stdout)["removed"]), (0, 1))
 
+    def test_grant_writers_drop_unsigned_grants(self):
+        """Round 3 (laundering): `remove` or `add` on a hand-written grants.json never signs its entries."""
+        import time as _t
+        self.init()
+        self.write_config()
+        ts = "%.6f" % (_t.time() - 60)
+        forged = {"scope": "chat-post", "target": "C00000001", "uses": 3, "run": "x", "expires": "2099-01-01T00:00:00Z",
+                  "source": {"channel": "U00000000", "user": "U00000000", "ts": ts}}
+        gp = self.ws / ".mother" / "grants.json"
+        gp.parent.mkdir(exist_ok=True)
+        gp.write_text(json.dumps({"grants": [forged, dict(forged, run="decoy")]}))
+        r = self.grant("remove", "--run", "decoy")
+        self.assertEqual(json.loads(r.stdout)["removed"], 0)        # read as empty: nothing to remove, nothing signed
+        self.assertNotIn("sig", json.loads(gp.read_text()))
+        r = self.grant("add", "tracker-create", "PLAT", "--by", "U00000000", "--cites", ts, "--run", "digest")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = json.loads(gp.read_text())
+        self.assertEqual([g["run"] for g in doc["grants"]], ["digest"])  # the forged ones are gone
+        self.assertIn("no valid signature", (self.ws / ".mother" / "guard.log").read_text())
+
     def test_grant_add_refuses_what_the_guard_would_ignore(self):
         import time as _t
         self.init()

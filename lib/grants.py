@@ -51,17 +51,9 @@ def locked(ws: Path):
 
 
 def read(ws: Path):
-    """(doc, problem). A missing file is an empty doc; an unreadable one is a problem (never overwritten)."""
-    p = ws / ".mother" / "grants.json"
-    if not p.exists():
-        return {"grants": []}, None
-    try:
-        doc = json.loads(p.read_text())
-    except (OSError, ValueError) as e:
-        return None, "grants.json is unreadable (%s); fix or remove it by hand" % type(e).__name__
-    if not isinstance(doc, dict) or not isinstance(doc.get("grants"), list):
-        return None, "grants.json has no grants list; fix or remove it by hand"
-    return doc, None
+    """(doc, problem). Missing or unsigned (or badly signed) grants read as an empty set, so a hand-written grant is
+    never laundered into a signed one; an unreadable file is a problem (never overwritten)."""
+    return guard.read_grants_for_write(str(ws / ".mother" / "grants.json"), str(ws))
 
 
 def write(ws: Path, doc) -> None:
