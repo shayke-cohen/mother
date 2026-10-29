@@ -97,6 +97,23 @@ only in an interactive `/mother:doctor`.
   └─ mother channels done          → state in .mother/channels.json, audit in .mother/channels.log
 ```
 
+## How the hub flows
+
+```
+launchd: mother hub watch   (lib/hub.py + hub_mcp.py + hub_sources.py, no model, read-only allow-list)
+  ├─ per connection: read-only MCP over stdio (or `gh`) → adapter → deterministic prefilter
+  ├─ appends one line per changed thing to .mother/hub/inbox.jsonl; heartbeat in watcher.json
+  └─ records nothing in capabilities.json: watcher.json plus one inbox `error` line are the record
+pinned desktop session (/mother:hub): Monitor tails the inbox, wakes only on a new line
+  ├─ mother hub decide   → log / Now row only │ send_message into the thing's session │ proposal card
+  ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
+  ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`)
+  └─ in-app session tools pass the guard only for the hub session; sub-agents and channel sessions are denied
+Now panel: Hub section (status, sessions, updates); an Open button opens a session (desktop draws only https links)
+```
+
+Accepted gaps: tracker changes to the manager's own fields and unthreaded replies in watched channels are not seen.
+
 ## Invariants the code relies on
 
 - **One writer.** Only MOTHER (the routine or interactive session) judges, writes and posts. Sub-agents and
