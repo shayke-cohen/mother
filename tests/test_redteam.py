@@ -95,8 +95,16 @@ class RedTeam(unittest.TestCase):
             self.g.run(json.dumps({"tool_name": "Bash", "tool_input": {"command": "mother hub tail --once"},
                                    "session_id": sid, "cwd": self.ws, "permission_mode": "default"}))
         self.assertEqual(self.g.hub_session_ids(self.ws)[:2], [HUB, OLD_HUB])
+        # the channels loop: a session the manager started with /mother:channels, whose first command is `plan`
+        self.loop_transcript = os.path.join(self.tmp, "loop.jsonl")
+        with open(self.loop_transcript, "w") as f:
+            f.write(json.dumps({"type": "user", "origin": {"kind": "human"},
+                                "message": {"role": "user", "content": "<command-message>mother:channels</command-message>"
+                                                                       "\n<command-name>/mother:channels</command-name>"}})
+                    + "\n")
         self.g.run(json.dumps({"tool_name": "Bash", "tool_input": {"command": "mother channels plan"},
-                               "session_id": LOOP, "cwd": self.ws, "permission_mode": "default"}))
+                               "session_id": LOOP, "cwd": self.ws, "permission_mode": "default",
+                               "transcript_path": self.loop_transcript}))
         if hasattr(self.g, "channels_session_ids"):  # MOTHER_REDTEAM_GUARD may point at an older guard
             self.assertEqual(self.g.channels_session_ids(self.ws), [LOOP])
 

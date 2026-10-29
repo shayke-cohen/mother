@@ -357,10 +357,16 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   every mode, PAUSED included; the hub session itself still denies them).
 - **The channels loop's session** (`kind: "grants"`, `op: "channels_session"`; checked right after hub-fed, in or
   out of the workspace): `mother channels approvals|triage|run|done` (and any `channels answer|send`) run
-  without a question only in a session listed in `.mother/channels-session.json`. The hook lists a session,
-  before deciding, when it runs a command that names `mother channels plan` with its cwd in the workspace, as
-  itself (no `agent_type`) and not hub-fed; a hub-fed session is never listed. Anywhere else these verbs **ask**;
-  PAUSED and `MOTHER_DRY_RUN` deny; bypass never passes it.
+  without a question only in a session listed in `.mother/channels-session.json`. The hook lists a session only
+  when all of these hold: the Bash command is exactly one plain `mother channels plan …` (`mother`, the plugin's
+  `bin/mother` by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` of it; plain or single-quoted words, nothing
+  chained, piped, redirected, expanded or commented), the guard gives it no decision, its cwd is in the workspace,
+  it runs as the session itself (no `agent_type`), the session is not hub-fed, and the first message a human typed
+  in the session (`transcript_path`; a slash command read as `/name args`) starts with `/mother:channels`, or with
+  `/loop` and names `mother:channels`. A command that only names `plan` (a grep, a comment, a chain) records
+  nothing. The file keeps at most 3 ids, newest first, each with its time in `recorded`; a new id evicts the
+  oldest one recorded more than 2 hours ago, and is not added when all three are more recent. Anywhere else these
+  verbs **ask**; PAUSED and `MOTHER_DRY_RUN` deny; bypass never passes it.
 - **ask, every session and mode** (`kind: "manager_only"`, PAUSED included; never passed by bypass;
   `MOTHER_DRY_RUN` denies): `mother channels resume` and `mother channels start`.
 - **ask, every session and mode** (`kind: "home_settings"`): a Write/Edit/MultiEdit/NotebookEdit of
@@ -584,6 +590,20 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   script it wrote (`chmod`, `./x.sh`). `gh api -X GET …` and `-F query=@file` whose file holds a query and no
   mutation are reads. Connector calls `executeRead` and `*_monitor`/`*_watch` are not outbound.
 
+- **Accepted risks.** These are known and left open on purpose:
+  - A session outside the workspace keeps Claude Code's normal permissions. The guard's shell allow-list applies
+    only in the workspace, so there `python3 lib/channels.py …` or a `python3 -c` that calls `grants.main` runs
+    with no question from the guard; Claude Code's own permission prompt is the only check there.
+  - From a hub-fed session (other than the hub session itself, which denies them), `Agent` with remote
+    isolation, `Skill schedule`, `CronCreate`, `mcp__ccd_session_mgmt__clear_session` /
+    `unarchive_session` and `set_session_permission_mode` are not fenced beyond the hub role: they keep their
+    normal rules.
+  - A channels loop session that hasn't run `plan` for more than 2 hours can be evicted from
+    `channels-session.json` by three other sessions the manager started with `/mother:channels`; it then asks
+    before its reply verbs until it runs `plan` again.
+  - Tools the guard has no rule for are not registered, so the hub session's deny-by-default covers only the
+    registered ones (§5, hook registration).
+
 ## 5b. Channel reply loop (`lib/channels.py`, `mother channels`, skill `mother:channels`)
 
 - The skill does chat I/O only; the CLI decides. `plan` → what to poll; `triage` (stdin: one channel's new
@@ -606,8 +626,10 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **The loop runs in its own session, never a hub-fed one** (§5). `approvals` and `triage` read replies on stdin
   as the manager's and `run`/`answer` write grants, so in a session that reads hub lines (a card the hub routes to,
   the hub itself, or any session that ran `mother hub …`) the guard asks before each of them. The loop's first
-  step is `mother channels plan`: the guard records the session that runs it (in the workspace, not a sub-agent,
-  not hub-fed) in `.mother/channels-session.json` (`{session_ids, at}`, newest first, at most 3), and
+  step is `mother channels plan`: the guard records the session that runs it (as one plain command, in the
+  workspace, not a sub-agent, not hub-fed, in a session the manager started with `/mother:channels` or
+  `/loop … /mother:channels`; §5) in `.mother/channels-session.json` (`{session_ids, at, recorded: {id: time}}`,
+  newest first, at most 3, none recorded in the last 2 hours evicted), and
   `approvals`, `triage`, `run` and `done` ask in any session not listed there, such as a brief that read mail. `mother channels
   start` and `resume` always ask: only the manager turns the loop back on.
 - State: `.mother/channels.json` (cursors, threads, pending actions, drafts, streaks, demotions, stop/pause);

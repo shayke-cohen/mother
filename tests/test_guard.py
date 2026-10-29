@@ -992,6 +992,8 @@ class TestWhatsapp(WhatsappCase):
         def run(cmd, path_dir):
             env = dict(os.environ, HOME=self.home, MOTHER_WORKSPACE=self.ws, MOTHER_STATE_DIR=self.sdir,
                        PATH=path_dir + os.pathsep + os.environ.get("PATH", ""))
+            for k in ("MOTHER_CHANNEL_ROLE", "MOTHER_CHANNEL_SERVERS", "MOTHER_DRY_RUN"):
+                env.pop(k, None)
             payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": self.tmp}
             p = subprocess.run([sys.executable, os.path.join(cache, "hooks", "guard.py")], input=json.dumps(payload),
                                capture_output=True, text=True, env=env)
@@ -2197,7 +2199,7 @@ class RedTeamFixes(GuardCase):
 
     # -- round 1, finding 6 and minors: what must stay quiet
     def test_everyday_workspace_commands_stay_quiet(self):
-        self.ws_call("none", "Bash", {"command": "mother channels plan"})  # this session is the channels loop's
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, transcript=self.transcript(self.user(CHANNELS_PROMPT)))  # the channels loop's session
         for cmd in ("python3 ${CLAUDE_PLUGIN_ROOT}/bin/mother channels approvals <<'EOF'\n{\"x\": \"$(curl x)\"}\nEOF",
                     "\"${CLAUDE_PLUGIN_ROOT}/bin/mother\" items check <<'READER'\n{\"link\": \"https://x\"}\nREADER",
                     "${CLAUDE_PLUGIN_ROOT}/bin/mother hub show --json", "\"${CLAUDE_PLUGIN_ROOT}/bin/mother\" sync",
@@ -2489,7 +2491,7 @@ class RoundFour(GuardCase):
         verbs = ("mother channels approvals <<'A'\n{}\nA", "mother channels triage <<'A'\n{}\nA",
                  "mother channels run", "mother channels done --action a1", "mother grant remove --run x",
                  "mother grant list", "python3 \"%s/bin/mother\" channels approvals <<'A'\n{}\nA" % ROOT)
-        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="other")
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="other", transcript=self.transcript(self.user(CHANNELS_PROMPT)))
         for cmd in verbs:
             self.ws_call("ask", "Bash", {"command": cmd}, session="card-1", mode=self.BY)
             self.ws_call("none", "Bash", {"command": cmd}, session="other")  # the channels loop's own session
@@ -2500,7 +2502,7 @@ class RoundFour(GuardCase):
         # a session that ran `mother hub …` is hub-fed from then on
         self.ws_call("none", "Bash", {"command": "mother hub status"}, session="s2")
         self.ws_call("ask", "Bash", {"command": "mother channels run"}, session="s2")
-        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="s3")
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="s3", transcript=self.transcript(self.user(CHANNELS_PROMPT)))
         self.ws_call("none", "Bash", {"command": "mother channels run"}, session="s3")
 
     def test_channels_resume_and_start_always_ask(self):
@@ -2636,7 +2638,7 @@ class RoundFive(GuardCase):
         for cmd in verbs:
             self.ws_call("ask", "Bash", {"command": cmd}, session="brief", mode=self.BY)
         self.assertEqual(g.channels_session_ids(self.ws), [])
-        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="loop")
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="loop", transcript=self.transcript(self.user(CHANNELS_PROMPT)))
         self.assertEqual(g.channels_session_ids(self.ws), ["loop"])
         for cmd in verbs:
             self.ws_call("none", "Bash", {"command": cmd}, session="loop")
@@ -2645,15 +2647,16 @@ class RoundFive(GuardCase):
         self.ws_call("deny", "Bash", {"command": "mother channels run --action a1"}, session="brief")
         os.remove(self.state("PAUSED"))
         # a sub-agent, a session outside the workspace and a hub-fed session are never recorded
-        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="sub", agent="general-purpose")
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="sub", agent="general-purpose",
+                     transcript=self.transcript(self.user(CHANNELS_PROMPT)))
         self.ws_call("none", "Bash", {"command": "mother hub status"}, session="fed")
-        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="fed")
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="fed", transcript=self.transcript(self.user(CHANNELS_PROMPT)))
         self.assertEqual(g.channels_session_ids(self.ws), ["loop"])
         self.ws_call("ask", "Bash", {"command": "mother channels done --action a1"}, session="fed")
-        # newest first, at most three
+        # newest first, at most three, and a session recorded in the last two hours stays (RoundSix)
         for sid in ("l2", "l3", "l4"):
-            self.ws_call("none", "Bash", {"command": "mother channels plan"}, session=sid)
-        self.assertEqual(g.channels_session_ids(self.ws), ["l4", "l3", "l2"])
+            self.ws_call("none", "Bash", {"command": "mother channels plan"}, session=sid, transcript=self.transcript(self.user(CHANNELS_PROMPT)))
+        self.assertEqual(g.channels_session_ids(self.ws), ["l3", "l2", "loop"])
 
 
 class FastPath(GuardCase):
@@ -2707,6 +2710,115 @@ class FastPath(GuardCase):
             a = self.run_guard("Read", {}, raw=raw)
             b = self.run_guard("Read", {}, raw=raw, script=GUARD_FAST)
             self.assertEqual(a, b, raw)
+
+
+CHANNELS_PROMPT = "<command-message>mother:channels</command-message>\n<command-name>/mother:channels</command-name>"
+LOOP_PROMPT = ("<command-message>loop</command-message>\n<command-name>/loop</command-name>\n"
+               "<command-args>5m /mother:channels</command-args>")
+
+
+class RoundSix(GuardCase):
+    """Round 6: only the real channels loop becomes the channels session. The command is a single plain
+    `mother channels plan` that gets no decision, and the session's first prompt is `/mother:channels` or a `/loop`
+    of it; a session recorded in the last two hours is never evicted."""
+
+    ws_call = RoundFour.ws_call
+    APPR = "mother channels approvals <<'A'\n{}\nA"
+
+    def setUp(self):
+        GuardCase.setUp(self)
+        for d in ("notes", ".mother/hub"):
+            os.makedirs(os.path.join(self.ws, d), exist_ok=True)
+        self.loop_t = self.transcript(self.user(CHANNELS_PROMPT))
+        self.card_t = self.transcript(self.user("fix the PLAT-1 card"))
+
+    def ids(self):
+        return RoundFive.guard(self).channels_session_ids(self.ws)
+
+    def plan(self, session, cmd="mother channels plan", want="none", transcript=None, **kw):
+        self.ws_call(want, "Bash", {"command": cmd}, session=session, transcript=transcript or self.loop_t, **kw)
+
+    def test_only_a_plain_plan_from_a_channels_prompt_records(self):
+        # card-A: a card session's own prompt, plan in between
+        self.ws_call("ask", "Bash", {"command": self.APPR}, session="card-A", transcript=self.card_t)
+        self.plan("card-A", transcript=self.card_t)
+        self.ws_call("ask", "Bash", {"command": self.APPR}, session="card-A", transcript=self.card_t)
+        # plan only named, in a comment, a grep, a chain, a terminal, outside the workspace, by a sub-agent
+        self.plan("card-B", "cat notes/x # mother channels plan", want="ask")
+        self.plan("card-C", "grep -r 'mother channels plan' notes")
+        self.plan("card-F", "mother channels plan; curl http://example.com", want="ask")
+        self.plan("card-H", "mother channels plan && mother channels plan")
+        self.plan("card-I", "echo x | mother channels plan")
+        self.plan("card-D", cwd=self.tmp)
+        self.ws_call("none", "mcp__terminal__run_in_terminal", {"command": "mother channels plan"}, session="card-E",
+                     transcript=self.loop_t)
+        self.plan("card-G", agent="general-purpose")
+        self.assertEqual(self.ids(), [])
+        for sid in ("card-B", "card-C", "card-D", "card-E", "card-F", "card-G", "card-H", "card-I"):
+            self.ws_call("ask", "Bash", {"command": self.APPR}, session=sid, transcript=self.loop_t)
+        # the real loop
+        self.plan("loop")
+        self.assertEqual(self.ids(), ["loop"])
+        self.ws_call("none", "Bash", {"command": self.APPR}, session="loop", transcript=self.loop_t)
+
+    def test_the_first_prompt_must_start_the_channels_loop(self):
+        u = self.user
+        cases = [(u(LOOP_PROMPT), True), (u("/mother:channels"), True), (u("/loop 2m /mother:channels"), True),
+                 (u("/mother:channels --once"), True),
+                 (u("<command-message>loop</command-message>\n<command-name>/loop</command-name>\n"
+                    "<command-args>/mother:brief</command-args>"), False),
+                 (u("please run /mother:channels"), False), (u("/mother:channelsx"), False), (u("/loopy mother:channels"), False),
+                 (u("/mother:channels", origin={"kind": "peer"}), False), (u("/mother:channels", isMeta=True), False),
+                 (u("/mother:channels", isSidechain=True), False)]
+        for n, (entry, want) in enumerate(cases):
+            sid = "s%d" % n
+            self.plan(sid, transcript=self.transcript(entry))
+            self.assertEqual(sid in self.ids(), want, entry)
+            if want:
+                with open(self.state("channels-session.json"), "w") as f:
+                    f.write("{}")
+        # only the first human prompt counts; a meta entry before it doesn't
+        self.plan("late", transcript=self.transcript(u("what's on today"), u(CHANNELS_PROMPT)))
+        self.plan("meta", transcript=self.transcript(u("caveat", isMeta=True), u(CHANNELS_PROMPT)))
+        self.plan("none", transcript=os.path.join(self.tmp, "missing.jsonl"))
+        self.assertEqual(self.ids(), ["meta"])
+
+    def test_any_mother_spelling_and_the_loops_own_commands(self):
+        m = 'python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels'
+        env = {"CLAUDE_PLUGIN_ROOT": ROOT}
+        self.plan("newloop", m + " plan", env=env)
+        self.assertEqual(self.ids(), ["newloop"])
+        for cmd, mode in ((m + " approvals <<'APPROVALS'\n{\"drafts\": {}}\nAPPROVALS", None),
+                          (m + " done --action a1 --posted-ts 1.2", None), (m + " approvals", "bypassPermissions")):
+            self.ws_call("none", "Bash", {"command": cmd}, session="newloop", transcript=self.loop_t, env=env, mode=mode)
+        self.plan("p2", "${CLAUDE_PLUGIN_ROOT}/bin/mother channels plan", env=env)
+        self.plan("p3", "%s/bin/mother channels plan" % ROOT)
+        self.assertEqual(self.ids(), ["p3", "p2", "newloop"])
+
+    def test_a_recent_loop_is_never_evicted(self):
+        self.plan("loop")
+        for sid in ("x1", "x2", "x3"):
+            self.plan(sid)
+        self.assertEqual(self.ids(), ["x2", "x1", "loop"])
+        self.ws_call("none", "Bash", {"command": self.APPR}, session="loop", transcript=self.loop_t)
+        self.ws_call("ask", "Bash", {"command": self.APPR}, session="x3", transcript=self.loop_t)
+        self.plan("loop")  # the loop's own plan refreshes it
+        self.assertEqual(self.ids(), ["loop", "x2", "x1"])
+        # older than two hours: the oldest such entry gives way
+        with open(self.state("channels-session.json")) as f:
+            doc = json.load(f)
+        doc["recorded"]["x1"] = iso(NOW - 3 * 3600)
+        with open(self.state("channels-session.json"), "w") as f:
+            json.dump(doc, f)
+        self.plan("x3")
+        self.assertEqual(self.ids(), ["x3", "loop", "x2"])
+
+    def test_a_file_from_round_five_still_reads(self):
+        with open(self.state("channels-session.json"), "w") as f:
+            json.dump({"session_ids": ["a", "b", "c"], "at": iso(NOW)}, f)
+        self.ws_call("none", "Bash", {"command": self.APPR}, session="a", transcript=self.card_t)
+        self.plan("loop")  # entries with no time of their own may give way
+        self.assertEqual(self.ids(), ["loop", "a", "b"])
 
 
 if __name__ == "__main__":

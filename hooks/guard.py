@@ -4116,7 +4116,8 @@ def record_hub_fed(ws, session_id):
 
 
 CHANNELS_SESSION_CAP = 3
-CHANNELS_PLAN_RE = re.compile(r"(?:^|[^\w.-])mother\s+channels\s+plan\b")
+CHANNELS_SESSION_KEEP_HOURS = 2   # a session recorded this recently is never evicted
+CHANNELS_PROMPT_RE = re.compile(r"^/(?:mother:channels|loop)(?:\s|$)")
 CHANNELS_LOOP_VERBS = {"approvals", "triage", "run", "answer", "done", "send"}
 # The app's tools that continue this conversation in another session
 HUB_FED_HANDOFFS = {"mcp__ccd_session__hand_off_to_session", "mcp__ccd_session__move_to_cloud"}
@@ -4133,9 +4134,12 @@ def channels_session_ids(ws):
     return [i for i in ids if isinstance(i, str) and i] if isinstance(ids, list) else []
 
 
-def record_channels_session(ws, session_id, at):
-    """Add session_id to channels-session.json (newest first, at most CHANNELS_SESSION_CAP), atomically under
-    channels-session.lock. Never raises."""
+def record_channels_session(ws, session_id, at, now=None):
+    """Add session_id to channels-session.json (newest first, at most CHANNELS_SESSION_CAP, each id's time in
+    `recorded`), atomically under channels-session.lock. Over the cap the oldest entry recorded more than
+    CHANNELS_SESSION_KEEP_HOURS ago gives way; when every entry is more recent, session_id is not added. Returns
+    True when it was recorded. Never raises."""
+    now = time.time() if now is None else now
     try:
         d = os.path.join(ws, ".mother")
         os.makedirs(d, exist_ok=True)
@@ -4146,15 +4150,70 @@ def record_channels_session(ws, session_id, at):
                 fcntl.flock(lock, fcntl.LOCK_EX)
             except ImportError:
                 pass
+            doc, ok = read_json(channels_session_path(ws))
+            rec = doc.get("recorded") if ok and isinstance(doc, dict) else None
+            rec = {k: v for k, v in rec.items() if isinstance(k, str)} if isinstance(rec, dict) else {}
             ids = [session_id] + [i for i in channels_session_ids(ws) if i != session_id]
+            while len(ids) > CHANNELS_SESSION_CAP:
+                old = [i for i in ids[1:] if (parse_time(rec.get(i)) or 0) < now - CHANNELS_SESSION_KEEP_HOURS * 3600]
+                if not old:
+                    return False
+                ids.remove(old[-1])
+            rec[session_id] = at
             tmp = os.path.join(d, ".channels-session.%d.tmp" % os.getpid())
             with open(tmp, "w") as f:
-                json.dump({"session_ids": ids[:CHANNELS_SESSION_CAP], "at": at}, f)
+                json.dump({"session_ids": ids, "at": at, "recorded": {i: rec.get(i) for i in ids}}, f)
             os.replace(tmp, channels_session_path(ws))
+            return True
         finally:
             lock.close()
     except Exception:
-        pass
+        return False
+
+
+def channels_plan_plain(cmd):
+    """True for exactly one plain `mother channels plan …` command: `mother`, the plugin's bin/mother by path or
+    `${CLAUDE_PLUGIN_ROOT}`, or `python3` of it; plain or single-quoted words, nothing chained, piped, redirected,
+    expanded or commented."""
+    c = cmd.strip().replace('"${CLAUDE_PLUGIN_ROOT}/bin/mother"', "${CLAUDE_PLUGIN_ROOT}/bin/mother")
+    parsed = hub_simple_command(c) if "\n" not in c else None
+    if not parsed:
+        return False
+    prog, args = parsed
+    if prog in ("python3", "python") and args and os.path.isabs(args[0]) and \
+            os.path.realpath(args[0]) == os.path.realpath(os.path.join(os.path.dirname(HERE), "bin", "mother")):
+        prog, args = "mother", args[1:]
+    return prog == "mother" and args[:2] == ["channels", "plan"]
+
+
+def first_prompt(transcript):
+    """The first message a human typed in this session (a slash command as `/name args`), or None."""
+    if not isinstance(transcript, str) or not os.path.isfile(transcript):
+        return None
+    try:
+        with open(transcript, errors="replace") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                text = user_text(e)
+                if text is None:
+                    continue
+                m = re.search(r"<command-name>([^<]*)</command-name>", text)
+                if m:
+                    a = re.search(r"<command-args>([^<]*)</command-args>", text)
+                    text = m.group(1).strip() + (" " + a.group(1).strip() if a else "")
+                return text.strip()
+    except Exception:
+        return None
+    return None
+
+
+def channels_loop_prompt(transcript):
+    """True when the session was started with `/mother:channels` or a `/loop` of it."""
+    t = first_prompt(transcript)
+    return bool(t) and bool(CHANNELS_PROMPT_RE.match(t)) and "mother:channels" in t
 
 
 def channels_loop_shell(norm):
@@ -4418,12 +4477,6 @@ def run(raw):
                 tool.split("__")[-1] == "run_in_terminal" else ""
             if text and HUB_CMD_RE.search(re.sub(r"[\"'\\]", "", text).casefold()):
                 record_hub_fed(ctx.ws, sid)
-            # the session that runs `mother channels plan` in the workspace, as itself and not hub-fed, is the
-            # channels loop's: only there do the reply verbs run without a question (CONTRACT §5b)
-            if text and CHANNELS_PLAN_RE.search(re.sub(r"[\"'\\]", "", text).casefold()) \
-                    and not payload.get("agent_type") and payload.get("cwd") \
-                    and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)) and not hub_fed(ctx):
-                record_channels_session(ctx.ws, sid, now_iso())
             if hub_is_tail(tool, inp) and not payload.get("agent_type") and payload.get("cwd") \
                     and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)):
                 record_hub_session(ctx.ws, sid, now_iso())
@@ -4436,6 +4489,14 @@ def run(raw):
                     return r
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
+            # The channels loop's session: a plain `mother channels plan` that gets no decision, run as itself in the
+            # workspace, not hub-fed, in a session the manager started with /mother:channels (CONTRACT §5b). Only
+            # there do the reply verbs run without a question.
+            if tool == "Bash" and ctx.ws and ctx.sid and channels_plan_plain(str(inp.get("command") or "")) \
+                    and not payload.get("agent_type") and payload.get("cwd") \
+                    and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)) and not hub_fed(ctx) \
+                    and channels_loop_prompt(payload.get("transcript_path")):
+                record_channels_session(ctx.ws, ctx.sid, now_iso())
             return None
         if os.environ.get(DRY_RUN_ENV, "").strip():
             r = "deny", "%s: dry run (%s is set), nothing leaves the machine." % (a["what"], DRY_RUN_ENV)

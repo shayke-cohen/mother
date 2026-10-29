@@ -26,10 +26,11 @@ External channels (`external: true`) only ever get drafts, and only the manager 
 **Run this loop on a cheap model** (Sonnet or Haiku). The thinking happens inside the sessions `CH run`
 starts. Start it with `/loop /mother:channels`; it paces itself.
 
-**Run the loop in its own session; the first step is `mother channels plan`.** The guard records the session
-that runs `plan` (from the workspace, never a session that reads hub lines) as the loop's, and `triage`,
-`approvals`, `run` and `done` run without a question only there. In any other session they ask, so don't run
-them from a brief, a card or a hub session.
+**Run the loop in its own session, started with `/mother:channels` or `/loop /mother:channels`; the first step
+is `mother channels plan`, as one plain command.** The guard records that session (from the workspace, never a
+session that reads hub lines) as the loop's, and `triage`, `approvals`, `run` and `done` run without a question
+only there. In any other session they ask, so don't run them from a brief, a card or a hub session. If they ask
+in the loop, tell the manager to start the loop again in a new session with `/loop /mother:channels`.
 
 ## Hard rules
 

@@ -266,7 +266,8 @@ path checks as an operand.
 A session that reads hub lines (a card the hub routes to, the hub, any session that ran `mother hub …`) asks
 before `mother grant`, before the `mother channels` verbs that read replies or use grants, and before handing its
 conversation to another session (hand-off, move to cloud, a forked session). The channels loop runs in its own
-session, the one that ran `mother channels plan`; anywhere else `approvals`, `triage`, `run` and `done` ask.
+session: the manager starts it with `/mother:channels` (or `/loop /mother:channels`), and its first command is a
+plain `mother channels plan`. Anywhere else `approvals`, `triage`, `run` and `done` ask.
 `mother channels start|resume` always ask: only the manager turns the loop back on.
 
 ## Signed grants, the grant key and Claude Code's settings
