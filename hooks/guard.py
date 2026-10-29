@@ -2641,10 +2641,6 @@ HUB_TOOLS = {"CronCreate", "CronDelete", "CronList", "ToolSearch", "TodoWrite", 
 HUB_SELF_TOOLS = {"mcp__ccd_session_mgmt__set_session_model", "mcp__ccd_session_mgmt__set_session_effort"}
 HUB_NET_TOKENS = {"fetch", "download", "upload", "export", "url", "http", "browse", "navigate"}
 HUB_NET_FIELDS = {"url", "uri", "href", "path", "file", "dest", "destination"}
-HUB_HEREDOC_RE = re.compile(r"[ \t]<<(-?)[ \t]*(['\"])([A-Za-z_][\w-]*)\2[ \t]*$")
-HUB_GH_READS = {"pr", "issue", "run", "repo", "mr"}
-HUB_GH_VERBS = {"view", "list", "status", "checks", "diff"}
-HUB_API_BAD = {"-f", "-F", "--field", "--raw-field", "--input", "--hostname", "-w", "--web"}
 HUB_ID_CAP = 5
 
 
@@ -2707,50 +2703,43 @@ def hub_odd_chars(text):
     return False
 
 
+HUB_BARE = r"[A-Za-z0-9_.:/@=,+-][A-Za-z0-9_.:/@=,+#-]*"
+HUB_TOKEN = r"(?:'[^'\n\t]*'|%s)" % HUB_BARE
+HUB_LINE_RE = re.compile(r"%s(?: %s)*" % (HUB_TOKEN, HUB_TOKEN))
+HUB_TOKEN_RE = re.compile(HUB_TOKEN)
+HUB_HEREDOC = "<<'HUBEOF'"
+HUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+HUB_FIELDS_RE = re.compile(r"^[A-Za-z,]+$")
+HUB_GH_SHAPES = {"gh": {("pr", "view"), ("pr", "checks"), ("issue", "view"), ("run", "view")},
+                 "glab": {("mr", "view"), ("mr", "checks"), ("issue", "view"), ("run", "view")}}
+
+
 def hub_simple_command(cmd):
-    """(program, args) of a single simple shell command, or None when it chains, pipes, redirects, substitutes
-    or expands anything. The program is `mother` (by name, or as this plugin's bin/mother) or the bare name.
-    A quoted heredoc may feed stdin: its delimiter must appear once, as the last line."""
+    """(program, args) of a command that matches an exact template, else None. A command is one line of tokens
+    separated by single spaces, each token plain characters or a single-quoted string, nothing else (no
+    expansion, chaining, redirect or comment). The one stdin form is `mother hub decide <<'HUBEOF'`, a body
+    and a last line `HUBEOF`."""
     if hub_odd_chars(cmd):
         return None
-    cmd = cmd.lstrip().rstrip("\n").replace("${CLAUDE_PLUGIN_ROOT}", os.path.dirname(HERE))
+    cmd = cmd.replace("${CLAUDE_PLUGIN_ROOT}", os.path.dirname(HERE)).rstrip("\n")
     lines = cmd.split("\n")
     head = lines[0]
-    if len(lines) > 1:
-        m = HUB_HEREDOC_RE.search(head)
-        if not m or len(lines) < 3:
+    heredoc = len(lines) > 1
+    if heredoc:
+        if len(lines) < 3 or lines[-1] != "HUBEOF" or any(x.strip(" \t") == "HUBEOF" for x in lines[1:-1]) \
+                or not head.endswith(" " + HUB_HEREDOC):
             return None
-        dash, delim = m.group(1), m.group(3)
-        norm = (lambda x: x.lstrip("\t")) if dash else (lambda x: x)
-        if norm(lines[-1]) != delim or any(norm(x) == delim for x in lines[1:-1]):
-            return None
-        head = head[:m.start()]
-    state = None
-    for ch in head:
-        if state == "'":
-            state = None if ch == "'" else state
-        elif state == '"':
-            if ch in "$`\\":
-                return None
-            state = None if ch == '"' else state
-        elif ch in "'\"":
-            state = ch
-        elif ch in ";&|<>$`()\\{}":
-            return None
-    if state:
+        head = head[:-len(HUB_HEREDOC) - 1]
+    if not HUB_LINE_RE.fullmatch(head):
         return None
-    try:
-        import shlex
-        argv = shlex.split(head)
-    except ValueError:
-        return None
-    if not argv or "=" in argv[0]:
-        return None
+    argv = [t[1:-1] if t.startswith("'") else t for t in HUB_TOKEN_RE.findall(head)]
     prog = argv[0]
     if prog.startswith("/"):
         if os.path.realpath(prog) != os.path.realpath(os.path.join(os.path.dirname(HERE), "bin", "mother")):
             return None
         prog = "mother"
+    if heredoc and (prog, argv[1:]) != ("mother", ["hub", "decide"]):
+        return None
     return prog, argv[1:]
 
 
@@ -2761,8 +2750,8 @@ def hub_is_tail(tool, inp):
     return bool(parsed) and parsed[0] == "mother" and parsed[1][:2] == ["hub", "tail"]
 
 
-def hub_bash_ok(parsed, cmd, cwd, ctx):
-    """One plain command the hub skill runs: a `mother` verb, `pwd`, `date`, or a read-only `gh`/`glab`."""
+def hub_bash_ok(parsed):
+    """One command the hub skill runs: a `mother` verb, `pwd`, `date`, or one of the exact `gh`/`glab` reads."""
     if not parsed:
         return False
     prog, args = parsed
@@ -2774,30 +2763,27 @@ def hub_bash_ok(parsed, cmd, cwd, ctx):
         return not args
     if prog == "date":
         return all(a.startswith("+") for a in args)
-    if prog in ("gh", "glab"):
-        return hub_gh_ok(args) and classify_bash(cmd, cwd, ctx) is None
+    if prog in HUB_GH_SHAPES:
+        return hub_gh_ok(prog, args)
     return False
 
 
-def hub_gh_ok(args):
-    """`<pr|issue|run|repo|mr> <view|list|status|checks|diff>` without --web, or a plain GET `api <path>`."""
-    if len(args) >= 2 and args[0] in HUB_GH_READS and args[1] in HUB_GH_VERBS:
-        return not any(a in ("-w", "--web") for a in args)
-    if not args or args[0] != "api":
+def hub_gh_ok(prog, args):
+    """`gh pr|issue|run view <N>` or `pr checks <N>` (`mr` for glab), then optionally `--repo owner/repo`,
+    `--json fields` and (view of a pr, issue or mr) `--comments`, each once, as separate long-form tokens."""
+    if len(args) < 3 or tuple(args[:2]) not in HUB_GH_SHAPES[prog] or not re.fullmatch(r"[0-9]+", args[2]):
         return False
-    rest = args[1:]
-    path = [a for a in rest if not a.startswith("-")]
-    if not path or path[0].startswith("http"):
-        return False
-    for i, a in enumerate(rest):
-        name = a.split("=")[0]
-        if name in HUB_API_BAD or (a.startswith(("-f", "-F")) and not a.startswith("--")):
+    rest, seen = args[3:], set()
+    while rest:
+        flag = rest.pop(0)
+        if flag in seen:
             return False
-        if name in ("-X", "--method") or (a.startswith("-X") and len(a) > 2):
-            val = a.split("=", 1)[1] if "=" in a else (a[2:] if a.startswith("-X") and len(a) > 2 else
-                                                       (rest[i + 1] if i + 1 < len(rest) else ""))
-            if val.upper() != "GET":
-                return False
+        seen.add(flag)
+        if flag == "--comments" and args[0] != "run" and args[1] == "view":
+            continue
+        pat = HUB_REPO_RE if flag == "--repo" else HUB_FIELDS_RE if flag == "--json" else None
+        if pat is None or not rest or not pat.match(rest.pop(0)):
+            return False
     return True
 
 
@@ -2838,7 +2824,7 @@ def hub_session(tool, inp, cwd, ctx, sid=None):
         cmd = str(inp.get("command") or "")
         if hub_bad_field(inp) or any(re.search(r"(^|_)(ws|wss|websocket|socket)(_|$)", str(k).lower()) for k in inp):
             return deny
-        return None if hub_bash_ok(hub_simple_command(cmd), cmd, cwd, ctx) else deny
+        return None if hub_bash_ok(hub_simple_command(cmd)) else deny
     if tool in IN_APP_SESSION_TOOLS:
         return "normal"
     if tool in HUB_SELF_TOOLS:
@@ -2847,7 +2833,7 @@ def hub_session(tool, inp, cwd, ctx, sid=None):
         return None if target in (None, "", "self", sid) else deny
     if tool == "Bash":
         cmd = str(inp.get("command") or "")
-        return None if hub_bash_ok(hub_simple_command(cmd), cmd, cwd, ctx) else deny
+        return None if hub_bash_ok(hub_simple_command(cmd)) else deny
     if tool in ("Read", "Grep", "Glob", "LS"):
         ws = os.path.realpath(ctx.ws)
         plugin = os.path.realpath(os.path.dirname(HERE))

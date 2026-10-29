@@ -220,11 +220,17 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `<workspace>/.mother/hub/hub-session.json` (newest first, at most 5; a newer `tail` never unfences an older id), which the hook writes (atomically, under `hub.lock`; a failure is
   swallowed and changes no decision) when a Bash call from the workspace (cwd inside it, not from a sub-agent) is
   one plain `mother hub tail …` command (`mother`, or the absolute path of this plugin's `bin/mother`). Sub-agent
-  and channel checks run first. In the hub session the hook allows only: Bash that is one plain command (no
-  chaining, pipe, redirect, `$` or substitution, and no control character other than newline and tab nor Unicode
-  space or format character; a quoted heredoc may feed stdin, its delimiter appearing once, as the last line): `mother hub <verb>` (not `install`, `uninstall` or `watch`), `mother home check`,
-  `mother now show`, `mother path`, `pwd`, `date`, and `gh`/`glab` only as `<pr|issue|run|repo|mr> <view|list|status|checks|diff>` without `--web`, or a GET `api <path>` (no `-X`/`--method` but GET, no field/input flags, no `--hostname`, no URL path); `Monitor` with no url or websocket field and a `command` that passes these same Bash rules;
-  `Read`/`Grep`/`Glob`/`LS` whose real path is inside the workspace or the plugin; MCP calls the guard does not
+  and channel checks run first. In the hub session the hook allows only: Bash (and a Monitor `command`) that matches an exact template: one line
+  of tokens separated by single spaces, each token plain characters (`A-Za-z0-9_.:/@=,+-`, and `#` only inside a
+  token, as in `owner/repo#45`) or a single-quoted string with no `'`, newline or tab; no other character (no
+  `"`, `$`, backtick, `;&|<>(){}\`, `*?[]~!`), and no control character other than newline and tab nor Unicode space
+  or format character anywhere. The commands: `mother hub <verb>` (not `install`, `uninstall` or `watch`),
+  `mother home check`, `mother now show`, `mother path`, `pwd`, `date` (a `+format` argument only); the one stdin
+  form, the first line exactly `mother hub decide <<'HUBEOF'`, a body, and a last line exactly `HUBEOF` (no body
+  line equals it after stripping spaces and tabs); and `gh pr view|checks <N>`, `gh issue view <N>`,
+  `gh run view <N>` (`mr` for glab), then at most once each `--repo owner/repo`, `--json fields` and (view of a
+  pr, issue or mr) `--comments`, as separate long-form tokens. `gh api` and every other `gh`/`glab` form are
+  denied. A Monitor also needs no url or websocket field. `Read`/`Grep`/`Glob`/`LS` whose real path is inside the workspace or the plugin; MCP calls the guard does not
   classify as writes whose operation starts with a read verb, whose name has no fetch, download, upload, export,
   url, http, browse or navigate part and whose input has no `url`, `uri`, `href`, `path`, `file`, `dest` or
   `destination` field; `set_session_model` and `set_session_effort` on the session itself; the in-app session

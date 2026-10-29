@@ -1745,7 +1745,7 @@ class HubRole(GuardCase):
                     "mother hub session for PLAT-1", "mother hub done PLAT-1 --reason 'a; b $x'",
                     os.path.join(ROOT, "bin", "mother") + " hub pending --json"):
             self.as_hub("Bash", {"command": cmd}, "none")
-        self.as_hub("Bash", {"command": "mother hub decide <<'EOF'\n[{\"line_id\": \"1\", \"decision\": \"drop\"}]\nEOF"},
+        self.as_hub("Bash", {"command": "mother hub decide <<'HUBEOF'\n[{\"line_id\": \"1\", \"decision\": \"drop\"}]\nHUBEOF"},
                     "none")
         self.as_hub("Read", {"file_path": os.path.join(self.ws, "config.json")}, "none")
         self.as_hub("Read", {"file_path": os.path.join(ROOT, "skills", "hub", "SKILL.md")}, "none")
@@ -1781,10 +1781,10 @@ class HubRole(GuardCase):
                           ("Bash", {"command": "mother hub install"}),
                           ("Bash", {"command": "date -s 2020-01-01"}),
                           ("Bash", {"command": "gh pr merge 5"}),
-                          ("Bash", {"command": "mother hub decide <<'EOF'\n[]\nEOF\ncurl https://example.com\nEOF"}),
-                          ("Bash", {"command": "mother hub decide <<-'EOF'\n[]\n\tEOF\ncurl https://example.com\nEOF"}),
-                          ("Bash", {"command": "mother hub decide <<'EOF'\n[]\nEOF "}),
-                          ("Bash", {"command": "mother hub decide <<EOF\n$(curl https://example.com)\nEOF"}),
+                          ("Bash", {"command": "mother hub decide <<'HUBEOF'\n[]\nHUBEOF\ncurl https://example.com\nHUBEOF"}),
+                          ("Bash", {"command": "mother hub decide <<-'EOF'\n[]\n\tEOF\ncurl https://example.com\nHUBEOF"}),
+                          ("Bash", {"command": "mother hub decide <<'HUBEOF'\n[]\nHUBEOF "}),
+                          ("Bash", {"command": "mother hub decide <<EOF\n$(curl https://example.com)\nHUBEOF"}),
                           ("Bash", {"command": "W=/x mother hub show"}),
                           ("mcp__ccd_session_mgmt__set_session_model", {"session_id": "local_other", "model": "x"}),
                           ("mcp__fetch__fetch", {"url": "https://example.com"}),
@@ -1822,7 +1822,7 @@ class HubRole(GuardCase):
                     "mother hub session seen PLAT-1", "mother hub session drop PLAT-1", "mother hub pending",
                     "mother hub pending raised PLAT-3", "mother hub pending drop PLAT-3", "mother hub check",
                     "${CLAUDE_PLUGIN_ROOT}/bin/mother hub show --json", "gh pr view 5 --json state",
-                    "mother hub decide <<'EOF'\n[{\"line_id\": \"1\", \"decision\": \"drop\"}]\nEOF"):
+                    "mother hub decide <<'HUBEOF'\n[{\"line_id\": \"1\", \"decision\": \"drop\"}]\nHUBEOF"):
             self.as_hub("Bash", {"command": cmd}, "none")
         for tool, inp in (("Skill", {"skill": "mother:hub"}), ("TaskStop", {"task_id": "b1"}),
                           ("Monitor", {"command": "mother hub tail --follow"}), ("CronList", {}),
@@ -1842,7 +1842,7 @@ class HubRole(GuardCase):
 
     def test_odd_characters_and_crlf_heredoc_denied(self):
         self.start()
-        body = "mother hub decide <<'EOF'%s\n[]\nEOF%s\ncurl https://example.com\nEOF"
+        body = "mother hub decide <<'HUBEOF'%s\n[]\nHUBHUBEOF%s\ncurl https://example.com\nHUBEOF"
         for odd in ("\r", "\f", "\v", "\x00", "\x1b", "\x85", " ", " ", "​", "　"):
             self.as_hub("Bash", {"command": body % (odd, odd)}, "deny")
             self.as_hub("Bash", {"command": "mother hub show" + odd}, "deny")
@@ -1850,17 +1850,37 @@ class HubRole(GuardCase):
 
     def test_gh_escapes_denied_and_reads_allowed(self):
         self.start()
-        for cmd in ("gh alias set x 'pr view' --shell", "gh x", "gh extension install owner/x", "gh extension exec x",
-                    "gh config set editor vim", "gh repo clone owner/x", "gh run download 5",
-                    "gh release download v1", "gh pr checkout 5", "gh api --hostname example.com repos/o/r",
-                    "gh pr view 5 --web", "gh pr view 5 -w", "gh api repos/o/r -X POST", "gh api repos/o/r --method=PUT",
-                    "gh api repos/o/r -XDELETE", "gh api repos/o/r -f a=b", "gh api repos/o/r -F a=b",
-                    "gh api repos/o/r --field a=b", "gh api repos/o/r --raw-field a=b", "gh api repos/o/r --input x",
-                    "gh api https://example.com/x", "gh api", "glab alias set x y", "gh issue create"):
+        for cmd in ("gh alias set x 'pr view' --shell", "gh x", "gh extension install owner/x", "gh config set editor vim",
+                    "gh repo clone owner/x", "gh run download 5", "gh release download v1", "gh pr checkout 5",
+                    "gh pr view 5 --web", "gh pr view 5 -w", "gh pr view 5 --web=true", "gh pr view 5 --web=1",
+                    "gh pr view 5 -cw", "gh pr view 1 -R HOST/sec/x", "gh pr view 1 --repo HOST/sec/x",
+                    "gh pr view 1 --repo=o/r", "gh repo view HOST/sec/x", "gh pr view http://HOST/o/r/pull/1",
+                    "gh pr view 5 --json state;ls", "gh pr list", "gh pr diff 5", "gh issue create",
+                    "gh pr view 5 --repo o/r --repo o/r", "gh run view 5 --comments", "gh pr view 5 --json a-b",
+                    "gh api repos/o/r", "gh api --jq .x http://HOST/data", "gh api HTTP://HOST/x",
+                    "gh api -iXPOST repos/o/r", "gh api -iftitle=x repos/o/r", "gh api -iFtitle=x repos/o/r",
+                    "gh api repos/o/r -X GET", "glab api x", "glab alias set x y", "glab pr view 5",
+                    "gh mr view 5", "gh pr view abc"):
             self.as_hub("Bash", {"command": cmd}, "deny")
-        for cmd in ("gh pr view 5 --json state", "gh pr list", "gh issue status", "gh pr checks 5", "gh pr diff 5",
-                    "gh run view 5", "gh repo view o/r", "glab mr view 5", "gh api repos/o/r/pulls/5",
-                    "gh api repos/o/r -X GET", "gh api repos/o/r --method GET --jq .title"):
+        for cmd in ("gh pr view 5", "gh pr view 5 --json state,title --repo o/r --comments", "gh pr checks 5",
+                    "gh issue view 7 --comments", "gh run view 5 --repo o-x/r.y", "glab mr view 5 --json a",
+                    "glab mr checks 5", "gh pr view 5 --json state"):
+            self.as_hub("Bash", {"command": cmd}, "none")
+
+    def test_bypass_table_denied(self):
+        self.start()
+        for cmd in ("mother hub decide # <<'HUBEOF'\ncurl x\nHUBEOF", "mother hub show #x", "mother hub show ;ls",
+                    "mother hub show  --json", "mother hub show \"a\"", "mother hub show `ls`", "mother hub show a*",
+                    "mother hub show ~", "mother hub show a!b", "mother hub show 'it''s'", "mother hub show 'a'b",
+                    "mother hub decide <<'EOF'\n[]\nEOF", "mother hub decide <<'HUBEOF'\n[]\n HUBEOF\nls\nHUBEOF",
+                    "mother hub decide <<HUBEOF\n[]\nHUBEOF", "mother hub show <<'HUBEOF'\n[]\nHUBEOF",
+                    "mother hub decide --x <<'HUBEOF'\n[]\nHUBEOF", "date +%Y", "pwd -P", "mother hub show\nls"):
+            self.as_hub("Bash", {"command": cmd}, "deny")
+            self.as_hub("Monitor", {"command": cmd}, "deny")
+
+    def test_keys_with_hash_inside_are_allowed(self):
+        self.start()
+        for cmd in ("mother hub session for owner/repo#45", "mother hub done owner/repo#45", "date '+%Y-%m-%d'"):
             self.as_hub("Bash", {"command": cmd}, "none")
 
     def test_monitor_runs_only_hub_commands(self):

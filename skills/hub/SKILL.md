@@ -72,7 +72,7 @@ line as `propose`.
 
 **Propose.** Deciding `propose` does not raise a card by itself; it puts the item in `pending`.
 1. Re-check once: read the line's `link` through the capability that owns it (`chat.read`, `tracker.read`,
-   `mail.read` or `code.read`; resolve the connector from `capabilities.json`). One read, no more. If the thing is
+   `mail.read` or `code.read`; resolve the connector from `capabilities.json`). One read, no more. For code, the only shell reads this session may run are `gh pr view|checks <N>`, `gh issue view <N>`, `gh run view <N>` (`glab mr …` likewise), each with at most `--repo owner/repo`, `--json fields` and `--comments`, as separate tokens. If the thing is
    closed, or the manager has already replied or acted, decide `log` instead.
 2. Decide `propose` with `title`, `link`, `read` and `next_step` (your own words, see above). `name` is optional.
 
@@ -94,8 +94,8 @@ later wake raises them. Never raise a card for an entry that has `raised_at`.
   `mother hub pending drop <key> --json` prints its `task_id`; withdraw the card with `dismiss_task` and that id.
   A pending entry also expires on its own after `hub.update_ttl_hours` working hours.
 
-**Record.** One `mother hub decide` call per wake, with every printed line in it (stdin: a list of `{line_id: <id>,
-key, decision, title?, why?, link?, read?, next_step?, name?, also?}`). If it exits 2 naming a line id, drop that
+**Record.** One `mother hub decide` call per wake, with every printed line in it (stdin: run exactly `mother hub decide <<'HUBEOF'`, then the list of `{line_id: <id>,
+key, decision, title?, why?, link?, read?, next_step?, name?, also?}` as JSON, then a last line `HUBEOF`; no other heredoc, pipe or quote style is allowed in this session). If it exits 2 naming a line id, drop that
 id from the list and retry the rest. Routing an update and recording it are separate steps: record only after the
 send went out. Read the result: `route` with no live session comes back as `propose` (it joins `pending` and is
 raised by the step above), and `now` for a key that has a session comes back as `route`; if that means a message
