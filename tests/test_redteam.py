@@ -87,7 +87,7 @@ class RedTeam(unittest.TestCase):
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["MOTHER_WORKSPACE"] = self.ws
-        os.environ["MOTHER_STATE_DIR"] = self.tmp
+        os.environ["MOTHER_STATE_DIR"] = os.path.join(self.tmp, "state")
         # two hub sessions: the older one must stay fenced after the newer one ran `mother hub tail`
         for sid in (OLD_HUB, HUB):
             self.g.run(json.dumps({"tool_name": "Bash", "tool_input": {"command": "mother hub tail --once"},
@@ -162,6 +162,25 @@ class RedTeam(unittest.TestCase):
                                 atk["id"], n, session, mode, want, got, call.get("fix", "-"), why[:110]))
         self.assertGreater(rows, 400)
         self.assertEqual(bad, [], "\n%d of %d rows differ:\n%s" % (failures, rows, "\n".join(bad)))
+
+    def test_routine_commands_run_without_a_question(self):
+        """Every shell command the skills and routines run in a workspace session is on the allow-list: no question
+        in default or bypass mode, and none under PAUSED (they reach no one)."""
+        path = os.path.join(ROOT, "tests", "fixtures", "routine_commands.txt")
+        with open(path) as f:
+            body = "".join(l for l in f if not l.startswith("#"))
+        cmds = [c.strip("\n") for c in body.split("\n----\n") if c.strip()]
+        self.assertGreater(len(cmds), 40)
+        plugin = os.path.dirname(GUARD).rsplit(os.sep, 1)[0]
+        bad = []
+        with self.env(CLAUDE_PLUGIN_ROOT=plugin):
+            for cmd in cmds:
+                call = {"tool": "Bash", "input": {"command": cmd}}
+                for mode in ("default", "bypassPermissions", "paused"):
+                    got, why = self.decide(call, "card", mode)
+                    if got != "none":
+                        bad.append("%s [%s] -> %s: %s" % (cmd.splitlines()[0], mode, got, why[:120]))
+        self.assertEqual(bad, [], "\n" + "\n".join(bad))
 
     def test_no_attack_call_runs_unasked_in_a_workspace_session(self):
         """Whatever the table says, an attack call that reaches someone is never `allow` in any session or mode."""
