@@ -53,7 +53,7 @@ holds code a later session would run.
 | `tests/` | stdlib `unittest`, one module per Python component plus packaging | `test_packaging` checks every runtime file is tracked |
 | `docs/` | CONTRACT (spec), DESIGN (why), ROADMAP (stages) | `docs/drafts/`, `docs/superpowers/` are untracked personal notes |
 
-Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `digest`, `dots`, `commitments`,
+Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `digest`, `dots`, `commitments`,
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,

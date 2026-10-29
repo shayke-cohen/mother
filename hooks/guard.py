@@ -1865,7 +1865,17 @@ def classify_bash(cmd, cwd, ctx):
     return None
 
 
+# The desktop app's own session tools reach only the manager's sessions, never another person, so they are not
+# outbound. Exact names only: a same-named tool on another server is classified like any other.
+IN_APP_SESSION_TOOLS = frozenset([
+    "mcp__ccd_session__start_session", "mcp__ccd_session__dismiss_task",
+    "mcp__ccd_session_mgmt__send_message", "mcp__ccd_session_mgmt__list_sessions",
+    "SendMessage", "ListAgents"])
+
+
 def classify_mcp(tool, inp):
+    if tool in IN_APP_SESSION_TOOLS:
+        return None
     parts = tool.split("__")
     server = parts[1] if len(parts) > 2 else ""
     short = parts[-1]

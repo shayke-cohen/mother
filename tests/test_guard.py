@@ -1590,3 +1590,25 @@ class TestWhatsappConfigBlock(WhatsappCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InAppSessions(GuardCase):
+    """The desktop app's session tools reach only the manager's own sessions, so they are not outbound."""
+
+    NAMES = ["mcp__ccd_session__start_session", "mcp__ccd_session__dismiss_task",
+             "mcp__ccd_session_mgmt__send_message", "mcp__ccd_session_mgmt__list_sessions",
+             "SendMessage", "ListAgents"]
+
+    def test_in_app_session_tools_pass(self):
+        for name in self.NAMES:
+            for inp in ({"session_id": "s1", "message": "what changed", "name": "plat-1",
+                         "initiation": "own_initiative", "prompt": "x"},
+                        # a field the guard reads as a chat target must not turn a session tool into a chat send
+                        {"session_id": "s1", "channel": "s1", "message": "what changed", "thread_id": "t1"}):
+                self.expect("none", name, inp)
+
+    def test_lookalike_send_message_still_classified(self):
+        got, _ = self.run_guard("mcp__other__send_message", {"channel": TEAM, "text": "hi"})
+        self.assertEqual(got, "ask")
+        got, _ = self.run_guard("mcp__ccd_session_mgmt__send_message_to_channel", {"channel": TEAM, "text": "hi"})
+        self.assertEqual(got, "ask")

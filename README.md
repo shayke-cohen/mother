@@ -133,6 +133,11 @@ skill: `brief`, `now`, `todo`, `remember`, `one-on-one`, `commitments`,
 WhatsApp" or "WhatsApp Dana that I'm late" go to the `whatsapp` skill: it reads any chat, and each message to
 someone else waits for your yes in the permission prompt.
 
+The hub is optional and runs on your home machine. Set the `hub` block in `config.json`, install the watcher with
+`mother hub install` (it polls your sources read-only and appends what changed to a local inbox), then run
+`/mother:hub` once in a pinned session. That session wakes only when a line arrives: it sends an update into the
+session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
+
 ### Replying in team channels
 
 Each channel in `config.json` has a reply mode: `off`, `watch` (read for digests only), `mention` (answers in

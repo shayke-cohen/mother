@@ -201,6 +201,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
   server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
   different targets in one call, is denied too (`rules/outbound.md`).
+- **allow**: the desktop app's own session tools (`start_session`, `dismiss_task`, `send_message`, `list_sessions` on the `ccd_session` / `ccd_session_mgmt` servers, `SendMessage`, `ListAgents`), by exact name; they reach only the manager's own sessions (§5e). Look-alikes on other servers are classified normally.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
@@ -639,6 +640,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `snooze_until`; an ended snooze is open again at the next write. Exit 1 for an unknown id, 2 for a bad word.
 - **Update expiry.** On every write an update goes when it is older than `hub.update_ttl_hours` **working** hours
   (`now.working_hours`, counted from the later of `at` and `snooze_until`) or when its key has a live session.
+- **Guard.** The desktop app's own session tools reach only the manager's sessions: `mcp__ccd_session__start_session`, `mcp__ccd_session__dismiss_task`, `mcp__ccd_session_mgmt__send_message`, `mcp__ccd_session_mgmt__list_sessions`, `SendMessage` and `ListAgents` are not outbound, so the guard allows them with no ask (§5). Exact names only: a same-named tool on another server (`mcp__other__send_message`) is classified like any other tool. The credential checks still apply to them.
 - **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
   posts or writes to a tracker.
   Adapters (`lib/hub_sources.py`) are keyed `<cap>:<connector>` (`chat:slack`, `mail:gmail`, `tracker:jira`,
@@ -670,7 +672,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 
 `setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
 (connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap), `reflect`, `todo`, `project`,
-`team`, `remember`, `whatsapp` (read chats, send through `mother whatsapp send`, which asks; §5d), `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
+`team`, `remember`, `whatsapp` (read chats, send through `mother whatsapp send`, which asks; §5d), `hub` (the manager's pinned hub session: wakes on the watcher's inbox through a Monitor on `mother hub tail --follow`, or a 3-minute cron running `tail --once`; decides each line with `mother hub decide`, routes it with the in-app message tool, raises cards with `start_session` `own_initiative`, and reconciles sessions on a `sweep` line; §5e), `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
 
 ## 8. Writing rules for everything in this repo
 
