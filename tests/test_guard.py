@@ -15,6 +15,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUARD = os.path.join(ROOT, "hooks", "guard.py")
+GUARD_FAST = os.path.join(ROOT, "hooks", "guard_fast.py")
 
 DM, ME, TEAM, SUPPORT, ANNOUNCE, EXT = "U00000000", "U00000000", "C00000001", "C00000002", "C00000003", "C00000009"
 NOW = time.time()
@@ -83,7 +84,7 @@ class GuardCase(unittest.TestCase):
         return os.path.join(self.ws, ".mother", name)
 
     def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None, env=None, agent=None,
-                  mode=None, session="t"):
+                  mode=None, session="t", script=GUARD):
         payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp, "session_id": session,
                    "cwd": cwd or self.tmp, "transcript_path": transcript}
         if agent:
@@ -92,12 +93,13 @@ class GuardCase(unittest.TestCase):
             payload["permission_mode"] = mode
         extra = env or {}
         env = dict(os.environ, HOME=self.home)
-        env.pop("MOTHER_WORKSPACE", None)
-        env.pop("MOTHER_CHANNEL_ROLE", None)
+        for k in ("MOTHER_WORKSPACE", "MOTHER_STATE_DIR", "MOTHER_CHANNEL_ROLE", "MOTHER_CHANNEL_SERVERS",
+                  "MOTHER_DRY_RUN"):  # sealed from the environment the suite runs in
+            env.pop(k, None)
         env.update(extra)
         if env_ws:
             env["MOTHER_WORKSPACE"] = self.ws
-        p = subprocess.run([sys.executable, GUARD], input=raw if raw is not None else json.dumps(payload),
+        p = subprocess.run([sys.executable, script], input=raw if raw is not None else json.dumps(payload),
                            capture_output=True, text=True, env=env)
         self.assertEqual(p.returncode, 0, p.stderr)
         if not p.stdout.strip():
@@ -2652,6 +2654,59 @@ class RoundFive(GuardCase):
         for sid in ("l2", "l3", "l4"):
             self.ws_call("none", "Bash", {"command": "mother channels plan"}, session=sid)
         self.assertEqual(g.channels_session_ids(self.ws), ["l4", "l3", "l2"])
+
+
+class FastPath(GuardCase):
+    """hooks/guard_fast.py takes Read/Grep/Glob/LS: it exits with no decision only where guard.py would, and hands
+    every other call to guard.py (CONTRACT §5, hook registration)."""
+
+    def both(self, want, tool, inp, **kw):
+        for script in (GUARD, GUARD_FAST):
+            got, why = self.run_guard(tool, inp, script=script, **kw)
+            self.assertEqual(got, want, "%s %s %s -> %s (%s)" % (os.path.basename(script), tool, inp, got, why))
+
+    def test_reads_get_no_decision_outside_the_cases_the_guard_has_rules_for(self):
+        notes = os.path.join(self.ws, "notes")
+        os.makedirs(notes)
+        for tool, inp in (("Read", {"file_path": os.path.join(self.ws, "config.json")}), ("Grep", {"pattern": "x", "path": notes}),
+                          ("Glob", {"pattern": "*.md", "path": notes}), ("LS", {"path": self.ws}),
+                          ("Read", {"file_path": "/etc/hosts"})):
+            self.both("none", tool, inp)
+            self.both("none", tool, inp, cwd=self.ws)
+
+    def test_the_grant_key_hub_session_channel_roles_and_sub_agents_reach_the_guard(self):
+        key = os.path.join(self.home, ".mother", "grant.key")
+        os.makedirs(os.path.dirname(key))
+        with open(key, "w") as f:
+            f.write("k" * 64)
+        for tool, inp in (("Read", {"file_path": key}), ("Read", {"file_path": "~/.mother/GRANT.KEY"}),
+                          ("Grep", {"pattern": "x", "path": self.home}), ("Glob", {"pattern": "*", "path": "/"}),
+                          ("LS", {"path": os.path.dirname(key)})):
+            self.both("deny", tool, inp)
+        state = os.path.join(self.tmp, "state")
+        os.makedirs(state)
+        self.both("deny", "Read", {"file_path": os.path.join(state, "grant.key")}, env={"MOTHER_STATE_DIR": state})
+        self.both("none", "Read", {"file_path": key}, env={"MOTHER_STATE_DIR": state})
+        # the hub session reads only the workspace and the plugin
+        self.both("none", "Bash", {"command": "mother hub tail --once"}, cwd=self.ws, session="hub-1")
+        self.both("deny", "Read", {"file_path": "/etc/hosts"}, session="hub-1")
+        self.both("none", "Read", {"file_path": "/etc/hosts"}, session="hub-2")
+        # channel reply sessions and MOTHER's sub-agents
+        self.both("deny", "Read", {"file_path": "/etc/hosts"}, env={"MOTHER_CHANNEL_ROLE": "team"})
+        self.both("deny", "Read", {"file_path": os.path.join(self.ws, "people", "x.md")},
+                  env={"MOTHER_CHANNEL_ROLE": "team"})
+        self.both("none", "Read", {"file_path": "/etc/hosts"}, agent="mother:critic")
+
+    def test_the_fast_path_is_one_of_the_guards_own_files(self):
+        self.expect("ask", "Write", {"file_path": GUARD_FAST, "content": ""}, mode="bypassPermissions")
+        self.expect("ask", "Bash", {"command": "sed -i '' 1d \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_fast.py\""},
+                    mode="bypassPermissions")
+
+    def test_odd_payloads_reach_the_guard(self):
+        for raw in ("", "nope", "[]", json.dumps({"tool_name": "Read", "tool_input": "x"})):
+            a = self.run_guard("Read", {}, raw=raw)
+            b = self.run_guard("Read", {}, raw=raw, script=GUARD_FAST)
+            self.assertEqual(a, b, raw)
 
 
 if __name__ == "__main__":

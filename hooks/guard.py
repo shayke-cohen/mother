@@ -447,7 +447,7 @@ def act(kind, category, what, **kw):
 
 
 def protected_paths(ctx):
-    ps = {os.path.join(HERE, "guard.py"), os.path.join(HERE, "hooks.json"),
+    ps = {os.path.join(HERE, "guard.py"), os.path.join(HERE, "guard_fast.py"), os.path.join(HERE, "hooks.json"),
           os.path.join(os.path.expanduser("~"), ".mother", "workspace")}
     if ctx.ws:
         m = os.path.join(ctx.ws, ".mother")
@@ -1881,7 +1881,7 @@ def shell_self_edit(cmd, run, cwd, ctx):
     # the session's cwd says where relative names land, unless the command moves first (then its cd path counts)
     here = os.path.realpath(cwd).lower() if cwd and not re.search(r"(?:^|[\s;&|(])cd\s", shell) else ""
     home = os.path.expanduser("~").lower()
-    homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "hooks.json"],
+    homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "guard_fast.py", "hooks.json"],
               "config")]
     if ctx.ws:
         # a command that sets its own MOTHER_WORKSPACE / MOTHER_STATE_DIR is working on a test workspace
@@ -4015,7 +4015,10 @@ def subagent_session(kind, tool, inp, cwd, ctx):
 
 HUB_DENY = "the hub session can only do hub work; ask the manager to open a session for this"
 HUB_NO_VERBS = {"install", "uninstall", "watch"}   # persistent jobs: the manager starts these
-HUB_TOOLS = {"CronCreate", "CronDelete", "CronList", "ToolSearch", "TodoWrite", "Skill", "TaskStop"}
+# Tools the hub session may use. HUB_PASS_TOOLS have no other rule anywhere in the guard, so hooks.json doesn't
+# hand them to it (tests/test_packaging.py checks every other tool name here is registered).
+HUB_PASS_TOOLS = {"CronList", "ToolSearch", "TodoWrite"}
+HUB_TOOLS = HUB_PASS_TOOLS | {"CronCreate", "CronDelete", "Skill", "TaskStop"}
 HUB_SELF_TOOLS = {"mcp__ccd_session_mgmt__set_session_model", "mcp__ccd_session_mgmt__set_session_effort"}
 HUB_NET_TOKENS = {"fetch", "download", "upload", "export", "url", "http", "browse", "navigate"}
 HUB_NET_FIELDS = {"url", "uri", "href", "path", "file", "dest", "destination"}

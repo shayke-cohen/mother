@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|mcp__.*",
+        "matcher": "^(Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|Task|Agent|Skill|Monitor|CronCreate|CronDelete|TaskStop|SendMessage|ListAgents)$|^mcp__",
         "hooks": [
           {
             "type": "command",
@@ -12,12 +12,12 @@
         ]
       },
       {
-        "matcher": "Read|Grep|Glob|LS|WebFetch|WebSearch|Task|Agent",
+        "matcher": "Read|Grep|Glob|LS",
         "hooks": [
           {
             "type": "command",
-            "timeout": 10,
-            "command": "[ -z \"$MOTHER_CHANNEL_ROLE\" ] || python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\""
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_fast.py\"",
+            "timeout": 10
           }
         ]
       }

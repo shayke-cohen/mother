@@ -9,8 +9,9 @@ Every part of v0 is built against this file. Change it first, then the code.
 ```
 .claude-plugin/plugin.json, marketplace.json
 bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now
-hooks/hooks.json           PreToolUse → hooks/guard.py; Stop + SessionEnd → `mother sync --quiet`
+hooks/hooks.json           PreToolUse → hooks/guard.py (Read/Grep/Glob/LS via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`
 hooks/guard.py             approval guard (see §5)
+hooks/guard_fast.py        the guard's fast path for Read/Grep/Glob/LS (see §5, hook registration)
 skills/<name>/SKILL.md     user- and routine-facing skills, invoked as `mother:<name>`
 agents/<name>.md           read-only sub-agents MOTHER dispatches: `mother:reader`, `mother:critic` (see §5c)
 routines/<id>.md           routine definitions: what a scheduled run does (reads config, calls skills)
@@ -196,6 +197,16 @@ this first and names any capability it needs that isn't `ok` in its output — n
 ## 5. Approval guard (`hooks/guard.py`)
 
 Port of the reference deployment's `guard-outbound.py`, made config-driven:
+- **Hook registration** (`hooks/hooks.json`): the guard sees only the tools Claude Code hands it, so it is
+  registered, in every session, for every tool it has a rule for: `Bash Write Edit MultiEdit NotebookEdit WebFetch
+  WebSearch Task Agent Skill Monitor CronCreate CronDelete TaskStop SendMessage ListAgents` and every `mcp__…` tool
+  (an anchored matcher, so `BashOutput` or `TaskOutput` don't reach it), plus `Read Grep Glob LS` through
+  `hooks/guard_fast.py`. Each tool reaches the guard through exactly one entry. The fast path exits with no
+  decision unless the call might touch the grant key, `MOTHER_CHANNEL_ROLE` is set, the payload has an
+  `agent_type`, or the session id appears in `hub-session.json`; then, or on any odd payload, it hands the call to
+  `guard.py` unchanged. It never decides itself. `CronList`, `ToolSearch` and `TodoWrite` (`HUB_PASS_TOOLS`) have
+  no rule and are not registered. `tests/test_packaging.py` collects every non-MCP tool name `guard.py` refers to
+  and fails if one isn't registered. `guard_fast.py` is one of the guard's own files (edits ask, like `guard.py`).
 - Matches outbound tools by **capability**, not server name: chat post/send/schedule, tracker create/update/
   transition/comment/sprint ops, mail send, calendar create/update with guests, `gh`/`glab` write commands.
 - **allow**: posts to `manager.chat_dm`; mail drafts; calendar events without guests.
@@ -562,7 +573,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   (config, ledger, log, PAUSED, hooks) ask.
 - A shell command asks as a self-edit only when it can write (a redirect other than `/dev/null` or `2>&1`,
   `rm`/`mv`/`cp`/`sed -i`/…, or a script that opens a file for writing) **and** it reaches the running copy:
-  it names `guard.py`/`hooks.json` together with the installed plugin's path (`${CLAUDE_PLUGIN_ROOT}`,
+  it names `guard.py`/`guard_fast.py`/`hooks.json` together with the installed plugin's path (`${CLAUDE_PLUGIN_ROOT}`,
   `.claude/plugins/`), or `config.json`/`PAUSED`/`ledger.json`/`guard.log` together with the workspace's
   path (`$MOTHER_WORKSPACE`, `$(cat ~/.mother/workspace)`, the path itself), or it runs from inside either
   without a `cd`; or it writes `~/.mother/workspace`. The same names in a checkout of this repo, another
@@ -588,7 +599,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   (`mcp__gw__jira`), so a gateway that also carries chat or mail stays shut; a prefix shared outright with chat,
   mail or calendar is refused. The manager's session may write only notes: `*.md` under `todos/ memory/ projects/
   teams/ people/` (an allow-list: `.mcp.json`, `skills/`, `scripts/` and pointer files are code a later session
-  would run). A second hook entry (`Read|Grep|Glob|LS|Web*|Task|Agent`) exits at once unless that variable is set.
+  would run). Every tool this needs is registered for the guard in every session (§5, hook registration).
   The `--allowedTools`/`--disallowedTools` flags repeat the same limits as a first fence. One session per thread
   and role (`--session-id`, then `--resume`); a teammate never joins a session the manager drove.
   `MOTHER_NO_SYNC=1` makes `mother sync` a no-op inside them.

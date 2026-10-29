@@ -30,8 +30,8 @@ holds code a later session would run.
 | Path | What it is | Notes |
 |---|---|---|
 | `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
-| `hooks/hooks.json` | Wires the hooks | PreToolUse → guard; Stop and SessionEnd → `mother sync --quiet` |
-| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
+| `hooks/hooks.json` | Wires the hooks | PreToolUse → guard (every tool it has a rule for; tests/test_packaging.py checks); Stop and SessionEnd → `mother sync --quiet` |
+| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. `hooks/guard_fast.py` lets Read/Grep/Glob/LS through without loading it unless one of its rules could apply. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
 | `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval`, `health` to `lib/` |
 | `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
 | `lib/channels.py` | Reply-mode engine behind `mother:channels` | The skill does chat I/O; this decides who, when, and what. CONTRACT §5b |
