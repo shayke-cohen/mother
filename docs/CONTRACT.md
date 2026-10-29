@@ -561,6 +561,11 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   without reading config), `hub.json` (what the hub session last did and what is pending), `sessions.json`
   (the manager's sessions the hub may route to), `hub.lock`. Readers treat a missing file as "nothing pending" or
   "the hub never woke".
+- **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
+  (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,
+  kind (update|resolved|error|sweep), key, also, title, who, link, summary}`, `id` = `<source>:<key>:<at>`,
+  `also` = other keys found in the text. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and deletes dated
+  files 7 or more days old.
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one
   poll, no write), `status`, `tail` (recent inbox), `decide` (the hub's one write path for a decision),
   `session add|drop|seen|for` (the session registry), `done`, `snooze`, `show`.
