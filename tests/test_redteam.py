@@ -33,6 +33,7 @@ SESSIONS = ("hub", "card", "channel_manager", "channel_team", "reader")
 MODES = ("default", "acceptEdits", "bypassPermissions", "paused", "dryrun")
 HUB, OLD_HUB, CARD = "local_hub-0000", "local_hub-old", "local_card-1111"
 LIVE = "11111111-1111-1111-1111-111111111111"
+LOOP = "local_channels-2222"  # the channels loop's session: it ran `mother channels plan`
 ENV_KEYS = ("MOTHER_WORKSPACE", "MOTHER_STATE_DIR", "MOTHER_DRY_RUN", "MOTHER_CHANNEL_ROLE", "MOTHER_CHANNEL_SERVERS")
 
 
@@ -94,6 +95,10 @@ class RedTeam(unittest.TestCase):
             self.g.run(json.dumps({"tool_name": "Bash", "tool_input": {"command": "mother hub tail --once"},
                                    "session_id": sid, "cwd": self.ws, "permission_mode": "default"}))
         self.assertEqual(self.g.hub_session_ids(self.ws)[:2], [HUB, OLD_HUB])
+        self.g.run(json.dumps({"tool_name": "Bash", "tool_input": {"command": "mother channels plan"},
+                               "session_id": LOOP, "cwd": self.ws, "permission_mode": "default"}))
+        if hasattr(self.g, "channels_session_ids"):  # MOTHER_REDTEAM_GUARD may point at an older guard
+            self.assertEqual(self.g.channels_session_ids(self.ws), [LOOP])
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -123,7 +128,7 @@ class RedTeam(unittest.TestCase):
                          .replace("$STATE", state))
         payload = {"tool_name": call["tool"], "tool_input": inp, "cwd": self.ws,
                    "permission_mode": mode if mode in ("acceptEdits", "bypassPermissions") else "default",
-                   "session_id": {"hub": HUB, "old_hub": OLD_HUB, "live": LIVE}.get(session, CARD)}
+                   "session_id": {"hub": HUB, "old_hub": OLD_HUB, "live": LIVE, "channels": LOOP}.get(session, CARD)}
         env = {}
         if session == "reader":
             payload.update(agent_id="a1", agent_type="mother:reader")
@@ -136,9 +141,16 @@ class RedTeam(unittest.TestCase):
             open(paused, "w").close()
         hubfile = os.path.join(self.ws, ".mother", "hub", "hub-session.json")
         fedfile = os.path.join(self.ws, ".mother", "hub", "fed-sessions.json")
+        chanfile = os.path.join(self.ws, ".mother", "channels-session.json")
         with open(hubfile) as f:
             hub_before = f.read()  # a row that runs `mother hub tail` must not make later rows hub sessions
-        fed_before = open(fedfile).read() if os.path.exists(fedfile) else None  # nor `mother hub …` hub-fed ones
+        fed_before = chan_before = None  # nor `mother hub …` hub-fed ones, nor `mother channels plan` loop ones
+        if os.path.exists(fedfile):
+            with open(fedfile) as f:
+                fed_before = f.read()
+        if os.path.exists(chanfile):
+            with open(chanfile) as f:
+                chan_before = f.read()
         try:
             with self.env(**env):
                 r = self.g.run(json.dumps(payload))
@@ -147,6 +159,12 @@ class RedTeam(unittest.TestCase):
                 os.remove(paused)
             with open(hubfile, "w") as f:
                 f.write(hub_before)
+            if chan_before is None:
+                if os.path.exists(chanfile):
+                    os.remove(chanfile)
+            else:
+                with open(chanfile, "w") as f:
+                    f.write(chan_before)
             if fed_before is None:
                 if os.path.exists(fedfile):
                     os.remove(fedfile)
@@ -181,7 +199,8 @@ class RedTeam(unittest.TestCase):
 
     def test_routine_commands_run_without_a_question(self):
         """Every shell command the skills and routines run in a workspace session is on the allow-list: no question
-        in default or bypass mode, and none under PAUSED (they reach no one)."""
+        in default or bypass mode, and none under PAUSED (they reach no one). The channels loop's reply verbs run in
+        its own session (the one that ran `mother channels plan`) and ask in any other."""
         path = os.path.join(ROOT, "tests", "fixtures", "routine_commands.txt")
         with open(path) as f:
             body = "".join(l for l in f if not l.startswith("#"))
@@ -192,10 +211,15 @@ class RedTeam(unittest.TestCase):
         with self.env(CLAUDE_PLUGIN_ROOT=plugin):
             for cmd in cmds:
                 call = {"tool": "Bash", "input": {"command": cmd}}
+                loop = self.g.channels_loop_shell(__import__("re").sub(r"[\"'\\]", "", cmd).casefold())
                 for mode in ("default", "bypassPermissions", "paused"):
-                    got, why = self.decide(call, "card", mode)
+                    got, why = self.decide(call, "channels" if loop else "card", mode)
                     if got != "none":
                         bad.append("%s [%s] -> %s: %s" % (cmd.splitlines()[0], mode, got, why[:120]))
+                if loop:
+                    got, why = self.decide(call, "card", "default")
+                    if got != "ask":
+                        bad.append("%s [card] -> %s, want ask" % (cmd.splitlines()[0], got))
         self.assertEqual(bad, [], "\n" + "\n".join(bad))
 
     def test_no_attack_call_runs_unasked_in_a_workspace_session(self):

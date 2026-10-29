@@ -2195,6 +2195,7 @@ class RedTeamFixes(GuardCase):
 
     # -- round 1, finding 6 and minors: what must stay quiet
     def test_everyday_workspace_commands_stay_quiet(self):
+        self.ws_call("none", "Bash", {"command": "mother channels plan"})  # this session is the channels loop's
         for cmd in ("python3 ${CLAUDE_PLUGIN_ROOT}/bin/mother channels approvals <<'EOF'\n{\"x\": \"$(curl x)\"}\nEOF",
                     "\"${CLAUDE_PLUGIN_ROOT}/bin/mother\" items check <<'READER'\n{\"link\": \"https://x\"}\nREADER",
                     "${CLAUDE_PLUGIN_ROOT}/bin/mother hub show --json", "\"${CLAUDE_PLUGIN_ROOT}/bin/mother\" sync",
@@ -2486,6 +2487,7 @@ class RoundFour(GuardCase):
         verbs = ("mother channels approvals <<'A'\n{}\nA", "mother channels triage <<'A'\n{}\nA",
                  "mother channels run", "mother channels done --action a1", "mother grant remove --run x",
                  "mother grant list", "python3 \"%s/bin/mother\" channels approvals <<'A'\n{}\nA" % ROOT)
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="other")
         for cmd in verbs:
             self.ws_call("ask", "Bash", {"command": cmd}, session="card-1", mode=self.BY)
             self.ws_call("none", "Bash", {"command": cmd}, session="other")  # the channels loop's own session
@@ -2496,6 +2498,7 @@ class RoundFour(GuardCase):
         # a session that ran `mother hub …` is hub-fed from then on
         self.ws_call("none", "Bash", {"command": "mother hub status"}, session="s2")
         self.ws_call("ask", "Bash", {"command": "mother channels run"}, session="s2")
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="s3")
         self.ws_call("none", "Bash", {"command": "mother channels run"}, session="s3")
 
     def test_channels_resume_and_start_always_ask(self):
@@ -2552,6 +2555,103 @@ class RoundFour(GuardCase):
         for cmd in ("git push", "git push origin", "git push origin main", "git push -u origin HEAD:main",
                     "git pull", "git pull --rebase --autostash -q", "git fetch origin", "git commit -m x"):
             self.ws_call("none", "Bash", {"command": cmd})
+
+
+class RoundFive(GuardCase):
+    """Round 5: printf/echo take no options and no builtin may set a variable, git config files are protected,
+    hub-fed sessions ask before handing the conversation to another session, and the channels reply verbs run
+    unasked only in the session that ran `mother channels plan`."""
+
+    BY = "bypassPermissions"
+    ws_call = RoundFour.ws_call
+
+    def setUp(self):
+        GuardCase.setUp(self)
+        for d in ("memory", "notes", "teams/plat", ".git", ".mother/hub"):
+            os.makedirs(os.path.join(self.ws, d), exist_ok=True)
+        with open(os.path.join(self.ws, "notes", "a.md"), "w") as f:
+            f.write("x\n")
+
+    def guard(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("guard_round5", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        return g
+
+    def test_printf_and_echo_take_no_options(self):
+        for cmd in ("printf '[core]\\n\\tfsmonitor = touch PWNED; false\\n' > notes/.gitconfig && "
+                    "printf -v HOME '%s' notes && git status",
+                    "printf -v HOME '%s' notes", "printf -vHOME '%s' notes && git status",
+                    "printf -v PATH '%s' notes && cat notes/a.md", "printf -v path '%s' notes",
+                    "printf -v MOTHER_STATE_DIR '%s' notes && mother status",
+                    "printf -v MOTHER_WORKSPACE '%s' notes && mother status", "printf -- '%s' x",
+                    "echo -n x", "echo -e 'a\\tb'", "echo -E x"):
+            self.ws_call("ask", "Bash", {"command": cmd}, mode=self.BY)
+        for cmd in ("printf '%s\\n' -v", "echo x -n", "printf 'a\\n'", "echo hello"):
+            self.ws_call("none", "Bash", {"command": cmd})
+
+    def test_builtins_that_set_variables_ask(self):
+        for b in ("read HOME", "declare HOME=x", "typeset HOME=x", "export HOME=x", "set -- x", "local x",
+                  "let x=1", "getopts a x", "mapfile x", "readarray x", "vared HOME", "zle -N x"):
+            self.ws_call("ask", "Bash", {"command": "cat notes/a.md | " + b}, mode=self.BY)
+            self.ws_call("ask", "Bash", {"command": b}, mode=self.BY)
+        g = self.guard()
+        self.assertTrue({"read", "declare", "typeset", "export", "set", "local", "let", "getopts", "mapfile",
+                         "readarray", "vared", "zle"} <= g.SL_ASSIGN_BUILTINS)
+
+    def test_git_config_files_are_protected(self):
+        for name in ("notes/.gitconfig", ".gitconfig", "notes/.config/git/config", ".gitattributes",
+                     "teams/plat/.gitmodules", ".GITCONFIG"):
+            self.ws_call("ask", "Bash", {"command": "printf 'x' > %s" % name}, mode=self.BY)
+            self.ws_call("ask", "Bash", {"command": "cp notes/a.md %s" % name}, mode=self.BY)
+            self.ws_call("ask", "Write", {"file_path": os.path.join(self.ws, name), "content": "[core]\n"},
+                         mode=self.BY)
+        self.ws_call("none", "Bash", {"command": "printf 'x' > notes/config"})
+        self.ws_call("none", "Bash", {"command": "printf 'x' > notes/git.md"})
+
+    def test_hub_fed_sessions_ask_before_handing_off(self):
+        with open(os.path.join(self.ws, ".mother", "hub", "sessions.json"), "w") as f:
+            json.dump({"version": 1, "sessions": {"PLAT-1": {"session_id": "card-1", "name": "p", "title": "t",
+                                                             "also": [], "state": "live"}}}, f)
+        calls = (("mcp__ccd_session__hand_off_to_session", {"title": "x", "remaining_plan": "run approvals"}),
+                 ("mcp__ccd_session__move_to_cloud", {"summary": "x"}),
+                 ("mcp__ccd_session__start_session", {"initiation": "own_initiative", "context": "fork",
+                                                      "title": "x", "prompt": "y"}))
+        for tool, inp in calls:
+            self.ws_call("ask", tool, inp, session="card-1", mode=self.BY)
+            self.ws_call("ask", tool, inp, session="card-1")
+            self.ws_call("none", tool, inp, session="other")
+        self.ws_call("none", "mcp__ccd_session__start_session", {"initiation": "own_initiative", "title": "x",
+                                                                 "prompt": "y", "background": "z" * 80},
+                     session="card-1")
+
+    def test_channels_reply_verbs_run_only_in_the_channels_session(self):
+        g = self.guard()
+        verbs = ("mother channels approvals <<'A'\n{}\nA", "mother channels triage <<'A'\n{}\nA",
+                 "mother channels run --action a1", "mother channels done --action a1",
+                 "python3 \"%s/bin/mother\" channels approvals <<'A'\n{}\nA" % ROOT)
+        for cmd in verbs:
+            self.ws_call("ask", "Bash", {"command": cmd}, session="brief", mode=self.BY)
+        self.assertEqual(g.channels_session_ids(self.ws), [])
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="loop")
+        self.assertEqual(g.channels_session_ids(self.ws), ["loop"])
+        for cmd in verbs:
+            self.ws_call("none", "Bash", {"command": cmd}, session="loop")
+            self.ws_call("ask", "Bash", {"command": cmd}, session="brief")
+        open(self.state("PAUSED"), "w").close()
+        self.ws_call("deny", "Bash", {"command": "mother channels run --action a1"}, session="brief")
+        os.remove(self.state("PAUSED"))
+        # a sub-agent, a session outside the workspace and a hub-fed session are never recorded
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="sub", agent="general-purpose")
+        self.ws_call("none", "Bash", {"command": "mother hub status"}, session="fed")
+        self.ws_call("none", "Bash", {"command": "mother channels plan"}, session="fed")
+        self.assertEqual(g.channels_session_ids(self.ws), ["loop"])
+        self.ws_call("ask", "Bash", {"command": "mother channels done --action a1"}, session="fed")
+        # newest first, at most three
+        for sid in ("l2", "l3", "l4"):
+            self.ws_call("none", "Bash", {"command": "mother channels plan"}, session=sid)
+        self.assertEqual(g.channels_session_ids(self.ws), ["l4", "l3", "l2"])
 
 
 if __name__ == "__main__":

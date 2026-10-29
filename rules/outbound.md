@@ -256,14 +256,18 @@ fit: the workspace path written out (from `mother path`), no shell variables, fi
 
 Within that list, read tools take only their common read options (`find` only name/path/type/time/
 size tests, `rg`/`grep`/`sed`/`sort`/`jq`/`tail`/… no option that runs a program, reads a file list or writes);
-a `.git` folder anywhere is protected and `git` runs only at the workspace root; `git push` never forces,
+`printf` and `echo` take no options and no builtin that sets a variable (`read`, `export`, `printf -v`, …) is
+allowed; a `.git` folder, a `.gitconfig`, `.gitattributes`, `.gitmodules` or `.config/git` anywhere is protected
+and `git` runs only at the workspace root; `git push` never forces,
 deletes, mirrors or pushes every ref, and `commit --amend` asks; no `cp`/`mv`/`rm`/`mkdir` may take, make or
 empty a folder that is or holds a protected path (no swapping in a new `memory/`); a `<` input file gets the same
 path checks as an operand.
 
 A session that reads hub lines (a card the hub routes to, the hub, any session that ran `mother hub …`) asks
-before `mother grant` and before the `mother channels` verbs that read replies or use grants; the channels loop
-runs in its own session. `mother channels start|resume` always ask: only the manager turns the loop back on.
+before `mother grant`, before the `mother channels` verbs that read replies or use grants, and before handing its
+conversation to another session (hand-off, move to cloud, a forked session). The channels loop runs in its own
+session, the one that ran `mother channels plan`; anywhere else `approvals`, `triage`, `run` and `done` ask.
+`mother channels start|resume` always ask: only the manager turns the loop back on.
 
 ## Signed grants, the grant key and Claude Code's settings
 

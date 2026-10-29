@@ -483,7 +483,7 @@ def persona_path(fp, ctx):
     rel = os.path.relpath(f, ws).replace(os.sep, "/")
     parts = rel.split("/")
     return rel in ("agents.md", ".mcp.json", "memory/memory.md") or parts[-1] == "claude.md" or ".claude" in parts \
-        or ".git" in parts  # git runs hooks and config (fsmonitor, aliases) from any .git folder
+        or ".git" in parts or git_config_parts(parts)  # git runs hooks and config (fsmonitor, aliases) from these
 
 
 def graphql_file_is_query(seg, cwd):
@@ -2400,6 +2400,11 @@ def classify_shell(cmd, cwd, ctx):
             return act("grants", "grants_file", "%s in a session that reads hub lines: it reads replies as the "
                                                 "manager's or makes a grant, and the text it was fed comes from "
                                                 "other people (%s)" % (why, cmd.strip()[:160]), op="hub_fed")
+    verb = channels_loop_shell(norm)
+    if verb and not (ctx.ws and ctx.sid and ctx.sid in channels_session_ids(ctx.ws)):
+        return act("grants", "grants_file", "`mother channels %s` outside the channels loop's session: it reads "
+                                            "replies as the manager's or acts on them (%s)" % (verb, cmd.strip()[:160]),
+                   op="channels_session")
     if not in_workspace(cwd, ctx):
         return classify_bash(cmd, cwd, ctx)
     wa = classify_whatsapp(cmd, cwd, ctx)
@@ -2443,6 +2448,11 @@ SL_READ = {"ls", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "grep
            "cmp", "stat", "file", "basename", "dirname", "realpath", "date", "pwd", "echo", "printf", "true",
            "false", "test", "[", "sleep", "which", "sed", "find"}
 SL_FILE = {"mkdir", "touch", "cp", "mv", "rm"}
+# Builtins that can set a shell variable (HOME, PATH, GIT_DIR, MOTHER_WORKSPACE …) for the stages after them: never
+# on the allow-list, and named here so the reason says why. `printf -v` is caught by printf taking no options.
+SL_ASSIGN_BUILTINS = {"read", "declare", "typeset", "export", "set", "local", "let", "getopts", "mapfile",
+                      "readarray", "vared", "zle", "unset", "alias", "source", ".", "eval", "print", "readonly",
+                      "integer", "float", "shift", "unalias", "hash", "builtin", "command", "emulate", "setopt"}
 SL_GIT = {"status", "log", "diff", "show", "add", "commit", "pull", "push", "fetch", "rev-parse", "branch",
           "ls-files", "blame", "stash"}
 SL_GH = {"gh", "glab"}
@@ -2634,6 +2644,16 @@ def _home_dirs():
     return home, state
 
 
+GIT_CONFIG_NAMES = (".gitconfig", ".gitattributes", ".gitmodules")
+
+
+def git_config_parts(parts):
+    """Casefolded path parts naming a file git reads its config or filters from: a .gitconfig, .gitattributes or
+    .gitmodules anywhere, or anything under a .config/git folder (git finds them through HOME or XDG_CONFIG_HOME)."""
+    return any(x in GIT_CONFIG_NAMES for x in parts) or any(
+        parts[i] == ".config" and parts[i + 1] == "git" for i in range(len(parts) - 1))
+
+
 def ws_protected(p, ws):
     """A real path inside the workspace that only a question may change: .mother/, any .git or .claude folder,
     CLAUDE.md, .mcp.json or grants.json anywhere, AGENTS.md and memory/MEMORY.md at the top, or the root."""
@@ -2641,7 +2661,7 @@ def ws_protected(p, ws):
         return False
     rel = os.path.relpath(p, ws).replace(os.sep, "/")
     parts = rel.casefold().split("/")
-    return rel == "." or parts[0] == ".mother" or ".claude" in parts or ".git" in parts \
+    return rel == "." or parts[0] == ".mother" or ".claude" in parts or ".git" in parts or git_config_parts(parts) \
         or parts[-1] in ("claude.md", ".mcp.json", "grants.json") \
         or "/".join(parts) in ("agents.md", "memory/memory.md", "config.json", "capabilities.json")
 
@@ -2803,6 +2823,11 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
             _sl_fail("a heredoc into %s (only `mother` reads one)" % prog)
         if "/" in prog:
             _sl_fail("a program by path (%s)" % prog)
+        if prog in SL_ASSIGN_BUILTINS:
+            _sl_fail("%s, a shell builtin that can set variables for the commands after it" % prog)
+        if prog in ("printf", "echo") and args and args[0].startswith("-"):
+            _sl_fail("%s with an option (%s): printf and echo take none (printf -v sets a variable)"
+                     % (prog, args[0]))
         if prog not in SL_READ | SL_FILE | SL_GH | {"git", "cd"}:
             _sl_fail("%s is not on the allow-list" % prog)
     opts, ops = _sl_args(args)
@@ -3211,6 +3236,11 @@ def classify(tool, inp, cwd, ctx):
         if in_workspace(cwd, ctx) and URLISH_RE.search(q):
             return act("outbound_unknown", "outbound_unknown", "a web search naming a URL: %s" % q[:160])
         return None
+    if tool in HUB_FED_HANDOFFS or (tool == "mcp__ccd_session__start_session" and inp.get("context") == "fork"):
+        if hub_fed(ctx):
+            return act("manager_only", "manager_only", "%s from a session that reads hub lines: it carries this "
+                                                       "conversation, and the text other people fed it, into a "
+                                                       "session the guard doesn't treat as hub-fed" % tool)
     if tool in IN_APP_SESSION_TOOLS:
         # a `mother approve` line in a card brief or a session message could read as the manager's own approval
         if approve_line(inp):
@@ -3709,6 +3739,9 @@ def decide(a, ctx, transcript=None):
     if a["kind"] == "grants" and a.get("op") == "hub_fed":
         return "ask", "%s. The channels loop runs in its own session, never one that reads hub lines; confirm this " \
                       "is you." % a["what"]
+    if a["kind"] == "grants" and a.get("op") == "channels_session":
+        return "ask", "%s. The channels loop runs in its own session, which starts with `mother channels plan`; " \
+                      "confirm this is you." % a["what"]
     if a["kind"] == "grants" and a.get("op") == "cli":
         return "ask", "%s. Confirm the manager asked for this grant." % a["what"]
     if a["kind"] == "grants":
@@ -4079,6 +4112,57 @@ def record_hub_fed(ws, session_id):
         pass
 
 
+CHANNELS_SESSION_CAP = 3
+CHANNELS_PLAN_RE = re.compile(r"(?:^|[^\w.-])mother\s+channels\s+plan\b")
+CHANNELS_LOOP_VERBS = {"approvals", "triage", "run", "answer", "done", "send"}
+# The app's tools that continue this conversation in another session
+HUB_FED_HANDOFFS = {"mcp__ccd_session__hand_off_to_session", "mcp__ccd_session__move_to_cloud"}
+
+
+def channels_session_path(ws):
+    return os.path.join(ws, ".mother", "channels-session.json")
+
+
+def channels_session_ids(ws):
+    """The channels loop's sessions (channels-session.json `session_ids`, newest first)."""
+    doc, ok = read_json(channels_session_path(ws)) if ws else ({}, False)
+    ids = doc.get("session_ids") if ok and isinstance(doc, dict) else None
+    return [i for i in ids if isinstance(i, str) and i] if isinstance(ids, list) else []
+
+
+def record_channels_session(ws, session_id, at):
+    """Add session_id to channels-session.json (newest first, at most CHANNELS_SESSION_CAP), atomically under
+    channels-session.lock. Never raises."""
+    try:
+        d = os.path.join(ws, ".mother")
+        os.makedirs(d, exist_ok=True)
+        lock = open(os.path.join(d, "channels-session.lock"), "a")
+        try:
+            try:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except ImportError:
+                pass
+            ids = [session_id] + [i for i in channels_session_ids(ws) if i != session_id]
+            tmp = os.path.join(d, ".channels-session.%d.tmp" % os.getpid())
+            with open(tmp, "w") as f:
+                json.dump({"session_ids": ids[:CHANNELS_SESSION_CAP], "at": at}, f)
+            os.replace(tmp, channels_session_path(ws))
+        finally:
+            lock.close()
+    except Exception:
+        pass
+
+
+def channels_loop_shell(norm):
+    """The reply-consuming `mother channels` verb a shell command (quotes dropped, casefolded) runs, or None."""
+    m = re.search(r"(?:^|[^\w.-])mother\s+channels\b\s*(\S*)", norm)
+    if m and m.group(1) in CHANNELS_LOOP_VERBS:
+        return m.group(1)
+    m = CHANNELS_REPLY_RE.search(norm)
+    return m.group(0).split()[-1] if m else None
+
+
 def hub_fed(ctx):
     """The call's session reads hub lines (text from people who can message the manager): an id in
     sessions.json in any state, a hub session, or a session that ran `mother hub …` (CONTRACT §5e)."""
@@ -4331,6 +4415,12 @@ def run(raw):
                 tool.split("__")[-1] == "run_in_terminal" else ""
             if text and HUB_CMD_RE.search(re.sub(r"[\"'\\]", "", text).casefold()):
                 record_hub_fed(ctx.ws, sid)
+            # the session that runs `mother channels plan` in the workspace, as itself and not hub-fed, is the
+            # channels loop's: only there do the reply verbs run without a question (CONTRACT §5b)
+            if text and CHANNELS_PLAN_RE.search(re.sub(r"[\"'\\]", "", text).casefold()) \
+                    and not payload.get("agent_type") and payload.get("cwd") \
+                    and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)) and not hub_fed(ctx):
+                record_channels_session(ctx.ws, sid, now_iso())
             if hub_is_tail(tool, inp) and not payload.get("agent_type") and payload.get("cwd") \
                     and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)):
                 record_hub_session(ctx.ws, sid, now_iso())

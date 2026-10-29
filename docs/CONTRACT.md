@@ -277,7 +277,11 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     `--skip-permissions`, and `register` with any argument; any other verb (`init`, `join`, `link`, `tts`, …)
     asks. `claude mcp list` (exactly). `python3 <plugin>/assets/plan/build.py …` and `…/assets/deck/build.py …`
     with literal arguments (an `.html` operand is a write target). Read-only: `ls cat head tail wc sort uniq cut tr grep egrep rg jq diff cmp stat file
-    basename dirname realpath date pwd echo printf true false test [ sleep which`, not `date -s`. **Options:** these
+    basename dirname realpath date pwd echo printf true false test [ sleep which`, not `date -s`. `printf` and `echo`
+    take **no options**: a first argument starting with `-` asks (`printf -v HOME …` would set a variable for the
+    stages after it). No builtin that can set a variable is ever on the list, and naming one asks: `read declare
+    typeset export set local let getopts mapfile readarray vared zle unset alias source . eval print readonly
+    integer float shift unalias hash builtin command emulate setopt`. **Options:** these
     take only the options listed (a short cluster is read letter by letter; a value-taking letter takes the rest of
     the cluster or the next word; anything else asks):
     `rg` `-n -i -l -c -w -v -F -S --files --hidden --json --no-heading` (and their long names) and `-e -g --glob
@@ -316,7 +320,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     `date`, `true`, `false`, `which`, `tr`, `cut`, nor a grep or sed script) and every redirection target is
     resolved from the stage's cwd (symlinks followed) and refused when it is in `~/.mother` (reading
     `~/.mother/workspace` excepted), in `~/.claude` or is `~/.claude.json`, or is protected in the workspace:
-    `.mother/`, any `.git` or `.claude` path component, any `CLAUDE.md`, `.mcp.json` or `grants.json`, `AGENTS.md`
+    `.mother/`, any `.git` or `.claude` path component, any `.gitconfig`, `.gitattributes` or `.gitmodules` path
+    component, any `.config/git` pair of components (git reads these through `HOME` or `XDG_CONFIG_HOME`), any
+    `CLAUDE.md`, `.mcp.json` or `grants.json`, `AGENTS.md`
     and `memory/MEMORY.md`, `config.json` and `capabilities.json` at the top (any case), and the workspace root
     itself as a write target. A write to `config.json` or `capabilities.json` is `kind: config`.
     **Hidden paths:** for every word of every allowed program, the word, the text after its first `=`, and the
@@ -325,15 +331,25 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     temp folders (`tempfile.gettempdir()`, `/tmp`, `/var/tmp`), or be `/dev/null`.
 - **ask, every mode** (`kind: "config"`): a Write/Edit/MultiEdit/NotebookEdit of the workspace's
   `capabilities.json` (written only by `mother health`), like `config.json`.
-- **ask, every mode** (`kind: "persona"`): a Write/Edit/MultiEdit/NotebookEdit of anything with a `.git` path
-  component in the workspace, at any depth (git runs hooks and config such as `core.fsmonitor` from it).
+- **ask, every mode** (`kind: "persona"`): a Write/Edit/MultiEdit/NotebookEdit of anything with a `.git`,
+  `.gitconfig`, `.gitattributes` or `.gitmodules` path component, or under a `.config/git` folder, in the
+  workspace, at any depth (git runs hooks and config such as `core.fsmonitor` from them).
 - **Hub-fed sessions** (`kind: "grants"`, `op: "hub_fed"`; checked first for a Bash, Monitor or `run_in_terminal`
   command, in or out of the workspace): a session whose id is in `.mother/hub/sessions.json` (any state), in
   `hub-session.json`, or in `.mother/hub/fed-sessions.json` (the hook adds the id, before deciding, whenever a
   command names `mother hub`) reads text from people who can message the manager. In it, `mother grant` (every
   verb), `mother channels` with any verb but `plan status mute unmute stop pause prune help`, and any
   `channels approvals|triage|run|answer|done|send` **ask**; PAUSED and `MOTHER_DRY_RUN` deny; bypass never passes
-  it. The channels loop runs in its own session (§5b).
+  it. The channels loop runs in its own session (§5b). The app's tools that carry the conversation into another
+  session, `mcp__ccd_session__hand_off_to_session`, `mcp__ccd_session__move_to_cloud` and
+  `mcp__ccd_session__start_session` with `context: "fork"`, are `kind: "manager_only"` in a hub-fed session (ask in
+  every mode, PAUSED included; the hub session itself still denies them).
+- **The channels loop's session** (`kind: "grants"`, `op: "channels_session"`; checked right after hub-fed, in or
+  out of the workspace): `mother channels approvals|triage|run|done` (and any `channels answer|send`) run
+  without a question only in a session listed in `.mother/channels-session.json`. The hook lists a session,
+  before deciding, when it runs a command that names `mother channels plan` with its cwd in the workspace, as
+  itself (no `agent_type`) and not hub-fed; a hub-fed session is never listed. Anywhere else these verbs **ask**;
+  PAUSED and `MOTHER_DRY_RUN` deny; bypass never passes it.
 - **ask, every session and mode** (`kind: "manager_only"`, PAUSED included; never passed by bypass;
   `MOTHER_DRY_RUN` denies): `mother channels resume` and `mother channels start`.
 - **ask, every session and mode** (`kind: "home_settings"`): a Write/Edit/MultiEdit/NotebookEdit of
@@ -578,7 +594,10 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `MOTHER_NO_SYNC=1` makes `mother sync` a no-op inside them.
 - **The loop runs in its own session, never a hub-fed one** (§5). `approvals` and `triage` read replies on stdin
   as the manager's and `run`/`answer` write grants, so in a session that reads hub lines (a card the hub routes to,
-  the hub itself, or any session that ran `mother hub …`) the guard asks before each of them. `mother channels
+  the hub itself, or any session that ran `mother hub …`) the guard asks before each of them. The loop's first
+  step is `mother channels plan`: the guard records the session that runs it (in the workspace, not a sub-agent,
+  not hub-fed) in `.mother/channels-session.json` (`{session_ids, at}`, newest first, at most 3), and
+  `approvals`, `triage`, `run` and `done` ask in any session not listed there, such as a brief that read mail. `mother channels
   start` and `resume` always ask: only the manager turns the loop back on.
 - State: `.mother/channels.json` (cursors, threads, pending actions, drafts, streaks, demotions, stop/pause);
   audit: `.mother/channels.log` (jsonl, one line per post, draft, skip, mute, stop, error). Both machine-local.
@@ -778,7 +797,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `mother hub tail` in the workspace, newest first, at most 5; the guard fences every id in `session_ids`, so a
   newer `tail` adds a hub session and never unfences an older one, §5), `fed-sessions.json` (`{session_ids}`: the
   sessions that ran any `mother hub …` command, newest first, at most 50; written by the guard under `hub.lock`, §5
-  hub-fed sessions), `hub.lock`. Readers treat a missing file as "nothing pending" or
+  hub-fed sessions), `hub.lock`. (`.mother/channels-session.json`, the channels loop's sessions, is §5b's.) Readers
+  treat a missing file as "nothing pending" or
   "the hub never woke".
 - **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
   (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,
