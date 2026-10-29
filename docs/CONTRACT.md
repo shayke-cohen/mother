@@ -698,8 +698,10 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
   activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
   A DM conversation is one thing, keyed `<channel>/dm`, so the manager's reply resolves it; an unthreaded reply in a
-  watched channel does not resolve the message it answers, and the manager's own tracker field changes are
-  indistinguishable from others' without a changelog (both accepted gaps; a comment by the manager does resolve).
+  watched channel does not resolve the message it answers, the manager's own tracker field changes are
+  indistinguishable from others' without a changelog and come through as updates, and replies in threads the
+  watcher does not follow (ones the manager has not posted in) are not read (all three accepted gaps; a comment by
+  the manager does resolve).
   A code PR leaving the review-requested set resolves its key; CI is green only when every check run is completed.
   The manager is recognised by `manager.email`, a chat user id (the first `U…` id in `manager.chat_dm`, a string
   or a list; else the `chat` of the `people` entry with the manager's email; a `D…` DM channel id is not a user),

@@ -104,15 +104,19 @@ launchd: mother hub watch   (lib/hub.py + hub_mcp.py + hub_sources.py, no model,
   ├─ per connection: read-only MCP over stdio (or `gh`) → adapter → deterministic prefilter
   ├─ appends one line per changed thing to .mother/hub/inbox.jsonl; heartbeat in watcher.json
   └─ records nothing in capabilities.json: watcher.json plus one inbox `error` line are the record
-pinned desktop session (/mother:hub): Monitor (or a cron prompt fallback) tails the inbox, wakes only on a new line
+pinned desktop session (/mother:hub): Monitor on `tail --follow` wakes it on each new line; the cron fallback wakes it every 3 minutes and ends at once when `tail --once` prints nothing
   ├─ mother hub decide   → log / Now row only │ send_message into the thing's session │ proposal card
   ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
-  ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`)
-  └─ in-app session tools pass the guard for the manager's own sessions (any normal session, the hub included); sub-agents and channel sessions are denied
+  ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`); pending and unseen expire after update_ttl_hours working hours
+  └─ in-app session tools pass the guard only inside what the hub manages (messages into live sessions.json sessions, own_initiative cards); anything else asks; sub-agents and channel sessions are denied
 Now panel: Hub section (status, sessions, updates); the Open button fills the prompt to open the session and marks it seen; the manager sends it (desktop draws only https links)
 ```
 
-Accepted gaps: the tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description) and reports changes in those four whoever made them; chat misses replies in threads of a watched channel that the watcher doesn't follow.
+Accepted gaps (also in CONTRACT §5e):
+
+- The tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description), and without a changelog it cannot tell the manager's own changes to those four from anyone else's: they come through as updates (a comment by the manager does resolve).
+- An unthreaded reply in a watched channel does not resolve the message it answers; only a reply in the thread (or in a DM) does.
+- Replies in threads the watcher does not follow (ones the manager has not posted in) are not read.
 
 ## Invariants the code relies on
 

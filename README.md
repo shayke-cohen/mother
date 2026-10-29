@@ -135,7 +135,7 @@ someone else waits for your yes in the permission prompt.
 
 The hub is optional and runs on your home machine. Set the `hub` block in `config.json` (with `enabled: true`), install the watcher with
 `mother hub install` (it polls your sources read-only and appends what changed to a local inbox), then run
-`/mother:hub` once in a pinned session. That session wakes only when a line arrives: it sends an update into the
+`/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
 session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
 
 ### Replying in team channels

@@ -141,7 +141,7 @@ closes that gap without a model polling. The 2026-10-29 spikes decided the shape
   follow-ups for a thing that already has a session go straight to it (`sessions.json` maps thing to session).
 - **A CLI session is not a desktop session.** `claude -p` runs did not appear in the sidebar, so sub-sessions
   are desktop sessions the manager opened.
-So: watcher appends to an inbox, one pinned hub session wakes only on a new line and decides (log, message,
+So: watcher appends to an inbox, one pinned hub session wakes on new lines (a Monitor; a 3-minute cron that ends at once when nothing is new is the fallback) and decides (log, message,
 or card), and the manager stays the one who starts anything. Nothing here scores or reads a person; the inbox
 keeps a short summary per thing, a summary of at most 300 characters, never full bodies or per-person counts.
 
