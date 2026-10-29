@@ -111,30 +111,43 @@ class TestFiles(unittest.TestCase):
         hub.rotate_inbox(self.ws, datetime(2026, 10, 29, 23, 0, tzinfo=UTC))
         self.assertEqual(len((d / "inbox-2026-10-29.jsonl").read_text().splitlines()), 2)
 
-    def test_rotate_never_loses_a_line_appended_during_rotation(self):
+    def test_append_waits_for_the_lock(self):
+        order = []
+        with hub.locked(self.ws):
+            th = threading.Thread(target=lambda: (hub.append_inbox(self.ws, [line()]), order.append("appended")))
+            th.start()
+            time.sleep(0.3)
+            self.assertFalse((hub.hub_dir(self.ws) / "inbox.jsonl").exists())
+            order.append("released")
+        th.join(5)
+        self.assertEqual(order, ["released", "appended"])
+        self.assertEqual(len((hub.hub_dir(self.ws) / "inbox.jsonl").read_text().splitlines()), 1)
+
+    def test_rotate_waits_for_the_lock_and_keeps_every_line(self):
         d = hub.hub_dir(self.ws)
-        (d / "inbox-2026-10-29.jsonl").parent.mkdir(parents=True, exist_ok=True)
         hub.append_inbox(self.ws, [line(key="PLAT-1")])
         (d / "inbox-2026-10-29.jsonl").write_text(json.dumps(line(key="PLAT-0")) + "\n")
-        real = os.replace
-        calls = []
-
-        def racing(a, b):
-            real(a, b)
-            if not calls:
-                calls.append(1)
-                hub.append_inbox(self.ws, [line(key="PLAT-LATE")])
-        hub.os.replace = racing
-        try:
-            hub.rotate_inbox(self.ws, datetime(2026, 10, 29, 6, 0, tzinfo=UTC))
-        finally:
-            hub.os.replace = real
+        at = datetime(2026, 10, 29, 6, 0, tzinfo=UTC)
+        with hub.locked(self.ws):
+            th = threading.Thread(target=hub.rotate_inbox, args=(self.ws, at))
+            th.start()
+            time.sleep(0.3)
+            self.assertTrue((d / "inbox.jsonl").exists())  # rotation has not started
+        th.join(5)
+        hub.append_inbox(self.ws, [line(key="PLAT-LATE")])
         keys = []
         for p in d.glob("inbox*.jsonl"):
             keys += [json.loads(l)["key"] for l in p.read_text().splitlines()]
         self.assertEqual(sorted(keys), ["PLAT-0", "PLAT-1", "PLAT-LATE"])
-        self.assertEqual([json.loads(l)["key"] for l in (d / "inbox.jsonl").read_text().splitlines()], ["PLAT-LATE"])
         self.assertEqual(list(d.glob("*.rotating")), [])
+
+    def test_stranded_rotating_file_is_folded(self):
+        d = hub.hub_dir(self.ws)
+        d.mkdir(parents=True)
+        (d / "inbox.jsonl.123.rotating").write_text(json.dumps(line(key="PLAT-S")) + "\n")
+        hub.rotate_inbox(self.ws, datetime(2026, 10, 29, 6, 0, tzinfo=UTC))
+        self.assertEqual(list(d.glob("*.rotating")), [])
+        self.assertIn("PLAT-S", (d / "inbox-2026-10-29.jsonl").read_text())
 
     def test_rotate_empty_or_missing_inbox_makes_no_dated_file(self):
         d = hub.hub_dir(self.ws)

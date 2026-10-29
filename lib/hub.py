@@ -5,7 +5,8 @@ This part: the machine-local files under <workspace>/.mother/hub/ and the vocabu
   thing key   one string per piece of work, the same wherever it shows up: tracker `PLAT-123`, code
               `owner/repo#45`, chat `C00000001/<thread ts>`, mail `mail:<thread id>`, calendar `cal:<event id>`.
   inbox line  one JSON object per source update, appended by the watcher; summary at most 300 characters.
-  state files written atomically (temp + os.replace) under the flock `hub.lock`; `inbox.jsonl` is append-only.
+  state files written atomically (temp + os.replace) under the flock `hub.lock`; `inbox.jsonl` is only appended to
+              (also under `hub.lock`, so a rotation never races an append).
 
 Python 3.9 stdlib only.
 """
@@ -123,46 +124,53 @@ def coalesce(lines: List[dict]) -> List[dict]:
 
 
 def append_inbox(ws: Path, lines: List[dict]) -> None:
-    """Append one JSON object per line to inbox.jsonl, flushed and fsynced."""
+    """Append one JSON object per line to inbox.jsonl, flushed and fsynced. Takes `locked(ws)` itself (so it
+    never interleaves with rotate_inbox); the caller must not already hold it."""
     if not lines:
         return
-    d = hub_dir(ws)
-    d.mkdir(parents=True, exist_ok=True)
-    with open(str(d / "inbox.jsonl"), "a") as f:
-        for l in lines:
-            f.write(json.dumps(l, sort_keys=True) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    with locked(ws):
+        d = hub_dir(ws)
+        with open(str(d / "inbox.jsonl"), "a") as f:
+            for l in lines:
+                f.write(json.dumps(l, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def _fold(src: Path, dest: Path) -> None:
+    """Append src to dest (fsynced), then delete src."""
+    with open(str(src), "rb") as r, open(str(dest), "ab") as out:
+        out.write(r.read())
+        out.flush()
+        os.fsync(out.fileno())
+    src.unlink()
 
 
 def rotate_inbox(ws: Path, at: datetime) -> None:
     """Move inbox.jsonl aside as inbox-YYYY-MM-DD.jsonl (the date of `at`, appended to if it exists) and
-    delete dated files 7 or more days older than `at`. Hold `locked(ws)` if a reader could be running."""
-    d = hub_dir(ws)
-    d.mkdir(parents=True, exist_ok=True)
-    today = at.date()
-    cur = d / "inbox.jsonl"
-    dest = d / ("inbox-%s.jsonl" % today.isoformat())
-    # Never copy-then-delete the live file: a line appended in between would be lost. Rename it away first
-    # (atomic), so later appends start a fresh inbox.jsonl, then fold the renamed file into the dated one.
-    if cur.exists():
-        if not dest.exists():
-            if cur.stat().st_size:
+    delete dated files 7 or more days older than `at`. Takes `locked(ws)` itself, so no append can land
+    mid-rotation; the caller must not already hold it. Leftover `inbox.jsonl.*.rotating` files from a crash
+    are folded into the dated file first, so no line is stranded."""
+    with locked(ws):
+        d = hub_dir(ws)
+        today = at.date()
+        cur = d / "inbox.jsonl"
+        dest = d / ("inbox-%s.jsonl" % today.isoformat())
+        for old in sorted(d.glob("inbox.jsonl.*.rotating")):
+            _fold(old, dest)
+        if cur.exists():
+            if not cur.stat().st_size:
+                cur.unlink()
+            elif not dest.exists():
                 os.replace(str(cur), str(dest))
             else:
-                cur.unlink()
-        else:
-            aside = d / ("inbox.jsonl.%d.rotating" % os.getpid())
-            os.replace(str(cur), str(aside))
-            with open(str(aside), "rb") as src, open(str(dest), "ab") as out:
-                out.write(src.read())
-                out.flush()
-                os.fsync(out.fileno())
-            aside.unlink()
-    for p in d.glob("inbox-*.jsonl"):
-        m = re.match(r"inbox-(\d{4}-\d{2}-\d{2})\.jsonl$", p.name)
-        if m and (today - datetime.strptime(m.group(1), "%Y-%m-%d").date()).days >= KEEP_DAYS:
-            p.unlink()
+                aside = d / ("inbox.jsonl.%d.rotating" % os.getpid())
+                os.replace(str(cur), str(aside))
+                _fold(aside, dest)
+        for p in d.glob("inbox-*.jsonl"):
+            m = re.match(r"inbox-(\d{4}-\d{2}-\d{2})\.jsonl$", p.name)
+            if m and (today - datetime.strptime(m.group(1), "%Y-%m-%d").date()).days >= KEEP_DAYS:
+                p.unlink()
 
 
 def main(args, ws, cfg, at) -> int:

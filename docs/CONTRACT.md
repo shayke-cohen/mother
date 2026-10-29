@@ -552,7 +552,8 @@ is set without `MOTHER_WORKSPACE`, as in throwaway test workspaces.
 A machine-local watcher polls the manager's sources read-only and appends source updates to an inbox; a hub
 Claude session routes them into the manager's sessions. Config: the `hub` block (§3). Everything below lives in
 `<workspace>/.mother/hub/`, is machine-local and gitignored, and is written atomically (temp file +
-`os.replace`) under the `fcntl` lock `hub.lock`, except `inbox.jsonl`, which is append-only by the watcher.
+`os.replace`) under the `fcntl` lock `hub.lock`. `inbox.jsonl` is append-only by the watcher, and both appending
+and rotating take `hub.lock`, so a rotation never races an append.
 Nothing holds a message body beyond a summary of at most 300 characters, and nothing counts per person.
 
 - **Files.** `cursors.json` (per-source poll cursors), `inbox.jsonl` (the updates the watcher found),
@@ -564,8 +565,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
   (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,
   kind (update|resolved|error|sweep), key, also, title, who, link, summary}`, `id` = `<source>:<key>:<at>`,
-  `also` = other keys found in the text. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and deletes dated
-  files 7 or more days old.
+  `also` = other keys found in the text. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
+  file from a crash into the dated file, and deletes dated files 7 or more days old.
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one
   poll, no write), `status`, `tail` (recent inbox), `decide` (the hub's one write path for a decision),
   `session add|drop|seen|for` (the session registry), `done`, `snooze`, `show`.
