@@ -21,7 +21,9 @@ templates/workspace/       files `mother init` copies into a new workspace
 mods/now/                  the Now panel, a second plugin in the same marketplace (`/plugin install mother-now@mother`):
                            .claude-plugin/plugin.json (userConfig `mother_bin`), hooks/register.tsx (+ tests), types/index.d.ts;
                            opens with `/now-panel` (the engine reserves `/now` for the mother:now skill);
-                           reads `.mother/now.json`, writes only through `mother now done|snooze|top`, no network or MCP calls
+                           reads `.mother/now.json` and the hub's `.mother/hub/hub.json`, `sessions.json`, `watcher.json` (§5e), writes only through
+                           `mother now done|snooze|top` and `mother hub done|snooze|session seen`, no network or MCP calls;
+                           a Hub section (health, Sessions, Waiting for you to start, Hub updates, Recently routed) and `hub ●|◌ stale|✗ · N waiting` on the status line
 tests/                     stdlib unittest; `python3 -m unittest discover tests`
 ```
 

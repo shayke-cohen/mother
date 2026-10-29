@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { hubStatus } from './register'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-10-26T10:00:00Z')
@@ -56,7 +57,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('prompt.fill', (_: any, e: any) => { out.fills.push({ text: e.text, mode: e.mode }); return { isFilled: true } })
     on('process.run', (_: any, e: any) => {
       out.argv.push([...e.argv])
-      if (cli && e.argv[2] === 'now') {
+      if (cli && (e.argv[2] === 'now' || e.argv[2] === 'hub')) {
         const r = cli([...e.argv])
         return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
@@ -64,7 +65,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
       return { value: { exitCode: 0, stdout: WS + '\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     on('fs.stat', (_: any, e: any) => {
-      out.stats++
+      if (e.path === PATH) out.stats++   // hub files are stat'ed too; the tests below count now.json
       const f = files[e.path]
       if (!f) return { deny: statErr }
       return { value: { kind: 'file', size: f.text.length, mtimeMs: f.mtimeMs } }
@@ -640,5 +641,271 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(out.fills).toEqual([{ text: 'mother now do S9', mode: 'replace' }])
     expect(await hasText(ui, /^▸ ★ b$/)).toBe(true)                 // the item marks that it is in Top 3
     await ui.unmount()
+  })
+
+  // ---- the hub ------------------------------------------------------------------------------------
+  const HUB = WS + '/.mother/hub'
+  const iso = (msAgo: number) => new Date(NOW - msAgo).toISOString()
+  const MIN = 60_000
+  const watcher = (over: Record<string, unknown> = {}) => ({
+    at: iso(MIN), every_seconds: 120, active: true,
+    sources: { chat: { status: 'ok' }, tracker: { status: 'couldnt_check', reason: 'no connection' }, mail: { status: 'partial' } }, errors: [], ...over,
+  })
+  const hubDoc = (over: Record<string, unknown> = {}) => ({
+    version: 1, last_wake: iso(2 * MIN), inbox_cursor: null, next_update: 2, routed: [], pending: [], updates: [], ...over,
+  })
+  const session = (over: Record<string, unknown> = {}) => ({
+    session_id: 'sid-1', name: 'plat-1', title: 'Fix the login', link: 'claude://session/sid-1', also: [],
+    opened_at: iso(48 * 60 * MIN), last_routed_at: iso(3 * 60 * MIN), unseen: 0, state: 'live', ...over,
+  })
+  const sessionsDoc = (map: Record<string, unknown>) => ({ version: 1, sessions: map })
+  // texts plus Link labels (a session's title is a Link on the terminal)
+  const withLinks = async (ui: any) => [...await texts(ui), ...(await ui.findAll({ type: 'Link' })).map((l: any) => l.text as string)]
+  const hasAny = async (ui: any, re: RegExp) => (await withLinks(ui)).some((t: string) => re.test(t))
+  const hubFiles = (w: unknown, h: unknown, ss: unknown, mt = 1) => {
+    const f: Record<string, { text: string; mtimeMs: number }> = { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }
+    if (w) f[HUB + '/watcher.json'] = { text: JSON.stringify(w), mtimeMs: mt }
+    if (h) f[HUB + '/hub.json'] = { text: JSON.stringify(h), mtimeMs: mt }
+    if (ss) f[HUB + '/sessions.json'] = { text: JSON.stringify(ss), mtimeMs: mt }
+    return f
+  }
+  const bundle = (w: any, h: any, ss: any) => ({ watcher: w, hub: h, sessions: ss })
+
+  test(`hubStatus: absent, alive, stale, down and waiting, on ${surface}`, () => {
+    expect(hubStatus(bundle(null, null, null), NOW)).toBe('')
+    expect(hubStatus(bundle(watcher(), hubDoc(), null), NOW)).toBe(' · hub ●')
+    // a quiet day: an old last_wake with nothing pending is normal
+    expect(hubStatus(bundle(watcher(), hubDoc({ last_wake: iso(5 * 60 * MIN) }), null), NOW)).toBe(' · hub ●')
+    // the watcher's own poll is older than 2 x every_seconds inside active hours
+    expect(hubStatus(bundle(watcher({ at: iso(5 * MIN) }), hubDoc(), null), NOW)).toBe(' · hub ◌ stale')
+    // outside active hours the watcher polls slowly: not stale
+    expect(hubStatus(bundle(watcher({ at: iso(5 * MIN), active: false }), hubDoc(), null), NOW)).toBe(' · hub ●')
+    // with work pending, an old last_wake is stale
+    const pending = [{ key: 'PLAT-1', title: 'T', link: null, proposed_at: iso(10 * MIN), raised_at: null }]
+    expect(hubStatus(bundle(watcher(), hubDoc({ pending, last_wake: iso(5 * MIN) }), null), NOW)).toBe(' · hub ◌ stale · 1 waiting')
+    // down: watcher.json missing, or its at older than 10 minutes
+    expect(hubStatus(bundle(null, hubDoc(), null), NOW)).toBe(' · hub ✗')
+    expect(hubStatus(bundle(watcher({ at: iso(11 * MIN) }), hubDoc(), null), NOW)).toBe(' · hub ✗')
+    // waiting = pending + live sessions with unseen
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 2 }), 'PLAT-3': session({ unseen: 0 }), 'PLAT-4': session({ unseen: 1, state: 'dropped' }) })
+    expect(hubStatus(bundle(watcher(), hubDoc({ pending }), ss), NOW)).toBe(' · hub ● · 2 waiting')
+  })
+
+  test(`the status line carries the hub and the count, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss))
+    expect(last(out)).toBe('◆ 3 on you · 2 neglected · tracker ✗ · hub ● · 1 waiting')
+  })
+
+  test(`no hub files means no hub on the status line or in the pane, on ${surface}`, async ($, on) => {
+    const { out } = await boot($, on, hubFiles(null, null, null))
+    expect(last(out)).toBe('◆ 3 on you · 2 neglected · tracker ✗')
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Hub [●◌✗]/)).toBe(false)
+    await ui.unmount()
+  })
+
+  test(`the Hub section is first, with the health row; Restart hub only when not alive, on ${surface}`, async ($, on) => {
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const all = await texts(ui)
+    expect(all.findIndex(t => /polled 1m ago/.test(t))).toBeLessThan(all.findIndex(t => /^Now · /.test(t)))
+    expect(all.some(t => /^[▾▸] Hub ●$/.test(t))).toBe(true)
+    expect(await hasText(ui, /polled 1m ago/)).toBe(true)
+    expect(await hasText(ui, /chat ✓/)).toBe(true)
+    expect(await hasText(ui, /mail ~/)).toBe(true)
+    expect(await hasText(ui, /tracker ✗/)).toBe(true)
+    expect(await ui.find({ key: 'hub-restart' })).toBeUndefined()
+    expect(out.fills).toEqual([])
+    await ui.unmount()
+  })
+
+  test(`Restart hub shows when watcher.json is missing, and when it is stale, on ${surface}`, async ($, on) => {
+    await boot($, on, hubFiles(null, hubDoc(), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'hub-restart' })).toBeDefined()
+    expect(await hasText(ui, /watcher not running/)).toBe(true)
+    await ui.unmount()
+  })
+
+  test(`Restart hub shows when the heartbeat is stale, on ${surface}`, async ($, on) => {
+    await boot($, on, hubFiles(watcher({ at: iso(5 * MIN) }), hubDoc(), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'hub-restart' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test(`Restart hub fills /mother:hub and never submits, on ${surface}`, async ($, on) => {
+    const { out } = await boot($, on, hubFiles(watcher({ at: iso(20 * MIN) }), hubDoc(), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'hub-restart' })
+    expect(out.fills).toEqual([{ text: '/mother:hub', mode: 'replace' }])
+    expect(out.submits).toBe(0)
+    await ui.unmount()
+  })
+
+  test(`the Hub section is open when something waits and collapsed when nothing does, on ${surface}`, async ($, on) => {
+    await boot($, on, hubFiles(watcher(), hubDoc(), sessionsDoc({ 'PLAT-2': session() })))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasAny(ui, /Fix the login/)).toBe(false)          // N = 0: collapsed
+    await ui.press({ key: 'hub-toggle' })
+    expect(await hasAny(ui, /Fix the login/)).toBe(true)
+    await ui.unmount()
+  })
+
+  test(`the Hub section is open when a session has an update, on ${surface}`, async ($, on) => {
+    await boot($, on, hubFiles(watcher(), hubDoc(), sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) })))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasAny(ui, /Fix the login/)).toBe(true)           // N > 0: open
+    await ui.unmount()
+  })
+
+  test(`a session with unseen shows new update and its age; a link opens it, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Sessions/)).toBe(true)
+    expect(await hasAny(ui, /Fix the login/)).toBe(true)
+    expect(await hasText(ui, /PLAT-2/)).toBe(true)
+    expect(await hasText(ui, /new update/)).toBe(true)
+    expect(await hasText(ui, /3h/)).toBe(true)
+    const links = await ui.findAll({ type: 'Link' })
+    // only the terminal is sent a claude:// link; the other surfaces get the Open button alone
+    expect(links.some((l: any) => l.props.href === 'claude://session/sid-1')).toBe(surface === 'terminal')
+    await ui.press({ key: 'sess-open-PLAT-2' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'session', 'seen', 'PLAT-2']])
+    expect(out.fills).toEqual([{ text: 'Open my "Fix the login" session', mode: 'replace' }])
+    await ui.unmount()
+  })
+
+  test(`a session with no link has no Link; Open fills the prompt and runs seen, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1, link: null }) })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.findAll({ type: 'Link' })).some((l: any) => /^claude:/.test(l.props.href))).toBe(false)
+    expect((await ui.find({ key: 'sess-open-PLAT-2' }))?.text).toBe('Open')
+    await ui.press({ key: 'sess-open-PLAT-2' })
+    expect(out.fills).toEqual([{ text: 'Open my "Fix the login" session', mode: 'replace' }])
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'session', 'seen', 'PLAT-2']])
+    expect(out.submits).toBe(0)
+    await ui.unmount()
+  })
+
+  test(`a dropped session is not shown, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ state: 'dropped', unseen: 3, title: 'Gone one' }) })
+    await boot($, on, hubFiles(watcher(), hubDoc(), ss))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Gone one/)).toBe(false)
+    await ui.unmount()
+  })
+
+  test(`a rising unseen toasts once across two reads, on ${surface}`, async ($, on) => {
+    const files = hubFiles(watcher(), hubDoc(), sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) }))
+    const { clock, out } = await boot($, on, files)
+    expect(out.toasts.filter(t => t.includes('Update in'))).toEqual(['◆ Update in Fix the login'])
+    files[HUB + '/watcher.json'] = { text: JSON.stringify(watcher({ at: iso(0) })), mtimeMs: 2 }
+    files[HUB + '/sessions.json'] = { text: JSON.stringify(sessionsDoc({ 'PLAT-2': session({ unseen: 1, last_routed_at: iso(0) }) })), mtimeMs: 2 }
+    await clock.advance(60_000)
+    expect(out.toasts.filter(t => t.includes('Update in')).length).toBe(1)
+    files[HUB + '/sessions.json'] = { text: JSON.stringify(sessionsDoc({ 'PLAT-2': session({ unseen: 2 }) })), mtimeMs: 3 }
+    await clock.advance(60_000)
+    expect(out.toasts.filter(t => t.includes('Update in')).length).toBe(2)   // it rose again
+  })
+
+  test(`a pending proposal toasts once, on ${surface}`, async ($, on) => {
+    const pending = [{ key: 'PLAT-9', title: 'Review the rollout', link: null, read: 'r', next_step: 'n', name: 'plat-9', proposed_at: iso(MIN), raised_at: null }]
+    const files = hubFiles(watcher(), hubDoc({ pending }), null)
+    const { clock, out } = await boot($, on, files)
+    expect(out.toasts.filter(t => t.includes('suggests'))).toEqual(['◆ MOTHER suggests a session: Review the rollout'])
+    files[HUB + '/hub.json'] = { text: JSON.stringify(hubDoc({ pending, last_wake: iso(0) })), mtimeMs: 2 }
+    await clock.advance(60_000)
+    expect(out.toasts.filter(t => t.includes('suggests')).length).toBe(1)
+  })
+
+  test(`Waiting for you to start lists pending cards by state and age, on ${surface}`, async ($, on) => {
+    const pending = [
+      { key: 'PLAT-9', title: 'Unraised one', link: null, proposed_at: iso(5 * 60 * MIN), raised_at: null },
+      { key: 'PLAT-8', title: 'Raised one', link: null, proposed_at: iso(30 * 60 * MIN), raised_at: iso(29 * 60 * MIN) },
+    ]
+    await boot($, on, hubFiles(watcher(), hubDoc({ pending }), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Waiting for you to start/)).toBe(true)
+    expect(await hasText(ui, /Unraised one/)).toBe(true)
+    expect(await hasText(ui, /card not raised yet/)).toBe(true)
+    expect(await hasText(ui, /open the hub to start it/)).toBe(true)
+    expect(await hasText(ui, /5h/)).toBe(true)
+    expect(await hasText(ui, /1d/)).toBe(true)
+    await ui.unmount()
+  })
+
+  test(`Done on a hub update runs mother hub done, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'PLAT-5', title: 'Spec changed', why: 'Dana edited it', link: 'https://example.com/PLAT-5', at: iso(MIN), state: 'open' }]
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Hub updates/)).toBe(true)
+    expect(await hasText(ui, /Spec changed/)).toBe(true)
+    await ui.press({ key: 'hub-done-U1' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'done', 'U1']])
+    await ui.unmount()
+  })
+
+  test(`Snooze on a hub update opens a Select and runs mother hub snooze, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'PLAT-5', title: 'Spec changed', why: 'w', link: null, at: iso(MIN), state: 'open' }]
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'hub-snooze-U1' })
+    const sel = await ui.find({ key: 'hub-snooze-pick-U1' })
+    expect(sel).toBeDefined()
+    await ui.select({ key: 'hub-snooze-pick-U1', value: 'tomorrow' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'snooze', 'U1', 'tomorrow']])
+    await ui.unmount()
+  })
+
+  test(`a done or snoozed hub update is not listed, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'K', title: 'Closed one', why: 'w', link: null, at: iso(MIN), state: 'done' },
+                     { id: 'U2', key: 'K2', title: 'Later one', why: 'w', link: null, at: iso(MIN), state: 'snoozed', snooze_until: iso(-MIN) }]
+    await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /Closed one|Later one|Hub updates/)).toBe(false)
+    await ui.unmount()
+  })
+
+  test(`Recently routed is collapsed and shows the last 10, on ${surface}`, async ($, on) => {
+    const routed = Array.from({ length: 12 }, (_, n) => ({ line_id: 'l' + n, key: 'PLAT-' + n, decision: 'log', at: iso((12 - n) * MIN) }))
+    await boot($, on, hubFiles(watcher(), hubDoc({ routed }), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'hub-toggle' })      // nothing waits: the section starts collapsed
+    expect(await hasText(ui, /PLAT-11/)).toBe(false)
+    await ui.press({ key: 'routed-toggle' })
+    expect(await hasText(ui, /PLAT-11/)).toBe(true)
+    expect(await hasText(ui, /PLAT-2 /)).toBe(true)
+    expect(await hasText(ui, /PLAT-1 /)).toBe(false)
+    await ui.unmount()
+  })
+
+  test(`a Now item linked to a session shows the marker and Open session, on ${surface}`, async ($, on) => {
+    const it: any = item('a', 'on_you', 'open', 'Review A')
+    it.link = 'https://example.com/browse/PLAT-2'
+    const d = doc({ items: [it, item('b', 'on_you', 'open', 'Other B')], counts: { on_you: 2, neglected: 0, suggestion: 0 }, coverage: {} })
+    const files = hubFiles(watcher(), hubDoc(), sessionsDoc({ 'PLAT-2': session({ link: null }) }))
+    files[PATH] = { text: JSON.stringify(d), mtimeMs: 1 }
+    const { out } = await boot($, on, files)
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /◆ session/)).toBe(true)
+    expect((await ui.find({ key: 'ask-a' }))?.text).toBe('Open session')
+    await ui.press({ key: 'ask-a' })
+    expect(out.fills).toEqual([{ text: 'Open my "Fix the login" session', mode: 'replace' }])
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'session', 'seen', 'PLAT-2']])
+    await ui.press({ key: 'row-b' })
+    expect((await ui.find({ key: 'ask-b' }))?.text).toBe('Ask Mother')
+    await ui.unmount()
+  })
+
+  test(`a hub file is re-read only when its mtime moves, on ${surface}`, async ($, on) => {
+    const files = hubFiles(watcher(), hubDoc(), null)
+    const { clock, out } = await boot($, on, files)
+    const before = out.reads
+    await clock.advance(60_000)
+    expect(out.reads).toBe(before)
   })
 }
