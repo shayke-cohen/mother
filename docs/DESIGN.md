@@ -128,6 +128,23 @@ opposite job: reading something large and noisy in a fresh context, and handing 
 - **Proved before it ships.** The brief keeps `gather: inline` until `brief-ab` (blind A/B on the same inputs,
   scored for per-source coverage, citations, false quiet and cost) says `ship`. Dots and digest follow only after that.
 
+## The hub: a watcher, one pinned session and cards
+
+The tick rescans sources hourly, so something that changed at 10:05 reaches the manager at 11:00. The hub
+closes that gap without a model polling. The 2026-10-29 spikes decided the shape:
+- **Plain code can read the sources.** A Python script spoke MCP over stdio to the gateway and read tracker and
+  mail with no model, so the watcher is a launchd process, read-only by construction (allow-list enforced
+  before send), and has no model cost while nothing changes.
+- **A timer-fired turn cannot start a session.** `start_session` was refused without the user's own words, so a
+  new session can only be proposed as a card the manager clicks. Hence cards, never auto-spawned sessions.
+- **It can message an existing one.** `send_message` from a cron-fired turn was delivered and acted on, so
+  follow-ups for a thing that already has a session go straight to it (`sessions.json` maps thing to session).
+- **A CLI session is not a desktop session.** `claude -p` runs did not appear in the sidebar, so sub-sessions
+  are desktop sessions the manager opened.
+So: watcher appends to an inbox, one pinned hub session wakes on new lines (a Monitor; a 3-minute cron that ends at once when nothing is new is the fallback) and decides (log, message,
+or card), and the manager stays the one who starts anything. Nothing here scores or reads a person; the inbox
+keeps a short summary per thing, a summary of at most 300 characters, never full bodies or per-person counts.
+
 ## Safety
 
 - **Approvals are enforced in a pre-tool hook, not only in the prompt.** Prompt-only rules can vanish when

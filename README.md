@@ -133,6 +133,11 @@ skill: `brief`, `now`, `todo`, `remember`, `one-on-one`, `commitments`,
 WhatsApp" or "WhatsApp Dana that I'm late" go to the `whatsapp` skill: it reads any chat, and each message to
 someone else waits for your yes in the permission prompt.
 
+The hub is optional and runs on your home machine. Set the `hub` block in `config.json` (with `enabled: true`), install the watcher with
+`mother hub install` (it polls your sources read-only and appends what changed to a local inbox), then run
+`/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
+session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
+
 ### Replying in team channels
 
 Each channel in `config.json` has a reply mode: `off`, `watch` (read for digests only), `mention` (answers in
@@ -162,6 +167,7 @@ Useful commands in your terminal:
 | `mother health` | Connector health: which server serves each capability, the failure log and a 7-day summary (`mother health help`) |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
+| `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `watch` runs it in the foreground |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
 | `mother channels pause` / `resume` | Stop or restart replies in every channel |

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Hook, Register, Timer } from 'claude-code'
 
-import type { NowCoverage, NowDoc, NowItem, NowTop } from '../types'
+import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
 
 // State the Now panel (Task 9) draws from. Keys are declared in types/index.d.ts.
 export const docAtom = atom({ plugin: 'mother-now', key: 'doc' } as const, null)
@@ -10,6 +10,7 @@ export const workspaceAtom = atom({ plugin: 'mother-now', key: 'workspace' } as 
 export const snoozingAtom = atom({ plugin: 'mother-now', key: 'snoozing' } as const, null)
 export const selectedAtom = atom({ plugin: 'mother-now', key: 'selected' } as const, null)
 export const expandedAtom = atom({ plugin: 'mother-now', key: 'expanded' } as const, null)
+export const hubAtom = atom({ plugin: 'mother-now', key: 'hub' } as const, null)
 
 const PANE = 'mother-now'
 const SNOOZES = ['1h', 'tomorrow', 'next-week'] as const
@@ -23,8 +24,12 @@ const DEFAULT_BIN = '~/.claude/plugins/marketplaces/mother/bin/mother'
 export type Dollar = Parameters<Hook<'session.start'>>[0]
 
 // What `load` remembers between polls: the mtime it last read, so an unchanged file is not re-read.
-export type Loader = { mtimeMs: number | null; statFailed: boolean }
-export const newLoader = (): Loader => ({ mtimeMs: null, statFailed: false })
+export type FileLoader = { mtimeMs: number | null; statFailed: boolean }
+export type Loader = FileLoader & { hub: Record<HubFile, FileLoader> }
+const newFileLoader = (): FileLoader => ({ mtimeMs: null, statFailed: false })
+export const newLoader = (): Loader => ({
+  ...newFileLoader(), hub: { watcher: newFileLoader(), hub: newFileLoader(), sessions: newFileLoader() },
+})
 
 export function statusText(doc: NowDoc | null, nowMs: number): string {
   if (!doc) return '◆ no tick here'
@@ -35,6 +40,48 @@ export function statusText(doc: NowDoc | null, nowMs: number): string {
     if (row && row.status !== 'ok') text += ` · ${source} ${row.status === 'partial' ? '~' : '✗'}`
   }
   return text
+}
+
+// ---- the hub ---------------------------------------------------------------------------------------
+
+export type HubFile = 'watcher' | 'hub' | 'sessions'
+const HUB_FILES: Record<HubFile, string> = { watcher: 'watcher.json', hub: 'hub.json', sessions: 'sessions.json' }
+const NO_HUB: HubBundle = { hub: null, sessions: null, watcher: null }
+const WATCHER_DOWN_MS = 10 * 60_000
+const ROUTED_SHOWN = 10
+
+export const liveSessions = (s: HubSessions | null | undefined): [string, HubSession][] =>
+  Object.entries(s?.sessions ?? {}).filter(([, v]) => v && v.state === 'live')
+
+// The sessions with an update the manager has not looked at, plus the cards waiting to be started.
+export const waitingCount = (h: HubBundle): number =>
+  (h.hub?.pending ?? []).length + liveSessions(h.sessions).filter(([, v]) => (v.unseen ?? 0) > 0).length
+
+export type HubHealth = 'none' | 'alive' | 'stale' | 'down'
+
+// R4: judged without config. Down: no heartbeat, or one older than max(10 minutes, 2 x every_seconds), so a
+// slow idle interval outside active hours is not down. Stale (inside active hours only): the heartbeat is older
+// than 2 x every_seconds, or the watcher appended a line the hub must decide (last_append_at) after the hub last
+// woke, and that was more than 2 x every_seconds ago. A quiet day's old last_wake is never stale on its own.
+export function hubHealth(h: HubBundle, nowMs: number): HubHealth {
+  if (!h.hub && !h.watcher) return 'none'
+  const at = h.watcher ? Date.parse(h.watcher.at) : NaN
+  const limit = 2 * (h.watcher?.every_seconds ?? 120) * 1000
+  if (Number.isNaN(at) || nowMs - at > Math.max(WATCHER_DOWN_MS, limit)) return 'down'
+  if (h.watcher?.active) {
+    if (nowMs - at > limit) return 'stale'
+    const appended = h.watcher.last_append_at ? Date.parse(h.watcher.last_append_at) : NaN
+    const wake = h.hub?.last_wake ? Date.parse(h.hub.last_wake) : NaN
+    if (!Number.isNaN(appended) && (Number.isNaN(wake) || appended > wake) && nowMs - appended > limit) return 'stale'
+  }
+  return 'alive'
+}
+
+export function hubStatus(h: HubBundle, nowMs: number): string {
+  const health = hubHealth(h, nowMs)
+  if (health === 'none') return ''
+  const n = waitingCount(h)
+  return (health === 'alive' ? ' · hub ●' : health === 'stale' ? ' · hub ◌ stale' : ' · hub ✗') + (n > 0 ? ` · ${n} waiting` : '')
 }
 
 export async function motherBin($: Dollar, configured: string): Promise<string> {
@@ -79,8 +126,10 @@ export async function load($: Dollar, bin: string, loader: Loader): Promise<void
     await update($, docAtom, () => null)
   } else {
     await readDoc($, `${ws}/.mother/now.json`, loader)
+    await readHub($, `${ws}/.mother/hub`, loader).catch(() => undefined)   // the hub never un-reads the list
   }
-  $.ui.status(statusText(await read($, docAtom), await $.clock.now()))
+  const nowMs = await $.clock.now()
+  $.ui.status(statusText(await read($, docAtom), nowMs) + hubStatus((await read($, hubAtom)) ?? NO_HUB, nowMs))
 }
 
 // Only a missing file means "no tick here"; any other failure keeps the previous doc and sets `error`.
@@ -127,6 +176,58 @@ export async function readDoc($: Dollar, path: string, loader: Loader): Promise<
   await toastNew($, parsed).catch(() => undefined)   // a toast or store failure never un-reads a good doc
 }
 
+// The three hub files, each re-read only when its mtime moved. A missing file is null; a file that will not
+// parse (or has another version, for hub.json and sessions.json) keeps the previous value.
+export async function readHub($: Dollar, dir: string, loader: Loader): Promise<void> {
+  const before = (await read($, hubAtom)) ?? NO_HUB
+  const next: HubBundle = { ...before }
+  for (const name of Object.keys(HUB_FILES) as HubFile[]) {
+    const path = `${dir}/${HUB_FILES[name]}`
+    const fl = loader.hub[name]
+    let mtimeMs: number
+    try {
+      mtimeMs = (await $.fs.stat(path)).mtimeMs
+    } catch (err) {
+      if (isMissing(err)) { fl.mtimeMs = null; (next as Record<string, unknown>)[name] = null }
+      continue   // any other failure keeps the previous value
+    }
+    if (mtimeMs === fl.mtimeMs) continue
+    fl.mtimeMs = mtimeMs
+    try {
+      const raw = JSON.parse(await $.fs.read(path))
+      if (!raw || typeof raw !== 'object') throw new Error('not an object')
+      if (name !== 'watcher' && raw.version !== 1) throw new Error('unsupported version')
+      ;(next as Record<string, unknown>)[name] = raw
+    } catch {
+      // keep the previous value; the next change of the file retries it
+    }
+  }
+  if (next.hub === before.hub && next.sessions === before.sessions && next.watcher === before.watcher) return
+  await update($, hubAtom, () => next)
+  await toastHub($, before, next).catch(() => undefined)   // a store failure never un-reads a good file
+}
+
+// Per-device de-dup in the store, like toastKey: a session toasts when its `unseen` rises above what this
+// device last saw; a proposal toasts once per (key, proposed_at).
+async function toastHub($: Dollar, before: HubBundle, next: HubBundle): Promise<void> {
+  const seenUnseen: Record<string, number> = ((await $.store.get('hubUnseen')) as Record<string, number> | undefined) ?? {}
+  const sessions = liveSessions(next.sessions)
+  const unseenNow: Record<string, number> = {}
+  let changed = false
+  for (const [key, v] of sessions) {
+    const n = v.unseen ?? 0
+    unseenNow[key] = n
+    if (n > (seenUnseen[key] ?? 0)) $.ui.toast(`◆ Update in ${v.title}`)
+    if (n !== seenUnseen[key]) changed = true
+  }
+  if (changed || Object.keys(seenUnseen).length !== sessions.length) await $.store.set('hubUnseen', unseenNow)
+  const toasted: string[] = ((await $.store.get('hubToasted')) as string[] | undefined) ?? []
+  const fresh = (next.hub?.pending ?? []).filter(p => !toasted.includes(pendingKey(p)))
+  if (fresh.length === 0) return
+  for (const p of fresh) $.ui.toast(`◆ MOTHER suggests a session: ${p.title}`)
+  await $.store.set('hubToasted', [...toasted, ...fresh.map(pendingKey)].slice(-TOASTED_CAP))
+}
+const pendingKey = (p: HubPending): string => `${p.key}@${p.proposed_at}`
 
 // ---- time ------------------------------------------------------------------------------------------
 
@@ -169,18 +270,26 @@ export function age(since: string, nowMs: number): string {
   return Number.isNaN(hours) ? '' : hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`
 }
 
+// A coarse age for the hub rows: minutes matter there.
+export function ago(iso: string | undefined | null, nowMs: number): string {
+  const ms = iso ? Date.parse(iso) : NaN
+  if (Number.isNaN(ms)) return ''
+  const mins = Math.max(0, Math.floor((nowMs - ms) / 60_000))
+  return mins < 1 ? 'now' : mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins / 60)}h` : `${Math.floor(mins / 1440)}d`
+}
+
 // ---- writes ----------------------------------------------------------------------------------------
 
 // Run one `mother now …` verb, then re-read now.json at once. A failure toasts the first line of stderr.
-async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null): Promise<void> {
+async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null, group = 'now'): Promise<void> {
   try {
-    const ran = await $.process.run(['python3', bin, 'now', ...args])
+    const ran = await $.process.run(['python3', bin, group, ...args])
     if (ran.exitCode !== 0) {
-      const line = String(ran.stderr ?? '').split('\n').find(l => l.trim()) ?? `mother now ${args[0]} failed`
+      const line = String(ran.stderr ?? '').split('\n').find(l => l.trim()) ?? `mother ${group} ${args[0]} failed`
       $.ui.toast(line.trim())
     }
   } catch (err) {
-    $.ui.toast(`mother now ${args[0]} failed: ${(err as Error).message ?? String(err)}`)
+    $.ui.toast(`mother ${group} ${args[0]} failed: ${(err as Error).message ?? String(err)}`)
   }
   await load($, bin, loader).catch(() => undefined)
   if (rowId) await update($, snoozingAtom, cur => (cur === rowId ? null : cur))
@@ -282,12 +391,19 @@ const LIMITS: Record<NowItem['section'], number> = { on_you: 5, neglected: 3, su
 const SECTIONS: [NowItem['section'], string][] = [['on_you', 'On you'], ['neglected', 'Neglected'], ['suggestion', 'Suggestions']]
 
 function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, snoozing: string | null, selected: string | null,
-                  expandedList: string[] | null, nowMs: number, go: (args: string[], rowId?: string | null) => Promise<void>) {
+                  expandedList: string[] | null, nowMs: number, go: (args: string[], rowId?: string | null) => Promise<void>,
+                  hub: HubBundle, goHub: (args: string[], rowId?: string | null) => Promise<void>, surface: string) {
   const { Box, Text, Button, Link, Select } = ui
+  const hubNode = hubSection($, ui, surface, hub, snoozing, new Set(expandedList ?? []), nowMs, goHub)
   if (!doc) {
-    return error
-      ? <Text color="warning">Couldn't read now.json.</Text>
-      : <Text dimColor>Tick runs on the home machine; nothing here yet.</Text>
+    return (
+      <Box flexDirection="column">
+        {hubNode}
+        {error
+          ? <Text color="warning">Couldn't read now.json.</Text>
+          : <Text dimColor>Tick runs on the home machine; nothing here yet.</Text>}
+      </Box>
+    )
   }
 
   const tz = doc.timezone
@@ -324,8 +440,10 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
     </Box>
   )
 
+  const sessionOf = (i: NowItem) => sessionForItem(hub.sessions, i)
   const row = (i: NowItem) => {
     const open = i.id === current
+    const sess = sessionOf(i)
     const meta = [i.team, age(i.since, nowMs)].filter(Boolean).join(' · ')
     return (
       <Box key={'item-' + i.id} flexDirection="column">
@@ -335,6 +453,7 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
           <Text dimColor>{' ' + meta + ' '}</Text>
           {isUrl(i.link) ? <Link href={i.link}>↗</Link> : null}
           {i.unverified_since ? <Text color="warning">{' unverified'}</Text> : null}
+          {sess ? <Text dimColor>{' ◆ session'}</Text> : null}
         </Box>
         {open ? (
           <Box flexDirection="column" paddingLeft={2}>
@@ -345,7 +464,9 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
                   hotkey={n === 0 ? hot(i.id, 'x') : undefined}
                   onPress={() => fill(a.prompt || `mother now do ${a.id}`)}>{n === 0 && !a.label ? 'Do it' : a.label || a.id}</Button>
               ))}
-              <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => fill(askPrompt(i.title, i.why, i.link))}>Ask Mother</Button>
+              {sess
+                ? <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => openSession($, goHub, sess[0], sess[1])}>Open session</Button>
+                : <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => fill(askPrompt(i.title, i.why, i.link))}>Ask Mother</Button>}
               <Button key={'done-' + i.id} hotkey={hot(i.id, 'd')} onPress={() => go(['done', i.id], i.id)}>Done</Button>
               <Button key={'snooze-' + i.id} hotkey={hot(i.id, 's')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
               {rank !== null && !inTop.has(i.id)
@@ -423,6 +544,7 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
 
   return (
     <Box flexDirection="column">
+      {hubNode}
       <Box>
         <Text weight="semibold">{`Now · ${at(doc.generated_at)} · next ${at(doc.next_at)}`}</Text>
       </Box>
@@ -475,6 +597,135 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
   )
 }
 
+// The live session an item belongs to: its link (or the key it names) is a session key, the session's own
+// link, or one of its `also` keys; item.also counts the same way. Exact matches, or the last path segment of
+// a URL (`…/browse/PLAT-2` -> `PLAT-2`).
+export function sessionForItem(sessions: HubSessions | null, i: NowItem): [string, HubSession] | null {
+  const tail = (u: string) => u.split(/[?#]/)[0].replace(/\/+$/, '').split('/').pop() ?? ''
+  const mine = new Set<string>()
+  for (const l of [i.link, ...(i.also ?? [])]) if (l) { mine.add(l); mine.add(tail(l)) }
+  for (const [key, v] of liveSessions(sessions)) {
+    const theirs = [key, v.link, ...(v.also ?? [])].filter(Boolean) as string[]
+    if (theirs.some(t => mine.has(t))) return [key, v]
+  }
+  return null
+}
+
+// Open a session: fill the prompt (the way in on a surface that cannot open the link) and run `session seen`.
+function openSession($: Dollar, goHub: (args: string[], rowId?: string | null) => Promise<void>, key: string, v: HubSession) {
+  void $.prompt.fill({ text: `Open my "${v.title}" session`, mode: 'replace' })
+  void goHub(['session', 'seen', key])
+}
+
+// The Hub section: first in the pane. Open by default when something waits; `hub` in `expanded` flips that.
+function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing: string | null, expanded: Set<string>, nowMs: number,
+                    goHub: (args: string[], rowId?: string | null) => Promise<void>) {
+  const { Box, Text, Button, Link, Select } = ui
+  const health = hubHealth(hb, nowMs)
+  if (health === 'none') return null
+  const waiting = waitingCount(hb)
+  const updates = (hb.hub?.updates ?? []).filter(u => u.state === 'open')
+  // Open by default when something waits on the manager: cards to start, sessions with news, open updates.
+  const open = (waiting > 0 || updates.length > 0) !== expanded.has('hub')
+  const toggle = (name: string) => update($, expandedAtom, cur => {
+    const set = new Set(cur ?? [])
+    if (set.has(name)) set.delete(name); else set.add(name)
+    return [...set]
+  })
+  const heading = (text: string, count?: number) => (
+    <Box key={'hh-' + text} marginTop={1}>
+      <Text weight="semibold">{text}{count !== undefined ? <Text dimColor weight="regular">{` ${count}`}</Text> : null}</Text>
+    </Box>
+  )
+  // The terminal opens any scheme (a claude:// link); the other surfaces are sent https links only, so the
+  // Open button (it fills the prompt) is the way in there.
+  const canLink = (l: string) => surface === 'terminal' || /^https?:\/\//.test(l)
+  const sources = Object.entries(hb.watcher?.sources ?? {})
+  const mark = (st: string) => (st === 'ok' ? '✓' : st === 'partial' ? '~' : '✗')
+  const healthLine = [
+    hb.watcher ? `watcher polled ${ago(hb.watcher.at, nowMs)} ago` : 'watcher not running',
+    ...sources.map(([cap, row]) => `${cap} ${mark(row?.status)}`),
+    hb.hub?.last_wake ? `hub woke ${ago(hb.hub.last_wake, nowMs)} ago` : 'hub never woke',
+  ].join(' · ')
+  const sessions = liveSessions(hb.sessions)
+  const pending = hb.hub?.pending ?? []
+  const routed = (hb.hub?.routed ?? []).slice(-ROUTED_SHOWN).reverse()
+  const label = health === 'alive' ? '●' : health === 'stale' ? '◌ stale' : '✗'
+  return (
+    <Box key="hub" flexDirection="column">
+      <Box>
+        <Button key="hub-toggle" plain onPress={() => toggle('hub')}>{`${open ? '▾' : '▸'} Hub ${label}`}</Button>
+        {waiting > 0 ? <Text dimColor>{` ${waiting} waiting `}</Text> : null}
+        {health !== 'alive'
+          ? <Button key="hub-restart" onPress={() => { void $.prompt.fill({ text: '/mother:hub', mode: 'replace' }) }}>Restart hub</Button>
+          : null}
+      </Box>
+      <Box paddingLeft={2}>
+        <Text color={health === 'alive' ? undefined : 'warning'} dimColor={health === 'alive'} wrap="wrap">{healthLine}</Text>
+      </Box>
+      {open ? (
+        <Box flexDirection="column" paddingLeft={2}>
+          {sessions.length > 0 ? (
+            <Box key="hub-sessions" flexDirection="column">
+              {heading('Sessions', sessions.length)}
+              {sessions.map(([key, v]) => (
+                <Box key={'sess-' + key} flexWrap="wrap">
+                  {v.link && canLink(v.link) ? <Link href={v.link}>{v.title}</Link> : <Text>{v.title}</Text>}
+                  <Text dimColor>{` ${key} `}</Text>
+                  {(v.unseen ?? 0) > 0 ? <Text color="warning">{'new update '}</Text> : null}
+                  <Text dimColor>{ago(v.last_routed_at, nowMs) ? ago(v.last_routed_at, nowMs) + ' ' : ''}</Text>
+                  <Button key={'sess-open-' + key} onPress={() => openSession($, goHub, key, v)}>Open</Button>
+                </Box>
+              ))}
+            </Box>
+          ) : null}
+          {pending.length > 0 ? (
+            <Box key="hub-pending" flexDirection="column">
+              {heading('Waiting for you to start', pending.length)}
+              {pending.map(p => (
+                <Box key={'pend-' + p.key} flexWrap="wrap">
+                  <Text>{p.title}</Text>
+                  <Text dimColor>{` ${p.key} · ${p.raised_at ? 'open the hub to start it' : 'card not raised yet'} · ${ago(p.proposed_at, nowMs)} `}</Text>
+                  {isUrl(p.link) ? <Link href={p.link}>↗</Link> : null}
+                </Box>
+              ))}
+            </Box>
+          ) : null}
+          {updates.length > 0 ? (
+            <Box key="hub-updates" flexDirection="column">
+              {heading('Hub updates', updates.length)}
+              {updates.map((u: HubUpdate) => (
+                <Box key={'upd-' + u.id} flexDirection="column">
+                  <Box flexWrap="wrap">
+                    <Text>{u.title}</Text>
+                    <Text dimColor>{` ${u.key} · ${ago(u.at, nowMs)} `}</Text>
+                    {isUrl(u.link) ? <Link href={u.link}>↗</Link> : null}
+                    <Button key={'hub-done-' + u.id} onPress={() => goHub(['done', u.id], 'hub:' + u.id)}>Done</Button>
+                    <Button key={'hub-snooze-' + u.id} onPress={() => update($, snoozingAtom, cur => (cur === 'hub:' + u.id ? null : 'hub:' + u.id))}>Snooze</Button>
+                  </Box>
+                  {u.why ? <Text dimColor wrap="wrap">{u.why}</Text> : null}
+                  {snoozing === 'hub:' + u.id
+                    ? <Select key={'hub-snooze-pick-' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
+                        onSelect={value => goHub(['snooze', u.id, value], 'hub:' + u.id)} />
+                    : null}
+                </Box>
+              ))}
+            </Box>
+          ) : null}
+          {routed.length > 0 ? (
+            <Box key="hub-routed" flexDirection="column">
+              <Button key="routed-toggle" plain dimColor onPress={() => toggle('routed')}>{`${expanded.has('routed') ? '▾' : '▸'} Recently routed ${routed.length}`}</Button>
+              {expanded.has('routed')
+                ? routed.map(r => <Text key={'routed-' + r.line_id} dimColor>{`${r.key} ${r.decision} ${ago(r.at, nowMs)}`}</Text>)
+                : null}
+            </Box>
+          ) : null}
+        </Box>
+      ) : null}
+    </Box>
+  )
+}
+
 export const COMMAND = 'now-panel'
 
 export const register: Register = (on, options) => {
@@ -522,7 +773,9 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const bin = await motherBin($, configured)
     const go = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId)
+    const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub')
     return paneTree($, $.ui.resolve(e), await read($, docAtom), await read($, errorAtom), await read($, snoozingAtom),
-      await read($, selectedAtom), await read($, expandedAtom), await $.clock.now(), go)
+      await read($, selectedAtom), await read($, expandedAtom), await $.clock.now(), go,
+      (await read($, hubAtom)) ?? NO_HUB, goHub, e.surface)
   })
 }

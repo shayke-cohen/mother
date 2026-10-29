@@ -21,7 +21,9 @@ templates/workspace/       files `mother init` copies into a new workspace
 mods/now/                  the Now panel, a second plugin in the same marketplace (`/plugin install mother-now@mother`):
                            .claude-plugin/plugin.json (userConfig `mother_bin`), hooks/register.tsx (+ tests), types/index.d.ts;
                            opens with `/now-panel` (the engine reserves `/now` for the mother:now skill);
-                           reads `.mother/now.json`, writes only through `mother now done|snooze|top`, no network or MCP calls
+                           reads `.mother/now.json` and the hub's `.mother/hub/hub.json`, `sessions.json`, `watcher.json` (§5e), writes only through
+                           `mother now done|snooze|top` and `mother hub done|snooze|session seen`, no network or MCP calls;
+                           a Hub section (health, Sessions, Waiting for you to start, Hub updates, Recently routed) and `hub ●|◌ stale|✗ · N waiting` on the status line (✗: `watcher.json` missing or its `at` older than max(10 min, 2x `every_seconds`); ◌ stale, only while `active`: `at` older than 2x `every_seconds`, or `last_append_at` later than `hub.json` `last_wake` (or no wake) and older than 2x `every_seconds`)
 tests/                     stdlib unittest; `python3 -m unittest discover tests`
 ```
 
@@ -42,7 +44,7 @@ journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for co
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
 .mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs), tick-register.json (the offset the tick cron was built with, §2),
                            now.json (the tick's Now list: items, Top 3, coverage; ids and links, no message bodies, no per-person counts),
-                           now-state.json (the manager's done/snooze/Top 3 edits), now.lock (serialises both); all written atomically. Each item's `actions[]` is `{id (S<n>), label, prompt, task}`: `prompt` is always `mother now do <id>` (what the panel pastes); `task` is the routine's original instruction (`dots do A3`, `digest ok 12`, `draft a nudge to …`) that `mother now do` prints for the `mother:now` skill. Top 3 entries are `{rank, title, why, link, item_id, set_by (agent|manager), set_at, state}`: `set_at` is the ISO time the list was set (the tick's `generated_at` when it first proposed it, carried on later ticks; the edit time for `mother now top set|swap`, kept as `at` in now-state.json). Only `top set` and `top swap` make the list the manager's (`set_by: manager` on every entry, and no swap hint); `top done` marks one entry done and keeps every entry's `set_by` and `set_at`, so an agent list stays the agent's (its swap hint too). The tick sends a fresh proposal on the first tick of each local day; merge ignores it while a manager list for today exists. Which toasts fired is per-device, in the mod's store (`toasted`, keyed `<item id>@<first_seen>`, so an item asked for again toasts again), not in the workspace. `swap_hint` is null or `{title, why, link, item_id?}`; merge keeps `item_id` only when it names an item of this run, else takes the one item with the same `link`, else drops it (the hint stays). A Top 3 entry without an `item_id` takes the id of the one item with the same `link`. Items that share a `(signal, link)` pair through `link` or `also` are one item: merge lists it once, and keeps an earlier item's id when the same work comes back under another link, so done and snooze still apply. Merge drops a candidate without a `why`, and any item whose `since` is older than `routines.tick.max_age_days` unless its signal's source is the workspace. Its stdout (the runs.md note) ends `couldn't check: <sources|none>`, then `; partial: <sources>` when some were only partly read
+                           now-state.json (the manager's done/snooze/Top 3 edits), now.lock (serialises both); hub/ (the watcher and hub state, §5e); all written atomically. Each item's `actions[]` is `{id (S<n>), label, prompt, task}`: `prompt` is always `mother now do <id>` (what the panel pastes); `task` is the routine's original instruction (`dots do A3`, `digest ok 12`, `draft a nudge to …`) that `mother now do` prints for the `mother:now` skill. Top 3 entries are `{rank, title, why, link, item_id, set_by (agent|manager), set_at, state}`: `set_at` is the ISO time the list was set (the tick's `generated_at` when it first proposed it, carried on later ticks; the edit time for `mother now top set|swap`, kept as `at` in now-state.json). Only `top set` and `top swap` make the list the manager's (`set_by: manager` on every entry, and no swap hint); `top done` marks one entry done and keeps every entry's `set_by` and `set_at`, so an agent list stays the agent's (its swap hint too). The tick sends a fresh proposal on the first tick of each local day; merge ignores it while a manager list for today exists. Which toasts fired is per-device, in the mod's store (`toasted`, keyed `<item id>@<first_seen>`, so an item asked for again toasts again), not in the workspace. `swap_hint` is null or `{title, why, link, item_id?}`; merge keeps `item_id` only when it names an item of this run, else takes the one item with the same `link`, else drops it (the hint stays). A Top 3 entry without an `item_id` takes the id of the one item with the same `link`. Items that share a `(signal, link)` pair through `link` or `also` are one item: merge lists it once, and keeps an earlier item's id when the same work comes back under another link, so done and snooze still apply. Merge drops a candidate without a `why`, and any item whose `since` is older than `routines.tick.max_age_days` unless its signal's source is the workspace. Its stdout (the runs.md note) ends `couldn't check: <sources|none>`, then `; partial: <sources>` when some were only partly read
 ```
 
 ## 2. Finding each other
@@ -106,6 +108,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.tick` | map, optional | the hourly pulse behind the Now list (`mother now`); absent = off. `every` (minutes, one of 30, 60, 120, 180, 240; default 60), `active_hours` (`"HH:MM-HH:MM"`, start before end, default `"06:00-22:00"`, in `manager.timezone`; no tick runs outside it), `days` (`workdays` / `all` / a day / list of days; not `monthly:`), `thresholds` (map signal -> `Nh`, `Nd` or `0`, counted in working time; default per signal), `signals` (map signal -> `true`/`false`; all on by default, and a signal whose source connector is `none` is off), `notify` (`none` default, or `dm` = one DM to `manager.chat_dm` for a new on-you item; never while `now.json.quiet`), `slow_every` (integer 1-6, default 3: every Nth slot scans every signal, the others only the on-you signals and `default_branch_red`), `max_age_days` (integer 0-365, default 30: work whose `since` is older is left off the list, except workspace signals; `0` = no cap). Default thresholds: `review_requested` 4h, `unanswered_mention` 2h, `decision_open` 1d, `mail_needs_reply` 4h, `pr_no_reviewer` 1d, `pr_approved_unmerged` 2d, `pr_changes_silent` 3d, `default_branch_red` 2h, `ticket_stalled` 3d, `bug_unowned` 1d, `blocker_cleared` 1d, `outside_question` 4h, `action_item_no_ticket` 1d, the rest 0. Signals: on you `review_requested`, `unanswered_mention`, `decision_open`, `ticket_waiting_on_you`, `mail_needs_reply`, `invite_unanswered`, `promise_due`, `suggestion_waiting`; neglected `pr_no_reviewer`, `pr_approved_unmerged`, `pr_changes_silent`, `default_branch_red`, `ticket_stalled`, `bug_unowned`, `blocker_cleared`, `sprint_at_risk`, `outside_question`, `action_item_no_ticket`, `one_on_one_drift`. Unknown keys or signals fail `mother status`. |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
 | `whatsapp` | map, optional | WhatsApp read and send from the manager's own number (§5d). `enabled` (bool), `self_jid` (the manager's own JID, `<digits>@s.whatsapp.net`; required when `enabled`), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `read`, `send` (bool). Other unknown keys fail. The keys of the earlier design, `allow`, `approve_via` and `max_prompts_per_day`, are accepted with any value and ignored; `mother whatsapp setup` drops them the next time it writes the block, and they are removed one release after WhatsApp ships. The block is written by `mother whatsapp setup`, run by the manager in their own terminal (§5d); the agent never edits it. JIDs are phone numbers: they live in `config.json` and tool output only, never in memory, journal or people files. |
+| `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `connections` (map from capability `chat|mail|tracker|calendar|code` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required), `watch` (`chat.channels` [id], `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str]). Unknown keys fail `mother status`. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 
@@ -200,6 +203,19 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
   server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
   different targets in one call, is denied too (`rules/outbound.md`).
+- **deny**: the desktop app's own session tools in a reader/critic sub-agent or a channel session (§5c).
+- **allow**: the desktop app's own session tools, by exact name, when they stay inside what the hub manages (§5e):
+  `list_sessions`, `dismiss_task` and `ListAgents` always; `send_message` (`ccd_session_mgmt`) only when its
+  `session_id` is the `session_id` of a `live` entry in `<workspace>/.mother/hub/sessions.json`; `SendMessage` when
+  its `to` is one of those live ids, or (outside the workspace) is not a session id (a session id is `local_…` or a
+  UUID); in a session whose cwd is the workspace or under it, `SendMessage` by name only to `main` or the `name`
+  of a `live` entry (with or without a ` [ref]` suffix);
+  `start_session` (`ccd_session`) only with `initiation: "own_initiative"` or `proposal_id` alone (with
+  `wake_when_done` at most). Look-alikes on other servers are classified normally.
+- **ask**: any other use of those session tools (a message into a session the hub does not route to, a `SendMessage`
+  by any other name from the workspace, a missing or
+  unreadable `sessions.json`, a `start_session` that starts a session now). This ask is not turned into a deny by
+  `PAUSED` or the never-list; `bypassPermissions` passes it like any other ask.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
@@ -546,6 +562,174 @@ is set without `MOTHER_WORKSPACE`, as in throwaway test workspaces.
 - **Never.** Storing a chat body in the workspace; a first message to someone with no history; sending by any
   path the guard cannot see; assessing a person from their messages.
 
+## 5e. Hub (`lib/hub*.py`, `mother hub`)
+
+A machine-local watcher polls the manager's sources read-only and appends source updates to an inbox; a hub
+Claude session routes them into the manager's sessions. Config: the `hub` block (§3). Everything below lives in
+`<workspace>/.mother/hub/`, is machine-local and gitignored, and is written atomically (temp file +
+`os.replace`) under the `fcntl` lock `hub.lock`. `inbox.jsonl` is append-only by the watcher, and both appending
+and rotating take `hub.lock`, so a rotation never races an append.
+Nothing holds a message body beyond a summary of at most 300 characters, and nothing counts per person.
+
+- **Files.** `cursors.json` (per-source poll cursors), `inbox.jsonl` (the updates the watcher found),
+  `watcher.json` (the watcher's heartbeat: last poll, per-source state, plus `every_seconds`, the current
+  effective interval, and `active`, whether it is inside active hours now, so a reader can judge staleness
+  without reading config), `hub.json` (what the hub session last did and what is pending), `sessions.json`
+  (the manager's sessions the hub may route to), `hub.lock`. Readers treat a missing file as "nothing pending" or
+  "the hub never woke".
+- **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
+  (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,
+  kind (update|resolved|error|sweep), key, also, title, who, link, summary}`, `id` = `<source>:<key>:<at>` (chat
+  uses the message's raw `ts` in place of `at`, so two messages in one second keep distinct ids), `also` = other
+  keys found in the text. When lines for one key are collapsed (`coalesce`, and `tail`), the latest `at` wins, but
+  a `resolved` line never replaces an `update` whose `at` is the same or later. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
+  file from a crash into the dated file, and deletes dated files 7 or more days old.
+- **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
+  connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below).
+  `mother hub help` works without a workspace. `--json` gives machine output; without it the output is short text.
+- **launchd job.** Label `com.mother.hub`, plist `~/Library/LaunchAgents/com.mother.hub.plist`.
+  `ProgramArguments` = absolute python, absolute `bin/mother`, `hub`, `watch`; `EnvironmentVariables` =
+  `MOTHER_WORKSPACE` and a `PATH` of the directories of every resolved connection program (`cli` wins over
+  `command`) plus `/usr/bin:/bin`; `KeepAlive` `{SuccessfulExit: false}` (a crash is restarted, a clean exit
+  is not), `ThrottleInterval` 60 and `RunAtLoad` true; stdout and stderr go to `.mother/hub/watcher.log`, which the
+  watcher keeps under 1 MB (past that it is copied to `watcher.log.1`, replacing it, and emptied in place).
+  `install` exits 2 or 3 off the home machine (as `home check`), exits 1 when `hub.enabled` is not `true`, naming
+  any program `shutil.which` cannot find, or when `hub.connections` is empty, then writes the plist and runs
+  `launchctl bootstrap gui/<uid>` (a `bootout` first, so a reinstall replaces the job); `uninstall` is `bootout`
+  plus removing the plist. `check` runs under that same `PATH`: an MCP connection must start and list every
+  tool on its adapter's read allow-list, each exactly once (`tools/list` is the read; no tool is called; a failure
+  names the missing ones), `gh` must answer `gh api
+  user`; it prints `cap | ok/✗ | reason` and exits 1 if any fails. `status` prints the `watcher.json` and
+  `hub.json` (`last_wake`) heartbeats and exits 2 only when the watcher never ran or its `at` is older than 2x
+  `watcher.json` `every_seconds` while `active`. The hub line is printed with `STALE` (the exit code is unchanged)
+  when, while `active`, `watcher.json` `last_append_at` is later than `hub.json` `last_wake` (or the hub never
+  woke) and older than 2x `every_seconds`: the hub has not caught up with a line it must decide. An old
+  `last_wake` with nothing appended since is a quiet day, not stale; a missing `hub.json` prints `hub: never woke`.
+- **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It writes one line to its log and
+  returns, so the process exits 0 and launchd leaves it down, when this is not the home machine
+  (`workspace.home_machine` names another machine or none), when `hub.enabled` is not `true`, or when the config
+  is unusable (`hub.every_seconds` not a number >= 1; `idle_every_seconds`, `sweep_minutes` or
+  `update_ttl_hours` not a number >= 0; active hours or timezone that will not parse); all are checked once at
+  start. It also returns on SIGTERM. A failed inbox rotation is logged and retried at the next day change.
+  Each pass (`hub.poll_once`) polls every capability in `connectors` that has an adapter, appends the coalesced
+  lines to the inbox, and only then saves that source's cursor in `cursors.json` (`{<cap>: cursor, _last_sweep}`), so
+  a crash repeats lines rather than losing them; a failing source keeps its cursor. It sleeps `every_seconds` inside
+  active hours (`routines.tick.active_hours` on `manager.workdays`, in `manager.timezone`) and `idle_every_seconds`
+  outside; at 0 it does not poll outside them and sleeps until the next window. It rotates the inbox when the local
+  day changes (the file is named for the day that ended).
+- **`watcher.json`.** `{at, every_seconds, active, last_append_at?, sources: {<cap>: {status: ok|partial|couldnt_check, reason?,
+  since?}}, errors: [str]}`. `partial` carries the adapter's sub-read failures as `reason`; `couldnt_check` carries
+  why (`no connection` when `hub.connections` has no entry for the capability, or the failure), `since` is when
+  the status began, and `errors` lists `<cap>: <reason>` for every source not `ok`. `last_append_at` is the poll
+  time of the last pass that appended a line the hub must decide (`update`, `error` or `sweep`; a `resolved` line
+  is never printed to the hub, so it does not count, and a key whose winning line in that pass, by the same rule
+  `tail` collapses with, is `resolved` does not count either); it is carried over from the previous heartbeat otherwise.
+- **Error transition.** On the first failing pass of a source since it last worked, the watcher appends one `error`
+  line (key `watcher:<cap>`); `cursors.json` `_errored` ([cap]) remembers that it was emitted, so further failing
+  passes add nothing and a restart does not repeat it; a successful pass clears it. The watcher never writes
+  `capabilities.json` and never calls `mother health record`: `watcher.json` and the `error` line are its record, and
+  `pick` / the doctor are untouched. A missing connection is reported in `watcher.json` only. A `ForbiddenTool` (a
+  tool name outside the adapter's `READ_TOOLS`, a programming error) is never caught: it stops the watcher, and
+  launchd restarts it after `ThrottleInterval`.
+- **Sweep.** A `sweep` line (source `hub`, key `sweep`) is appended when `hub.sweep_minutes` have passed since
+  `cursors.json` `_last_sweep` (or there is none) and something is pending: `hub.json` `pending` is non-empty, or a
+  `sessions.json` session with `state: live` has `unseen > 0` and a `last_routed_at` within `hub.update_ttl_hours`
+  working hours (older unseen news no longer wakes the hub). Both files are read defensively; a missing or
+  unreadable one counts as nothing pending.
+- **`hub.json`.** `{version: 1, last_wake, inbox_cursor (an inbox line id), next_update (counter behind the U ids),
+  routed: [at most 50 {line_id, key, decision, session_id?, at}], pending: [{key, title, link, read, next_step,
+  also: [key] (at most 50), proposed_at, raised_at (null until a card is raised), task_id (the card's id, or
+  null), last_update_at (the last `propose` for the key), name}], updates: [{id (U<n>), key, title, why, link, at, state: open|done|snoozed, snooze_until?}]}`.
+  Readers must tolerate any field missing.
+- **`pending raised <key> --name <slug> [--task <task_id>]`.** Stamps `raised_at` (now), `name` and `task_id` on
+  that `pending` entry; exit 1 when there is no such pending key, 2 on bad usage. **`pending drop <key>`** removes
+  the entry and prints its `task_id` (so the hub can `dismiss_task` the card); exit 1 when there is none.
+  **Expiry:** on every write a `pending` entry goes when it is older than `hub.update_ttl_hours` working hours,
+  counted from `raised_at`, else `proposed_at`. `decide` `propose` leaves `raised_at` null (keeping an earlier stamp for the same key); the hub raises a card for each entry without `raised_at`, oldest `proposed_at` first, within its card budget, then stamps it. An unraised entry keeps the watcher's sweep firing. The sweep matches started cards by the stamped `name`.
+- **`sessions.json`.** `{version: 1, sessions: {<key>: {session_id, name, title, link (a `claude://` URL or null,
+  stored as given), also: [key], opened_at, last_routed_at, unseen (int), state: live|dropped}}}`. A key maps to a
+  session when it, or any key in the line's `also`, is a session key or is in a session's `also`; only `live`
+  sessions receive anything.
+- **`tail [--once] [--follow]`.** Prints, one JSON line per item and flushed, the inbox lines after
+  `hub.json` `inbox_cursor`, reading the rotated `inbox-*.jsonl` files and then `inbox.jsonl` in order. `update`
+  lines are collapsed to one per key (`coalesce`); `sweep` and `error` lines pass through as they are. A key whose
+  latest line is `resolved` prints nothing and its `pending` and `updates` entries are dropped. With no cursor it
+  starts at the oldest kept line; if the cursor line was pruned (older than 7 days) it does the same and says so
+  on stderr. `--follow` (what the hub's Monitor runs) keeps polling the files every 1.5 s, remembers printed line
+  ids and so survives a rotation. `tail` never moves the cursor; only `decide` does. `--once` (the default) exits
+  after one pass.
+- **`decide`.** stdin is one object or a list `{line_id, key, decision: log|now|route|propose|error, title?, why?,
+  link?, read?, next_step?, name?, also?}` (exit 2 on bad input, nothing written). Under `hub.lock` it appends to
+  `routed` (last 50), moves `inbox_cursor` to `line_id` (never backwards), and sets `last_wake`. `now` creates (or
+  refreshes, per key) an `updates` entry with the next `U<n>`; `also` may be one key (a string) or a list
+  of keys; anything else exits 2. `propose` replaces the `pending` entry for the key
+  (keeping `proposed_at`, `raised_at`, `task_id` and `name`, merging `also`, and setting `last_update_at`);
+  `route` adds 1 to `unseen`, sets `last_routed_at` on the matching live session, and adds the line's key and its
+  `also` keys to that session's `also` (at most 50, oldest dropped), so a later line in the same thread finds the
+  session even without the key it was first routed by. A `line_id` already in `routed` is not applied again: its
+  result is `{line_id, key, already_decided: true}`, and a call where every item is already decided writes
+  nothing. A `route` with no live session
+  is stored as `propose`; the result says so (`note`). A `now` for a key that has a live session is recorded as a
+  `route` instead (an update would be dropped at once), and the result says so. A `line_id` that is not in the kept
+  inbox files exits 2 with nothing written. The batch is applied in inbox order whatever order it was given in, and
+  the cursor moves to the furthest decided line, where a decided `update` line stands for every `update` line of
+  its key after the old cursor with no later `at` (the lines `tail` collapsed into it), wherever they sit; a later `decide` for a line before the cursor is still recorded
+  but never moves the cursor back, so the hub must decide every printed line, in printed order. `title` and `link` default to the inbox line's. Output: one
+  `{line_id, key, decision (as stored), session_id?, update_id?, note?}` per item.
+- **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (live, `unseen` 0; removes the
+  key and its `also` from `pending`; when that pending entry's `last_update_at` is later than its `raised_at`, the
+  output carries `catch_up: {key, read, next_step, link, at}`, the one message the hub sends into the new session), `drop <key>` (state `dropped`), `seen <key>` (`unseen` 0; exit 1 for an
+  unknown key), `for <key>` (prints the live session id, or exits 1).
+- **`done <U-id>`, `snooze <U-id> 1h|tomorrow|next-week`, `show [--json]`.** Snooze uses `mother now`'s
+  `snooze_until`; an ended snooze is open again at the next write. Exit 1 for an unknown id, 2 for a bad word.
+- **Update expiry.** On every write an update goes when it is older than `hub.update_ttl_hours` **working** hours
+  (`now.working_hours`, counted from the later of `at` and `snooze_until`) or when its key has a live session.
+- **Guard.** The desktop app's own session tools reach only the manager's sessions, but a message can carry
+  untrusted source text, so the guard lets them through only inside what the hub manages (§5): `list_sessions`,
+  `dismiss_task` and `ListAgents` always; `mcp__ccd_session_mgmt__send_message` only to the `session_id` of a
+  `live` `sessions.json` entry; `SendMessage` to such an id, and by name (not a session id, `local_…` or a UUID)
+  only to `main` or a `live` entry's `name` (a ` [ref]` suffix is ignored) when the session's cwd is the workspace
+  or under it, so text injected into a source the hub reads cannot steer it to another of the manager's sessions
+  (outside the workspace any name passes); `mcp__ccd_session__start_session` only with `initiation: "own_initiative"` (a card the manager starts) or
+  `proposal_id` alone. Anything else asks. Exact names only: a same-named tool on another server (`mcp__other__send_message`) is classified like any other tool. The credential-shaped-content check (`SECRET_RE`) still applies to their input, so a token pasted into a message or card brief is denied. A reader or critic sub-agent and a channel session (either role) are denied all six.
+- **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
+  posts or writes to a tracker.
+  Adapters (`lib/hub_sources.py`) are keyed `<cap>:<connector>` (`chat:slack`, `mail:gmail`, `tracker:jira`,
+  `calendar:google`, `code:github`) and declare `READ_TOOLS`, tool-name suffixes whose first word is a read verb.
+  The client (`lib/hub_mcp.py`) resolves them against the server's `tools/list` and wraps it in `ReadOnlyClient`,
+  which raises `ForbiddenTool` for a name outside `READ_TOOLS` before anything is sent. An allowed suffix that the
+  server does not offer, or offers more than once, raises `McpError` instead: that source is `partial` (an
+  optional sub-read) or `couldnt_check`, and the watcher goes on. GitHub goes through `gh api` with one
+  pseudo-tool, `get`, limited to the path prefixes `search/issues?` and `repos/` and no method or field flags.
+  `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
+  activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
+  A DM conversation is one thing, keyed `<channel>/dm`, so the manager's reply resolves it; an unthreaded reply in a
+  watched channel does not resolve the message it answers, the manager's own tracker field changes are
+  indistinguishable from others' without a changelog and come through as updates, and replies in threads the
+  watcher does not follow (ones the manager has not posted in) are not read (all three accepted gaps; a comment by
+  the manager does resolve).
+  A code PR leaving the review-requested set resolves its key; CI is green only when every check run is completed.
+  The manager is recognised by `manager.email`, a chat user id (the first `U…` id in `manager.chat_dm`, a string
+  or a list; else the `chat` of the `people` entry with the manager's email; a `D…` DM channel id is not a user),
+  and the code login. A chat message whose first line carries MOTHER's signature (`<agent.name> (AI)` or
+  `agent.signature`) and was posted as the manager, without a user, or by a bot is MOTHER's own post: it yields
+  no line at all. A mail `resolved` line (the manager's sent reply) is stamped with the sent message's own
+  `internalDate` (one `read-email` when the list carries no date), so newer incoming mail in the same poll still
+  shows. Mail lines link to the web thread (`https://mail.google.com/mail/u/0/#all/<thread id>`). Each list is read
+  one past its limit (mail 20 new messages, tracker 50 updated issues, chat history 100 messages per channel);
+  more than the limit marks the source `partial` (`more than N …`) and only the limit is used.
+  The tracker read tool (`get-issues`) requires `projectKey`, so the tracker adapter polls once per project key: the
+  union of `hub.watch.tracker.projects` and every `teams[].tracker.project`, de-duplicated, order kept, each call
+  carrying `projectKey` and the JQL scoped to that project (`extra_jql` still applies). No project keys is a config
+  gap: the source is `couldnt_check` with reason `no tracker projects configured` (no error line). One project
+  failing (e.g. an unknown key) is skipped and marks the source `partial` (`project <KEY>: <kind>`); the other
+  projects still poll and their cursor and fingerprints advance. Accepted gap: issues assigned to the manager in
+  projects not listed are not watched. A chat search sub-read that fails for a missing scope says
+  `mentions: missing scope` (or `DMs: …`) in the `partial` reason.
+  The calendar list tool has no recurrence-expansion argument (its inputSchema is calendarId, timeMin, timeMax), so
+  starting-soon sees recurring meetings only when the tool returns the expanded instance.
+  Errors carry a `health.CLASSES` kind: a timeout is `unreachable`, a closed server `dropped`.
+
 ## 6. Sync (`bin/mother sync`)
 
 - `--quiet` (the hook path) with nothing changed but appended `tick` lines in `runs.md` → no commit, no push,
@@ -560,7 +744,7 @@ is set without `MOTHER_WORKSPACE`, as in throwaway test workspaces.
 
 `setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
 (connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap), `reflect`, `todo`, `project`,
-`team`, `remember`, `whatsapp` (read chats, send through `mother whatsapp send`, which asks; §5d), `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
+`team`, `remember`, `whatsapp` (read chats, send through `mother whatsapp send`, which asks; §5d), `hub` (the manager's pinned hub session: wakes on the watcher's inbox through a Monitor on `mother hub tail --follow`, or a 3-minute cron running `tail --once`; decides each line with `mother hub decide`, routes it with the in-app message tool, raises cards with `start_session` `own_initiative`, and reconciles sessions on a `sweep` line; §5e), `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
 
 ## 8. Writing rules for everything in this repo
 

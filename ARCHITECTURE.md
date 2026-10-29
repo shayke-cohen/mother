@@ -39,6 +39,9 @@ holds code a later session would run.
 | `bridge/whatsapp/` | Send-only WhatsApp bridge (Node, Baileys linked device) on a 0600 Unix socket | Optional; `checks.mjs` = pure send rules (cap, gap), `bridge.mjs` = socket + WhatsApp. CONTRACT §5d |
 | `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
 | `lib/now.py` | Deterministic core of the hourly tick and Now panel (working hours, signal thresholds, merge into `now.json`, the `mother now` verbs) | Python 3.9 stdlib only |
+| `lib/hub.py` | State core of the watcher and hub: thing keys, inbox lines, `.mother/hub/` files (atomic, locked) | Python 3.9 stdlib only |
+| `lib/hub_mcp.py` | Minimal MCP stdio client plus the read-only wrapper the watcher uses | Allow-list enforced before send. CONTRACT §5e |
+| `lib/hub_sources.py` | Per-capability poll adapters and the deterministic prefilter | Product-specific tool names live only here. CONTRACT §5e |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
 | `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |
@@ -50,7 +53,7 @@ holds code a later session would run.
 | `tests/` | stdlib `unittest`, one module per Python component plus packaging | `test_packaging` checks every runtime file is tracked |
 | `docs/` | CONTRACT (spec), DESIGN (why), ROADMAP (stages) | `docs/drafts/`, `docs/superpowers/` are untracked personal notes |
 
-Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `digest`, `dots`, `commitments`,
+Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `digest`, `dots`, `commitments`,
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
@@ -93,6 +96,27 @@ only in an interactive `/mother:doctor`.
   ├─ answer → guard grant written; skill posts the signed reply │ draft → manager's DM │ skip
   └─ mother channels done          → state in .mother/channels.json, audit in .mother/channels.log
 ```
+
+## How the hub flows
+
+```
+launchd: mother hub watch   (lib/hub.py + hub_mcp.py + hub_sources.py, no model, read-only allow-list)
+  ├─ per connection: read-only MCP over stdio (or `gh`) → adapter → deterministic prefilter
+  ├─ appends one line per changed thing to .mother/hub/inbox.jsonl; heartbeat in watcher.json
+  └─ records nothing in capabilities.json: watcher.json plus one inbox `error` line are the record
+pinned desktop session (/mother:hub): Monitor on `tail --follow` wakes it on each new line; the cron fallback wakes it every 3 minutes and ends at once when `tail --once` prints nothing
+  ├─ mother hub decide   → log / Now row only │ send_message into the thing's session │ proposal card
+  ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
+  ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`); pending and unseen expire after update_ttl_hours working hours
+  └─ in-app session tools pass the guard only inside what the hub manages (messages into live sessions.json sessions, own_initiative cards); anything else asks; sub-agents and channel sessions are denied
+Now panel: Hub section (status, sessions, updates); the Open button fills the prompt to open the session and marks it seen; the manager sends it (desktop draws only https links)
+```
+
+Accepted gaps (also in CONTRACT §5e):
+
+- The tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description), and without a changelog it cannot tell the manager's own changes to those four from anyone else's: they come through as updates (a comment by the manager does resolve).
+- An unthreaded reply in a watched channel does not resolve the message it answers; only a reply in the thread (or in a DM) does.
+- Replies in threads the watcher does not follow (ones the manager has not posted in) are not read.
 
 ## Invariants the code relies on
 

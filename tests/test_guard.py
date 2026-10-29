@@ -1588,5 +1588,107 @@ class TestWhatsappConfigBlock(WhatsappCase):
         self.assertEqual(self.wa("script -q /tmp/session.log")[0], "none")
 
 
+
+class InAppSessions(GuardCase):
+    """The desktop app's session tools reach only the manager's own sessions, so they are not outbound."""
+
+    NAMES = ["mcp__ccd_session__start_session", "mcp__ccd_session__dismiss_task",
+             "mcp__ccd_session_mgmt__send_message", "mcp__ccd_session_mgmt__list_sessions",
+             "SendMessage", "ListAgents"]
+
+    def hub_sessions(self, **sessions):
+        d = os.path.join(self.ws, ".mother", "hub")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "sessions.json"), "w") as f:
+            json.dump({"version": 1, "sessions": sessions}, f)
+
+    def test_in_app_session_tools_pass(self):
+        self.hub_sessions(**{"PLAT-1": {"session_id": "s1", "state": "live"}})
+        for name in self.NAMES:
+            for inp in ({"session_id": "s1", "message": "what changed", "name": "plat-1",
+                         "initiation": "own_initiative", "prompt": "x"},
+                        # a field the guard reads as a chat target must not turn a session tool into a chat send
+                        {"session_id": "s1", "channel": "s1", "message": "what changed", "thread_id": "t1",
+                         "initiation": "own_initiative"}):
+                self.expect("none", name, inp)
+
+    def test_send_message_only_to_a_live_hub_session(self):
+        self.hub_sessions(**{"PLAT-1": {"session_id": "local_live", "state": "live"},
+                             "PLAT-2": {"session_id": "local_gone", "state": "dropped"}})
+        send = "mcp__ccd_session_mgmt__send_message"
+        self.expect("none", send, {"session_id": "local_live", "message": "PLAT-1 moved"})
+        self.assertIn("session", self.expect("ask", send, {"session_id": "local_other", "message": "hi"}))
+        self.expect("ask", send, {"session_id": "local_gone", "message": "hi"})   # dropped
+        self.expect("ask", send, {"session_id": "parent", "message": "hi"})
+        self.expect("ask", send, {"message": "hi"})
+        self.expect("none", "SendMessage", {"to": "local_live", "message": "hi"})
+        self.expect("ask", "SendMessage", {"to": "local_other", "message": "hi"})
+        self.expect("ask", "SendMessage", {"to": "1b4e28ba-2fa1-11d2-883f-0016d3cca427", "message": "hi"})
+        self.expect("none", "SendMessage", {"to": "researcher", "message": "hi"})   # an agent, not a session id
+
+    def test_send_message_by_name_in_the_workspace_reaches_only_hub_sessions(self):
+        self.hub_sessions(**{"PLAT-1": {"session_id": "local_live", "name": "plat-1", "state": "live"},
+                             "PLAT-2": {"session_id": "local_gone", "name": "plat-2", "state": "dropped"}})
+        for cwd in (self.ws, os.path.join(self.ws, "projects")):
+            self.expect("none", "SendMessage", {"to": "main", "message": "hi"}, cwd=cwd)
+            self.expect("none", "SendMessage", {"to": "local_live", "message": "hi"}, cwd=cwd)
+            self.expect("none", "SendMessage", {"to": "plat-1", "message": "hi"}, cwd=cwd)
+            self.expect("none", "SendMessage", {"to": "plat-1 [abc123]", "message": "hi"}, cwd=cwd)
+            self.assertIn("session", self.expect("ask", "SendMessage", {"to": "researcher", "message": "hi"},
+                                                 cwd=cwd))
+            self.expect("ask", "SendMessage", {"to": "plat-2", "message": "hi"}, cwd=cwd)          # dropped
+            self.expect("ask", "SendMessage", {"to": "plat-2 [abc123]", "message": "hi"}, cwd=cwd)
+            self.expect("ask", "SendMessage", {"to": "local_gone", "message": "hi"}, cwd=cwd)
+            self.expect("ask", "SendMessage", {"message": "hi"}, cwd=cwd)
+        # outside the workspace a name that is not a session id passes, as before
+        self.expect("none", "SendMessage", {"to": "researcher", "message": "hi"}, cwd=self.tmp)
+        self.expect("none", "SendMessage", {"to": "plat-2", "message": "hi"}, cwd=self.tmp)
+        self.expect("none", "ListAgents", {}, cwd=self.ws)
+
+    def test_send_message_in_the_workspace_without_hub_files_asks_by_name(self):
+        self.expect("ask", "SendMessage", {"to": "plat-1", "message": "hi"}, cwd=self.ws)
+        self.expect("none", "SendMessage", {"to": "main", "message": "hi"}, cwd=self.ws)
+
+    def test_send_message_without_hub_files_asks(self):
+        self.expect("ask", "mcp__ccd_session_mgmt__send_message", {"session_id": "local_x", "message": "hi"})
+        os.makedirs(os.path.join(self.ws, ".mother", "hub"))
+        with open(os.path.join(self.ws, ".mother", "hub", "sessions.json"), "w") as f:
+            f.write("{not json")
+        self.expect("ask", "mcp__ccd_session_mgmt__send_message", {"session_id": "local_x", "message": "hi"})
+
+    def test_start_session_only_own_initiative_or_proposal(self):
+        start = "mcp__ccd_session__start_session"
+        self.expect("none", start, {"initiation": "own_initiative", "title": "PLAT-1", "prompt": "x"})
+        self.expect("none", start, {"proposal_id": "task_1"})
+        self.expect("none", start, {"proposal_id": "task_1", "wake_when_done": True})
+        for inp in ({"initiation": "user_asked", "title": "t", "prompt": "x"},
+                    {"initiation": "offer", "title": "t"}, {"title": "t", "prompt": "x"},
+                    {"proposal_id": "task_1", "prompt": "do something else"}):
+            self.expect("ask", start, inp)
+
+    def test_session_ask_is_not_paused_deny(self):
+        open(self.state("PAUSED"), "w").close()
+        self.expect("ask", "mcp__ccd_session_mgmt__send_message", {"session_id": "local_x", "message": "hi"})
+
+    def test_lookalike_send_message_still_classified(self):
+        got, _ = self.run_guard("mcp__other__send_message", {"channel": TEAM, "text": "hi"})
+        self.assertEqual(got, "ask")
+        got, _ = self.run_guard("mcp__ccd_session_mgmt__send_message_to_channel", {"channel": TEAM, "text": "hi"})
+        self.assertEqual(got, "ask")
+
+    def test_token_in_session_message_still_caught(self):
+        for name in self.NAMES[:3]:
+            got, why = self.run_guard(name, {"session_id": "s1", "message": "use ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"})
+            self.assertEqual(got, "deny", "%s %s" % (name, why))
+
+    def test_restricted_sessions_cannot_use_session_tools(self):
+        inp = {"session_id": "s1", "message": "hi", "prompt": "x"}
+        for name in self.NAMES:
+            for agent in ("reader", "critic"):
+                self.expect("deny", name, inp, agent=agent)
+            for role in ("manager", "team"):
+                self.expect("deny", name, inp, env={"MOTHER_CHANNEL_ROLE": role})
+
+
 if __name__ == "__main__":
     unittest.main()

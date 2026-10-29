@@ -711,6 +711,15 @@ class CliTest(unittest.TestCase):
         self.assertIn("skipped — outside active hours", disp)
 
 
+class HubHelp(unittest.TestCase):
+    def test_hub_help(self):
+        env = dict(os.environ, MOTHER_STATE_DIR=tempfile.mkdtemp())
+        env.pop("MOTHER_WORKSPACE", None)
+        r = run(["hub", "help"], env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("install", r.stdout)
+
+
 class TestWhatsappConfig(unittest.TestCase):
     # Reuse CliTest's fixtures without inheriting (and re-running) its tests.
     setUp, tearDown, init, write_config = CliTest.setUp, CliTest.tearDown, CliTest.init, CliTest.write_config
@@ -784,3 +793,79 @@ class TestWhatsappConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HubConfig(unittest.TestCase):
+    setUp, tearDown, init, write_config = CliTest.setUp, CliTest.tearDown, CliTest.init, CliTest.write_config
+
+    def status_with(self, mutate):
+        self.init()
+        block = json.loads((ROOT / "templates/workspace/config.example.json").read_text())["hub"]
+        mutate(block)
+        self.write_config(hub=block)
+        return run(["status"], self.env)
+
+    def test_hub_absent_is_valid(self):
+        self.init()
+        cfg = json.loads((ROOT / "templates/workspace/config.example.json").read_text())
+        cfg.pop("hub", None)
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertEqual(run(["status"], self.env).returncode, 0)
+
+    def test_hub_example_block_is_valid(self):
+        hub = json.loads((ROOT / "templates/workspace/config.example.json").read_text())["hub"]
+        self.assertIs(hub["enabled"], False)
+        r = self.status_with(lambda b: None)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_hub_full_block_is_valid(self):
+        def full(b):
+            b.update(enabled=True, every_seconds=120, idle_every_seconds=0, model=None, max_cards_per_wake=3,
+                     sweep_minutes=30, update_ttl_hours=24,
+                     connections={"chat": {"command": "example-mcp", "args": ["--x"], "env": {"K": "v"}},
+                                  "code": {"cli": "gh"}},
+                     watch={"chat": {"channels": ["C00000001"]},
+                            "mail": {"ignore_senders": ["noreply@example.com"], "ignore_labels": ["promo"]},
+                            "tracker": {"projects": ["PLAT"], "extra_jql": None},
+                            "calendar": {"lead_minutes": 15}, "code": {"repos": ["example/repo"]}})
+        r = self.status_with(full)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_hub_unknown_key_fails(self):
+        r = self.status_with(lambda b: b.update(foo=1))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hub.foo", r.stdout)
+
+    def test_hub_bad_every_fails(self):
+        r = self.status_with(lambda b: b.update(every_seconds=5))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hub.every_seconds", r.stdout)
+
+    def test_hub_connection_needs_command_or_cli(self):
+        r = self.status_with(lambda b: b.update(connections={"chat": {"args": []}}))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hub.connections.chat", r.stdout)
+
+    def test_hub_unknown_capability_fails(self):
+        r = self.status_with(lambda b: b.update(connections={"fax": {"cli": "gh"}}))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hub.connections.fax", r.stdout)
+
+    def test_hub_cards_capped_at_3(self):
+        r = self.status_with(lambda b: b.update(max_cards_per_wake=4))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hub.max_cards_per_wake", r.stdout)
+
+    def test_hub_other_ranges_fail(self):
+        for key, val in (("idle_every_seconds", 86401), ("sweep_minutes", 9), ("update_ttl_hours", 169),
+                         ("enabled", "yes"), ("model", 5)):
+            r = self.status_with(lambda b: b.update({key: val}))
+            self.assertEqual(r.returncode, 1, key)
+            self.assertIn("hub." + key, r.stdout)
+
+    def test_hub_watch_shape_fails(self):
+        for watch in ({"chat": {"channels": "C1"}}, {"calendar": {"lead_minutes": "x"}}, {"nope": {}},
+                      {"mail": {"ignore_senders": [1]}}, {"tracker": {"extra_jql": 3}}):
+            r = self.status_with(lambda b: b.update(watch=watch))
+            self.assertEqual(r.returncode, 1, watch)
+            self.assertIn("hub.watch", r.stdout)

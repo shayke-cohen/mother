@@ -67,6 +67,57 @@ export type NowDoc = {
   items: NowItem[]
 }
 
+// The hub's files in <workspace>/.mother/hub/ (docs/CONTRACT.md §5e, lib/hub.py). Readers tolerate any field missing.
+export type WatcherSource = { status: 'ok' | 'partial' | 'couldnt_check'; reason?: string; since?: string }
+
+export type WatcherDoc = {
+  at: string
+  every_seconds?: number   // the watcher's current effective interval
+  active?: boolean         // inside active hours now
+  last_append_at?: string  // the last poll that appended a line the hub must decide
+  sources?: Record<string, WatcherSource>
+  errors?: string[]
+}
+
+export type HubRouted = { line_id: string; key: string; decision: string; session_id?: string; at: string; note?: string }
+
+export type HubPending = {
+  key: string; title: string; link: string | null; read?: string; next_step?: string
+  name?: string; proposed_at: string; raised_at: string | null   // raised_at null until a card is raised
+  task_id?: string | null; last_update_at?: string; also?: string[]
+}
+
+export type HubUpdate = {
+  id: string   // U<n>
+  key: string; title: string; why: string; link: string | null; at: string
+  state: 'open' | 'done' | 'snoozed'
+  snooze_until?: string
+}
+
+export type HubDoc = {
+  version: 1
+  last_wake?: string | null
+  inbox_cursor?: string | null
+  next_update?: number
+  routed?: HubRouted[]
+  pending?: HubPending[]
+  updates?: HubUpdate[]
+}
+
+export type HubSession = {
+  session_id: string; name: string; title: string
+  link: string | null     // a claude:// URL, or null
+  also?: string[]
+  opened_at?: string; last_routed_at?: string | null
+  unseen?: number
+  state: 'live' | 'dropped'
+}
+
+export type HubSessions = { version: 1; sessions: Record<string, HubSession> }
+
+// What the panel holds of the three files; null = the file is missing (or never read).
+export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null }
+
 declare module 'claude-code' {
   interface PluginState {
     'mother-now': {
@@ -75,7 +126,8 @@ declare module 'claude-code' {
       workspace: string | null
       selected: string | null   // row holding the d/s/t/x hotkeys: an item id or top:<rank>
       snoozing: string | null   // id of the row whose snooze Select is open
-      expanded: string[] | null // sections drawn in full (`on_you`, `neglected`, `suggestion`) and `health`
+      expanded: string[] | null // sections drawn in full (`on_you`, `neglected`, `suggestion`) and `health`; `hub` flips the Hub section's default, `routed` opens Recently routed
+      hub: HubBundle | null     // watcher.json, hub.json and sessions.json as last read
     }
   }
 }
