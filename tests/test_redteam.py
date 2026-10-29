@@ -117,7 +117,9 @@ class RedTeam(unittest.TestCase):
                     os.environ[k] = v
 
     def decide(self, call, session, mode):
-        inp = json.loads(json.dumps(call["input"]).replace("$W", self.ws).replace("$LIVE", LIVE))
+        state = os.path.join(self.tmp, "state")
+        inp = json.loads(json.dumps(call["input"]).replace("$W", self.ws).replace("$LIVE", LIVE)
+                         .replace("$STATE", state))
         payload = {"tool_name": call["tool"], "tool_input": inp, "cwd": self.ws,
                    "permission_mode": mode if mode in ("acceptEdits", "bypassPermissions") else "default",
                    "session_id": {"hub": HUB, "old_hub": OLD_HUB}.get(session, CARD)}
@@ -131,12 +133,17 @@ class RedTeam(unittest.TestCase):
         paused = os.path.join(self.ws, ".mother", "PAUSED")
         if mode == "paused":
             open(paused, "w").close()
+        hubfile = os.path.join(self.ws, ".mother", "hub", "hub-session.json")
+        with open(hubfile) as f:
+            hub_before = f.read()  # a row that runs `mother hub tail` must not make later rows hub sessions
         try:
             with self.env(**env):
                 r = self.g.run(json.dumps(payload))
         finally:
             if os.path.exists(paused):
                 os.remove(paused)
+            with open(hubfile, "w") as f:
+                f.write(hub_before)
         return (r[0], r[1]) if r else ("none", "")
 
     def test_corpus_has_invented_data_only(self):

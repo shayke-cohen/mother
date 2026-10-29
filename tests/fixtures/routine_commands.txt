@@ -97,3 +97,45 @@ date -u +%Y-%m-%d
 mother hub status
 ----
 mother hub show --json
+----
+claude mcp list
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/assets/plan/build.py" teams/platform/meetings/2026-10-29-plan.json teams/platform/meetings/2026-10-29-plan.html
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/assets/deck/build.py" teams/platform/meetings/2026-10-29-deck.json
+----
+mother health merge --file /tmp/health.json
+----
+mother items check --file /tmp/reader.json
+----
+glab auth status
+----
+gh issue view 12
+----
+gh pr checks 12
+----
+mother home show
+----
+mother register
+----
+mother scan
+----
+mother eval report
+----
+mother now top set 'fix the thing (urgent)?'
+----
+mother now snooze S1 1h
+----
+mother hub session seen PLAT-1
+----
+mother hub pending drop C00000001/1.0 --json
+----
+mother whatsapp status
+----
+mother channels resume
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels approvals <<'APPROVALS'
+{"drafts": {"a1": ["ok"]}}
+APPROVALS
+----
+cd memory && ls
