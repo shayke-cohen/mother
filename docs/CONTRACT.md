@@ -718,6 +718,14 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   shows. Mail lines link to the web thread (`https://mail.google.com/mail/u/0/#all/<thread id>`). Each list is read
   one past its limit (mail 20 new messages, tracker 50 updated issues, chat history 100 messages per channel);
   more than the limit marks the source `partial` (`more than N …`) and only the limit is used.
+  The tracker read tool (`get-issues`) requires `projectKey`, so the tracker adapter polls once per project key: the
+  union of `hub.watch.tracker.projects` and every `teams[].tracker.project`, de-duplicated, order kept, each call
+  carrying `projectKey` and the JQL scoped to that project (`extra_jql` still applies). No project keys is a config
+  gap: the source is `couldnt_check` with reason `no tracker projects configured` (no error line). One project
+  failing (e.g. an unknown key) is skipped and marks the source `partial` (`project <KEY>: <kind>`); the other
+  projects still poll and their cursor and fingerprints advance. Accepted gap: issues assigned to the manager in
+  projects not listed are not watched. A chat search sub-read that fails for a missing scope says
+  `mentions: missing scope` (or `DMs: …`) in the `partial` reason.
   The calendar list tool has no recurrence-expansion argument (its inputSchema is calendarId, timeMin, timeMax), so
   starting-soon sees recurring meetings only when the tool returns the expanded instance.
   Errors carry a `health.CLASSES` kind: a timeout is `unreachable`, a closed server `dropped`.

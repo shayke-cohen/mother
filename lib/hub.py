@@ -314,6 +314,20 @@ def pending_work(ws: Path, cfg: dict, at: datetime) -> bool:
     return False
 
 
+def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
+    """`hub.watch.<cap>`; for the tracker, `projects` is that list plus every team's tracker project, de-duplicated."""
+    w = (h.get("watch") or {}).get(cap)
+    w = dict(w) if isinstance(w, dict) else {}
+    if cap == "tracker":
+        keys = list(w.get("projects") or [])
+        for t in (cfg or {}).get("teams") or []:
+            p = ((t or {}).get("tracker") or {}).get("project") if isinstance(t, dict) else None
+            if p:
+                keys.append(p)
+        w["projects"] = list(dict.fromkeys(k for k in keys if isinstance(k, str) and k))
+    return w
+
+
 def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = True) -> dict:
     """One pass over the sources; returns the heartbeat it wrote to watcher.json.
 
@@ -362,8 +376,14 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             continue
         cursors = load_json(ws, "cursors.json", {})
         cursors = cursors if isinstance(cursors, dict) else {}
+        wcfg = _watch_cfg(cfg, h, cap)
+        gap = getattr(adapter, "gap", lambda c: None)(wcfg)
+        if gap:  # a config gap, not a failure: nothing to alert on
+            sources[cap] = {"status": "couldnt_check", "reason": gap, "since": since}
+            errors.append("%s: %s" % (cap, gap))
+            continue
         try:
-            res = adapter.poll(client, cursors.get(cap), (h.get("watch") or {}).get(cap) or {}, me, at)
+            res = adapter.poll(client, cursors.get(cap), wcfg, me, at)
         except ForbiddenTool:
             raise  # a programming error: stop the watcher rather than swallow it
         except Exception as e:

@@ -51,6 +51,11 @@ class Adapter:
     READ_TOOLS = set()  # tool-name suffixes this adapter may call
 
     @classmethod
+    def gap(cls, cfg: dict) -> Optional[str]:
+        """A reason this source cannot be polled until the manager configures something, else None."""
+        return None
+
+    @classmethod
     def poll(cls, client, cursor: Optional[dict], cfg: dict, me: dict, at: datetime) -> dict:
         raise NotImplementedError
 
@@ -135,7 +140,9 @@ class ChatSlack(Adapter):
             try:
                 res = client.call("search-messages", {"searchText": text, "after": day}) or {}
             except McpError as e:
-                partial.append("%s: %s" % (label, e.kind))
+                low = str(getattr(e, "message", e)).lower()
+                scope = e.kind == "missing_scope" or re.search(r"missing[_ ]scope|insufficient scope", low)
+                partial.append("%s: %s" % (label, "missing scope" if scope else e.kind))
                 continue
             box = res.get("messages", res)
             for m in (box.get("matches") if isinstance(box, dict) else None) or []:
@@ -223,23 +230,38 @@ class TrackerJira(Adapter):
     READ_TOOLS = {"get-issues"}
     FIELDS = ["summary", "status", "assignee", "reporter", "priority", "updated", "created", "comment", "labels"]
 
+    @staticmethod
+    def _projects(cfg: dict) -> List[str]:
+        return list(dict.fromkeys(p for p in cfg.get("projects") or [] if isinstance(p, str) and p))
+
     @classmethod
-    def _jql(cls, cfg: dict, minutes: int) -> str:
-        scope = ["assignee = currentUser()", "reporter = currentUser()", "watcher = currentUser()"]
-        projects = cfg.get("projects") or []
-        if projects:
-            scope.append("project in (%s)" % ", ".join(projects))
-        jql = "(%s) AND updated >= -%dm" % (" OR ".join(scope), minutes)
+    def gap(cls, cfg):
+        return None if cls._projects(cfg) else "no tracker projects configured"
+
+    @classmethod
+    def _jql(cls, cfg: dict, project: str, minutes: int) -> str:
+        scope = ["assignee = currentUser()", "reporter = currentUser()", "watcher = currentUser()",
+                 "project = %s" % project]
+        jql = "project = %s AND (%s) AND updated >= -%dm" % (project, " OR ".join(scope), minutes)
         if cfg.get("extra_jql"):
             jql += " AND (%s)" % cfg["extra_jql"]
         return jql + " ORDER BY updated DESC"
 
     @classmethod
     def _fetch(cls, client, cfg, minutes, n):
-        projects = cfg.get("projects") or [""]
-        res = client.call("get-issues", {"projectKey": projects[0], "jql": cls._jql(cfg, minutes),
-                                         "fields": cls.FIELDS, "maxResults": n}) or {}
-        return res.get("issues") or []
+        """(issues, failed): the read tool needs a projectKey, so one call per project; a failing project is
+        skipped (named in `failed`) and the others still poll."""
+        issues, failed = [], []
+        for project in cls._projects(cfg):
+            try:
+                res = client.call("get-issues", {"projectKey": project, "jql": cls._jql(cfg, project, minutes),
+                                                 "fields": cls.FIELDS, "maxResults": n}) or {}
+            except McpError as e:
+                failed.append("%s: %s" % (project, e.kind))
+                continue
+            got = res.get("issues") or []
+            issues.append((project, got))
+        return issues, failed
 
     @staticmethod
     def _fp(f: dict) -> dict:
@@ -254,7 +276,8 @@ class TrackerJira(Adapter):
         if cursor is None:
             fp = {}
             try:  # seed fingerprints so the first real poll can tell a field change from a label edit
-                for i in cls._fetch(client, cfg, 7 * 24 * 60, 100):
+                issues = [i for _, got in cls._fetch(client, cfg, 7 * 24 * 60, 100)[0] for i in got]
+                for i in issues:
                     fp[i["key"]] = dict(cls._fp(i.get("fields") or {}), u=(i.get("fields") or {}).get("updated", ""))
             except McpError:
                 pass
@@ -264,10 +287,15 @@ class TrackerJira(Adapter):
         minutes = int(math.ceil((at - since).total_seconds() / 60.0)) + 2
         email = (me.get("email") or "").lower()
         lines, partial = [], []
-        got = cls._fetch(client, cfg, minutes, MAX_ISSUES + 1)
-        if len(got) > MAX_ISSUES:
-            partial.append("more than %d updated issues" % MAX_ISSUES)
-        for i in got[:MAX_ISSUES]:
+        pages, failed = cls._fetch(client, cfg, minutes, MAX_ISSUES + 1)
+        got = []
+        for project, page in pages:
+            if len(page) > MAX_ISSUES:
+                partial.append("more than %d updated issues" % MAX_ISSUES)
+            got.extend(page[:MAX_ISSUES])
+        partial.extend("project %s" % f for f in failed)
+        partial = list(dict.fromkeys(partial))
+        for i in got:
             key, f = i["key"], i.get("fields") or {}
             new = cls._fp(f)
             old = fps.get(key)

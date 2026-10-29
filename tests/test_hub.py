@@ -319,6 +319,18 @@ class Watcher(unittest.TestCase):
         self.assertEqual(beat["sources"]["tracker"]["reason"], "no connection")
         self.assertEqual(FakeAdapter.calls, 0)
 
+    def test_no_tracker_projects_is_a_config_gap_not_a_failure(self):
+        self.cfg["hub"]["watch"] = {}
+        hub_sources.ADAPTERS["tracker:jira"] = hub_sources.TrackerJira
+        beat = self.poll()
+        self.assertEqual(beat["sources"]["tracker"]["status"], "couldnt_check")
+        self.assertEqual(beat["sources"]["tracker"]["reason"], "no tracker projects configured")
+        self.assertEqual([l for l in self.inbox() if l["kind"] == "error"], [])
+
+    def test_tracker_projects_are_watch_plus_team_projects_deduped(self):
+        self.cfg["teams"] = [{"slug": "a", "tracker": {"project": "OPS"}}, {"slug": "b", "tracker": {"project": "PLAT"}}]
+        self.assertEqual(hub._watch_cfg(self.cfg, self.cfg["hub"], "tracker")["projects"], ["PLAT", "OPS"])
+
     def test_sweep_only_when_pending(self):
         self.poll()
         self.poll(31)

@@ -352,10 +352,49 @@ def issue(key, status="To Do", assignee="acc1", prio="Medium", ncomments=0, labe
 
 
 class TestTracker(unittest.TestCase):
-    def run_poll(self, issues, fp, cfg=None):
-        client, f = ro({"get-issues": lambda a: {"issues": issues}}, hs.TrackerJira.READ_TOOLS)
+    def run_poll(self, issues, fp, cfg=None, handler=None):
+        def get_issues(a):  # the real read tool requires projectKey
+            if not a.get("projectKey"):
+                raise hub_mcp.McpError("other", "Invalid arguments for `get-issues`: Missing required parameter `projectKey`.")
+            return handler(a) if handler else {"issues": issues}
+        client, f = ro({"get-issues": get_issues}, hs.TrackerJira.READ_TOOLS)
         cur = {"since": "2026-10-29T09:50:00Z", "fp": fp}
         return hs.TrackerJira.poll(client, cur, cfg or {"projects": ["PLAT"], "extra_jql": "labels != x"}, ME, AT), f
+
+    def test_polls_once_per_project_with_project_key(self):
+        def h(a):
+            return {"issues": [issue(a["projectKey"] + "-1", status="Done")]}
+        out, f = self.run_poll([], {"PLAT-1": dict(self.BASE), "OPS-1": dict(self.BASE)},
+                               cfg={"projects": ["PLAT", "OPS", "PLAT"]}, handler=h)
+        self.assertEqual([c[1]["projectKey"] for c in f.calls], ["PLAT", "OPS"])
+        self.assertIn("project = OPS", f.calls[1][1]["jql"])
+        self.assertEqual(sorted(l["key"] for l in out["lines"]), ["OPS-1", "PLAT-1"])
+        self.assertEqual(out["partial"], [])
+
+    def test_one_failing_project_is_partial_others_advance(self):
+        def h(a):
+            if a["projectKey"] == "BAD":
+                raise hub_mcp.McpError("other", "no such project")
+            return {"issues": [issue("OPS-1", status="Done")]}
+        out, f = self.run_poll([], {"OPS-1": dict(self.BASE), "BAD-9": dict(self.BASE)},
+                               cfg={"projects": ["BAD", "OPS"]}, handler=h)
+        self.assertEqual([l["key"] for l in out["lines"]], ["OPS-1"])
+        self.assertEqual(len(out["partial"]), 1)
+        self.assertIn("BAD", out["partial"][0])
+        self.assertEqual(out["cursor"]["fp"]["OPS-1"]["status"], "Done")
+        self.assertIn("BAD-9", out["cursor"]["fp"])  # the failed project's fingerprints are kept
+
+    def test_no_projects_is_a_config_gap(self):
+        self.assertEqual(hs.TrackerJira.gap({"projects": []}), "no tracker projects configured")
+        self.assertIsNone(hs.TrackerJira.gap({"projects": ["PLAT"]}))
+
+    def test_chat_search_scope_error_is_named(self):
+        def search(a):
+            raise hub_mcp.McpError("other", "An API error occurred: missing_scope")
+        client, _ = ro({"get_channel_history": lambda a: {"messages": []}, "get_thread_replies": lambda a: {},
+                        "search-messages": search}, hs.ChatSlack.READ_TOOLS)
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, {"channels": []}, ME, AT)
+        self.assertEqual(out["partial"], ["mentions: missing scope", "DMs: missing scope"])
 
     BASE = {"status": "To Do", "assignee": "acc1", "priority": "Medium", "comments": 0}
 
@@ -378,7 +417,7 @@ class TestTracker(unittest.TestCase):
         _, f = self.run_poll([], {})
         jql = f.calls[0][1]["jql"]
         for part in ("assignee = currentUser()", "reporter = currentUser()", "watcher = currentUser()",
-                     "project in (PLAT)", "labels != x", "updated >= -"):
+                     "project = PLAT", "labels != x", "updated >= -"):
             self.assertIn(part, jql)
 
     def test_own_comment_is_resolved(self):
