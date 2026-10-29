@@ -59,18 +59,20 @@ export const waitingCount = (h: HubBundle): number =>
 
 export type HubHealth = 'none' | 'alive' | 'stale' | 'down'
 
-// R4: judged from watcher.json alone (no config). Down: no heartbeat, or one older than 10 minutes.
-// Stale: inside active hours the heartbeat is older than 2 x every_seconds, or work waits and the hub
-// has not woken for that long (a quiet day's old last_wake is normal, so it counts only with work pending).
+// R4: judged without config. Down: no heartbeat, or one older than max(10 minutes, 2 x every_seconds), so a
+// slow idle interval outside active hours is not down. Stale (inside active hours only): the heartbeat is older
+// than 2 x every_seconds, or the watcher appended a line the hub must decide (last_append_at) after the hub last
+// woke, and that was more than 2 x every_seconds ago. A quiet day's old last_wake is never stale on its own.
 export function hubHealth(h: HubBundle, nowMs: number): HubHealth {
   if (!h.hub && !h.watcher) return 'none'
   const at = h.watcher ? Date.parse(h.watcher.at) : NaN
-  if (Number.isNaN(at) || nowMs - at > WATCHER_DOWN_MS) return 'down'
   const limit = 2 * (h.watcher?.every_seconds ?? 120) * 1000
+  if (Number.isNaN(at) || nowMs - at > Math.max(WATCHER_DOWN_MS, limit)) return 'down'
   if (h.watcher?.active) {
     if (nowMs - at > limit) return 'stale'
+    const appended = h.watcher.last_append_at ? Date.parse(h.watcher.last_append_at) : NaN
     const wake = h.hub?.last_wake ? Date.parse(h.hub.last_wake) : NaN
-    if (waitingCount(h) > 0 && !Number.isNaN(wake) && nowMs - wake > limit) return 'stale'
+    if (!Number.isNaN(appended) && (Number.isNaN(wake) || appended > wake) && nowMs - appended > limit) return 'stale'
   }
   return 'alive'
 }

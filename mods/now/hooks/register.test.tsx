@@ -680,12 +680,22 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(hubStatus(bundle(watcher({ at: iso(5 * MIN) }), hubDoc(), null), NOW)).toBe(' · hub ◌ stale')
     // outside active hours the watcher polls slowly: not stale
     expect(hubStatus(bundle(watcher({ at: iso(5 * MIN), active: false }), hubDoc(), null), NOW)).toBe(' · hub ●')
-    // with work pending, an old last_wake is stale
+    // work pending and an old last_wake, but nothing appended since it woke: the hub is not behind
     const pending = [{ key: 'PLAT-1', title: 'T', link: null, proposed_at: iso(10 * MIN), raised_at: null }]
-    expect(hubStatus(bundle(watcher(), hubDoc({ pending, last_wake: iso(5 * MIN) }), null), NOW)).toBe(' · hub ◌ stale · 1 waiting')
-    // down: watcher.json missing, or its at older than 10 minutes
+    expect(hubStatus(bundle(watcher(), hubDoc({ pending, last_wake: iso(25 * MIN) }), null), NOW)).toBe(' · hub ● · 1 waiting')
+    // a line it must decide arrived after its last wake, more than 2 x every_seconds ago: stale
+    expect(hubStatus(bundle(watcher({ last_append_at: iso(5 * MIN) }), hubDoc({ last_wake: iso(25 * MIN) }), null), NOW)).toBe(' · hub ◌ stale')
+    expect(hubStatus(bundle(watcher({ last_append_at: iso(5 * MIN) }), hubDoc({ last_wake: null }), null), NOW)).toBe(' · hub ◌ stale')
+    // ... but not yet 2 x every_seconds, or already woken since, or outside active hours: alive
+    expect(hubStatus(bundle(watcher({ last_append_at: iso(3 * MIN) }), hubDoc({ last_wake: iso(25 * MIN) }), null), NOW)).toBe(' · hub ●')
+    expect(hubStatus(bundle(watcher({ last_append_at: iso(5 * MIN) }), hubDoc({ last_wake: iso(4 * MIN) }), null), NOW)).toBe(' · hub ●')
+    expect(hubStatus(bundle(watcher({ last_append_at: iso(5 * MIN), active: false }), hubDoc({ last_wake: iso(25 * MIN) }), null), NOW)).toBe(' · hub ●')
+    // down: watcher.json missing, or its at older than max(10 minutes, 2 x every_seconds)
     expect(hubStatus(bundle(null, hubDoc(), null), NOW)).toBe(' · hub ✗')
     expect(hubStatus(bundle(watcher({ at: iso(11 * MIN) }), hubDoc(), null), NOW)).toBe(' · hub ✗')
+    // outside active hours with a 30-minute idle interval, a 20-minute-old poll is not down
+    expect(hubStatus(bundle(watcher({ at: iso(20 * MIN), active: false, every_seconds: 1800 }), hubDoc(), null), NOW)).toBe(' · hub ●')
+    expect(hubStatus(bundle(watcher({ at: iso(61 * MIN), active: false, every_seconds: 1800 }), hubDoc(), null), NOW)).toBe(' · hub ✗')
     // waiting = pending + live sessions with unseen
     const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 2 }), 'PLAT-3': session({ unseen: 0 }), 'PLAT-4': session({ unseen: 1, state: 'dropped' }) })
     expect(hubStatus(bundle(watcher(), hubDoc({ pending }), ss), NOW)).toBe(' · hub ● · 2 waiting')

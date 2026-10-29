@@ -23,7 +23,7 @@ mods/now/                  the Now panel, a second plugin in the same marketplac
                            opens with `/now-panel` (the engine reserves `/now` for the mother:now skill);
                            reads `.mother/now.json` and the hub's `.mother/hub/hub.json`, `sessions.json`, `watcher.json` (§5e), writes only through
                            `mother now done|snooze|top` and `mother hub done|snooze|session seen`, no network or MCP calls;
-                           a Hub section (health, Sessions, Waiting for you to start, Hub updates, Recently routed) and `hub ●|◌ stale|✗ · N waiting` on the status line
+                           a Hub section (health, Sessions, Waiting for you to start, Hub updates, Recently routed) and `hub ●|◌ stale|✗ · N waiting` on the status line (✗: `watcher.json` missing or its `at` older than max(10 min, 2x `every_seconds`); ◌ stale, only while `active`: `at` older than 2x `every_seconds`, or `last_append_at` later than `hub.json` `last_wake` (or no wake) and older than 2x `every_seconds`)
 tests/                     stdlib unittest; `python3 -m unittest discover tests`
 ```
 

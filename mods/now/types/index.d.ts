@@ -74,6 +74,7 @@ export type WatcherDoc = {
   at: string
   every_seconds?: number   // the watcher's current effective interval
   active?: boolean         // inside active hours now
+  last_append_at?: string  // the last poll that appended a line the hub must decide
   sources?: Record<string, WatcherSource>
   errors?: string[]
 }
@@ -83,6 +84,7 @@ export type HubRouted = { line_id: string; key: string; decision: string; sessio
 export type HubPending = {
   key: string; title: string; link: string | null; read?: string; next_step?: string
   name?: string; proposed_at: string; raised_at: string | null   // raised_at null until a card is raised
+  task_id?: string | null; last_update_at?: string; also?: string[]
 }
 
 export type HubUpdate = {
