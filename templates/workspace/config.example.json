@@ -134,6 +134,23 @@
     "read": true,
     "send": true
   },
+  "hub": {
+    "enabled": false,
+    "every_seconds": 120,
+    "idle_every_seconds": 600,
+    "model": null,
+    "max_cards_per_wake": 3,
+    "sweep_minutes": 30,
+    "update_ttl_hours": 24,
+    "connections": {},
+    "watch": {
+      "chat": {"channels": []},
+      "mail": {"ignore_senders": [], "ignore_labels": []},
+      "tracker": {"projects": [], "extra_jql": null},
+      "calendar": {"lead_minutes": 15},
+      "code": {"repos": []}
+    }
+  },
   "policy": {
     "auto_without_asking": [
       "own_dm",
