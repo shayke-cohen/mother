@@ -1626,6 +1626,29 @@ class InAppSessions(GuardCase):
         self.expect("ask", "SendMessage", {"to": "1b4e28ba-2fa1-11d2-883f-0016d3cca427", "message": "hi"})
         self.expect("none", "SendMessage", {"to": "researcher", "message": "hi"})   # an agent, not a session id
 
+    def test_send_message_by_name_in_the_workspace_reaches_only_hub_sessions(self):
+        self.hub_sessions(**{"PLAT-1": {"session_id": "local_live", "name": "plat-1", "state": "live"},
+                             "PLAT-2": {"session_id": "local_gone", "name": "plat-2", "state": "dropped"}})
+        for cwd in (self.ws, os.path.join(self.ws, "projects")):
+            self.expect("none", "SendMessage", {"to": "main", "message": "hi"}, cwd=cwd)
+            self.expect("none", "SendMessage", {"to": "local_live", "message": "hi"}, cwd=cwd)
+            self.expect("none", "SendMessage", {"to": "plat-1", "message": "hi"}, cwd=cwd)
+            self.expect("none", "SendMessage", {"to": "plat-1 [abc123]", "message": "hi"}, cwd=cwd)
+            self.assertIn("session", self.expect("ask", "SendMessage", {"to": "researcher", "message": "hi"},
+                                                 cwd=cwd))
+            self.expect("ask", "SendMessage", {"to": "plat-2", "message": "hi"}, cwd=cwd)          # dropped
+            self.expect("ask", "SendMessage", {"to": "plat-2 [abc123]", "message": "hi"}, cwd=cwd)
+            self.expect("ask", "SendMessage", {"to": "local_gone", "message": "hi"}, cwd=cwd)
+            self.expect("ask", "SendMessage", {"message": "hi"}, cwd=cwd)
+        # outside the workspace a name that is not a session id passes, as before
+        self.expect("none", "SendMessage", {"to": "researcher", "message": "hi"}, cwd=self.tmp)
+        self.expect("none", "SendMessage", {"to": "plat-2", "message": "hi"}, cwd=self.tmp)
+        self.expect("none", "ListAgents", {}, cwd=self.ws)
+
+    def test_send_message_in_the_workspace_without_hub_files_asks_by_name(self):
+        self.expect("ask", "SendMessage", {"to": "plat-1", "message": "hi"}, cwd=self.ws)
+        self.expect("none", "SendMessage", {"to": "main", "message": "hi"}, cwd=self.ws)
+
     def test_send_message_without_hub_files_asks(self):
         self.expect("ask", "mcp__ccd_session_mgmt__send_message", {"session_id": "local_x", "message": "hi"})
         os.makedirs(os.path.join(self.ws, ".mother", "hub"))

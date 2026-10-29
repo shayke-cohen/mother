@@ -207,10 +207,13 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **allow**: the desktop app's own session tools, by exact name, when they stay inside what the hub manages (§5e):
   `list_sessions`, `dismiss_task` and `ListAgents` always; `send_message` (`ccd_session_mgmt`) only when its
   `session_id` is the `session_id` of a `live` entry in `<workspace>/.mother/hub/sessions.json`; `SendMessage` when
-  its `to` is not a session id, or is one of those live ids (a session id is `local_…` or a UUID);
+  its `to` is one of those live ids, or (outside the workspace) is not a session id (a session id is `local_…` or a
+  UUID); in a session whose cwd is the workspace or under it, `SendMessage` by name only to `main` or the `name`
+  of a `live` entry (with or without a ` [ref]` suffix);
   `start_session` (`ccd_session`) only with `initiation: "own_initiative"` or `proposal_id` alone (with
   `wake_when_done` at most). Look-alikes on other servers are classified normally.
-- **ask**: any other use of those session tools (a message into a session the hub does not route to, a missing or
+- **ask**: any other use of those session tools (a message into a session the hub does not route to, a `SendMessage`
+  by any other name from the workspace, a missing or
   unreadable `sessions.json`, a `start_session` that starts a session now). This ask is not turned into a deny by
   `PAUSED` or the never-list; `bypassPermissions` passes it like any other ask.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
@@ -683,8 +686,10 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **Guard.** The desktop app's own session tools reach only the manager's sessions, but a message can carry
   untrusted source text, so the guard lets them through only inside what the hub manages (§5): `list_sessions`,
   `dismiss_task` and `ListAgents` always; `mcp__ccd_session_mgmt__send_message` only to the `session_id` of a
-  `live` `sessions.json` entry; `SendMessage` to such an id or to a name that is not a session id (`local_…` or a
-  UUID); `mcp__ccd_session__start_session` only with `initiation: "own_initiative"` (a card the manager starts) or
+  `live` `sessions.json` entry; `SendMessage` to such an id, and by name (not a session id, `local_…` or a UUID)
+  only to `main` or a `live` entry's `name` (a ` [ref]` suffix is ignored) when the session's cwd is the workspace
+  or under it, so text injected into a source the hub reads cannot steer it to another of the manager's sessions
+  (outside the workspace any name passes); `mcp__ccd_session__start_session` only with `initiation: "own_initiative"` (a card the manager starts) or
   `proposal_id` alone. Anything else asks. Exact names only: a same-named tool on another server (`mcp__other__send_message`) is classified like any other tool. The credential-shaped-content check (`SECRET_RE`) still applies to their input, so a token pasted into a message or card brief is denied. A reader or critic sub-agent and a channel session (either role) are denied all six.
 - **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
   posts or writes to a tracker.

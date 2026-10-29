@@ -1876,20 +1876,43 @@ IN_APP_SESSION_TOOLS = frozenset([
 SESSION_ID_RE = re.compile(r"^(local_\S+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 
 
-def live_hub_sessions(ctx):
-    """The session ids of `live` entries in <workspace>/.mother/hub/sessions.json; empty when it is missing or odd."""
+def live_hub_entries(ctx):
+    """The `live` entries in <workspace>/.mother/hub/sessions.json; empty when it is missing or odd."""
     if not ctx.ws:
-        return set()
+        return []
     doc, ok = read_json(os.path.join(ctx.ws, ".mother", "hub", "sessions.json"))
     items = doc.get("sessions") if ok and isinstance(doc, dict) else None
-    return {str(s["session_id"]) for s in (items.values() if isinstance(items, dict) else [])
-            if isinstance(s, dict) and s.get("state") == "live" and s.get("session_id")}
+    return [s for s in (items.values() if isinstance(items, dict) else [])
+            if isinstance(s, dict) and s.get("state") == "live"]
 
 
-def session_target(tool, inp, ctx):
+def live_hub_sessions(ctx):
+    """The session ids of `live` entries in sessions.json."""
+    return {str(s["session_id"]) for s in live_hub_entries(ctx) if s.get("session_id")}
+
+
+def live_hub_names(ctx):
+    """The names of `live` entries in sessions.json."""
+    return {str(s["name"]).strip() for s in live_hub_entries(ctx) if str(s.get("name") or "").strip()}
+
+
+NAME_REF_RE = re.compile(r"^(.*?)\s*\[[^\[\]]*\]$")
+
+
+def in_workspace(cwd, ctx):
+    """The session runs in the workspace or under it (the hub's home), judged on real paths."""
+    if not ctx.ws:
+        return False
+    here = os.path.realpath(cwd or os.getcwd())
+    return inside(here, os.path.realpath(ctx.ws))
+
+
+def session_target(tool, inp, ctx, cwd=None):
     """A message into a session passes only when that session is one the hub routes to (a `live` entry in
-    sessions.json); anything else could carry untrusted source text into an unrelated session, so it asks. A card
-    passes only as `own_initiative` (it waits for the manager) or as the start of an existing proposal."""
+    sessions.json); anything else could carry untrusted source text into an unrelated session, so it asks. In the
+    workspace (where the hub runs) `SendMessage` by name passes only for `main` or a live hub session's name,
+    with or without a ` [ref]` suffix. A card passes only as `own_initiative` (it waits for the manager) or as
+    the start of an existing proposal."""
     what = None
     if tool == "mcp__ccd_session_mgmt__send_message":
         target = str(inp.get("session_id") or "")
@@ -1897,8 +1920,15 @@ def session_target(tool, inp, ctx):
             what = "a message into session %s, which is not a live hub session" % (target or "(none named)")
     elif tool == "SendMessage":
         target = str(inp.get("to") or "").strip()
-        if SESSION_ID_RE.match(target) and target not in live_hub_sessions(ctx):
-            what = "a message into session %s, which is not a live hub session" % target
+        if SESSION_ID_RE.match(target):
+            if target not in live_hub_sessions(ctx):
+                what = "a message into session %s, which is not a live hub session" % target
+        elif in_workspace(cwd, ctx) and target != "main":
+            m = NAME_REF_RE.match(target)
+            name = m.group(1).strip() if m else target
+            if not name or name not in live_hub_names(ctx):
+                what = "a message to %s from the workspace, which is not main or a live hub session" % (
+                    target or "(none named)")
     elif tool == "mcp__ccd_session__start_session":
         keys = set(inp) - {"wake_when_done"}
         if not (inp.get("initiation") == "own_initiative" or (keys == {"proposal_id"} and inp.get("proposal_id"))):
@@ -2046,7 +2076,7 @@ def classify(tool, inp, cwd, ctx):
         if SECRET_RE.search(json.dumps(inp)):
             return act("credential", "credentials", "a session message or brief whose content looks like a "
                                                     "credential (%s)" % tool)
-        return session_target(tool, inp, ctx)
+        return session_target(tool, inp, ctx, cwd)
     if not tool.startswith("mcp__"):
         return None
     if any(SENSITIVE_KEYS.match(str(k)) for k in inp.keys()):
