@@ -21,7 +21,7 @@ wake mechanism and catches up from the cursor.
 1. `mother home check` must exit 0; if not, say this is not the home machine and stop. This session must run in
    the workspace folder: if `pwd` is not `$W`, tell the manager to reopen the hub session in `$W` (so the cards it
    raises start there and pick up the MOTHER persona) and stop. Then `mother hub status`:
-   if the watcher is down or never ran, tell the manager to run `mother hub install` (and `mother hub check`
+   if the watcher is down or never ran, tell the manager to set `hub.enabled: true` in `config.json` and run `mother hub install` (and `mother hub check`
    if a source fails), and carry on: lines catch up when it returns.
 2. If `hub.model` in `$W/config.json` is set and differs from this session's model, set it on this session with
    the session-model tool (the app asks the manager). Don't change anything else about the session.

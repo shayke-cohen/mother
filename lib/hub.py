@@ -432,7 +432,8 @@ def build_clients(cfg: dict, have: dict) -> dict:
                 raw = hub_mcp.Client(conn.get("command") or "", list(conn.get("args") or []),
                                      dict(conn.get("env") or {}))
                 raw.start()
-            out[cap] = hub_mcp.ReadOnlyClient(raw, hub_mcp.resolve_tools(raw.tools, adapter.READ_TOOLS))
+            out[cap] = hub_mcp.ReadOnlyClient(raw, hub_mcp.resolve_tools(raw.tools, adapter.READ_TOOLS),
+                                              adapter.READ_TOOLS)
         except McpError as e:
             out[cap] = e
         except Exception as e:
@@ -449,18 +450,66 @@ def home_status(cfg: dict) -> int:
     return 0 if home == here else 2
 
 
+LOG_MAX = 1024 * 1024
+
+
+def _log(msg: str) -> None:
+    print("%s mother hub: %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg), file=sys.stderr)
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def cap_log(ws: Path) -> None:
+    """Keep watcher.log under LOG_MAX: copy it to watcher.log.1 (replacing it) and empty it in place, so launchd's
+    open handle keeps writing to watcher.log."""
+    import shutil
+    p = hub_dir(ws) / "watcher.log"
+    try:
+        if p.stat().st_size > LOG_MAX:
+            shutil.copyfile(str(p), str(p) + ".1")
+            os.truncate(str(p), 0)
+    except OSError:
+        pass
+
+
+def config_problem(cfg: dict) -> Optional[str]:
+    """Why the watcher cannot run on this config (one line), or None. Checked once at start."""
+    h = _hub_cfg(cfg)
+    if h.get("enabled") is not True:
+        return "hub.enabled is not true in config.json"
+    for k, low in (("every_seconds", 1), ("idle_every_seconds", 0), ("sweep_minutes", 0), ("update_ttl_hours", 0)):
+        if k not in h:
+            continue
+        v = h[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < low:
+            return "hub.%s must be a number >= %d, not %r" % (k, low, v)
+    try:
+        import now as nowmod
+        nowmod.Schedule.from_config(cfg)
+        is_active(cfg, datetime.now().astimezone())
+    except Exception as e:
+        return "active hours or timezone in config.json: %s" % e
+    return None
+
+
 def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) -> None:
-    """Run the watcher until SIGTERM (returns, so the process exits 0). Exits 2 (3 when no home machine is set)
-    if this is not the home machine. Polls every `every_seconds` in active hours, `idle_every_seconds` outside
+    """Run the watcher until SIGTERM. Returns (so the process exits 0 and launchd, `KeepAlive.SuccessfulExit` false,
+    does not respawn it) with one log line when this is not the home machine, `hub.enabled` is not true, or a config
+    number is bad. Polls every `every_seconds` in active hours, `idle_every_seconds` outside
     (0: not at all, sleeping until the next window); rotates the inbox when the local day changes.
     `clock() -> aware datetime`, `sleep(seconds)`, `factory(cfg, have) -> clients` and `stop` (a threading.Event)
     are injectable for tests."""
     import threading
     import now as nowmod
-    code = home_status(cfg)
-    if code:
-        print("mother hub: not the home machine (see `mother home check`)", file=sys.stderr)
-        sys.exit(code)
+    if home_status(cfg):
+        _log("not the home machine (see `mother home check`); not watching")
+        return
+    why = config_problem(cfg)
+    if why:
+        _log("%s; not watching" % why)
+        return
     tz = nowmod.Schedule.from_config(cfg).tz
     clock = clock or (lambda: datetime.now(tz))
     sleep = sleep or time.sleep
@@ -476,7 +525,11 @@ def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) 
         while not stop.is_set():
             at = clock()
             if prev_at.astimezone(tz).date() != at.astimezone(tz).date():
-                rotate_inbox(ws, prev_at.astimezone(tz))
+                try:
+                    rotate_inbox(ws, prev_at.astimezone(tz))
+                except OSError as e:  # the next day change tries again; never crash-loop on it
+                    _log("inbox rotation failed: %s" % e)
+            cap_log(ws)
             active, every = interval(cfg, at)
             idle0 = not active and int(_hub_cfg(cfg).get("idle_every_seconds", DEFAULTS["idle_every_seconds"])) == 0
             if not idle0:
@@ -574,7 +627,8 @@ def plist(ws: Path, cfg: dict, python: str, mother: str, found: Optional[Dict[st
     doc = {"Label": LABEL,
            "ProgramArguments": [python, mother, "hub", "watch"],
            "EnvironmentVariables": {"MOTHER_WORKSPACE": str(ws), "PATH": launch_path(found)},
-           "KeepAlive": True,
+           "KeepAlive": {"SuccessfulExit": False},  # a clean exit (off home, disabled, bad config) stays down
+           "ThrottleInterval": 60,
            "RunAtLoad": True,
            "StandardOutPath": str(hub_dir(ws) / "watcher.log"),
            "StandardErrorPath": str(hub_dir(ws) / "watcher.log")}
@@ -598,6 +652,9 @@ def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=N
     if code:
         print("mother hub install: not the home machine (see `mother home check`)", file=sys.stderr)
         return code
+    if _hub_cfg(cfg).get("enabled") is not True:
+        print("mother hub install: hub.enabled is not true in config.json; set it first", file=sys.stderr)
+        return 1
     if not _conns(cfg):
         print("mother hub install: hub.connections is empty; nothing to watch", file=sys.stderr)
         return 1
@@ -644,7 +701,7 @@ def _gh_user() -> None:
 
 def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
     """One read per connection, under the PATH the plist sets: an MCP server must start and answer `tools/list`
-    with at least one tool on its adapter's read allow-list; `gh` must answer `gh api user`. Never calls a write
+    with every tool on its adapter's read allow-list (each exactly once); `gh` must answer `gh api user`. Never calls a write
     tool. Prints `cap | ok/✗ | reason`; exit 1 if any fails."""
     import hub_mcp
     import hub_sources
@@ -682,8 +739,9 @@ def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
             try:
                 if c is None or isinstance(c, Exception):
                     rows.append((cap, False, str(c) if c is not None else "no client"))
-                elif not hub_mcp.resolve_tools(c.tools, adapter.READ_TOOLS):
-                    rows.append((cap, False, "no read tool (%s) in tools/list" % ", ".join(sorted(adapter.READ_TOOLS))))
+                elif _missing_reads(c.tools, adapter.READ_TOOLS):
+                    rows.append((cap, False, "missing read tools: %s" % ", ".join(
+                        _missing_reads(c.tools, adapter.READ_TOOLS))))
                 else:
                     rows.append((cap, True, "tools/list: %d tools" % len(c.tools)))
             finally:
@@ -697,6 +755,11 @@ def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
     for cap, ok, why in rows:
         print("%s | %s | %s" % (cap, "ok" if ok else "\u2717", why), file=out)
     return 0 if all(r[1] for r in rows) else 1
+
+
+def _missing_reads(tools, suffixes) -> List[str]:
+    """READ_TOOLS suffixes the server does not offer exactly once."""
+    return sorted(s for s in suffixes if len([t for t in tools or [] if t.rsplit("__", 1)[-1] == s]) != 1)
 
 
 def _age(stamp, at: datetime):

@@ -425,15 +425,62 @@ class Loop(unittest.TestCase):
             out["tracker"] = c
         return out
 
-    def test_not_home_exits_2_and_3(self):
+    def quiet_watch(self):
+        import io
+        from unittest import mock
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            hub.watch(self.ws, self.cfg, clock=lambda: self.now, sleep=self.sleep, factory=self.factory,
+                      stop=self.stop)  # returns: the process exits 0, so launchd does not respawn it
+        return err.getvalue()
+
+    def test_not_home_or_not_enabled_returns_with_one_line(self):
+        self.after = None
         self.cfg["workspace"]["home_machine"] = "elsewhere"
-        with self.assertRaises(SystemExit) as cm:
-            hub.watch(self.ws, self.cfg, stop=self.stop)
-        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("not the home machine", self.quiet_watch())
         del self.cfg["workspace"]["home_machine"]
-        with self.assertRaises(SystemExit) as cm:
-            hub.watch(self.ws, self.cfg, stop=self.stop)
-        self.assertEqual(cm.exception.code, 3)
+        self.assertIn("not the home machine", self.quiet_watch())
+        self.cfg["workspace"]["home_machine"] = "laptop"
+        for off in (False, None, "yes"):
+            self.cfg["hub"]["enabled"] = off
+            self.assertIn("hub.enabled", self.quiet_watch())
+        del self.cfg["hub"]["enabled"]
+        self.assertIn("hub.enabled", self.quiet_watch())
+        self.assertEqual(self.made, [])
+        self.assertFalse((hub.hub_dir(self.ws) / "watcher.json").exists())
+
+    def test_bad_config_numbers_return_with_one_line(self):
+        self.after = None
+        for k, v in (("every_seconds", "soon"), ("every_seconds", 0), ("idle_every_seconds", -1),
+                     ("sweep_minutes", [1]), ("update_ttl_hours", "x")):
+            cfg = json.loads(json.dumps(self.cfg))
+            cfg["hub"][k] = v
+            self.cfg, saved = cfg, self.cfg
+            self.assertIn("hub.%s" % k, self.quiet_watch())
+            self.cfg = saved
+        self.assertEqual(self.made, [])
+
+    def test_rotation_failure_is_logged_and_the_loop_goes_on(self):
+        import io
+        from unittest import mock
+        self.now = datetime(2026, 10, 29, 23, 57, tzinfo=UTC)
+        self.cfg["hub"]["idle_every_seconds"] = 120
+        with mock.patch.object(hub, "rotate_inbox", side_effect=OSError("disk full")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.run_watch(lambda t: sum(t.slept) >= 480)
+        self.assertIn("disk full", err.getvalue())
+        self.assertGreaterEqual(FakeAdapter.calls, 3)
+
+    def test_watcher_log_rotates_at_1mb(self):
+        d = hub.hub_dir(self.ws)
+        d.mkdir(parents=True, exist_ok=True)
+        log = d / "watcher.log"
+        log.write_text("x" * (hub.LOG_MAX + 10))
+        hub.cap_log(self.ws)
+        self.assertEqual(log.stat().st_size, 0)
+        self.assertEqual((d / "watcher.log.1").stat().st_size, hub.LOG_MAX + 10)
+        log.write_text("small")
+        hub.cap_log(self.ws)
+        self.assertEqual(log.read_text(), "small")
 
     def test_polls_every_interval_then_returns_on_stop(self):
         self.run_watch(lambda t: sum(t.slept) >= 240)
@@ -515,13 +562,25 @@ class Install(unittest.TestCase):
         env = d["EnvironmentVariables"]
         self.assertEqual(env["MOTHER_WORKSPACE"], str(self.ws))
         self.assertEqual(env["PATH"], "/opt/x/bin:/opt/homebrew/bin:/usr/bin:/bin")
-        self.assertTrue(d["KeepAlive"])
+        self.assertEqual(d["KeepAlive"], {"SuccessfulExit": False})  # a clean exit (off home, disabled) stays down
+        self.assertEqual(d["ThrottleInterval"], 60)
         self.assertTrue(d["StandardOutPath"].endswith(".mother/hub/watcher.log"))
         self.assertTrue(any(c[0] == "bootstrap" for c in self.calls))
 
     def test_install_fails_on_missing_command(self):
         self.which = {"gh": "/opt/homebrew/bin/gh"}.get
         self.assertEqual(self.run_install(), 1)
+        self.assertFalse(self.plist.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_install_refuses_when_not_enabled(self):
+        import io
+        from unittest import mock
+        for off in (False, None):
+            self.cfg["hub"]["enabled"] = off
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertEqual(self.run_install(), 1)
+            self.assertIn("hub.enabled", err.getvalue())
         self.assertFalse(self.plist.exists())
         self.assertEqual(self.calls, [])
 
@@ -559,7 +618,7 @@ class Install(unittest.TestCase):
         buf = io.StringIO()
         self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"tracker": c}, gh_user=lambda: None,
                                    which=self.which, out=buf), 1)
-        self.assertIn("tracker | \u2717 | no read tool", buf.getvalue())
+        self.assertIn("tracker | \u2717 | missing read tools: get-issues", buf.getvalue())
         buf = io.StringIO()
 
         def bad():

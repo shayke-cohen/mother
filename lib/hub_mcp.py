@@ -162,9 +162,15 @@ def resolve_tools(tools: List[str], suffixes: Set[str]) -> Set[str]:
 
 
 class ReadOnlyClient:
-    def __init__(self, client, allowed: Set[str]):
+    """Calls only tools on the read allow-list. `allowed` are the full names resolved against the server; `suffixes`
+    (the adapter's READ_TOOLS) say what may be asked for at all. A name outside `suffixes` is a programming error
+    (`ForbiddenTool`); an allowed suffix the server does not offer, or offers twice, is a source failure
+    (`McpError`), so one missing read tool marks that source instead of stopping the watcher."""
+
+    def __init__(self, client, allowed: Set[str], suffixes: Set[str] = None):
         self._client = client
         self.allowed = set(allowed)
+        self.suffixes = set(suffixes) if suffixes is not None else {a.rsplit("__", 1)[-1] for a in self.allowed}
 
     @property
     def tools(self) -> List[str]:
@@ -173,9 +179,13 @@ class ReadOnlyClient:
     def call(self, name: str, arguments: dict = None) -> Any:
         full = name
         if full not in self.allowed:
-            hits = [a for a in self.allowed if a.rsplit("__", 1)[-1] == name]
-            if len(hits) != 1:
+            suffix = name.rsplit("__", 1)[-1]
+            if suffix not in self.suffixes:
                 raise ForbiddenTool("tool not on the read allow-list: %s" % name)
+            hits = [a for a in self.allowed if a.rsplit("__", 1)[-1] == suffix]
+            if len(hits) != 1:
+                raise McpError("other", "the server offers %s read tool %s" % (
+                    "no" if not hits else "more than one", suffix))
             full = hits[0]
         return self._client.call(full, arguments or {})
 

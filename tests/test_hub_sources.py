@@ -115,6 +115,30 @@ class TestClient(unittest.TestCase):
         self.assertEqual(len(self.logged()), 1)
 
 
+class TestReadOnlyMissingTools(unittest.TestCase):
+    def test_missing_or_ambiguous_allowed_tool_is_a_source_error_not_forbidden(self):
+        f = Fake({"get_channel_history": lambda a: {}})
+        r = hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, hs.ChatSlack.READ_TOOLS), hs.ChatSlack.READ_TOOLS)
+        with self.assertRaises(hub_mcp.McpError) as cm:
+            r.call("search-messages", {})
+        self.assertIn("search-messages", cm.exception.message)
+        with self.assertRaises(hub_mcp.ForbiddenTool):
+            r.call("post_message", {})
+        with self.assertRaises(hub_mcp.ForbiddenTool):
+            r.call("gw__post_message", {})
+        f.tools = ["a__get_channel_history", "b__get_channel_history"]
+        r = hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, hs.ChatSlack.READ_TOOLS), hs.ChatSlack.READ_TOOLS)
+        with self.assertRaises(hub_mcp.McpError):
+            r.call("get_channel_history", {})
+        self.assertEqual(f.calls, [])
+
+    def test_chat_server_without_search_is_partial(self):
+        f = Fake({"get_channel_history": lambda a: {"messages": []}, "get_thread_replies": lambda a: {"messages": []}})
+        r = hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, hs.ChatSlack.READ_TOOLS), hs.ChatSlack.READ_TOOLS)
+        out = hs.ChatSlack.poll(r, {"ts": "%.6f" % (NOW - 120), "threads": {}}, {"channels": ["C00000001"]}, ME, AT)
+        self.assertTrue(any("search-messages" in p or "other" in p for p in out["partial"]), out["partial"])
+
+
 class TestAdapterShape(unittest.TestCase):
     def test_every_adapter_read_tools_are_reads(self):
         self.assertEqual(set(hs.ADAPTERS), {"chat:slack", "mail:gmail", "tracker:jira", "calendar:google",

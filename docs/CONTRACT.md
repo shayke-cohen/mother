@@ -585,20 +585,27 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **launchd job.** Label `com.mother.hub`, plist `~/Library/LaunchAgents/com.mother.hub.plist`.
   `ProgramArguments` = absolute python, absolute `bin/mother`, `hub`, `watch`; `EnvironmentVariables` =
   `MOTHER_WORKSPACE` and a `PATH` of the directories of every resolved connection program (`cli` wins over
-  `command`) plus `/usr/bin:/bin`; `KeepAlive` and `RunAtLoad` true; stdout and stderr go to
-  `.mother/hub/watcher.log`. `install` exits 2 or 3 off the home machine (as `home check`), exits 1 naming any
-  program `shutil.which` cannot find or when `hub.connections` is empty, then writes the plist and runs
+  `command`) plus `/usr/bin:/bin`; `KeepAlive` `{SuccessfulExit: false}` (a crash is restarted, a clean exit
+  is not), `ThrottleInterval` 60 and `RunAtLoad` true; stdout and stderr go to `.mother/hub/watcher.log`, which the
+  watcher keeps under 1 MB (past that it is copied to `watcher.log.1`, replacing it, and emptied in place).
+  `install` exits 2 or 3 off the home machine (as `home check`), exits 1 when `hub.enabled` is not `true`, naming
+  any program `shutil.which` cannot find, or when `hub.connections` is empty, then writes the plist and runs
   `launchctl bootstrap gui/<uid>` (a `bootout` first, so a reinstall replaces the job); `uninstall` is `bootout`
-  plus removing the plist. `check` runs under that same `PATH`: an MCP connection must start and list at least one
-  tool on its adapter's read allow-list (`tools/list` is the read; no tool is called), `gh` must answer `gh api
+  plus removing the plist. `check` runs under that same `PATH`: an MCP connection must start and list every
+  tool on its adapter's read allow-list, each exactly once (`tools/list` is the read; no tool is called; a failure
+  names the missing ones), `gh` must answer `gh api
   user`; it prints `cap | ok/✗ | reason` and exits 1 if any fails. `status` prints the `watcher.json` and
   `hub.json` (`last_wake`) heartbeats and exits 2 only when the watcher never ran or its `at` is older than 2x
   `watcher.json` `every_seconds` while `active`. The hub line is printed with `STALE` (the exit code is unchanged)
   when, while `active`, `watcher.json` `last_append_at` is later than `hub.json` `last_wake` (or the hub never
   woke) and older than 2x `every_seconds`: the hub has not caught up with a line it must decide. An old
   `last_wake` with nothing appended since is a quiet day, not stale; a missing `hub.json` prints `hub: never woke`.
-- **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It exits 2 when `workspace.home_machine`
-  names another machine (3 when none is set, as `mother home check`) and returns, so the process exits 0, on SIGTERM.
+- **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It writes one line to its log and
+  returns, so the process exits 0 and launchd leaves it down, when this is not the home machine
+  (`workspace.home_machine` names another machine or none), when `hub.enabled` is not `true`, or when the config
+  is unusable (`hub.every_seconds` not a number >= 1; `idle_every_seconds`, `sweep_minutes` or
+  `update_ttl_hours` not a number >= 0; active hours or timezone that will not parse); all are checked once at
+  start. It also returns on SIGTERM. A failed inbox rotation is logged and retried at the next day change.
   Each pass (`hub.poll_once`) polls every capability in `connectors` that has an adapter, appends the coalesced
   lines to the inbox, and only then saves that source's cursor in `cursors.json` (`{<cap>: cursor, _last_sweep}`), so
   a crash repeats lines rather than losing them; a failing source keeps its cursor. It sleeps `every_seconds` inside
@@ -615,8 +622,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   line (key `watcher:<cap>`); `cursors.json` `_errored` ([cap]) remembers that it was emitted, so further failing
   passes add nothing and a restart does not repeat it; a successful pass clears it. The watcher never writes
   `capabilities.json` and never calls `mother health record`: `watcher.json` and the `error` line are its record, and
-  `pick` / the doctor are untouched. A missing connection is reported in `watcher.json` only. A `ForbiddenTool` is
-  never caught: it stops the watcher.
+  `pick` / the doctor are untouched. A missing connection is reported in `watcher.json` only. A `ForbiddenTool` (a
+  tool name outside the adapter's `READ_TOOLS`, a programming error) is never caught: it stops the watcher, and
+  launchd restarts it after `ThrottleInterval`.
 - **Sweep.** A `sweep` line (source `hub`, key `sweep`) is appended when `hub.sweep_minutes` have passed since
   `cursors.json` `_last_sweep` (or there is none) and something is pending: `hub.json` `pending` is non-empty, or a
   `sessions.json` session with `state: live` has `unseen > 0` and a `last_routed_at` within `hub.update_ttl_hours`
@@ -679,7 +687,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   Adapters (`lib/hub_sources.py`) are keyed `<cap>:<connector>` (`chat:slack`, `mail:gmail`, `tracker:jira`,
   `calendar:google`, `code:github`) and declare `READ_TOOLS`, tool-name suffixes whose first word is a read verb.
   The client (`lib/hub_mcp.py`) resolves them against the server's `tools/list` and wraps it in `ReadOnlyClient`,
-  which raises `ForbiddenTool` for any other name before anything is sent. GitHub goes through `gh api` with one
+  which raises `ForbiddenTool` for a name outside `READ_TOOLS` before anything is sent. An allowed suffix that the
+  server does not offer, or offers more than once, raises `McpError` instead: that source is `partial` (an
+  optional sub-read) or `couldnt_check`, and the watcher goes on. GitHub goes through `gh api` with one
   pseudo-tool, `get`, limited to the path prefixes `search/issues?` and `repos/` and no method or field flags.
   `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
   activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
