@@ -204,7 +204,15 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
   different targets in one call, is denied too (`rules/outbound.md`).
 - **deny**: the desktop app's own session tools in a reader/critic sub-agent or a channel session (§5c).
-- **allow**: the desktop app's own session tools (`start_session`, `dismiss_task`, `send_message`, `list_sessions` on the `ccd_session` / `ccd_session_mgmt` servers, `SendMessage`, `ListAgents`), by exact name; they reach only the manager's own sessions (§5e). Look-alikes on other servers are classified normally.
+- **allow**: the desktop app's own session tools, by exact name, when they stay inside what the hub manages (§5e):
+  `list_sessions`, `dismiss_task` and `ListAgents` always; `send_message` (`ccd_session_mgmt`) only when its
+  `session_id` is the `session_id` of a `live` entry in `<workspace>/.mother/hub/sessions.json`; `SendMessage` when
+  its `to` is not a session id, or is one of those live ids (a session id is `local_…` or a UUID);
+  `start_session` (`ccd_session`) only with `initiation: "own_initiative"` or `proposal_id` alone (with
+  `wake_when_done` at most). Look-alikes on other servers are classified normally.
+- **ask**: any other use of those session tools (a message into a session the hub does not route to, a missing or
+  unreadable `sessions.json`, a `start_session` that starts a session now). This ask is not turned into a deny by
+  `PAUSED` or the never-list; `bypassPermissions` passes it like any other ask.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
@@ -644,7 +652,12 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `snooze_until`; an ended snooze is open again at the next write. Exit 1 for an unknown id, 2 for a bad word.
 - **Update expiry.** On every write an update goes when it is older than `hub.update_ttl_hours` **working** hours
   (`now.working_hours`, counted from the later of `at` and `snooze_until`) or when its key has a live session.
-- **Guard.** The desktop app's own session tools reach only the manager's sessions: `mcp__ccd_session__start_session`, `mcp__ccd_session__dismiss_task`, `mcp__ccd_session_mgmt__send_message`, `mcp__ccd_session_mgmt__list_sessions`, `SendMessage` and `ListAgents` are not outbound, so the guard allows them with no ask (§5). Exact names only: a same-named tool on another server (`mcp__other__send_message`) is classified like any other tool. The credential-shaped-content check (`SECRET_RE`) still applies to their input, so a token pasted into a message or card brief is denied. A reader or critic sub-agent and a channel session (either role) are denied all six.
+- **Guard.** The desktop app's own session tools reach only the manager's sessions, but a message can carry
+  untrusted source text, so the guard lets them through only inside what the hub manages (§5): `list_sessions`,
+  `dismiss_task` and `ListAgents` always; `mcp__ccd_session_mgmt__send_message` only to the `session_id` of a
+  `live` `sessions.json` entry; `SendMessage` to such an id or to a name that is not a session id (`local_…` or a
+  UUID); `mcp__ccd_session__start_session` only with `initiation: "own_initiative"` (a card the manager starts) or
+  `proposal_id` alone. Anything else asks. Exact names only: a same-named tool on another server (`mcp__other__send_message`) is classified like any other tool. The credential-shaped-content check (`SECRET_RE`) still applies to their input, so a token pasted into a message or card brief is denied. A reader or critic sub-agent and a channel session (either role) are denied all six.
 - **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
   posts or writes to a tracker.
   Adapters (`lib/hub_sources.py`) are keyed `<cap>:<connector>` (`chat:slack`, `mail:gmail`, `tracker:jira`,

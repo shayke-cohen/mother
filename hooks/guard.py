@@ -1873,6 +1873,40 @@ IN_APP_SESSION_TOOLS = frozenset([
     "SendMessage", "ListAgents"])
 
 
+SESSION_ID_RE = re.compile(r"^(local_\S+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
+
+
+def live_hub_sessions(ctx):
+    """The session ids of `live` entries in <workspace>/.mother/hub/sessions.json; empty when it is missing or odd."""
+    if not ctx.ws:
+        return set()
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "hub", "sessions.json"))
+    items = doc.get("sessions") if ok and isinstance(doc, dict) else None
+    return {str(s["session_id"]) for s in (items.values() if isinstance(items, dict) else [])
+            if isinstance(s, dict) and s.get("state") == "live" and s.get("session_id")}
+
+
+def session_target(tool, inp, ctx):
+    """A message into a session passes only when that session is one the hub routes to (a `live` entry in
+    sessions.json); anything else could carry untrusted source text into an unrelated session, so it asks. A card
+    passes only as `own_initiative` (it waits for the manager) or as the start of an existing proposal."""
+    what = None
+    if tool == "mcp__ccd_session_mgmt__send_message":
+        target = str(inp.get("session_id") or "")
+        if target not in live_hub_sessions(ctx):
+            what = "a message into session %s, which is not a live hub session" % (target or "(none named)")
+    elif tool == "SendMessage":
+        target = str(inp.get("to") or "").strip()
+        if SESSION_ID_RE.match(target) and target not in live_hub_sessions(ctx):
+            what = "a message into session %s, which is not a live hub session" % target
+    elif tool == "mcp__ccd_session__start_session":
+        keys = set(inp) - {"wake_when_done"}
+        if not (inp.get("initiation") == "own_initiative" or (keys == {"proposal_id"} and inp.get("proposal_id"))):
+            what = "starting a session now (initiation %s), not a card the manager starts" % (
+                inp.get("initiation") or "none")
+    return act("session", "session_messages", what) if what else None
+
+
 def classify_mcp(tool, inp):
     if tool in IN_APP_SESSION_TOOLS:
         return None
@@ -2012,7 +2046,7 @@ def classify(tool, inp, cwd, ctx):
         if SECRET_RE.search(json.dumps(inp)):
             return act("credential", "credentials", "a session message or brief whose content looks like a "
                                                     "credential (%s)" % tool)
-        return None
+        return session_target(tool, inp, ctx)
     if not tool.startswith("mcp__"):
         return None
     if any(SENSITIVE_KEYS.match(str(k)) for k in inp.keys()):
@@ -2377,6 +2411,8 @@ def decide(a, ctx, transcript=None):
         return decide_whatsapp(a, ctx)
     if a["kind"] == "config":
         return "ask", "%s. The agent must not change its own guard; confirm this is you." % a["what"]
+    if a["kind"] == "session":  # the manager's own sessions: always a question, never PAUSED or the never-list
+        return "ask", "%s. Confirm it." % a["what"]
     p = paused(ctx)
     if p:
         return "deny", "Outbound is PAUSED (%s exists). Blocked: %s. Only the manager removes that file." % (

@@ -1596,13 +1596,56 @@ class InAppSessions(GuardCase):
              "mcp__ccd_session_mgmt__send_message", "mcp__ccd_session_mgmt__list_sessions",
              "SendMessage", "ListAgents"]
 
+    def hub_sessions(self, **sessions):
+        d = os.path.join(self.ws, ".mother", "hub")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "sessions.json"), "w") as f:
+            json.dump({"version": 1, "sessions": sessions}, f)
+
     def test_in_app_session_tools_pass(self):
+        self.hub_sessions(**{"PLAT-1": {"session_id": "s1", "state": "live"}})
         for name in self.NAMES:
             for inp in ({"session_id": "s1", "message": "what changed", "name": "plat-1",
                          "initiation": "own_initiative", "prompt": "x"},
                         # a field the guard reads as a chat target must not turn a session tool into a chat send
-                        {"session_id": "s1", "channel": "s1", "message": "what changed", "thread_id": "t1"}):
+                        {"session_id": "s1", "channel": "s1", "message": "what changed", "thread_id": "t1",
+                         "initiation": "own_initiative"}):
                 self.expect("none", name, inp)
+
+    def test_send_message_only_to_a_live_hub_session(self):
+        self.hub_sessions(**{"PLAT-1": {"session_id": "local_live", "state": "live"},
+                             "PLAT-2": {"session_id": "local_gone", "state": "dropped"}})
+        send = "mcp__ccd_session_mgmt__send_message"
+        self.expect("none", send, {"session_id": "local_live", "message": "PLAT-1 moved"})
+        self.assertIn("session", self.expect("ask", send, {"session_id": "local_other", "message": "hi"}))
+        self.expect("ask", send, {"session_id": "local_gone", "message": "hi"})   # dropped
+        self.expect("ask", send, {"session_id": "parent", "message": "hi"})
+        self.expect("ask", send, {"message": "hi"})
+        self.expect("none", "SendMessage", {"to": "local_live", "message": "hi"})
+        self.expect("ask", "SendMessage", {"to": "local_other", "message": "hi"})
+        self.expect("ask", "SendMessage", {"to": "1b4e28ba-2fa1-11d2-883f-0016d3cca427", "message": "hi"})
+        self.expect("none", "SendMessage", {"to": "researcher", "message": "hi"})   # an agent, not a session id
+
+    def test_send_message_without_hub_files_asks(self):
+        self.expect("ask", "mcp__ccd_session_mgmt__send_message", {"session_id": "local_x", "message": "hi"})
+        os.makedirs(os.path.join(self.ws, ".mother", "hub"))
+        with open(os.path.join(self.ws, ".mother", "hub", "sessions.json"), "w") as f:
+            f.write("{not json")
+        self.expect("ask", "mcp__ccd_session_mgmt__send_message", {"session_id": "local_x", "message": "hi"})
+
+    def test_start_session_only_own_initiative_or_proposal(self):
+        start = "mcp__ccd_session__start_session"
+        self.expect("none", start, {"initiation": "own_initiative", "title": "PLAT-1", "prompt": "x"})
+        self.expect("none", start, {"proposal_id": "task_1"})
+        self.expect("none", start, {"proposal_id": "task_1", "wake_when_done": True})
+        for inp in ({"initiation": "user_asked", "title": "t", "prompt": "x"},
+                    {"initiation": "offer", "title": "t"}, {"title": "t", "prompt": "x"},
+                    {"proposal_id": "task_1", "prompt": "do something else"}):
+            self.expect("ask", start, inp)
+
+    def test_session_ask_is_not_paused_deny(self):
+        open(self.state("PAUSED"), "w").close()
+        self.expect("ask", "mcp__ccd_session_mgmt__send_message", {"session_id": "local_x", "message": "hi"})
 
     def test_lookalike_send_message_still_classified(self):
         got, _ = self.run_guard("mcp__other__send_message", {"channel": TEAM, "text": "hi"})
