@@ -488,7 +488,12 @@ USAGE = """mother hub <verb>
   uninstall   unload the job and remove the plist
   check       one read per hub.connections entry, under the plist's environment: cap | ok/✗ | reason; exit 1 if any fails
   status      watcher and hub heartbeats; exit 2 if either is stale or the watcher never ran
-(tail, decide, session, done, snooze, show: later)"""
+  tail        [--once] [--follow]  inbox lines after hub.json inbox_cursor, one JSON line per key (the hub's Monitor runs --follow)
+  decide      stdin: one decision object or a list {line_id, key, decision: log|now|route|propose|error, ...}
+  session     add <key> --id ID --name N --title T [--link URL] [--also K,K] | drop <key> | seen <key> | for <key>
+  done        <U-id>  mark an update done
+  snooze      <U-id> 1h|tomorrow|next-week
+  show        [--json]  pending proposals, updates and sessions"""
 
 
 def default_plist_path() -> Path:
@@ -711,6 +716,402 @@ def status(ws: Path, at: datetime, out=None) -> int:
     return 2 if stale else 0
 
 
+# ------------------------------------------------------------------------------------------- hub verbs
+ROUTED_MAX = 50
+DECISIONS = ("log", "now", "route", "propose", "error")
+
+
+def _inbox_files(ws: Path) -> List[Path]:
+    d = hub_dir(ws)
+    files = sorted(d.glob("inbox-*.jsonl"))
+    cur = d / "inbox.jsonl"
+    if cur.exists():
+        files.append(cur)
+    return files
+
+
+def read_inbox(ws: Path) -> List[dict]:
+    """Every readable line of the rotated files then inbox.jsonl, oldest first. A torn or odd line is skipped."""
+    out = []
+    for f in _inbox_files(ws):
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            try:
+                l = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(l, dict) and isinstance(l.get("id"), str) and isinstance(l.get("key"), str):
+                out.append(l)
+    return out
+
+
+def after_cursor(lines: List[dict], cursor) -> Tuple[List[dict], bool]:
+    """(lines after the cursor line, cursor_missing). No cursor = everything; a cursor that is no longer in the
+    files (pruned) = everything kept, with cursor_missing True."""
+    if not cursor:
+        return lines, False
+    idx = [i for i, l in enumerate(lines) if l["id"] == cursor]
+    if not idx:
+        return lines, True
+    return lines[idx[-1] + 1:], False
+
+
+def _hub_doc(ws: Path) -> dict:
+    h = load_json(ws, "hub.json", {})
+    h = h if isinstance(h, dict) else {}
+    h.setdefault("version", 1)
+    for k in ("routed", "pending", "updates"):
+        if not isinstance(h.get(k), list):
+            h[k] = []
+    return h
+
+
+def _sessions_doc(ws: Path) -> dict:
+    d = load_json(ws, "sessions.json", {})
+    d = d if isinstance(d, dict) else {}
+    d.setdefault("version", 1)
+    if not isinstance(d.get("sessions"), dict):
+        d["sessions"] = {}
+    return d
+
+
+def find_session(sessions: dict, keys, live_only: bool = True):
+    """(session key, session) for the first of `keys` that is a session key or in a session's `also`; live
+    sessions only unless live_only is False. None when there is no such session."""
+    items = sessions.get("sessions") or {}
+    for k in keys:
+        cands = [(sk, s) for sk, s in items.items() if isinstance(s, dict)
+                 and (sk == k or k in (s.get("also") or []))]
+        for sk, s in cands:
+            if not live_only or s.get("state") == "live":
+                return sk, s
+    return None
+
+
+def _apply_resolved(ws: Path, keys) -> None:
+    keys = set(keys)
+    if not keys:
+        return
+    with locked(ws):
+        h = _hub_doc(ws)
+        pend = [p for p in h["pending"] if p.get("key") not in keys]
+        upd = [u for u in h["updates"] if u.get("key") not in keys]
+        if len(pend) != len(h["pending"]) or len(upd) != len(h["updates"]):
+            h["pending"], h["updates"] = pend, upd
+            save_json(ws, "hub.json", h)
+
+
+def digest(ws: Path, batch: List[dict]) -> List[dict]:
+    """What tail prints for a batch: sweep and error lines as they are, update lines collapsed to one per key,
+    and no output for a key whose latest line is `resolved` (that resolution is applied to hub.json)."""
+    pos = {}
+    for i, l in enumerate(batch):
+        pos[l["id"]] = i
+    by_key = {}
+    keep = []
+    for l in batch:
+        if l.get("kind") in ("sweep", "error"):
+            keep.append(l)
+        else:
+            by_key.setdefault(l["key"], []).append(l)
+    resolved = []
+    for k, ls in by_key.items():
+        latest = ls[0]
+        for l in ls:
+            if l["at"] >= latest["at"]:
+                latest = l
+        if latest.get("kind") == "resolved":
+            resolved.append(k)
+            continue
+        keep.extend(coalesce([l for l in ls if l.get("kind") == "update"]))
+    _apply_resolved(ws, resolved)
+    keep.sort(key=lambda l: pos.get(l["id"], 0))
+    return keep
+
+
+def tail(ws: Path, follow: bool = False, out=None, err=None, sleep=time.sleep, stop=None,
+         every: float = 1.5) -> int:
+    """Print the inbox lines after hub.json `inbox_cursor`, one JSON line per collapsed item, flushed. Never moves
+    the cursor (`decide` does). With `follow`, keep polling the files: a rotation needs no special handling because
+    the rotated and current files are read together and lines already printed are remembered by id."""
+    out = out or sys.stdout
+    err = err or sys.stderr
+    seen = set()
+    warned = False
+    sig = None
+    while True:
+        files = _inbox_files(ws)
+        try:
+            now_sig = [(f.name, f.stat().st_size, f.stat().st_mtime_ns) for f in files]
+        except OSError:
+            now_sig = None
+        if now_sig is None or now_sig != sig:
+            sig = now_sig
+            cursor = _hub_doc(ws).get("inbox_cursor")
+            lines, missing = after_cursor(read_inbox(ws), cursor)
+            if missing and not warned:
+                warned = True
+                print("mother hub tail: cursor line %s is no longer in the inbox (pruned after %d days); "
+                      "starting from the oldest kept line" % (cursor, KEEP_DAYS), file=err)
+                err.flush()
+            batch = [l for l in lines if l["id"] not in seen]
+            seen.update(l["id"] for l in batch)
+            for l in digest(ws, batch):
+                out.write(json.dumps(l, sort_keys=True) + "\n")
+            out.flush()
+        if not follow or (stop is not None and stop()):
+            return 0
+        sleep(every)
+
+
+def _schedule(cfg: dict):
+    import now as nowmod
+    return nowmod.Schedule.from_config(cfg or {})
+
+
+def _prune_updates(h: dict, sessions: dict, cfg: dict, at: datetime) -> None:
+    """Drop updates older than hub.update_ttl_hours working hours (counted from the later of `at` and a snooze end)
+    and those whose key has a live session; snoozes that have ended become open again."""
+    import now as nowmod
+    import hub_sources
+    try:
+        ttl = float(_hub_cfg(cfg).get("update_ttl_hours", 24))
+    except (TypeError, ValueError):
+        ttl = 24.0
+    sched = _schedule(cfg)
+    keep = []
+    for u in h["updates"]:
+        if find_session(sessions, [u.get("key")]):
+            continue
+        try:
+            ref = hub_sources.parse_iso(u.get("at"))
+            if u.get("snooze_until"):
+                ref = max(ref, hub_sources.parse_iso(u["snooze_until"]))
+                if u.get("state") == "snoozed" and hub_sources.parse_iso(u["snooze_until"]) <= at:
+                    u["state"] = "open"
+            if nowmod.working_hours(ref, at, sched) > ttl:
+                continue
+        except (TypeError, ValueError, AttributeError):
+            pass
+        keep.append(u)
+    h["updates"] = keep
+
+
+def _save_hub(ws: Path, h: dict, sessions: dict, cfg: dict, at: datetime) -> None:
+    _prune_updates(h, sessions, cfg, at)
+    save_json(ws, "hub.json", h)
+
+
+def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
+    """Record the hub's decisions. Returns one result per item: {line_id, key, decision (as stored), session_id?,
+    note?}. A `route` to a key with no live session (directly or through `also`) is stored as `propose`."""
+    stamp = _iso(at)
+    lines = read_inbox(ws)
+    by_id = {l["id"]: l for l in lines}
+    order = {}
+    for i, l in enumerate(lines):
+        order[l["id"]] = i
+    results = []
+    with locked(ws):
+        h = _hub_doc(ws)
+        sess = _sessions_doc(ws)
+        for it in items:
+            line = by_id.get(it["line_id"]) or {}
+            key, dec = it["key"], it["decision"]
+            res = {"line_id": it["line_id"], "key": key, "decision": dec}
+            also = list(it.get("also") or line.get("also") or [])
+            entry = {"line_id": it["line_id"], "key": key, "decision": dec, "at": stamp}
+            if dec == "route":
+                hit = find_session(sess, [key] + also)
+                if hit:
+                    sk, s = hit
+                    s["unseen"] = int(s.get("unseen") or 0) + 1
+                    s["last_routed_at"] = stamp
+                    entry["session_id"] = res["session_id"] = s.get("session_id")
+                else:
+                    dec = res["decision"] = entry["decision"] = "propose"
+                    res["note"] = "no live session for %s; stored as a proposal" % key
+            title = it.get("title") or line.get("title") or key
+            link = it.get("link") or line.get("link") or ""
+            if dec == "propose":
+                h["pending"] = [p for p in h["pending"] if p.get("key") != key]
+                h["pending"].append({"key": key, "title": title, "link": link, "read": it.get("read") or "",
+                                     "next_step": it.get("next_step") or "", "raised_at": stamp,
+                                     "name": it.get("name") or ""})
+            elif dec == "now":
+                old = [u for u in h["updates"] if u.get("key") == key and u.get("state") != "done"]
+                if old:
+                    u = old[0]
+                    u.update({"title": title, "why": it.get("why") or u.get("why") or "", "link": link,
+                              "at": stamp, "state": "open"})
+                    u.pop("snooze_until", None)
+                    res["update_id"] = u["id"]
+                else:
+                    n = int(h.get("next_update") or 0)
+                    for u in h["updates"]:
+                        m = re.match(r"U(\d+)$", str(u.get("id")))
+                        n = max(n, int(m.group(1)) if m else 0)
+                    n += 1
+                    h["next_update"] = n
+                    h["updates"].append({"id": "U%d" % n, "key": key, "title": title,
+                                         "why": it.get("why") or "", "link": link, "at": stamp, "state": "open"})
+                    res["update_id"] = "U%d" % n
+            h["routed"].append(entry)
+            cur = h.get("inbox_cursor")
+            if it["line_id"] in order and (cur not in order or order[it["line_id"]] > order[cur]):
+                h["inbox_cursor"] = it["line_id"]
+            elif it["line_id"] not in order:
+                h["inbox_cursor"] = it["line_id"]
+            results.append(res)
+        h["routed"] = h["routed"][-ROUTED_MAX:]
+        h["last_wake"] = stamp
+        save_json(ws, "sessions.json", sess)
+        _save_hub(ws, h, sess, cfg, at)
+    return results
+
+
+def _parse_flags(args, valued) -> Tuple[List[str], dict]:
+    pos, opts = [], {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--") and a[2:] in valued:
+            if i + 1 >= len(args):
+                raise ValueError("%s needs a value" % a)
+            opts[a[2:]] = args[i + 1]
+            i += 2
+        elif a.startswith("--"):
+            opts[a[2:]] = True
+            i += 1
+        else:
+            pos.append(a)
+            i += 1
+    return pos, opts
+
+
+def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> int:
+    sub, rest = (args[0], args[1:]) if args else ("", [])
+    try:
+        pos, o = _parse_flags(rest, ("id", "name", "title", "link", "also"))
+    except ValueError as e:
+        print("mother hub session: %s" % e, file=sys.stderr)
+        return 2
+    if sub not in ("add", "drop", "seen", "for") or len(pos) != 1:
+        print("usage: mother hub session add <key> --id ID --name N --title T [--link URL] [--also K,K] | "
+              "drop <key> | seen <key> | for <key>", file=sys.stderr)
+        return 2
+    key = pos[0]
+    stamp = _iso(at)
+    if sub == "for":
+        hit = find_session(_sessions_doc(ws), [key])
+        if not hit:
+            print("no live session for %s" % key, file=sys.stderr)
+            return 1
+        print(json.dumps({"key": hit[0], "session_id": hit[1].get("session_id")}) if as_json
+              else hit[1].get("session_id"), file=out)
+        return 0
+    with locked(ws):
+        sess = _sessions_doc(ws)
+        h = _hub_doc(ws)
+        items = sess["sessions"]
+        if sub == "add":
+            if not o.get("id") or not o.get("name") or not o.get("title"):
+                print("mother hub session add needs --id, --name and --title", file=sys.stderr)
+                return 2
+            also = [a for a in str(o.get("also") or "").split(",") if a]
+            prev = items.get(key) or {}
+            items[key] = {"session_id": o["id"], "name": o["name"], "title": o["title"],
+                          "link": o.get("link") or None, "also": also,
+                          "opened_at": prev.get("opened_at") or stamp, "last_routed_at": prev.get("last_routed_at"),
+                          "unseen": 0, "state": "live"}
+            gone = set([key] + also)
+            h["pending"] = [p for p in h["pending"] if p.get("key") not in gone]
+        else:
+            if key not in items:
+                print("no session for %s" % key, file=sys.stderr)
+                return 1
+            if sub == "drop":
+                items[key]["state"] = "dropped"
+            else:
+                items[key]["unseen"] = 0
+        save_json(ws, "sessions.json", sess)
+        _save_hub(ws, h, sess, cfg, at)
+    print(json.dumps({"ok": True, "key": key, "action": sub}) if as_json else "%s: %s" % (sub, key), file=out)
+    return 0
+
+
+def update_cmd(ws: Path, cfg: dict, at: datetime, verb: str, args, as_json: bool, out) -> int:
+    need = 2 if verb == "snooze" else 1
+    if len(args) != need:
+        print("usage: mother hub %s" % ("snooze <U-id> 1h|tomorrow|next-week" if verb == "snooze" else "done <U-id>"),
+              file=sys.stderr)
+        return 2
+    uid = args[0]
+    until = None
+    if verb == "snooze":
+        import now as nowmod
+        try:
+            until = _iso(nowmod.snooze_until(args[1], at, _schedule(cfg)))
+        except ValueError as e:
+            print("mother hub snooze: %s" % e, file=sys.stderr)
+            return 2
+    with locked(ws):
+        h = _hub_doc(ws)
+        sess = _sessions_doc(ws)
+        u = next((u for u in h["updates"] if u.get("id") == uid), None)
+        if not u:
+            print("no update %s" % uid, file=sys.stderr)
+            return 1
+        if verb == "done":
+            u["state"] = "done"
+            u.pop("snooze_until", None)
+        else:
+            u["state"] = "snoozed"
+            u["snooze_until"] = until
+        _save_hub(ws, h, sess, cfg, at)
+    print(json.dumps({"ok": True, "id": uid, "state": u["state"], "snooze_until": u.get("snooze_until")})
+          if as_json else "%s: %s%s" % (uid, u["state"], " until %s" % until if until else ""), file=out)
+    return 0
+
+
+def show(ws: Path, as_json: bool, out) -> int:
+    h, s = _hub_doc(ws), _sessions_doc(ws)
+    if as_json:
+        print(json.dumps({"hub": h, "sessions": s["sessions"]}, indent=2, sort_keys=True), file=out)
+        return 0
+    print("last wake: %s" % (h.get("last_wake") or "never"), file=out)
+    print("pending proposals: %d" % len(h["pending"]), file=out)
+    for p in h["pending"]:
+        print("  %s | %s | %s" % (p.get("key"), p.get("title"), p.get("next_step") or ""), file=out)
+    print("updates: %d" % len(h["updates"]), file=out)
+    for u in h["updates"]:
+        print("  %s | %s | %s | %s%s" % (u.get("id"), u.get("state"), u.get("key"), u.get("title"),
+                                       " (until %s)" % u["snooze_until"] if u.get("snooze_until") else ""), file=out)
+    live = [(k, v) for k, v in s["sessions"].items() if isinstance(v, dict)]
+    print("sessions: %d" % len(live), file=out)
+    for k, v in sorted(live):
+        print("  %s | %s | %s | unseen %s | %s" % (k, v.get("name"), v.get("state"), v.get("unseen"),
+                                                  v.get("link") or "no link"), file=out)
+    return 0
+
+
+def _read_decisions(stdin) -> List[dict]:
+    try:
+        doc = json.loads(stdin.read())
+    except ValueError as e:
+        raise ValueError("stdin is not JSON: %s" % e)
+    items = doc if isinstance(doc, list) else [doc]
+    for it in items:
+        if not isinstance(it, dict) or not isinstance(it.get("line_id"), str) or not isinstance(it.get("key"), str):
+            raise ValueError("each decision needs a string line_id and key")
+        if it.get("decision") not in DECISIONS:
+            raise ValueError("decision must be one of %s" % ", ".join(DECISIONS))
+    return items
+
+
 def main(args, ws, cfg, at) -> int:
     verb, rest = (args[0], args[1:]) if args else ("", [])
     if verb in ("", "help", "-h", "--help"):
@@ -728,5 +1129,28 @@ def main(args, ws, cfg, at) -> int:
         return check(cfg)
     if verb == "status":
         return status(ws, at)
-    print("mother hub: unknown or not yet built verb %r; see `mother hub help`" % verb, file=sys.stderr)
+    as_json = "--json" in rest
+    rest = [a for a in rest if a != "--json"]
+    if verb == "tail":
+        return tail(ws, follow="--follow" in rest)
+    if verb == "decide":
+        try:
+            items = _read_decisions(sys.stdin)
+        except ValueError as e:
+            print("mother hub decide: %s" % e, file=sys.stderr)
+            return 2
+        res = decide(ws, cfg, at, items)
+        if as_json:
+            print(json.dumps(res, indent=2))
+        else:
+            for r in res:
+                print("%s -> %s%s" % (r["key"], r["decision"], " (%s)" % r["note"] if r.get("note") else ""))
+        return 0
+    if verb == "session":
+        return session_cmd(ws, cfg, at, rest, as_json, sys.stdout)
+    if verb in ("done", "snooze"):
+        return update_cmd(ws, cfg, at, verb, rest, as_json, sys.stdout)
+    if verb == "show":
+        return show(ws, as_json, sys.stdout)
+    print("mother hub: unknown verb %r; see `mother hub help`" % verb, file=sys.stderr)
     return 1

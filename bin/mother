@@ -18,9 +18,8 @@ Commands:
                                bridge (send; the guard asks first), install/stop/status (`mother whatsapp help`); home machine only
   whatsapp setup | link | unlink
                                the manager's guided WhatsApp setup and device link; own terminal only (a TTY; the guard denies them to the agent)
-  hub watch|install|uninstall|check|status
-                               the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e);
-                               tail, decide, session, done, snooze, show land with the hub session
+  hub watch|install|uninstall|check|status|tail|decide|session|done|snooze|show
+                               the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e)
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   now merge|show|done|snooze|top|do

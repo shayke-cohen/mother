@@ -568,9 +568,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `also` = other keys found in the text. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
   file from a crash into the dated file, and deletes dated files 7 or more days old.
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
-  connection), `status`, and, landing later, `tail` (recent inbox), `decide` (the hub's one write path for a
-  decision), `session add|drop|seen|for` (the session registry), `done`, `snooze`, `show`. `mother hub help` works
-  without a workspace.
+  connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `done`, `snooze`, `show` (below).
+  `mother hub help` works without a workspace. `--json` gives machine output; without it the output is short text.
 - **launchd job.** Label `com.mother.hub`, plist `~/Library/LaunchAgents/com.mother.hub.plist`.
   `ProgramArguments` = absolute python, absolute `bin/mother`, `hub`, `watch`; `EnvironmentVariables` =
   `MOTHER_WORKSPACE` and a `PATH` of the directories of every resolved connection program (`cli` wins over
@@ -606,8 +605,36 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `cursors.json` `_last_sweep` (or there is none) and something is pending: `hub.json` `pending` is non-empty, or a
   `sessions.json` session with `state: live` has `unseen > 0`. Both files are read defensively; a missing or
   unreadable one counts as nothing pending.
-- **Decisions.** The hub records each update's outcome through `mother hub decide` as one of
-  `log|now|route|propose|error`. Details land with the tasks that build them.
+- **`hub.json`.** `{version: 1, last_wake, inbox_cursor (an inbox line id), next_update (counter behind the U ids),
+  routed: [at most 50 {line_id, key, decision, session_id?, at}], pending: [{key, title, link, read, next_step,
+  raised_at, name}], updates: [{id (U<n>), key, title, why, link, at, state: open|done|snoozed, snooze_until?}]}`.
+  Readers must tolerate any field missing.
+- **`sessions.json`.** `{version: 1, sessions: {<key>: {session_id, name, title, link (a `claude://` URL or null,
+  stored as given), also: [key], opened_at, last_routed_at, unseen (int), state: live|dropped}}}`. A key maps to a
+  session when it, or any key in the line's `also`, is a session key or is in a session's `also`; only `live`
+  sessions receive anything.
+- **`tail [--once] [--follow]`.** Prints, one JSON line per item and flushed, the inbox lines after
+  `hub.json` `inbox_cursor`, reading the rotated `inbox-*.jsonl` files and then `inbox.jsonl` in order. `update`
+  lines are collapsed to one per key (`coalesce`); `sweep` and `error` lines pass through as they are. A key whose
+  latest line is `resolved` prints nothing and its `pending` and `updates` entries are dropped. With no cursor it
+  starts at the oldest kept line; if the cursor line was pruned (older than 7 days) it does the same and says so
+  on stderr. `--follow` (what the hub's Monitor runs) keeps polling the files every 1.5 s, remembers printed line
+  ids and so survives a rotation. `tail` never moves the cursor; only `decide` does. `--once` (the default) exits
+  after one pass.
+- **`decide`.** stdin is one object or a list `{line_id, key, decision: log|now|route|propose|error, title?, why?,
+  link?, read?, next_step?, name?, also?}` (exit 2 on bad input, nothing written). Under `hub.lock` it appends to
+  `routed` (last 50), moves `inbox_cursor` to `line_id` (never backwards), and sets `last_wake`. `now` creates (or
+  refreshes, per key) an `updates` entry with the next `U<n>`; `propose` replaces the `pending` entry for the key;
+  `route` adds 1 to `unseen` and sets `last_routed_at` on the matching live session. A `route` with no live session
+  is stored as `propose`; the result says so (`note`). `title` and `link` default to the inbox line's. Output: one
+  `{line_id, key, decision (as stored), session_id?, update_id?, note?}` per item.
+- **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (live, `unseen` 0; removes the
+  key and its `also` from `pending`), `drop <key>` (state `dropped`), `seen <key>` (`unseen` 0; exit 1 for an
+  unknown key), `for <key>` (prints the live session id, or exits 1).
+- **`done <U-id>`, `snooze <U-id> 1h|tomorrow|next-week`, `show [--json]`.** Snooze uses `mother now`'s
+  `snooze_until`; an ended snooze is open again at the next write. Exit 1 for an unknown id, 2 for a bad word.
+- **Update expiry.** On every write an update goes when it is older than `hub.update_ttl_hours` **working** hours
+  (`now.working_hours`, counted from the later of `at` and `snooze_until`) or when its key has a live session.
 - **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
   posts or writes to a tracker.
   Adapters (`lib/hub_sources.py`) are keyed `<cap>:<connector>` (`chat:slack`, `mail:gmail`, `tracker:jira`,

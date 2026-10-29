@@ -609,5 +609,234 @@ class FakeClient:
         self.closed = True
 
 
+
+class Verbs(unittest.TestCase):
+    AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)  # a Thursday
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.cfg = {"manager": {"timezone": "UTC"}, "hub": {"update_ttl_hours": 24}}
+
+    def tail_lines(self, **kw):
+        import io
+        buf = io.StringIO()
+        hub.tail(self.ws, out=buf, err=kw.pop("err", io.StringIO()), **kw)
+        return [json.loads(x) for x in buf.getvalue().splitlines()]
+
+    def add(self, *lines):
+        hub.append_inbox(self.ws, list(lines))
+
+    def decide(self, *items, **kw):
+        return hub.decide(self.ws, self.cfg, kw.get("at", self.AT), list(items))
+
+    def hub_doc(self):
+        return hub.load_json(self.ws, "hub.json", {})
+
+    def session(self, *args, **kw):
+        import io
+        buf = io.StringIO()
+        rc = hub.session_cmd(self.ws, self.cfg, kw.get("at", self.AT), list(args), False, buf)
+        return rc, buf.getvalue()
+
+    def test_tail_collapses_by_key_and_skips_resolved(self):
+        self.add(line(key="PLAT-1", at="2026-10-29T09:00:00Z", title="old"),
+                 line(key="PLAT-1", at="2026-10-29T09:05:00Z", title="new", also=["PLAT-9"]),
+                 line(key="PLAT-2", at="2026-10-29T09:01:00Z"),
+                 line(key="PLAT-2", at="2026-10-29T09:06:00Z", kind="resolved"),
+                 line(source="hub", key="sweep", kind="sweep", at="2026-10-29T09:07:00Z"),
+                 line(source="hub", key="watcher:chat", kind="error", at="2026-10-29T09:08:00Z"))
+        hub.save_json(self.ws, "hub.json", {"version": 1, "pending": [{"key": "PLAT-2"}, {"key": "PLAT-1"}],
+                                           "updates": [{"id": "U1", "key": "PLAT-2", "state": "open"}]})
+        out = self.tail_lines()
+        self.assertEqual([(l["kind"], l["key"]) for l in out],
+                         [("update", "PLAT-1"), ("sweep", "sweep"), ("error", "watcher:chat")])
+        self.assertEqual(out[0]["title"], "new")
+        self.assertEqual(out[0]["also"], ["PLAT-9"])
+        h = self.hub_doc()
+        self.assertEqual([p["key"] for p in h["pending"]], ["PLAT-1"])
+        self.assertEqual(h["updates"], [])
+        self.assertNotIn("inbox_cursor", h)  # tail never moves the cursor
+
+    def test_decide_advances_cursor_and_logs(self):
+        a = line(key="PLAT-1", at="2026-10-29T09:00:00Z")
+        b = line(key="PLAT-2", at="2026-10-29T09:01:00Z")
+        self.add(a, b)
+        res = self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "log"})
+        self.assertEqual(res[0]["decision"], "log")
+        h = self.hub_doc()
+        self.assertEqual(h["inbox_cursor"], a["id"])
+        self.assertEqual(h["last_wake"], "2026-10-29T10:00:00Z")
+        self.assertEqual(h["routed"][0]["decision"], "log")
+        self.assertEqual([l["key"] for l in self.tail_lines()], ["PLAT-2"])
+        self.decide({"line_id": b["id"], "key": "PLAT-2", "decision": "error"})
+        self.assertEqual(self.tail_lines(), [])
+        # an older line id never moves the cursor back
+        self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "log"})
+        self.assertEqual(self.hub_doc()["inbox_cursor"], b["id"])
+
+    def test_routed_keeps_last_50(self):
+        for i in range(55):
+            self.decide({"line_id": "x:%d" % i, "key": "K-%d" % i, "decision": "log"})
+        r = self.hub_doc()["routed"]
+        self.assertEqual(len(r), 50)
+        self.assertEqual(r[-1]["key"], "K-54")
+
+    def test_now_and_propose_write_updates_and_pending(self):
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "now", "title": "T", "why": "w",
+                     "link": "https://example.com/1"},
+                    {"line_id": "x:2", "key": "PLAT-2", "decision": "propose", "title": "P", "read": "r",
+                     "next_step": "n", "name": "plat-2"})
+        h = self.hub_doc()
+        self.assertEqual(h["updates"][0]["id"], "U1")
+        self.assertEqual(h["updates"][0]["state"], "open")
+        self.assertEqual(h["updates"][0]["why"], "w")
+        self.assertEqual(h["pending"][0]["key"], "PLAT-2")
+        self.assertEqual(h["pending"][0]["raised_at"], "2026-10-29T10:00:00Z")
+        self.assertEqual(h["pending"][0]["name"], "plat-2")
+        self.decide({"line_id": "x:3", "key": "PLAT-1", "decision": "now", "title": "T2"})
+        self.assertEqual(len(self.hub_doc()["updates"]), 1)
+
+    def test_route_increments_unseen(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t",
+                     "--link", "claude://session/S1")
+        res = self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "route"})
+        self.assertEqual(res[0]["session_id"], "S1")
+        s = hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]
+        self.assertEqual(s["unseen"], 1)
+        self.assertEqual(s["last_routed_at"], "2026-10-29T10:00:00Z")
+        self.assertEqual(s["link"], "claude://session/S1")
+        self.assertEqual(self.hub_doc()["routed"][0]["session_id"], "S1")
+        self.session("seen", "PLAT-1")
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["unseen"], 0)
+
+    def test_route_to_dropped_session_becomes_proposal(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
+        self.session("drop", "PLAT-1")
+        res = self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "route", "title": "T"},
+                          {"line_id": "x:2", "key": "PLAT-7", "decision": "route"})
+        for r in res:
+            self.assertEqual(r["decision"], "propose")
+            self.assertIn("proposal", r["note"])
+        h = self.hub_doc()
+        self.assertEqual({p["key"] for p in h["pending"]}, {"PLAT-1", "PLAT-7"})
+        self.assertEqual(h["routed"][0]["decision"], "propose")
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["unseen"], 0)
+
+    def test_also_key_finds_session(self):
+        self.session("add", "PLAT-12", "--id", "S12", "--name", "n", "--title", "t", "--also", "o/r#4")
+        l = line(source="chat", key="C00000001/1700.1", also=["PLAT-12"])
+        self.add(l)
+        res = self.decide({"line_id": l["id"], "key": l["key"], "decision": "route"})
+        self.assertEqual(res[0]["session_id"], "S12")
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-12"]["unseen"], 1)
+        res = self.decide({"line_id": "x:9", "key": "o/r#4", "decision": "route"})
+        self.assertEqual(res[0]["session_id"], "S12")
+        rc, out = self.session("for", "o/r#4")
+        self.assertEqual((rc, out.strip()), (0, "S12"))
+        self.assertEqual(self.session("for", "PLAT-99")[0], 1)
+
+    def test_session_add_clears_pending(self):
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "propose"},
+                    {"line_id": "x:2", "key": "PLAT-2", "decision": "propose"},
+                    {"line_id": "x:3", "key": "PLAT-1", "decision": "now"})
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
+        h = self.hub_doc()
+        self.assertEqual([p["key"] for p in h["pending"]], ["PLAT-2"])
+        self.assertEqual(h["updates"], [])  # its key gained a session
+        s = hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]
+        self.assertEqual((s["state"], s["unseen"], s["link"], s["also"]), ("live", 0, None, []))
+
+    def test_updates_expire_after_ttl_working_hours(self):
+        self.cfg["hub"]["update_ttl_hours"] = 8
+        # Thursday 09:00 UTC; default hours 06:00-22:00 Mon-Fri
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "now", "title": "t"},
+                    at=datetime(2026, 10, 29, 9, 0, tzinfo=UTC))
+        # Thursday 16:00 = 7 working hours: still there
+        self.decide({"line_id": "x:2", "key": "PLAT-2", "decision": "log"}, at=datetime(2026, 10, 29, 16, 0, tzinfo=UTC))
+        self.assertEqual(len(self.hub_doc()["updates"]), 1)
+        # Saturday evening: hours Thu 16-22 (6) + Fri (16) > 8 -> gone; a weekend alone would not count
+        self.decide({"line_id": "x:3", "key": "PLAT-3", "decision": "log"}, at=datetime(2026, 10, 31, 20, 0, tzinfo=UTC))
+        self.assertEqual(self.hub_doc()["updates"], [])
+
+    def test_updates_survive_a_weekend(self):
+        self.cfg["hub"]["update_ttl_hours"] = 8
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "now", "title": "t"},
+                    at=datetime(2026, 10, 30, 20, 0, tzinfo=UTC))  # Friday 20:00, 2 working hours left in day
+        self.decide({"line_id": "x:2", "key": "PLAT-2", "decision": "log"}, at=datetime(2026, 11, 1, 20, 0, tzinfo=UTC))
+        self.assertEqual(len(self.hub_doc()["updates"]), 1)
+
+    def test_update_done_and_snooze(self):
+        import io
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "now", "title": "a"},
+                    {"line_id": "x:2", "key": "PLAT-2", "decision": "now", "title": "b"})
+        out = io.StringIO()
+        self.assertEqual(hub.update_cmd(self.ws, self.cfg, self.AT, "done", ["U1"], False, out), 0)
+        self.assertEqual(hub.update_cmd(self.ws, self.cfg, self.AT, "snooze", ["U2", "1h"], False, out), 0)
+        ups = {u["id"]: u for u in self.hub_doc()["updates"]}
+        self.assertEqual(ups["U1"]["state"], "done")
+        self.assertEqual(ups["U2"]["state"], "snoozed")
+        self.assertEqual(ups["U2"]["snooze_until"], "2026-10-29T11:00:00Z")
+        self.assertEqual(hub.update_cmd(self.ws, self.cfg, self.AT, "done", ["U9"], False, out), 1)
+        self.assertEqual(hub.update_cmd(self.ws, self.cfg, self.AT, "snooze", ["U2", "soon"], False, out), 2)
+        # once the snooze ends the update is open again
+        self.decide({"line_id": "x:3", "key": "PLAT-3", "decision": "log"}, at=self.AT + timedelta(hours=2))
+        self.assertEqual({u["id"]: u["state"] for u in self.hub_doc()["updates"]}["U2"], "open")
+
+    def test_tail_reads_rotated_files_from_cursor(self):
+        a = line(key="PLAT-1", at="2026-10-28T09:00:00Z")
+        b = line(key="PLAT-2", at="2026-10-28T09:01:00Z")
+        self.add(a, b)
+        hub.rotate_inbox(self.ws, datetime(2026, 10, 28, 23, 0, tzinfo=UTC))
+        c = line(key="PLAT-3", at="2026-10-29T09:00:00Z")
+        self.add(c)
+        hub.save_json(self.ws, "hub.json", {"version": 1, "inbox_cursor": a["id"]})
+        self.assertEqual([l["key"] for l in self.tail_lines()], ["PLAT-2", "PLAT-3"])
+
+    def test_tail_pruned_cursor_starts_from_oldest_and_says_so(self):
+        import io
+        self.add(line(key="PLAT-1"))
+        hub.save_json(self.ws, "hub.json", {"version": 1, "inbox_cursor": "tracker:GONE:2020-01-01T00:00:00Z"})
+        err = io.StringIO()
+        self.assertEqual([l["key"] for l in self.tail_lines(err=err)], ["PLAT-1"])
+        self.assertIn("no longer in the inbox", err.getvalue())
+
+    def test_tail_follow_survives_rotation(self):
+        import io
+
+        class Out(io.StringIO):
+            pass
+        out = Out()
+        self.add(line(key="PLAT-1", at="2026-10-29T09:00:00Z"))
+        step = {"n": 0}
+
+        def sleep(_):
+            step["n"] += 1
+            if step["n"] == 1:
+                self.add(line(key="PLAT-2", at="2026-10-29T09:01:00Z"))
+            elif step["n"] == 2:
+                hub.rotate_inbox(self.ws, datetime(2026, 10, 29, 23, 0, tzinfo=UTC))
+                self.add(line(key="PLAT-3", at="2026-10-30T09:00:00Z"))
+
+        hub.tail(self.ws, follow=True, out=out, err=io.StringIO(), sleep=sleep, stop=lambda: step["n"] >= 3)
+        keys = [json.loads(x)["key"] for x in out.getvalue().splitlines()]
+        self.assertEqual(keys, ["PLAT-1", "PLAT-2", "PLAT-3"])
+
+    def test_main_decide_json_and_bad_input(self):
+        import io
+        from unittest import mock
+        with mock.patch("sys.stdin", io.StringIO(json.dumps({"line_id": "x:1", "key": "PLAT-1", "decision": "log"}))), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as so:
+            self.assertEqual(hub.main(["decide", "--json"], self.ws, self.cfg, self.AT), 0)
+        self.assertEqual(json.loads(so.getvalue())[0]["decision"], "log")
+        with mock.patch("sys.stdin", io.StringIO('[{"line_id":"a","key":"k","decision":"bogus"}]')), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(hub.main(["decide"], self.ws, self.cfg, self.AT), 2)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as so:
+            self.assertEqual(hub.main(["show", "--json"], self.ws, self.cfg, self.AT), 0)
+        self.assertIn("pending", json.loads(so.getvalue())["hub"])
+
+
 if __name__ == "__main__":
     unittest.main()
