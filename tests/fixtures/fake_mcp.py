@@ -5,6 +5,7 @@ FAKE_MCP_DIE_AFTER=N exits after N tools/call (to test restart)."""
 import json
 import os
 import sys
+import time
 
 fx = json.load(open(os.environ["FAKE_MCP_FIXTURE"]))
 log = os.environ.get("FAKE_MCP_LOG")
@@ -40,6 +41,8 @@ for raw in sys.stdin:
             with open(log, "a") as f:
                 f.write(json.dumps(p) + "\n")
         calls += 1
+        if p["name"] in fx.get("sleep", {}):
+            time.sleep(fx["sleep"][p["name"]])
         if die and calls > die:
             sys.exit(0)
         if p["name"] in fx.get("errors", {}):

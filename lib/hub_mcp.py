@@ -40,7 +40,6 @@ class Client:
         self._proc = None
         self._q = None  # type: Any
         self._id = 0
-        self._restarted = False
 
     # -- process plumbing
     def _spawn(self) -> None:
@@ -63,6 +62,8 @@ class Client:
         q.put(None)  # EOF
 
     def _send(self, method: str, params=None, notify: bool = False):
+        if self._proc is None:
+            raise EOFError("server not running")  # closed after a timeout or crash; the caller respawns
         msg = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             msg["params"] = params
@@ -82,7 +83,7 @@ class Client:
                 r = self._q.get(timeout=self.timeout)
             except queue.Empty:
                 self.close()
-                raise McpError("timeout", "no reply to %s within %ss" % (method, self.timeout))
+                raise McpError("unreachable", "no reply to %s within %ss" % (method, self.timeout))
             if r is None:
                 raise EOFError("server closed")
             if r.get("id") == want:
@@ -106,21 +107,20 @@ class Client:
             self._handshake()
         except EOFError:
             self.close()
-            raise McpError("other", "server closed during start")
+            raise McpError("dropped", "server closed during start")
 
     def call(self, name: str, arguments: dict) -> Any:
+        params = {"name": name, "arguments": arguments or {}}
         try:
-            res = self._send("tools/call", {"name": name, "arguments": arguments or {}})
+            res = self._send("tools/call", params)
         except EOFError:
-            if self._restarted:
-                raise McpError("other", "server closed")
-            self._restarted = True
+            # One restart per call: a later crash gets its own restart.
             self.close()
             self.start()
             try:
-                res = self._send("tools/call", {"name": name, "arguments": arguments or {}})
+                res = self._send("tools/call", params)
             except EOFError:
-                raise McpError("other", "server closed")
+                raise McpError("dropped", "server closed")
         res = res or {}
         text = ""
         for c in res.get("content", []):

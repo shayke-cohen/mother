@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
+import health  # noqa: E402
 import hub_mcp  # noqa: E402
 import hub_sources as hs  # noqa: E402
 
@@ -68,11 +69,32 @@ class TestClient(unittest.TestCase):
         self.assertEqual(c.call("gw__get_x", {"q": 1}), {"a": 1})
 
     def test_error_result_maps_to_kind(self):
-        c = self.client({"tools": ["gw__get_x"], "errors": {"gw__get_x": "Service Unavailable (status 503)"}})
+        c = self.client({"tools": ["gw__get_x"], "errors": {"gw__get_x": "connect ECONNREFUSED 127.0.0.1"}})
         c.start()
         with self.assertRaises(hub_mcp.McpError) as cm:
             c.call("gw__get_x", {})
-        self.assertTrue(cm.exception.kind)
+        self.assertEqual(cm.exception.kind, "unreachable")
+        for msg, kind in (("token expired, sign in", "invalidated"), ("weird failure", "other")):
+            self.assertEqual(health.classify(msg)[1], kind)
+            self.assertIn(kind, health.CLASSES)
+        self.assertIn(cm.exception.kind, health.CLASSES)
+
+    def test_timeout_is_unreachable_and_client_recovers(self):
+        c = self.client({"tools": ["gw__get_x", "gw__slow"], "results": {"gw__get_x": {"ok": 1}},
+                         "sleep": {"gw__slow": 5}})
+        c.timeout = 1
+        c.start()
+        with self.assertRaises(hub_mcp.McpError) as cm:
+            c.call("gw__slow", {})
+        self.assertEqual(cm.exception.kind, "unreachable")
+        self.assertIn(cm.exception.kind, health.CLASSES)
+        self.assertEqual(c.call("gw__get_x", {}), {"ok": 1})  # respawned lazily
+
+    def test_restart_is_per_call_not_per_lifetime(self):
+        c = self.client({"tools": ["gw__get_x"], "results": {"gw__get_x": {"ok": 1}}}, FAKE_MCP_DIE_AFTER="1")
+        c.start()
+        for _ in range(5):  # every second call finds a dead server; each recovers
+            self.assertEqual(c.call("gw__get_x", {}), {"ok": 1})
 
     def test_restarts_once_on_eof(self):
         c = self.client({"tools": ["gw__get_x"], "results": {"gw__get_x": {"ok": 1}}}, FAKE_MCP_DIE_AFTER="1")
@@ -153,6 +175,25 @@ class TestChat(unittest.TestCase):
         self.assertEqual(mention["also"], ["PLAT-12"])
         # an unwatched channel is never read
         self.assertEqual([a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history")], ["C00000001"])
+
+    def test_dm_is_one_thing_and_manager_reply_resolves_it(self):
+        search = {"is:dm": [{"ts": "%.6f" % (NOW - 90), "user": "U00000006", "text": "dm", "channel": {"id": "D00000001"}},
+                            {"ts": "%.6f" % (NOW - 30), "user": "U00000000", "text": "answered",
+                             "channel": {"id": "D00000001"}}]}
+        out, _ = self.poll(search=search)
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("D00000001/dm", "resolved")])
+
+    def test_search_overlap_and_dedupe(self):
+        # cursor is NOW-600; the 10-minute overlap reaches back to NOW-1200
+        late = {"ts": "%.6f" % (NOW - 700), "user": "U00000005", "text": "late indexed", "channel": {"id": "C00000077"}}
+        old = {"ts": "%.6f" % (NOW - 2000), "user": "U00000005", "text": "old", "channel": {"id": "C00000078"}}
+        search = {"<@U00000000>": [late, old]}
+        out, f = self.poll(search=search)
+        self.assertEqual([l["key"] for l in out["lines"]], ["C00000077/%.6f" % (NOW - 700)])
+        sent = [a for n, a in f.calls if n.endswith("search-messages")][0]
+        self.assertEqual(sent["after"], "2026-10-28")  # the day before the cursor's date
+        again, _ = self.poll(search=search, cursor=out["cursor"])
+        self.assertEqual(again["lines"], [])  # the seen-set dedupes the overlap
 
     def test_thread_the_manager_posted_in_yields_replies(self):
         parent = NOW - 3000
@@ -250,10 +291,22 @@ class TestTracker(unittest.TestCase):
                                {"PLAT-1": dict(self.BASE)})
         self.assertEqual([l["kind"] for l in out["lines"]], ["resolved"])
 
-    def test_unseen_old_issue_is_seeded_new_issue_is_candidate(self):
-        out, _ = self.run_poll([issue("PLAT-2"), issue("PLAT-3", created="2026-10-29T09:55:00.000+0000")], {})
-        self.assertEqual([l["key"] for l in out["lines"]], ["PLAT-3"])
-        self.assertIn("PLAT-2", out["cursor"]["fp"])
+    def test_unseen_issue_touched_since_cursor_is_candidate(self):
+        # newly assigned to the manager: old issue, first sight, updated after the cursor
+        out, _ = self.run_poll([issue("PLAT-2")], {})
+        self.assertEqual([l["key"] for l in out["lines"]], ["PLAT-2"])
+        stale = issue("PLAT-4")
+        stale["fields"]["updated"] = "2026-10-29T09:00:00.000+0000"
+        out, _ = self.run_poll([stale], {})
+        self.assertEqual(out["lines"], [])
+        self.assertIn("PLAT-4", out["cursor"]["fp"])
+
+    def test_fingerprints_pruned_by_least_recently_updated(self):
+        fp = {"K-%d" % n: dict(self.BASE, u="2026-10-%02dT00:00:00.000+0000" % (n % 28 + 1)) for n in range(600)}
+        fp["OLDEST-INSERTED"] = dict(self.BASE, u="2026-10-29T09:59:00.000+0000")
+        out, _ = self.run_poll([], dict(list({"OLDEST-INSERTED": fp.pop("OLDEST-INSERTED")}.items()) + list(fp.items())))
+        self.assertEqual(len(out["cursor"]["fp"]), 500)
+        self.assertIn("OLDEST-INSERTED", out["cursor"]["fp"])  # first inserted, but recently updated
 
 
 def event(eid, start_min=None, updated="2026-10-29T09:58:00.000Z", resp="needsAction", organizer_self=False,
@@ -283,6 +336,16 @@ class TestCalendar(unittest.TestCase):
         again = self.poll([event("ev2", start_min=5, updated="2026-10-01T00:00:00Z", resp="accepted")],
                           cursor=out["cursor"])
         self.assertEqual(again["lines"], [])  # starting-soon fires once per event start
+
+    def test_expanded_recurring_instance_starts_soon(self):
+        inst = event("ev9_20261029T100500Z", start_min=5, updated="2026-01-01T00:00:00Z", resp="accepted")
+        inst["recurringEventId"] = "ev9"
+        out = self.poll([inst])
+        self.assertEqual([l["key"] for l in out["lines"]], ["cal:ev9_20261029T100500Z"])
+
+    def test_first_sight_already_answered_is_resolved(self):
+        out = self.poll([event("ev5", start_min=300, resp="accepted")])
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("cal:ev5", "resolved")])
 
     def test_cancellation_and_own_response(self):
         out = self.poll([event("ev1", start_min=300, status="cancelled")],
@@ -330,6 +393,30 @@ class TestCode(unittest.TestCase):
         # same red sha is not reported twice
         again = hs.CodeGithub.poll(c, out["cursor"], {"repos": ["example-org/platform-api"]}, ME, AT)
         self.assertNotIn("example-org/platform-api#ci-main", {l["key"] for l in again["lines"]})
+
+    def test_left_review_requested_set_is_resolved(self):
+        pr = {"number": 45, "title": "Fix", "updated_at": "2026-10-29T09:00:00Z", "user": {"login": "samroe"},
+              "repository_url": "https://api.example.com/repos/example-org/platform-api"}
+        c = self.runner({"search/issues?per_page=30&sort=updated&q=is:pr+is:open+review-requested": {"items": []}})
+        cur = {"since": "2026-10-29T09:50:00Z", "ci": {}, "branch": {}, "rr": {"example-org/platform-api#45": "Fix"}}
+        out = hs.CodeGithub.poll(c, cur, {}, ME, AT)
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("example-org/platform-api#45", "resolved")])
+        self.assertEqual(out["cursor"]["rr"], {})
+        c = self.runner({"search/issues?per_page=30&sort=updated&q=is:pr+is:open+review-requested": {"items": [pr]}})
+        out = hs.CodeGithub.poll(c, None, {}, ME, AT)
+        self.assertEqual(out["cursor"]["rr"], {"example-org/platform-api#45": "Fix"})
+
+    def test_ci_green_needs_every_run_completed(self):
+        def poll(runs):
+            c = self.runner({"repos/example-org/platform-api/commits/main/check-runs": {"check_runs": runs},
+                             "repos/example-org/platform-api": {"default_branch": "main"}})
+            cur = {"since": "2026-10-29T09:50:00Z", "ci": {"example-org/platform-api": "abc"}, "branch": {}}
+            return hs.CodeGithub.poll(c, cur, {"repos": ["example-org/platform-api"]}, {"email": "x"}, AT)
+        pending = poll([{"name": "a", "status": "completed", "conclusion": "success", "head_sha": "def"},
+                        {"name": "b", "status": "in_progress", "conclusion": None, "head_sha": "def"}])
+        self.assertEqual(pending["lines"], [])
+        done = poll([{"name": "a", "status": "completed", "conclusion": "success", "head_sha": "def"}])
+        self.assertEqual([l["kind"] for l in done["lines"]], ["resolved"])
 
     def test_gh_client_allow_list(self):
         c = hs.GhClient(runner=lambda p: {})

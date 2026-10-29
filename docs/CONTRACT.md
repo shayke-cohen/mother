@@ -581,6 +581,13 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   pseudo-tool, `get`, limited to the path prefixes `search/issues?` and `repos/` and no method or field flags.
   `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
   activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
+  A DM conversation is one thing, keyed `<channel>/dm`, so the manager's reply resolves it; an unthreaded reply in a
+  watched channel does not resolve the message it answers, and the manager's own tracker field changes are
+  indistinguishable from others' without a changelog (both accepted gaps; a comment by the manager does resolve).
+  A code PR leaving the review-requested set resolves its key; CI is green only when every check run is completed.
+  The calendar list tool has no recurrence-expansion argument (its inputSchema is calendarId, timeMin, timeMax), so
+  starting-soon sees recurring meetings only when the tool returns the expanded instance.
+  Errors carry a `health.CLASSES` kind: a timeout is `unreachable`, a closed server `dropped`.
 
 ## 6. Sync (`bin/mother sync`)
 

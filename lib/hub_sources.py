@@ -19,6 +19,7 @@ UTC = timezone.utc
 MAX_THREADS = 25
 MAX_MAIL = 20
 THREAD_DAYS = 7
+SEARCH_OVERLAP = 600
 
 
 def iso(dt: datetime) -> str:
@@ -74,16 +75,18 @@ class ChatSlack(Adapter):
         for t in cfg.get("follow") or []:
             threads.setdefault(t, since)
 
-        def add(ch, msg, link="", floor=since):
+        def add(ch, msg, link="", floor=since, dm=False):
             ts = msg.get("ts")
             if not ts or float(ts) <= floor:
                 return
             tts = msg.get("thread_ts")
-            key = hub.thing_key("chat", {"channel": ch, "ts": ts, "thread_ts": tts})
+            # a DM conversation is one thing: the manager's reply resolves it
+            key = hub.thing_key("chat", {"channel": ch, "ts": "dm" if dm else ts, "thread_ts": None if dm else tts})
             text = msg.get("text") or ""
             who = msg.get("user") or msg.get("username") or ""
             if mine and who == mine:
-                threads.setdefault(key, float(ts))
+                if not dm:
+                    threads.setdefault(key, float(ts))
                 lines.append(hub.make_line("chat", "resolved", key, ts_iso(ts), title=text[:80], who=who,
                                            link=link, summary=text))
                 return
@@ -110,7 +113,10 @@ class ChatSlack(Adapter):
                     add(ch, dict(m, thread_ts=tts), floor=float(seen))
                     threads[key] = max(float(threads[key]), float(m["ts"]))
 
-        day = datetime.fromtimestamp(since, UTC).strftime("%Y-%m-%d")
+        # Search indexes late and `after` is exclusive by day: look back a day, overlap 10 minutes, dedupe by ts.
+        seen = list(cursor.get("seen") or [])
+        floor = since - SEARCH_OVERLAP
+        day = (datetime.fromtimestamp(since, UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         for label, text in (("mentions", "<@%s>" % mine), ("DMs", "is:dm")):
             if label == "mentions" and not mine:
                 continue
@@ -122,10 +128,13 @@ class ChatSlack(Adapter):
             box = res.get("messages", res)
             for m in (box.get("matches") if isinstance(box, dict) else None) or []:
                 ch = (m.get("channel") or {}).get("id") or m.get("channel_id") or ""
-                if ch:
-                    add(ch, m, link=m.get("permalink") or "")
+                sid = "%s:%s" % (ch, m.get("ts"))
+                if not ch or not m.get("ts") or float(m["ts"]) <= floor or sid in seen:
+                    continue
+                seen.append(sid)
+                add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
         keep = dict(list(threads.items())[-MAX_THREADS:])
-        return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep}, partial)
+        return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:]}, partial)
 
 
 # --------------------------------------------------------------------------------------------------- mail
@@ -224,7 +233,7 @@ class TrackerJira(Adapter):
             fp = {}
             try:  # seed fingerprints so the first real poll can tell a field change from a label edit
                 for i in cls._fetch(client, cfg, 7 * 24 * 60, 100):
-                    fp[i["key"]] = cls._fp(i.get("fields") or {})
+                    fp[i["key"]] = dict(cls._fp(i.get("fields") or {}), u=(i.get("fields") or {}).get("updated", ""))
             except McpError:
                 pass
             return _result([], {"since": iso(at), "fp": fp})
@@ -237,10 +246,11 @@ class TrackerJira(Adapter):
             key, f = i["key"], i.get("fields") or {}
             new = cls._fp(f)
             old = fps.get(key)
-            fps[key] = new
+            fps[key] = dict(new, u=f.get("updated", ""))
             if old is None:
-                if not f.get("created") or parse_iso(f["created"]) < since:
-                    continue  # first sight of an old issue: nothing observable changed
+                # first sight (newly assigned, newly in scope, or created): a candidate if touched since the cursor
+                if not f.get("updated") or parse_iso(f["updated"]) <= since:
+                    continue
                 old = {}
             changed = [k for k in ("status", "assignee", "priority", "comments") if old.get(k) != new[k]]
             if not changed:
@@ -258,7 +268,8 @@ class TrackerJira(Adapter):
                                        title=(f.get("summary") or "")[:120], who=who, link=link,
                                        summary="changed: " + ", ".join(changed) + "; status " + new["status"],
                                        also=hub.extract_also(f.get("summary") or "")))
-        keep = dict(list(fps.items())[-500:])
+        # prune the least recently updated, not the oldest inserted
+        keep = dict(sorted(fps.items(), key=lambda kv: kv[1].get("u", ""))[-500:])
         return _result(lines, {"since": iso(at), "fp": keep})
 
 
@@ -299,11 +310,11 @@ class CalendarGoogle(Adapter):
             who = (ev.get("organizer") or {}).get("email", "")
             upd = parse_iso(ev["updated"]) if ev.get("updated") else None
             if upd and upd > since:
-                if prev == "needsAction" and my and my != "needsAction":
+                if (ev.get("organizer") or {}).get("self"):
+                    pass  # the manager's own change
+                elif my in ("accepted", "declined", "tentative") and prev in (None, "needsAction"):
                     lines.append(hub.make_line("calendar", "resolved", key, iso(upd), title=title, who=who,
                                                link=link, summary="responded: " + my))
-                elif (ev.get("organizer") or {}).get("self"):
-                    pass  # the manager's own change
                 elif ev.get("status") == "cancelled":
                     lines.append(hub.make_line("calendar", "update", key, iso(upd), title=title, who=who,
                                                link=link, summary="cancelled"))
@@ -341,7 +352,7 @@ class GhClient:
             p = subprocess.run(["gh", "api", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True, timeout=self.timeout)
         except (OSError, subprocess.TimeoutExpired) as e:
-            raise McpError("other", str(e))
+            raise McpError("unreachable", str(e))
         if p.returncode != 0:
             raise McpError(health.classify(p.stderr or "gh failed")[1], (p.stderr or "")[:300])
         return json.loads(p.stdout) if p.stdout.strip() else {}
@@ -361,14 +372,27 @@ class CodeGithub(Adapter):
     READ_TOOLS = {"get"}
 
     @staticmethod
+    def _rr_path(login):
+        return "search/issues?per_page=30&sort=updated&q=is:pr+is:open+review-requested:%s" % login
+
+    @staticmethod
     def _repo(item: dict) -> str:
         return (item.get("repository_url") or "").split("/repos/", 1)[-1]
 
     @classmethod
     def poll(cls, client, cursor, cfg, me, at):
         if cursor is None:
-            return _result([], {"since": iso(at), "ci": {}, "branch": {}})
+            rr = {}
+            if me.get("code"):
+                try:  # seed the review-requested set so a PR leaving it can be told from one never seen
+                    for it in (client.call("get", {"path": cls._rr_path(me["code"])}) or {}).get("items") or []:
+                        rr[hub.thing_key("code", {"repo": cls._repo(it), "number": it["number"]})] = it.get("title", "")
+                except McpError:
+                    pass
+            return _result([], {"since": iso(at), "ci": {}, "branch": {}, "rr": rr})
         since = parse_iso(cursor["since"])
+        prev_rr = dict(cursor.get("rr") or {})
+        rr = {}
         ci = dict(cursor.get("ci") or {})
         branches = dict(cursor.get("branch") or {})
         login = me.get("code") or ""
@@ -380,11 +404,16 @@ class CodeGithub(Adapter):
 
         if login:
             for it in search("is:pr+is:open+review-requested:%s" % login):
+                key = hub.thing_key("code", {"repo": cls._repo(it), "number": it["number"]})
+                rr[key] = it.get("title", "")
                 if parse_iso(it["updated_at"]) > since:
-                    key = hub.thing_key("code", {"repo": cls._repo(it), "number": it["number"]})
                     lines.append(hub.make_line("code", "update", key, it["updated_at"], title=it.get("title", "")[:120],
                                                who=(it.get("user") or {}).get("login", ""),
                                                link=it.get("html_url", ""), summary="review requested"))
+            for k, title in prev_rr.items():  # left the set: reviewed, merged, closed or request withdrawn
+                if k not in rr:
+                    lines.append(hub.make_line("code", "resolved", k, iso(at), title=title[:120],
+                                               summary="no longer awaiting your review"))
             for it in search("is:pr+is:open+author:%s" % login):
                 if parse_iso(it["updated_at"]) <= since:
                     continue
@@ -415,10 +444,10 @@ class CodeGithub(Adapter):
                 lines.append(hub.make_line("code", "update", key, iso(at), title="CI red on %s" % br,
                                            link=red[0].get("html_url", ""),
                                            summary="%s failing on %s" % (red[0].get("name", "check"), br)))
-            elif not red and runs and ci.get(repo):
+            elif not red and runs and ci.get(repo) and all(r.get("status") == "completed" for r in runs):
                 ci[repo] = ""
                 lines.append(hub.make_line("code", "resolved", key, iso(at), title="CI green on %s" % br))
-        return _result(lines, {"since": iso(at), "ci": ci, "branch": branches})
+        return _result(lines, {"since": iso(at), "ci": ci, "branch": branches, "rr": rr})
 
 
 ADAPTERS = {
