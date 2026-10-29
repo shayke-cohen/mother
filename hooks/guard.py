@@ -2636,10 +2636,12 @@ def subagent_session(kind, tool, inp, cwd, ctx):
 # ------------------------------------------------------------------ the hub session
 
 HUB_DENY = "the hub session can only do hub work; ask the manager to open a session for this"
-HUB_VERBS = {"tail", "decide", "session", "pending", "done", "snooze", "show", "status"}
-HUB_TOOLS = {"Monitor", "CronCreate", "CronDelete", "CronList", "ToolSearch", "TodoWrite"}
-HUB_READ_TOOLS = {"execute_read", "discover"}
-HUB_HEREDOC_RE = re.compile(r"\s<<-?\s*(['\"])([A-Za-z_][\w-]*)\1\s*$")
+HUB_NO_VERBS = {"install", "uninstall", "watch"}   # persistent jobs: the manager starts these
+HUB_TOOLS = {"Monitor", "CronCreate", "CronDelete", "CronList", "ToolSearch", "TodoWrite", "Skill", "TaskStop"}
+HUB_SELF_TOOLS = {"mcp__ccd_session_mgmt__set_session_model", "mcp__ccd_session_mgmt__set_session_effort"}
+HUB_NET_TOKENS = {"fetch", "download", "upload", "export", "url", "http", "browse", "navigate"}
+HUB_NET_FIELDS = {"url", "uri", "href", "path", "file", "dest", "destination"}
+HUB_HEREDOC_RE = re.compile(r"\s<<(-?)\s*(['\"])([A-Za-z_][\w-]*)\2\s*$")
 
 
 def hub_session_path(ws):
@@ -2678,14 +2680,19 @@ def record_hub_session(ws, session_id, at):
 
 
 def hub_simple_command(cmd):
-    """The argv of a single simple shell command (an optional quoted heredoc may follow), or None when it
-    chains, pipes, redirects, substitutes or expands anything."""
-    cmd = cmd.strip().replace("${CLAUDE_PLUGIN_ROOT}", os.path.dirname(HERE))
+    """(program, args) of a single simple shell command, or None when it chains, pipes, redirects, substitutes
+    or expands anything. The program is `mother` (by name, or as this plugin's bin/mother) or the bare name.
+    A quoted heredoc may feed stdin: its delimiter must appear once, as the last line."""
+    cmd = cmd.lstrip().rstrip("\n").replace("${CLAUDE_PLUGIN_ROOT}", os.path.dirname(HERE))
     lines = cmd.split("\n")
     head = lines[0]
     if len(lines) > 1:
         m = HUB_HEREDOC_RE.search(head)
-        if not m or len(lines) < 3 or lines[-1].strip() != m.group(2):
+        if not m or len(lines) < 3:
+            return None
+        dash, delim = m.group(1), m.group(3)
+        norm = (lambda x: x.lstrip("\t")) if dash else (lambda x: x)
+        if norm(lines[-1]) != delim or any(norm(x) == delim for x in lines[1:-1]):
             return None
         head = head[:m.start()]
     state = None
@@ -2693,7 +2700,7 @@ def hub_simple_command(cmd):
         if state == "'":
             state = None if ch == "'" else state
         elif state == '"':
-            if ch in "$`":
+            if ch in "$`\\":
                 return None
             state = None if ch == '"' else state
         elif ch in "'\"":
@@ -2710,36 +2717,69 @@ def hub_simple_command(cmd):
     if not argv or "=" in argv[0]:
         return None
     prog = argv[0]
-    if prog != "mother":
-        if not os.path.isabs(prog) or os.path.realpath(prog) != os.path.realpath(
-                os.path.join(os.path.dirname(HERE), "bin", "mother")):
+    if prog.startswith("/"):
+        if os.path.realpath(prog) != os.path.realpath(os.path.join(os.path.dirname(HERE), "bin", "mother")):
             return None
-    return argv[1:]
+        prog = "mother"
+    return prog, argv[1:]
 
 
 def hub_is_tail(tool, inp):
     if tool != "Bash":
         return False
-    args = hub_simple_command(str(inp.get("command") or ""))
-    return bool(args) and args[:2] == ["hub", "tail"]
+    parsed = hub_simple_command(str(inp.get("command") or ""))
+    return bool(parsed) and parsed[0] == "mother" and parsed[1][:2] == ["hub", "tail"]
 
 
-def hub_session(tool, inp, cwd, ctx):
+def hub_bash_ok(parsed, cmd, cwd, ctx):
+    """One plain command the hub skill runs: a `mother` verb, `pwd`, `date`, or a read-only `gh`/`glab`."""
+    if not parsed:
+        return False
+    prog, args = parsed
+    if prog == "mother":
+        return bool(args) and (
+            (args[0] == "hub" and len(args) > 1 and args[1] not in HUB_NO_VERBS)
+            or args[:2] in (["home", "check"], ["now", "show"]) or args == ["path"])
+    if prog == "pwd":
+        return not args
+    if prog == "date":
+        return all(a.startswith("+") for a in args)
+    if prog in READER_BASH and prog != "date":
+        return classify_bash(cmd, cwd, ctx) is None
+    return False
+
+
+def hub_mcp_ok(tool, inp):
+    """A read that cannot carry data out: a read lead verb, no fetch/download/url-style name, no url/path field."""
+    short = tool.split("__")[-1]
+    toks = tokens_of(short)
+    if set(toks) & HUB_NET_TOKENS:
+        return False
+    ops = [t for t in toks if t not in PRODUCT_WORDS]
+    if not ops or ops[0] not in READ_VERBS:
+        return False
+
+    def bad_key(d):
+        return any(str(k).lower() in HUB_NET_FIELDS or (isinstance(v, dict) and bad_key(v)) for k, v in d.items())
+    return not bad_key(inp)
+
+
+def hub_session(tool, inp, cwd, ctx, sid=None):
     """The pinned hub session reads untrusted mail, chat and tracker summaries, so it may only do hub work:
-    `mother hub` verbs and `mother home check`, reads inside the workspace and plugin, MCP reads, the in-app
-    session tools the guard allows, and its wake mechanism. Everything else is denied. Returns
-    (decision, reason) or None (allowed: the normal rules still apply)."""
+    the hub skill's own commands, reads inside the workspace and plugin, MCP reads that carry nothing out, the
+    in-app session tools, and its wake mechanism. Returns (decision, reason) to deny, None when allowed with
+    no further check, or "normal" to run the normal rules (the in-app session tools keep their ask)."""
     deny = "deny", "%s (%s)." % (HUB_DENY, tool)
     if tool in HUB_TOOLS:
         return None
     if tool in IN_APP_SESSION_TOOLS:
-        return deny if classify(tool, inp, cwd, ctx) is not None else None
+        return "normal"
+    if tool in HUB_SELF_TOOLS:
+        target = inp.get("session_id", inp.get("sessionId", inp.get("session")))
+        return None if target in (None, "", "self", sid) else deny
     if tool == "Bash":
-        args = hub_simple_command(str(inp.get("command") or ""))
-        if args and ((args[0] == "hub" and len(args) > 1 and args[1] in HUB_VERBS)
-                     or args[:2] == ["home", "check"]):
-            return deny if classify(tool, inp, cwd, ctx) is not None else None
-        return deny
+        cmd = str(inp.get("command") or "")
+        return None if hub_bash_ok(hub_simple_command(cmd), cmd, cwd, ctx) else deny
     if tool in ("Read", "Grep", "Glob", "LS"):
         ws = os.path.realpath(ctx.ws)
         plugin = os.path.realpath(os.path.dirname(HERE))
@@ -2752,14 +2792,9 @@ def hub_session(tool, inp, cwd, ctx):
         if any(".." in x or x.startswith(("/", "~")) for x in pats):
             return deny
         return None
-    if tool.startswith("mcp__"):
-        if classify(tool, inp, cwd, ctx) is not None:
-            return deny
-        toks = [t for t in tokens_of(tool.split("__")[-1]) if t not in PRODUCT_WORDS]
-        if "_".join(toks) in HUB_READ_TOOLS or (toks and toks[0] in READ_VERBS):
-            return None
+    if tool.startswith("mcp__") and classify(tool, inp, cwd, ctx) is None and hub_mcp_ok(tool, inp):
+        return None
     return deny
-
 
 
 def run(raw):
@@ -2799,14 +2834,16 @@ def run(raw):
             return r
         sid = payload.get("session_id")
         if ctx.ws and isinstance(sid, str) and sid:
-            if hub_is_tail(tool, inp):
+            if hub_is_tail(tool, inp) and not payload.get("agent_type") and payload.get("cwd") \
+                    and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)):
                 record_hub_session(ctx.ws, sid, now_iso())
             if sid == hub_session_id(ctx.ws):
-                r = hub_session(tool, inp, payload.get("cwd"), ctx)
+                r = hub_session(tool, inp, payload.get("cwd"), ctx, sid)
                 if r is None:
                     return None
-                log(ctx, tool, {"kind": "hub-session", "category": "hub"}, r[0], r[1])
-                return r
+                if r != "normal":
+                    log(ctx, tool, {"kind": "hub-session", "category": "hub"}, r[0], r[1])
+                    return r
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             return None

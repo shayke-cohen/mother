@@ -11,7 +11,7 @@ logs it, lists it, sends it into a session that already follows that thing, or p
 sources only to re-check a proposal and sends nothing to people. Run it once, in a pinned session titled
 "MOTHER hub".
 
-`W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"`. All state is files under `$W/.mother/hub/`, written only by
+Run `mother path` once and use its literal output as the workspace `$W` below (never a shell variable in a command: the guard lets this session run only plain commands). All state is files under `$W/.mother/hub/`, written only by
 `${CLAUDE_PLUGIN_ROOT}/bin/mother hub …` verbs (`mother` below). You keep nothing between wakes: re-read
 `mother hub show --json` on every wake, never trust memory. Running `/mother:hub` again is safe: it stops the old
 wake mechanism and catches up from the cursor.

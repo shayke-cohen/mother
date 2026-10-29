@@ -218,15 +218,20 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `PAUSED` or the never-list; `bypassPermissions` passes it like any other ask.
 - **deny**: nearly everything in the hub session (§5e). It is the session whose id equals `session_id` in
   `<workspace>/.mother/hub/hub-session.json`, which the hook writes (atomically, under `hub.lock`; a failure is
-  swallowed and changes no decision) when a Bash call is one plain `mother hub tail …` command (`mother`, or the
-  absolute path of this plugin's `bin/mother`). Sub-agent and channel checks run first. In the hub session the
-  hook allows only: Bash that is one plain `mother hub tail|decide|session|pending|done|snooze|show|status` or
-  `mother home check` command (no chaining, pipe, redirect or substitution; a quoted heredoc may feed stdin);
+  swallowed and changes no decision) when a Bash call from the workspace (cwd inside it, not from a sub-agent) is
+  one plain `mother hub tail …` command (`mother`, or the absolute path of this plugin's `bin/mother`). Sub-agent
+  and channel checks run first. In the hub session the hook allows only: Bash that is one plain command (no
+  chaining, pipe, redirect, `$` or substitution; a quoted heredoc may feed stdin, its delimiter appearing once, as
+  the last line): `mother hub <verb>` (not `install`, `uninstall` or `watch`), `mother home check`,
+  `mother now show`, `mother path`, `pwd`, `date`, and `gh`/`glab` that are not writes (as the reader sub-agent);
   `Read`/`Grep`/`Glob`/`LS` whose real path is inside the workspace or the plugin; MCP calls the guard does not
-  classify as writes and whose operation starts with a read verb; the in-app session tools that the rules above
-  allow; `Monitor`, `CronCreate`, `CronDelete`, `CronList`, `ToolSearch`, `TodoWrite`. Everything else
-  (`Write`, `Edit`, `WebFetch`, `WebSearch`, `Agent`, `Skill`, other commands, other MCP calls) is denied with
-  "the hub session can only do hub work; ask the manager to open a session for this". Other sessions are unchanged.
+  classify as writes whose operation starts with a read verb, whose name has no fetch, download, upload, export,
+  url, http, browse or navigate part and whose input has no `url`, `uri`, `href`, `path`, `file`, `dest` or
+  `destination` field; `set_session_model` and `set_session_effort` on the session itself; the in-app session
+  tools, which keep the rules above (so a send to a non-hub session still asks); `Skill`, `Monitor`, `CronCreate`,
+  `CronDelete`, `CronList`, `TaskStop`, `ToolSearch`, `TodoWrite`. Everything else (`Write`, `Edit`, `WebFetch`,
+  `WebSearch`, `Agent`, other commands, other MCP calls) is denied with "the hub session can only do hub work; ask
+  the manager to open a session for this". Other sessions are unchanged.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
@@ -587,7 +592,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   effective interval, and `active`, whether it is inside active hours now, so a reader can judge staleness
   without reading config), `hub.json` (what the hub session last did and what is pending), `sessions.json`
   (the manager's sessions the hub may route to), `hub-session.json` (`{session_id, at}`: the session that last ran
-  `mother hub tail`, which the guard fences, §5), `hub.lock`. Readers treat a missing file as "nothing pending" or
+  `mother hub tail` in the workspace, which the guard fences, §5; the newest `tail` becomes the hub), `hub.lock`. Readers treat a missing file as "nothing pending" or
   "the hub never woke".
 - **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
   (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,

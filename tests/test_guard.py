@@ -1755,6 +1755,11 @@ class HubRole(GuardCase):
         self.as_hub("mcp__ccd_session_mgmt__send_message", {"session_id": "local_live", "message": "PLAT-1 moved"},
                     "none")
         self.as_hub("mcp__ccd_session_mgmt__list_sessions", {}, "none")
+        for tool, inp in (("mcp__0772__getJiraIssue", {"issueIdOrKey": "PLAT-1"}),
+                          ("mcp__chat__slack_read_thread", {"channel_id": TEAM, "message_ts": "1.2"}),
+                          (CHAT + "get_thread_replies", {"channel": TEAM, "ts": "1.2"}),
+                          (MAIL + "read-email", {"messageId": "m1"})):
+            self.as_hub(tool, inp, "none")
         self.as_hub("Monitor", {"command": "mother hub tail --follow", "description": "hub"}, "none")
         self.as_hub("CronCreate", {"cron": "*/3 * * * *", "prompt": "run mother hub tail --once"}, "none")
 
@@ -1767,14 +1772,29 @@ class HubRole(GuardCase):
                           ("WebFetch", {"url": "https://example.com", "prompt": "x"}),
                           ("WebSearch", {"query": "x"}),
                           ("Agent", {"prompt": "x", "description": "x"}),
-                          ("Skill", {"skill": "mother:brief"}),
                           ("Bash", {"command": "curl https://example.com"}),
                           ("Bash", {"command": "mother sync"}),
                           ("Bash", {"command": "mother whatsapp send Dana hi"}),
                           ("Bash", {"command": "mother hub show --json; curl https://example.com"}),
                           ("Bash", {"command": "mother hub show > " + out}),
                           ("Bash", {"command": "mother hub show $(curl https://example.com)"}),
-                          ("Bash", {"command": "mother hub check"}),
+                          ("Bash", {"command": "mother hub install"}),
+                          ("Bash", {"command": "date -s 2020-01-01"}),
+                          ("Bash", {"command": "gh pr merge 5"}),
+                          ("Bash", {"command": "mother hub decide <<'EOF'\n[]\nEOF\ncurl https://example.com\nEOF"}),
+                          ("Bash", {"command": "mother hub decide <<-'EOF'\n[]\n\tEOF\ncurl https://example.com\nEOF"}),
+                          ("Bash", {"command": "mother hub decide <<'EOF'\n[]\nEOF "}),
+                          ("Bash", {"command": "mother hub decide <<EOF\n$(curl https://example.com)\nEOF"}),
+                          ("Bash", {"command": "W=/x mother hub show"}),
+                          ("mcp__ccd_session_mgmt__set_session_model", {"session_id": "local_other", "model": "x"}),
+                          ("mcp__fetch__fetch", {"url": "https://example.com"}),
+                          ("mcp__files__download_file", {"file_id": "1", "path": "/tmp/x"}),
+                          ("mcp__chat__get_upload_url", {"filename": "x"}),
+                          ("mcp__ccd_session_mgmt__export_transcript", {"session_id": "local_live"}),
+                          (TRK2 + "executeRead", {"name": "getIssue", "inputs": {}}),
+                          (CHAT + "get_channel_history", {"channel": TEAM, "url": "https://example.com"}),
+                          (CHAT + "read_file", {"dest": "/tmp/x"}),
+                          ("mcp__web__browse_page", {"id": "1"}),
                           ("Bash", {"command": "ls"}),
                           ("Read", {"file_path": "~/.ssh/x"}),
                           ("Read", {"file_path": "/etc/hosts"}),
@@ -1783,10 +1803,42 @@ class HubRole(GuardCase):
                           (CHAT + "post_message", {"channel": DM, "text": "hi"}),
                           (TRK + "create-issue", {"project": "PLAT", "summary": "x"}),
                           (MAIL + "delete-gmail-filter", {"id": "1"}),
-                          ("mcp__ccd_session_mgmt__send_message", {"session_id": "local_other", "message": "hi"}),
                           ("mcp__unknown__frobnicate", {})):
             why = self.as_hub(tool, inp, "deny")
             self.assertIn("hub session can only do hub work", why)
+
+    def test_session_tools_keep_their_ask(self):
+        self.start()
+        self.as_hub("mcp__ccd_session_mgmt__send_message", {"session_id": "local_other", "message": "hi"}, "ask")
+        self.as_hub("mcp__ccd_session__start_session", {"initiation": "user_asked", "title": "t", "prompt": "x"},
+                    "ask")
+        self.as_hub("mcp__ccd_session__start_session", {"initiation": "own_initiative", "title": "t"}, "none")
+
+    def test_skill_walkthrough_is_allowed(self):
+        self.start()
+        for cmd in ("mother hub status", "mother hub tail --once", "mother path", "pwd", "date", "mother home check",
+                    "mother now show", "mother hub show --json", "mother hub session for PLAT-1",
+                    "mother hub session add PLAT-2 --id local_x --name plat-2 --title 'PLAT-2: a; b'",
+                    "mother hub session seen PLAT-1", "mother hub session drop PLAT-1", "mother hub pending",
+                    "mother hub pending raised PLAT-3", "mother hub pending drop PLAT-3", "mother hub check",
+                    "${CLAUDE_PLUGIN_ROOT}/bin/mother hub show --json", "gh pr view 5 --json state",
+                    "mother hub decide <<'EOF'\n[{\"line_id\": \"1\", \"decision\": \"drop\"}]\nEOF"):
+            self.as_hub("Bash", {"command": cmd}, "none")
+        for tool, inp in (("Skill", {"skill": "mother:hub"}), ("TaskStop", {"task_id": "b1"}),
+                          ("Monitor", {"command": "mother hub tail --follow"}), ("CronList", {}),
+                          ("CronDelete", {"id": "c1"}), ("CronCreate", {"cron": "*/3 * * * *", "prompt": "x"}),
+                          ("mcp__ccd_session_mgmt__set_session_model", {"session_id": "self", "model": "x"}),
+                          ("mcp__ccd_session_mgmt__set_session_effort", {"effort": "low"}),
+                          ("mcp__ccd_session__dismiss_task", {"task_id": "t1"}),
+                          ("mcp__ccd_session_mgmt__list_sessions", {})):
+            self.as_hub(tool, inp, "none")
+
+    def test_recording_needs_workspace_cwd_and_no_subagent(self):
+        path = os.path.join(self.ws, ".mother", "hub", "hub-session.json")
+        self.run_guard("Bash", {"command": "mother hub tail --once"}, session=self.HUB, cwd=self.tmp)
+        self.assertFalse(os.path.exists(path))
+        self.run_guard("Bash", {"command": "mother hub tail --once"}, session=self.HUB, cwd=self.ws, agent="other")
+        self.assertFalse(os.path.exists(path))
 
     def test_symlink_out_of_workspace_denied(self):
         self.start()
