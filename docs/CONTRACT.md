@@ -603,7 +603,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   "the hub never woke".
 - **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
   (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,
-  kind (update|resolved|error|sweep), key, also, title, who, link, summary}`, `id` = `<source>:<key>:<at>` (chat
+  kind (update|resolved|error|sweep), key, also, title, who, link, summary}` (`title` and `who` are the sender's
+  text: `make_line` drops C0/C1 control characters and Unicode format and line/paragraph separator characters,
+  and turns tab, CR and newline into a space), `id` = `<source>:<key>:<at>` (chat
   uses the message's raw `ts` in place of `at`, so two messages in one second keep distinct ids), `also` = other
   keys found in the text. When lines for one key are collapsed (`coalesce`, and `tail`), the latest `at` wins, but
   a `resolved` line never replaces an `update` whose `at` is the same or later. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
@@ -695,12 +697,13 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   nothing. A `route` with no live session
   is stored as `propose`; the result says so (`note`). A `now` for a key that has a live session is recorded as a
   `route` instead (an update would be dropped at once), and the result says so. A `line_id` that is not in the kept
-  inbox files exits 2 with nothing written. The batch is applied in inbox order whatever order it was given in, and
+  inbox files, or whose inbox line has a different `key` than the item's, exits 2 with nothing written. The batch is applied in inbox order whatever order it was given in, and
   the cursor moves to the furthest decided line, where a decided `update` line stands for every `update` line of
   its key after the old cursor with no later `at` (the lines `tail` collapsed into it), wherever they sit; a later `decide` for a line before the cursor is still recorded
   but never moves the cursor back, so the hub must decide every printed line, in printed order. `title` and `link` default to the inbox line's. Output: one
   `{line_id, key, decision (as stored), session_id?, update_id?, note?}` per item.
-- **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (live, `unseen` 0; removes the
+- **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (only when `<key>` has a `pending`
+  entry with `raised_at` set, or is already in `sessions.json`; else exit 1 and nothing written; live, `unseen` 0; removes the
   key and its `also` from `pending`; when that pending entry's `last_update_at` is later than its `raised_at`, the
   output carries `catch_up: {key, read, next_step, link, at}`, the one message the hub sends into the new session), `drop <key>` (state `dropped`), `seen <key>` (`unseen` 0; exit 1 for an
   unknown key), `for <key>` (prints the live session id, or exits 1).

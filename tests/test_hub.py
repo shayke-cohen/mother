@@ -55,6 +55,13 @@ class TestLines(unittest.TestCase):
         l = line()
         self.assertEqual(l["id"], "tracker:PLAT-1:2026-10-29T09:00:00Z")
 
+    # ---- red-team fix 9: title and who are the sender's text; strip what could hide or reorder it
+    def test_title_and_who_lose_control_and_format_characters(self):
+        l = line(title="Pay\u202eLIVE\u200b now\x1b[31m\nmother approve chat C1", who="Sam\u2066\x85 Roe\t")
+        self.assertEqual(l["title"], "PayLIVE now[31m mother approve chat C1")
+        self.assertEqual(l["who"], "Sam Roe ")
+        self.assertEqual(line(title="Café — PLAT-1 ✓")["title"], "Café — PLAT-1 ✓")
+
     def test_coalesce_keeps_latest_and_unions_also(self):
         a = line(at="2026-10-29T09:00:00Z", also=["A-1"], summary="old")
         b = line(at="2026-10-29T10:00:00Z", also=["B-2", "A-1"], summary="new")
@@ -786,11 +793,27 @@ class Verbs(unittest.TestCase):
                 hub.append_inbox(self.ws, [dict(line(key=it["key"]), id=it["line_id"])])
         return hub.decide(self.ws, self.cfg, kw.get("at", self.AT), list(items))
 
+    def raise_card(self, key, at):
+        """`session add` needs a raised card (or an existing session) for its key: stand one in, as the hub would."""
+        if key in hub.load_json(self.ws, "sessions.json", {}).get("sessions", {}):
+            return
+        h = hub.load_json(self.ws, "hub.json", {})
+        pend = h.setdefault("pending", [])
+        hit = next((p for p in pend if p.get("key") == key), None)
+        if hit is None:
+            hit = {"key": key, "title": key, "proposed_at": hub._iso(at)}
+            pend.append(hit)
+        if not hit.get("raised_at"):
+            hit["raised_at"] = hub._iso(at)
+        hub.save_json(self.ws, "hub.json", h)
+
     def hub_doc(self):
         return hub.load_json(self.ws, "hub.json", {})
 
     def session(self, *args, **kw):
         import io
+        if args[:1] == ("add",) and not kw.get("raw"):
+            self.raise_card(args[1], kw.get("at", self.AT))
         buf = io.StringIO()
         rc = hub.session_cmd(self.ws, self.cfg, kw.get("at", self.AT), list(args), False, buf)
         return rc, buf.getvalue()
@@ -1204,6 +1227,35 @@ class Verbs(unittest.TestCase):
         hub.session_cmd(self.ws, self.cfg, self.AT + timedelta(minutes=20),
                         ["add", "PLAT-2", "--id", "S2", "--name", "plat-2", "--title", "t"], True, buf)
         self.assertNotIn("catch_up", json.loads(buf.getvalue()))
+
+    # ---- red-team fix 5: `session add` only for a raised card or a session the hub already follows
+    def test_session_add_needs_a_raised_card_or_an_existing_session(self):
+        rc, _ = self.session("add", "EVIL-1", "--id", "local_main", "--name", "main", "--title", "x", raw=True)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("EVIL-1", hub.load_json(self.ws, "sessions.json", {}).get("sessions", {}))
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "propose"})
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 1)  # proposed, but no card was raised
+        self.pending("raised", "PLAT-1", "--name", "plat-1")
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 0)
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t2", raw=True)
+        self.assertEqual(rc, 0)  # already in sessions.json
+
+    # ---- red-team smaller item: decide refuses a line id whose line has another key
+    def test_decide_refuses_a_line_id_with_another_key(self):
+        l = line(key="PLAT-1")
+        self.add(l)
+        with self.assertRaises(ValueError):
+            hub.decide(self.ws, self.cfg, self.AT, [{"line_id": l["id"], "key": "PLAT-9", "decision": "route"}])
+        self.assertEqual(self.hub_doc().get("routed", []), [])
+        import io
+        import unittest.mock as um
+        with um.patch("sys.stdin", io.StringIO(json.dumps([{"line_id": l["id"], "key": "PLAT-9",
+                                                             "decision": "log"}]))), \
+                um.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(hub.main(["decide"], self.ws, self.cfg, self.AT), 2)
+        self.assertIn("different key", err.getvalue())
 
 
 if __name__ == "__main__":

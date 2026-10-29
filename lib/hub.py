@@ -18,6 +18,7 @@ import signal
 import socket
 import sys
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -97,6 +98,22 @@ def extract_also(text: str) -> List[str]:
     return found
 
 
+def plain(text) -> str:
+    """Source text with C0/C1 control characters and Unicode format characters (bidi controls, zero-width
+    characters, tags) removed; tabs and newlines become spaces. `title` and `who` are written by whoever sent the
+    message, and are shown as one line of plain text."""
+    out = []
+    for ch in str(text or ""):
+        o = ord(ch)
+        if ch in "\t\n\r":
+            out.append(" ")
+        elif o < 32 or 0x7f <= o <= 0x9f or unicodedata.category(ch) in ("Cf", "Zl", "Zp"):
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def make_line(source: str, kind: str, key: str, at: str, title: str = "", who: str = "", link: str = "",
               summary: str = "", also=None, uid: str = "") -> dict:
     """`uid` replaces `at` in the id when the source has a finer stamp (a chat message's raw ts), so two updates in
@@ -104,7 +121,7 @@ def make_line(source: str, kind: str, key: str, at: str, title: str = "", who: s
     if kind not in KINDS:
         raise ValueError("unknown kind: %r" % (kind,))
     return {"id": "%s:%s:%s" % (source, key, uid or at), "at": at, "source": source, "kind": kind, "key": key,
-            "also": list(also or []), "title": title, "who": who, "link": link,
+            "also": list(also or []), "title": plain(title), "who": plain(who), "link": link,
             "summary": (summary or "")[:SUMMARY_MAX]}
 
 
@@ -1099,6 +1116,9 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
     unknown = [it["line_id"] for it in items if it["line_id"] not in order]
     if unknown:
         raise ValueError("line_id not in the kept inbox: %s" % ", ".join(unknown))
+    wrong = [it["line_id"] for it in items if by_id[it["line_id"]].get("key") != it["key"]]
+    if wrong:
+        raise ValueError("line_id whose inbox line has a different key: %s" % ", ".join(wrong))
     items = sorted(items, key=lambda it: order[it["line_id"]])
     results = []
     with locked(ws):
@@ -1244,6 +1264,12 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
             also = [a for a in str(o.get("also") or "").split(",") if a]
             prev = items.get(key) or {}
             was = next((p for p in h["pending"] if p.get("key") == key), None)
+            if key not in items and not (was and was.get("raised_at")):
+                # only a card the hub raised (or a session it already follows) becomes a hub session: otherwise a
+                # line could have the hub route source text into any session by its id
+                print("mother hub session add: %s has no raised card in pending and no session; raise a card first"
+                      % key, file=sys.stderr)
+                return 1
             if was and was.get("raised_at") and (was.get("last_update_at") or "") > was["raised_at"]:
                 catch_up = {"key": key, "read": was.get("read") or "", "next_step": was.get("next_step") or "",
                             "link": was.get("link") or "", "at": was["last_update_at"]}
