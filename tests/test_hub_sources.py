@@ -195,6 +195,14 @@ class TestChat(unittest.TestCase):
         again, _ = self.poll(search=search, cursor=out["cursor"])
         self.assertEqual(again["lines"], [])  # the seen-set dedupes the overlap
 
+    def test_history_emitted_message_is_not_re_emitted_by_search(self):
+        m = msg(NOW - 100, text="hey <@U00000000>")
+        hit = {"ts": m["ts"], "user": m["user"], "text": m["text"], "channel": {"id": "C00000001"}}
+        out, _ = self.poll(history={"C00000001": [m]}, search={"<@U00000000>": [hit]})
+        self.assertEqual(len(out["lines"]), 1)  # history and search in the same poll: one line
+        again, _ = self.poll(search={"<@U00000000>": [hit]}, cursor=out["cursor"])
+        self.assertEqual(again["lines"], [])  # next poll's overlap window finds it again: skipped
+
     def test_thread_the_manager_posted_in_yields_replies(self):
         parent = NOW - 3000
         pkey = "C00000001/%.6f" % parent

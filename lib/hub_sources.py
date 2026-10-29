@@ -72,13 +72,15 @@ class ChatSlack(Adapter):
         threads = dict(cursor.get("threads") or {})
         mine = me.get("chat") or ""
         lines, partial = [], []
+        seen = list(cursor.get("seen") or [])
         for t in cfg.get("follow") or []:
             threads.setdefault(t, since)
 
         def add(ch, msg, link="", floor=since, dm=False):
             ts = msg.get("ts")
-            if not ts or float(ts) <= floor:
+            if not ts or float(ts) <= floor or "%s:%s" % (ch, ts) in seen:
                 return
+            seen.append("%s:%s" % (ch, ts))  # every path (history, replies, search) shares this set
             tts = msg.get("thread_ts")
             # a DM conversation is one thing: the manager's reply resolves it
             key = hub.thing_key("chat", {"channel": ch, "ts": "dm" if dm else ts, "thread_ts": None if dm else tts})
@@ -114,7 +116,6 @@ class ChatSlack(Adapter):
                     threads[key] = max(float(threads[key]), float(m["ts"]))
 
         # Search indexes late and `after` is exclusive by day: look back a day, overlap 10 minutes, dedupe by ts.
-        seen = list(cursor.get("seen") or [])
         floor = since - SEARCH_OVERLAP
         day = (datetime.fromtimestamp(since, UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         for label, text in (("mentions", "<@%s>" % mine), ("DMs", "is:dm")):
@@ -128,10 +129,8 @@ class ChatSlack(Adapter):
             box = res.get("messages", res)
             for m in (box.get("matches") if isinstance(box, dict) else None) or []:
                 ch = (m.get("channel") or {}).get("id") or m.get("channel_id") or ""
-                sid = "%s:%s" % (ch, m.get("ts"))
-                if not ch or not m.get("ts") or float(m["ts"]) <= floor or sid in seen:
+                if not ch:
                     continue
-                seen.append(sid)
                 add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
         keep = dict(list(threads.items())[-MAX_THREADS:])
         return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:]}, partial)
