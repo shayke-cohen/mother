@@ -889,10 +889,15 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `manual` line (source `manual`; key = `--key`, else a chat message link's thread key, else the first tracker or
   PR key in the text, else `manual:<sha1 prefix>`; `link` is the first URL; id carries a hash so two adds in a
   second stay distinct). Before appending, the watcher drops a line whose key or `also` key is a muted key, whose
-  `who` is a muted person (id equal, or email contained), or whose chat key is in a muted channel. A `manual`
-  line is never dropped by mute, never produced by the watcher, never collapsed by `coalesce`, never resolved
-  (`digest` skips resolution for a key with a `manual` line in the batch), and `tail` always prints it; the hub
-  routes or proposes it, never only logs it.
+  `who` is a muted person (a user id or email equal to `who`, or to the address inside a trailing `<…>`; never a substring), or whose chat key is in a muted channel. A `manual`
+  line is never dropped by mute (mute does drop watcher `resolved` lines), never produced by the watcher, never collapsed by `coalesce`, never resolved
+  (a `manual` line in a batch suppresses the `resolved` handling of that key in the same batch), and `tail` always prints it; the hub
+  routes or proposes it, never only logs it. `add` strips control and format characters from the text, key and
+  link (a link not matching `^https?://\S+$` is left out and stays in the text); its id ends in a random suffix.
+  A bare uppercase token given to `follow` is a project; it is a channel only when it is `C`/`G` plus 8 or more
+  characters and already a known channel, or with `--channel`; `--project|--channel|--thread|--repo` force the type.
+  The chat adapter remembers which threads came from the follow list (`followed` in its cursor) and drops one when
+  it leaves the list, so `unfollow` stops polling it; threads the adapter tracks itself stay.
 - **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It writes one line to its log and
   returns, so the process exits 0 and launchd leaves it down, when this is not the home machine
   (`workspace.home_machine` names another machine or none), when `hub.enabled` is not `true`, or when the config

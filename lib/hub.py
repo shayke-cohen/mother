@@ -407,10 +407,11 @@ def is_muted(line: dict, mute: dict) -> bool:
     keys = set(mute.get("keys") or [])
     if line.get("key") in keys or any(a in keys for a in line.get("also") or []):
         return True
-    who = (line.get("who") or "").lower()
+    who = (line.get("who") or "").strip().lower()
+    inner = re.search(r"<([^<>]+)>\s*$", who)
     for p in mute.get("people") or []:
         p = p.lower()
-        if who and (who == p or ("@" in p and p in who)):
+        if who and (who == p or (inner and inner.group(1).strip() == p)):
             return True
     if line.get("source") == "chat" and "/" in str(line.get("key")):
         if line["key"].split("/", 1)[0] in (mute.get("channels") or []):
@@ -746,7 +747,7 @@ USAGE = """mother hub <verb>
   snooze      <U-id> 1h|tomorrow|next-week
   show        [--json]  pending proposals, updates and sessions
   add         <link-or-text> [--key K]  hand the hub a thing by hand (a `manual` line it always routes or proposes)
-  follow      <PROJECT | channel id | channel/ts | owner/repo>  watch it too (`unfollow` stops)
+  follow      [--project|--channel|--thread|--repo] <PROJECT | channel id | channel/ts | owner/repo>  watch it too (`unfollow` stops)
   mute        <key | U-id | email | channel id>  drop its watcher lines (`unmute` undoes)
   watching    [--json]  the merged watch list (config plus follows) and the mutes"""
 
@@ -1540,22 +1541,34 @@ def add_cmd(ws: Path, at: datetime, args, out) -> int:
     if not text:
         print("usage: mother hub add <link-or-text> [--key K]", file=sys.stderr)
         return 2
-    key = opts.get("key") if isinstance(opts.get("key"), str) and opts.get("key") else manual_key(text)
+    text = plain(text)
+    key = plain(opts.get("key")).strip() if isinstance(opts.get("key"), str) else ""
+    key = key or manual_key(text)
     stamp = _iso(at)
     url = _URL.search(text)
-    digest_ = hashlib.sha1(text.encode("utf-8")).hexdigest()[:6]
-    ln = make_line("manual", "manual", key, stamp, title=text[:80], link=url.group(0) if url else "",
-                   summary=text, also=[a for a in extract_also(text) if a != key], uid="%s-%s" % (stamp, digest_))
+    link = url.group(0) if url and re.match(r"^https?://\S+$", url.group(0)) else ""
+    ln = make_line("manual", "manual", key, stamp, title=text[:80], link=link,
+                   summary=text, also=[a for a in extract_also(text) if a != key],
+                   uid="%s-%s" % (stamp, os.urandom(3).hex()))
     append_inbox(ws, [ln])
     print("added %s" % key, file=out)
     return 0
 
 
-def classify_follow(x: str):
-    """(list name in watch.json `follow`, value) or None."""
+_FORCE = {"project": ("projects", _PROJECT), "channel": ("channels", _CHANNEL), "thread": ("threads", _THREAD),
+          "repo": ("repos", _REPO)}
+_STRICT_CHANNEL = re.compile(r"^[CG][A-Z0-9]{8,}$")
+
+
+def classify_follow(x: str, force: Optional[str] = None, known_channels=()):
+    """(list name in watch.json `follow`, value) or None. A bare uppercase token is a project; it is a channel
+    only when it looks like a channel id (`C`/`G` + 8 or more) AND is already a known channel, or `force` says so."""
+    if force:
+        name, pat = _FORCE[force]
+        return (name, x) if pat.match(x) else None
     if _THREAD.match(x):
         return "threads", x
-    if _CHANNEL.match(x) and any(c.isdigit() for c in x):
+    if _STRICT_CHANNEL.match(x) and x in known_channels:
         return "channels", x
     if _PROJECT.match(x):
         return "projects", x
@@ -1586,13 +1599,23 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
         for k in ("keys", "people", "channels"):
             print("mute %s: %s" % (k, ", ".join(merged["mute"][k]) or "-"), file=out)
         return 0
+    force = None
+    if verb in ("follow", "unfollow"):
+        flags = [a for a in args if a in ("--project", "--channel", "--thread", "--repo")]
+        args = [a for a in args if a not in flags]
+        if len(flags) > 1:
+            print("mother hub %s: give at most one of --project --channel --thread --repo" % verb, file=sys.stderr)
+            return 2
+        force = flags[0][2:] if flags else None
     if len(args) != 1 or args[0].startswith("--"):
         print("usage: mother hub %s <%s>" % (verb, "key|person|channel" if "mute" in verb
-                                             else "project|channel-id|channel/ts|owner/repo"), file=sys.stderr)
+                                             else "[--project|--channel|--thread|--repo] "
+                                                  "project|channel-id|channel/ts|owner/repo"), file=sys.stderr)
         return 2
     x = args[0]
+    known = set(merged_watch(cfg, load_watch(ws)).get("chat", {}).get("channels") or [])
     mute = verb in ("mute", "unmute")
-    found = classify_mute(x) if mute else classify_follow(x)
+    found = classify_mute(x) if mute else classify_follow(x, force, known)
     if found is None:
         print("mother hub %s: cannot tell what %r is (a project key, channel id, channel/ts or owner/repo)"
               % (verb, x), file=sys.stderr)

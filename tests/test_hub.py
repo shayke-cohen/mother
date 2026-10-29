@@ -1275,10 +1275,6 @@ class Verbs(unittest.TestCase):
         self.assertIn("different key", err.getvalue())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Direct(unittest.TestCase):
     """The manager's watch list (follow / mute) and `manual` lines."""
     AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
@@ -1341,6 +1337,8 @@ class Direct(unittest.TestCase):
         self.assertTrue(hub._must_decide([m1, res]))
 
     def test_follow_classifies_targets(self):
+        self.run_verb("follow", "--channel", "C00000002")
+        self.run_verb("follow", "--channel", "G00000003")
         for x, part in (("WEB", "projects"), ("C00000002", "channels"), ("G00000003", "channels"),
                         ("C00000002/1700000000.000100", "threads"), ("example/repo", "repos")):
             self.assertEqual(self.run_verb("follow", x)[0], 0, x)
@@ -1349,6 +1347,58 @@ class Direct(unittest.TestCase):
         self.assertEqual(self.run_verb("follow", "plat-1")[0], 2)
         self.run_verb("follow", "WEB")
         self.assertEqual(hub.load_watch(self.ws)["follow"]["projects"], ["WEB"])
+
+    def test_follow_bare_token_is_project_unless_known_or_forced(self):
+        for x in ("CORE2024", "GROWTH1", "C00000099"):
+            self.run_verb("follow", x)
+        f = hub.load_watch(self.ws)["follow"]
+        self.assertEqual(f["projects"], ["CORE2024", "GROWTH1", "C00000099"])
+        self.run_verb("follow", "--channel", "C00000098")
+        self.run_verb("follow", "C00000001")  # already a configured channel
+        f = hub.load_watch(self.ws)["follow"]
+        self.assertEqual((f["channels"], f["projects"]), (["C00000098", "C00000001"], ["CORE2024", "GROWTH1", "C00000099"]))
+        self.assertEqual(self.run_verb("follow", "--repo", "WEB")[0], 2)
+
+    def test_mute_email_is_exact(self):
+        mute = {"people": ["bob@example.com"]}
+        self.assertTrue(hub.is_muted(line(who="Bob <bob@example.com>"), mute))
+        self.assertTrue(hub.is_muted(line(who="BOB@example.com"), mute))
+        self.assertFalse(hub.is_muted(line(who="Rob <rbob@example.com>"), mute))
+        self.assertFalse(hub.is_muted(line(who="bob@example.com.evil.net"), mute))
+
+    def test_add_strips_control_chars_and_bad_links(self):
+        self.run_verb("add", "see https://example.com/x\x1b[31m\x07 \u202ehi", "--key", "k\x1by")
+        (l,) = self.inbox()
+        for f in ("summary", "title", "link", "key"):
+            self.assertFalse(any(c in l[f] for c in "\x1b\x07\u202e"), f)
+        self.assertEqual(l["key"], "ky")
+        self.assertRegex(l["link"], r"^https?://\S+$")
+
+    def test_identical_adds_in_one_second_both_reach_tail(self):
+        self.run_verb("add", "same thing")
+        self.run_verb("add", "same thing")
+        ids = [l["id"] for l in self.inbox()]
+        self.assertEqual(len(set(ids)), 2)
+        import io
+        buf = io.StringIO()
+        hub.tail(self.ws, out=buf, err=io.StringIO())
+        self.assertEqual(len(buf.getvalue().splitlines()), 2)
+
+    def test_unfollow_thread_stops_polling(self):
+        import types
+        t = "C00000001/1700000000.000100"
+        client = types.SimpleNamespace(calls=[], call=None)
+
+        def call(name, args):
+            client.calls.append((name, dict(args)))
+            return {"messages": []}
+        client.call = call
+        cur = {"ts": "%.6f" % (self.AT.timestamp() - 60), "threads": {}}
+        cfg = {"follow": [t]}
+        res = hub_sources.ChatSlack.poll(client, cur, cfg, {}, self.AT)
+        self.assertIn(t, res["cursor"]["threads"])
+        res = hub_sources.ChatSlack.poll(client, res["cursor"], {"follow": []}, {}, self.AT)
+        self.assertNotIn(t, res["cursor"]["threads"])
 
     def test_unfollow_removes(self):
         self.run_verb("follow", "WEB")
@@ -1399,7 +1449,7 @@ class Direct(unittest.TestCase):
 
     def test_watching_merges_config_and_file(self):
         self.run_verb("follow", "WEB")
-        self.run_verb("follow", "C00000002")
+        self.run_verb("follow", "--channel", "C00000002")
         self.run_verb("follow", "C00000002/1700000000.000100")
         self.run_verb("follow", "example/repo")
         self.run_verb("mute", "PLAT-9")
@@ -1413,3 +1463,7 @@ class Direct(unittest.TestCase):
         text = self.run_verb("watching")[1]
         self.assertIn("tracker projects: PLAT, WEB", text)
         self.assertEqual(self.cfg["hub"]["watch"]["tracker"]["projects"], ["PLAT"])  # config untouched
+
+
+if __name__ == "__main__":
+    unittest.main()

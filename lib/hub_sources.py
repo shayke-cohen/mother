@@ -82,7 +82,11 @@ class ChatSlack(Adapter):
         marks = [m for m in me.get("marks") or [] if m]
         lines, partial = [], []
         seen = list(cursor.get("seen") or [])
-        for t in cfg.get("follow") or []:
+        followed = [t for t in cfg.get("follow") or [] if isinstance(t, str)]
+        for t in cursor.get("followed") or []:  # unfollowed since the last pass: stop polling it
+            if t not in followed:
+                threads.pop(t, None)
+        for t in followed:
             threads.setdefault(t, since)
 
         def add(ch, msg, link="", floor=since, dm=False):
@@ -151,7 +155,8 @@ class ChatSlack(Adapter):
                     continue
                 add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
         keep = dict(list(threads.items())[-MAX_THREADS:])
-        return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:]}, partial)
+        return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:],
+                                                                     "followed": followed}, partial)
 
 
 # --------------------------------------------------------------------------------------------------- mail
