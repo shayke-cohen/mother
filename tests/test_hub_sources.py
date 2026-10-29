@@ -1,0 +1,345 @@
+"""Tests for lib/hub_mcp.py and lib/hub_sources.py — read-only client and source adapters.
+Fixtures are invented example.com data. Run: python3 -m unittest tests.test_hub_sources -v
+"""
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+import hub_mcp  # noqa: E402
+import hub_sources as hs  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location("guard", os.path.join(ROOT, "hooks", "guard.py"))
+guard = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(guard)
+
+FAKE = os.path.join(ROOT, "tests", "fixtures", "fake_mcp.py")
+UTC = timezone.utc
+AT = datetime(2026, 10, 29, 10, 0, 0, tzinfo=UTC)
+NOW = AT.timestamp()
+ME = {"email": "dana@example.com", "chat": "U00000000", "code": "danalevi"}
+
+
+class Fake:
+    """In-memory stand-in for an MCP client: handlers map a tool suffix to a function(args) -> result."""
+
+    def __init__(self, handlers):
+        self.handlers = handlers
+        self.tools = ["gw__" + k for k in handlers]
+        self.calls = []
+
+    def call(self, name, arguments):
+        self.calls.append((name, arguments))
+        return self.handlers[name.rsplit("__", 1)[-1]](arguments)
+
+
+def ro(handlers, suffixes):
+    f = Fake(handlers)
+    return hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, suffixes)), f
+
+
+class TestClient(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.fx = os.path.join(self.tmp, "fx.json")
+        self.log = os.path.join(self.tmp, "calls.jsonl")
+
+    def client(self, fixture, **env):
+        Path(self.fx).write_text(json.dumps(fixture))
+        e = {"FAKE_MCP_FIXTURE": self.fx, "FAKE_MCP_LOG": self.log}
+        e.update(env)
+        c = hub_mcp.Client(sys.executable, [FAKE], e, timeout=10)
+        self.addCleanup(c.close)
+        return c
+
+    def logged(self):
+        return [json.loads(l) for l in Path(self.log).read_text().splitlines()] if os.path.exists(self.log) else []
+
+    def test_client_lists_tools_before_call(self):
+        c = self.client({"tools": ["gw__get_x", "gw__post_message"], "results": {"gw__get_x": {"a": 1}}})
+        c.start()
+        self.assertEqual(c.tools, ["gw__get_x", "gw__post_message"])
+        self.assertEqual(c.call("gw__get_x", {"q": 1}), {"a": 1})
+
+    def test_error_result_maps_to_kind(self):
+        c = self.client({"tools": ["gw__get_x"], "errors": {"gw__get_x": "Service Unavailable (status 503)"}})
+        c.start()
+        with self.assertRaises(hub_mcp.McpError) as cm:
+            c.call("gw__get_x", {})
+        self.assertTrue(cm.exception.kind)
+
+    def test_restarts_once_on_eof(self):
+        c = self.client({"tools": ["gw__get_x"], "results": {"gw__get_x": {"ok": 1}}}, FAKE_MCP_DIE_AFTER="1")
+        c.start()
+        self.assertEqual(c.call("gw__get_x", {}), {"ok": 1})
+        self.assertEqual(c.call("gw__get_x", {}), {"ok": 1})  # server exited; one restart serves it
+
+    def test_readonly_refuses_write_tool_without_sending(self):
+        c = self.client({"tools": ["gw__get_x", "gw__post_message"], "results": {}})
+        c.start()
+        r = hub_mcp.ReadOnlyClient(c, hub_mcp.resolve_tools(c.tools, {"get_x"}))
+        with self.assertRaises(hub_mcp.ForbiddenTool):
+            r.call("gw__post_message", {"text": "hi"})
+        with self.assertRaises(hub_mcp.ForbiddenTool):
+            r.call("post_message", {"text": "hi"})
+        self.assertEqual(self.logged(), [])
+        r.call("get_x", {})  # suffix resolves against the allowed full names
+        self.assertEqual(len(self.logged()), 1)
+
+
+class TestAdapterShape(unittest.TestCase):
+    def test_every_adapter_read_tools_are_reads(self):
+        self.assertEqual(set(hs.ADAPTERS), {"chat:slack", "mail:gmail", "tracker:jira", "calendar:google",
+                                            "code:github"})
+        for key, a in hs.ADAPTERS.items():
+            self.assertTrue(a.READ_TOOLS, key)
+            for t in a.READ_TOOLS:
+                lead = t.replace("-", "_").split("_")[0]
+                self.assertTrue(lead in guard.READ_VERBS or lead in ("search", "list", "get"), (key, t))
+
+    def test_first_poll_returns_cursor_only(self):
+        for key, a in hs.ADAPTERS.items():
+            cap = key.split(":")[0]
+            handlers = {t: (lambda args: {}) for t in a.READ_TOOLS}
+            client = hs.GhClient(runner=lambda p: {}) if cap == "code" else ro(handlers, a.READ_TOOLS)[0]
+            out = a.poll(client, None, {}, ME, AT)
+            self.assertEqual(out["lines"], [], key)
+            self.assertIsInstance(out["cursor"], dict, key)
+
+
+def msg(ts, user="U00000009", text="hello", **kw):
+    d = {"ts": "%.6f" % ts, "user": user, "text": text}
+    d.update(kw)
+    return d
+
+
+class TestChat(unittest.TestCase):
+    def poll(self, history=None, replies=None, search=None, cursor=None, cfg=None):
+        cur = cursor or {"ts": "%.6f" % (NOW - 600), "threads": {}}
+
+        def hist(a):
+            return {"ok": True, "messages": (history or {}).get(a["channel_id"], [])}
+
+        def rep(a):
+            return {"ok": True, "messages": (replies or {}).get(a["thread_ts"], [])}
+
+        def srch(a):
+            if isinstance(search, Exception):
+                raise search
+            return {"ok": True, "messages": {"matches": (search or {}).get(a["searchText"], [])}}
+
+        client, f = ro({"get_channel_history": hist, "get_thread_replies": rep, "search-messages": srch},
+                       hs.ChatSlack.READ_TOOLS)
+        return hs.ChatSlack.poll(client, cur, cfg or {"channels": ["C00000001"]}, ME, AT), f
+
+    def test_chat_prefilter(self):
+        search = {"<@U00000000>": [{"ts": "%.6f" % (NOW - 60), "user": "U00000005", "text": "ping PLAT-12 pls",
+                                    "channel": {"id": "C00000077"}}],
+                  "is:dm": [{"ts": "%.6f" % (NOW - 30), "user": "U00000006", "text": "dm",
+                             "channel": {"id": "D00000001"}}]}
+        out, f = self.poll(history={"C00000001": [msg(NOW - 100, text="watched msg")]}, search=search)
+        keys = sorted(l["key"] for l in out["lines"])
+        self.assertEqual(len(keys), 3)
+        self.assertIn("C00000001/%.6f" % (NOW - 100), keys)
+        self.assertTrue(any(k.startswith("C00000077/") for k in keys))
+        self.assertTrue(any(k.startswith("D00000001/") for k in keys))
+        mention = [l for l in out["lines"] if l["key"].startswith("C00000077")][0]
+        self.assertEqual(mention["also"], ["PLAT-12"])
+        # an unwatched channel is never read
+        self.assertEqual([a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history")], ["C00000001"])
+
+    def test_thread_the_manager_posted_in_yields_replies(self):
+        parent = NOW - 3000
+        pkey = "C00000001/%.6f" % parent
+        cur = {"ts": "%.6f" % (NOW - 600), "threads": {pkey: parent}}
+        out, _ = self.poll(replies={"%.6f" % parent: [msg(parent, user="U00000000"),
+                                                       msg(NOW - 120, text="reply", thread_ts="%.6f" % parent)]},
+                           cursor=cur)
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [(pkey, "update")])
+
+    def test_own_activity_is_resolved_not_candidate(self):
+        out, _ = self.poll(history={"C00000001": [msg(NOW - 100, user="U00000000", text="on it")]})
+        self.assertEqual([l["kind"] for l in out["lines"]], ["resolved"])
+        self.assertIn("C00000001/%.6f" % (NOW - 100), out["cursor"]["threads"])  # later replies are followed
+
+    def test_search_scope_error_makes_source_partial_not_failed(self):
+        out, _ = self.poll(history={"C00000001": [msg(NOW - 100)]},
+                           search=hub_mcp.McpError("missing_scope", "search:read"))
+        self.assertEqual(len(out["lines"]), 1)
+        self.assertEqual(len(out["partial"]), 2)
+
+    def test_summary_is_trimmed(self):
+        out, _ = self.poll(history={"C00000001": [msg(NOW - 100, text="x" * 900)]})
+        self.assertEqual(len(out["lines"][0]["summary"]), 300)
+
+
+def mail_msg(i, sender="Sam <sam@example.com>", subj="Question", labels=("INBOX",), thread=None):
+    return {"id": i, "threadId": thread or "t" + i, "labelIds": list(labels), "snippet": "snip",
+            "internalDate": str(int((NOW - 60) * 1000)),
+            "payload": {"headers": [{"name": "From", "value": sender}, {"name": "Subject", "value": subj}]}}
+
+
+class TestMail(unittest.TestCase):
+    def test_mail_prefilter_ignores_noise_senders(self):
+        msgs = {"a": mail_msg("a", subj="Re PLAT-9 rollout"),
+                "b": mail_msg("b", sender="Bot <noreply@example.com>"),
+                "c": mail_msg("c", labels=("INBOX", "Newsletters")),
+                "d": mail_msg("d", sender="Dana <dana@example.com>")}
+
+        def lst(a):
+            if a["query"].startswith("from:"):
+                return {"messages": [{"id": "s1", "threadId": "tsent"}]}
+            return {"messages": [{"id": k, "threadId": "t" + k} for k in msgs]}
+
+        client, f = ro({"list-emails": lst, "read-email": lambda a: msgs[a["messageId"]]},
+                       hs.MailGmail.READ_TOOLS)
+        cfg = {"ignore_senders": ["noreply@"], "ignore_labels": ["Newsletters"]}
+        out = hs.MailGmail.poll(client, {"since": int(NOW - 600), "seen": []}, cfg, ME, AT)
+        by = {l["key"]: l for l in out["lines"]}
+        self.assertEqual(set(by), {"mail:ta", "mail:tsent"})
+        self.assertEqual(by["mail:ta"]["kind"], "update")
+        self.assertEqual(by["mail:ta"]["also"], ["PLAT-9"])
+        self.assertEqual(by["mail:tsent"]["kind"], "resolved")
+        self.assertIn("-label", f.calls[0][1]["query"])
+        out2 = hs.MailGmail.poll(client, out["cursor"], cfg, ME, AT)  # already-seen ids are not re-read
+        self.assertEqual([l["key"] for l in out2["lines"]], ["mail:tsent"])
+
+
+def issue(key, status="To Do", assignee="acc1", prio="Medium", ncomments=0, labels=(), created="2026-01-01T00:00:00.000+0000",
+          last_author="sam@example.com"):
+    comments = [{"author": {"emailAddress": last_author, "displayName": "Sam"}}] * ncomments
+    return {"key": key, "self": "https://jira.example.com/rest/api/3/issue/10001",
+            "fields": {"summary": "Thing " + key, "status": {"name": status}, "assignee": {"accountId": assignee},
+                       "priority": {"name": prio}, "created": created, "updated": "2026-10-29T09:58:00.000+0000",
+                       "labels": list(labels), "comment": {"total": ncomments, "comments": comments}}}
+
+
+class TestTracker(unittest.TestCase):
+    def run_poll(self, issues, fp, cfg=None):
+        client, f = ro({"get-issues": lambda a: {"issues": issues}}, hs.TrackerJira.READ_TOOLS)
+        cur = {"since": "2026-10-29T09:50:00Z", "fp": fp}
+        return hs.TrackerJira.poll(client, cur, cfg or {"projects": ["PLAT"], "extra_jql": "labels != x"}, ME, AT), f
+
+    BASE = {"status": "To Do", "assignee": "acc1", "priority": "Medium", "comments": 0}
+
+    def test_tracker_change_fields(self):
+        cases = [("status", issue("PLAT-1", status="Done")), ("assignee", issue("PLAT-1", assignee="acc2")),
+                 ("priority", issue("PLAT-1", prio="High")), ("comment", issue("PLAT-1", ncomments=1))]
+        for name, i in cases:
+            out, _ = self.run_poll([i], {"PLAT-1": dict(self.BASE)})
+            self.assertEqual([l["key"] for l in out["lines"]], ["PLAT-1"], name)
+            self.assertEqual(out["lines"][0]["link"], "https://jira.example.com/browse/PLAT-1")
+        out, _ = self.run_poll([issue("PLAT-1", labels=["new-label"])], {"PLAT-1": dict(self.BASE)})
+        self.assertEqual(out["lines"], [])  # label-only change
+
+    def test_jql_covers_scope_and_extra(self):
+        _, f = self.run_poll([], {})
+        jql = f.calls[0][1]["jql"]
+        for part in ("assignee = currentUser()", "reporter = currentUser()", "watcher = currentUser()",
+                     "project in (PLAT)", "labels != x", "updated >= -"):
+            self.assertIn(part, jql)
+
+    def test_own_comment_is_resolved(self):
+        out, _ = self.run_poll([issue("PLAT-1", ncomments=1, last_author="dana@example.com")],
+                               {"PLAT-1": dict(self.BASE)})
+        self.assertEqual([l["kind"] for l in out["lines"]], ["resolved"])
+
+    def test_unseen_old_issue_is_seeded_new_issue_is_candidate(self):
+        out, _ = self.run_poll([issue("PLAT-2"), issue("PLAT-3", created="2026-10-29T09:55:00.000+0000")], {})
+        self.assertEqual([l["key"] for l in out["lines"]], ["PLAT-3"])
+        self.assertIn("PLAT-2", out["cursor"]["fp"])
+
+
+def event(eid, start_min=None, updated="2026-10-29T09:58:00.000Z", resp="needsAction", organizer_self=False,
+          status="confirmed"):
+    ev = {"id": eid, "status": status, "summary": "Sync", "updated": updated, "htmlLink": "https://cal.example.com/" + eid,
+          "organizer": {"email": "sam@example.com", "self": organizer_self},
+          "attendees": [{"email": "dana@example.com", "self": True, "responseStatus": resp}]}
+    if start_min is not None:
+        ev["start"] = {"dateTime": datetime.fromtimestamp(NOW + start_min * 60, UTC).isoformat()}
+    return ev
+
+
+class TestCalendar(unittest.TestCase):
+    def poll(self, events, cursor=None, cfg=None):
+        client, _ = ro({"list-events": lambda a: {"items": events}}, hs.CalendarGoogle.READ_TOOLS)
+        cur = cursor or {"since": "2026-10-29T09:50:00Z", "resp": {}, "notified": []}
+        return hs.CalendarGoogle.poll(client, cur, cfg or {"lead_minutes": 10}, ME, AT)
+
+    def test_calendar_new_invite_and_starting_soon(self):
+        out = self.poll([event("ev1", start_min=300), event("ev2", start_min=5, updated="2026-10-01T00:00:00Z",
+                                                          resp="accepted"),
+                         event("ev3", start_min=60, updated="2026-10-01T00:00:00Z")])
+        by = {l["key"]: l["summary"] for l in out["lines"]}
+        self.assertEqual(by["cal:ev1"], "new invite")
+        self.assertTrue(by["cal:ev2"].startswith("starts at"))
+        self.assertNotIn("cal:ev3", by)
+        again = self.poll([event("ev2", start_min=5, updated="2026-10-01T00:00:00Z", resp="accepted")],
+                          cursor=out["cursor"])
+        self.assertEqual(again["lines"], [])  # starting-soon fires once per event start
+
+    def test_cancellation_and_own_response(self):
+        out = self.poll([event("ev1", start_min=300, status="cancelled")],
+                        cursor={"since": "2026-10-29T09:50:00Z", "resp": {"ev1": "accepted"}, "notified": []})
+        self.assertEqual(out["lines"][0]["summary"], "cancelled")
+        out = self.poll([event("ev2", start_min=300, resp="accepted")],
+                        cursor={"since": "2026-10-29T09:50:00Z", "resp": {"ev2": "needsAction"}, "notified": []})
+        self.assertEqual([l["kind"] for l in out["lines"]], ["resolved"])
+
+
+class TestCode(unittest.TestCase):
+    def runner(self, table):
+        self.paths = []
+
+        def run(path):
+            self.paths.append(path)
+            for k, v in table.items():
+                if path.startswith(k):
+                    return v
+            return {}
+        return hs.GhClient(runner=run)
+
+    def test_review_requested_and_comments_and_ci(self):
+        pr = {"number": 45, "title": "Fix", "updated_at": "2026-10-29T09:58:00Z", "user": {"login": "samroe"},
+              "repository_url": "https://api.example.com/repos/example-org/platform-api",
+              "html_url": "https://github.example.com/example-org/platform-api/pull/45"}
+        mine = dict(pr, number=46)
+        c = self.runner({
+            "search/issues?per_page=30&sort=updated&q=is:pr+is:open+review-requested": {"items": [pr]},
+            "search/issues?per_page=30&sort=updated&q=is:pr+is:open+author": {"items": [mine]},
+            "repos/example-org/platform-api/issues/46/comments": [
+                {"created_at": "2026-10-29T09:57:00Z", "user": {"login": "samroe"}, "body": "nit"},
+                {"created_at": "2026-10-29T09:58:00Z", "user": {"login": "danalevi"}, "body": "fixed"}],
+            "repos/example-org/platform-api/pulls/46/comments": [],
+            "repos/example-org/platform-api/commits/main/check-runs": {"check_runs": [
+                {"name": "build", "conclusion": "failure", "head_sha": "abc"}]},
+            "repos/example-org/platform-api": {"default_branch": "main"}})
+        cur = {"since": "2026-10-29T09:50:00Z", "ci": {}, "branch": {}}
+        out = hs.CodeGithub.poll(c, cur, {"repos": ["example-org/platform-api"]}, ME, AT)
+        kinds = {(l["key"], l["kind"]) for l in out["lines"]}
+        self.assertIn(("example-org/platform-api#45", "update"), kinds)
+        keys = {l["key"] for l in out["lines"]}
+        self.assertEqual(keys, {"example-org/platform-api#45", "example-org/platform-api#46",
+                                "example-org/platform-api#ci-main"})
+        # same red sha is not reported twice
+        again = hs.CodeGithub.poll(c, out["cursor"], {"repos": ["example-org/platform-api"]}, ME, AT)
+        self.assertNotIn("example-org/platform-api#ci-main", {l["key"] for l in again["lines"]})
+
+    def test_gh_client_allow_list(self):
+        c = hs.GhClient(runner=lambda p: {})
+        for bad in ("user/emails", "repos/a/b/issues/1/comments -X POST", "repos/../admin", "orgs/x"):
+            with self.assertRaises(hub_mcp.ForbiddenTool, msg=bad):
+                c.call("get", {"path": bad})
+        with self.assertRaises(hub_mcp.ForbiddenTool):
+            c.call("post", {"path": "repos/a/b"})
+        self.assertEqual(c.call("get", {"path": "repos/a/b"}), {})
+
+
+if __name__ == "__main__":
+    unittest.main()

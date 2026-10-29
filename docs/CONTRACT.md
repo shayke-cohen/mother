@@ -574,6 +574,13 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `log|now|route|propose|error`. Details land with the tasks that build them.
 - **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
   posts or writes to a tracker.
+  Adapters (`lib/hub_sources.py`) are keyed `<cap>:<connector>` (`chat:slack`, `mail:gmail`, `tracker:jira`,
+  `calendar:google`, `code:github`) and declare `READ_TOOLS`, tool-name suffixes whose first word is a read verb.
+  The client (`lib/hub_mcp.py`) resolves them against the server's `tools/list` and wraps it in `ReadOnlyClient`,
+  which raises `ForbiddenTool` for any other name before anything is sent. GitHub goes through `gh api` with one
+  pseudo-tool, `get`, limited to the path prefixes `search/issues?` and `repos/` and no method or field flags.
+  `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
+  activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
 
 ## 6. Sync (`bin/mother sync`)
 
