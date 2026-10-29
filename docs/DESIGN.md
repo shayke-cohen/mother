@@ -134,7 +134,7 @@ The tick rescans sources hourly, so something that changed at 10:05 reaches the 
 closes that gap without a model polling. The 2026-10-29 spikes decided the shape:
 - **Plain code can read the sources.** A Python script spoke MCP over stdio to the gateway and read tracker and
   mail with no model, so the watcher is a launchd process, read-only by construction (allow-list enforced
-  before send), and costs nothing while nothing changes.
+  before send), and has no model cost while nothing changes.
 - **A timer-fired turn cannot start a session.** `start_session` was refused without the user's own words, so a
   new session can only be proposed as a card the manager clicks. Hence cards, never auto-spawned sessions.
 - **It can message an existing one.** `send_message` from a cron-fired turn was delivered and acted on, so
@@ -143,7 +143,7 @@ closes that gap without a model polling. The 2026-10-29 spikes decided the shape
   are desktop sessions the manager opened.
 So: watcher appends to an inbox, one pinned hub session wakes only on a new line and decides (log, message,
 or card), and the manager stays the one who starts anything. Nothing here scores or reads a person; the inbox
-keeps a short summary per thing, never message bodies or per-person counts.
+keeps a short summary per thing, a summary of at most 300 characters, never full bodies or per-person counts.
 
 ## Safety
 

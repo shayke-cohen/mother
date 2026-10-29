@@ -104,15 +104,15 @@ launchd: mother hub watch   (lib/hub.py + hub_mcp.py + hub_sources.py, no model,
   ├─ per connection: read-only MCP over stdio (or `gh`) → adapter → deterministic prefilter
   ├─ appends one line per changed thing to .mother/hub/inbox.jsonl; heartbeat in watcher.json
   └─ records nothing in capabilities.json: watcher.json plus one inbox `error` line are the record
-pinned desktop session (/mother:hub): Monitor tails the inbox, wakes only on a new line
+pinned desktop session (/mother:hub): Monitor (or a cron prompt fallback) tails the inbox, wakes only on a new line
   ├─ mother hub decide   → log / Now row only │ send_message into the thing's session │ proposal card
   ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
   ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`)
-  └─ in-app session tools pass the guard only for the hub session; sub-agents and channel sessions are denied
-Now panel: Hub section (status, sessions, updates); an Open button opens a session (desktop draws only https links)
+  └─ in-app session tools pass the guard for the manager's own sessions (any normal session, the hub included); sub-agents and channel sessions are denied
+Now panel: Hub section (status, sessions, updates); the Open button fills the prompt to open the session and marks it seen; the manager sends it (desktop draws only https links)
 ```
 
-Accepted gaps: tracker changes to the manager's own fields and unthreaded replies in watched channels are not seen.
+Accepted gaps: the tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description) and reports changes in those four whoever made them; chat misses replies in threads of a watched channel that the watcher doesn't follow.
 
 ## Invariants the code relies on
 
