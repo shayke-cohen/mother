@@ -6,7 +6,8 @@ session type and mode, the guard's decision must be the expected one: never `non
 that reaches anyone, unless the row says so. No model runs; the guard is called in process, in a temp workspace.
 
 Session types: hub (the pinned hub), card (any workspace session), channel_manager / channel_team (a channel
-reply session), reader (the mother:reader sub-agent). Modes: default, acceptEdits, bypassPermissions (with
+reply session), reader (the mother:reader sub-agent). A row may name one session instead, such as live (a card
+the hub routes to: its id is in sessions.json, so it is hub-fed) or old_hub. Modes: default, acceptEdits, bypassPermissions (with
 policy.bypass_passes_asks off, the default), paused (.mother/PAUSED), dryrun (MOTHER_DRY_RUN=1).
 
 `want` is the decision in default mode. acceptEdits and bypass expect the same. paused and dryrun expect `deny`
@@ -122,7 +123,7 @@ class RedTeam(unittest.TestCase):
                          .replace("$STATE", state))
         payload = {"tool_name": call["tool"], "tool_input": inp, "cwd": self.ws,
                    "permission_mode": mode if mode in ("acceptEdits", "bypassPermissions") else "default",
-                   "session_id": {"hub": HUB, "old_hub": OLD_HUB}.get(session, CARD)}
+                   "session_id": {"hub": HUB, "old_hub": OLD_HUB, "live": LIVE}.get(session, CARD)}
         env = {}
         if session == "reader":
             payload.update(agent_id="a1", agent_type="mother:reader")
@@ -134,8 +135,10 @@ class RedTeam(unittest.TestCase):
         if mode == "paused":
             open(paused, "w").close()
         hubfile = os.path.join(self.ws, ".mother", "hub", "hub-session.json")
+        fedfile = os.path.join(self.ws, ".mother", "hub", "fed-sessions.json")
         with open(hubfile) as f:
             hub_before = f.read()  # a row that runs `mother hub tail` must not make later rows hub sessions
+        fed_before = open(fedfile).read() if os.path.exists(fedfile) else None  # nor `mother hub …` hub-fed ones
         try:
             with self.env(**env):
                 r = self.g.run(json.dumps(payload))
@@ -144,6 +147,12 @@ class RedTeam(unittest.TestCase):
                 os.remove(paused)
             with open(hubfile, "w") as f:
                 f.write(hub_before)
+            if fed_before is None:
+                if os.path.exists(fedfile):
+                    os.remove(fedfile)
+            else:
+                with open(fedfile, "w") as f:
+                    f.write(fed_before)
         return (r[0], r[1]) if r else ("none", "")
 
     def test_corpus_has_invented_data_only(self):
