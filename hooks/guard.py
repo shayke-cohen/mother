@@ -2633,6 +2633,135 @@ def subagent_session(kind, tool, inp, cwd, ctx):
     return None
 
 
+# ------------------------------------------------------------------ the hub session
+
+HUB_DENY = "the hub session can only do hub work; ask the manager to open a session for this"
+HUB_VERBS = {"tail", "decide", "session", "pending", "done", "snooze", "show", "status"}
+HUB_TOOLS = {"Monitor", "CronCreate", "CronDelete", "CronList", "ToolSearch", "TodoWrite"}
+HUB_READ_TOOLS = {"execute_read", "discover"}
+HUB_HEREDOC_RE = re.compile(r"\s<<-?\s*(['\"])([A-Za-z_][\w-]*)\1\s*$")
+
+
+def hub_session_path(ws):
+    return os.path.join(ws, ".mother", "hub", "hub-session.json")
+
+
+def hub_session_id(ws):
+    """The session id `mother hub tail` last ran in, or None."""
+    if not ws:
+        return None
+    doc, ok = read_json(hub_session_path(ws))
+    sid = doc.get("session_id") if ok and isinstance(doc, dict) else None
+    return sid if isinstance(sid, str) and sid else None
+
+
+def record_hub_session(ws, session_id, at):
+    """Atomically write hub-session.json under hub.lock. Never raises: recording must not fail the hook."""
+    try:
+        d = os.path.join(ws, ".mother", "hub")
+        os.makedirs(d, exist_ok=True)
+        lock = open(os.path.join(d, "hub.lock"), "a")
+        try:
+            try:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except ImportError:
+                pass
+            tmp = os.path.join(d, ".hub-session.%d.tmp" % os.getpid())
+            with open(tmp, "w") as f:
+                json.dump({"session_id": session_id, "at": at}, f)
+            os.replace(tmp, hub_session_path(ws))
+        finally:
+            lock.close()
+    except Exception:
+        pass
+
+
+def hub_simple_command(cmd):
+    """The argv of a single simple shell command (an optional quoted heredoc may follow), or None when it
+    chains, pipes, redirects, substitutes or expands anything."""
+    cmd = cmd.strip().replace("${CLAUDE_PLUGIN_ROOT}", os.path.dirname(HERE))
+    lines = cmd.split("\n")
+    head = lines[0]
+    if len(lines) > 1:
+        m = HUB_HEREDOC_RE.search(head)
+        if not m or len(lines) < 3 or lines[-1].strip() != m.group(2):
+            return None
+        head = head[:m.start()]
+    state = None
+    for ch in head:
+        if state == "'":
+            state = None if ch == "'" else state
+        elif state == '"':
+            if ch in "$`":
+                return None
+            state = None if ch == '"' else state
+        elif ch in "'\"":
+            state = ch
+        elif ch in ";&|<>$`()\\{}":
+            return None
+    if state:
+        return None
+    try:
+        import shlex
+        argv = shlex.split(head)
+    except ValueError:
+        return None
+    if not argv or "=" in argv[0]:
+        return None
+    prog = argv[0]
+    if prog != "mother":
+        if not os.path.isabs(prog) or os.path.realpath(prog) != os.path.realpath(
+                os.path.join(os.path.dirname(HERE), "bin", "mother")):
+            return None
+    return argv[1:]
+
+
+def hub_is_tail(tool, inp):
+    if tool != "Bash":
+        return False
+    args = hub_simple_command(str(inp.get("command") or ""))
+    return bool(args) and args[:2] == ["hub", "tail"]
+
+
+def hub_session(tool, inp, cwd, ctx):
+    """The pinned hub session reads untrusted mail, chat and tracker summaries, so it may only do hub work:
+    `mother hub` verbs and `mother home check`, reads inside the workspace and plugin, MCP reads, the in-app
+    session tools the guard allows, and its wake mechanism. Everything else is denied. Returns
+    (decision, reason) or None (allowed: the normal rules still apply)."""
+    deny = "deny", "%s (%s)." % (HUB_DENY, tool)
+    if tool in HUB_TOOLS:
+        return None
+    if tool in IN_APP_SESSION_TOOLS:
+        return deny if classify(tool, inp, cwd, ctx) is not None else None
+    if tool == "Bash":
+        args = hub_simple_command(str(inp.get("command") or ""))
+        if args and ((args[0] == "hub" and len(args) > 1 and args[1] in HUB_VERBS)
+                     or args[:2] == ["home", "check"]):
+            return deny if classify(tool, inp, cwd, ctx) is not None else None
+        return deny
+    if tool in ("Read", "Grep", "Glob", "LS"):
+        ws = os.path.realpath(ctx.ws)
+        plugin = os.path.realpath(os.path.dirname(HERE))
+        raw = inp.get("file_path") or inp.get("path") or ""
+        base = cwd or ws
+        fp = os.path.realpath(os.path.join(base, os.path.expanduser(str(raw)))) if raw else os.path.realpath(base)
+        if not (inside(fp, ws) or inside(fp, plugin)):
+            return deny
+        pats = [str(inp.get(k) or "") for k in ("pattern", "glob")] if tool == "Glob" else [str(inp.get("glob") or "")]
+        if any(".." in x or x.startswith(("/", "~")) for x in pats):
+            return deny
+        return None
+    if tool.startswith("mcp__"):
+        if classify(tool, inp, cwd, ctx) is not None:
+            return deny
+        toks = [t for t in tokens_of(tool.split("__")[-1]) if t not in PRODUCT_WORDS]
+        if "_".join(toks) in HUB_READ_TOOLS or (toks and toks[0] in READ_VERBS):
+            return None
+    return deny
+
+
+
 def run(raw):
     """Returns (decision, reason) or None. Never raises."""
     try:
@@ -2668,6 +2797,16 @@ def run(raw):
                 return None
             log(ctx, tool, {"kind": "subagent", "category": sub}, r[0], r[1])
             return r
+        sid = payload.get("session_id")
+        if ctx.ws and isinstance(sid, str) and sid:
+            if hub_is_tail(tool, inp):
+                record_hub_session(ctx.ws, sid, now_iso())
+            if sid == hub_session_id(ctx.ws):
+                r = hub_session(tool, inp, payload.get("cwd"), ctx)
+                if r is None:
+                    return None
+                log(ctx, tool, {"kind": "hub-session", "category": "hub"}, r[0], r[1])
+                return r
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             return None

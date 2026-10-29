@@ -17,6 +17,8 @@ remembering anything. When this page and the hook disagree, the hook wins, and t
 | `drafts` | A mail or chat draft. A draft delivers nothing |
 | `own_calendar_no_guests` | A calendar event whose only guest, if any, is `manager.email` |
 
+The pinned hub session reads untrusted source summaries, so the guard fences it to hub work (`mother hub` verbs, reads inside the workspace and plugin, MCP reads, the session tools above): no file writes, web, other commands or MCP writes. It is the session that last ran `mother hub tail`, recorded in `.mother/hub/hub-session.json` (CONTRACT §5).
+
 Reading anything and local work (memory, todos, files in the workspace) is not outbound at all. Neither are the desktop app's own session tools (raising a session card, messaging one of the manager's sessions): they reach only the manager, and the guard matches them by exact name. Because a message can carry text quoted from a source, the guard asks before a message goes into a session the hub does not route to (one that is not `live` in `.mother/hub/sessions.json`; from the workspace, a message by name goes without asking only to `main` or a live hub session's name), and before a session is started right away rather than raised as a card.
 
 **Needs a yes** (`policy.needs_yes`). The agent drafts it, shows it, and the human confirms in the prompt.

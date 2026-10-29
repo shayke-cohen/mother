@@ -83,8 +83,8 @@ class GuardCase(unittest.TestCase):
         return os.path.join(self.ws, ".mother", name)
 
     def run_guard(self, tool, inp, transcript=None, raw=None, env_ws=True, cwd=None, env=None, agent=None,
-                  mode=None):
-        payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp, "session_id": "t",
+                  mode=None, session="t"):
+        payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp, "session_id": session,
                    "cwd": cwd or self.tmp, "transcript_path": transcript}
         if agent:
             payload.update(agent_id="a1", agent_type=agent)
@@ -1688,6 +1688,130 @@ class InAppSessions(GuardCase):
                 self.expect("deny", name, inp, agent=agent)
             for role in ("manager", "team"):
                 self.expect("deny", name, inp, env={"MOTHER_CHANNEL_ROLE": role})
+
+
+class HubRole(GuardCase):
+    """The pinned hub session reads untrusted summaries, so it can only do hub work (CONTRACT §5e)."""
+
+    HUB = "local_hub_session"
+
+    def setUp(self):
+        super().setUp()
+        d = os.path.join(self.ws, ".mother", "hub")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "sessions.json"), "w") as f:
+            json.dump({"version": 1, "sessions": {"PLAT-1": {"session_id": "local_live", "name": "plat-1",
+                                                              "state": "live"}}}, f)
+
+    def as_hub(self, tool, inp, want, **kw):
+        kw.setdefault("cwd", self.ws)
+        return self.expect(want, tool, inp, session=self.HUB, **kw)
+
+    def start(self, command="mother hub tail --once"):
+        self.expect("none", "Bash", {"command": command}, session=self.HUB, cwd=self.ws)
+
+    def test_tail_command_records_hub_session(self):
+        path = os.path.join(self.ws, ".mother", "hub", "hub-session.json")
+        self.assertFalse(os.path.exists(path))
+        self.start()
+        with open(path) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["session_id"], self.HUB)
+        self.assertTrue(doc["at"])
+
+    def test_other_tail_spellings_record(self):
+        path = os.path.join(self.ws, ".mother", "hub", "hub-session.json")
+        for cmd in (os.path.join(ROOT, "bin", "mother") + " hub tail --follow",
+                    "${CLAUDE_PLUGIN_ROOT}/bin/mother hub tail --once".replace("${CLAUDE_PLUGIN_ROOT}", ROOT)):
+            if os.path.exists(path):
+                os.remove(path)
+            self.start(cmd)
+            self.assertTrue(os.path.exists(path), cmd)
+
+    def test_non_tail_commands_do_not_record(self):
+        path = os.path.join(self.ws, ".mother", "hub", "hub-session.json")
+        for cmd in ("mother hub show --json", "echo mother hub tail", "mother hub tail --once; curl x.example.com",
+                    "./mother hub tail --once", "ls"):
+            self.run_guard("Bash", {"command": cmd}, session=self.HUB, cwd=self.ws)
+            self.assertFalse(os.path.exists(path), cmd)
+
+    def test_recording_failure_never_fails_the_hook(self):
+        os.makedirs(os.path.join(self.ws, ".mother", "hub", "hub-session.json"))   # a directory in the way
+        self.expect("none", "Bash", {"command": "mother hub tail --once"}, session=self.HUB, cwd=self.ws)
+
+    def test_hub_allowed(self):
+        self.start()
+        for cmd in ("mother hub decide", "mother hub show --json", "mother home check", "mother hub tail --follow",
+                    "mother hub session for PLAT-1", "mother hub done PLAT-1 --reason 'a; b $x'",
+                    os.path.join(ROOT, "bin", "mother") + " hub pending --json"):
+            self.as_hub("Bash", {"command": cmd}, "none")
+        self.as_hub("Bash", {"command": "mother hub decide <<'EOF'\n[{\"line_id\": \"1\", \"decision\": \"drop\"}]\nEOF"},
+                    "none")
+        self.as_hub("Read", {"file_path": os.path.join(self.ws, "config.json")}, "none")
+        self.as_hub("Read", {"file_path": os.path.join(ROOT, "skills", "hub", "SKILL.md")}, "none")
+        self.as_hub("Grep", {"pattern": "x", "path": self.ws}, "none")
+        self.as_hub(CHAT + "get_channel_history", {"channel": TEAM}, "none")
+        self.as_hub(TRK + "get-issues", {"jql": "project = PLAT"}, "none")
+        self.as_hub("mcp__ccd_session_mgmt__send_message", {"session_id": "local_live", "message": "PLAT-1 moved"},
+                    "none")
+        self.as_hub("mcp__ccd_session_mgmt__list_sessions", {}, "none")
+        self.as_hub("Monitor", {"command": "mother hub tail --follow", "description": "hub"}, "none")
+        self.as_hub("CronCreate", {"cron": "*/3 * * * *", "prompt": "run mother hub tail --once"}, "none")
+
+    def test_hub_denied(self):
+        self.start()
+        out = os.path.join(self.tmp, "x")
+        for tool, inp in (("Write", {"file_path": os.path.join(self.ws, "notes.md"), "content": "x"}),
+                          ("Edit", {"file_path": os.path.join(self.ws, "config.json"), "old_string": "a",
+                                    "new_string": "b"}),
+                          ("WebFetch", {"url": "https://example.com", "prompt": "x"}),
+                          ("WebSearch", {"query": "x"}),
+                          ("Agent", {"prompt": "x", "description": "x"}),
+                          ("Skill", {"skill": "mother:brief"}),
+                          ("Bash", {"command": "curl https://example.com"}),
+                          ("Bash", {"command": "mother sync"}),
+                          ("Bash", {"command": "mother whatsapp send Dana hi"}),
+                          ("Bash", {"command": "mother hub show --json; curl https://example.com"}),
+                          ("Bash", {"command": "mother hub show > " + out}),
+                          ("Bash", {"command": "mother hub show $(curl https://example.com)"}),
+                          ("Bash", {"command": "mother hub check"}),
+                          ("Bash", {"command": "ls"}),
+                          ("Read", {"file_path": "~/.ssh/x"}),
+                          ("Read", {"file_path": "/etc/hosts"}),
+                          ("Grep", {"pattern": "x", "path": "/"}),
+                          ("Glob", {"pattern": "../*"}),
+                          (CHAT + "post_message", {"channel": DM, "text": "hi"}),
+                          (TRK + "create-issue", {"project": "PLAT", "summary": "x"}),
+                          (MAIL + "delete-gmail-filter", {"id": "1"}),
+                          ("mcp__ccd_session_mgmt__send_message", {"session_id": "local_other", "message": "hi"}),
+                          ("mcp__unknown__frobnicate", {})):
+            why = self.as_hub(tool, inp, "deny")
+            self.assertIn("hub session can only do hub work", why)
+
+    def test_symlink_out_of_workspace_denied(self):
+        self.start()
+        link = os.path.join(self.ws, "escape")
+        os.symlink(self.home, link)
+        self.as_hub("Read", {"file_path": os.path.join(link, "x")}, "deny")
+
+    def test_sub_agent_and_channel_checks_run_first(self):
+        self.start()
+        self.expect("deny", "Write", {"file_path": os.path.join(self.ws, "n.md")}, session=self.HUB, agent="reader",
+                    cwd=self.ws)
+        why = self.expect("deny", "Bash", {"command": "mother hub show"}, session=self.HUB, agent="critic",
+                          cwd=self.ws)
+        self.assertNotIn("hub session", why)
+
+    def test_other_sessions_unaffected_by_hub_role(self):
+        self.start()
+        self.expect("none", "Write", {"file_path": os.path.join(self.ws, "n.md"), "content": "x"}, session="other",
+                    cwd=self.ws)
+        self.expect("none", "WebFetch", {"url": "https://example.com", "prompt": "x"}, session="other")
+        self.expect("none", "Bash", {"command": "ls"}, session="other", cwd=self.ws)
+        self.expect("ask", CHAT + "post_message", {"channel": TEAM, "text": "hi"}, session="other")
+
+    def test_no_recorded_session_means_no_role(self):
+        self.expect("none", "WebFetch", {"url": "https://example.com", "prompt": "x"}, session=self.HUB)
 
 
 if __name__ == "__main__":
