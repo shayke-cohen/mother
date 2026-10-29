@@ -11,6 +11,7 @@ This part: the machine-local files under <workspace>/.mother/hub/ and the vocabu
 Python 3.9 stdlib only.
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -26,7 +27,7 @@ from typing import Dict, List, Optional, Tuple
 
 SUMMARY_MAX = 300
 KEEP_DAYS = 7
-KINDS = ("update", "resolved", "error", "sweep")
+KINDS = ("update", "resolved", "error", "sweep", "manual")
 
 _TRACKER = re.compile(r"(?<![A-Za-z0-9_-])[A-Z][A-Z0-9]+-\d+(?![A-Za-z0-9_-])")
 _PR_URL = r"https?://[\w.-]+/(?P<u>[\w.-]+/[\w.-]+)/pull/(?P<un>\d+)"
@@ -138,7 +139,7 @@ def _must_decide(lines: List[dict]) -> bool:
     as `digest` picks it) is not `resolved`. An update and its resolution in one pass print nothing."""
     latest = {}
     for l in lines:
-        if l.get("kind") in ("sweep", "error"):
+        if l.get("kind") in ("sweep", "error", "manual"):
             return True
         k = l.get("key")
         if k not in latest or _wins(l, latest[k]):
@@ -147,20 +148,30 @@ def _must_decide(lines: List[dict]) -> bool:
 
 
 def coalesce(lines: List[dict]) -> List[dict]:
-    """One line per key: the latest `at` wins (`_wins`), `also` is the union (order kept). First-seen key order."""
+    """One line per key: the latest `at` wins (`_wins`), `also` is the union (order kept). First-seen key order.
+    A `manual` line is never collapsed: it stays, as it is, where it came."""
     best = {}
     also = {}
+    order = []  # type: list
     for l in lines:
+        if l.get("kind") == "manual":
+            order.append((None, l))
+            continue
         k = l["key"]
         also.setdefault(k, [])
         for a in l.get("also") or []:
             if a not in also[k]:
                 also[k].append(a)
+        if k not in best:
+            order.append((k, None))
         if k not in best or _wins(l, best[k]):
             best[k] = l
     out = []
-    for k, l in best.items():
-        l = dict(l)
+    for k, m in order:
+        if k is None:
+            out.append(m)
+            continue
+        l = dict(best[k])
         l["also"] = also[k]
         out.append(l)
     return out
@@ -331,6 +342,82 @@ def pending_work(ws: Path, cfg: dict, at: datetime) -> bool:
     return False
 
 
+_EMPTY_WATCH = {"version": 1, "follow": {"projects": [], "channels": [], "threads": [], "repos": []},
+                "mute": {"keys": [], "people": [], "channels": []}, "auto": {"projects": []}}
+
+
+def load_watch(ws: Path) -> dict:
+    """`watch.json` with every field present and well-typed (a missing or damaged file is an empty list)."""
+    doc = load_json(ws, "watch.json", {})
+    doc = doc if isinstance(doc, dict) else {}
+    out = json.loads(json.dumps(_EMPTY_WATCH))
+    for part in ("follow", "mute"):
+        got = doc.get(part) if isinstance(doc.get(part), dict) else {}
+        for k in out[part]:
+            out[part][k] = list(dict.fromkeys(x for x in (got.get(k) or []) if isinstance(x, str) and x)) \
+                if isinstance(got.get(k), list) else []
+    auto = doc.get("auto") if isinstance(doc.get("auto"), dict) else {}
+    out["auto"]["projects"] = [a for a in (auto.get("projects") or []) if isinstance(a, dict)
+                               and isinstance(a.get("key"), str) and a["key"]] \
+        if isinstance(auto.get("projects"), list) else []
+    return out
+
+
+def save_watch(ws: Path, doc: dict) -> None:
+    """Atomic write of `watch.json`; the caller holds `locked(ws)`."""
+    save_json(ws, "watch.json", doc)
+
+
+def merged_watch(cfg: dict, watch: dict) -> dict:
+    """`hub.watch` from config plus the manager's watch list, in the shape adapters read (`chat.channels`,
+    `chat.follow` = thread keys, `tracker.projects`, `code.repos`), plus a `mute` block."""
+    w = _hub_cfg(cfg).get("watch")
+    out = json.loads(json.dumps(w)) if isinstance(w, dict) else {}
+    for cap in ("chat", "tracker", "code"):
+        if not isinstance(out.get(cap), dict):
+            out[cap] = {}
+    f = watch.get("follow") or {}
+
+    def join(sec, field, extra):
+        base = out[sec].get(field)
+        out[sec][field] = list(dict.fromkeys([x for x in (base if isinstance(base, list) else []) if x] + list(extra)))
+
+    join("chat", "channels", f.get("channels") or [])
+    join("chat", "follow", f.get("threads") or [])
+    join("tracker", "projects", list(f.get("projects") or []) + [a["key"] for a in (watch.get("auto") or {}).get("projects") or []])
+    join("code", "repos", f.get("repos") or [])
+    out["mute"] = {k: list((watch.get("mute") or {}).get(k) or []) for k in ("keys", "people", "channels")}
+    return out
+
+
+def effective_cfg(cfg: dict, watch: dict) -> dict:
+    """A copy of `cfg` whose `hub.watch` is the merged list: what one polling pass hands to the adapters."""
+    eff = dict(cfg or {})
+    h = dict(_hub_cfg(cfg))
+    h["watch"] = merged_watch(cfg, watch)
+    eff["hub"] = h
+    return eff
+
+
+def is_muted(line: dict, mute: dict) -> bool:
+    """A watcher line the manager muted: its key or an `also` key, its author (chat user id or email), or the
+    channel of a chat key. A `manual` line is never muted."""
+    if line.get("kind") == "manual":
+        return False
+    keys = set(mute.get("keys") or [])
+    if line.get("key") in keys or any(a in keys for a in line.get("also") or []):
+        return True
+    who = (line.get("who") or "").lower()
+    for p in mute.get("people") or []:
+        p = p.lower()
+        if who and (who == p or ("@" in p and p in who)):
+            return True
+    if line.get("source") == "chat" and "/" in str(line.get("key")):
+        if line["key"].split("/", 1)[0] in (mute.get("channels") or []):
+            return True
+    return False
+
+
 def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
     """`hub.watch.<cap>`; for the tracker, `projects` is that list plus every team's tracker project, de-duplicated."""
     w = (h.get("watch") or {}).get(cap)
@@ -367,6 +454,9 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         errors = [str(e) for e in (old.get("errors") or [])] if isinstance(old, dict) else []
     connectors = (cfg or {}).get("connectors") or {}
     me = build_me(cfg)
+    eff = effective_cfg(cfg, load_watch(ws))
+    h = _hub_cfg(eff)
+    mute = h["watch"].get("mute") or {}
     for cap in CAPS if poll else ():
         connector = connectors.get(cap)
         if not isinstance(connector, str) or not connector:
@@ -409,6 +499,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             sources[cap] = ent
             errors.append("%s: %s" % (cap, ent["reason"]))
             continue
+        res["lines"] = [l for l in res["lines"] if not is_muted(l, mute)]
         append_inbox(ws, res["lines"])
         woke = _must_decide(res["lines"]) or woke
         with locked(ws):
@@ -653,7 +744,11 @@ USAGE = """mother hub <verb>
   session     add <key> --id ID --name N --title T [--link URL] [--also K,K] | drop <key> | seen <key> | for <key>
   done        <U-id>  mark an update done
   snooze      <U-id> 1h|tomorrow|next-week
-  show        [--json]  pending proposals, updates and sessions"""
+  show        [--json]  pending proposals, updates and sessions
+  add         <link-or-text> [--key K]  hand the hub a thing by hand (a `manual` line it always routes or proposes)
+  follow      <PROJECT | channel id | channel/ts | owner/repo>  watch it too (`unfollow` stops)
+  mute        <key | U-id | email | channel id>  drop its watcher lines (`unmute` undoes)
+  watching    [--json]  the merged watch list (config plus follows) and the mutes"""
 
 
 def default_plist_path() -> Path:
@@ -994,16 +1089,19 @@ def _apply_resolved(ws: Path, keys) -> None:
 
 
 def digest(ws: Path, batch: List[dict]) -> List[dict]:
-    """What tail prints for a batch: sweep and error lines as they are, update lines collapsed to one per key,
+    """What tail prints for a batch: sweep, error and manual lines as they are, update lines collapsed to one per key,
     and no output for a key whose latest line is `resolved` (that resolution is applied to hub.json)."""
     pos = {}
     for i, l in enumerate(batch):
         pos[l["id"]] = i
     by_key = {}
     keep = []
+    asked = set()  # keys the manager handed over by hand in this batch: no resolution applies to them
     for l in batch:
-        if l.get("kind") in ("sweep", "error"):
+        if l.get("kind") in ("sweep", "error", "manual"):
             keep.append(l)
+            if l.get("kind") == "manual":
+                asked.add(l["key"])
         else:
             by_key.setdefault(l["key"], []).append(l)
     resolved = []
@@ -1013,7 +1111,8 @@ def digest(ws: Path, batch: List[dict]) -> List[dict]:
             if _wins(l, latest):
                 latest = l
         if latest.get("kind") == "resolved":
-            resolved.append(k)
+            if k not in asked:
+                resolved.append(k)
             continue
         keep.extend(coalesce([l for l in ls if l.get("kind") == "update"]))
     _apply_resolved(ws, resolved)
@@ -1410,6 +1509,117 @@ def _read_decisions(stdin) -> List[dict]:
     return items
 
 
+_SLACK_LINK = re.compile(r"/archives/(?P<c>[CG][A-Z0-9]+)/p(?P<a>\d{10})(?P<b>\d{6})(?:\?[^\s]*thread_ts=(?P<t>\d+\.\d+))?")
+_URL = re.compile(r"https?://\S+")
+_CHANNEL = re.compile(r"^[CG][A-Z0-9]{6,}$")
+_PROJECT = re.compile(r"^[A-Z][A-Z0-9]+$")
+_THREAD = re.compile(r"^[CG][A-Z0-9]+/\d+\.\d+$")
+_REPO = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def manual_key(text: str) -> str:
+    """The thing a link or note is about: a chat message link -> its thread key, else the first tracker or PR key
+    in it, else `manual:<hash of the text>`."""
+    m = _SLACK_LINK.search(text)
+    if m:
+        return thing_key("chat", {"channel": m.group("c"), "ts": "%s.%s" % (m.group("a"), m.group("b")),
+                                  "thread_ts": m.group("t")})
+    found = extract_also(text)
+    if found:
+        return found[0]
+    return "manual:" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+
+def add_cmd(ws: Path, at: datetime, args, out) -> int:
+    try:
+        pos, opts = _parse_flags(args, {"key"})
+    except ValueError as e:
+        print("mother hub add: %s" % e, file=sys.stderr)
+        return 2
+    text = " ".join(pos).strip()
+    if not text:
+        print("usage: mother hub add <link-or-text> [--key K]", file=sys.stderr)
+        return 2
+    key = opts.get("key") if isinstance(opts.get("key"), str) and opts.get("key") else manual_key(text)
+    stamp = _iso(at)
+    url = _URL.search(text)
+    digest_ = hashlib.sha1(text.encode("utf-8")).hexdigest()[:6]
+    ln = make_line("manual", "manual", key, stamp, title=text[:80], link=url.group(0) if url else "",
+                   summary=text, also=[a for a in extract_also(text) if a != key], uid="%s-%s" % (stamp, digest_))
+    append_inbox(ws, [ln])
+    print("added %s" % key, file=out)
+    return 0
+
+
+def classify_follow(x: str):
+    """(list name in watch.json `follow`, value) or None."""
+    if _THREAD.match(x):
+        return "threads", x
+    if _CHANNEL.match(x) and any(c.isdigit() for c in x):
+        return "channels", x
+    if _PROJECT.match(x):
+        return "projects", x
+    if _REPO.match(x):
+        return "repos", x
+    return None
+
+
+def classify_mute(x: str):
+    if _CHAT_USER.match(x) or ("@" in x and "/" not in x):
+        return "people", x
+    if _CHANNEL.match(x) and any(c.isdigit() for c in x):
+        return "channels", x
+    return "keys", x
+
+
+def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
+    if verb == "watching":
+        w = load_watch(ws)
+        merged = merged_watch(cfg, w)
+        if as_json:
+            print(json.dumps({"watch": merged, "follow": w["follow"], "mute": w["mute"], "auto": w["auto"]},
+                             indent=2, sort_keys=True), file=out)
+            return 0
+        for cap, fld in (("chat", "channels"), ("chat", "follow"), ("tracker", "projects"), ("code", "repos")):
+            print("%s %s: %s" % (cap, "threads" if fld == "follow" else fld,
+                                 ", ".join(merged.get(cap, {}).get(fld) or []) or "-"), file=out)
+        for k in ("keys", "people", "channels"):
+            print("mute %s: %s" % (k, ", ".join(merged["mute"][k]) or "-"), file=out)
+        return 0
+    if len(args) != 1 or args[0].startswith("--"):
+        print("usage: mother hub %s <%s>" % (verb, "key|person|channel" if "mute" in verb
+                                             else "project|channel-id|channel/ts|owner/repo"), file=sys.stderr)
+        return 2
+    x = args[0]
+    mute = verb in ("mute", "unmute")
+    found = classify_mute(x) if mute else classify_follow(x)
+    if found is None:
+        print("mother hub %s: cannot tell what %r is (a project key, channel id, channel/ts or owner/repo)"
+              % (verb, x), file=sys.stderr)
+        return 2
+    part, name = "mute" if mute else "follow", found[0]
+    with locked(ws):
+        w = load_watch(ws)
+        lst = w[part][name]
+        if verb in ("follow", "mute"):
+            changed = found[1] not in lst
+            if changed:
+                lst.append(found[1])
+        else:
+            changed = found[1] in lst
+            if changed:
+                lst.remove(found[1])
+            if verb == "unfollow" and name == "projects":  # an auto-followed project is dropped too
+                auto = w["auto"]["projects"]
+                keep = [a for a in auto if a.get("key") != found[1]]
+                changed = changed or len(keep) != len(auto)
+                w["auto"]["projects"] = keep
+        if changed:
+            save_watch(ws, w)
+    print("%s %s %s%s" % (verb, name, found[1], "" if changed else " (no change)"), file=out)
+    return 0
+
+
 def main(args, ws, cfg, at) -> int:
     verb, rest = (args[0], args[1:]) if args else ("", [])
     if verb in ("", "help", "-h", "--help"):
@@ -1463,5 +1673,9 @@ def main(args, ws, cfg, at) -> int:
         return update_cmd(ws, cfg, at, verb, rest, as_json, sys.stdout)
     if verb == "show":
         return show(ws, as_json, sys.stdout)
+    if verb == "add":
+        return add_cmd(ws, at, rest, sys.stdout)
+    if verb in ("follow", "unfollow", "mute", "unmute", "watching"):
+        return watch_cmd(ws, cfg, verb, rest, as_json, sys.stdout)
     print("mother hub: unknown verb %r; see `mother hub help`" % verb, file=sys.stderr)
     return 1

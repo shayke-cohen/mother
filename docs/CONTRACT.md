@@ -847,7 +847,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   "the hub never woke".
 - **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
   (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,
-  kind (update|resolved|error|sweep), key, also, title, who, link, summary}` (`title` and `who` are the sender's
+  kind (update|resolved|error|sweep|manual), key, also, title, who, link, summary}` (`title` and `who` are the sender's
   text: `make_line` drops C0/C1 control characters and Unicode format and line/paragraph separator characters,
   and turns tab, CR and newline into a space), `id` = `<source>:<key>:<at>` (chat
   uses the message's raw `ts` in place of `at`, so two messages in one second keep distinct ids), `also` = other
@@ -855,7 +855,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   a `resolved` line never replaces an `update` whose `at` is the same or later. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
   file from a crash into the dated file, and deletes dated files 7 or more days old.
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
-  connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below).
+  connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below) and
+  the manager's verbs `add`, `follow`, `unfollow`, `mute`, `unmute`, `watching` (watch list, below).
   `mother hub help` works without a workspace. `--json` gives machine output; without it the output is short text.
 - **launchd job.** Label `com.mother.hub`, plist `~/Library/LaunchAgents/com.mother.hub.plist`.
   `ProgramArguments` = absolute python, absolute `bin/mother`, `hub`, `watch`; `EnvironmentVariables` =
@@ -875,6 +876,23 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   when, while `active`, `watcher.json` `last_append_at` is later than `hub.json` `last_wake` (or the hub never
   woke) and older than 2x `every_seconds`: the hub has not caught up with a line it must decide. An old
   `last_wake` with nothing appended since is a quiet day, not stale; a missing `hub.json` prints `hub: never woke`.
+- **Watch list and `manual` lines.** `watch.json` (machine-local, atomic, under `hub.lock`) is
+  `{version: 1, follow: {projects, channels, threads, repos}, mute: {keys, people, channels}, auto: {projects:
+  [{key, from, at}]}}`; a missing or damaged file is empty. Each polling pass merges it with `hub.watch`
+  (`merged_watch`: `chat.channels` + followed channels, `chat.follow` + followed threads, `tracker.projects` +
+  followed and auto projects, `code.repos` + followed repos, plus the `mute` block) and hands the adapters that
+  effective config; `hub.watch` itself is never rewritten. Verbs, all writing only `.mother/hub/`: `follow <x>` /
+  `unfollow <x>` classify `x` as a project (`[A-Z][A-Z0-9]+`), a channel (`C…`/`G…` id), a thread
+  (`<channel>/<ts>`) or a repo (`owner/repo`), else exit 2 (`unfollow` of a project also drops it from `auto`);
+  `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, or anything else as a
+  key; `watching [--json]` prints the merged list and the mutes; `add <link-or-text> [--key K]` appends one
+  `manual` line (source `manual`; key = `--key`, else a chat message link's thread key, else the first tracker or
+  PR key in the text, else `manual:<sha1 prefix>`; `link` is the first URL; id carries a hash so two adds in a
+  second stay distinct). Before appending, the watcher drops a line whose key or `also` key is a muted key, whose
+  `who` is a muted person (id equal, or email contained), or whose chat key is in a muted channel. A `manual`
+  line is never dropped by mute, never produced by the watcher, never collapsed by `coalesce`, never resolved
+  (`digest` skips resolution for a key with a `manual` line in the batch), and `tail` always prints it; the hub
+  routes or proposes it, never only logs it.
 - **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It writes one line to its log and
   returns, so the process exits 0 and launchd leaves it down, when this is not the home machine
   (`workspace.home_machine` names another machine or none), when `hub.enabled` is not `true`, or when the config

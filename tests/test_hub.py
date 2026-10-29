@@ -1277,3 +1277,139 @@ class Verbs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Direct(unittest.TestCase):
+    """The manager's watch list (follow / mute) and `manual` lines."""
+    AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.cfg = {"manager": {"timezone": "UTC", "email": "dana@example.com", "chat_dm": "U00000000"},
+                    "connectors": {"tracker": "jira"},
+                    "hub": {"enabled": True, "connections": {"tracker": {"command": "x", "args": [], "env": {}}},
+                            "watch": {"chat": {"channels": ["C00000001"]}, "tracker": {"projects": ["PLAT"]}}}}
+
+    def run_verb(self, *args):
+        import io
+        out = io.StringIO()
+        real = sys.stdout
+        sys.stdout = out
+        try:
+            rc = hub.main(list(args), self.ws, self.cfg, self.AT)
+        finally:
+            sys.stdout = real
+        return rc, out.getvalue()
+
+    def inbox(self):
+        return hub.read_inbox(self.ws)
+
+    def test_add_link_appends_manual_line_with_key(self):
+        rc, _ = self.run_verb("add", "https://example.com/browse/PLAT-7")
+        self.assertEqual(rc, 0)
+        (l,) = self.inbox()
+        self.assertEqual((l["kind"], l["source"], l["key"]), ("manual", "manual", "PLAT-7"))
+        self.assertEqual(l["link"], "https://example.com/browse/PLAT-7")
+        self.run_verb("add", "https://example.com/archives/C00000001/p1700000000123456")
+        self.assertEqual(self.inbox()[-1]["key"], "C00000001/1700000000.123456")
+        self.run_verb("add", "look at this", "--key", "mine")
+        self.assertEqual(self.inbox()[-1]["key"], "mine")
+
+    def test_add_text_uses_manual_hash_key(self):
+        self.run_verb("add", "ask Agnes about the launch")
+        self.run_verb("add", "ask Agnes about the launch")
+        a, b = self.inbox()
+        self.assertTrue(a["key"].startswith("manual:"))
+        self.assertEqual(a["key"], b["key"])
+        self.assertEqual(self.run_verb("add")[0], 2)
+
+    def test_manual_line_never_collapsed_or_resolved(self):
+        m1 = line(source="manual", kind="manual", key="PLAT-1", at="2026-10-29T09:00:00Z")
+        m2 = line(source="manual", kind="manual", key="PLAT-1", at="2026-10-29T09:00:00Z", summary="again")
+        res = line(kind="resolved", key="PLAT-1", at="2026-10-29T09:30:00Z")
+        upd = line(kind="update", key="PLAT-1", at="2026-10-29T09:10:00Z")
+        self.assertEqual(len(hub.coalesce([m1, upd, m2, res])), 3)
+        self.assertEqual(sum(1 for l in hub.coalesce([m1, m2]) if l["kind"] == "manual"), 2)
+        hub.append_inbox(self.ws, [m1, upd, res])
+        h = {"pending": [], "updates": [{"id": "U1", "key": "PLAT-1", "state": "open"}], "routed": []}
+        hub.save_json(self.ws, "hub.json", h)
+        out = hub.digest(self.ws, hub.read_inbox(self.ws))
+        self.assertEqual([l["kind"] for l in out], ["manual"])
+        self.assertEqual(len(hub.load_json(self.ws, "hub.json", {})["updates"]), 1)  # not resolved away
+        self.assertTrue(hub._must_decide([m1, res]))
+
+    def test_follow_classifies_targets(self):
+        for x, part in (("WEB", "projects"), ("C00000002", "channels"), ("G00000003", "channels"),
+                        ("C00000002/1700000000.000100", "threads"), ("example/repo", "repos")):
+            self.assertEqual(self.run_verb("follow", x)[0], 0, x)
+            self.assertIn(x, hub.load_watch(self.ws)["follow"][part])
+        self.assertEqual(self.run_verb("follow", "no good")[0], 2)
+        self.assertEqual(self.run_verb("follow", "plat-1")[0], 2)
+        self.run_verb("follow", "WEB")
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["projects"], ["WEB"])
+
+    def test_unfollow_removes(self):
+        self.run_verb("follow", "WEB")
+        w = hub.load_watch(self.ws)
+        w["auto"]["projects"] = [{"key": "WEB", "from": "PLAT-1", "at": "x"}]
+        hub.save_watch(self.ws, w)
+        self.assertEqual(self.run_verb("unfollow", "WEB")[0], 0)
+        w = hub.load_watch(self.ws)
+        self.assertEqual((w["follow"]["projects"], w["auto"]["projects"]), ([], []))
+        self.assertEqual(self.run_verb("unfollow", "WEB")[0], 0)  # absent: no change, no error
+
+    def test_mute_classifies_and_unmutes(self):
+        for x in ("PLAT-9", "U00000009", "agnes@example.com", "C00000009"):
+            self.run_verb("mute", x)
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual((m["keys"], m["people"], m["channels"]),
+                         (["PLAT-9"], ["U00000009", "agnes@example.com"], ["C00000009"]))
+        self.run_verb("unmute", "PLAT-9")
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["keys"], [])
+
+    def test_mute_drops_watcher_lines_not_manual(self):
+        class A:
+            SOURCE = "tracker"
+            READ_TOOLS = set()
+            seen = None
+
+            @classmethod
+            def poll(cls, client, cursor, cfg, me, at):
+                cls.seen = cfg
+                if cursor is None:
+                    return {"lines": [], "cursor": {"n": 1}, "partial": []}
+                return {"lines": [line(key="PLAT-1"), line(key="PLAT-2", also=["PLAT-8"]),
+                                  line(key="PLAT-3", who="U00000009"), line(key="PLAT-4", who="Agnes <a@example.com>"),
+                                  line(source="chat", key="C00000009/1.0", who="U1"),
+                                  line(source="manual", kind="manual", key="PLAT-1")], "cursor": {"n": 2},
+                        "partial": []}
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["tracker:jira"] = A
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        for x in ("PLAT-1", "PLAT-8", "U00000009", "a@example.com", "C00000009"):
+            self.run_verb("mute", x)
+        self.run_verb("follow", "WEB")
+        clients = {"tracker": object()}
+        hub.poll_once(self.ws, self.cfg, self.AT, clients)
+        hub.poll_once(self.ws, self.cfg, self.AT + timedelta(minutes=2), clients)
+        self.assertEqual([(l["source"], l["key"]) for l in self.inbox()], [("manual", "PLAT-1")])
+        self.assertEqual(set(A.seen["projects"]), {"PLAT", "WEB"})
+
+    def test_watching_merges_config_and_file(self):
+        self.run_verb("follow", "WEB")
+        self.run_verb("follow", "C00000002")
+        self.run_verb("follow", "C00000002/1700000000.000100")
+        self.run_verb("follow", "example/repo")
+        self.run_verb("mute", "PLAT-9")
+        rc, out = self.run_verb("watching", "--json")
+        doc = json.loads(out)["watch"]
+        self.assertEqual(doc["chat"]["channels"], ["C00000001", "C00000002"])
+        self.assertEqual(doc["chat"]["follow"], ["C00000002/1700000000.000100"])
+        self.assertEqual(doc["tracker"]["projects"], ["PLAT", "WEB"])
+        self.assertEqual(doc["code"]["repos"], ["example/repo"])
+        self.assertEqual(doc["mute"]["keys"], ["PLAT-9"])
+        text = self.run_verb("watching")[1]
+        self.assertIn("tracker projects: PLAT, WEB", text)
+        self.assertEqual(self.cfg["hub"]["watch"]["tracker"]["projects"], ["PLAT"])  # config untouched
