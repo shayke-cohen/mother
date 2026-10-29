@@ -593,8 +593,10 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   tool on its adapter's read allow-list (`tools/list` is the read; no tool is called), `gh` must answer `gh api
   user`; it prints `cap | ok/✗ | reason` and exits 1 if any fails. `status` prints the `watcher.json` and
   `hub.json` (`last_wake`) heartbeats and exits 2 only when the watcher never ran or its `at` is older than 2x
-  `watcher.json` `every_seconds` while `active`. The hub wakes on events, so an old `last_wake` is printed with
-  `STALE` but does not fail; a missing `hub.json` prints `hub: never woke`.
+  `watcher.json` `every_seconds` while `active`. The hub line is printed with `STALE` (the exit code is unchanged)
+  when, while `active`, `watcher.json` `last_append_at` is later than `hub.json` `last_wake` (or the hub never
+  woke) and older than 2x `every_seconds`: the hub has not caught up with a line it must decide. An old
+  `last_wake` with nothing appended since is a quiet day, not stale; a missing `hub.json` prints `hub: never woke`.
 - **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It exits 2 when `workspace.home_machine`
   names another machine (3 when none is set, as `mother home check`) and returns, so the process exits 0, on SIGTERM.
   Each pass (`hub.poll_once`) polls every capability in `connectors` that has an adapter, appends the coalesced
@@ -603,10 +605,12 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   active hours (`routines.tick.active_hours` on `manager.workdays`, in `manager.timezone`) and `idle_every_seconds`
   outside; at 0 it does not poll outside them and sleeps until the next window. It rotates the inbox when the local
   day changes (the file is named for the day that ended).
-- **`watcher.json`.** `{at, every_seconds, active, sources: {<cap>: {status: ok|partial|couldnt_check, reason?,
+- **`watcher.json`.** `{at, every_seconds, active, last_append_at?, sources: {<cap>: {status: ok|partial|couldnt_check, reason?,
   since?}}, errors: [str]}`. `partial` carries the adapter's sub-read failures as `reason`; `couldnt_check` carries
   why (`no connection` when `hub.connections` has no entry for the capability, or the failure), `since` is when
-  the status began, and `errors` lists `<cap>: <reason>` for every source not `ok`.
+  the status began, and `errors` lists `<cap>: <reason>` for every source not `ok`. `last_append_at` is the poll
+  time of the last pass that appended a line the hub must decide (`update`, `error` or `sweep`; a `resolved` line
+  is never printed to the hub, so it does not count); it is carried over from the previous heartbeat otherwise.
 - **Error transition.** On the first failing pass of a source since it last worked, the watcher appends one `error`
   line (key `watcher:<cap>`); `cursors.json` `_errored` ([cap]) remembers that it was emitted, so further failing
   passes add nothing and a restart does not repeat it; a successful pass clears it. The watcher never writes
@@ -615,13 +619,19 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   never caught: it stops the watcher.
 - **Sweep.** A `sweep` line (source `hub`, key `sweep`) is appended when `hub.sweep_minutes` have passed since
   `cursors.json` `_last_sweep` (or there is none) and something is pending: `hub.json` `pending` is non-empty, or a
-  `sessions.json` session with `state: live` has `unseen > 0`. Both files are read defensively; a missing or
+  `sessions.json` session with `state: live` has `unseen > 0` and a `last_routed_at` within `hub.update_ttl_hours`
+  working hours (older unseen news no longer wakes the hub). Both files are read defensively; a missing or
   unreadable one counts as nothing pending.
 - **`hub.json`.** `{version: 1, last_wake, inbox_cursor (an inbox line id), next_update (counter behind the U ids),
   routed: [at most 50 {line_id, key, decision, session_id?, at}], pending: [{key, title, link, read, next_step,
-  proposed_at, raised_at (null until a card is raised), name}], updates: [{id (U<n>), key, title, why, link, at, state: open|done|snoozed, snooze_until?}]}`.
+  also: [key] (at most 50), proposed_at, raised_at (null until a card is raised), task_id (the card's id, or
+  null), last_update_at (the last `propose` for the key), name}], updates: [{id (U<n>), key, title, why, link, at, state: open|done|snoozed, snooze_until?}]}`.
   Readers must tolerate any field missing.
-- **`pending raised <key> --name <slug>`.** Stamps `raised_at` (now) and `name` on that `pending` entry; exit 1 when there is no such pending key, 2 on bad usage. `decide` `propose` leaves `raised_at` null (keeping an earlier stamp for the same key); the hub raises a card for each entry without `raised_at`, oldest `proposed_at` first, within its card budget, then stamps it. An unraised entry keeps the watcher's sweep firing. The sweep matches started cards by the stamped `name`.
+- **`pending raised <key> --name <slug> [--task <task_id>]`.** Stamps `raised_at` (now), `name` and `task_id` on
+  that `pending` entry; exit 1 when there is no such pending key, 2 on bad usage. **`pending drop <key>`** removes
+  the entry and prints its `task_id` (so the hub can `dismiss_task` the card); exit 1 when there is none.
+  **Expiry:** on every write a `pending` entry goes when it is older than `hub.update_ttl_hours` working hours,
+  counted from `raised_at`, else `proposed_at`. `decide` `propose` leaves `raised_at` null (keeping an earlier stamp for the same key); the hub raises a card for each entry without `raised_at`, oldest `proposed_at` first, within its card budget, then stamps it. An unraised entry keeps the watcher's sweep firing. The sweep matches started cards by the stamped `name`.
 - **`sessions.json`.** `{version: 1, sessions: {<key>: {session_id, name, title, link (a `claude://` URL or null,
   stored as given), also: [key], opened_at, last_routed_at, unseen (int), state: live|dropped}}}`. A key maps to a
   session when it, or any key in the line's `also`, is a session key or is in a session's `also`; only `live`
@@ -637,8 +647,13 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **`decide`.** stdin is one object or a list `{line_id, key, decision: log|now|route|propose|error, title?, why?,
   link?, read?, next_step?, name?, also?}` (exit 2 on bad input, nothing written). Under `hub.lock` it appends to
   `routed` (last 50), moves `inbox_cursor` to `line_id` (never backwards), and sets `last_wake`. `now` creates (or
-  refreshes, per key) an `updates` entry with the next `U<n>`; `propose` replaces the `pending` entry for the key;
-  `route` adds 1 to `unseen` and sets `last_routed_at` on the matching live session. A `route` with no live session
+  refreshes, per key) an `updates` entry with the next `U<n>`; `propose` replaces the `pending` entry for the key
+  (keeping `proposed_at`, `raised_at`, `task_id` and `name`, merging `also`, and setting `last_update_at`);
+  `route` adds 1 to `unseen`, sets `last_routed_at` on the matching live session, and adds the line's key and its
+  `also` keys to that session's `also` (at most 50, oldest dropped), so a later line in the same thread finds the
+  session even without the key it was first routed by. A `line_id` already in `routed` is not applied again: its
+  result is `{line_id, key, already_decided: true}`, and a call where every item is already decided writes
+  nothing. A `route` with no live session
   is stored as `propose`; the result says so (`note`). A `now` for a key that has a live session is recorded as a
   `route` instead (an update would be dropped at once), and the result says so. A `line_id` that is not in the kept
   inbox files exits 2 with nothing written. The batch is applied in inbox order whatever order it was given in, and
@@ -646,7 +661,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   but never moves the cursor back, so the hub must decide every printed line, in printed order. `title` and `link` default to the inbox line's. Output: one
   `{line_id, key, decision (as stored), session_id?, update_id?, note?}` per item.
 - **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (live, `unseen` 0; removes the
-  key and its `also` from `pending`), `drop <key>` (state `dropped`), `seen <key>` (`unseen` 0; exit 1 for an
+  key and its `also` from `pending`; when that pending entry's `last_update_at` is later than its `raised_at`, the
+  output carries `catch_up: {key, read, next_step, link, at}`, the one message the hub sends into the new session), `drop <key>` (state `dropped`), `seen <key>` (`unseen` 0; exit 1 for an
   unknown key), `for <key>` (prints the live session id, or exits 1).
 - **`done <U-id>`, `snooze <U-id> 1h|tomorrow|next-week`, `show [--json]`.** Snooze uses `mother now`'s
   `snooze_until`; an ended snooze is open again at the next write. Exit 1 for an unknown id, 2 for a bad word.

@@ -236,8 +236,26 @@ def build_me(cfg: dict) -> dict:
     return me
 
 
-def pending_work(ws: Path) -> bool:
-    """Something is waiting on the hub: `pending` proposals in hub.json, or a live session with unseen > 0.
+def _ttl(cfg: dict) -> float:
+    try:
+        return float(_hub_cfg(cfg).get("update_ttl_hours", 24))
+    except (TypeError, ValueError):
+        return 24.0
+
+
+def _older_than_ttl(stamp, cfg: dict, at: datetime) -> bool:
+    """True when `stamp` is more than hub.update_ttl_hours working hours before `at`; False when unreadable."""
+    import now as nowmod
+    import hub_sources
+    try:
+        return nowmod.working_hours(hub_sources.parse_iso(stamp), at, _schedule(cfg)) > _ttl(cfg)
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def pending_work(ws: Path, cfg: dict, at: datetime) -> bool:
+    """Something is waiting on the hub: any `pending` proposal in hub.json, or a live session with unseen > 0 that
+    was routed to within hub.update_ttl_hours working hours (older unseen news no longer wakes the hub).
     Both files are read defensively; a missing or odd one counts as nothing pending."""
     doc = load_json(ws, "hub.json", {})
     if isinstance(doc, dict) and doc.get("pending"):
@@ -247,10 +265,11 @@ def pending_work(ws: Path) -> bool:
     for s in (items.values() if isinstance(items, dict) else []):
         if isinstance(s, dict) and s.get("state") == "live":
             try:
-                if int(s.get("unseen") or 0) > 0:
-                    return True
+                unseen = int(s.get("unseen") or 0)
             except (TypeError, ValueError):
-                pass
+                continue
+            if unseen > 0 and s.get("last_routed_at") and not _older_than_ttl(s["last_routed_at"], cfg, at):
+                return True
     return False
 
 
@@ -270,6 +289,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     active, every = interval(cfg, at)
     sources = {}  # type: Dict[str, dict]
     errors = []
+    woke = False  # a line the hub must decide (anything but `resolved`) was appended this pass
     if not poll:
         sources = dict(old_src)
         errors = [str(e) for e in (old.get("errors") or [])] if isinstance(old, dict) else []
@@ -295,7 +315,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
                 reason = str(getattr(client, "message", None) or client)[:200]
             ent = {"status": "couldnt_check", "reason": reason, "since": since}
             if isinstance(client, Exception) and cap in conns:  # the server would not start: a source failure
-                _failed(ws, cap, stamp, ent)
+                woke = _failed(ws, cap, stamp, ent) or woke
             sources[cap] = ent
             errors.append("%s: %s" % (cap, reason))
             continue
@@ -307,11 +327,12 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             raise  # a programming error: stop the watcher rather than swallow it
         except Exception as e:
             ent = {"status": "couldnt_check", "reason": str(getattr(e, "message", None) or e)[:200], "since": since}
-            _failed(ws, cap, stamp, ent)
+            woke = _failed(ws, cap, stamp, ent) or woke
             sources[cap] = ent
             errors.append("%s: %s" % (cap, ent["reason"]))
             continue
         append_inbox(ws, res["lines"])
+        woke = woke or any(l.get("kind") != "resolved" for l in res["lines"])
         with locked(ws):
             cursors = load_json(ws, "cursors.json", {})
             cursors = cursors if isinstance(cursors, dict) else {}
@@ -325,24 +346,28 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             sources[cap] = {"status": "ok"}
         _set_errored(ws, cap, False)
     if poll:
-        _maybe_sweep(ws, h, at, stamp)
+        woke = _maybe_sweep(ws, cfg, at, stamp) or woke
     beat = {"at": stamp, "every_seconds": every, "active": active, "sources": sources, "errors": errors}
+    last = stamp if woke else (old.get("last_append_at") if isinstance(old, dict) else None)
+    if last:
+        beat["last_append_at"] = last
     with locked(ws):
         save_json(ws, "watcher.json", beat)
     return beat
 
 
-def _failed(ws, cap, stamp, ent) -> None:
+def _failed(ws, cap, stamp, ent) -> bool:
     """The first failing pass of a source since it last worked: one `error` inbox line. `cursors.json` `_errored`
     remembers that it was emitted (not the status, so a source that was `couldnt_check` for a missing connection
     still gets its line when it later fails). Nothing is written to capabilities.json."""
     cursors = load_json(ws, "cursors.json", {})
     cursors = cursors if isinstance(cursors, dict) else {}
     if cap in (cursors.get("_errored") or []):
-        return
+        return False
     append_inbox(ws, [make_line(cap, "error", "watcher:%s" % cap, stamp, title="%s source unreachable" % cap,
                                 summary=ent["reason"])])
     _set_errored(ws, cap, True)
+    return True
 
 
 def _set_errored(ws, cap, on: bool) -> None:
@@ -357,8 +382,10 @@ def _set_errored(ws, cap, on: bool) -> None:
             save_json(ws, "cursors.json", cursors)
 
 
-def _maybe_sweep(ws: Path, h: dict, at: datetime, stamp: str) -> None:
-    """Append one `sweep` line when sweep_minutes have passed since the last one and something is pending."""
+def _maybe_sweep(ws: Path, cfg: dict, at: datetime, stamp: str) -> bool:
+    """Append one `sweep` line when sweep_minutes have passed since the last one and something is pending.
+    True when it appended one."""
+    h = _hub_cfg(cfg)
     minutes = int(h.get("sweep_minutes", DEFAULTS["sweep_minutes"]))
     cursors = load_json(ws, "cursors.json", {})
     last = cursors.get("_last_sweep") if isinstance(cursors, dict) else None
@@ -366,11 +393,11 @@ def _maybe_sweep(ws: Path, h: dict, at: datetime, stamp: str) -> None:
         import hub_sources
         try:
             if at - hub_sources.parse_iso(last) < timedelta(minutes=minutes):
-                return
+                return False
         except (ValueError, TypeError):
             pass
-    if not pending_work(ws):
-        return
+    if not pending_work(ws, cfg, at):
+        return False
     append_inbox(ws, [make_line("hub", "sweep", "sweep", stamp, title="sweep",
                                 summary="pending proposals or unseen session updates")])
     with locked(ws):
@@ -378,6 +405,7 @@ def _maybe_sweep(ws: Path, h: dict, at: datetime, stamp: str) -> None:
         cursors = cursors if isinstance(cursors, dict) else {}
         cursors["_last_sweep"] = stamp
         save_json(ws, "cursors.json", cursors)
+    return True
 
 
 def build_clients(cfg: dict, have: dict) -> dict:
@@ -490,6 +518,7 @@ USAGE = """mother hub <verb>
   status      watcher and hub heartbeats; exit 2 if either is stale or the watcher never ran
   tail        [--once] [--follow]  inbox lines after hub.json inbox_cursor, one JSON line per key (the hub's Monitor runs --follow)
   decide      stdin: one decision object or a list {line_id, key, decision: log|now|route|propose|error, ...}
+  pending     raised <key> --name <slug> [--task <task_id>] | drop <key>
   session     add <key> --id ID --name N --title T [--link URL] [--also K,K] | drop <key> | seen <key> | for <key>
   done        <U-id>  mark an update done
   snooze      <U-id> 1h|tomorrow|next-week
@@ -680,8 +709,7 @@ def _age(stamp, at: datetime):
 
 def status(ws: Path, at: datetime, out=None) -> int:
     """Heartbeats of the watcher and the hub. Exit 2 only when the watcher never ran or is stale (`at` older than
-    2x `every_seconds` while `active`). The hub wakes on events, so an old `last_wake` is printed as STALE but
-    does not fail; a missing hub.json only says the hub never woke."""
+    2x `every_seconds` while `active`). The hub is printed STALE (exit unchanged) when `hub_lagging` while active."""
     out = out or sys.stdout
     w = load_json(ws, "watcher.json", {})
     h = load_json(ws, "hub.json", {})
@@ -706,18 +734,38 @@ def status(ws: Path, at: datetime, out=None) -> int:
     for cap, ent in sorted((w.get("sources") or {}).items()):
         why = ent.get("reason")
         print("  %s: %s%s" % (cap, ent.get("status"), " (%s)" % why if why else ""), file=out)
+    lagging = hub_lagging(w, h, at)
     if h.get("last_wake"):
         hage = _age(h["last_wake"], at)
-        hstale = active and (hage is None or hage > 2 * every)
+        hstale = active and lagging
         print("hub: last wake %s (%s)%s" % (h["last_wake"], "unreadable time" if hage is None else "%ds ago" % hage,
                                            ", STALE" if hstale else ""), file=out)
     else:
-        print("hub: never woke", file=out)
+        print("hub: never woke%s" % (", STALE" if active and lagging else ""), file=out)
     return 2 if stale else 0
+
+
+def hub_lagging(w: dict, h: dict, at: datetime) -> bool:
+    """The hub has not caught up: the watcher appended a line it must decide (`last_append_at`) after the hub last
+    woke (or it never woke), more than 2x `every_seconds` ago. A quiet day's old `last_wake` is not lagging."""
+    import hub_sources
+    try:
+        appended = hub_sources.parse_iso(w.get("last_append_at"))
+        every = int(w.get("every_seconds") or DEFAULTS["every_seconds"])
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if h.get("last_wake"):
+        try:
+            if hub_sources.parse_iso(h["last_wake"]) >= appended:
+                return False
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return (at - appended).total_seconds() > 2 * every
 
 
 # ------------------------------------------------------------------------------------------- hub verbs
 ROUTED_MAX = 50
+ALSO_MAX = 50
 DECISIONS = ("log", "now", "route", "propose", "error")
 
 
@@ -900,8 +948,16 @@ def _prune_updates(h: dict, sessions: dict, cfg: dict, at: datetime) -> None:
     h["updates"] = keep
 
 
+def _prune_pending(h: dict, cfg: dict, at: datetime) -> None:
+    """Drop proposals older than hub.update_ttl_hours working hours, counted from `raised_at` (else
+    `proposed_at`)."""
+    h["pending"] = [p for p in h["pending"] if not (isinstance(p, dict) and _older_than_ttl(
+        p.get("raised_at") or p.get("proposed_at"), cfg, at))]
+
+
 def _save_hub(ws: Path, h: dict, sessions: dict, cfg: dict, at: datetime) -> None:
     _prune_updates(h, sessions, cfg, at)
+    _prune_pending(h, cfg, at)
     save_json(ws, "hub.json", h)
 
 
@@ -922,7 +978,12 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
     with locked(ws):
         h = _hub_doc(ws)
         sess = _sessions_doc(ws)
+        done = {r.get("line_id") for r in h["routed"] if isinstance(r, dict)}
         for it in items:
+            if it["line_id"] in done:  # a second decide for the same line (a replayed backlog) changes nothing
+                results.append({"line_id": it["line_id"], "key": it["key"], "already_decided": True})
+                continue
+            done.add(it["line_id"])
             line = by_id.get(it["line_id"]) or {}
             key, dec = it["key"], it["decision"]
             res = {"line_id": it["line_id"], "key": key, "decision": dec}
@@ -937,6 +998,13 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
                     sk, s = hit
                     s["unseen"] = int(s.get("unseen") or 0) + 1
                     s["last_routed_at"] = stamp
+                    # the line's own key and the keys it mentions now belong to this session too, so the next
+                    # reply in the thread finds it even when it no longer names the key it was routed by
+                    keep = [a for a in (s.get("also") or []) if isinstance(a, str)]
+                    for k in [key] + also:
+                        if k != sk and k not in keep:
+                            keep.append(k)
+                    s["also"] = keep[-ALSO_MAX:]
                     entry["session_id"] = res["session_id"] = s.get("session_id")
                 elif dec == "route":
                     dec = res["decision"] = entry["decision"] = "propose"
@@ -946,10 +1014,17 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
             if dec == "propose":
                 prev = next((p for p in h["pending"] if p.get("key") == key), {})
                 h["pending"] = [p for p in h["pending"] if p.get("key") != key]
+                keep = [a for a in (prev.get("also") or []) if isinstance(a, str)]
+                for k in also:
+                    if k != key and k not in keep:
+                        keep.append(k)
                 h["pending"].append({"key": key, "title": title, "link": link, "read": it.get("read") or "",
                                      "next_step": it.get("next_step") or "",
                                      "proposed_at": prev.get("proposed_at") or stamp,
                                      "raised_at": prev.get("raised_at"),
+                                     "task_id": prev.get("task_id"),
+                                     "last_update_at": stamp,
+                                     "also": keep[-ALSO_MAX:],
                                      "name": it.get("name") or prev.get("name") or ""})
             elif dec == "now":
                 old = [u for u in h["updates"] if u.get("key") == key and u.get("state") != "done"]
@@ -974,6 +1049,8 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
             if cur not in order or order[it["line_id"]] > order[cur]:
                 h["inbox_cursor"] = it["line_id"]
             results.append(res)
+        if all(r.get("already_decided") for r in results):
+            return results  # nothing new: no write at all
         h["routed"] = h["routed"][-ROUTED_MAX:]
         h["last_wake"] = stamp
         save_json(ws, "sessions.json", sess)
@@ -1013,6 +1090,7 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
         return 2
     key = pos[0]
     stamp = _iso(at)
+    catch_up = None
     if sub == "for":
         hit = find_session(_sessions_doc(ws), [key])
         if not hit:
@@ -1031,6 +1109,10 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
                 return 2
             also = [a for a in str(o.get("also") or "").split(",") if a]
             prev = items.get(key) or {}
+            was = next((p for p in h["pending"] if p.get("key") == key), None)
+            if was and was.get("raised_at") and (was.get("last_update_at") or "") > was["raised_at"]:
+                catch_up = {"key": key, "read": was.get("read") or "", "next_step": was.get("next_step") or "",
+                            "link": was.get("link") or "", "at": was["last_update_at"]}
             items[key] = {"session_id": o["id"], "name": o["name"], "title": o["title"],
                           "link": o.get("link") or None, "also": also,
                           "opened_at": prev.get("opened_at") or stamp, "last_routed_at": prev.get("last_routed_at"),
@@ -1047,18 +1129,24 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
                 items[key]["unseen"] = 0
         save_json(ws, "sessions.json", sess)
         _save_hub(ws, h, sess, cfg, at)
-    print(json.dumps({"ok": True, "key": key, "action": sub}) if as_json else "%s: %s" % (sub, key), file=out)
+    res = {"ok": True, "key": key, "action": sub}
+    if catch_up:
+        res["catch_up"] = catch_up
+    print(json.dumps(res) if as_json else "%s: %s%s" % (
+        sub, key, "; catch up: %s" % json.dumps(catch_up) if catch_up else ""), file=out)
     return 0
 
 
 def pending_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> int:
     try:
-        pos, o = _parse_flags(args, ("name",))
+        pos, o = _parse_flags(args, ("name", "task"))
     except ValueError as e:
         print("mother hub pending: %s" % e, file=sys.stderr)
         return 2
-    if len(pos) != 2 or pos[0] != "raised" or not isinstance(o.get("name"), str) or not o["name"]:
-        print("usage: mother hub pending raised <key> --name <slug>", file=sys.stderr)
+    raised = len(pos) == 2 and pos[0] == "raised" and isinstance(o.get("name"), str) and o["name"]
+    if not raised and not (len(pos) == 2 and pos[0] == "drop"):
+        print("usage: mother hub pending raised <key> --name <slug> [--task <task_id>] | drop <key>",
+              file=sys.stderr)
         return 2
     key, stamp = pos[1], _iso(at)
     with locked(ws):
@@ -1067,7 +1155,15 @@ def pending_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
         if hit is None:
             print("no pending proposal for %s" % key, file=sys.stderr)
             return 1
+        if not raised:
+            h["pending"] = [p for p in h["pending"] if p.get("key") != key]
+            _save_hub(ws, h, sess, cfg, at)
+            print(json.dumps({"ok": True, "key": key, "action": "drop", "task_id": hit.get("task_id")}) if as_json
+                  else "dropped: %s%s" % (key, " (card %s)" % hit["task_id"] if hit.get("task_id") else ""), file=out)
+            return 0
         hit["raised_at"], hit["name"] = stamp, o["name"]
+        if isinstance(o.get("task"), str) and o["task"]:
+            hit["task_id"] = o["task"]
         _save_hub(ws, h, sess, cfg, at)
     print(json.dumps({"ok": True, "key": key, "name": o["name"], "raised_at": stamp}) if as_json
           else "raised: %s as %s" % (key, o["name"]), file=out)

@@ -307,6 +307,18 @@ class Watcher(unittest.TestCase):
         self.poll(64)
         self.assertEqual(len(self.inbox()), 2)
 
+    def test_last_append_at_marks_lines_the_hub_must_decide(self):
+        beat = self.poll()
+        self.assertNotIn("last_append_at", beat)
+        FakeAdapter.items = ["PLAT-1"]
+        self.assertEqual(self.poll(2)["last_append_at"], "2026-10-29T10:02:00Z")
+        self.assertEqual(self.poll(4)["last_append_at"], "2026-10-29T10:02:00Z")  # nothing new: kept
+        real = FakeAdapter.poll
+        FakeAdapter.poll = classmethod(lambda cls, *a: {"lines": [line(key="PLAT-1", kind="resolved")],
+                                                        "cursor": {"n": 1}, "partial": []})
+        self.addCleanup(setattr, FakeAdapter, "poll", real)
+        self.assertEqual(self.poll(6)["last_append_at"], "2026-10-29T10:02:00Z")  # resolved never wakes the hub
+
     def test_sweep_for_unseen_live_sessions(self):
         with hub.locked(self.ws):
             hub.save_json(self.ws, "sessions.json", {"version": 1, "sessions": {
@@ -316,8 +328,13 @@ class Watcher(unittest.TestCase):
         self.assertEqual(self.inbox(), [])
         with hub.locked(self.ws):
             hub.save_json(self.ws, "sessions.json", {"version": 1, "sessions": {
-                "b": {"session_id": "s2", "unseen": 2, "state": "live"}}})
-        self.poll(1)
+                "b": {"session_id": "s2", "unseen": 2, "state": "live", "last_routed_at": "2026-10-27T09:00:00Z"}}})
+        self.poll(1)  # unseen news routed more than update_ttl_hours working hours ago no longer sweeps
+        self.assertEqual(self.inbox(), [])
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "sessions.json", {"version": 1, "sessions": {
+                "b": {"session_id": "s2", "unseen": 2, "state": "live", "last_routed_at": "2026-10-29T09:50:00Z"}}})
+        self.poll(2)
         self.assertEqual([l["kind"] for l in self.inbox()], ["sweep"])
 
     def test_interval_inside_and_outside_active_hours(self):
@@ -596,7 +613,16 @@ class Status(unittest.TestCase):
         rc, out = self.run_status()
         self.assertEqual(rc, 0)
         self.assertIn("hub: last wake", out)
+        self.assertNotIn("STALE", out.split("hub:")[1])  # an old wake with nothing new since is a quiet day
+        w = hub.load_json(self.ws, "watcher.json", {})
+        w["last_append_at"] = hub_sources.iso(self.AT - timedelta(seconds=600))
+        hub.save_json(self.ws, "watcher.json", w)
+        rc, out = self.run_status()
+        self.assertEqual(rc, 0)
         self.assertIn("STALE", out.split("hub:")[1])
+        w["last_append_at"] = hub_sources.iso(self.AT - timedelta(seconds=100))  # appended recently: not yet
+        hub.save_json(self.ws, "watcher.json", w)
+        self.assertNotIn("STALE", self.run_status()[1].split("hub:")[1])
 
 
 class FakeClient:
@@ -879,10 +905,11 @@ class Verbs(unittest.TestCase):
         h = self.hub_doc()
         self.assertEqual([r["key"] for r in h["routed"]], ["PLAT-1", "PLAT-2", "PLAT-3"])
         self.assertEqual(h["inbox_cursor"], c["id"])
-        self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "log"})
+        res = self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "log"})
+        self.assertTrue(res[0]["already_decided"])
         h = self.hub_doc()
         self.assertEqual(h["inbox_cursor"], c["id"])
-        self.assertEqual(h["routed"][-1]["key"], "PLAT-1")
+        self.assertEqual(h["routed"][-1]["key"], "PLAT-3")
 
     def test_now_with_live_session_becomes_route(self):
         self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
@@ -919,6 +946,116 @@ class Verbs(unittest.TestCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as so:
             self.assertEqual(hub.main(["show", "--json"], self.ws, self.cfg, self.AT), 0)
         self.assertIn("pending", json.loads(so.getvalue())["hub"])
+
+    # ---- C2: pending and unseen do not wait forever
+    def test_pending_expires_after_ttl_working_hours(self):
+        self.cfg["hub"]["update_ttl_hours"] = 8
+        thu9 = datetime(2026, 10, 29, 9, 0, tzinfo=UTC)
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "propose"},
+                    {"line_id": "x:2", "key": "PLAT-2", "decision": "propose"}, at=thu9)
+        self.pending("raised", "PLAT-2", "--name", "plat-2", at=datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+        # Thursday 21:00: PLAT-1 (proposed 09:00) is 12 working hours old; PLAT-2 (raised 15:00) is 6
+        self.decide({"line_id": "x:3", "key": "PLAT-3", "decision": "log"}, at=datetime(2026, 10, 29, 21, 0, tzinfo=UTC))
+        self.assertEqual([p["key"] for p in self.hub_doc()["pending"]], ["PLAT-2"])
+
+    def test_pending_drop(self):
+        import io
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "propose"})
+        self.pending("raised", "PLAT-1", "--name", "plat-1", "--task", "task_9")
+        self.decide({"line_id": "x:2", "key": "PLAT-1", "decision": "propose"})  # a newer line keeps the card id
+        self.assertEqual(self.hub_doc()["pending"][0]["task_id"], "task_9")
+        buf = io.StringIO()
+        self.assertEqual(hub.pending_cmd(self.ws, self.cfg, self.AT, ["drop", "PLAT-1"], True, buf), 0)
+        self.assertEqual(json.loads(buf.getvalue())["task_id"], "task_9")
+        self.decide({"line_id": "x:3", "key": "PLAT-1", "decision": "propose"})
+        self.assertEqual(self.pending("drop", "PLAT-1")[0], 0)
+        self.assertEqual(self.hub_doc()["pending"], [])
+        self.assertEqual(self.pending("drop", "PLAT-1")[0], 1)
+        self.assertEqual(self.pending("drop")[0], 2)
+
+    def test_pending_work_ignores_old_unseen(self):
+        self.cfg["hub"]["update_ttl_hours"] = 8
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
+        thu9 = datetime(2026, 10, 29, 9, 0, tzinfo=UTC)
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "route"}, at=thu9)
+        self.assertTrue(hub.pending_work(self.ws, self.cfg, thu9 + timedelta(hours=1)))
+        self.assertFalse(hub.pending_work(self.ws, self.cfg, thu9 + timedelta(hours=12)))
+        self.session("seen", "PLAT-1")
+        self.assertFalse(hub.pending_work(self.ws, self.cfg, thu9 + timedelta(hours=1)))
+        self.decide({"line_id": "x:2", "key": "PLAT-2", "decision": "propose"}, at=thu9)
+        self.assertTrue(hub.pending_work(self.ws, self.cfg, thu9 + timedelta(hours=1)))
+
+    # ---- I2: decide is idempotent per line
+    def test_decide_twice_is_already_decided_without_side_effects(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
+        a = line(key="PLAT-1")
+        self.add(a)
+        self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "route"})
+        before = (self.hub_doc(), hub.load_json(self.ws, "sessions.json", {}))
+        res = self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "route"},
+                          at=self.AT + timedelta(minutes=5))
+        self.assertEqual(res, [{"line_id": a["id"], "key": "PLAT-1", "already_decided": True}])
+        self.assertEqual((self.hub_doc(), hub.load_json(self.ws, "sessions.json", {})), before)
+        b = line(key="PLAT-1", at="2026-10-29T09:30:00Z")
+        self.add(b)
+        res = self.decide({"line_id": b["id"], "key": "PLAT-1", "decision": "route"},
+                          {"line_id": b["id"], "key": "PLAT-1", "decision": "route"})
+        self.assertEqual([r.get("already_decided", False) for r in res], [False, True])
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["unseen"], 2)
+
+    # ---- I3: a thread routed through `also` stays with its session
+    def test_route_through_also_keeps_the_thread(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "plat-1", "--title", "t")
+        l1 = hub.make_line("chat", "update", "C00000001/1.0", "2026-10-29T10:00:00Z", summary="see PLAT-1",
+                           also=["PLAT-1", "o/r#4"])
+        l2 = hub.make_line("chat", "update", "C00000001/1.0", "2026-10-29T10:05:00Z", summary="any news?")
+        self.add(l1)
+        self.assertEqual(self.decide({"line_id": l1["id"], "key": l1["key"], "decision": "route"})[0]["session_id"], "S1")
+        s = hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]
+        self.assertEqual(s["also"], ["C00000001/1.0", "o/r#4"])
+        self.add(l2)
+        res = self.decide({"line_id": l2["id"], "key": l2["key"], "decision": "route"})
+        self.assertEqual((res[0]["decision"], res[0].get("session_id")), ("route", "S1"))
+
+    def test_session_also_capped_at_50(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t",
+                     "--also", ",".join("K-%d" % i for i in range(50)))
+        l = line(source="chat", key="C00000001/2.0", also=["PLAT-1"])
+        self.add(l)
+        self.decide({"line_id": l["id"], "key": l["key"], "decision": "route"})
+        also = hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["also"]
+        self.assertEqual(len(also), 50)
+        self.assertEqual((also[0], also[-1]), ("K-1", "C00000001/2.0"))
+
+    def test_pending_keeps_also(self):
+        l = line(source="chat", key="C00000001/3.0", also=["PLAT-7"])
+        self.add(l)
+        self.decide({"line_id": l["id"], "key": l["key"], "decision": "propose"})
+        self.assertEqual(self.hub_doc()["pending"][0]["also"], ["PLAT-7"])
+
+    # ---- I8: what arrived between a card and its start is caught up
+    def test_session_add_reports_catch_up_after_raise(self):
+        import io
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "propose", "read": "r1", "next_step": "n1"})
+        self.pending("raised", "PLAT-1", "--name", "plat-1", at=self.AT + timedelta(minutes=1))
+        self.decide({"line_id": "x:2", "key": "PLAT-1", "decision": "route", "read": "r2", "next_step": "n2"},
+                    at=self.AT + timedelta(minutes=10))
+        p = self.hub_doc()["pending"][0]
+        self.assertEqual((p["last_update_at"], p["raised_at"], p["read"]),
+                         ("2026-10-29T10:10:00Z", "2026-10-29T10:01:00Z", "r2"))
+        buf = io.StringIO()
+        hub.session_cmd(self.ws, self.cfg, self.AT + timedelta(minutes=20),
+                        ["add", "PLAT-1", "--id", "S1", "--name", "plat-1", "--title", "t"], True, buf)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["catch_up"], {"key": "PLAT-1", "read": "r2", "next_step": "n2",
+                                           "link": "https://example.com/PLAT-1", "at": "2026-10-29T10:10:00Z"})
+        # no update since the raise: no catch-up
+        self.decide({"line_id": "x:3", "key": "PLAT-2", "decision": "propose"})
+        self.pending("raised", "PLAT-2", "--name", "plat-2", at=self.AT + timedelta(minutes=1))
+        buf = io.StringIO()
+        hub.session_cmd(self.ws, self.cfg, self.AT + timedelta(minutes=20),
+                        ["add", "PLAT-2", "--id", "S2", "--name", "plat-2", "--title", "t"], True, buf)
+        self.assertNotIn("catch_up", json.loads(buf.getvalue()))
 
 
 if __name__ == "__main__":
