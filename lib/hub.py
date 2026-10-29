@@ -142,11 +142,23 @@ def rotate_inbox(ws: Path, at: datetime) -> None:
     d.mkdir(parents=True, exist_ok=True)
     today = at.date()
     cur = d / "inbox.jsonl"
+    dest = d / ("inbox-%s.jsonl" % today.isoformat())
+    # Never copy-then-delete the live file: a line appended in between would be lost. Rename it away first
+    # (atomic), so later appends start a fresh inbox.jsonl, then fold the renamed file into the dated one.
     if cur.exists():
-        dest = d / ("inbox-%s.jsonl" % today.isoformat())
-        with open(str(dest), "a") as out:
-            out.write(cur.read_text())
-        cur.unlink()
+        if not dest.exists():
+            if cur.stat().st_size:
+                os.replace(str(cur), str(dest))
+            else:
+                cur.unlink()
+        else:
+            aside = d / ("inbox.jsonl.%d.rotating" % os.getpid())
+            os.replace(str(cur), str(aside))
+            with open(str(aside), "rb") as src, open(str(dest), "ab") as out:
+                out.write(src.read())
+                out.flush()
+                os.fsync(out.fileno())
+            aside.unlink()
     for p in d.glob("inbox-*.jsonl"):
         m = re.match(r"inbox-(\d{4}-\d{2}-\d{2})\.jsonl$", p.name)
         if m and (today - datetime.strptime(m.group(1), "%Y-%m-%d").date()).days >= KEEP_DAYS:
