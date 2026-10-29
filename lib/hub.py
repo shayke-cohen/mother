@@ -1264,7 +1264,13 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
             also = [a for a in str(o.get("also") or "").split(",") if a]
             prev = items.get(key) or {}
             was = next((p for p in h["pending"] if p.get("key") == key), None)
-            if key not in items and not (was and was.get("raised_at")):
+            raised = bool(was and was.get("raised_at"))
+            if prev.get("state") == "live" and str(prev.get("session_id")) != str(o["id"]) and not raised:
+                # a live key keeps its session: only a newly started card (pending, raised) may repoint it
+                print("mother hub session add: %s is live in session %s; refusing to repoint it to %s"
+                      % (key, prev.get("session_id"), o["id"]), file=sys.stderr)
+                return 1
+            if key not in items and not raised:
                 # only a card the hub raised (or a session it already follows) becomes a hub session: otherwise a
                 # line could have the hub route source text into any session by its id
                 print("mother hub session add: %s has no raised card in pending and no session; raise a card first"

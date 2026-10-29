@@ -1242,6 +1242,23 @@ class Verbs(unittest.TestCase):
         rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t2", raw=True)
         self.assertEqual(rc, 0)  # already in sessions.json
 
+    # ---- round 1, finding 4: a live key is not repointed to another session
+    def test_session_add_does_not_repoint_a_live_key(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
+        rc, _ = self.session("add", "PLAT-1", "--id", "S-OTHER", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 1)
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["session_id"], "S1")
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t2", raw=True)
+        self.assertEqual(rc, 0)  # the same id: a refresh
+        # a newly started card for the key (pending, raised) may take it over
+        h = hub.load_json(self.ws, "hub.json", {})
+        h.setdefault("pending", []).append({"key": "PLAT-1", "title": "t", "proposed_at": "2026-10-29T10:00:00Z",
+                                            "raised_at": "2026-10-29T10:01:00Z"})
+        hub.save_json(self.ws, "hub.json", h)
+        rc, _ = self.session("add", "PLAT-1", "--id", "S2", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["session_id"], "S2")
+
     # ---- red-team smaller item: decide refuses a line id whose line has another key
     def test_decide_refuses_a_line_id_with_another_key(self):
         l = line(key="PLAT-1")

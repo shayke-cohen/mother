@@ -745,7 +745,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   but never moves the cursor back, so the hub must decide every printed line, in printed order. `title` and `link` default to the inbox line's. Output: one
   `{line_id, key, decision (as stored), session_id?, update_id?, note?}` per item.
 - **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (only when `<key>` has a `pending`
-  entry with `raised_at` set, or is already in `sessions.json`; else exit 1 and nothing written; live, `unseen` 0; removes the
+  entry with `raised_at` set, or is already in `sessions.json`; else exit 1 and nothing written; a key that is live
+  under another session id is repointed only when it also has that raised pending entry, else exit 1; live, `unseen` 0; removes the
   key and its `also` from `pending`; when that pending entry's `last_update_at` is later than its `raised_at`, the
   output carries `catch_up: {key, read, next_step, link, at}`, the one message the hub sends into the new session), `drop <key>` (state `dropped`), `seen <key>` (`unseen` 0; exit 1 for an
   unknown key), `for <key>` (prints the live session id, or exits 1).
