@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "Read|Grep|Glob|LS",
+        "matcher": "^(?!(?:Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|Task|Agent|Skill|Monitor|CronCreate|CronDelete|TaskStop|SendMessage|ListAgents)$)(?!mcp__).*",
         "hooks": [
           {
             "type": "command",

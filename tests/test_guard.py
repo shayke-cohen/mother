@@ -2705,6 +2705,39 @@ class FastPath(GuardCase):
         self.expect("ask", "Bash", {"command": "sed -i '' 1d \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_fast.py\""},
                     mode="bypassPermissions")
 
+    def test_odd_cwd_and_a_casefolded_key_folder(self):
+        key = os.path.join(self.home, ".mother", "grant.key")
+        os.makedirs(os.path.dirname(key))
+        with open(key, "w") as f:
+            f.write("k" * 64)
+        for cwd in (123, True, ["x"]):
+            a = self.run_guard("Read", {"file_path": "/etc/hosts"}, cwd=cwd)
+            b = self.run_guard("Read", {"file_path": "/etc/hosts"}, cwd=cwd, script=GUARD_FAST)
+            self.assertEqual(a, b, cwd)
+        for tool, inp in (("Grep", {"pattern": "x", "path": self.home.upper()}),
+                          ("LS", {"path": os.path.dirname(key).upper()}),
+                          ("Glob", {"pattern": "*", "path": self.home.swapcase()})):
+            self.both("deny", tool, inp)
+
+    def test_every_other_tool_reaches_the_guard_only_where_an_allow_list_applies(self):
+        self.both("none", "Bash", {"command": "mother hub tail --once"}, cwd=self.ws, session="hub-1")
+        with open(os.path.join(self.ws, ".mother", "hub", "sessions.json"), "w") as f:
+            json.dump({"version": 1, "sessions": {"PLAT-1": {"session_id": "card-1", "name": "p", "title": "t",
+                                                             "also": [], "state": "live"}}}, f)
+        for tool in ("Artifact", "RemoteTrigger", "PushNotification", "TaskOutput"):
+            inp = {"x": 1}
+            self.both("none", tool, inp)
+            self.both("none", tool, inp, cwd=self.ws)
+            self.both("none", tool, inp, session="card-1")
+            self.both("deny", tool, inp, session="hub-1")
+            self.both("deny", tool, inp, agent="mother:reader")
+            self.both("deny", tool, inp, agent="critic")
+            self.both("none", tool, inp, agent="general-purpose")
+        for tool in ("ToolSearch", "TodoWrite", "CronList"):
+            self.both("none", tool, {"query": "x"}, session="hub-1")
+        self.both("none", "ToolSearch", {"query": "select:x"}, agent="mother:reader")
+        self.both("deny", "ToolSearch", {"query": "select:x"}, agent="mother:critic")
+
     def test_odd_payloads_reach_the_guard(self):
         for raw in ("", "nope", "[]", json.dumps({"tool_name": "Read", "tool_input": "x"})):
             a = self.run_guard("Read", {}, raw=raw)
@@ -2769,7 +2802,17 @@ class RoundSix(GuardCase):
                     "<command-args>/mother:brief</command-args>"), False),
                  (u("please run /mother:channels"), False), (u("/mother:channelsx"), False), (u("/loopy mother:channels"), False),
                  (u("/mother:channels", origin={"kind": "peer"}), False), (u("/mother:channels", isMeta=True), False),
-                 (u("/mother:channels", isSidechain=True), False)]
+                 (u("/mother:channels", isSidechain=True), False),
+                 # review13: the tag form only at the start, and a /loop runs /mother:channels itself
+                 (u("please look at this log: <command-name>/mother:channels</command-name>"), False),
+                 (u("x\n<command-message>mother:channels</command-message>\n<command-name>/mother:channels</command-name>"),
+                  False),
+                 (u("<command-name>/mother:brief</command-name><command-args>x</command-args>"), False),
+                 (u("<command-name>/loop</command-name><command-args>10m /mother:brief and read docs about "
+                    "mother:channels</command-args>"), False),
+                 (u("/loop mother:channels"), False), (u("/loop /mother:brief /mother:channels"), False),
+                 (u("/loop 10m /mother:channels"), True), (u("/loop /mother:channels"), True),
+                 (u("<command-name>/mother:channels</command-name>"), True)]
         for n, (entry, want) in enumerate(cases):
             sid = "s%d" % n
             self.plan(sid, transcript=self.transcript(entry))
@@ -2819,6 +2862,47 @@ class RoundSix(GuardCase):
         self.ws_call("none", "Bash", {"command": self.APPR}, session="a", transcript=self.card_t)
         self.plan("loop")  # entries with no time of their own may give way
         self.assertEqual(self.ids(), ["loop", "a", "b"])
+
+
+class RoundSeven(GuardCase):
+    """Round 7 (review13): a session can't rewrite its own transcript (or any under ~/.claude/projects) to pass as
+    the channels loop."""
+
+    def setUp(self):
+        GuardCase.setUp(self)
+        self.projects = os.path.join(self.home, ".claude", "projects", "-x")
+        os.makedirs(self.projects)
+        self.tr = self.transcript(self.user("summarise my mail"))
+
+    def test_transcript_edits_always_ask(self):
+        other = os.path.join(self.projects, "s.jsonl")
+        for fp in (self.tr, other, self.tr.upper() if sys.platform == "darwin" else self.tr):
+            for tool, inp in (("Write", {"file_path": fp, "content": "{}"}),
+                              ("Edit", {"file_path": fp, "old_string": "a", "new_string": "b"}),
+                              ("MultiEdit", {"file_path": fp, "edits": []}), ("NotebookEdit", {"notebook_path": fp})):
+                for cwd in (self.tmp, self.ws):
+                    for mode in (None, "acceptEdits", "bypassPermissions"):
+                        why = self.expect("ask", tool, inp, transcript=self.tr, cwd=cwd, mode=mode)
+                        self.assertIn("transcript", why)
+        self.expect("none", "Write", {"file_path": os.path.join(self.tmp, "notes.jsonl"), "content": "x"},
+                    transcript=self.tr)
+        for fp in (os.path.join(self.projects, "memory", "MEMORY.md"), os.path.join(self.projects, "notes.md")):
+            self.expect("none", "Write", {"file_path": fp, "content": "x"}, transcript=self.tr, mode="bypassPermissions")
+        self.expect("ask", "Write", {"file_path": os.path.join(self.projects, "s", "subagents", "a.JSONL"),
+                                     "content": "x"}, transcript=self.tr)
+
+    def test_shell_writes_to_transcripts_ask(self):
+        for cmd in ("printf x > %s" % self.tr, "sed -i '' 1d %s" % self.tr, "cp /tmp/x %s" % os.path.join(self.projects, "s.jsonl"),
+                    "cp /tmp/x ~/.claude/projects/-x/s.jsonl", "cd ~/.claude/projects/-x && rm s.jsonl",
+                    "python3 -c \"open('%s','w')\"" % self.tr):
+            for cwd in (self.tmp, self.ws):
+                self.expect("ask", "Bash", {"command": cmd}, transcript=self.tr, cwd=cwd, mode="bypassPermissions")
+        for cmd in ("cat %s" % self.tr, "grep x ~/.claude/projects/-x/s.jsonl"):
+            self.expect("none", "Bash", {"command": cmd}, transcript=self.tr)
+
+    def test_a_rewritten_transcript_does_not_make_a_loop(self):
+        new = json.dumps(self.user("/mother:channels")) + "\n"
+        self.expect("ask", "Write", {"file_path": self.tr, "content": new}, transcript=self.tr, mode="bypassPermissions")
 
 
 if __name__ == "__main__":

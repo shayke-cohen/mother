@@ -197,16 +197,21 @@ this first and names any capability it needs that isn't `ok` in its output — n
 ## 5. Approval guard (`hooks/guard.py`)
 
 Port of the reference deployment's `guard-outbound.py`, made config-driven:
-- **Hook registration** (`hooks/hooks.json`): the guard sees only the tools Claude Code hands it, so it is
-  registered, in every session, for every tool it has a rule for: `Bash Write Edit MultiEdit NotebookEdit WebFetch
-  WebSearch Task Agent Skill Monitor CronCreate CronDelete TaskStop SendMessage ListAgents` and every `mcp__…` tool
-  (an anchored matcher, so `BashOutput` or `TaskOutput` don't reach it), plus `Read Grep Glob LS` through
-  `hooks/guard_fast.py`. Each tool reaches the guard through exactly one entry. The fast path exits with no
-  decision unless the call might touch the grant key, `MOTHER_CHANNEL_ROLE` is set, the payload has an
-  `agent_type`, or the session id appears in `hub-session.json`; then, or on any odd payload, it hands the call to
-  `guard.py` unchanged. It never decides itself. `CronList`, `ToolSearch` and `TodoWrite` (`HUB_PASS_TOOLS`) have
-  no rule and are not registered. `tests/test_packaging.py` collects every non-MCP tool name `guard.py` refers to
-  and fails if one isn't registered. `guard_fast.py` is one of the guard's own files (edits ask, like `guard.py`).
+- **Hook registration** (`hooks/hooks.json`): the guard sees only the tools Claude Code hands it, so every tool
+  reaches it, in every session, through exactly one of two PreToolUse entries. The tools it has a rule for in
+  every session go to `guard.py`: `Bash Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent Skill
+  Monitor CronCreate CronDelete TaskStop SendMessage ListAgents` and every `mcp__…` tool (an anchored matcher).
+  Every other tool (the complement matcher `^(?!(?:…)$)(?!mcp__).*`: `Read Grep Glob LS`, `ToolSearch`,
+  `TodoWrite`, `CronList`, and whatever the host adds, such as `Artifact` or `RemoteTrigger`) goes to
+  `hooks/guard_fast.py`. The fast path hands the call to `guard.py` unchanged when `MOTHER_CHANNEL_ROLE` is set,
+  `agent_type` names one of MOTHER's sub-agents (`reader`, `critic`, with or without `mother:`), the session id
+  appears in `.mother/hub/hub-session.json`, `sessions.json` or `fed-sessions.json` (a hub or hub-fed session),
+  a Read/Grep/Glob/LS might touch the grant key (casefolded), or anything in the payload is odd (bad JSON, a
+  non-object input, a non-string `cwd` or `agent_type`); otherwise it exits with no decision. It never decides
+  itself, so the sub-agents' tool lists and the hub's deny-by-default cover every tool. `tests/test_packaging.py`
+  collects every tool name in a comparison on `tool` in `guard.py` (named sets resolved) and fails unless each,
+  and any other name, matches exactly one entry, and each one with a rule outside the fast path's cases goes to
+  `guard.py`. `guard_fast.py` is one of the guard's own files (edits ask, like `guard.py`).
 - Matches outbound tools by **capability**, not server name: chat post/send/schedule, tracker create/update/
   transition/comment/sprint ops, mail send, calendar create/update with guests, `gh`/`glab` write commands.
 - **allow**: posts to `manager.chat_dm`; mail drafts; calendar events without guests.
@@ -362,8 +367,8 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `bin/mother` by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` of it; plain or single-quoted words, nothing
   chained, piped, redirected, expanded or commented), the guard gives it no decision, its cwd is in the workspace,
   it runs as the session itself (no `agent_type`), the session is not hub-fed, and the first message a human typed
-  in the session (`transcript_path`; a slash command read as `/name args`) starts with `/mother:channels`, or with
-  `/loop` and names `mother:channels`. A command that only names `plan` (a grep, a comment, a chain) records
+  in the session (`transcript_path`; a slash command, only in its own format at the very start of the message,
+  read as `/name args`) is `/mother:channels …` or `/loop [interval] /mother:channels …`. A command that only names `plan` (a grep, a comment, a chain) records
   nothing. The file keeps at most 3 ids, newest first, each with its time in `recorded`; a new id evicts the
   oldest one recorded more than 2 hours ago, and is not added when all three are more recent. Anywhere else these
   verbs **ask**; PAUSED and `MOTHER_DRY_RUN` deny; bypass never passes it.
@@ -371,10 +376,13 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `MOTHER_DRY_RUN` denies): `mother channels resume` and `mother channels start`.
 - **ask, every session and mode** (`kind: "home_settings"`): a Write/Edit/MultiEdit/NotebookEdit of
   `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json` or anything under
-  `~/.claude/plugins/` (they decide which plugins and hooks run). Never passed by bypass.
+  `~/.claude/plugins/` (they decide which plugins and hooks run). Never passed by bypass. The same for a session
+  transcript: the payload's `transcript_path` or any `*.jsonl` under `~/.claude/projects/` (the channels-session
+  rule reads the first prompt there; the auto-memory `*.md` notes there are not transcripts), by a file tool or by a shell command that writes and names `.claude/projects`,
+  the transcript's path or file name, or runs from inside `~/.claude/projects`.
 - **deny, every session** (`kind: "grant-key"`, checked before any role): `Read`, `Edit`, `Write`, `MultiEdit`,
   `NotebookEdit` of the grant key (`<state>/grant.key`, state = `$MOTHER_STATE_DIR` or `~/.mother`), and `Grep`,
-  `Glob`, `LS` whose root is the key or a folder holding it.
+  `Glob`, `LS` whose root is the key or a folder holding it (paths compared casefolded).
 - **MCP web tools** (`outbound_unknown`, workspace sessions, any server but `mcp__ccd_…`, when the domain rules
   give no decision): a tool name with a `url`, `http`, `https`, `fetch`, `download`, `web`, `scrape`, `page`,
   `request`, `browse`, `navigate` or `crawl` part; an input field `url`, `uri`, `target`, `href`, `endpoint`,
@@ -601,8 +609,8 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   - A channels loop session that hasn't run `plan` for more than 2 hours can be evicted from
     `channels-session.json` by three other sessions the manager started with `/mother:channels`; it then asks
     before its reply verbs until it runs `plan` again.
-  - Tools the guard has no rule for are not registered, so the hub session's deny-by-default covers only the
-    registered ones (§5, hook registration).
+  - Outside the sessions the fast path hands on (§5, hook registration), a tool the guard has no rule for gets
+    Claude Code's normal permissions.
 
 ## 5b. Channel reply loop (`lib/channels.py`, `mother channels`, skill `mother:channels`)
 
@@ -657,7 +665,8 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   <relative endpoint>` (not `graphql`), `glab mr list|view`, `glab issue list|view`, `glab ci list|view|status`,
   `glab repo view`, `glab release list|view`, `glab api …`; never with `--hostname`, `-H`/`--header`, `--web`,
   `--input`, `-f`/`-F`/`--field`/`--raw-field`, `-X`/`--method`, an argument holding `://`, or a `--repo`/`-R`
-  that is not `owner/repo`. A critic gets no MCP tools. Other sub-agents
+  that is not `owner/repo`. A reader may also use `ToolSearch` (it loads a deferred MCP tool's schema). A critic
+  gets no MCP tools. Other sub-agents
   (not MOTHER's) keep the normal rules.
 - `mother items check` turns a reader's reply into the only input a skill may use. Items without a link
   (URL, ticket key, `owner/repo#N`, workspace path) are dropped. A `state: noise` tally cited by the query that reproduces it is kept as a count, never a finding. A reader whose items were all uncited

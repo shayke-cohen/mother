@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""MOTHER approval guard, fast path for Read, Grep, Glob and LS (hooks.json; CONTRACT §5).
+"""MOTHER approval guard, fast path for every tool the main hook entry doesn't take (hooks.json; CONTRACT §5).
 
-These are the most frequent tool calls, and the guard has a rule for them only in four cases: the call touches
-the grant key, the session is a channel reply session (MOTHER_CHANNEL_ROLE), a sub-agent makes it (agent_type),
-or the session is the pinned hub session. Loading guard.py costs tens of milliseconds, so this file checks
-those four cases first and exits with no decision when none applies. When any might apply, or anything is
-unclear, it hands the call to guard.py unchanged. It never decides anything itself.
+hooks.json hands guard.py the tools it has rules for in every session (Bash, the file writers, web, agents, MCP
+…). Every other tool comes here: Read, Grep, Glob and LS, which are the most frequent calls, and any tool the
+host adds (ToolSearch, TodoWrite, Artifact, …). guard.py has a rule for them only where an allow-list or a fence
+applies: a call that touches the grant key (Read/Grep/Glob/LS), a channel reply session (MOTHER_CHANNEL_ROLE),
+one of MOTHER's sub-agents (agent_type), or a hub or hub-fed session. Loading guard.py costs tens of
+milliseconds, so this file checks those cases first and exits with no decision when none applies. When any
+might apply, or anything is unclear, it hands the call to guard.py unchanged. It never decides anything itself.
 
 Python 3.9 stdlib only.
 """
@@ -14,7 +16,9 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-FAST_TOOLS = ("Read", "Grep", "Glob", "LS")
+KEY_TOOLS = ("Read", "Grep", "Glob", "LS")
+SUBAGENTS = ("reader", "critic")  # guard.SUBAGENT_TOOLS (tests check the two agree)
+HUB_FILES = ("hub-session.json", "sessions.json", "fed-sessions.json")  # the hub session and hub-fed sessions
 
 
 def _inside(path, root):
@@ -43,28 +47,39 @@ def needs_guard(raw):
         p = json.loads(raw or "")
     except Exception:
         return True
-    if not isinstance(p, dict) or p.get("tool_name") not in FAST_TOOLS or not isinstance(p.get("tool_input"), dict):
+    if not isinstance(p, dict) or not isinstance(p.get("tool_name"), str) or not isinstance(p.get("tool_input"), dict):
         return True
-    if os.environ.get("MOTHER_CHANNEL_ROLE", "").strip() or str(p.get("agent_type") or "").strip():
+    if os.environ.get("MOTHER_CHANNEL_ROLE", "").strip():
+        return True
+    agent = p.get("agent_type")
+    if agent is not None and not isinstance(agent, str):
+        return True
+    agent = (agent or "").strip()
+    if (agent[len("mother:"):] if agent.startswith("mother:") else agent) in SUBAGENTS:
+        return True
+    cwd = p.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
         return True
     inp = p["tool_input"]
     try:
-        state = os.environ.get("MOTHER_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".mother")
-        key = os.path.realpath(os.path.join(state, "grant.key")).casefold()
-        target = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or ""
-        base = str(p.get("cwd") or os.getcwd())
-        fp = os.path.realpath(os.path.join(base, os.path.expanduser(str(target))) if target else base).casefold()
-        if _inside(key, fp):  # the key itself, or a folder holding it
-            return True
+        if p["tool_name"] in KEY_TOOLS:
+            state = os.environ.get("MOTHER_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".mother")
+            key = os.path.realpath(os.path.join(state, "grant.key")).casefold()
+            target = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or ""
+            base = cwd or os.getcwd()
+            fp = os.path.realpath(os.path.join(base, os.path.expanduser(str(target))) if target else base).casefold()
+            if _inside(key, fp):  # the key itself, or a folder holding it
+                return True
         sid = p.get("session_id")
         if isinstance(sid, str) and sid:
             for ws in _workspaces():
-                try:
-                    with open(os.path.join(ws, ".mother", "hub", "hub-session.json")) as f:
-                        if sid in f.read():
-                            return True
-                except FileNotFoundError:
-                    pass
+                for name in HUB_FILES:
+                    try:
+                        with open(os.path.join(ws, ".mother", "hub", name)) as f:
+                            if sid in f.read():
+                                return True
+                    except FileNotFoundError:
+                        pass
     except Exception:
         return True
     return False

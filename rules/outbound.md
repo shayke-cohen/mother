@@ -279,7 +279,9 @@ plain `mother channels plan`. Anywhere else `approvals`, `triage`, `run` and `do
 - The key is off limits: any Read, Edit, Write, Grep, Glob or LS of it is denied in every session, and the shell
   allow-list asks before any command that names `~/.mother`.
 - An edit to `~/.claude/settings.json`, `~/.claude/settings.local.json`, `~/.claude.json` or anything under
-  `~/.claude/plugins/` asks in every session and mode: those files decide which plugins and hooks run.
+  `~/.claude/plugins/` asks in every session and mode: those files decide which plugins and hooks run. So does
+  any write to a session transcript (this session's, or any `*.jsonl` under `~/.claude/projects/`), by a file tool or
+  a shell command: the guard reads a session's first prompt there.
 - In a workspace session an MCP tool whose name says url, http, fetch, download, web, scrape, page, request,
   browse, navigate or crawl, or whose input names a web address in a url/target/href-style field, is
   `outbound_unknown`; so is typing into a page (`computer` type/key, `form_input`).

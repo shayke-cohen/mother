@@ -146,6 +146,7 @@ class Ctx(object):
         self.problem = "no workspace"
         self.stamps = set()
         self.sid = None  # the session id of the call, set by run()
+        self.transcript = None  # the payload's transcript_path, set by run()
 
 
 def resolve_workspace():
@@ -470,6 +471,17 @@ def home_settings_path(fp):
     c = os.path.join(home, ".claude")
     return f in (os.path.join(c, "settings.json"), os.path.join(c, "settings.local.json"),
                  os.path.join(home, ".claude.json")) or inside(f, os.path.join(c, "plugins"))
+
+
+def transcript_file(fp, ctx):
+    """This session's transcript (the payload's transcript_path) or any transcript (`*.jsonl`) under
+    ~/.claude/projects/: the guard reads a session's first prompt from it, so no session may rewrite one. The
+    auto-memory notes there (`memory/*.md`) are not transcripts."""
+    f = fp.casefold()
+    projects = os.path.realpath(os.path.join(os.path.expanduser("~"), ".claude", "projects")).casefold()
+    t = ctx.transcript
+    return (inside(f, projects) and f.endswith(".jsonl")) or \
+        bool(t and f == os.path.realpath(os.path.expanduser(t)).casefold())
 
 
 def persona_path(fp, ctx):
@@ -1871,7 +1883,8 @@ def shell_self_edit(cmd, run, cwd, ctx):
     that reaches the running copy (the installed plugin, the workspace) or runs from inside it. The same file
     names in a checkout of this repo or in another project pass. Reads (cat, grep, 2>/dev/null) pass.
     Returns the kind it touches: "config" (the guard, config.json, PAUSED, the ledger, the log), "grants"
-    (.mother/grants.json) or "persona" (the workspace's AGENTS.md, CLAUDE.md, .mcp.json, .claude/, MEMORY.md);
+    (.mother/grants.json), "persona" (the workspace's AGENTS.md, CLAUDE.md, .mcp.json, .claude/, MEMORY.md) or
+    "home_settings" (a session transcript: this session's transcript_path or anything under ~/.claude/projects);
     False for none."""
     if not shell_writes(cmd, run):
         return False
@@ -1881,6 +1894,15 @@ def shell_self_edit(cmd, run, cwd, ctx):
     # the session's cwd says where relative names land, unless the command moves first (then its cd path counts)
     here = os.path.realpath(cwd).lower() if cwd and not re.search(r"(?:^|[\s;&|(])cd\s", shell) else ""
     home = os.path.expanduser("~").lower()
+    projects = os.path.realpath(os.path.join(home, ".claude", "projects")).lower()
+    tforms = []
+    if ctx.transcript:
+        t = os.path.realpath(os.path.expanduser(ctx.transcript)).lower()
+        tforms = [t, ctx.transcript.lower(), os.path.basename(t)] + ([t[len("/private"):]] if t.startswith("/private/")
+                                                                     else [])
+    if re.search(r"\.claude/+projects\b", re.sub(r"[\"'\\]", "", low)) or here == projects \
+            or here.startswith(projects + os.sep) or any(f and f in low for f in tforms):
+        return "home_settings"
     homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "guard_fast.py", "hooks.json"],
               "config")]
     if ctx.ws:
@@ -1959,6 +1981,9 @@ def classify_bash(cmd, cwd, ctx):
         return act("grants", "grants_file", "`mother grant add`: a new grant lets later writes through without a "
                                             "question", op="cli")
     touched = shell_self_edit(cmd, run, cwd, ctx)
+    if touched == "home_settings":
+        return act("home_settings", "home_settings", "a shell command that could change a session transcript "
+                                                     "(~/.claude/projects): " + cmd.strip()[:160])
     if not touched:
         prot = shell_protected(cmd, run, cwd, ctx)
         if prot == "grants":
@@ -3216,6 +3241,8 @@ def classify(tool, inp, cwd, ctx):
                            + fp)
             if home_settings_path(fp):
                 return act("home_settings", "home_settings", "an edit to Claude Code's settings: " + fp)
+            if transcript_file(fp, ctx):
+                return act("home_settings", "home_settings", "an edit to a session transcript: " + fp)
             if fp.casefold() == grants_path(ctx):
                 return act("grants", "grants_file", "an edit to .mother/grants.json")
             if persona_path(fp, ctx):
@@ -3889,7 +3916,8 @@ def channel_session(tool, inp, cwd, ctx, role):
 
 # agents/*.md. Plugin agents can't carry their own hooks, so this is where their limits live. Hooks run inside
 # sub-agents, and the payload names the agent in `agent_type`, scoped ("mother:reader") or bare.
-SUBAGENT_TOOLS = {"reader": {"Read", "Grep", "Glob", "LS", "Bash"}, "critic": {"Read", "Grep", "Glob", "LS"}}
+# ToolSearch only loads the schema of a deferred MCP tool: the reader needs it to reach its source.
+SUBAGENT_TOOLS = {"reader": {"Read", "Grep", "Glob", "LS", "Bash", "ToolSearch"}, "critic": {"Read", "Grep", "Glob", "LS"}}
 DRY_RUN_ENV = "MOTHER_DRY_RUN"
 
 
@@ -4117,7 +4145,10 @@ def record_hub_fed(ws, session_id):
 
 CHANNELS_SESSION_CAP = 3
 CHANNELS_SESSION_KEEP_HOURS = 2   # a session recorded this recently is never evicted
-CHANNELS_PROMPT_RE = re.compile(r"^/(?:mother:channels|loop)(?:\s|$)")
+# /mother:channels, or /loop with an optional interval and then /mother:channels
+CHANNELS_PROMPT_RE = re.compile(r"^/(?:loop(?:\s+\d+[a-z]*)?\s+/)?mother:channels(?:\s|$)")
+COMMAND_TAG_RE = re.compile(r"^\s*(?:<command-message>[^<]*</command-message>\s*)?<command-name>(/[^<]*)</command-name>"
+                            r"(?:\s*<command-args>([^<]*)</command-args>)?")
 CHANNELS_LOOP_VERBS = {"approvals", "triage", "run", "answer", "done", "send"}
 # The app's tools that continue this conversation in another session
 HUB_FED_HANDOFFS = {"mcp__ccd_session__hand_off_to_session", "mcp__ccd_session__move_to_cloud"}
@@ -4200,10 +4231,9 @@ def first_prompt(transcript):
                 text = user_text(e)
                 if text is None:
                     continue
-                m = re.search(r"<command-name>([^<]*)</command-name>", text)
+                m = COMMAND_TAG_RE.match(text)  # the slash-command form, only at the very start
                 if m:
-                    a = re.search(r"<command-args>([^<]*)</command-args>", text)
-                    text = m.group(1).strip() + (" " + a.group(1).strip() if a else "")
+                    text = m.group(1).strip() + (" " + m.group(2).strip() if m.group(2) else "")
                 return text.strip()
     except Exception:
         return None
@@ -4213,7 +4243,7 @@ def first_prompt(transcript):
 def channels_loop_prompt(transcript):
     """True when the session was started with `/mother:channels` or a `/loop` of it."""
     t = first_prompt(transcript)
-    return bool(t) and bool(CHANNELS_PROMPT_RE.match(t)) and "mother:channels" in t
+    return bool(t) and bool(CHANNELS_PROMPT_RE.match(t))
 
 
 def channels_loop_shell(norm):
@@ -4427,7 +4457,7 @@ def key_touch(tool, inp, cwd):
     fp = os.path.realpath(os.path.join(base, os.path.expanduser(str(raw)))) if raw else os.path.realpath(base)
     key = os.path.realpath(grant_key_path())
     if tool in ("Grep", "Glob", "LS"):
-        return inside(key, fp)
+        return inside(key.casefold(), fp.casefold())
     return fp.casefold() == key.casefold()
 
 
@@ -4446,6 +4476,8 @@ def run(raw):
     except Exception as e:
         ctx = Ctx()
         ctx.problem = "workspace error %s" % type(e).__name__
+    tp = payload.get("transcript_path")
+    ctx.transcript = tp if isinstance(tp, str) and tp else None
     a = None
     try:
         if not isinstance(inp, dict):
