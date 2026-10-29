@@ -51,7 +51,9 @@ dispatcher, do those first.
       ~100k tokens). Slack, when the token has `files:write` (Slack: `get_upload_url` with
       `filename` = the file's name and `length` = `bytes` → `curl -sf -X POST -F file=@<path> "<upload_url>"`
       → `complete_upload` with that file id, a title like "Brief — Sun 24 Oct (1:10)", `channel_id` =
-      `manager.chat_dm` and `thread_ts` = the brief's post). Only to the manager's own DM. A `missing_scope`
+      `manager.chat_dm` and `thread_ts` = the brief's post). Only to the manager's own DM. The guard can't see where a `curl` sends data, so in the workspace
+      it asks (PAUSED or a dry run denies it): if it is held for a person or refused, don't retry it; keep the
+      file and name its path in the runs note. A `missing_scope`
       answer means no upload this time: don't retry it daily — note it in the runs note. If neither route
       worked, keep the file and name its path in the runs note.
 

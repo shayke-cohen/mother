@@ -10,7 +10,10 @@ tool call that sends, posts or writes somewhere another person can see, the guar
          guests; a chat/tracker write covered by a `mother approve tracker|chat <target>` line at the top
          of a genuine user message in this session (12 h); or a valid run grant (.mother/grants.json)
   ask    every other outbound call: the human confirms it in the UI. In a session whose permission_mode is
-         bypassPermissions, these get no output instead (logged as "pass"); denies and the self-edit ask stay
+         bypassPermissions, these get no output instead (logged as "pass") outside the workspace, or anywhere
+         when policy.bypass_passes_asks is true; denies and the self-edit, grants.json and persona-file asks stay.
+         In a workspace session, network programs, web fetches, browser navigation and MCP writes the guard
+         can't place are outbound_unknown (ask; PAUSED and dry run deny).
 
 WhatsApp works like chat: `mother whatsapp send --to WHO --text …` asks, showing the recipient and the text (a
 send to the manager's own chat is `own_dm`, allowed). Any agent touch of the bridge socket or its state folder
@@ -299,6 +302,22 @@ WRITE_VERBS = {"create", "post", "send", "reply", "schedule", "update", "edit", 
                "transfer", "mark", "react", "convert", "start", "end", "invoke", "trigger", "run", "write",
                "trash", "spam", "junk"}
 
+# Extra write words, used only for an MCP call no domain claims (outbound_unknown, CONTRACT §5).
+UNKNOWN_WRITE_VERBS = {"copy", "batch", "save", "store", "import", "sync", "deploy", "notify", "broadcast",
+                       "duplicate", "clone", "emit", "dispatch", "enqueue", "commit", "release"}
+URLISH_RE = re.compile(r"://|\bwww\.|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/\S")
+# Programs that reach the network by themselves; named at a command position in a workspace session, the command
+# is outbound_unknown whatever its arguments (CONTRACT §5).
+NET_PROGS = ("curl", "wget", "nc", "ncat", "netcat", "socat", "ssh", "scp", "sftp", "rsync", "ftp", "telnet",
+             "http", "https", "httpie", "xh")
+_CMD_POS = (r"(?:^|[;&|({\n`]|\$\(|\b(?:then|do|else|exec|command|builtin|nohup|time|sudo|doas|eval|xargs|nice"
+            r"|caffeinate|watch|env|timeout|parallel)\s|-exec\s|-execdir\s|-c\s)\s*(?:[A-Za-z_]\w*=\S*\s+)*"
+            r"(?:-\S+\s+)*(?:\S*/)?")
+NET_RE = re.compile(_CMD_POS + r"(%s)(?=$|[\s;&|)}`])" % "|".join(NET_PROGS), re.M)
+INTERP_RE = re.compile(_CMD_POS + r"(python[0-9.]*|node|nodejs)(?=$|[\s;&|)}`])([^;&|\n]*)", re.M)
+INTERP_CODE_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]*[ce]|--eval|-p|--print|-)(?=\s|$)|<<|://"
+                            r"|(?:^|\s)-m\s*(?:http|urllib|smtplib|ftplib|telnetlib|socketserver|webbrowser"
+                            r"|SimpleHTTPServer|xmlrpc|pip)\b")
 SECRET_RE = re.compile(
     r"xox[abposr]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}"
     r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bsk-[A-Za-z0-9_-]{20,}")
@@ -422,6 +441,27 @@ def protected_paths(ctx):
         ps |= {os.path.join(ctx.ws, "config.json"), os.path.join(m, "PAUSED"), os.path.join(m, "ledger.json"),
                os.path.join(m, "guard.log")}
     return {_cf(p) for p in ps}  # casefolded: macOS file systems ignore case (Config.json is config.json)
+
+
+# Files a later session obeys as standing instructions (CONTRACT §5): an edit to one always asks, bypass included.
+PERSONA_NAMES = ("AGENTS.md", "CLAUDE.md", ".mcp.json", "MEMORY.md", ".claude")
+
+
+def grants_path(ctx):
+    return _cf(os.path.join(ctx.ws, ".mother", "grants.json")) if ctx.ws else None
+
+
+def persona_path(fp, ctx):
+    """fp (real path) is the workspace's AGENTS.md, CLAUDE.md, .mcp.json, memory/MEMORY.md or under .claude/."""
+    if not ctx.ws:
+        return False
+    ws = _cf(ctx.ws)
+    f = fp.casefold()
+    if not inside(f, ws) or f == ws:
+        return False
+    rel = os.path.relpath(f, ws).replace(os.sep, "/")
+    return rel in ("agents.md", "claude.md", ".mcp.json", "memory/memory.md") or rel == ".claude" \
+        or rel.startswith(".claude/")
 
 
 def graphql_file_is_query(seg, cwd):
@@ -1806,7 +1846,10 @@ def shell_writes(cmd, run):
 def shell_self_edit(cmd, run, cwd, ctx):
     """A shell command that could change the guard's own files: it writes, and it names one of them by a path
     that reaches the running copy (the installed plugin, the workspace) or runs from inside it. The same file
-    names in a checkout of this repo or in another project pass. Reads (cat, grep, 2>/dev/null) pass."""
+    names in a checkout of this repo or in another project pass. Reads (cat, grep, 2>/dev/null) pass.
+    Returns the kind it touches: "config" (the guard, config.json, PAUSED, the ledger, the log), "grants"
+    (.mother/grants.json) or "persona" (the workspace's AGENTS.md, CLAUDE.md, .mcp.json, .claude/, MEMORY.md);
+    False for none."""
     if not shell_writes(cmd, run):
         return False
     text = run_text(cmd, quotes=False)  # a `cat > notes.md <<'EOF'` body that mentions config.json names nothing
@@ -1815,13 +1858,16 @@ def shell_self_edit(cmd, run, cwd, ctx):
     # the session's cwd says where relative names land, unless the command moves first (then its cd path counts)
     here = os.path.realpath(cwd).lower() if cwd and not re.search(r"(?:^|[\s;&|(])cd\s", shell) else ""
     home = os.path.expanduser("~").lower()
-    homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "hooks.json"])]
+    homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "hooks.json"],
+              "config")]
     if ctx.ws:
         # a command that sets its own MOTHER_WORKSPACE / MOTHER_STATE_DIR is working on a test workspace
         test_ws = re.search(r"\b(?:mother_workspace|mother_state_dir)=", shell)
-        homes.append((ctx.ws, [] if test_ws else [r"\$\{?mother_workspace\b", r"\.mother/workspace\b"],
-                      ["config.json", "PAUSED", "ledger.json", "guard.log"]))
-    for base, marks, names in homes:
+        marks = [] if test_ws else [r"\$\{?mother_workspace\b", r"\.mother/workspace\b"]
+        homes.append((ctx.ws, marks, ["config.json", "PAUSED", "ledger.json", "guard.log"], "config"))
+        homes.append((ctx.ws, marks, ["grants.json"], "grants"))
+        homes.append((ctx.ws, marks, list(PERSONA_NAMES), "persona"))
+    for base, marks, names, kind in homes:
         # exact case as a bare word (so prose "paused" is not PAUSED), any case after a slash (macOS ignores case)
         if not any(re.search(r"(?<![\w.-])" + re.escape(x) + r"(?![\w.-])", text) or
                    re.search(r"/" + re.escape(x.lower()) + r"(?![\w.-])", low) for x in names):
@@ -1833,9 +1879,9 @@ def shell_self_edit(cmd, run, cwd, ctx):
             forms.append(base[len("/private"):])
         if (here == base or here.startswith(base + os.sep) or any(f in low for f in forms)
                 or any(re.search(mk, shell) for mk in marks)):
-            return True
+            return kind
     # the workspace pointer itself; reading it (`cat ~/.mother/workspace`) is how every routine finds the workspace
-    return bool(POINTER_RE.search(POINTER_READ_RE.sub(" ", text)))
+    return "config" if POINTER_RE.search(POINTER_READ_RE.sub(" ", text)) else False
 
 
 def wa_shell_names_config(cmd):
@@ -1849,7 +1895,13 @@ def classify_bash(cmd, cwd, ctx):
     if wa:
         return wa
     run = run_text(cmd)
-    if shell_self_edit(cmd, run, cwd, ctx):
+    touched = shell_self_edit(cmd, run, cwd, ctx)
+    if touched == "grants":
+        return act("grants", "grants_file", "a shell command that could change .mother/grants.json")
+    if touched == "persona":
+        return act("persona", "persona_files", "a shell command that could change the workspace's standing "
+                                               "instructions (AGENTS.md, CLAUDE.md, .mcp.json, .claude/, MEMORY.md)")
+    if touched:
         # config.json holds the whatsapp block: only `mother whatsapp setup`, in the manager's terminal, changes it
         if wa_shell_names_config(cmd) and wa_block_now(ctx):
             return wa_act("terminal", "a shell write to config.json, which holds the whatsapp block (MOTHER's "
@@ -2056,9 +2108,84 @@ def classify_mcp(tool, inp):
                board=first(flat, "originBoardId", "boardId", "board_id"), creates=n, text=text_of(flat))
 
 
+def net_command(cmd):
+    """The network-capable program a shell command runs, or None: one of NET_PROGS at a command position (quotes
+    and backslashes ignored, so `c'u'rl` is curl), or python/node with inline code (-c, -e, stdin, a heredoc), a
+    network module (-m http.server) or a URL argument. Heredoc bodies fed to a plain command are data."""
+    text = re.sub(r"[\"'\\\\]", "", run_text(cmd, quotes=False))
+    m = NET_RE.search(text)
+    if m:
+        return m.group(1)
+    for seg in CMD_SPLIT_RE.split(text):  # a code-host API call aimed at another host or a full URL
+        if API_RE.search(seg) and re.search(r"--hostname\b|://", seg):
+            return "gh/glab api to another host"
+    for m in INTERP_RE.finditer(text):
+        if INTERP_CODE_RE.search(m.group(2)):
+            return m.group(1)
+    return None
+
+
+def classify_shell(cmd, cwd, ctx):
+    """A shell command (Bash, a Monitor command, a terminal-panel command): the Bash rules, then, in a workspace
+    session, a program that can reach the network is outbound_unknown."""
+    a = classify_bash(cmd, cwd, ctx)
+    if a is None and in_workspace(cwd, ctx):
+        net = net_command(cmd)
+        if net:
+            a = act("outbound_unknown", "outbound_unknown", "a shell command that can send data off this machine "
+                                                            "(%s): %s" % (net, cmd.strip()[:160]))
+    return a
+
+
+def approve_line(inp):
+    """True when any text in a session tool's input has a line starting `mother approve`."""
+    def strings(v):
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, dict):
+            for x in v.values():
+                for s in strings(x):
+                    yield s
+        elif isinstance(v, list):
+            for x in v:
+                for s in strings(x):
+                    yield s
+    import unicodedata
+    for s in strings(inp):
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+        if APPROVE_ANY_RE.search(s):
+            return True
+    return False
+
+
+def mcp_navigates(tool, inp):
+    """A browser navigation: a tool named …navigate…, or a batch tool whose actions include one."""
+    if "navigate" in tokens_of(tool.split("__")[-1]):
+        return True
+    if "batch" in tokens_of(tool.split("__")[-1]):
+        return '"navigate"' in json.dumps(inp) or re.search(r'"name":\s*"[^"]*navigate', json.dumps(inp)) is not None
+    return False
+
+
+def mcp_unknown_write(tool, inp):
+    """An MCP call whose operation writes but that no domain claims (classify_mcp gave it no decision). The desktop
+    app's own tools (`mcp__ccd_…`) reach only the manager's app and are left alone."""
+    parts = tool.split("__")
+    server = parts[1] if len(parts) > 2 else ""
+    if server.startswith("ccd_"):
+        return False
+    toks = tokens_of(parts[-1])
+    if domain_from(toks) or domain_from(tokens_of(server)) or domain_from_shape(inp):
+        return False
+    ops = [t for t in toks if t not in PRODUCT_WORDS]
+    if not ops or ops[0] in READ_VERBS:
+        return False
+    return bool(set(ops) & (WRITE_VERBS | DELETE_VERBS | UNKNOWN_WRITE_VERBS))
+
+
 def classify(tool, inp, cwd, ctx):
     if tool == "Bash":
-        return classify_bash(str(inp.get("command", "")), cwd, ctx)
+        return classify_shell(str(inp.get("command", "")), cwd, ctx)
     if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         fp = str(inp.get("file_path") or inp.get("notebook_path") or "")
         if fp:
@@ -2070,8 +2197,31 @@ def classify(tool, inp, cwd, ctx):
                                           "WhatsApp setup)")
             if fp.casefold() in protected_paths(ctx):
                 return act("config", "guard_config", "an edit to the guard's own files: " + fp)
+            if fp.casefold() == grants_path(ctx):
+                return act("grants", "grants_file", "an edit to .mother/grants.json")
+            if persona_path(fp, ctx):
+                return act("persona", "persona_files", "an edit to the workspace's standing instructions: " + fp)
+        return None
+    if tool == "Monitor":
+        a = classify_shell(str(inp.get("command") or ""), cwd, ctx)
+        if a is None and inp.get("ws") not in (None, "", {}, []) and in_workspace(cwd, ctx):
+            url = inp["ws"].get("url") if isinstance(inp["ws"], dict) else inp["ws"]
+            a = act("outbound_unknown", "outbound_unknown", "a Monitor websocket to %s" % str(url)[:120])
+        return a
+    if tool == "WebFetch":
+        if in_workspace(cwd, ctx):
+            return act("outbound_unknown", "outbound_unknown", "a web fetch of %s" % str(inp.get("url") or "?")[:160])
+        return None
+    if tool == "WebSearch":
+        q = str(inp.get("query") or "")
+        if in_workspace(cwd, ctx) and URLISH_RE.search(q):
+            return act("outbound_unknown", "outbound_unknown", "a web search naming a URL: %s" % q[:160])
         return None
     if tool in IN_APP_SESSION_TOOLS:
+        # a `mother approve` line in a card brief or a session message could read as the manager's own approval
+        if approve_line(inp):
+            return act("approve-line", "session_approvals", "a session message or card brief with a line that "
+                                                            "starts `mother approve` (%s)" % tool)
         # not outbound, but a token pasted into a message or card brief is still caught
         if SECRET_RE.search(json.dumps(inp)):
             return act("credential", "credentials", "a session message or brief whose content looks like a "
@@ -2081,9 +2231,17 @@ def classify(tool, inp, cwd, ctx):
         return None
     if any(SENSITIVE_KEYS.match(str(k)) for k in inp.keys()):
         return act("credential", "credentials", "a tool call carrying a password or card field (%s)" % tool)
+    if tool.split("__")[-1] == "run_in_terminal":  # a shell in the manager's terminal panel: read as Bash
+        return classify_shell(str(inp.get("command") or ""), cwd, ctx)
     a = classify_mcp(tool, inp)
     if a and a["kind"] not in ("draft", "deletion") and SECRET_RE.search(json.dumps(inp)):
         return act("credential", "credentials", "an outbound call whose content looks like a credential (%s)" % tool)
+    if a is None and in_workspace(cwd, ctx):
+        if mcp_navigates(tool, inp):
+            return act("outbound_unknown", "outbound_unknown", "a browser navigation (%s)" % tool)
+        if mcp_unknown_write(tool, inp):
+            return act("outbound_unknown", "outbound_unknown", "a write through %s, which the guard can't place "
+                                                              "(chat, mail, calendar, tracker, code, docs)" % tool)
     return a
 
 
@@ -2112,6 +2270,7 @@ def green(a, ctx, auto):
 # ------------------------------------------------------------------ session approvals (attended runs)
 
 APPROVE_RE = re.compile(r"^\s*mother approve (tracker|chat) ([A-Za-z0-9_-]+)\s*$", re.I)
+APPROVE_ANY_RE = re.compile(r"^\s*mother\s+approve\b", re.I | re.M)
 SESSION_APPROVAL_MAX_HOURS = 12
 
 
@@ -2385,6 +2544,11 @@ def run_grant_scope(a, ctx, sc, now=None):
 # ------------------------------------------------------------------ decision
 
 
+def bypass_passes(ctx):
+    """policy.bypass_passes_asks is true (an invalid config counts as false)."""
+    return bool(ctx.ok) and ((ctx.cfg.get("policy") or {}).get("bypass_passes_asks") is True)
+
+
 def paused(ctx):
     if not ctx.ws:
         return None
@@ -2441,9 +2605,20 @@ def decide(a, ctx, transcript=None):
         return decide_whatsapp(a, ctx)
     if a["kind"] == "config":
         return "ask", "%s. The agent must not change its own guard; confirm this is you." % a["what"]
+    if a["kind"] == "persona":
+        return "ask", "%s. A later session obeys these files as standing instructions; confirm this is you, not " \
+                      "text from a message." % a["what"]
+    if a["kind"] == "approve-line":
+        return "deny", "%s. Only the manager types `mother approve`; a session message or card brief never " \
+                       "carries one. Leave the line out." % a["what"]
     if a["kind"] == "session":  # the manager's own sessions: always a question, never PAUSED or the never-list
         return "ask", "%s. Confirm it." % a["what"]
     p = paused(ctx)
+    if p and a["kind"] == "grants":
+        return "deny", "Outbound is PAUSED (%s exists). Blocked: %s." % (p, a["what"])
+    if a["kind"] == "grants":
+        return "ask", "%s. Grants are written by `mother grant add`, which checks them; a direct edit could forge " \
+                      "one. Confirm this is you." % a["what"]
     if p:
         return "deny", "Outbound is PAUSED (%s exists). Blocked: %s. Only the manager removes that file." % (
             p, a["what"])
@@ -2460,6 +2635,8 @@ def decide(a, ctx, transcript=None):
         return "allow", "%s: auto (%s)." % (a["what"], g[1])
     if a["kind"] in ("chat", "tracker") and covered_by_session(a, session_approvals(transcript), ctx.cfg):
         return "allow", "%s: covered by the manager's `mother approve` line in this session." % a["what"]
+    if a["kind"] == "outbound_unknown":
+        return "ask", "%s: the guard can't tell where this sends data or who sees it. Confirm it." % a["what"]
     why = run_grant(a, ctx)
     if why:
         return "allow", "%s: %s." % (a["what"], why)
@@ -2516,7 +2693,7 @@ def log(ctx, tool, a, decision, reason):
 
 CHANNEL_PRIVATE = ["people", "journal", "memory", "todos", ".mother", "bridge"]
 CHANNEL_NOTE_DIRS = ("todos", "memory", "projects", "teams", "people")
-CHANNEL_NO_TOOLS = {"Bash", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"}
+CHANNEL_NO_TOOLS = {"Bash", "Monitor", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"}
 
 
 def inside(path, root):
@@ -2545,6 +2722,8 @@ def channel_session(tool, inp, cwd, ctx, role):
         if rel is None or rel.split(os.sep)[0] not in CHANNEL_NOTE_DIRS or not rel.endswith(".md"):
             return "deny", "%s may write only notes (*.md under %s), not %s." % (
                 who, ", ".join(d + "/" for d in CHANNEL_NOTE_DIRS), fp)
+        if persona_path(fp, ctx):
+            return "ask", "%s: an edit to memory/MEMORY.md, which later sessions obey; confirm it." % who
         return None
     if tool in ("Read", "Grep", "Glob", "LS"):
         raw = inp.get("file_path") or inp.get("path") or ""
@@ -2583,7 +2762,6 @@ def channel_session(tool, inp, cwd, ctx, role):
 # agents/*.md. Plugin agents can't carry their own hooks, so this is where their limits live. Hooks run inside
 # sub-agents, and the payload names the agent in `agent_type`, scoped ("mother:reader") or bare.
 SUBAGENT_TOOLS = {"reader": {"Read", "Grep", "Glob", "LS", "Bash"}, "critic": {"Read", "Grep", "Glob", "LS"}}
-READER_BASH = {"gh", "glab", "date"}
 DRY_RUN_ENV = "MOTHER_DRY_RUN"
 
 
@@ -2596,8 +2774,81 @@ def mother_subagent(payload):
     return t if t in SUBAGENT_TOOLS else None
 
 
-def unquoted(cmd):
-    return re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", "''", cmd)
+# The reader's code-source reads (CONTRACT §5c). The hub's exact shapes (HUB_GH_SHAPES) pass too. Anything that
+# could name another host or send data in a header or body is refused.
+READER_GH_SHAPES = {
+    "gh": {("pr", "list"), ("pr", "view"), ("pr", "checks"), ("pr", "status"), ("pr", "diff"), ("issue", "list"),
+           ("issue", "view"), ("issue", "status"), ("search", "prs"), ("search", "issues"), ("run", "list"),
+           ("run", "view"), ("repo", "view"), ("release", "list"), ("release", "view"), ("api", None)},
+    "glab": {("mr", "list"), ("mr", "view"), ("issue", "list"), ("issue", "view"), ("ci", "list"), ("ci", "view"),
+             ("ci", "status"), ("repo", "view"), ("release", "list"), ("release", "view"), ("api", None)}}
+READER_BAD_FLAGS = {"--hostname", "-H", "--header", "--web", "-w", "--input", "-f", "-F", "--field",
+                    "--raw-field", "-X", "--method", "--browser"}
+
+
+def reader_argv(cmd):
+    """argv of one plain command: words of plain characters, single-quoted strings, or double-quoted strings
+    with no `$`, backtick, backslash or `!`; nothing else (no expansion, chaining, redirect, glob or comment)."""
+    if hub_odd_chars(cmd) or "\n" in cmd.strip():
+        return None
+    argv, i, n, word, have = [], 0, len(cmd.strip()), [], False
+    cmd = cmd.strip()
+    while i < n:
+        c = cmd[i]
+        if c == " " or c == "\t":
+            if have:
+                argv.append("".join(word))
+            word, have = [], False
+            i += 1
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return None
+            word.append(cmd[i + 1:j])
+            have, i = True, j + 1
+        elif c == '"':
+            j = cmd.find('"', i + 1)
+            if j < 0 or re.search(r"[$`\\!]", cmd[i + 1:j]):
+                return None
+            word.append(cmd[i + 1:j])
+            have, i = True, j + 1
+        elif re.match(r"[A-Za-z0-9_.:/@=,+%^#-]", c) and not (c == "#" and not have):
+            word.append(c)
+            have, i = True, i + 1
+        else:
+            return None
+    if have:
+        argv.append("".join(word))
+    return argv or None
+
+
+def reader_bash_ok(prog, args):
+    """`date`, or a gh/glab read: a shape in READER_GH_SHAPES (an `api` call only GET, to a relative endpoint),
+    no flag that names a host, adds a header or sends a body, `--repo`/`-R` only as owner/repo, no URL anywhere."""
+    if prog == "date":
+        return not any(a in ("-s", "--set") or a.startswith("--set=") for a in args)
+    if prog not in READER_GH_SHAPES:
+        return False
+    if prog in HUB_GH_SHAPES and hub_gh_ok(prog, list(args)):
+        return True
+    if not args or (args[0], args[1] if len(args) > 1 else None) not in READER_GH_SHAPES[prog] \
+            and (args[0], None) not in READER_GH_SHAPES[prog]:
+        return False
+    rest = list(args[1:]) if args[0] == "api" else list(args[2:])
+    if args[0] == "api":
+        if not rest or rest[0].startswith("-") or not re.fullmatch(r"/?[A-Za-z0-9_./{}?=&,:%+-]+", rest[0]) \
+                or rest[0].lstrip("/").startswith("graphql"):
+            return False
+    for k, a in enumerate(rest):
+        flag = a.split("=", 1)[0]
+        if "://" in a or flag in READER_BAD_FLAGS or (flag.startswith("-") and not flag.startswith("--")
+                                                    and any(ch in flag for ch in "HfFXw")):
+            return False
+        if flag in ("--repo", "-R"):
+            val = a.split("=", 1)[1] if "=" in a else (rest[k + 1] if k + 1 < len(rest) else "")
+            if not HUB_REPO_RE.match(val):
+                return False
+    return True
 
 
 def subagent_session(kind, tool, inp, cwd, ctx):
@@ -2623,9 +2874,8 @@ def subagent_session(kind, tool, inp, cwd, ctx):
             if kind == "reader" and WA_READ_RE.match(cmd) and classify_whatsapp(cmd, cwd, ctx) is None:
                 return None
             return "deny", "%s may run only a single `mother whatsapp read` command, not: %s" % (who, cmd[:120])
-        bare = unquoted(cmd)
-        first = os.path.basename(bare.split()[0]) if bare.split() else ""
-        if first not in READER_BASH or re.search(r"[;&|`<>]|\$\(", bare):
+        argv = reader_argv(cmd)
+        if not argv or not reader_bash_ok(argv[0], argv[1:]):
             return "deny", "%s runs only single gh/glab read commands, not: %s" % (who, cmd[:120])
         a = classify_bash(cmd, cwd, ctx)
         if a is not None:
@@ -2818,6 +3068,10 @@ def hub_session(tool, inp, cwd, ctx, sid=None):
     in-app session tools, and its wake mechanism. Returns (decision, reason) to deny, None when allowed with
     no further check, or "normal" to run the normal rules (the in-app session tools keep their ask)."""
     deny = "deny", "%s (%s)." % (HUB_DENY, tool)
+    if tool == "CronCreate":  # the cron fallback wake only: a standing prompt could carry anything
+        prompt = str(inp.get("prompt") or "").strip()
+        return None if not hub_odd_chars(prompt) and (prompt.startswith("/mother:hub") or
+                                                      prompt.startswith("mother hub tail --once")) else deny
     if tool in HUB_TOOLS:
         return None
     if tool == "Monitor":
@@ -2908,8 +3162,11 @@ def run(raw):
         # The manager chose bypass mode for this session: an ask becomes no decision, so Claude Code's own
         # mode applies, WhatsApp sends included (as for chat). Denies (PAUSED, the never-list, dry run, the
         # WhatsApp state and setup rules) and the guard's self-edit check still hold.
-        if r[0] == "ask" and a["kind"] != "config" \
-                and payload.get("permission_mode") == "bypassPermissions":
+        # In the workspace an ask stays an ask unless the manager set policy.bypass_passes_asks; the guard's own
+        # files, grants.json and the persona files always ask.
+        if r[0] == "ask" and a["kind"] not in ("config", "grants", "persona") \
+                and payload.get("permission_mode") == "bypassPermissions" \
+                and (bypass_passes(ctx) or not in_workspace(payload.get("cwd"), ctx)):
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])
             return None
     except Exception as e:  # fail closed on anything that might be outbound; WhatsApp fails to deny

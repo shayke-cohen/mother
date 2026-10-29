@@ -111,6 +111,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `connections` (map from capability `chat|mail|tracker|calendar|code` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required), `watch` (`chat.channels` [id], `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str]). Unknown keys fail `mother status`. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
+| `policy.bypass_passes_asks` | bool, optional | default `false`: in a session whose cwd is the workspace, a guard ask stays an ask in `bypassPermissions` mode. `true` restores the pass (§5). Any other type fails `mother status` |
 
 The CLI validates this (`mother status`) and fails loudly on unknown keys or a wrong type.
 
@@ -199,7 +200,32 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   transition/comment/sprint ops, mail send, calendar create/update with guests, `gh`/`glab` write commands.
 - **allow**: posts to `manager.chat_dm`; mail drafts; calendar events without guests.
 - **ask**: everything else outbound (the human confirms). When the payload's `permission_mode` is
-  `bypassPermissions`, an ask (other than a guard self-edit) gets no output and is logged as `pass`.
+  `bypassPermissions`, an ask gets no output and is logged as `pass` only when the session's cwd is outside the
+  workspace, or `policy.bypass_passes_asks` is `true` (an invalid config counts as `false`). An ask for the guard's
+  own files, `grants.json` or a persona file never passes.
+- **ask, every mode** (`kind: "grants"`): a Write/Edit/MultiEdit/NotebookEdit of `<workspace>/.mother/grants.json`,
+  or a shell command that writes and names `grants.json` by a path that reaches the workspace (the same reach test
+  as the guard's own files). **deny** under PAUSED. `mother grant add|remove` is the one writer (below).
+- **ask, every mode** (`kind: "persona"`): an edit (Write/Edit/MultiEdit/NotebookEdit, or a shell write naming it)
+  of the workspace's `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `memory/MEMORY.md`, or anything under `.claude/`
+  (names compared casefolded). PAUSED leaves it an ask. A channel session for the manager asks for
+  `memory/MEMORY.md` too.
+- **deny** (`kind: "approve-line"`): an in-app session tool (`start_session`, `send_message`, `SendMessage`, …)
+  whose input has, in any string, a line that starts `mother approve` (any case, any whitespace between the words,
+  Unicode format characters ignored). Only the manager types approvals.
+- **ask** (`kind: "outbound_unknown"`), only in a session whose cwd is the workspace or under it (any role; outside
+  the workspace these get no decision, as before): a shell command (Bash, a `Monitor` `command`, or an MCP
+  `run_in_terminal` `command`) that runs, at a command position after quotes and backslashes are dropped, `curl`,
+  `wget`, `nc`, `ncat`, `netcat`, `socat`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `telnet`, `http`, `https`,
+  `httpie` or `xh`, whatever the arguments; `python*`/`node` with `-c`/`-e`/`-p`/`--eval`/`-` or a heredoc, `-m`
+  of a network module (`http.server`, `urllib`, `smtplib`, …) or a `://` argument; `gh`/`glab api` with
+  `--hostname` or a `://` endpoint; `WebFetch`; `WebSearch` whose query holds a URL (`://`, `www.`, or
+  `host.tld/…`); an MCP tool whose name has a `navigate` part, or a `…batch` tool whose input names one; a
+  `Monitor` with a `ws` target; and an MCP call the domain rules give no decision whose operation is not a read
+  verb but has a write verb (the write list plus `copy`, `batch`, `save`, `store`, `import`, `sync`, `deploy`,
+  `notify`, `broadcast`, `duplicate`, `clone`, `emit`, `dispatch`, `enqueue`, `commit`, `release`) and whose
+  server is not the app's own (`mcp__ccd_…`). PAUSED and `MOTHER_DRY_RUN` deny it.
+- **Monitor** in every session: its `command` is classified exactly like a Bash command (§5 rules above).
 - **deny**: a chat write (post/reply/schedule/edit, or a canvas/topic/purpose change; not a reaction) through a
   server listed in any connector's `stamps` to anyone other than `manager.chat_dm`; an unknown target, or two
   different targets in one call, is denied too (`rules/outbound.md`).
@@ -234,13 +260,22 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   classify as writes whose operation starts with a read verb, whose name has no fetch, download, upload, export,
   url, http, browse or navigate part and whose input has no `url`, `uri`, `href`, `path`, `file`, `dest` or
   `destination` field; `set_session_model` and `set_session_effort` on the session itself; the in-app session
-  tools, which keep the rules above (so a send to a non-hub session still asks); `Skill`, `CronCreate`,
-  `CronDelete`, `CronList`, `TaskStop`, `ToolSearch`, `TodoWrite`. Everything else (`Write`, `Edit`, `WebFetch`,
+  tools, which keep the rules above (so a send to a non-hub session still asks, a line starting `mother approve`
+  is denied, and in bypass an ask stays an ask in the workspace); `Skill`, `CronCreate` (only a `prompt` that,
+  stripped, starts `/mother:hub` or `mother hub tail --once`, with no control or format character), `CronDelete`, `CronList`, `TaskStop`, `ToolSearch`, `TodoWrite`. Everything else (`Write`, `Edit`, `WebFetch`,
   `WebSearch`, `Agent`, other commands, other MCP calls) is denied with "the hub session can only do hub work; ask
   the manager to open a session for this". Other sessions are unchanged.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
+- **`mother grant`** (`lib/grants.py`) is the only writer of grants (besides `mother channels`' own answer and
+  reply grants): `add <scope> <target> --by <user-id> --cites <link|ts> [--channel ID] [--uses N] [--hours H
+  (default 24)] [--run ID] [--thread TS]` builds `{scope, target, uses: min(N, ceiling), expires: min(now + H,
+  ts + max age), run (default manual), source{channel, user, ts}}` and writes it only if `valid_grant` would honour
+  it now (exit 1 and nothing written otherwise, for `answer`, while PAUSED, or when `grants.json` is unreadable,
+  which it never overwrites). `--cites` is a message link holding `/<CHANNEL>/p<16 digits>` or a ts (channel from
+  `--channel`, else the first `manager.chat_dm`). `remove --run ID` drops that run's grants; `list [--json]`.
+  Atomic, under `.mother/grants.lock`. Exit 2 on usage errors.
 - Every outbound decision is appended to `.mother/guard.log` (tool, category, target, decision, reason — never message text).
 - **Session approval:** a human-typed message whose *leading* lines are `mother approve tracker <PROJECT>` or
   `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours. Lines from
@@ -399,7 +434,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   thread) → `send` actions; `done` records each post.
 - Sessions run in the workspace with `--permission-mode default` and `MOTHER_CHANNEL_ROLE=manager|team|anyone`.
   **The guard enforces the limits from that variable**, whatever the user's allow rules say: a channel session
-  makes no outbound call at all (not even green ones — the loop posts), no `Bash`/web/subagents, and reads only
+  makes no outbound call at all (not even green ones — the loop posts), no `Bash`/`Monitor`/web/subagents, and reads only
   the workspace and the plugin. A teammate's session also can't write, can't read `people/ journal/ memory/ todos/
   .mother/ bridge/`, grep the workspace root or use `..`/absolute search patterns, and may call only tools under the
   prefixes in `MOTHER_CHANNEL_SERVERS` — the tracker and code-host prefixes *with their product segment*
@@ -428,7 +463,14 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **The guard enforces read-only** from the hook payload's `agent_type` (`mother:reader` or `reader`, likewise
   critic), because plugin agents can't carry their own hooks. Every classified write is denied, including
   green ones. Write/Edit and web are denied, and so is any tool outside the agent's list. A reader's Bash is
-  limited to single `gh`/`glab`/`date` commands with no chaining. A critic gets no MCP tools. Other sub-agents
+  limited to one plain command (words of plain characters, single-quoted strings, or double-quoted strings with
+  no `$`, backtick, backslash or `!`; no chaining, redirect, glob, newline or env prefix): `date` (not `-s`/`--set`),
+  or `gh`/`glab` as the hub allows (§5e) or one of `gh pr list|view|checks|status|diff`, `gh issue
+  list|view|status`, `gh search prs|issues`, `gh run list|view`, `gh repo view`, `gh release list|view`, `gh api
+  <relative endpoint>` (not `graphql`), `glab mr list|view`, `glab issue list|view`, `glab ci list|view|status`,
+  `glab repo view`, `glab release list|view`, `glab api …`; never with `--hostname`, `-H`/`--header`, `--web`,
+  `--input`, `-f`/`-F`/`--field`/`--raw-field`, `-X`/`--method`, an argument holding `://`, or a `--repo`/`-R`
+  that is not `owner/repo`. A critic gets no MCP tools. Other sub-agents
   (not MOTHER's) keep the normal rules.
 - `mother items check` turns a reader's reply into the only input a skill may use. Items without a link
   (URL, ticket key, `owner/repo#N`, workspace path) are dropped. A `state: noise` tally cited by the query that reproduces it is kept as a count, never a finding. A reader whose items were all uncited

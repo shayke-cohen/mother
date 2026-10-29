@@ -167,6 +167,7 @@
       "credentials",
       "deletions",
       "payments"
-    ]
+    ],
+    "bypass_passes_asks": false
   }
 }

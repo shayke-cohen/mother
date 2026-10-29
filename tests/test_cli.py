@@ -354,6 +354,77 @@ class CliTest(unittest.TestCase):
         for frag in ("unknown top-level key 'bogus'", "external channels are capped", "brief.at must be HH:MM"):
             self.assertIn(frag, r.stdout)
 
+    def test_bypass_passes_asks_validated(self):
+        self.init()
+        cfg = self.write_config()
+        for val, ok in ((True, True), (False, True), ("yes", False), (1, False)):
+            cfg["policy"]["bypass_passes_asks"] = val
+            (self.ws / "config.json").write_text(json.dumps(cfg))
+            r = run(["status"], self.env)
+            self.assertEqual(r.returncode, 0 if ok else 1, r.stdout)
+            if not ok:
+                self.assertIn("policy.bypass_passes_asks must be true or false", r.stdout)
+
+    # -- grant (red-team fix 1: the only writer of .mother/grants.json)
+    def grant(self, *args):
+        return run(["grant", *args], self.env)
+
+    def test_grant_add_writes_what_the_guard_honours(self):
+        import importlib.util
+        import time as _t
+        self.init()
+        cfg = self.write_config()
+        ts = "%.6f" % (_t.time() - 60)
+        r = self.grant("add", "tracker-create", "PLAT", "--by", "U00000000", "--cites", ts, "--uses", "9",
+                       "--run", "digest")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = json.loads((self.ws / ".mother" / "grants.json").read_text())
+        g = doc["grants"][0]
+        self.assertEqual((g["scope"], g["target"], g["uses"], g["run"], g["source"]),
+                         ("tracker-create", "PLAT", 5, "digest", {"channel": "U00000000", "user": "U00000000", "ts": ts}))
+        spec = importlib.util.spec_from_file_location("g", str(ROOT / "hooks" / "guard.py"))
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        scopes, age = guard.grant_limits(cfg)
+        self.assertTrue(guard.valid_grant(g, "tracker-create", "PLAT", cfg, scopes, age, _t.time()))
+        # a link cites a channel message
+        link = "https://chat.example.com/archives/C00000001/p%s" % ts.replace(".", "")
+        r = self.grant("add", "chat-post", "C00000001", "--by", "U00000000", "--cites", link, "--hours", "1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["grant"]["source"]["channel"], "C00000001")
+        self.assertEqual(len(json.loads(self.grant("list", "--json").stdout)), 2)
+        r = self.grant("remove", "--run", "digest")
+        self.assertEqual((r.returncode, json.loads(r.stdout)["removed"]), (0, 1))
+
+    def test_grant_add_refuses_what_the_guard_would_ignore(self):
+        import time as _t
+        self.init()
+        self.write_config()
+        ts = "%.6f" % (_t.time() - 60)
+        old = "%.6f" % (_t.time() - 97 * 3600)
+        for args, frag in ((["chat-post", "C00000001", "--by", "U00000099", "--cites", ts], "manager's own chat id"),
+                           (["chat-post", "C00000009", "--by", "U00000000", "--cites", ts], "not a target"),
+                           (["tracker-create", "EVIL", "--by", "U00000000", "--cites", ts], "not a target"),
+                           (["answer", "C00000001", "--by", "U00000000", "--cites", ts], "mother channels"),
+                           (["mail-send", "x", "--by", "U00000000", "--cites", ts], "scope must be"),
+                           (["chat-post", "C00000001", "--by", "U00000000", "--cites", old], "last 96 hours"),
+                           (["chat-post", "C00000001", "--by", "U00000000", "--cites", "soon"], "--cites must be"),
+                           (["chat-post", "C00000001", "--by", "U00000000", "--cites", ts, "--channel", "C00000077"],
+                            "would not honour")):
+            r = self.grant("add", *args)
+            self.assertEqual(r.returncode, 1, (args, r.stderr))
+            self.assertIn(frag, r.stderr)
+        self.assertFalse((self.ws / ".mother" / "grants.json").exists())
+        (self.ws / ".mother" / "PAUSED").write_text("")
+        r = self.grant("add", "chat-post", "C00000001", "--by", "U00000000", "--cites", ts)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("PAUSED", r.stderr)
+        (self.ws / ".mother" / "PAUSED").unlink()
+        (self.ws / ".mother" / "grants.json").write_text("{not json")
+        r = self.grant("add", "chat-post", "C00000001", "--by", "U00000000", "--cites", ts)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual((self.ws / ".mother" / "grants.json").read_text(), "{not json")  # never clobbered
+
     def test_commitments_options_validated(self):
         self.init()
         cfg = self.write_config()
