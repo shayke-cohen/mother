@@ -629,6 +629,12 @@ class Verbs(unittest.TestCase):
         hub.append_inbox(self.ws, list(lines))
 
     def decide(self, *items, **kw):
+        # tests name lines like "x:1"; make sure each exists in the inbox (decide refuses unknown ids)
+        known = {l["id"] for l in hub.read_inbox(self.ws)}
+        for it in items:
+            if it["line_id"] not in known:
+                known.add(it["line_id"])
+                hub.append_inbox(self.ws, [dict(line(key=it["key"]), id=it["line_id"])])
         return hub.decide(self.ws, self.cfg, kw.get("at", self.AT), list(items))
 
     def hub_doc(self):
@@ -823,10 +829,65 @@ class Verbs(unittest.TestCase):
         keys = [json.loads(x)["key"] for x in out.getvalue().splitlines()]
         self.assertEqual(keys, ["PLAT-1", "PLAT-2", "PLAT-3"])
 
+    def test_unknown_line_id_is_refused(self):
+        import io
+        from unittest import mock
+        a = line(key="PLAT-1")
+        self.add(a)
+        self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "log"})
+        before = self.hub_doc()
+        with self.assertRaises(ValueError):
+            hub.decide(self.ws, self.cfg, self.AT, [{"line_id": a["id"], "key": "PLAT-1", "decision": "log"},
+                                                    {"line_id": "nope", "key": "K", "decision": "log"}])
+        self.assertEqual(self.hub_doc(), before)
+        body = json.dumps({"line_id": "nope", "key": "K", "decision": "log"})
+        with mock.patch("sys.stdin", io.StringIO(body)), mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(hub.main(["decide"], self.ws, self.cfg, self.AT), 2)
+        self.assertEqual(self.hub_doc(), before)
+
+    def test_out_of_order_batch_keeps_inbox_order(self):
+        a = line(key="PLAT-1", at="2026-10-29T09:00:00Z")
+        b = line(key="PLAT-2", at="2026-10-29T09:01:00Z")
+        c = line(key="PLAT-3", at="2026-10-29T09:02:00Z")
+        self.add(a, b, c)
+        res = self.decide({"line_id": c["id"], "key": "PLAT-3", "decision": "log"},
+                          {"line_id": a["id"], "key": "PLAT-1", "decision": "log"},
+                          {"line_id": b["id"], "key": "PLAT-2", "decision": "log"})
+        self.assertEqual([r["key"] for r in res], ["PLAT-1", "PLAT-2", "PLAT-3"])
+        h = self.hub_doc()
+        self.assertEqual([r["key"] for r in h["routed"]], ["PLAT-1", "PLAT-2", "PLAT-3"])
+        self.assertEqual(h["inbox_cursor"], c["id"])
+        self.decide({"line_id": a["id"], "key": "PLAT-1", "decision": "log"})
+        h = self.hub_doc()
+        self.assertEqual(h["inbox_cursor"], c["id"])
+        self.assertEqual(h["routed"][-1]["key"], "PLAT-1")
+
+    def test_now_with_live_session_becomes_route(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
+        res = self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "now", "title": "T"})
+        self.assertEqual(res[0]["decision"], "route")
+        self.assertEqual(res[0]["session_id"], "S1")
+        self.assertIn("route", res[0]["note"])
+        self.assertNotIn("update_id", res[0])
+        h = self.hub_doc()
+        self.assertEqual(h["updates"], [])
+        self.assertEqual(h["routed"][0]["decision"], "route")
+        s = hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]
+        self.assertEqual((s["unseen"], s["last_routed_at"]), (1, "2026-10-29T10:00:00Z"))
+
+    def test_tail_exits_quietly_on_interrupt_or_broken_pipe(self):
+        from unittest import mock
+        for exc in (KeyboardInterrupt, BrokenPipeError):
+            with mock.patch.object(hub, "tail", side_effect=exc), \
+                    mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+                self.assertEqual(hub.main(["tail", "--follow"], self.ws, self.cfg, self.AT), 0)
+
     def test_main_decide_json_and_bad_input(self):
         import io
         from unittest import mock
-        with mock.patch("sys.stdin", io.StringIO(json.dumps({"line_id": "x:1", "key": "PLAT-1", "decision": "log"}))), \
+        l1 = line(key="PLAT-1")
+        self.add(l1)
+        with mock.patch("sys.stdin", io.StringIO(json.dumps({"line_id": l1["id"], "key": "PLAT-1", "decision": "log"}))), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as so:
             self.assertEqual(hub.main(["decide", "--json"], self.ws, self.cfg, self.AT), 0)
         self.assertEqual(json.loads(so.getvalue())[0]["decision"], "log")

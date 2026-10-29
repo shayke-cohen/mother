@@ -914,6 +914,10 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
     order = {}
     for i, l in enumerate(lines):
         order[l["id"]] = i
+    unknown = [it["line_id"] for it in items if it["line_id"] not in order]
+    if unknown:
+        raise ValueError("line_id not in the kept inbox: %s" % ", ".join(unknown))
+    items = sorted(items, key=lambda it: order[it["line_id"]])
     results = []
     with locked(ws):
         h = _hub_doc(ws)
@@ -924,14 +928,17 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
             res = {"line_id": it["line_id"], "key": key, "decision": dec}
             also = list(it.get("also") or line.get("also") or [])
             entry = {"line_id": it["line_id"], "key": key, "decision": dec, "at": stamp}
-            if dec == "route":
+            if dec in ("route", "now"):
                 hit = find_session(sess, [key] + also)
+                if hit and dec == "now":
+                    dec = res["decision"] = entry["decision"] = "route"
+                    res["note"] = "live session for %s; recorded as a route, not an update" % key
                 if hit:
                     sk, s = hit
                     s["unseen"] = int(s.get("unseen") or 0) + 1
                     s["last_routed_at"] = stamp
                     entry["session_id"] = res["session_id"] = s.get("session_id")
-                else:
+                elif dec == "route":
                     dec = res["decision"] = entry["decision"] = "propose"
                     res["note"] = "no live session for %s; stored as a proposal" % key
             title = it.get("title") or line.get("title") or key
@@ -961,9 +968,7 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
                     res["update_id"] = "U%d" % n
             h["routed"].append(entry)
             cur = h.get("inbox_cursor")
-            if it["line_id"] in order and (cur not in order or order[it["line_id"]] > order[cur]):
-                h["inbox_cursor"] = it["line_id"]
-            elif it["line_id"] not in order:
+            if cur not in order or order[it["line_id"]] > order[cur]:
                 h["inbox_cursor"] = it["line_id"]
             results.append(res)
         h["routed"] = h["routed"][-ROUTED_MAX:]
@@ -1132,14 +1137,25 @@ def main(args, ws, cfg, at) -> int:
     as_json = "--json" in rest
     rest = [a for a in rest if a != "--json"]
     if verb == "tail":
-        return tail(ws, follow="--follow" in rest)
+        try:
+            return tail(ws, follow="--follow" in rest)
+        except (KeyboardInterrupt, BrokenPipeError):
+            try:
+                sys.stdout = open(os.devnull, "w")
+            except OSError:
+                pass
+            return 0
     if verb == "decide":
         try:
             items = _read_decisions(sys.stdin)
         except ValueError as e:
             print("mother hub decide: %s" % e, file=sys.stderr)
             return 2
-        res = decide(ws, cfg, at, items)
+        try:
+            res = decide(ws, cfg, at, items)
+        except ValueError as e:
+            print("mother hub decide: %s" % e, file=sys.stderr)
+            return 2
         if as_json:
             print(json.dumps(res, indent=2))
         else:

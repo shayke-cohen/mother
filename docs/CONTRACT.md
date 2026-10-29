@@ -626,7 +626,11 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `routed` (last 50), moves `inbox_cursor` to `line_id` (never backwards), and sets `last_wake`. `now` creates (or
   refreshes, per key) an `updates` entry with the next `U<n>`; `propose` replaces the `pending` entry for the key;
   `route` adds 1 to `unseen` and sets `last_routed_at` on the matching live session. A `route` with no live session
-  is stored as `propose`; the result says so (`note`). `title` and `link` default to the inbox line's. Output: one
+  is stored as `propose`; the result says so (`note`). A `now` for a key that has a live session is recorded as a
+  `route` instead (an update would be dropped at once), and the result says so. A `line_id` that is not in the kept
+  inbox files exits 2 with nothing written. The batch is applied in inbox order whatever order it was given in, and
+  the cursor moves to the furthest decided line; a later `decide` for a line before the cursor is still recorded
+  but never moves the cursor back, so the hub must decide every printed line, in printed order. `title` and `link` default to the inbox line's. Output: one
   `{line_id, key, decision (as stored), session_id?, update_id?, note?}` per item.
 - **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (live, `unseen` 0; removes the
   key and its `also` from `pending`), `drop <key>` (state `dropped`), `seen <key>` (`unseen` 0; exit 1 for an
