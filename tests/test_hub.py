@@ -8,12 +8,14 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import hub  # noqa: E402
+import hub_sources  # noqa: E402
+from hub_mcp import McpError  # noqa: E402
 
 UTC = timezone.utc
 
@@ -158,6 +160,190 @@ class TestFiles(unittest.TestCase):
         hub.rotate_inbox(self.ws, at)
         self.assertEqual(list(d.glob("inbox-*.jsonl")), [])
         self.assertFalse((d / "inbox.jsonl").exists())
+
+
+class FakeAdapter:
+    """Stands in for the tracker adapter: the first poll returns a cursor and no lines (as a real one does)."""
+    items = []
+    fail = None
+    calls = 0
+
+    @classmethod
+    def poll(cls, client, cursor, cfg, me, at):
+        cls.calls += 1
+        if cls.fail:
+            raise McpError(cls.fail, "server went away")
+        if cursor is None:
+            return {"lines": [], "cursor": {"n": 0}, "partial": []}
+        new = cls.items[cursor["n"]:]
+        return {"lines": [line(key=k, at="2026-10-29T09:%02d:00Z" % i) for i, k in enumerate(new)],
+                "cursor": {"n": len(cls.items)}, "partial": getattr(cls, "partial", [])}
+
+
+class Watcher(unittest.TestCase):
+    AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)  # a Thursday, inside active hours (Europe/London, 06-22)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.cfg = {"version": 1, "manager": {"email": "dana@example.com", "timezone": "Europe/London",
+                                              "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"], "chat_dm": "U00000000"},
+                    "connectors": {"tracker": "jira"},
+                    "hub": {"enabled": True, "every_seconds": 120, "idle_every_seconds": 600, "sweep_minutes": 30,
+                            "connections": {"tracker": {"command": "example-server", "args": [], "env": {}}},
+                            "watch": {"tracker": {"projects": ["PLAT"]}}}}
+        (self.ws / "config.json").write_text(json.dumps(self.cfg))
+        FakeAdapter.items, FakeAdapter.fail, FakeAdapter.calls = [], None, 0
+        FakeAdapter.partial = []
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["tracker:jira"] = FakeAdapter
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        self.clients = {"tracker": object()}
+
+    def at(self, minutes=0):
+        return self.AT + timedelta(minutes=minutes)
+
+    def poll(self, minutes=0, clients=None):
+        return hub.poll_once(self.ws, self.cfg, self.at(minutes), self.clients if clients is None else clients)
+
+    def inbox(self):
+        p = hub.hub_dir(self.ws) / "inbox.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def test_first_poll_sets_cursor_and_appends_nothing(self):
+        beat = self.poll()
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["tracker"], {"n": 0})
+        self.assertEqual(self.inbox(), [])
+        self.assertEqual(beat["sources"], {"tracker": {"status": "ok"}})
+        self.assertEqual(beat["errors"], [])
+        self.assertEqual(hub.load_json(self.ws, "watcher.json", {}), beat)
+        self.assertEqual((beat["at"], beat["every_seconds"], beat["active"]), ("2026-10-29T10:00:00Z", 120, True))
+
+    def test_new_items_appended_once_across_two_polls(self):
+        self.poll()
+        FakeAdapter.items = ["PLAT-1", "PLAT-2"]
+        self.poll(2)
+        self.poll(4)
+        self.assertEqual([l["key"] for l in self.inbox()], ["PLAT-1", "PLAT-2"])
+
+    def test_failing_source_one_error_line_and_cursor_holds(self):
+        self.poll()
+        FakeAdapter.fail = "unreachable"
+        for m in (2, 4, 6):
+            beat = self.poll(m)
+        errs = [l for l in self.inbox() if l["kind"] == "error"]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0]["source"], "tracker")
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["tracker"], {"n": 0})
+        ent = beat["sources"]["tracker"]
+        self.assertEqual(ent["status"], "couldnt_check")
+        self.assertEqual(ent["since"], "2026-10-29T10:02:00Z")
+        self.assertIn("went away", ent["reason"])
+        self.assertEqual(len(beat["errors"]), 1)
+        caps = json.loads((self.ws / "capabilities.json").read_text())
+        entry = caps["connectors"]["jira"]["health"]["example-server"]["read"]
+        self.assertEqual(entry["class"], "unreachable")
+        self.assertNotEqual(entry["status"], "ok")
+        # recovery: items found while it was down come through once the source answers again
+        FakeAdapter.fail = None
+        FakeAdapter.items = ["PLAT-9"]
+        beat = self.poll(8)
+        self.assertEqual(beat["sources"]["tracker"], {"status": "ok"})
+        self.assertEqual([l["key"] for l in self.inbox() if l["kind"] == "update"], ["PLAT-9"])
+        caps = json.loads((self.ws / "capabilities.json").read_text())
+        self.assertEqual(caps["connectors"]["jira"]["health"]["example-server"]["read"]["status"], "ok")
+
+    def test_forbidden_tool_stops_the_watcher(self):
+        from hub_mcp import ForbiddenTool
+
+        def boom(*a):
+            raise ForbiddenTool("nope")
+        orig = FakeAdapter.__dict__["poll"]
+        FakeAdapter.poll = staticmethod(boom)
+        self.addCleanup(setattr, FakeAdapter, "poll", orig)
+        with self.assertRaises(ForbiddenTool):
+            self.poll()
+
+    def test_partial_source_is_reported_with_reasons(self):
+        self.poll()
+        FakeAdapter.items = ["PLAT-1"]
+        FakeAdapter.partial = ["search failed"]
+        beat = self.poll(2)
+        self.assertEqual(beat["sources"]["tracker"]["status"], "partial")
+        self.assertEqual(beat["sources"]["tracker"]["reason"], "search failed")
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["tracker"], {"n": 1})
+        self.assertEqual([l["kind"] for l in self.inbox()], ["update"])
+
+    def test_client_that_would_not_start_is_one_error(self):
+        bad = {"tracker": McpError("dropped", "server exited")}
+        for m in (0, 2):
+            beat = self.poll(m, clients=bad)
+        self.assertEqual(beat["sources"]["tracker"]["status"], "couldnt_check")
+        self.assertEqual(len([l for l in self.inbox() if l["kind"] == "error"]), 1)
+
+    def test_missing_connection_is_couldnt_check(self):
+        del self.cfg["hub"]["connections"]["tracker"]
+        beat = self.poll(clients={})
+        self.assertEqual(beat["sources"]["tracker"]["status"], "couldnt_check")
+        self.assertEqual(beat["sources"]["tracker"]["reason"], "no connection")
+        self.assertEqual(FakeAdapter.calls, 0)
+
+    def test_sweep_only_when_pending(self):
+        self.poll()
+        self.poll(31)
+        self.assertEqual([l for l in self.inbox() if l["kind"] == "sweep"], [])
+        # a missing or odd hub.json / sessions.json is nothing pending
+        (hub.hub_dir(self.ws) / "hub.json").write_text("not json")
+        (hub.hub_dir(self.ws) / "sessions.json").write_text("[]")
+        self.poll(32)
+        self.assertEqual(self.inbox(), [])
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "hub.json", {"version": 1, "pending": [{"key": "PLAT-1"}]})
+        self.poll(33)
+        self.assertEqual([l["kind"] for l in self.inbox()], ["sweep"])
+        self.poll(40)  # inside sweep_minutes: no second sweep
+        self.assertEqual(len(self.inbox()), 1)
+        self.poll(64)
+        self.assertEqual(len(self.inbox()), 2)
+
+    def test_sweep_for_unseen_live_sessions(self):
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "sessions.json", {"version": 1, "sessions": {
+                "a": {"session_id": "s1", "unseen": 0, "state": "live"},
+                "b": {"session_id": "s2", "unseen": 3, "state": "dropped"}}})
+        self.poll()
+        self.assertEqual(self.inbox(), [])
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "sessions.json", {"version": 1, "sessions": {
+                "b": {"session_id": "s2", "unseen": 2, "state": "live"}}})
+        self.poll(1)
+        self.assertEqual([l["kind"] for l in self.inbox()], ["sweep"])
+
+    def test_interval_inside_and_outside_active_hours(self):
+        self.assertEqual(hub.interval(self.cfg, self.AT), (True, 120))
+        night = datetime(2026, 10, 29, 23, 0, tzinfo=UTC)
+        self.assertEqual(hub.interval(self.cfg, night), (False, 600))
+        self.cfg["hub"]["idle_every_seconds"] = 0  # sleep until the window opens: Fri 06:00 London = 06:00 UTC
+        self.assertEqual(hub.interval(self.cfg, night), (False, 7 * 3600))
+        saturday = datetime(2026, 10, 31, 10, 0, tzinfo=UTC)
+        self.assertFalse(hub.interval(self.cfg, saturday)[0])
+        beat = hub.poll_once(self.ws, self.cfg, night, self.clients, poll=False)
+        self.assertEqual((beat["active"], beat["every_seconds"]), (False, 7 * 3600))
+        self.assertEqual(FakeAdapter.calls, 0)
+
+    def test_me_comes_from_manager_and_matching_person(self):
+        self.cfg["teams"] = [{"people": [{"name": "Dana Levi", "email": "dana@example.com", "code": "danal"}]}]
+        self.assertEqual(hub.build_me(self.cfg), {"email": "dana@example.com", "chat": "U00000000", "code": "danal"})
+
+    def test_home_status(self):
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        self.assertEqual(hub.home_status(self.cfg), 3)
+        self.cfg["workspace"] = {"home_machine": "other"}
+        self.assertEqual(hub.home_status(self.cfg), 2)
+        self.cfg["workspace"] = {"home_machine": "laptop"}
+        self.assertEqual(hub.home_status(self.cfg), 0)
 
 
 if __name__ == "__main__":

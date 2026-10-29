@@ -570,6 +570,27 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one
   poll, no write), `status`, `tail` (recent inbox), `decide` (the hub's one write path for a decision),
   `session add|drop|seen|for` (the session registry), `done`, `snooze`, `show`.
+- **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It exits 2 when `workspace.home_machine`
+  names another machine (3 when none is set, as `mother home check`) and returns, so the process exits 0, on SIGTERM.
+  Each pass (`hub.poll_once`) polls every capability in `connectors` that has an adapter, appends the coalesced
+  lines to the inbox, and only then saves that source's cursor in `cursors.json` (`{<cap>: cursor, _last_sweep}`), so
+  a crash repeats lines rather than losing them; a failing source keeps its cursor. It sleeps `every_seconds` inside
+  active hours (`routines.tick.active_hours` on `manager.workdays`, in `manager.timezone`) and `idle_every_seconds`
+  outside; at 0 it does not poll outside them and sleeps until the next window. It rotates the inbox when the local
+  day changes (the file is named for the day that ended).
+- **`watcher.json`.** `{at, every_seconds, active, sources: {<cap>: {status: ok|partial|couldnt_check, reason?,
+  since?}}, errors: [str]}`. `partial` carries the adapter's sub-read failures as `reason`; `couldnt_check` carries
+  why (`no connection` when `hub.connections` has no entry for the capability, or the failure), `since` is when
+  the status began, and `errors` lists `<cap>: <reason>` for every source not `ok`.
+- **Error transition.** On the first failing pass of a source that was not already `couldnt_check`, the watcher
+  appends one `error` line (key `watcher:<cap>`) and runs `mother health record --kind <cap> --cap read --server
+  <connection command, or gh> --status <status> --class <kind>` through `health.main`, never writing
+  `capabilities.json` itself. Further failing passes add nothing. When the source answers again it records `ok`.
+  A missing connection is reported in `watcher.json` only. A `ForbiddenTool` is never caught: it stops the watcher.
+- **Sweep.** A `sweep` line (source `hub`, key `sweep`) is appended when `hub.sweep_minutes` have passed since
+  `cursors.json` `_last_sweep` (or there is none) and something is pending: `hub.json` `pending` is non-empty, or a
+  `sessions.json` session with `state: live` has `unseen > 0`. Both files are read defensively; a missing or
+  unreadable one counts as nothing pending.
 - **Decisions.** The hub records each update's outcome through `mother hub decide` as one of
   `log|now|route|propose|error`. Details land with the tasks that build them.
 - **Read-only by construction.** The watcher calls only tools on its adapters' read allow-list. It never sends,
