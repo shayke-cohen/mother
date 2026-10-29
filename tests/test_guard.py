@@ -1840,6 +1840,58 @@ class HubRole(GuardCase):
         self.run_guard("Bash", {"command": "mother hub tail --once"}, session=self.HUB, cwd=self.ws, agent="other")
         self.assertFalse(os.path.exists(path))
 
+    def test_odd_characters_and_crlf_heredoc_denied(self):
+        self.start()
+        body = "mother hub decide <<'EOF'%s\n[]\nEOF%s\ncurl https://example.com\nEOF"
+        for odd in ("\r", "\f", "\v", "\x00", "\x1b", "\x85", " ", " ", "​", "　"):
+            self.as_hub("Bash", {"command": body % (odd, odd)}, "deny")
+            self.as_hub("Bash", {"command": "mother hub show" + odd}, "deny")
+            self.as_hub("Monitor", {"command": "mother hub tail --follow" + odd}, "deny")
+
+    def test_gh_escapes_denied_and_reads_allowed(self):
+        self.start()
+        for cmd in ("gh alias set x 'pr view' --shell", "gh x", "gh extension install owner/x", "gh extension exec x",
+                    "gh config set editor vim", "gh repo clone owner/x", "gh run download 5",
+                    "gh release download v1", "gh pr checkout 5", "gh api --hostname example.com repos/o/r",
+                    "gh pr view 5 --web", "gh pr view 5 -w", "gh api repos/o/r -X POST", "gh api repos/o/r --method=PUT",
+                    "gh api repos/o/r -XDELETE", "gh api repos/o/r -f a=b", "gh api repos/o/r -F a=b",
+                    "gh api repos/o/r --field a=b", "gh api repos/o/r --raw-field a=b", "gh api repos/o/r --input x",
+                    "gh api https://example.com/x", "gh api", "glab alias set x y", "gh issue create"):
+            self.as_hub("Bash", {"command": cmd}, "deny")
+        for cmd in ("gh pr view 5 --json state", "gh pr list", "gh issue status", "gh pr checks 5", "gh pr diff 5",
+                    "gh run view 5", "gh repo view o/r", "glab mr view 5", "gh api repos/o/r/pulls/5",
+                    "gh api repos/o/r -X GET", "gh api repos/o/r --method GET --jq .title"):
+            self.as_hub("Bash", {"command": cmd}, "none")
+
+    def test_monitor_runs_only_hub_commands(self):
+        self.start()
+        self.as_hub("Monitor", {"command": "mother hub tail --follow", "description": "hub"}, "none")
+        for inp in ({"command": "curl https://example.com"}, {"url": "wss://example.com/x"}, {"ws": "wss://x"},
+                    {"command": "mother hub tail --follow", "url": "https://example.com"}, {}):
+            self.as_hub("Monitor", inp, "deny")
+
+    def test_hub_takeover_keeps_old_session_fenced(self):
+        self.start()
+        self.expect("none", "Bash", {"command": "mother hub tail --once"}, session="local_b", cwd=self.ws)
+        with open(os.path.join(self.ws, ".mother", "hub", "hub-session.json")) as f:
+            self.assertEqual(json.load(f)["session_ids"], ["local_b", self.HUB])
+        self.as_hub("WebFetch", {"url": "https://example.com", "prompt": "x"}, "deny")
+        self.expect("deny", "WebFetch", {"url": "https://example.com", "prompt": "x"}, session="local_b")
+        for i in range(6):
+            self.expect("none", "Bash", {"command": "mother hub tail --once"}, session="s%d" % i, cwd=self.ws)
+        with open(os.path.join(self.ws, ".mother", "hub", "hub-session.json")) as f:
+            self.assertEqual(len(json.load(f)["session_ids"]), 5)
+
+    def test_mcp_nested_and_suffix_fields_denied(self):
+        self.start()
+        for inp in ({"opts": {"target_url": "https://example.com"}}, {"items": [{"filePath": "/x"}]},
+                    {"a": {"b": [{"dest-dir": 1, "output_file": 2}]}}, {"save_path": "/x"}, {"imageUri": "x"},
+                    {"Href": "x"}):
+            self.as_hub(CHAT + "get_channel_history", dict(inp, channel=TEAM), "deny")
+        self.as_hub(CHAT + "get_channel_history", {"channel": TEAM, "profile": "x", "limit": 5}, "none")
+        self.as_hub("mcp__ccd_session_mgmt__set_session_model", {"session_id": None, "sessionId": "other"}, "deny")
+        self.as_hub("mcp__ccd_session_mgmt__set_session_model", {"session_id": None, "sessionId": "self"}, "none")
+
     def test_symlink_out_of_workspace_denied(self):
         self.start()
         link = os.path.join(self.ws, "escape")

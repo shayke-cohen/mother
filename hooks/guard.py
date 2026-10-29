@@ -2637,28 +2637,42 @@ def subagent_session(kind, tool, inp, cwd, ctx):
 
 HUB_DENY = "the hub session can only do hub work; ask the manager to open a session for this"
 HUB_NO_VERBS = {"install", "uninstall", "watch"}   # persistent jobs: the manager starts these
-HUB_TOOLS = {"Monitor", "CronCreate", "CronDelete", "CronList", "ToolSearch", "TodoWrite", "Skill", "TaskStop"}
+HUB_TOOLS = {"CronCreate", "CronDelete", "CronList", "ToolSearch", "TodoWrite", "Skill", "TaskStop"}
 HUB_SELF_TOOLS = {"mcp__ccd_session_mgmt__set_session_model", "mcp__ccd_session_mgmt__set_session_effort"}
 HUB_NET_TOKENS = {"fetch", "download", "upload", "export", "url", "http", "browse", "navigate"}
 HUB_NET_FIELDS = {"url", "uri", "href", "path", "file", "dest", "destination"}
-HUB_HEREDOC_RE = re.compile(r"\s<<(-?)\s*(['\"])([A-Za-z_][\w-]*)\2\s*$")
+HUB_HEREDOC_RE = re.compile(r"[ \t]<<(-?)[ \t]*(['\"])([A-Za-z_][\w-]*)\2[ \t]*$")
+HUB_GH_READS = {"pr", "issue", "run", "repo", "mr"}
+HUB_GH_VERBS = {"view", "list", "status", "checks", "diff"}
+HUB_API_BAD = {"-f", "-F", "--field", "--raw-field", "--input", "--hostname", "-w", "--web"}
+HUB_ID_CAP = 5
 
 
 def hub_session_path(ws):
     return os.path.join(ws, ".mother", "hub", "hub-session.json")
 
 
-def hub_session_id(ws):
-    """The session id `mother hub tail` last ran in, or None."""
+def hub_session_ids(ws):
+    """The hub session ids in hub-session.json, newest first (empty when it is missing or odd)."""
     if not ws:
-        return None
+        return []
     doc, ok = read_json(hub_session_path(ws))
-    sid = doc.get("session_id") if ok and isinstance(doc, dict) else None
-    return sid if isinstance(sid, str) and sid else None
+    if not ok or not isinstance(doc, dict):
+        return []
+    ids = doc.get("session_ids")
+    ids = ids if isinstance(ids, list) else [doc.get("session_id")]
+    return [i for i in ids if isinstance(i, str) and i]
+
+
+def hub_session_id(ws):
+    """The newest hub session id, or None."""
+    ids = hub_session_ids(ws)
+    return ids[0] if ids else None
 
 
 def record_hub_session(ws, session_id, at):
-    """Atomically write hub-session.json under hub.lock. Never raises: recording must not fail the hook."""
+    """Add session_id to the set in hub-session.json (newest first, at most HUB_ID_CAP), atomically under
+    hub.lock. Never raises: recording must not fail the hook."""
     try:
         d = os.path.join(ws, ".mother", "hub")
         os.makedirs(d, exist_ok=True)
@@ -2669,9 +2683,10 @@ def record_hub_session(ws, session_id, at):
                 fcntl.flock(lock, fcntl.LOCK_EX)
             except ImportError:
                 pass
+            ids = [session_id] + [i for i in hub_session_ids(ws) if i != session_id]
             tmp = os.path.join(d, ".hub-session.%d.tmp" % os.getpid())
             with open(tmp, "w") as f:
-                json.dump({"session_id": session_id, "at": at}, f)
+                json.dump({"session_id": session_id, "session_ids": ids[:HUB_ID_CAP], "at": at}, f)
             os.replace(tmp, hub_session_path(ws))
         finally:
             lock.close()
@@ -2679,10 +2694,25 @@ def record_hub_session(ws, session_id, at):
         pass
 
 
+def hub_odd_chars(text):
+    """True for a control character other than newline and tab, or a Unicode space, line/paragraph separator or
+    format character: the shell and a regex can disagree about where a line ends."""
+    import unicodedata
+    for ch in text:
+        if ch in "\n\t":
+            continue
+        o = ord(ch)
+        if o < 32 or 0x7f <= o <= 0x9f or (o > 127 and unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cf")):
+            return True
+    return False
+
+
 def hub_simple_command(cmd):
     """(program, args) of a single simple shell command, or None when it chains, pipes, redirects, substitutes
     or expands anything. The program is `mother` (by name, or as this plugin's bin/mother) or the bare name.
     A quoted heredoc may feed stdin: its delimiter must appear once, as the last line."""
+    if hub_odd_chars(cmd):
+        return None
     cmd = cmd.lstrip().rstrip("\n").replace("${CLAUDE_PLUGIN_ROOT}", os.path.dirname(HERE))
     lines = cmd.split("\n")
     head = lines[0]
@@ -2744,8 +2774,42 @@ def hub_bash_ok(parsed, cmd, cwd, ctx):
         return not args
     if prog == "date":
         return all(a.startswith("+") for a in args)
-    if prog in READER_BASH and prog != "date":
-        return classify_bash(cmd, cwd, ctx) is None
+    if prog in ("gh", "glab"):
+        return hub_gh_ok(args) and classify_bash(cmd, cwd, ctx) is None
+    return False
+
+
+def hub_gh_ok(args):
+    """`<pr|issue|run|repo|mr> <view|list|status|checks|diff>` without --web, or a plain GET `api <path>`."""
+    if len(args) >= 2 and args[0] in HUB_GH_READS and args[1] in HUB_GH_VERBS:
+        return not any(a in ("-w", "--web") for a in args)
+    if not args or args[0] != "api":
+        return False
+    rest = args[1:]
+    path = [a for a in rest if not a.startswith("-")]
+    if not path or path[0].startswith("http"):
+        return False
+    for i, a in enumerate(rest):
+        name = a.split("=")[0]
+        if name in HUB_API_BAD or (a.startswith(("-f", "-F")) and not a.startswith("--")):
+            return False
+        if name in ("-X", "--method") or (a.startswith("-X") and len(a) > 2):
+            val = a.split("=", 1)[1] if "=" in a else (a[2:] if a.startswith("-X") and len(a) > 2 else
+                                                       (rest[i + 1] if i + 1 < len(rest) else ""))
+            if val.upper() != "GET":
+                return False
+    return True
+
+
+def hub_bad_field(v):
+    """True when a nested input names a field that is, or ends in, url/uri/href/path/file/dest/destination."""
+    if isinstance(v, dict):
+        for k, x in v.items():
+            name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(k)).lower().replace("-", "_")
+            if name in HUB_NET_FIELDS or any(name.endswith("_" + f) for f in HUB_NET_FIELDS) or hub_bad_field(x):
+                return True
+    elif isinstance(v, list):
+        return any(hub_bad_field(x) for x in v)
     return False
 
 
@@ -2759,9 +2823,7 @@ def hub_mcp_ok(tool, inp):
     if not ops or ops[0] not in READ_VERBS:
         return False
 
-    def bad_key(d):
-        return any(str(k).lower() in HUB_NET_FIELDS or (isinstance(v, dict) and bad_key(v)) for k, v in d.items())
-    return not bad_key(inp)
+    return not hub_bad_field(inp)
 
 
 def hub_session(tool, inp, cwd, ctx, sid=None):
@@ -2772,10 +2834,16 @@ def hub_session(tool, inp, cwd, ctx, sid=None):
     deny = "deny", "%s (%s)." % (HUB_DENY, tool)
     if tool in HUB_TOOLS:
         return None
+    if tool == "Monitor":
+        cmd = str(inp.get("command") or "")
+        if hub_bad_field(inp) or any(re.search(r"(^|_)(ws|wss|websocket|socket)(_|$)", str(k).lower()) for k in inp):
+            return deny
+        return None if hub_bash_ok(hub_simple_command(cmd), cmd, cwd, ctx) else deny
     if tool in IN_APP_SESSION_TOOLS:
         return "normal"
     if tool in HUB_SELF_TOOLS:
-        target = inp.get("session_id", inp.get("sessionId", inp.get("session")))
+        target = inp.get("session_id")
+        target = inp.get("sessionId") if target is None else target
         return None if target in (None, "", "self", sid) else deny
     if tool == "Bash":
         cmd = str(inp.get("command") or "")
@@ -2837,7 +2905,7 @@ def run(raw):
             if hub_is_tail(tool, inp) and not payload.get("agent_type") and payload.get("cwd") \
                     and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)):
                 record_hub_session(ctx.ws, sid, now_iso())
-            if sid == hub_session_id(ctx.ws):
+            if sid in hub_session_ids(ctx.ws):
                 r = hub_session(tool, inp, payload.get("cwd"), ctx, sid)
                 if r is None:
                     return None
