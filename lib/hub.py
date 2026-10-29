@@ -98,16 +98,26 @@ def extract_also(text: str) -> List[str]:
 
 
 def make_line(source: str, kind: str, key: str, at: str, title: str = "", who: str = "", link: str = "",
-              summary: str = "", also=None) -> dict:
+              summary: str = "", also=None, uid: str = "") -> dict:
+    """`uid` replaces `at` in the id when the source has a finer stamp (a chat message's raw ts), so two updates in
+    one second do not share an id."""
     if kind not in KINDS:
         raise ValueError("unknown kind: %r" % (kind,))
-    return {"id": "%s:%s:%s" % (source, key, at), "at": at, "source": source, "kind": kind, "key": key,
+    return {"id": "%s:%s:%s" % (source, key, uid or at), "at": at, "source": source, "kind": kind, "key": key,
             "also": list(also or []), "title": title, "who": who, "link": link,
             "summary": (summary or "")[:SUMMARY_MAX]}
 
 
+def _wins(new: dict, cur: dict) -> bool:
+    """`new` replaces `cur` for the same key: a later `at`, or the same `at` unless that would let a `resolved` line
+    swallow an `update` (a reply never hides a message that arrived with or after it)."""
+    if new["at"] != cur["at"]:
+        return new["at"] > cur["at"]
+    return not (new.get("kind") == "resolved" and cur.get("kind") == "update")
+
+
 def coalesce(lines: List[dict]) -> List[dict]:
-    """One line per key: the latest `at` wins, `also` is the union (order kept). First-seen key order."""
+    """One line per key: the latest `at` wins (`_wins`), `also` is the union (order kept). First-seen key order."""
     best = {}
     also = {}
     for l in lines:
@@ -116,7 +126,7 @@ def coalesce(lines: List[dict]) -> List[dict]:
         for a in l.get("also") or []:
             if a not in also[k]:
                 also[k].append(a)
-        if k not in best or l["at"] >= best[k]["at"]:
+        if k not in best or _wins(l, best[k]):
             best[k] = l
     out = []
     for k, l in best.items():
@@ -224,13 +234,31 @@ def interval(cfg: dict, at: datetime) -> Tuple[bool, int]:
     return False, max(1, int((next_active_start(cfg, at) - at).total_seconds()))
 
 
+def _as_list(v) -> List[str]:
+    if v is None or v == "":
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return [str(x) for x in v if x not in (None, "")]
+    return [str(v)]
+
+
+_CHAT_USER = re.compile(r"^U[A-Z0-9]{2,}$")
+
+
 def build_me(cfg: dict) -> dict:
-    """What the adapters need to recognise the manager: email, chat id and (from the matching people entry) code login."""
+    """What the adapters need to recognise the manager: email, chat user id (the first `U…` id in manager.chat_dm,
+    else the matching people entry's `chat`; a `D…` DM channel id is not a user), code login, and `marks`, the
+    text MOTHER signs its own posts with (agent name `(AI)` and any configured signature)."""
     m = (cfg or {}).get("manager") or {}
-    me = {"email": m.get("email") or "", "chat": m.get("chat_dm") or "", "code": m.get("code") or ""}
+    users = [x for x in _as_list(m.get("chat_dm")) if _CHAT_USER.match(x)]
+    me = {"email": m.get("email") or "", "chat": users[0] if users else "", "code": m.get("code") or ""}
+    a = (cfg or {}).get("agent") or {}
+    me["marks"] = ["%s (AI)" % a["name"]] if isinstance(a.get("name"), str) and a["name"] else []
+    if isinstance(a.get("signature"), str) and a["signature"].strip():
+        me["marks"].append(a["signature"].strip())
     for team in (cfg or {}).get("teams") or []:
         for p in (team or {}).get("people") or []:
-            if me["email"] and (p.get("email") or "").lower() == me["email"].lower():
+            if isinstance(p, dict) and me["email"] and (p.get("email") or "").lower() == me["email"].lower():
                 me["chat"] = me["chat"] or p.get("chat") or ""
                 me["code"] = me["code"] or p.get("code") or ""
     return me
@@ -931,8 +959,8 @@ def digest(ws: Path, batch: List[dict]) -> List[dict]:
     resolved = []
     for k, ls in by_key.items():
         latest = ls[0]
-        for l in ls:
-            if l["at"] >= latest["at"]:
+        for l in ls[1:]:
+            if _wins(l, latest):
                 latest = l
         if latest.get("kind") == "resolved":
             resolved.append(k)
@@ -1033,6 +1061,8 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
     order = {}
     for i, l in enumerate(lines):
         order[l["id"]] = i
+    cursor0 = _hub_doc(ws).get("inbox_cursor")
+    start = order[cursor0] + 1 if cursor0 in order else 0
     unknown = [it["line_id"] for it in items if it["line_id"] not in order]
     if unknown:
         raise ValueError("line_id not in the kept inbox: %s" % ", ".join(unknown))
@@ -1108,9 +1138,17 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
                                          "why": it.get("why") or "", "link": link, "at": stamp, "state": "open"})
                     res["update_id"] = "U%d" % n
             h["routed"].append(entry)
+            # the printed line stands for every update line of its key that tail collapsed into it (same key,
+            # after the cursor, no later `at`), wherever they sit in the inbox: move past the furthest of them
+            far = it["line_id"]
+            if line.get("kind") == "update":
+                for l in lines[start:]:
+                    if l["key"] == line["key"] and l.get("kind") == "update" and l["at"] <= line["at"] \
+                            and order[l["id"]] > order[far]:
+                        far = l["id"]
             cur = h.get("inbox_cursor")
-            if cur not in order or order[it["line_id"]] > order[cur]:
-                h["inbox_cursor"] = it["line_id"]
+            if cur not in order or order[far] > order[cur]:
+                h["inbox_cursor"] = far
             results.append(res)
         if all(r.get("already_decided") for r in results):
             return results  # nothing new: no write at all
@@ -1299,6 +1337,11 @@ def _read_decisions(stdin) -> List[dict]:
             raise ValueError("each decision needs a string line_id and key")
         if it.get("decision") not in DECISIONS:
             raise ValueError("decision must be one of %s" % ", ".join(DECISIONS))
+        also = it.get("also")
+        if isinstance(also, str):
+            it["also"] = [also] if also else []  # one key, not its characters
+        elif also is not None and not (isinstance(also, list) and all(isinstance(a, str) for a in also)):
+            raise ValueError("also must be a key or a list of keys")
     return items
 
 

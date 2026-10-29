@@ -576,8 +576,10 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   "the hub never woke".
 - **Formats.** A thing key is `PLAT-123` (tracker), `owner/repo#45` (code), `<channel>/<thread ts, else message ts>`
   (chat), `mail:<thread id>`, `cal:<event id>`. An `inbox.jsonl` line is one JSON object `{id, at, source,
-  kind (update|resolved|error|sweep), key, also, title, who, link, summary}`, `id` = `<source>:<key>:<at>`,
-  `also` = other keys found in the text. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
+  kind (update|resolved|error|sweep), key, also, title, who, link, summary}`, `id` = `<source>:<key>:<at>` (chat
+  uses the message's raw `ts` in place of `at`, so two messages in one second keep distinct ids), `also` = other
+  keys found in the text. When lines for one key are collapsed (`coalesce`, and `tail`), the latest `at` wins, but
+  a `resolved` line never replaces an `update` whose `at` is the same or later. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
   file from a crash into the dated file, and deletes dated files 7 or more days old.
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
   connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below).
@@ -655,7 +657,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **`decide`.** stdin is one object or a list `{line_id, key, decision: log|now|route|propose|error, title?, why?,
   link?, read?, next_step?, name?, also?}` (exit 2 on bad input, nothing written). Under `hub.lock` it appends to
   `routed` (last 50), moves `inbox_cursor` to `line_id` (never backwards), and sets `last_wake`. `now` creates (or
-  refreshes, per key) an `updates` entry with the next `U<n>`; `propose` replaces the `pending` entry for the key
+  refreshes, per key) an `updates` entry with the next `U<n>`; `also` may be one key (a string) or a list
+  of keys; anything else exits 2. `propose` replaces the `pending` entry for the key
   (keeping `proposed_at`, `raised_at`, `task_id` and `name`, merging `also`, and setting `last_update_at`);
   `route` adds 1 to `unseen`, sets `last_routed_at` on the matching live session, and adds the line's key and its
   `also` keys to that session's `also` (at most 50, oldest dropped), so a later line in the same thread finds the
@@ -665,7 +668,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   is stored as `propose`; the result says so (`note`). A `now` for a key that has a live session is recorded as a
   `route` instead (an update would be dropped at once), and the result says so. A `line_id` that is not in the kept
   inbox files exits 2 with nothing written. The batch is applied in inbox order whatever order it was given in, and
-  the cursor moves to the furthest decided line; a later `decide` for a line before the cursor is still recorded
+  the cursor moves to the furthest decided line, where a decided `update` line stands for every `update` line of
+  its key after the old cursor with no later `at` (the lines `tail` collapsed into it), wherever they sit; a later `decide` for a line before the cursor is still recorded
   but never moves the cursor back, so the hub must decide every printed line, in printed order. `title` and `link` default to the inbox line's. Output: one
   `{line_id, key, decision (as stored), session_id?, update_id?, note?}` per item.
 - **`session`.** `add <key> --id ID --name N --title T [--link URL] [--also K,K]` (live, `unseen` 0; removes the
@@ -697,6 +701,15 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   watched channel does not resolve the message it answers, and the manager's own tracker field changes are
   indistinguishable from others' without a changelog (both accepted gaps; a comment by the manager does resolve).
   A code PR leaving the review-requested set resolves its key; CI is green only when every check run is completed.
+  The manager is recognised by `manager.email`, a chat user id (the first `U…` id in `manager.chat_dm`, a string
+  or a list; else the `chat` of the `people` entry with the manager's email; a `D…` DM channel id is not a user),
+  and the code login. A chat message whose first line carries MOTHER's signature (`<agent.name> (AI)` or
+  `agent.signature`) and was posted as the manager, without a user, or by a bot is MOTHER's own post: it yields
+  no line at all. A mail `resolved` line (the manager's sent reply) is stamped with the sent message's own
+  `internalDate` (one `read-email` when the list carries no date), so newer incoming mail in the same poll still
+  shows. Mail lines link to the web thread (`https://mail.google.com/mail/u/0/#all/<thread id>`). Each list is read
+  one past its limit (mail 20 new messages, tracker 50 updated issues, chat history 100 messages per channel);
+  more than the limit marks the source `partial` (`more than N …`) and only the limit is used.
   The calendar list tool has no recurrence-expansion argument (its inputSchema is calendarId, timeMin, timeMax), so
   starting-soon sees recurring meetings only when the tool returns the expanded instance.
   Errors carry a `health.CLASSES` kind: a timeout is `unreachable`, a closed server `dropped`.

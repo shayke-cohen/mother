@@ -18,6 +18,9 @@ from hub_mcp import ForbiddenTool, McpError
 UTC = timezone.utc
 MAX_THREADS = 25
 MAX_MAIL = 20
+MAX_ISSUES = 50
+MAX_HISTORY = 100
+MAIL_LINK = "https://mail.google.com/mail/u/0/#all/%s"
 THREAD_DAYS = 7
 SEARCH_OVERLAP = 600
 
@@ -71,6 +74,7 @@ class ChatSlack(Adapter):
         since = float(cursor["ts"])
         threads = dict(cursor.get("threads") or {})
         mine = me.get("chat") or ""
+        marks = [m for m in me.get("marks") or [] if m]
         lines, partial = [], []
         seen = list(cursor.get("seen") or [])
         for t in cfg.get("follow") or []:
@@ -81,23 +85,30 @@ class ChatSlack(Adapter):
             if not ts or float(ts) <= floor or "%s:%s" % (ch, ts) in seen:
                 return
             seen.append("%s:%s" % (ch, ts))  # every path (history, replies, search) shares this set
+            who = msg.get("user") or msg.get("username") or ""
+            first = (msg.get("text") or "").lstrip().split("\n", 1)[0]
+            if marks and any(k in first for k in marks) and (not msg.get("user") or who == mine or msg.get("bot_id")):
+                return  # MOTHER's own signed post: neither news nor the manager's reply
             tts = msg.get("thread_ts")
             # a DM conversation is one thing: the manager's reply resolves it
             key = hub.thing_key("chat", {"channel": ch, "ts": "dm" if dm else ts, "thread_ts": None if dm else tts})
             text = msg.get("text") or ""
-            who = msg.get("user") or msg.get("username") or ""
             if mine and who == mine:
                 if not dm:
                     threads.setdefault(key, float(ts))
                 lines.append(hub.make_line("chat", "resolved", key, ts_iso(ts), title=text[:80], who=who,
-                                           link=link, summary=text))
+                                           link=link, summary=text, uid=ts))
                 return
             lines.append(hub.make_line("chat", "update", key, ts_iso(ts), title=text[:80], who=who, link=link,
-                                       summary=text, also=hub.extract_also(text)))
+                                       summary=text, also=hub.extract_also(text), uid=ts))
 
         for ch in cfg.get("channels") or []:
-            res = client.call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % since, "limit": 100})
-            for m in (res or {}).get("messages") or []:
+            res = client.call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % since,
+                                                      "limit": MAX_HISTORY + 1})
+            got = (res or {}).get("messages") or []
+            if len(got) > MAX_HISTORY:
+                partial.append("%s: more than %d new messages" % (ch, MAX_HISTORY))
+            for m in got:
                 add(ch, m)
 
         for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
@@ -160,9 +171,12 @@ class MailGmail(Adapter):
             q += " -from:%s" % email
         for lab in cfg.get("ignore_labels") or []:
             q += ' -label:"%s"' % lab
-        lines = []
-        listed = client.call("list-emails", {"query": q, "maxResults": MAX_MAIL}) or {}
-        for ref in listed.get("messages") or []:
+        lines, partial = [], []
+        listed = client.call("list-emails", {"query": q, "maxResults": MAX_MAIL + 1}) or {}
+        refs = listed.get("messages") or []
+        if len(refs) > MAX_MAIL:
+            partial.append("more than %d new messages" % MAX_MAIL)
+        for ref in refs[:MAX_MAIL]:
             if ref["id"] in seen:
                 continue
             seen.append(ref["id"])
@@ -181,17 +195,26 @@ class MailGmail(Adapter):
                 when = ts_iso(int(m.get("internalDate")) / 1000.0)
             except (TypeError, ValueError):
                 when = iso(at)
-            key = hub.thing_key("mail", {"thread_id": m.get("threadId") or ref.get("threadId")})
-            lines.append(hub.make_line("mail", "update", key, when, title=subj[:120], who=sender, link="",
+            tid = m.get("threadId") or ref.get("threadId")
+            key = hub.thing_key("mail", {"thread_id": tid})
+            lines.append(hub.make_line("mail", "update", key, when, title=subj[:120], who=sender, link=MAIL_LINK % tid,
                                        summary=m.get("snippet") or "", also=hub.extract_also(subj)))
-        if email:  # the manager's own sent mail resolves its thread; ids only, no reads
+        if email:  # the manager's own sent mail resolves its thread, stamped when it was sent
             sent = client.call("list-emails", {"query": "from:%s after:%d" % (email, since),
                                                "maxResults": MAX_MAIL}) or {}
             for ref in sent.get("messages") or []:
-                if ref.get("threadId"):
-                    lines.append(hub.make_line("mail", "resolved", "mail:" + ref["threadId"], iso(at),
-                                               who=email))
-        return _result(lines, {"since": int(at.timestamp()), "seen": seen[-200:]})
+                if not ref.get("threadId"):
+                    continue
+                stamp = ref.get("internalDate")
+                if stamp is None:  # the list gives ids only: one read for the time (nothing else is kept)
+                    stamp = (client.call("read-email", {"messageId": ref["id"]}) or {}).get("internalDate")
+                try:
+                    when = ts_iso(int(stamp) / 1000.0)
+                except (TypeError, ValueError):
+                    when = iso(at)
+                lines.append(hub.make_line("mail", "resolved", "mail:" + ref["threadId"], when, who=email,
+                                           link=MAIL_LINK % ref["threadId"]))
+        return _result(lines, {"since": int(at.timestamp()), "seen": seen[-200:]}, partial)
 
 
 # ------------------------------------------------------------------------------------------------- tracker
@@ -240,8 +263,11 @@ class TrackerJira(Adapter):
         fps = dict(cursor.get("fp") or {})
         minutes = int(math.ceil((at - since).total_seconds() / 60.0)) + 2
         email = (me.get("email") or "").lower()
-        lines = []
-        for i in cls._fetch(client, cfg, minutes, 50):
+        lines, partial = [], []
+        got = cls._fetch(client, cfg, minutes, MAX_ISSUES + 1)
+        if len(got) > MAX_ISSUES:
+            partial.append("more than %d updated issues" % MAX_ISSUES)
+        for i in got[:MAX_ISSUES]:
             key, f = i["key"], i.get("fields") or {}
             new = cls._fp(f)
             old = fps.get(key)
@@ -269,7 +295,7 @@ class TrackerJira(Adapter):
                                        also=hub.extract_also(f.get("summary") or "")))
         # prune the least recently updated, not the oldest inserted
         keep = dict(sorted(fps.items(), key=lambda kv: kv[1].get("u", ""))[-500:])
-        return _result(lines, {"since": iso(at), "fp": keep})
+        return _result(lines, {"since": iso(at), "fp": keep}, partial)
 
 
 # ------------------------------------------------------------------------------------------------ calendar

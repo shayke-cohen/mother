@@ -247,6 +247,33 @@ class TestChat(unittest.TestCase):
         self.assertEqual(len(out["lines"]), 1)
         self.assertEqual(len(out["partial"]), 2)
 
+    def test_two_messages_in_one_second_keep_distinct_ids(self):
+        out, _ = self.poll(history={"C00000001": [msg(NOW - 100.5, text="a", thread_ts="%.6f" % (NOW - 900)),
+                                                  msg(NOW - 100.2, text="b", thread_ts="%.6f" % (NOW - 900))]})
+        lines = out["lines"]
+        self.assertEqual(len(lines), 1)  # one thread: coalesced to the later one
+        self.assertEqual(lines[0]["id"], "chat:C00000001/%.6f:%.6f" % (NOW - 900, NOW - 100.2))
+        a = hub_line_ids = [hs.hub.make_line("chat", "update", "C/1", "2026-10-29T10:00:00Z", uid=t)["id"]
+                            for t in ("1761732000.000100", "1761732000.000900")]
+        self.assertEqual(len(set(hub_line_ids)), 2, a)
+
+    def test_full_history_page_is_partial(self):
+        page = [msg(NOW - 500 + i) for i in range(101)]
+        out, _ = self.poll(history={"C00000001": page})
+        self.assertTrue(any("more than 100" in p for p in out["partial"]), out["partial"])
+
+    def test_own_signed_posts_do_not_wake_the_hub(self):
+        me = dict(ME, marks=["Agnes (AI)"])
+        signed = msg(NOW - 100, user="U00000000", text=":sparkles: *Agnes (AI)* · on behalf of Dana\nshipped")
+        bot = msg(NOW - 90, user="", text=":sparkles: *Agnes (AI)* · on behalf of Dana\nhi", bot_id="B1")
+        human = msg(NOW - 80, user="U00000009", text="what did Agnes (AI) mean?")
+        client, _ = ro({"get_channel_history": lambda a: {"messages": [signed, bot, human]},
+                        "get_thread_replies": lambda a: {"messages": []},
+                        "search-messages": lambda a: {"messages": {"matches": []}}}, hs.ChatSlack.READ_TOOLS)
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, {"channels": ["C00000001"]},
+                                me, AT)
+        self.assertEqual([(l["kind"], l["summary"]) for l in out["lines"]], [("update", "what did Agnes (AI) mean?")])
+
     def test_summary_is_trimmed(self):
         out, _ = self.poll(history={"C00000001": [msg(NOW - 100, text="x" * 900)]})
         self.assertEqual(len(out["lines"][0]["summary"]), 300)
@@ -270,7 +297,8 @@ class TestMail(unittest.TestCase):
                 return {"messages": [{"id": "s1", "threadId": "tsent"}]}
             return {"messages": [{"id": k, "threadId": "t" + k} for k in msgs]}
 
-        client, f = ro({"list-emails": lst, "read-email": lambda a: msgs[a["messageId"]]},
+        sent = mail_msg("s1", sender="Dana <dana@example.com>", thread="tsent")
+        client, f = ro({"list-emails": lst, "read-email": lambda a: msgs.get(a["messageId"]) or sent},
                        hs.MailGmail.READ_TOOLS)
         cfg = {"ignore_senders": ["noreply@"], "ignore_labels": ["Newsletters"]}
         out = hs.MailGmail.poll(client, {"since": int(NOW - 600), "seen": []}, cfg, ME, AT)
@@ -282,6 +310,36 @@ class TestMail(unittest.TestCase):
         self.assertIn("-label", f.calls[0][1]["query"])
         out2 = hs.MailGmail.poll(client, out["cursor"], cfg, ME, AT)  # already-seen ids are not re-read
         self.assertEqual([l["key"] for l in out2["lines"]], ["mail:tsent"])
+        self.assertEqual(by["mail:ta"]["link"], "https://mail.google.com/mail/u/0/#all/ta")
+
+    def test_sent_reply_does_not_swallow_newer_mail(self):
+        # the manager replied at 09:58:30; a new message arrived in the same thread at 09:59:30, same poll
+        def at_ms(sec):
+            return str(int((NOW - sec) * 1000))
+        inbound = dict(mail_msg("m1", thread="T1"), internalDate=at_ms(30))
+        sent = dict(mail_msg("s1", sender="Dana <dana@example.com>", thread="T1"), internalDate=at_ms(90))
+
+        def lst(a):
+            return {"messages": [{"id": "s1", "threadId": "T1"}] if a["query"].startswith("from:")
+                    else [{"id": "m1", "threadId": "T1"}]}
+        client, _ = ro({"list-emails": lst, "read-email": lambda a: {"m1": inbound, "s1": sent}[a["messageId"]]},
+                       hs.MailGmail.READ_TOOLS)
+        out = hs.MailGmail.poll(client, {"since": int(NOW - 600), "seen": []}, {}, ME, AT)
+        self.assertEqual([(l["kind"], l["at"]) for l in out["lines"]], [("update", hs.ts_iso(NOW - 30))])
+        # the reply after the newest inbound message does resolve it
+        sent["internalDate"] = at_ms(10)
+        out = hs.MailGmail.poll(client, {"since": int(NOW - 600), "seen": []}, {}, ME, AT)
+        self.assertEqual([(l["kind"], l["at"]) for l in out["lines"]], [("resolved", hs.ts_iso(NOW - 10))])
+
+    def test_full_mail_page_is_partial(self):
+        msgs = {"m%d" % i: mail_msg("m%d" % i) for i in range(hs.MAX_MAIL + 1)}
+
+        def lst(a):
+            return {"messages": [] if a["query"].startswith("from:") else [{"id": k, "threadId": "t" + k} for k in msgs]}
+        client, _ = ro({"list-emails": lst, "read-email": lambda a: msgs[a["messageId"]]}, hs.MailGmail.READ_TOOLS)
+        out = hs.MailGmail.poll(client, {"since": int(NOW - 600), "seen": []}, {}, ME, AT)
+        self.assertEqual(out["partial"], ["more than %d new messages" % hs.MAX_MAIL])
+        self.assertEqual(len(out["lines"]), hs.MAX_MAIL)
 
 
 def issue(key, status="To Do", assignee="acc1", prio="Medium", ncomments=0, labels=(), created="2026-01-01T00:00:00.000+0000",
@@ -310,6 +368,11 @@ class TestTracker(unittest.TestCase):
             self.assertEqual(out["lines"][0]["link"], "https://jira.example.com/browse/PLAT-1")
         out, _ = self.run_poll([issue("PLAT-1", labels=["new-label"])], {"PLAT-1": dict(self.BASE)})
         self.assertEqual(out["lines"], [])  # label-only change
+
+    def test_full_tracker_page_is_partial(self):
+        out, _ = self.run_poll([issue("PLAT-%d" % n) for n in range(51)], {})
+        self.assertEqual(out["partial"], ["more than 50 updated issues"])
+        self.assertEqual(len(out["lines"]), 50)
 
     def test_jql_covers_scope_and_extra(self):
         _, f = self.run_poll([], {})

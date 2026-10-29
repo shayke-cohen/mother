@@ -66,6 +66,36 @@ class TestLines(unittest.TestCase):
         self.assertEqual(got["also"], ["B-2", "A-1"])
 
 
+class TestMe(unittest.TestCase):
+    PEOPLE = [{"people": [{"email": "dana@example.com", "chat": "U00000042", "code": "dana"}]}]
+
+    def test_chat_id_is_the_first_user_id(self):
+        def me(dm, teams=None):
+            return hub.build_me({"manager": {"email": "dana@example.com", "chat_dm": dm}, "teams": teams or []})
+        self.assertEqual(me(["D00000001", "U00000001"])["chat"], "U00000001")
+        self.assertEqual(me("U00000001")["chat"], "U00000001")
+        self.assertEqual(me("D00000001", self.PEOPLE)["chat"], "U00000042")
+        self.assertEqual(me(["D00000001"], self.PEOPLE)["chat"], "U00000042")
+        self.assertEqual(me("D00000001")["chat"], "")
+        self.assertEqual(me("D00000001", self.PEOPLE)["code"], "dana")
+
+    def test_marks_from_agent(self):
+        m = hub.build_me({"agent": {"name": "Agnes", "signature": "-- Agnes for Dana"}})
+        self.assertEqual(m["marks"], ["Agnes (AI)", "-- Agnes for Dana"])
+
+
+class TestCoalesceResolved(unittest.TestCase):
+    def test_resolved_never_replaces_a_later_update(self):
+        upd = line(at="2026-10-29T10:01:30Z")
+        res = line(at="2026-10-29T10:00:30Z", kind="resolved")
+        self.assertEqual([l["kind"] for l in hub.coalesce([upd, res])], ["update"])
+        self.assertEqual([l["kind"] for l in hub.coalesce([res, upd])], ["update"])
+        tie = line(at="2026-10-29T10:01:30Z", kind="resolved")
+        self.assertEqual([l["kind"] for l in hub.coalesce([upd, tie])], ["update"])
+        later = line(at="2026-10-29T10:02:00Z", kind="resolved")
+        self.assertEqual([l["kind"] for l in hub.coalesce([upd, later])], ["resolved"])
+
+
 class TestFiles(unittest.TestCase):
     def setUp(self):
         self._t = tempfile.TemporaryDirectory()
@@ -351,7 +381,8 @@ class Watcher(unittest.TestCase):
 
     def test_me_comes_from_manager_and_matching_person(self):
         self.cfg["teams"] = [{"people": [{"name": "Dana Levi", "email": "dana@example.com", "code": "danal"}]}]
-        self.assertEqual(hub.build_me(self.cfg), {"email": "dana@example.com", "chat": "U00000000", "code": "danal"})
+        self.assertEqual(hub.build_me(self.cfg), {"email": "dana@example.com", "chat": "U00000000", "code": "danal",
+                                                  "marks": []})
 
     def test_home_status(self):
         os.environ["MOTHER_HOSTNAME"] = "laptop"
@@ -1005,6 +1036,31 @@ class Verbs(unittest.TestCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as so:
             self.assertEqual(hub.main(["show", "--json"], self.ws, self.cfg, self.AT), 0)
         self.assertIn("pending", json.loads(so.getvalue())["hub"])
+
+    def test_also_given_as_a_string_is_one_key(self):
+        import io
+        from unittest import mock
+        l = line(key="C00000001/4.0")
+        self.add(l)
+        body = json.dumps({"line_id": l["id"], "key": l["key"], "decision": "propose", "also": "PLAT-12"})
+        with mock.patch("sys.stdin", io.StringIO(body)), mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(hub.main(["decide"], self.ws, self.cfg, self.AT), 0)
+        self.assertEqual(self.hub_doc()["pending"][0]["also"], ["PLAT-12"])
+        bad = json.dumps({"line_id": l["id"], "key": l["key"], "decision": "log", "also": [1]})
+        with mock.patch("sys.stdin", io.StringIO(bad)), mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(hub.main(["decide"], self.ws, self.cfg, self.AT), 2)
+
+    def test_cursor_moves_past_the_whole_coalesced_group(self):
+        # inbox order is not `at` order: the printed (latest-at) PLAT-1 line sits before an older PLAT-1 line
+        a = line(key="PLAT-1", at="2026-10-29T09:05:00Z", title="newest")
+        b = line(key="PLAT-2", at="2026-10-29T09:01:00Z")
+        c = line(key="PLAT-1", at="2026-10-29T09:00:00Z", title="older, appended later")
+        self.add(a, b, c)
+        out = self.tail_lines()
+        self.assertEqual([(l["key"], l["title"]) for l in out], [("PLAT-1", "newest"), ("PLAT-2", "t")])
+        self.decide(*[{"line_id": l["id"], "key": l["key"], "decision": "log"} for l in out])
+        self.assertEqual(self.hub_doc()["inbox_cursor"], c["id"])
+        self.assertEqual(self.tail_lines(), [])
 
     # ---- C2: pending and unseen do not wait forever
     def test_pending_expires_after_ttl_working_hours(self):
