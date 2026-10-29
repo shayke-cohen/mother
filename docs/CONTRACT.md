@@ -582,11 +582,12 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   since?}}, errors: [str]}`. `partial` carries the adapter's sub-read failures as `reason`; `couldnt_check` carries
   why (`no connection` when `hub.connections` has no entry for the capability, or the failure), `since` is when
   the status began, and `errors` lists `<cap>: <reason>` for every source not `ok`.
-- **Error transition.** On the first failing pass of a source that was not already `couldnt_check`, the watcher
-  appends one `error` line (key `watcher:<cap>`) and runs `mother health record --kind <cap> --cap read --server
-  <connection command, or gh> --status <status> --class <kind>` through `health.main`, never writing
-  `capabilities.json` itself. Further failing passes add nothing. When the source answers again it records `ok`.
-  A missing connection is reported in `watcher.json` only. A `ForbiddenTool` is never caught: it stops the watcher.
+- **Error transition.** On the first failing pass of a source since it last worked, the watcher appends one `error`
+  line (key `watcher:<cap>`); `cursors.json` `_errored` ([cap]) remembers that it was emitted, so further failing
+  passes add nothing and a restart does not repeat it; a successful pass clears it. The watcher never writes
+  `capabilities.json` and never calls `mother health record`: `watcher.json` and the `error` line are its record, and
+  `pick` / the doctor are untouched. A missing connection is reported in `watcher.json` only. A `ForbiddenTool` is
+  never caught: it stops the watcher.
 - **Sweep.** A `sweep` line (source `hub`, key `sweep`) is appended when `hub.sweep_minutes` have passed since
   `cursors.json` `_last_sweep` (or there is none) and something is pending: `hub.json` `pending` is non-empty, or a
   `sessions.json` session with `state: live` has `unseen > 0`. Both files are read defensively; a missing or

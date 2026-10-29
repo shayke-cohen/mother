@@ -241,18 +241,18 @@ class Watcher(unittest.TestCase):
         self.assertEqual(ent["since"], "2026-10-29T10:02:00Z")
         self.assertIn("went away", ent["reason"])
         self.assertEqual(len(beat["errors"]), 1)
-        caps = json.loads((self.ws / "capabilities.json").read_text())
-        entry = caps["connectors"]["jira"]["health"]["example-server"]["read"]
-        self.assertEqual(entry["class"], "unreachable")
-        self.assertNotEqual(entry["status"], "ok")
+        self.assertFalse((self.ws / "capabilities.json").exists())  # the watcher never touches health
         # recovery: items found while it was down come through once the source answers again
         FakeAdapter.fail = None
         FakeAdapter.items = ["PLAT-9"]
         beat = self.poll(8)
         self.assertEqual(beat["sources"]["tracker"], {"status": "ok"})
         self.assertEqual([l["key"] for l in self.inbox() if l["kind"] == "update"], ["PLAT-9"])
-        caps = json.loads((self.ws / "capabilities.json").read_text())
-        self.assertEqual(caps["connectors"]["jira"]["health"]["example-server"]["read"]["status"], "ok")
+        self.assertFalse((self.ws / "capabilities.json").exists())
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["_errored"], [])
+        FakeAdapter.fail = "unreachable"  # a new failure after recovery is a new error line
+        self.poll(10)
+        self.assertEqual(len([l for l in self.inbox() if l["kind"] == "error"]), 2)
 
     def test_forbidden_tool_stops_the_watcher(self):
         from hub_mcp import ForbiddenTool
@@ -344,6 +344,133 @@ class Watcher(unittest.TestCase):
         self.assertEqual(hub.home_status(self.cfg), 2)
         self.cfg["workspace"] = {"home_machine": "laptop"}
         self.assertEqual(hub.home_status(self.cfg), 0)
+
+
+    def test_new_connection_that_fails_to_start_still_gets_its_error_line(self):
+        conns = self.cfg["hub"]["connections"]
+        saved = dict(conns)
+        conns.clear()
+        self.poll(clients={})  # couldnt_check: no connection, no error line
+        self.assertEqual(self.inbox(), [])
+        conns.update(saved)
+        bad = {"tracker": McpError("dropped", "server exited")}
+        self.poll(2, clients=bad)
+        self.poll(4, clients=bad)
+        self.assertEqual(len([l for l in self.inbox() if l["kind"] == "error"]), 1)
+
+    def test_recovery_after_missing_connection_writes_nothing_to_health(self):
+        del self.cfg["hub"]["connections"]["tracker"]
+        self.poll(clients={})
+        self.cfg["hub"]["connections"]["tracker"] = {"command": "example-server", "args": [], "env": {}}
+        self.poll(2)
+        self.assertFalse((self.ws / "capabilities.json").exists())
+
+
+class Loop(unittest.TestCase):
+    """watch(): driven with an injected clock, sleep, stop flag and client factory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.cfg = {"version": 1, "manager": {"email": "dana@example.com", "timezone": "UTC",
+                                              "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"]},
+                    "connectors": {"tracker": "jira"}, "workspace": {"home_machine": "laptop"},
+                    "hub": {"enabled": True, "every_seconds": 120, "idle_every_seconds": 600,
+                            "connections": {"tracker": {"command": "example-server", "args": [], "env": {}}}}}
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        FakeAdapter.items, FakeAdapter.fail, FakeAdapter.calls, FakeAdapter.partial = [], None, 0, []
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["tracker:jira"] = FakeAdapter
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        self.now = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
+        self.slept = []
+        self.stop = threading.Event()
+        self.made = []
+
+    def sleep(self, n):
+        self.slept.append(n)
+        self.now += timedelta(seconds=n)
+        if self.after and self.after(self):
+            self.stop.set()
+
+    def run_watch(self, after, factory=None):
+        self.after = after
+        hub.watch(self.ws, self.cfg, clock=lambda: self.now, sleep=self.sleep,
+                  factory=factory or self.factory, stop=self.stop)
+
+    def factory(self, cfg, have):
+        out = dict(have)
+        if "tracker" not in out:
+            c = FakeClient()
+            self.made.append(c)
+            out["tracker"] = c
+        return out
+
+    def test_not_home_exits_2_and_3(self):
+        self.cfg["workspace"]["home_machine"] = "elsewhere"
+        with self.assertRaises(SystemExit) as cm:
+            hub.watch(self.ws, self.cfg, stop=self.stop)
+        self.assertEqual(cm.exception.code, 2)
+        del self.cfg["workspace"]["home_machine"]
+        with self.assertRaises(SystemExit) as cm:
+            hub.watch(self.ws, self.cfg, stop=self.stop)
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_polls_every_interval_then_returns_on_stop(self):
+        self.run_watch(lambda t: sum(t.slept) >= 240)
+        self.assertEqual(FakeAdapter.calls, 2)
+        self.assertEqual(len(self.made), 1)
+        self.assertTrue(self.made[0].closed)
+
+    def test_sigterm_returns(self):
+        import signal
+
+        def after(t):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return False
+        before = signal.getsignal(signal.SIGTERM)
+        self.run_watch(after)  # returns instead of dying: the handler only sets the flag
+        self.assertEqual(FakeAdapter.calls, 1)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_inbox_rotates_when_the_local_day_changes(self):
+        self.now = datetime(2026, 10, 29, 21, 59, tzinfo=UTC)
+        hub.append_inbox(self.ws, [line(key="PLAT-OLD")])
+        self.run_watch(lambda t: (hub.hub_dir(t.ws) / "inbox-2026-10-29.jsonl").exists())
+        d = hub.hub_dir(self.ws)
+        self.assertIn("PLAT-OLD", (d / "inbox-2026-10-29.jsonl").read_text())
+        self.assertFalse((d / "inbox.jsonl").exists())
+
+    def test_failed_client_is_closed_and_rebuilt(self):
+        FakeAdapter.fail = "dropped"
+        self.run_watch(lambda t: sum(t.slept) >= 240)
+        self.assertEqual(len(self.made), 2)
+        self.assertTrue(all(c.closed for c in self.made))
+        self.assertEqual(len([l for l in hub.load_json(self.ws, "cursors.json", {})["_errored"]]), 1)
+
+    def test_forbidden_tool_propagates_out_of_watch(self):
+        from hub_mcp import ForbiddenTool
+        orig = FakeAdapter.__dict__["poll"]
+
+        def boom(*a):
+            raise ForbiddenTool("nope")
+        FakeAdapter.poll = staticmethod(boom)
+        self.addCleanup(setattr, FakeAdapter, "poll", orig)
+        with self.assertRaises(ForbiddenTool):
+            self.run_watch(None)
+        self.assertTrue(self.made[0].closed)  # cleanup still ran
+
+
+class FakeClient:
+    tools = []
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
 
 if __name__ == "__main__":

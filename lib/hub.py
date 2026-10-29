@@ -10,9 +10,7 @@ This part: the machine-local files under <workspace>/.mother/hub/ and the vocabu
 
 Python 3.9 stdlib only.
 """
-import contextlib
 import fcntl
-import io
 import json
 import os
 import re
@@ -181,7 +179,6 @@ def rotate_inbox(ws: Path, at: datetime) -> None:
 # ------------------------------------------------------------------------------------------------- watcher
 CAPS = ("chat", "mail", "tracker", "calendar", "code")
 DEFAULTS = {"every_seconds": 120, "idle_every_seconds": 600, "sweep_minutes": 30}
-SERVER_NAME = "hub-watcher"
 
 
 def _hub_cfg(cfg: dict) -> dict:
@@ -257,29 +254,12 @@ def pending_work(ws: Path) -> bool:
     return False
 
 
-def _server_of(conn: dict) -> str:
-    return os.path.basename(str(conn.get("command") or "")) or ("gh" if conn.get("cli") else SERVER_NAME)
-
-
-def _record_health(ws: Path, cap: str, connector: str, server: str, status: str, kind: str = "") -> None:
-    import health
-    argv = ["record", "--kind", cap, "--cap", "read", "--server", server, "--status", status]
-    if kind and status != "ok":
-        argv += ["--class", kind]
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            health.main(argv, ws)
-    except Exception as e:  # health trouble must never stop the watcher
-        print("mother hub: could not record health (%s)" % e, file=sys.stderr)
-
-
 def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = True) -> dict:
     """One pass over the sources; returns the heartbeat it wrote to watcher.json.
 
     For each capability in `connectors` that has an adapter: poll, coalesce, append to the inbox, and only then
     save the cursor (a crash between the two repeats lines rather than losing them). A failing source keeps its
-    cursor; on the ok -> failing transition one `error` line is appended and the failure recorded through
-    `mother health record`. `clients` maps capability -> ReadOnlyClient (or the exception that building it raised).
+    cursor; on the first failing pass one `error` line is appended (the health records are not touched). `clients` maps capability -> ReadOnlyClient (or the exception that building it raised).
     With `poll=False` only the heartbeat is refreshed (idle hours with no polling)."""
     import hub_sources
     from hub_mcp import ForbiddenTool
@@ -315,7 +295,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
                 reason = str(getattr(client, "message", None) or client)[:200]
             ent = {"status": "couldnt_check", "reason": reason, "since": since}
             if isinstance(client, Exception) and cap in conns:  # the server would not start: a source failure
-                _failed(ws, cap, connector, conns[cap], client, prev, stamp, ent)
+                _failed(ws, cap, stamp, ent)
             sources[cap] = ent
             errors.append("%s: %s" % (cap, reason))
             continue
@@ -327,7 +307,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             raise  # a programming error: stop the watcher rather than swallow it
         except Exception as e:
             ent = {"status": "couldnt_check", "reason": str(getattr(e, "message", None) or e)[:200], "since": since}
-            _failed(ws, cap, connector, conns[cap], e, prev, stamp, ent)
+            _failed(ws, cap, stamp, ent)
             sources[cap] = ent
             errors.append("%s: %s" % (cap, ent["reason"]))
             continue
@@ -343,8 +323,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             errors.append("%s: %s" % (cap, sources[cap]["reason"]))
         else:
             sources[cap] = {"status": "ok"}
-        if prev.get("status") == "couldnt_check":
-            _record_health(ws, cap, connector, _server_of(conns[cap]), "ok")
+        _set_errored(ws, cap, False)
     if poll:
         _maybe_sweep(ws, h, at, stamp)
     beat = {"at": stamp, "every_seconds": every, "active": active, "sources": sources, "errors": errors}
@@ -353,20 +332,29 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     return beat
 
 
-def _failed(ws, cap, connector, conn, exc, prev, stamp, ent) -> None:
-    """On the ok -> failing transition (anything but an already couldnt_check source): one `error` inbox line and
-    one `mother health record`. Further failures in a row stay quiet."""
-    if prev.get("status") == "couldnt_check":
+def _failed(ws, cap, stamp, ent) -> None:
+    """The first failing pass of a source since it last worked: one `error` inbox line. `cursors.json` `_errored`
+    remembers that it was emitted (not the status, so a source that was `couldnt_check` for a missing connection
+    still gets its line when it later fails). Nothing is written to capabilities.json."""
+    cursors = load_json(ws, "cursors.json", {})
+    cursors = cursors if isinstance(cursors, dict) else {}
+    if cap in (cursors.get("_errored") or []):
         return
-    kind = getattr(exc, "kind", None) or "other"
-    server = _server_of(conn) if isinstance(conn, dict) else SERVER_NAME
     append_inbox(ws, [make_line(cap, "error", "watcher:%s" % cap, stamp, title="%s source unreachable" % cap,
                                 summary=ent["reason"])])
-    import health
-    status = health.classify(ent["reason"])[0]
-    if status == "ok" or not health.valid_status(status):
-        status = "error:%s" % kind
-    _record_health(ws, cap, connector, server, status, kind)
+    _set_errored(ws, cap, True)
+
+
+def _set_errored(ws, cap, on: bool) -> None:
+    with locked(ws):
+        cursors = load_json(ws, "cursors.json", {})
+        cursors = cursors if isinstance(cursors, dict) else {}
+        cur = [c for c in (cursors.get("_errored") or []) if c != cap]
+        if on:
+            cur.append(cap)
+        if cur != list(cursors.get("_errored") or []):
+            cursors["_errored"] = cur
+            save_json(ws, "cursors.json", cursors)
 
 
 def _maybe_sweep(ws: Path, h: dict, at: datetime, stamp: str) -> None:
@@ -433,50 +421,64 @@ def home_status(cfg: dict) -> int:
     return 0 if home == here else 2
 
 
-def watch(ws: Path, cfg: dict) -> None:
+def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) -> None:
     """Run the watcher until SIGTERM (returns, so the process exits 0). Exits 2 (3 when no home machine is set)
     if this is not the home machine. Polls every `every_seconds` in active hours, `idle_every_seconds` outside
-    (0: not at all, sleeping until the next window); rotates the inbox when the local day changes."""
+    (0: not at all, sleeping until the next window); rotates the inbox when the local day changes.
+    `clock() -> aware datetime`, `sleep(seconds)`, `factory(cfg, have) -> clients` and `stop` (a threading.Event)
+    are injectable for tests."""
+    import threading
     import now as nowmod
     code = home_status(cfg)
     if code:
         print("mother hub: not the home machine (see `mother home check`)", file=sys.stderr)
         sys.exit(code)
-    stop = {"flag": False}
-    old = signal.signal(signal.SIGTERM, lambda *_: stop.update(flag=True))
     tz = nowmod.Schedule.from_config(cfg).tz
-    clients = {}  # type: dict
-    prev_at = datetime.now(tz)
+    clock = clock or (lambda: datetime.now(tz))
+    sleep = sleep or time.sleep
+    factory = factory or build_clients
+    stop = stop or threading.Event()
     try:
-        while not stop["flag"]:
-            at = datetime.now(tz)
-            if prev_at.astimezone(tz).date() != at.date():
-                rotate_inbox(ws, prev_at)
+        old = signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    except ValueError:  # not the main thread: the caller stops us through `stop`
+        old = None
+    clients = {}  # type: dict
+    prev_at = clock()
+    try:
+        while not stop.is_set():
+            at = clock()
+            if prev_at.astimezone(tz).date() != at.astimezone(tz).date():
+                rotate_inbox(ws, prev_at.astimezone(tz))
             active, every = interval(cfg, at)
             idle0 = not active and int(_hub_cfg(cfg).get("idle_every_seconds", DEFAULTS["idle_every_seconds"])) == 0
             if not idle0:
-                clients = build_clients(cfg, clients)
+                clients = factory(cfg, clients)
             beat = poll_once(ws, cfg, at, clients, poll=not idle0)
             for cap, ent in beat["sources"].items():  # a failed source gets a fresh client next pass
                 c = clients.get(cap)
-                if ent.get("status") == "couldnt_check" and c is not None and not isinstance(c, Exception):
-                    try:
-                        c.close()
-                    except Exception:
-                        pass
+                if ent.get("status") == "couldnt_check" and c is not None:
                     clients.pop(cap, None)
+                    if not isinstance(c, Exception):
+                        _close(c)
             prev_at = at
-            end = time.time() + beat["every_seconds"]
-            while not stop["flag"] and time.time() < end:
-                time.sleep(min(1.0, max(0.0, end - time.time())))
+            waited = 0
+            while not stop.is_set() and waited < beat["every_seconds"]:
+                step = min(1, beat["every_seconds"] - waited)
+                sleep(step)
+                waited += step
     finally:
-        signal.signal(signal.SIGTERM, old)
+        if old is not None:
+            signal.signal(signal.SIGTERM, old)
         for c in clients.values():
             if not isinstance(c, Exception):
-                try:
-                    c.close()
-                except Exception:
-                    pass
+                _close(c)
+
+
+def _close(c) -> None:
+    try:
+        c.close()
+    except Exception:
+        pass
 
 
 def main(args, ws, cfg, at) -> int:
