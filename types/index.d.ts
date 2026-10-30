@@ -116,8 +116,11 @@ export type HubSession = {
 
 export type HubSessions = { version: 1; sessions: Record<string, HubSession> }
 
-// What the panel holds of the three files; null = the file is missing (or never read).
-export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null }
+// watch.json (`mother hub follow|mute`); the panel reads only `mute`. `until`: muted value -> ISO end of a `--for` mute.
+export type HubWatch = { version: 1; mute?: { keys?: string[]; people?: string[]; channels?: string[]; until?: Record<string, string> } }
+
+// What the panel holds of the hub files; null = the file is missing (or never read).
+export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null; watch: HubWatch | null }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -126,9 +129,9 @@ declare module 'claude-code' {
       error: string | null
       workspace: string | null
       selected: string | null   // row holding the d/s/t/x hotkeys: an item id or top:<rank>
-      snoozing: string | null   // id of the row whose snooze Select is open
-      expanded: string[] | null // sections drawn in full (`on_you`, `neglected`, `suggestion`) and `health`; `hub` flips the Hub section's default, `routed` opens Recently routed
-      hub: HubBundle | null     // watcher.json, hub.json and sessions.json as last read
+      snoozing: string | null   // the row whose snooze Select is open (an item id, hub:<U-id>), or ignore:<row> for its Ignore picker
+      expanded: string[] | null // sections drawn in full (`on_you`, `neglected`, `suggestion`) and `health`; `hub` flips the Hub section's default, `routed` opens Recently routed, `ignored` opens Ignored
+      hub: HubBundle | null     // watcher.json, hub.json, sessions.json and watch.json as last read
     }
   }
 }

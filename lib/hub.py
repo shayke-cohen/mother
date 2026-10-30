@@ -255,6 +255,15 @@ def _iso(at: datetime) -> str:
     return hub_sources.iso(at)
 
 
+def _parse_at(stamp) -> Optional[datetime]:
+    """An ISO time, or None when it is not one."""
+    import hub_sources
+    try:
+        return hub_sources.parse_iso(stamp)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def is_active(cfg: dict, at: datetime) -> bool:
     """Inside the manager's active hours on a workday (routines.tick.active_hours, manager.workdays/timezone)."""
     import now as nowmod
@@ -378,7 +387,8 @@ def pending_work(ws: Path, cfg: dict, at: datetime) -> bool:
 
 _EMPTY_WATCH = {"version": 1, "follow": {"projects": [], "channels": [], "threads": [], "repos": [], "whatsapp": [],
                                          "dms": {}, "inbox": ""},
-                "mute": {"keys": [], "people": [], "channels": []}, "auto": {"projects": []}, "unfollowed": []}
+                "mute": {"keys": [], "people": [], "channels": [], "until": {}}, "auto": {"projects": []},
+                "unfollowed": []}
 _DM_CHANNEL = re.compile(r"^D[A-Z0-9]{2,}$")
 
 
@@ -390,6 +400,8 @@ def load_watch(ws: Path) -> dict:
     for part in ("follow", "mute"):
         got = doc.get(part) if isinstance(doc.get(part), dict) else {}
         for k in out[part]:
+            if part == "mute" and k == "until":  # {<muted value>: <ISO UTC>}, filled in below once the lists are read
+                continue
             if part == "follow" and k == "dms":  # {<user id>: <DM channel id>}; a malformed pair is dropped
                 d = got.get(k) if isinstance(got.get(k), dict) else {}
                 out[part][k] = {u: c for u, c in d.items() if isinstance(u, str) and _CHAT_USER.match(u)
@@ -401,6 +413,10 @@ def load_watch(ws: Path) -> dict:
                 continue
             out[part][k] = list(dict.fromkeys(x for x in (got.get(k) or []) if isinstance(x, str) and x)) \
                 if isinstance(got.get(k), list) else []
+    got = (doc.get("mute") or {}).get("until") if isinstance(doc.get("mute"), dict) else None
+    listed = {x for k in ("keys", "people", "channels") for x in out["mute"][k]}
+    out["mute"]["until"] = {v: t for v, t in got.items() if v in listed and isinstance(t, str) and _parse_at(t)} \
+        if isinstance(got, dict) else {}
     auto = doc.get("auto") if isinstance(doc.get("auto"), dict) else {}
     out["auto"]["projects"] = [a for a in (auto.get("projects") or []) if isinstance(a, dict)
                                and isinstance(a.get("key"), str) and a["key"]] \
@@ -443,7 +459,40 @@ def merged_watch(cfg: dict, watch: dict) -> dict:
     out["chat"]["dms"] = {u: d for u, d in (f.get("dms") or {}).items() if u in ok and d != inbox}
     out["chat"]["inbox"] = inbox
     out["mute"] = {k: list((watch.get("mute") or {}).get(k) or []) for k in ("keys", "people", "channels")}
+    out["mute"]["until"] = dict((watch.get("mute") or {}).get("until") or {})
     return out
+
+
+def live_mute(mute: dict, at: datetime) -> dict:
+    """The mutes still in force at `at`: a value muted `--for` a while drops out once its `until` has passed."""
+    until = mute.get("until") or {}
+    gone = {v for v, t in until.items() if (_parse_at(t) or at) <= at}
+    out = {k: [x for x in mute.get(k) or [] if x not in gone] for k in ("keys", "people", "channels")}
+    out["until"] = {v: t for v, t in until.items() if v not in gone}
+    return out
+
+
+def item_keys(item: dict) -> set:
+    """Every key a Now item names: its link, `also` and `links` urls as they are, plus the thing each url is about
+    (a chat link's thread key, a tracker or PR key)."""
+    urls = [item.get("link")] + list(item.get("also") or []) + [l.get("url") for l in item.get("links") or []
+                                                                 if isinstance(l, dict)]
+    keys = {u for u in urls if isinstance(u, str) and u}
+    for u in list(keys):
+        if _URL.match(u):
+            k = manual_key(u)
+            if not k.startswith("manual:"):
+                keys.add(k)
+    return keys
+
+
+def item_muted(item: dict, mute: dict) -> bool:
+    """A Now item the manager ignored: any of its keys is muted, or a chat thread it names is in a muted channel."""
+    keys = item_keys(item)
+    if keys & set(mute.get("keys") or []):
+        return True
+    chans = set(mute.get("channels") or [])
+    return any(_THREAD.match(k) and k.split("/", 1)[0] in chans for k in keys)
 
 
 def effective_cfg(cfg: dict, watch: dict) -> dict:
@@ -523,7 +572,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     me = build_me(cfg)
     eff = effective_cfg(cfg, load_watch(ws))
     h = _hub_cfg(eff)
-    mute = h["watch"].get("mute") or {}
+    mute = live_mute(h["watch"].get("mute") or {}, at)
     passed = []  # every line of this pass, for auto-follow
     known = None  # the tracker's real project keys, when its adapter could read them this pass
     for cap in CAPS if poll else ():
@@ -881,7 +930,8 @@ USAGE = """mother hub <verb>
   show        [--json]  pending proposals, updates and sessions
   add         <link-or-text> [--key K]  hand the hub a thing by hand (a `manual` line it always routes or proposes)
   follow      [--project|--channel|--thread|--repo|--whatsapp] <PROJECT | channel id | channel/ts | owner/repo | WhatsApp JID>  watch it too (`unfollow` stops)
-  mute        <key | U-id | email | channel id | WhatsApp JID>  drop its watcher lines (`unmute` undoes)
+  mute        [--for Nd|Nw] [--scope item|channel] <key | link | U-id | email | channel id | WhatsApp JID>
+              drop its watcher lines and its Now items (`unmute` undoes); --scope channel mutes a thread's channel
   watching    [--json]  the merged watch list (config plus follows) and the mutes
   dms         set <user id>=<DM id> [...] | drop <user id> | inbox <self-DM id>|none | show [--json]
               DMs with people in config the watcher reads, and the self-DM it reads as your inbox"""
@@ -1814,7 +1864,7 @@ def classify_mute(x: str):
     return "keys", x
 
 
-def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
+def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out, at: datetime) -> int:
     if verb == "watching":
         w = load_watch(ws)
         merged = merged_watch(cfg, w)
@@ -1830,8 +1880,10 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
         dms = merged["chat"].get("dms") or {}
         print("chat dms: %s" % (", ".join("%s=%s" % kv for kv in sorted(dms.items())) or "- (%s)" % DMS_HINT), file=out)
         print("chat inbox: %s" % (merged["chat"].get("inbox") or "-"), file=out)
+        until = merged["mute"].get("until") or {}
         for k in ("keys", "people", "channels"):
-            print("mute %s: %s" % (k, ", ".join(merged["mute"][k]) or "-"), file=out)
+            print("mute %s: %s" % (k, ", ".join(v + (" (until %s)" % until[v] if v in until else "")
+                                                for v in merged["mute"][k]) or "-"), file=out)
         return 0
     force = None
     tail_args = []
@@ -1845,6 +1897,27 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
             print("mother hub %s: give at most one of --project --channel --thread --repo --whatsapp" % verb, file=sys.stderr)
             return 2
         force = flags[0][2:] if flags else None
+    span, scope = None, "item"
+    if verb == "mute":  # `--for 1d|2w` ends the mute then; `--scope channel` mutes the channel a chat key or link is in
+        try:
+            pos, opts = _parse_flags(args, {"for", "scope"})
+        except ValueError as e:
+            print("mother hub mute: %s" % e, file=sys.stderr)
+            return 2
+        if set(opts) - {"for", "scope"}:
+            print("mother hub mute: unknown flag --%s" % sorted(set(opts) - {"for", "scope"})[0], file=sys.stderr)
+            return 2
+        args = pos
+        if "for" in opts:
+            m = re.fullmatch(r"([1-9]\d?)([dw])", str(opts["for"]))
+            if not m or int(m.group(1)) * (7 if m.group(2) == "w" else 1) > 90:
+                print("mother hub mute: --for takes Nd or Nw, at most 90 days (e.g. 1d, 1w)", file=sys.stderr)
+                return 2
+            span = timedelta(days=int(m.group(1)) * (7 if m.group(2) == "w" else 1))
+        scope = opts.get("scope", "item")
+        if scope not in ("item", "channel"):
+            print("mother hub mute: --scope is item or channel", file=sys.stderr)
+            return 2
     args = args + tail_args
     if len(args) != 1 or (not tail_args and args[0].startswith("--")):
         print("usage: mother hub %s <%s>" % (verb, "key|person|channel" if "mute" in verb
@@ -1852,6 +1925,14 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
                                                   "project|channel-id|channel/ts|owner/repo|whatsapp-jid"), file=sys.stderr)
         return 2
     x = args[0]
+    if verb in ("mute", "unmute") and _URL.fullmatch(x):  # a link names the thing it is about, if it names one
+        k = manual_key(x)
+        x = x if k.startswith("manual:") else k
+    if scope == "channel":
+        if not _THREAD.match(x):
+            print("mother hub mute: --scope channel needs a chat thread key or link, not %r" % x, file=sys.stderr)
+            return 2
+        x = x.split("/", 1)[0]
     known = set(merged_watch(cfg, load_watch(ws)).get("chat", {}).get("channels") or [])
     mute = verb in ("mute", "unmute")
     found = classify_mute(x) if mute else classify_follow(x, force, known)
@@ -1867,6 +1948,14 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
             changed = found[1] not in lst
             if changed:
                 lst.append(found[1])
+            if verb == "mute":
+                until = _iso(at + span) if span else None
+                if w["mute"]["until"].get(found[1]) != until:
+                    changed = True
+                    if until:
+                        w["mute"]["until"][found[1]] = until
+                    else:
+                        w["mute"]["until"].pop(found[1], None)
             if verb == "follow" and name == "projects" and found[1] in w["unfollowed"]:
                 w["unfollowed"].remove(found[1])
                 changed = True
@@ -1874,6 +1963,8 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
             changed = found[1] in lst
             if changed:
                 lst.remove(found[1])
+            if verb == "unmute":
+                w["mute"]["until"].pop(found[1], None)
             if verb == "unfollow" and name == "projects":  # an auto-followed project is dropped too
                 auto = w["auto"]["projects"]
                 keep = [a for a in auto if a.get("key") != found[1]]
@@ -1892,6 +1983,8 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
                 "repos": base["code"].get("repos") or [], "whatsapp": base["whatsapp"].get("groups") or []}
         if found[1] in conf.get(name, []):
             still = "; still watched from config.json"
+    if verb == "mute" and span:
+        still = " until %s" % _iso(at + span)
     print("%s %s %s%s%s" % (verb, name, found[1], "" if changed else " (no change)", still), file=out)
     return 0
 
@@ -2039,6 +2132,6 @@ def main(args, ws, cfg, at) -> int:
     if verb == "dms":
         return dms_cmd(ws, cfg, rest, as_json, sys.stdout)
     if verb in ("follow", "unfollow", "mute", "unmute", "watching"):
-        return watch_cmd(ws, cfg, verb, rest, as_json, sys.stdout)
+        return watch_cmd(ws, cfg, verb, rest, as_json, sys.stdout, at)
     print("mother hub: unknown verb %r; see `mother hub help`" % verb, file=sys.stderr)
     return 1

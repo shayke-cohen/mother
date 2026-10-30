@@ -1482,6 +1482,44 @@ class Direct(unittest.TestCase):
         self.run_verb("unmute", "PLAT-9")
         self.assertEqual(hub.load_watch(self.ws)["mute"]["keys"], [])
 
+    def test_mute_for_a_while_expires_and_a_plain_mute_or_unmute_clears_the_expiry(self):
+        rc, out = self.run_verb("mute", "--for", "1w", "--", "PLAT-9")
+        self.assertEqual(rc, 0)
+        self.assertIn("until 2026-11-05", out)
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual(m["until"], {"PLAT-9": "2026-11-05T10:00:00Z"})
+        self.assertEqual(hub.live_mute(m, self.AT)["keys"], ["PLAT-9"])
+        self.assertEqual(hub.live_mute(m, self.AT + timedelta(days=8))["keys"], [])
+        self.run_verb("mute", "PLAT-9")                  # for good now
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["until"], {})
+        self.run_verb("mute", "--for", "3d", "--", "PLAT-9")
+        self.run_verb("unmute", "PLAT-9")
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual((m["keys"], m["until"]), ([], {}))
+        self.assertEqual(self.run_verb("mute", "--for", "soon", "--", "PLAT-9")[0], 2)
+
+    def test_mute_a_link_stores_its_key_and_scope_channel_stores_the_channel(self):
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        self.run_verb("mute", "--", chat)
+        self.run_verb("mute", "--", "https://example.com/browse/PLAT-3")
+        self.run_verb("mute", "--", "https://example.com/some/page")
+        self.run_verb("mute", "--scope", "channel", "--", chat)
+        self.run_verb("mute", "--scope", "channel", "--", "C00000009/1700000000.123456")
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual(m["keys"], ["C00000009/1700000000.123456", "PLAT-3", "https://example.com/some/page"])
+        self.assertEqual(m["channels"], ["C00000009"])
+        self.assertEqual(self.run_verb("mute", "--scope", "channel", "--", "PLAT-3")[0], 2)
+        self.assertEqual(self.run_verb("mute", "--scope", "everything", "--", "PLAT-3")[0], 2)
+
+    def test_item_muted_matches_link_also_links_and_channel(self):
+        mute = {"keys": ["PLAT-3", "https://example.com/page"], "people": [], "channels": ["C00000009"]}
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        self.assertTrue(hub.item_muted({"link": chat}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/acme/api/pull/1", "also": ["PLAT-3"]}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/browse/PLAT-3"}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/x", "links": [{"label": "P", "url": "https://example.com/page"}]}, mute))
+        self.assertFalse(hub.item_muted({"link": "https://example.com/browse/PLAT-4", "also": []}, mute))
+
     def test_mute_drops_watcher_lines_not_manual(self):
         class A:
             SOURCE = "tracker"
@@ -1947,7 +1985,7 @@ class WhatsAppWatcher(unittest.TestCase):
         l = line(source="whatsapp", key="wa:" + lid, who="a chat")
         self.assertTrue(hub.is_muted(l, {"keys": ["wa:" + lid]}))
         self.assertEqual(self.run_verb("mute", "--", "wa:" + lid)[0], 0)
-        self.assertEqual(hub.load_watch(self.ws)["mute"], {"keys": ["wa:" + lid], "people": [], "channels": []})
+        self.assertEqual(hub.load_watch(self.ws)["mute"], {"keys": ["wa:" + lid], "people": [], "channels": [], "until": {}})
 
     def test_whatsapp_text_never_auto_follows_a_project(self):
         r = WaReader()

@@ -168,6 +168,19 @@ class Merge(unittest.TestCase):
         kept = now.merge(inp(), first, {}, CFG, NOW + timedelta(hours=1))
         self.assertEqual(kept["items"][0]["links"], links)
 
+    def test_ignored_items_are_left_out_and_counted(self):
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        mute = {"keys": ["PLAT-3"], "people": [], "channels": ["C00000009"], "until": {}}
+        first = now.merge(inp(cand("review_requested", link="https://example.com/pr/9")), None, {}, CFG, NOW)
+        out = now.merge(inp(cand("unanswered_mention", kind="chat", link=chat),
+                            cand("review_requested", link="https://example.com/pr/1", also=["PLAT-3"]),
+                            cand("review_requested", link="https://example.com/pr/2")),
+                        first, {}, CFG, NOW, mute={"keys": ["https://example.com/pr/9"] + mute["keys"],
+                                                   "people": [], "channels": mute["channels"]})
+        self.assertEqual([i["link"] for i in out["items"]], ["https://example.com/pr/2"])
+        self.assertEqual(out["ignored"], 3)                 # two candidates and the kept pr/9
+        self.assertEqual(now.merge(inp(), None, {}, CFG, NOW)["ignored"], 0)
+
     def test_action_ids_are_stable(self):
         acts = [{"label": "Nudge", "prompt": "x"}]
         c = cand("review_requested", actions=acts)

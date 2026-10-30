@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Hook, Register, Timer } from 'claude-code'
 
-import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
+import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, HubWatch, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
 
 // State the Now panel (Task 9) draws from. Keys are declared in types/index.d.ts.
 export const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)
@@ -27,7 +27,7 @@ export type FileLoader = { mtimeMs: number | null; statFailed: boolean }
 export type Loader = FileLoader & { hub: Record<HubFile, FileLoader> }
 const newFileLoader = (): FileLoader => ({ mtimeMs: null, statFailed: false })
 export const newLoader = (): Loader => ({
-  ...newFileLoader(), hub: { watcher: newFileLoader(), hub: newFileLoader(), sessions: newFileLoader() },
+  ...newFileLoader(), hub: { watcher: newFileLoader(), hub: newFileLoader(), sessions: newFileLoader(), watch: newFileLoader() },
 })
 
 export function statusText(doc: NowDoc | null, nowMs: number): string {
@@ -43,9 +43,9 @@ export function statusText(doc: NowDoc | null, nowMs: number): string {
 
 // ---- the hub ---------------------------------------------------------------------------------------
 
-export type HubFile = 'watcher' | 'hub' | 'sessions'
-const HUB_FILES: Record<HubFile, string> = { watcher: 'watcher.json', hub: 'hub.json', sessions: 'sessions.json' }
-const NO_HUB: HubBundle = { hub: null, sessions: null, watcher: null }
+export type HubFile = 'watcher' | 'hub' | 'sessions' | 'watch'
+const HUB_FILES: Record<HubFile, string> = { watcher: 'watcher.json', hub: 'hub.json', sessions: 'sessions.json', watch: 'watch.json' }
+const NO_HUB: HubBundle = { hub: null, sessions: null, watcher: null, watch: null }
 const WATCHER_DOWN_MS = 10 * 60_000
 const ROUTED_SHOWN = 10
 
@@ -177,7 +177,7 @@ export async function readDoc($: Dollar, path: string, loader: Loader): Promise<
   await toastNew($, parsed).catch(() => undefined)   // a toast or store failure never un-reads a good doc
 }
 
-// The three hub files, each re-read only when its mtime moved. A missing file is null; a file that will not
+// The hub files, each re-read only when its mtime moved. A missing file is null; a file that will not
 // parse (or has another version, for hub.json and sessions.json) keeps the previous value.
 export async function readHub($: Dollar, dir: string, loader: Loader): Promise<void> {
   const before = (await read($, hubAtom)) ?? NO_HUB
@@ -203,7 +203,7 @@ export async function readHub($: Dollar, dir: string, loader: Loader): Promise<v
       // keep the previous value; the next change of the file retries it
     }
   }
-  if (next.hub === before.hub && next.sessions === before.sessions && next.watcher === before.watcher) return
+  if (next.hub === before.hub && next.sessions === before.sessions && next.watcher === before.watcher && next.watch === before.watch) return
   await update($, hubAtom, () => next)
   await toastHub($, before, next).catch(() => undefined)   // a store failure never un-reads a good file
 }
@@ -404,6 +404,19 @@ export function chipLabel(url: string, fallback: string): string {
   return fallback
 }
 
+// The Ignore picker: just this, this for a week, and (for a chat thread key or link) its whole channel.
+// `x` is what `mother hub mute` is given: a hub key or an item's link.
+const THREAD_KEY = /^[CG][A-Z0-9]+\/\d+\.\d+$/
+export function ignoreOptions(chat: boolean): { value: string; label: string }[] {
+  return [{ value: 'item', label: 'Just this' }, { value: 'week', label: 'This, for a week' },
+          ...(chat ? [{ value: 'channel', label: 'The whole channel' }] : [])]
+}
+export function ignoreArgs(scope: string, x: string): string[] {
+  if (scope === 'week') return ['mute', '--for', '1w', '--', x]
+  if (scope === 'channel') return ['mute', '--scope', 'channel', '--', x]
+  return ['mute', '--', x]
+}
+
 // Every source of a row as chips: the tick's labelled `links` first, then `link` and each http(s) `also`
 // they miss, one chip per url.
 export function linkChips(links: Chip[] | null | undefined, link: string | null | undefined, also: string[] | null | undefined): Chip[] {
@@ -519,6 +532,9 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
               {isUrl(i.link) ? <Button key={'tohub-' + i.id} onPress={() => goHub(['add', '--', i.link])}>Send to hub</Button> : null}
               <Button key={'done-' + i.id} hotkey={hot(i.id, 'd')} onPress={() => go(['done', i.id], i.id)}>Done</Button>
               <Button key={'snooze-' + i.id} hotkey={hot(i.id, 's')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
+              {isUrl(i.link)
+                ? <Button key={'ignore-' + i.id} onPress={() => update($, snoozingAtom, cur => (cur === 'ignore:' + i.id ? null : 'ignore:' + i.id))}>Ignore…</Button>
+                : null}
               {rank !== null && !inTop.has(i.id)
                 ? <Button key={'maketop-' + i.id} hotkey={hot(i.id, 't')} onPress={() => go(['top', 'swap', String(rank), i.id], i.id)}>Make top 3</Button>
                 : null}
@@ -526,6 +542,10 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
             {snoozing === i.id
               ? <Select key={'snooze-pick-' + i.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
                   onSelect={value => go(['snooze', i.id, value], i.id)} />
+              : null}
+            {snoozing === 'ignore:' + i.id && isUrl(i.link)
+              ? <Select key={'ignore-pick-' + i.id} label="Ignore" options={ignoreOptions(i.id.startsWith('chat:'))}
+                  onSelect={async value => { await goHub(ignoreArgs(value, i.link), i.id); await go(['done', i.id], i.id) }} />
               : null}
           </Box>
         ) : null}
@@ -641,8 +661,34 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
         </Box>
       ) : null}
       {SECTIONS.map(([kind, name]) => section(kind, name))}
+      {ignoredSection(ui, hub.watch, expanded, toggle, at, goHub)}
       {noItems && health.length === 0 && top.length === 0
         ? <Text>{`Nothing on you. Next check ${at(doc.next_at)}.`}</Text> : null}
+    </Box>
+  )
+}
+
+// What the manager ignored (`mother hub mute`, in watch.json), collapsed at the foot of the pane: each value
+// with what it is and its expiry, and Unignore (`unmute -- <value>`). Nothing muted draws nothing.
+function ignoredSection(ui: Ui, watch: HubWatch | null, expanded: Set<string>, toggle: (name: string) => unknown,
+                        at: (iso: string | null | undefined) => string, goHub: (args: string[], rowId?: string | null) => Promise<void>) {
+  const { Box, Text, Button } = ui
+  const m = watch?.mute
+  const until = m?.until ?? {}
+  const rows: [string, string][] = [...(m?.keys ?? []).map(v => [v, 'item'] as [string, string]),
+                                    ...(m?.people ?? []).map(v => [v, 'sender'] as [string, string]),
+                                    ...(m?.channels ?? []).map(v => [v, 'channel'] as [string, string])]
+  if (rows.length === 0) return null
+  const open = expanded.has('ignored')
+  return (
+    <Box key="ignored" flexDirection="column" marginTop={1}>
+      <Button key="ignored-toggle" plain dimColor onPress={() => toggle('ignored')}>{`${open ? '▾' : '▸'} Ignored ${rows.length}`}</Button>
+      {open ? rows.map(([v, kind]) => (
+        <Box key={'ign-' + v} paddingLeft={2} flexWrap="wrap">
+          <Text dimColor>{`${v} · ${until[v] ? 'until ' + at(until[v]) : kind} `}</Text>
+          <Button key={'unignore-' + v} onPress={() => goHub(['unmute', '--', v])}>Unignore</Button>
+        </Box>
+      )) : null}
     </Box>
   )
 }
@@ -701,6 +747,7 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
   const pending = hb.hub?.pending ?? []
   const routed = (hb.hub?.routed ?? []).slice(-ROUTED_SHOWN).reverse()
   const label = health === 'alive' ? '●' : health === 'stale' ? '◌ stale' : '✗'
+  const pickIgnore = (row: string) => update($, snoozingAtom, cur => (cur === 'ignore:' + row ? null : 'ignore:' + row))
   return (
     <Box key="hub" flexDirection="column">
       <Box>
@@ -726,10 +773,14 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                   <Text dimColor>{ago(v.last_routed_at, nowMs) ? ago(v.last_routed_at, nowMs) + ' ' : ''}</Text>
                   <Button key={'sess-open-' + key} onPress={() => openSession($, goHub, key, v)}>Open</Button>
                   {followArgs(key) ? <Button key={'sess-follow-' + key} onPress={() => goHub(followArgs(key) as string[])}>Follow</Button> : null}
-                  <Button key={'sess-mute-' + key} onPress={() => goHub(['mute', '--', key])}>Mute</Button>
+                  <Button key={'sess-mute-' + key} onPress={() => pickIgnore('sess:' + key)}>Ignore…</Button>
                   {linkChips(null, null, v.also).filter(c => c.url !== v.link).map((c, n) => (
                     <Link key={`chip-sess-${key}-${n}`} href={c.url}>{c.label}</Link>
                   ))}
+                  {snoozing === 'ignore:sess:' + key
+                    ? <Select key={'sess-ignore-pick-' + key} label="Ignore" options={ignoreOptions(THREAD_KEY.test(key))}
+                        onSelect={value => goHub(ignoreArgs(value, key))} />
+                    : null}
                 </Box>
               ))}
             </Box>
@@ -757,10 +808,14 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                     {isUrl(u.link) ? <Link href={u.link}>↗</Link> : null}
                     <Button key={'hub-done-' + u.id} onPress={() => goHub(['done', u.id], 'hub:' + u.id)}>Done</Button>
                     {followArgs(u.key) ? <Button key={'hub-follow-' + u.id} onPress={() => goHub(followArgs(u.key) as string[])}>Follow</Button> : null}
-                    <Button key={'hub-mute-' + u.id} onPress={() => goHub(['mute', '--', u.key])}>Mute</Button>
+                    <Button key={'hub-mute-' + u.id} onPress={() => pickIgnore('hub:' + u.id)}>Ignore…</Button>
                     <Button key={'hub-snooze-' + u.id} onPress={() => update($, snoozingAtom, cur => (cur === 'hub:' + u.id ? null : 'hub:' + u.id))}>Snooze</Button>
                   </Box>
                   {u.why ? <Text dimColor wrap="wrap">{u.why}</Text> : null}
+                  {snoozing === 'ignore:hub:' + u.id
+                    ? <Select key={'hub-ignore-pick-' + u.id} label="Ignore" options={ignoreOptions(THREAD_KEY.test(u.key))}
+                        onSelect={async value => { await goHub(ignoreArgs(value, u.key)); await goHub(['done', u.id], 'hub:' + u.id) }} />
+                    : null}
                   {snoozing === 'hub:' + u.id
                     ? <Select key={'hub-snooze-pick-' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
                         onSelect={value => goHub(['snooze', u.id, value], 'hub:' + u.id)} />
@@ -830,7 +885,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const bin = await motherBin($, configured)
     const go = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId)
-    const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub', args[0] === 'add' || args[0] === 'follow' || args[0] === 'mute')
+    const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub', ['add', 'follow', 'mute', 'unmute'].includes(args[0]))
     return paneTree($, $.ui.resolve(e), await read($, docAtom), await read($, errorAtom), await read($, snoozingAtom),
       await read($, selectedAtom), await read($, expandedAtom), await $.clock.now(), go,
       (await read($, hubAtom)) ?? NO_HUB, goHub, e.surface)

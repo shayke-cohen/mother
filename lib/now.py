@@ -290,10 +290,13 @@ def _mark_top_done(top: list, now_ids: set, prev_ids: set, st_items: dict) -> li
     return top
 
 
-def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime) -> dict:
+def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime, mute: Optional[dict] = None) -> dict:
     """Fold this tick's candidates into the previous now.json and apply the manager's `state`
     (done, snooze, Top 3). Expired snoozes and resurfaced done entries are removed from
-    `state["items"]` in place; the caller saves it."""
+    `state["items"]` in place; the caller saves it. `mute` is the hub's mutes in force (`hub.live_mute`):
+    an item it names is left out and counted in `ignored`."""
+    import hub
+    ignored = hub.item_muted if mute else (lambda _i, _m: False)
     s = Schedule.from_config(cfg)
     coverage = _coverage(inp, prev, cfg, now)
     checked = set(inp.get("checked_signals") or [])
@@ -313,7 +316,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         for k in _keys(pi.get("signal"), pi.get("link"), pi.get("also")):
             prev_by_key.setdefault(k, pi["id"])
 
-    items, seen, taken, dropped = [], set(), set(), 0
+    items, seen, taken, dropped, hidden = [], set(), set(), 0, 0
     for c in inp.get("candidates") or []:
         try:
             if not isinstance(c, dict) or any(not c.get(k) for k in ("kind", "link", "signal", "since", "title", "why")):
@@ -331,6 +334,10 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         keys = _keys(sig, c["link"], c.get("also"))
         if keys & taken:
             continue                       # already listed under another of its links
+        if ignored(c, mute):
+            hidden += 1
+            taken |= keys                  # its old self is not kept either
+            continue
         iid = item_id(c)
         if iid not in prev_items:
             iid = next((prev_by_key[k] for k in sorted(keys) if k in prev_by_key), iid)
@@ -379,6 +386,9 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
             continue
         if _keys(sig, pi.get("link"), pi.get("also")) & taken:
             continue                       # this tick lists the same work under another link
+        if ignored(pi, mute):
+            hidden += 1
+            continue
         if _too_old(sig, _parse_iso(pi["since"]), cfg, now):
             continue
         row = coverage.get(SIGNALS[sig][1]) if sig in SIGNALS else None
@@ -421,6 +431,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         "counts": {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS},
         "next_action": next_action,
         "dropped": dropped,
+        "ignored": hidden,
         "top": top,
         "top_date": top_date,
         "swap_hint": hint,
@@ -686,7 +697,7 @@ def main(args, ws: Path, cfg: dict, at: datetime) -> None:
         with locked(ws):
             state = load_state(ws)
             try:
-                doc = merge(inp, load_now(ws), state, cfg, at)
+                doc = merge(inp, load_now(ws), state, cfg, at, _mutes(ws, at))
             except (KeyError, ValueError, TypeError, AttributeError) as e:
                 _fail("merge input is unusable: %s" % e)
             write_now(ws, doc)
@@ -710,6 +721,12 @@ def main(args, ws: Path, cfg: dict, at: datetime) -> None:
         _edit(verb, rest, ws, cfg, at, s)
         return
     _fail("unknown verb %r — see `mother now help`" % verb)
+
+
+def _mutes(ws: Path, at: datetime) -> dict:
+    """What the manager ignored (`mother hub mute`), still in force at `at`."""
+    import hub
+    return hub.live_mute(hub.load_watch(ws)["mute"], at)
 
 
 def _edit(verb: str, rest: list, ws: Path, cfg: dict, at: datetime, s: Schedule) -> None:

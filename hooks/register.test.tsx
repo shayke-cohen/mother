@@ -951,6 +951,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'sess-follow-PLAT-2' })
     await ui.press({ key: 'sess-mute-PLAT-2' })
+    await ui.select({ key: 'sess-ignore-pick-PLAT-2', value: 'item' })
     await ui.press({ key: 'sess-follow-acme/web#12' })
     await ui.press({ key: 'sess-follow-C00000001/1700000000.000100' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
@@ -970,6 +971,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'sess-follow-' + g })
     await ui.press({ key: 'sess-mute-' + lid })
+    await ui.select({ key: 'sess-ignore-pick-' + lid, value: 'item' })
     expect(await ui.find({ key: 'sess-follow-' + dm })).toBeUndefined()
     expect(await ui.find({ key: 'sess-follow-' + lid })).toBeUndefined()
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
@@ -997,12 +999,73 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'hub-follow-U1' })
     await ui.press({ key: 'hub-mute-U1' })
+    await ui.select({ key: 'hub-ignore-pick-U1', value: 'item' })
     await ui.press({ key: 'hub-follow-U2' })
     await ui.press({ key: 'hub-follow-U3' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
       ['python3', BIN, 'hub', 'follow', '--project', '--', 'PLAT'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-5'],
+      ['python3', BIN, 'hub', 'done', 'U1'],
       ['python3', BIN, 'hub', 'follow', '--repo', '--', 'acme/web'],
       ['python3', BIN, 'hub', 'follow', '--thread', '--', 'C00000001/1700000000.000100']])
+    await ui.unmount()
+  })
+
+  test(`Ignore on a hub row offers a week, and the whole channel only for a chat thread, on ${surface}`, async ($, on) => {
+    const t = 'C00000001/1700000000.000100'
+    const ss = sessionsDoc({ [t]: session({ unseen: 1 }), 'PLAT-2': session({ unseen: 1 }) })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'sess-mute-PLAT-2' }))?.text).toBe('Ignore…')
+    await ui.press({ key: 'sess-mute-PLAT-2' })
+    expect(((await ui.find({ type: 'Select', key: 'sess-ignore-pick-PLAT-2' }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week'])
+    await ui.select({ key: 'sess-ignore-pick-PLAT-2', value: 'week' })
+    await ui.press({ key: 'sess-mute-' + t })
+    expect(((await ui.find({ type: 'Select', key: 'sess-ignore-pick-' + t }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week', 'channel'])
+    await ui.select({ key: 'sess-ignore-pick-' + t, value: 'channel' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
+      ['python3', BIN, 'hub', 'mute', '--for', '1w', '--', 'PLAT-2'],
+      ['python3', BIN, 'hub', 'mute', '--scope', 'channel', '--', t]])
+    await ui.unmount()
+  })
+
+  test(`Ignore on a Now item mutes its link, then marks it done, on ${surface}`, async ($, on) => {
+    const chat: any = item('a', 'on_you', 'open', 'Question')
+    chat.id = 'chat:https://example.com/archives/C00000009/p1700000000123456:unanswered_mention'
+    chat.link = 'https://example.com/archives/C00000009/p1700000000123456'
+    const d = doc({ items: [chat, item('b', 'on_you', 'open')], counts: { on_you: 2, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'ignore-' + chat.id })
+    expect(((await ui.find({ type: 'Select', key: 'ignore-pick-' + chat.id }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week', 'channel'])
+    await ui.select({ key: 'ignore-pick-' + chat.id, value: 'channel' })
+    expect(out.argv.filter(a => a[2] === 'hub' || a[2] === 'now').map(a => a.slice(2))).toEqual([
+      ['hub', 'mute', '--scope', 'channel', '--', chat.link], ['now', 'done', chat.id]])
+    await ui.press({ key: 'row-b' })
+    await ui.press({ key: 'ignore-b' })
+    expect(((await ui.find({ type: 'Select', key: 'ignore-pick-b' }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week'])
+    await ui.unmount()
+  })
+
+  test(`the Ignored list shows each mute with its expiry and Unignore runs unmute, on ${surface}`, async ($, on) => {
+    const files = hubFiles(watcher(), hubDoc(), null)
+    files[HUB + '/watch.json'] = { text: JSON.stringify({ version: 1, mute: { keys: ['PLAT-9'], people: ['U00000009'], channels: ['C00000009'], until: { 'PLAT-9': '2026-11-02T10:00:00Z' } } }), mtimeMs: 1 }
+    const { out } = await boot($, on, files, false, {}, 'ENOENT', () => ({ exitCode: 0, stdout: 'unmute keys PLAT-9\n' }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'ignored-toggle' }))?.text).toBe('▸ Ignored 3')
+    await ui.press({ key: 'ignored-toggle' })
+    expect(await hasText(ui, /PLAT-9 · until/)).toBe(true)
+    expect(await hasText(ui, /U00000009 · sender/)).toBe(true)
+    expect(await hasText(ui, /C00000009 · channel/)).toBe(true)
+    await ui.press({ key: 'unignore-PLAT-9' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'unmute', '--', 'PLAT-9']])
+    expect(out.toasts).toContain('unmute keys PLAT-9')
+    await ui.unmount()
+  })
+
+  test(`no Ignored list when nothing is muted, on ${surface}`, async ($, on) => {
+    await boot($, on, hubFiles(watcher(), hubDoc(), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'ignored-toggle' })).toBeUndefined()
     await ui.unmount()
   })
 
