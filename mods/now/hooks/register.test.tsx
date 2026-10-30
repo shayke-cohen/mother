@@ -898,26 +898,60 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
-  test(`Follow and Mute on a hub session row run mother hub follow|mute -- <key>, on ${surface}`, async ($, on) => {
-    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) })
-    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss), false, {}, 'ENOENT', () => ({ exitCode: 0, stdout: 'following PLAT-2\n' }))
+  test(`Follow on a hub session row follows what its key belongs to, and Mute runs mute -- <key>, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1 }), 'acme/web#12': session(), 'C00000001/1700000000.000100': session() })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss), false, {}, 'ENOENT', () => ({ exitCode: 0, stdout: 'follow projects PLAT\n' }))
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'sess-follow-PLAT-2' })
     await ui.press({ key: 'sess-mute-PLAT-2' })
+    await ui.press({ key: 'sess-follow-acme/web#12' })
+    await ui.press({ key: 'sess-follow-C00000001/1700000000.000100' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
-      ['python3', BIN, 'hub', 'follow', '--', 'PLAT-2'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-2']])
-    expect(out.toasts).toContain('following PLAT-2')
+      ['python3', BIN, 'hub', 'follow', '--project', '--', 'PLAT'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-2'],
+      ['python3', BIN, 'hub', 'follow', '--repo', '--', 'acme/web'],
+      ['python3', BIN, 'hub', 'follow', '--thread', '--', 'C00000001/1700000000.000100']])
+    expect(out.toasts).toContain('follow projects PLAT')
     await ui.unmount()
   })
 
-  test(`Follow and Mute on a hub update row run mother hub follow|mute -- <key>, on ${surface}`, async ($, on) => {
-    const updates = [{ id: 'U1', key: 'PLAT-5', title: 'Spec changed', why: 'w', link: null, at: iso(MIN), state: 'open' }]
+  test(`a hub session row whose key has nothing to follow shows no Follow, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'mail:t1': session({ unseen: 1 }), 'cal:e1': session({ unseen: 1 }), 'manual:abc123': session({ unseen: 1 }) })
+    await boot($, on, hubFiles(watcher(), hubDoc(), ss))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    for (const k of ['mail:t1', 'cal:e1', 'manual:abc123']) {
+      expect(await ui.find({ key: 'sess-follow-' + k })).toBeUndefined()
+      expect(await ui.find({ key: 'sess-mute-' + k })).toBeDefined()
+    }
+    await ui.unmount()
+  })
+
+  test(`Follow on a hub update row follows what its key belongs to, and Mute runs mute -- <key>, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'PLAT-5', title: 'Spec changed', why: 'w', link: null, at: iso(MIN), state: 'open' },
+                     { id: 'U2', key: 'acme/web#12', title: 'PR moved', why: 'w', link: null, at: iso(MIN), state: 'open' },
+                     { id: 'U3', key: 'C00000001/1700000000.000100', title: 'Thread reply', why: 'w', link: null, at: iso(MIN), state: 'open' }]
     const { out } = await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'hub-follow-U1' })
     await ui.press({ key: 'hub-mute-U1' })
+    await ui.press({ key: 'hub-follow-U2' })
+    await ui.press({ key: 'hub-follow-U3' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
-      ['python3', BIN, 'hub', 'follow', '--', 'PLAT-5'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-5']])
+      ['python3', BIN, 'hub', 'follow', '--project', '--', 'PLAT'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-5'],
+      ['python3', BIN, 'hub', 'follow', '--repo', '--', 'acme/web'],
+      ['python3', BIN, 'hub', 'follow', '--thread', '--', 'C00000001/1700000000.000100']])
+    await ui.unmount()
+  })
+
+  test(`a hub update row whose key has nothing to follow shows no Follow, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'mail:t1', title: 'Mail', why: 'w', link: null, at: iso(MIN), state: 'open' },
+                     { id: 'U2', key: 'cal:e1', title: 'Meeting', why: 'w', link: null, at: iso(MIN), state: 'open' },
+                     { id: 'U3', key: 'manual:abc123', title: 'Note', why: 'w', link: null, at: iso(MIN), state: 'open' }]
+    await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    for (const id of ['U1', 'U2', 'U3']) {
+      expect(await ui.find({ key: 'hub-follow-' + id })).toBeUndefined()
+      expect(await ui.find({ key: 'hub-mute-' + id })).toBeDefined()
+    }
     await ui.unmount()
   })
 

@@ -390,6 +390,17 @@ type Ui = ReturnType<Dollar['ui']['resolve']>
 // A link the surface can open; a workspace path (`teams/x/intake.md#1`) stays in the Ask prompt instead.
 const isUrl = (link: string | null | undefined): link is string => !!link && /^https?:\/\//.test(link)
 
+// What Follow watches for a row key: a tracker item follows its project, a pull request its repo, a chat
+// thread itself. Mail, calendar and manual keys have nothing to follow, so the row shows no Follow button.
+export function followArgs(key: string): string[] | null {
+  let m = /^([A-Z][A-Z0-9]+)-\d+$/.exec(key)
+  if (m) return ['follow', '--project', '--', m[1]]
+  m = /^([\w.-]+\/[\w.-]+)#\d+$/.exec(key)
+  if (m) return ['follow', '--repo', '--', m[1]]
+  if (/^[CG][A-Z0-9]+\/\d+\.\d+$/.test(key)) return ['follow', '--thread', '--', key]
+  return null
+}
+
 // Rows a section draws before "Show all"; the rest wait behind the toggle.
 const LIMITS: Record<NowItem['section'], number> = { on_you: 5, neglected: 3, suggestion: 3 }
 const SECTIONS: [NowItem['section'], string][] = [['on_you', 'On you'], ['neglected', 'Neglected'], ['suggestion', 'Suggestions']]
@@ -680,7 +691,7 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                   {(v.unseen ?? 0) > 0 ? <Text color="warning">{'new update '}</Text> : null}
                   <Text dimColor>{ago(v.last_routed_at, nowMs) ? ago(v.last_routed_at, nowMs) + ' ' : ''}</Text>
                   <Button key={'sess-open-' + key} onPress={() => openSession($, goHub, key, v)}>Open</Button>
-                  <Button key={'sess-follow-' + key} onPress={() => goHub(['follow', '--', key])}>Follow</Button>
+                  {followArgs(key) ? <Button key={'sess-follow-' + key} onPress={() => goHub(followArgs(key) as string[])}>Follow</Button> : null}
                   <Button key={'sess-mute-' + key} onPress={() => goHub(['mute', '--', key])}>Mute</Button>
                 </Box>
               ))}
@@ -708,7 +719,7 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                     <Text dimColor>{` ${u.key} · ${ago(u.at, nowMs)} `}</Text>
                     {isUrl(u.link) ? <Link href={u.link}>↗</Link> : null}
                     <Button key={'hub-done-' + u.id} onPress={() => goHub(['done', u.id], 'hub:' + u.id)}>Done</Button>
-                    <Button key={'hub-follow-' + u.id} onPress={() => goHub(['follow', '--', u.key])}>Follow</Button>
+                    {followArgs(u.key) ? <Button key={'hub-follow-' + u.id} onPress={() => goHub(followArgs(u.key) as string[])}>Follow</Button> : null}
                     <Button key={'hub-mute-' + u.id} onPress={() => goHub(['mute', '--', u.key])}>Mute</Button>
                     <Button key={'hub-snooze-' + u.id} onPress={() => update($, snoozingAtom, cur => (cur === 'hub:' + u.id ? null : 'hub:' + u.id))}>Snooze</Button>
                   </Box>
