@@ -1804,6 +1804,75 @@ class Direct(unittest.TestCase):
         self.run_verb("unmute", "PLAT-9")
         self.assertEqual(hub.load_watch(self.ws)["mute"]["keys"], [])
 
+    def test_mute_for_a_while_expires_and_a_plain_mute_or_unmute_clears_the_expiry(self):
+        rc, out = self.run_verb("mute", "--for", "1w", "--", "PLAT-9")
+        self.assertEqual(rc, 0)
+        self.assertIn("until 2026-11-05", out)
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual(m["until"], {"PLAT-9": "2026-11-05T10:00:00Z"})
+        self.assertEqual(hub.live_mute(m, self.AT)["keys"], ["PLAT-9"])
+        self.assertEqual(hub.live_mute(m, self.AT + timedelta(days=8))["keys"], [])
+        self.run_verb("mute", "PLAT-9")                  # for good now
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["until"], {})
+        self.run_verb("mute", "--for", "3d", "--", "PLAT-9")
+        self.run_verb("unmute", "PLAT-9")
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual((m["keys"], m["until"]), ([], {}))
+        self.assertEqual(self.run_verb("mute", "--for", "soon", "--", "PLAT-9")[0], 2)
+
+    def test_mute_a_link_stores_its_key_and_scope_channel_stores_the_channel(self):
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        self.run_verb("mute", "--", chat)
+        self.run_verb("mute", "--", "https://example.com/browse/PLAT-3")
+        self.run_verb("mute", "--", "https://example.com/some/page")
+        self.run_verb("mute", "--scope", "channel", "--", chat)
+        self.run_verb("mute", "--scope", "channel", "--", "C00000009/1700000000.123456")
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual(m["keys"], ["C00000009/1700000000.123456", "PLAT-3", "https://example.com/some/page"])
+        self.assertEqual(m["channels"], ["C00000009"])
+        self.assertEqual(self.run_verb("mute", "--scope", "channel", "--", "PLAT-3")[0], 2)
+        self.assertEqual(self.run_verb("mute", "--scope", "everything", "--", "PLAT-3")[0], 2)
+
+    def test_item_muted_matches_link_also_links_and_channel(self):
+        mute = {"keys": ["PLAT-3", "https://example.com/page"], "people": [], "channels": ["C00000009"]}
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        self.assertTrue(hub.item_muted({"link": chat}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/acme/api/pull/1", "also": ["PLAT-3"]}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/browse/PLAT-3"}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/x", "links": [{"label": "P", "url": "https://example.com/page"}]}, mute))
+        self.assertFalse(hub.item_muted({"link": "https://example.com/browse/PLAT-4", "also": []}, mute))
+
+    def test_mute_words_stores_a_topic_rule_and_unmute_takes_it_back(self):
+        rc, out = self.run_verb("mute", "--words", "Flaky, retry,flaky", "--channel", "C00000009", "--for", "1w")
+        self.assertEqual(rc, 0, out)
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual(m["topics"], ["topic:flaky|retry@C00000009"])
+        self.assertIn("topic:flaky|retry@C00000009", m["until"])
+        self.run_verb("mute", "--words", "deploy")
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["topics"], ["topic:flaky|retry@C00000009", "topic:deploy"])
+        self.run_verb("unmute", "--", "topic:deploy")
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["topics"], ["topic:flaky|retry@C00000009"])
+        for bad in (["mute", "--words", "ab"], ["mute", "--words", "a b c"], ["mute", "--words", "x1,x2,x3,x4,x5,x6"],
+                    ["mute", "--words", "flaky", "--", "PLAT-1"], ["mute", "--words", "flaky", "--channel", "nope"],
+                    ["mute", "--", "topic:no spaces"]):
+            self.assertEqual(self.run_verb(*bad)[0], 2, bad)
+
+    def test_topic_and_sender_mutes_match_lines_and_items(self):
+        mute = {"keys": [], "people": ["U00000009", "agnes@example.com"], "channels": [],
+                "topics": ["topic:flaky|retry@C00000009", "topic:newsletter"]}
+        self.assertTrue(hub.is_muted(line(source="chat", key="C00000009/1.0", title="CI is FLAKY again"), mute))
+        self.assertFalse(hub.is_muted(line(source="chat", key="C00000001/1.0", title="CI is flaky again"), mute))
+        self.assertFalse(hub.is_muted(line(source="chat", key="C00000009/1.0", title="unflakyness"), mute))
+        self.assertTrue(hub.is_muted(line(source="mail", key="mail:t1", title="x", summary="the weekly newsletter"), mute))
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        self.assertTrue(hub.item_muted({"link": chat, "title": "Retry the build?"}, mute))
+        self.assertFalse(hub.item_muted({"link": "https://example.com/x", "title": "Retry the build?"}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/x", "title": "Our newsletter"}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/x", "title": "t", "from": "Agnes@Example.com"}, mute))
+        self.assertFalse(hub.item_muted({"link": "https://example.com/x", "title": "t", "from": "U00000001"}, mute))
+        self.assertEqual(hub.live_mute(dict(mute, until={"topic:newsletter": "2026-10-01T00:00:00Z"}), self.AT)["topics"],
+                         ["topic:flaky|retry@C00000009"])
+
     def test_mute_drops_watcher_lines_not_manual(self):
         class A:
             SOURCE = "tracker"
@@ -2269,7 +2338,7 @@ class WhatsAppWatcher(unittest.TestCase):
         l = line(source="whatsapp", key="wa:" + lid, who="a chat")
         self.assertTrue(hub.is_muted(l, {"keys": ["wa:" + lid]}))
         self.assertEqual(self.run_verb("mute", "--", "wa:" + lid)[0], 0)
-        self.assertEqual(hub.load_watch(self.ws)["mute"], {"keys": ["wa:" + lid], "people": [], "channels": []})
+        self.assertEqual(hub.load_watch(self.ws)["mute"], {"keys": ["wa:" + lid], "people": [], "channels": [], "topics": [], "until": {}})
 
     def test_whatsapp_text_never_auto_follows_a_project(self):
         r = WaReader()

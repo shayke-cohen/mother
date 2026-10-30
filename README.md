@@ -100,6 +100,15 @@ It symlinks `mother` into `~/.local/bin`. Pass another directory if that one isn
 (a hooks module beside the guard), so there is nothing more to install. Open it with `/now-panel` (`/now` is
 MOTHER's chat skill, which prints the same list in the conversation). It reads `.mother/now.json` on the machine
 the tick runs on and makes no network calls.
+Open an item and it shows a chip for each of its sources (thread, channel, mail, ticket, PR, build) and up to three
+quick actions picked by what the item is: Draft a reply and Summarize the thread for chat and mail, Review brief and
+Why is CI red? for a PR, Find related PRs and Find the owner for a ticket. Each one only fills the prompt; you press
+Enter, and anything that reaches another person comes back as a draft. **Focus** (`f`) opens a second pane with the
+selected item in full: its sources and timeline, every action grouped as Respond, Investigate, Delegate and Triage,
+Run in a session (the hub), Tell Mother… for your own words, and related items from the same team.
+Mail rows also get **Archive** and **Mark read**, done straight through the hub's mail connection with no model
+(`mother inbox`, still checked by the guard); a section with several rows gets **Done all**, and **Archive N mail**
+when two or more are mail.
 Its one setting, `mother_bin` (userConfig), is the path to the `mother` script it calls for `mother path` and
 the `mother now` edits. Left empty (the default) it runs this plugin's own `bin/mother`, the same version the
 hooks run; set it only to point the panel at another copy (a leading `~` is your home folder).
@@ -213,7 +222,7 @@ Here chat and WhatsApp stay on the default. `mother hub status` shows each sourc
 
 WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 
-You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** and **Mute** on a hub session or hub update. It can't fetch the web or edit files; for those it proposes a session.
+You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** on a hub session or hub update, and **Ignore…** on those and on any Now item with a link: just this, this for a week, a chat thread's whole channel, everything from the sender, or messages like it (the tick proposes a few words such messages always contain, you see them before choosing, and from then on they are matched without a model). Ignored things drop out of the hub and the Now list; the **Ignored** list at the foot of the panel shows them and undoes each one. It can't fetch the web or edit files; for those it proposes a session.
 
 ### Replying in team channels
 
@@ -246,6 +255,7 @@ Useful commands in your terminal:
 | `mother memory index <file>` | Add one index line for `memory/<file>.md` to `memory/MEMORY.md` (idempotent); the only unprompted writer of the index. `memory check` lists drift |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
+| `mother inbox archive\|read <mail:ID \| link>...` | Archive or mark read whole mail threads with no model in the loop, through the hub's mail connection; the guard's classifier is asked first, nothing changes while paused, and each thread is logged to `.mother/guard.log`. The Now panel's Archive, Mark read and Archive N mail buttons run it |
 | `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `smoke` runs `check` and two polling passes 20 s apart into a throwaway copy of the state and prints per-source status and line counts (never content; exit 2 if a source cannot be read), `watch` runs it in the foreground; `add <link-or-text>` hands the hub something by hand, `follow`/`unfollow`/`mute`/`unmute` edit its machine-local watch list, `watching` prints it; `dms set|drop|show|inbox` maps DMs with people in config and the self-DM inbox |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |

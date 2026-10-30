@@ -129,6 +129,9 @@ def threshold_hours(signal: str, cfg: dict, s: Schedule) -> Optional[float]:
 SECTIONS = ["on_you", "neglected", "suggestion"]
 SUGGESTION_LAPSE_DAYS = 3
 VERSION = 1
+LINKS_MAX = 8
+ACTIONS_MAX = 3
+LINK_LABEL_MAX = 24
 TOP_MAX = 3
 
 
@@ -146,6 +149,46 @@ def _too_old(sig: str, since: datetime, cfg: dict, now: datetime) -> bool:
 def _keys(sig: str, link: str, also) -> set:
     """Every (signal, link) pair that names the same work: the item's link and its `also` links."""
     return {(sig, k) for k in [link] + list(also or []) if k}
+
+
+def _links(raw) -> list:
+    """The candidate's labelled source links, cleaned: http(s) url, a label (trimmed), no repeated url, at most
+    LINKS_MAX. A bad entry is skipped; it is not a malformed candidate."""
+    out, urls = [], set()
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        url, label = e.get("url"), e.get("label")
+        if not isinstance(url, str) or not re.match(r"https?://", url) or url in urls:
+            continue
+        if not isinstance(label, str) or not label.strip():
+            continue
+        urls.add(url)
+        out.append({"label": label.strip()[:LINK_LABEL_MAX].rstrip(), "url": url})
+        if len(out) == LINKS_MAX:
+            break
+    return out
+
+
+def _sender(v) -> Optional[str]:
+    """The candidate's `from`: a chat user id or an email (lower case), else None. Only for Ignore by sender."""
+    v = v.strip() if isinstance(v, str) else ""
+    if re.fullmatch(r"U[A-Z0-9]{2,}", v):
+        return v
+    return v.lower() if re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", v) else None
+
+
+def _similar(v) -> Optional[dict]:
+    """The tick's proposed "similar messages" rule, `{words, channel}`, when `mother hub mute --words` would take it."""
+    import hub
+    if not isinstance(v, dict) or not isinstance(v.get("words"), list) or len(v["words"]) > 5:
+        return None
+    channel = v.get("channel") if isinstance(v.get("channel"), str) else ""
+    topic = hub.topic_value([w for w in v["words"] if isinstance(w, str)], channel)
+    if topic is None:
+        return None
+    words = topic[len("topic:"):].split("@", 1)[0].split("|")
+    return {"words": words, "channel": channel}
 
 
 def item_id(c: dict) -> str:
@@ -269,10 +312,13 @@ def _mark_top_done(top: list, now_ids: set, prev_ids: set, st_items: dict) -> li
     return top
 
 
-def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime) -> dict:
+def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime, mute: Optional[dict] = None) -> dict:
     """Fold this tick's candidates into the previous now.json and apply the manager's `state`
     (done, snooze, Top 3). Expired snoozes and resurfaced done entries are removed from
-    `state["items"]` in place; the caller saves it."""
+    `state["items"]` in place; the caller saves it. `mute` is the hub's mutes in force (`hub.live_mute`):
+    an item it names is left out and counted in `ignored`."""
+    import hub
+    ignored = hub.item_muted if mute else (lambda _i, _m: False)
     s = Schedule.from_config(cfg)
     coverage = _coverage(inp, prev, cfg, now)
     checked = set(inp.get("checked_signals") or [])
@@ -292,7 +338,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         for k in _keys(pi.get("signal"), pi.get("link"), pi.get("also")):
             prev_by_key.setdefault(k, pi["id"])
 
-    items, seen, taken, dropped = [], set(), set(), 0
+    items, seen, taken, dropped, hidden = [], set(), set(), 0, 0
     for c in inp.get("candidates") or []:
         try:
             if not isinstance(c, dict) or any(not c.get(k) for k in ("kind", "link", "signal", "since", "title", "why")):
@@ -310,6 +356,10 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         keys = _keys(sig, c["link"], c.get("also"))
         if keys & taken:
             continue                       # already listed under another of its links
+        if ignored(c, mute):
+            hidden += 1
+            taken |= keys                  # its old self is not kept either
+            continue
         iid = item_id(c)
         if iid not in prev_items:
             iid = next((prev_by_key[k] for k in sorted(keys) if k in prev_by_key), iid)
@@ -326,7 +376,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         old = prev_items.get(iid)
         old_ids = {a["label"]: a["id"] for a in (old or {}).get("actions") or []}
         actions = []
-        for a in c.get("actions") or []:
+        for a in (c.get("actions") or [])[:ACTIONS_MAX]:
             if not isinstance(a, dict) or not a.get("label"):
                 dropped += 1
                 continue
@@ -341,7 +391,8 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
             continue
         items.append({
             "id": iid, "section": section, "signal": sig, "title": c["title"], "why": c.get("why", ""),
-            "link": c["link"], "also": list(c.get("also") or []), "team": c.get("team"),
+            "link": c["link"], "also": list(c.get("also") or []), "links": _links(c.get("links")), "team": c.get("team"),
+            "from": _sender(c.get("from")), "similar": _similar(c.get("similar")),
             "since": c["since"], "first_seen": first_seen, "last_seen": _iso(now),
             "state": effect or ("open" if old else "new"),
             "snooze_until": None, "actions": actions,
@@ -358,6 +409,9 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
             continue
         if _keys(sig, pi.get("link"), pi.get("also")) & taken:
             continue                       # this tick lists the same work under another link
+        if ignored(pi, mute):
+            hidden += 1
+            continue
         if _too_old(sig, _parse_iso(pi["since"]), cfg, now):
             continue
         row = coverage.get(SIGNALS[sig][1]) if sig in SIGNALS else None
@@ -400,6 +454,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         "counts": {k: sum(1 for i in items if i["section"] == k) for k in SECTIONS},
         "next_action": next_action,
         "dropped": dropped,
+        "ignored": hidden,
         "top": top,
         "top_date": top_date,
         "swap_hint": hint,
@@ -665,7 +720,7 @@ def main(args, ws: Path, cfg: dict, at: datetime) -> None:
         with locked(ws):
             state = load_state(ws)
             try:
-                doc = merge(inp, load_now(ws), state, cfg, at)
+                doc = merge(inp, load_now(ws), state, cfg, at, _mutes(ws, at))
             except (KeyError, ValueError, TypeError, AttributeError) as e:
                 _fail("merge input is unusable: %s" % e)
             write_now(ws, doc)
@@ -689,6 +744,12 @@ def main(args, ws: Path, cfg: dict, at: datetime) -> None:
         _edit(verb, rest, ws, cfg, at, s)
         return
     _fail("unknown verb %r — see `mother now help`" % verb)
+
+
+def _mutes(ws: Path, at: datetime) -> dict:
+    """What the manager ignored (`mother hub mute`), still in force at `at`."""
+    import hub
+    return hub.live_mute(hub.load_watch(ws)["mute"], at)
 
 
 def _edit(verb: str, rest: list, ws: Path, cfg: dict, at: datetime, s: Schedule) -> None:

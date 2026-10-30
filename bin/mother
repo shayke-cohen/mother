@@ -22,6 +22,9 @@ Commands:
                                the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e)
   hub add|follow|unfollow|mute|unmute|watching
                                the manager's steering: hand the hub a link or note, and the watch and mute lists
+  inbox archive|read <mail:ID | mail link>...
+                               the Now panel's mail triage, no model: archive or mark read through the hub's mail
+                               connection, checked against the guard first (docs/CONTRACT.md §5f)
   grant add <scope> <target> --by <user-id> --cites <link|ts> [--uses N] [--hours H] [--run ID] | remove --run ID | list
                                the only writer of .mother/grants.json for unattended runs (checked like the guard)
   memory index <memory-file> [--title T] [--hook H] | check
@@ -1258,6 +1261,15 @@ def cmd_hub(args):
     sys.exit(hub.main(args, ws, load_config(ws), _now()))
 
 
+def cmd_inbox(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import inbox
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        sys.exit(inbox.main(args, None, {}))
+    ws = workspace()
+    sys.exit(inbox.main(args, ws, load_config(ws)))
+
+
 def cmd_grant(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import grants
@@ -1402,7 +1414,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "grant": cmd_grant, "memory": cmd_memory, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "inbox": cmd_inbox, "grant": cmd_grant, "memory": cmd_memory, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

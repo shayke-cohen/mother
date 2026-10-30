@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { hubStatus, sourceStale } from './register'
+import { hubStatus, quickActions, sourceStale } from './register'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-10-26T10:00:00Z')
@@ -59,7 +59,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('prompt.fill', (_: any, e: any) => { out.fills.push({ text: e.text, mode: e.mode }); return { isFilled: true } })
     on('process.run', (_: any, e: any) => {
       out.argv.push([...e.argv])
-      if (cli && (e.argv[2] === 'now' || e.argv[2] === 'hub')) {
+      if (cli && ['now', 'hub', 'inbox'].includes(e.argv[2])) {
         const r = cli([...e.argv])
         return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
@@ -84,6 +84,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
     return { clock, out }
   }
   const last = (o: { status: (string | undefined)[] }) => o.status[o.status.length - 1]
+  // Link chips as [label, href]; a Link's text is its href then its label. The row's own ↗ is not a chip.
+  const chipsOf = async (ui: any): Promise<[string, string][]> => (await ui.findAll({ type: 'Link' }))
+    .map((l: any) => [String(l.text).slice(String(l.props.href).length), String(l.props.href)] as [string, string])
+    .filter(([label]) => label !== '↗')
   const PATH = WS + '/.mother/now.json'
 
   test(`status line counts and a failing source, on ${surface}`, async ($, on) => {
@@ -325,6 +329,171 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
+  test(`an open row draws a chip per source: links first, then link and http also, on ${surface}`, async ($, on) => {
+    const it: any = item('a', 'on_you', 'open', 'Review A')
+    it.link = 'https://example.com/acme/api/pull/7'
+    it.links = [{ label: 'Thread', url: 'https://example.com/t/1' }, { label: 'Channel', url: 'https://example.com/c' }]
+    it.also = ['https://example.com/browse/PLAT-2', 'PLAT-2', 'https://example.com/t/1', 'https://example.com/other']
+    const d = doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await chipsOf(ui)).toEqual([
+      ['Thread', 'https://example.com/t/1'],
+      ['Channel', 'https://example.com/c'],
+      ['api#7', 'https://example.com/acme/api/pull/7'],
+      ['PLAT-2', 'https://example.com/browse/PLAT-2'],
+      ['Link', 'https://example.com/other'],
+    ])
+    await ui.unmount()
+  })
+
+  test(`a row with only its link draws no chip line, on ${surface}`, async ($, on) => {
+    const d = doc({ items: [item('a', 'on_you', 'open')], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await chipsOf(ui)).toEqual([])
+    await ui.unmount()
+  })
+
+  const FOCUS = { ...PANE, requestId: 'mother-focus', props: { ...PANE.props, title: 'Focus' } } as const
+  const kinded = (kind: string, signal: string, title: string, link: string) => {
+    const it: any = item('x', 'on_you', 'open', title)
+    it.id = `${kind}:${link}:${signal}`
+    it.signal = signal
+    it.link = link
+    it.why = 'Asked 5 working hours ago'
+    return it
+  }
+
+  test(`quick actions follow the item's kind and never send, on ${surface}`, async () => {
+    const chat = quickActions(kinded('chat', 'unanswered_mention', 'Release question', 'https://example.com/t/1'))
+    expect(chat.map(q => q.label)).toEqual(['Draft a reply', 'Summarize the thread', 'Find related tickets',
+      'Turn into a ticket', 'Hand it to someone', 'Make it a todo'])
+    for (const q of chat) {
+      expect(q.text).toContain('"Release question" (https://example.com/t/1)')
+      expect(q.text).toMatch(/don't send/)
+    }
+    expect(quickActions(kinded('pr', 'review_requested', 'Review api#7', 'https://example.com/acme/api/pull/7')).map(q => q.label))
+      .toEqual(['Review brief', 'Why is CI red?', 'Hand it to someone', 'Make it a todo'])
+    expect(quickActions(kinded('pr', 'pr_no_reviewer', 'api#8', 'https://example.com/acme/api/pull/8')).map(q => q.label))
+      .toEqual(['Why is CI red?', 'Find a reviewer', 'Hand it to someone', 'Make it a todo'])
+    expect(quickActions(kinded('ticket', 'bug_unowned', 'Login broken', 'https://example.com/browse/PLAT-2')).map(q => q.label))
+      .toEqual(['Find related PRs and commits', 'Investigate in the code', 'Find the owner and draft a DM', 'Make it a todo'])
+    expect(quickActions(kinded('repo', 'default_branch_red', 'api main red', 'https://example.com/acme/api/commits/main')).map(q => q.label))
+      .toEqual(['Find the breaking change', 'Draft a heads-up to its author', 'Make it a todo'])
+    expect(quickActions(kinded('todo', 'promise_due', 'Send the plan', 'https://example.com/x')).map(q => q.label))
+      .toEqual(["What's this about?", 'Hand it to someone', 'Make it a todo'])
+    expect(chat.map(q => q.group)).toEqual(['Respond', 'Respond', 'Investigate', 'Delegate', 'Delegate', 'Triage'])
+  })
+
+  test(`an open row shows three quick actions that fill the prompt, plus Focus, on ${surface}`, async ($, on) => {
+    const it = kinded('chat', 'unanswered_mention', 'Release question', 'https://example.com/t/1')
+    const d = doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.findAll({ type: 'Button' })).filter((b: any) => String(b.key).startsWith('quick')).map((b: any) => b.text))
+      .toEqual(['Draft a reply', 'Summarize the thread', 'Find related tickets'])
+    await ui.press({ key: 'quick1-' + it.id })
+    expect(out.fills).toEqual([{ text: quickActions(it)[1].text, mode: 'replace' }])
+    expect(out.submits).toBe(0)
+    await ui.press({ key: 'focus-' + it.id })
+    expect(out.opened).toContain('mother-focus')
+    await ui.unmount()
+  })
+
+  test(`the focus pane follows the selected row: links, timeline, grouped actions, triage, on ${surface}`, async ($, on) => {
+    const a = kinded('chat', 'unanswered_mention', 'Release question', 'https://example.com/t/1')
+    a.links = [{ label: 'Channel', url: 'https://example.com/c' }]
+    a.team = 'platform'
+    a.actions = [{ id: 'S1', label: 'Draft the cutoff reply', prompt: 'mother now do S1', task: 'draft' }]
+    const b: any = item('b', 'on_you', 'open', 'Other B')
+    b.team = 'platform'
+    const d = doc({ items: [a, b], counts: { on_you: 2, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const fp = await $.ui.mount({ ...FOCUS, surface })
+    expect(await hasText(fp, /Release question/)).toBe(true)
+    for (const h of [/^Suggested$/, /^Respond$/, /^Investigate$/, /^Delegate$/, /^Triage$/, /^Related$/]) expect(await hasText(fp, h)).toBe(true)
+    expect(await hasText(fp, /raised 2h ago/)).toBe(true)
+    expect((await chipsOf(fp)).map(([l]) => l)).toEqual(['Channel', 'Source'])
+    await fp.press({ key: 'fp-act0' })
+    expect(out.fills[0]).toEqual({ text: 'mother now do S1', mode: 'replace' })
+    await fp.press({ key: 'fp-tell' })
+    expect(out.fills[1]).toEqual({ text: 'About "Release question" (https://example.com/t/1): ', mode: 'replace' })
+    await fp.press({ key: 'fp-done' })
+    expect(nowCalls(out)).toEqual([['done', a.id]])
+    await fp.press({ key: 'fp-ignore' })
+    await fp.select({ key: 'fp-ignore-pick', value: 'week' })
+    expect(out.argv.filter(x => x[2] === 'hub').map(x => x.slice(3))).toEqual([['mute', '--for', '1w', '--', a.link]])
+    await fp.press({ key: 'fp-rel-b' })               // a related item: the pane follows it
+    expect(await hasText(fp, /Other B/)).toBe(true)
+    await fp.unmount()
+  })
+
+  const mailItem = (tid: string, title: string) => {
+    const it = kinded('mail', 'mail_needs_reply', title, 'https://mail.google.com/mail/u/0/#all/' + tid)
+    it.id = 'mail:' + it.link + ':mail_needs_reply'
+    return it
+  }
+  const mine = (out: { argv: string[][] }) => out.argv.filter(a => ['now', 'hub', 'inbox'].includes(a[2])).map(a => a.slice(2))
+
+  test(`a mail row archives or marks read with no model, then Archive marks it done, on ${surface}`, async ($, on) => {
+    const m = mailItem('T1', 'Budget question')
+    const d = doc({ items: [m, item('b', 'on_you', 'open')], counts: { on_you: 2, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'read-' + m.id })
+    await ui.press({ key: 'archive-' + m.id })
+    expect(mine(out)).toEqual([['inbox', 'read', '--', m.link], ['inbox', 'archive', '--', m.link], ['now', 'done', m.id]])
+    await ui.press({ key: 'row-b' })
+    expect(await ui.find({ key: 'archive-b' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test(`a section with two or more mail rows offers Archive all, and Done all marks every row done, on ${surface}`, async ($, on) => {
+    const m1 = mailItem('T1', 'One'), m2 = mailItem('T2', 'Two')
+    const d = doc({ items: [m1, m2, item('c', 'on_you', 'open')], counts: { on_you: 3, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'archive-all-on_you' }))?.text).toBe('Archive 2 mail')
+    await ui.press({ key: 'archive-all-on_you' })
+    expect(mine(out)).toEqual([['inbox', 'archive', '--', m1.link, m2.link], ['now', 'done', m1.id], ['now', 'done', m2.id]])
+    out.argv.length = 0
+    await ui.press({ key: 'done-all-on_you' })
+    expect(mine(out)).toEqual([['now', 'done', m1.id], ['now', 'done', m2.id], ['now', 'done', 'c']])
+    await ui.unmount()
+  })
+
+  test(`a failed archive leaves the row on the list, on ${surface}`, async ($, on) => {
+    const m = mailItem('T1', 'Budget question')
+    const d = doc({ items: [m], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT',
+      (argv: string[]) => argv[2] === 'inbox' ? { exitCode: 1, stderr: "mother inbox: couldn't archive mail:T1: 403\n" } : { exitCode: 0 })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'archive-' + m.id })
+    expect(mine(out)).toEqual([['inbox', 'archive', '--', m.link]])
+    expect(out.toasts).toContain("mother inbox: couldn't archive mail:T1: 403")
+    await ui.unmount()
+  })
+
+  test(`a hub update about a mail thread can be archived, then is done, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'mail:T1', title: 'New mail', why: 'w', link: null, at: iso(MIN), state: 'open' },
+                     { id: 'U2', key: 'PLAT-5', title: 'Spec', why: 'w', link: null, at: iso(MIN), state: 'open' }]
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'hub-archive-U2' })).toBeUndefined()
+    await ui.press({ key: 'hub-archive-U1' })
+    expect(mine(out)).toEqual([['inbox', 'archive', '--', 'mail:T1'], ['hub', 'done', 'U1']])
+    await ui.unmount()
+  })
+
+  test(`the focus pane with nothing on the list says so, on ${surface}`, async ($, on) => {
+    const d = doc({ items: [], counts: { on_you: 0, neglected: 0, suggestion: 0 }, coverage: {} })
+    await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const fp = await $.ui.mount({ ...FOCUS, surface })
+    expect(await hasText(fp, /Select an item in the Now panel/)).toBe(true)
+    await fp.unmount()
+  })
+
   test(`Done runs mother now done and re-reads at once, on ${surface}`, async ($, on) => {
     const files: Record<string, { text: string; mtimeMs: number }> = { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }
     const after = doc({ items: [item('b', 'on_you', 'open', 'Only B')], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
@@ -380,7 +549,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     d.items[0].actions = [{ id: 'S2', label: 'Draft a nudge', prompt: 'mother now do S2', task: 'draft a nudge to the reviewer' }]
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hotkeys(ui)).toEqual(['x:doit-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['x:doit-a', 'f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     expect((await ui.find({ key: 'doit-a' }))?.text).toBe('Draft a nudge')   // the action's own label
     await ui.press({ key: 'doit-a' })
     expect(out.fills).toEqual([{ text: 'mother now do S2', mode: 'replace' }])
@@ -393,7 +562,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc({ top, top_date: '2026-10-25' })), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hasText(ui, /Top 3 today|Old one/)).toBe(false)
-    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     await ui.unmount()
   })
 
@@ -503,7 +672,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`with no focus event the first row holds the hotkeys, on ${surface}`, async ($, on) => {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     expect((await ui.find({ key: 'row-a' }))?.props.autoFocus).toBe(true)
     expect(await ui.find({ key: 'done-b' })).toBeUndefined()     // only the selected row draws its buttons
     await ui.unmount()
@@ -513,7 +682,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
     await $.ui.focus({ requestId: 'mother-now', key: 'snooze-b' } as any)
-    expect(await hotkeys(ui)).toEqual(['a:ask-b', 'd:done-b', 's:snooze-b', 't:maketop-b'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-b', 'a:ask-b', 'd:done-b', 's:snooze-b', 't:maketop-b'])
     await ui.unmount()
   })
 
@@ -538,7 +707,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hotkeys(ui)).toEqual(['a:top-ask-1', 'd:top-done-1'])
     await $.ui.focus({ requestId: 'mother-now', key: 'row-a' } as any)
-    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     await ui.unmount()
   })
 
@@ -810,6 +979,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
+  test(`a session row draws a chip for each http also, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1, also: ['https://example.com/acme/api/pull/9', 'PLAT-2'] }) })
+    await boot($, on, hubFiles(watcher(), hubDoc(), ss))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await chipsOf(ui)).filter(([, href]) => /^https:/.test(href))).toEqual([['api#9', 'https://example.com/acme/api/pull/9']])
+    await ui.unmount()
+  })
+
   test(`a session with unseen shows new update and its age; a link opens it, on ${surface}`, async ($, on) => {
     const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) })
     const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss))
@@ -944,6 +1121,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'sess-follow-PLAT-2' })
     await ui.press({ key: 'sess-mute-PLAT-2' })
+    await ui.select({ key: 'sess-ignore-pick-PLAT-2', value: 'item' })
     await ui.press({ key: 'sess-follow-acme/web#12' })
     await ui.press({ key: 'sess-follow-C00000001/1700000000.000100' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
@@ -963,6 +1141,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'sess-follow-' + g })
     await ui.press({ key: 'sess-mute-' + lid })
+    await ui.select({ key: 'sess-ignore-pick-' + lid, value: 'item' })
     expect(await ui.find({ key: 'sess-follow-' + dm })).toBeUndefined()
     expect(await ui.find({ key: 'sess-follow-' + lid })).toBeUndefined()
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
@@ -990,12 +1169,93 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     await ui.press({ key: 'hub-follow-U1' })
     await ui.press({ key: 'hub-mute-U1' })
+    await ui.select({ key: 'hub-ignore-pick-U1', value: 'item' })
     await ui.press({ key: 'hub-follow-U2' })
     await ui.press({ key: 'hub-follow-U3' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
       ['python3', BIN, 'hub', 'follow', '--project', '--', 'PLAT'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-5'],
+      ['python3', BIN, 'hub', 'done', 'U1'],
       ['python3', BIN, 'hub', 'follow', '--repo', '--', 'acme/web'],
       ['python3', BIN, 'hub', 'follow', '--thread', '--', 'C00000001/1700000000.000100']])
+    await ui.unmount()
+  })
+
+  test(`Ignore on a hub row offers a week, and the whole channel only for a chat thread, on ${surface}`, async ($, on) => {
+    const t = 'C00000001/1700000000.000100'
+    const ss = sessionsDoc({ [t]: session({ unseen: 1 }), 'PLAT-2': session({ unseen: 1 }) })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'sess-mute-PLAT-2' }))?.text).toBe('Ignore…')
+    await ui.press({ key: 'sess-mute-PLAT-2' })
+    expect(((await ui.find({ type: 'Select', key: 'sess-ignore-pick-PLAT-2' }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week'])
+    await ui.select({ key: 'sess-ignore-pick-PLAT-2', value: 'week' })
+    await ui.press({ key: 'sess-mute-' + t })
+    expect(((await ui.find({ type: 'Select', key: 'sess-ignore-pick-' + t }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week', 'channel'])
+    await ui.select({ key: 'sess-ignore-pick-' + t, value: 'channel' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
+      ['python3', BIN, 'hub', 'mute', '--for', '1w', '--', 'PLAT-2'],
+      ['python3', BIN, 'hub', 'mute', '--scope', 'channel', '--', t]])
+    await ui.unmount()
+  })
+
+  test(`Ignore on a Now item mutes its link, then marks it done, on ${surface}`, async ($, on) => {
+    const chat: any = item('a', 'on_you', 'open', 'Question')
+    chat.id = 'chat:https://example.com/archives/C00000009/p1700000000123456:unanswered_mention'
+    chat.link = 'https://example.com/archives/C00000009/p1700000000123456'
+    const d = doc({ items: [chat, item('b', 'on_you', 'open')], counts: { on_you: 2, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'ignore-' + chat.id })
+    expect(((await ui.find({ type: 'Select', key: 'ignore-pick-' + chat.id }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week', 'channel'])
+    await ui.select({ key: 'ignore-pick-' + chat.id, value: 'channel' })
+    expect(out.argv.filter(a => a[2] === 'hub' || a[2] === 'now').map(a => a.slice(2))).toEqual([
+      ['hub', 'mute', '--scope', 'channel', '--', chat.link], ['now', 'done', chat.id]])
+    await ui.press({ key: 'row-b' })
+    await ui.press({ key: 'ignore-b' })
+    expect(((await ui.find({ type: 'Select', key: 'ignore-pick-b' }))?.props.options as any[]).map(o => o.value)).toEqual(['item', 'week'])
+    await ui.unmount()
+  })
+
+  test(`Ignore offers the sender and the tick's similar rule when the item has them, on ${surface}`, async ($, on) => {
+    const it: any = item('a', 'on_you', 'open', 'CI flaky again')
+    it.from = 'U00000009'
+    it.similar = { words: ['flaky', 'retry'], channel: 'C00000009' }
+    const d = doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'ignore-a' })
+    const opts = (await ui.find({ type: 'Select', key: 'ignore-pick-a' }))?.props.options as any[]
+    expect(opts.map(o => o.value)).toEqual(['item', 'week', 'sender', 'similar'])
+    expect(opts[3].label).toBe('Similar: "flaky" or "retry", in this channel')
+    await ui.select({ key: 'ignore-pick-a', value: 'similar' })
+    await ui.press({ key: 'ignore-a' })
+    await ui.select({ key: 'ignore-pick-a', value: 'sender' })
+    expect(out.argv.filter(a => a[2] === 'hub').map(a => a.slice(3))).toEqual([
+      ['mute', '--words', 'flaky,retry', '--channel', 'C00000009'], ['mute', '--', 'U00000009']])
+    await ui.unmount()
+  })
+
+  test(`the Ignored list shows each mute with its expiry and Unignore runs unmute, on ${surface}`, async ($, on) => {
+    const files = hubFiles(watcher(), hubDoc(), null)
+    files[HUB + '/watch.json'] = { text: JSON.stringify({ version: 1, mute: { keys: ['PLAT-9'], people: ['U00000009'], channels: ['C00000009'], topics: ['topic:flaky|retry@C00000009'], until: { 'PLAT-9': '2026-11-02T10:00:00Z' } } }), mtimeMs: 1 }
+    const { out } = await boot($, on, files, false, {}, 'ENOENT', () => ({ exitCode: 0, stdout: 'unmute keys PLAT-9\n' }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'ignored-toggle' }))?.text).toBe('▸ Ignored 4')
+    await ui.press({ key: 'ignored-toggle' })
+    expect(await hasText(ui, /PLAT-9 · until/)).toBe(true)
+    expect(await hasText(ui, /U00000009 · sender/)).toBe(true)
+    expect(await hasText(ui, /C00000009 · channel/)).toBe(true)
+    expect(await hasText(ui, /"flaky" or "retry" in C00000009 · similar/)).toBe(true)
+    await ui.press({ key: 'unignore-PLAT-9' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'unmute', '--', 'PLAT-9']])
+    expect(out.toasts).toContain('unmute keys PLAT-9')
+    await ui.unmount()
+  })
+
+  test(`no Ignored list when nothing is muted, on ${surface}`, async ($, on) => {
+    await boot($, on, hubFiles(watcher(), hubDoc(), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'ignored-toggle' })).toBeUndefined()
     await ui.unmount()
   })
 

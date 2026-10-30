@@ -145,6 +145,60 @@ class Merge(unittest.TestCase):
         out = now.merge(inp(cand("suggestion_waiting", kind="sug")), None, {}, CFG, NOW)
         self.assertEqual(out["items"][0]["section"], "on_you")
 
+    def test_links_are_kept_cleaned_and_capped(self):
+        links = ([{"label": "Thread", "url": "https://example.com/t/1"},
+                  {"label": "Thread again", "url": "https://example.com/t/1"},     # same url: dropped
+                  {"label": "", "url": "https://example.com/x"},                   # no label
+                  {"label": "Local", "url": "teams/x/intake.md#1"},                # not http(s)
+                  {"label": "A label much longer than twenty-four", "url": "https://example.com/long"},
+                  "not a dict"]
+                 + [{"label": "L%d" % n, "url": "https://example.com/n/%d" % n} for n in range(10)])
+        out = now.merge(inp(cand("review_requested", links=links)), None, {}, CFG, NOW)
+        kept = out["items"][0]["links"]
+        self.assertEqual(kept[0], {"label": "Thread", "url": "https://example.com/t/1"})
+        self.assertEqual(kept[1], {"label": "A label much longer than", "url": "https://example.com/long"})
+        self.assertEqual(len(kept), 8)
+        self.assertEqual(out["dropped"], 0)
+
+    def test_links_default_empty_and_carry_on_a_kept_item(self):
+        out = now.merge(inp(cand("review_requested")), None, {}, CFG, NOW)
+        self.assertEqual(out["items"][0]["links"], [])
+        links = [{"label": "Channel", "url": "https://example.com/c"}]
+        first = now.merge(inp(cand("review_requested", links=links)), None, {}, CFG, NOW)
+        kept = now.merge(inp(), first, {}, CFG, NOW + timedelta(hours=1))
+        self.assertEqual(kept["items"][0]["links"], links)
+
+    def test_sender_and_similar_rule_are_kept_only_when_well_formed(self):
+        out = now.merge(inp(cand("unanswered_mention", kind="chat", link="https://example.com/t/1", **{"from": "U00000009"},
+                                 similar={"words": ["Flaky", "retry"], "channel": "C00000009"}),
+                            cand("mail_needs_reply", kind="mail", link="https://example.com/m/1", **{"from": "Agnes@Example.com"},
+                                 similar={"words": ["ok"]}),
+                            cand("review_requested", link="https://example.com/pr/1", **{"from": "Agnes"},
+                                 similar="flaky")), None, {}, CFG, NOW)
+        got = {i["link"]: (i["from"], i["similar"]) for i in out["items"]}
+        self.assertEqual(got["https://example.com/t/1"], ("U00000009", {"words": ["flaky", "retry"], "channel": "C00000009"}))
+        self.assertEqual(got["https://example.com/m/1"], ("agnes@example.com", None))   # "ok" is too short a word
+        self.assertEqual(got["https://example.com/pr/1"], (None, None))
+        self.assertEqual(out["dropped"], 0)
+
+    def test_at_most_three_actions_per_item(self):
+        acts = [{"label": "A%d" % n, "prompt": "p%d" % n} for n in range(5)]
+        out = now.merge(inp(cand("review_requested", actions=acts)), None, {}, CFG, NOW)
+        self.assertEqual([a["label"] for a in out["items"][0]["actions"]], ["A0", "A1", "A2"])
+
+    def test_ignored_items_are_left_out_and_counted(self):
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        mute = {"keys": ["PLAT-3"], "people": [], "channels": ["C00000009"], "until": {}}
+        first = now.merge(inp(cand("review_requested", link="https://example.com/pr/9")), None, {}, CFG, NOW)
+        out = now.merge(inp(cand("unanswered_mention", kind="chat", link=chat),
+                            cand("review_requested", link="https://example.com/pr/1", also=["PLAT-3"]),
+                            cand("review_requested", link="https://example.com/pr/2")),
+                        first, {}, CFG, NOW, mute={"keys": ["https://example.com/pr/9"] + mute["keys"],
+                                                   "people": [], "channels": mute["channels"]})
+        self.assertEqual([i["link"] for i in out["items"]], ["https://example.com/pr/2"])
+        self.assertEqual(out["ignored"], 3)                 # two candidates and the kept pr/9
+        self.assertEqual(now.merge(inp(), None, {}, CFG, NOW)["ignored"], 0)
+
     def test_action_ids_are_stable(self):
         acts = [{"label": "Nudge", "prompt": "x"}]
         c = cand("review_requested", actions=acts)
