@@ -76,6 +76,14 @@ export function hubHealth(h: HubBundle, nowMs: number): HubHealth {
   return 'alive'
 }
 
+// A source is stale (inside active hours only) when its own last poll is older than 2 x its own interval. A beat
+// without the per-source fields (an older watcher) is never judged here; the heartbeat rules above still apply.
+export function sourceStale(row: { every_seconds?: number; at?: string } | null | undefined, active: boolean | undefined, nowMs: number): boolean {
+  if (!active || !row || !(typeof row.every_seconds === 'number' && row.every_seconds > 0) || !row.at) return false
+  const at = Date.parse(row.at)
+  return !Number.isNaN(at) && nowMs - at > 2 * row.every_seconds * 1000
+}
+
 export function hubStatus(h: HubBundle, nowMs: number): string {
   const health = hubHealth(h, nowMs)
   if (health === 'none') return ''
@@ -663,7 +671,7 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
   const mark = (st: string) => (st === 'ok' ? '✓' : st === 'partial' ? '~' : '✗')
   const healthLine = [
     hb.watcher ? `watcher polled ${ago(hb.watcher.at, nowMs)} ago` : 'watcher not running',
-    ...sources.map(([cap, row]) => `${cap} ${mark(row?.status)}`),
+    ...sources.map(([cap, row]) => `${cap} ${mark(row?.status)}${sourceStale(row, hb.watcher?.active, nowMs) ? ' stale' : ''}`),
     hb.hub?.last_wake ? `hub woke ${ago(hb.hub.last_wake, nowMs)} ago` : 'hub never woke',
   ].join(' · ')
   const sessions = liveSessions(hb.sessions)

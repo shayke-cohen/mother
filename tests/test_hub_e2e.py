@@ -206,7 +206,7 @@ class E2E(unittest.TestCase):
         self.assertEqual(self.sessions()["PLAT-1"]["unseen"], 2)
 
         beat = hub.load_json(self.ws, "watcher.json", {})
-        self.assertEqual(beat["sources"], {"chat": {"status": "ok"}, "tracker": {"status": "ok"}})
+        self.assertEqual({k: v["status"] for k, v in beat["sources"].items()}, {"chat": "ok", "tracker": "ok"})
         self.assertEqual(beat["errors"], [])
         self.assertTrue(beat["last_append_at"])
         self.assertTrue(self.hub_json()["last_wake"])

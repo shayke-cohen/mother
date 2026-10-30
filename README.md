@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck, the sprint plan and WhatsApp, covered by 841 automated tests. One manager's workspace has
+> routines, the meeting deck, the sprint plan and WhatsApp, covered by 860 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -197,6 +197,19 @@ show` lists the map, `mother hub dms drop U00000001` removes one). A message fro
 own reply in the DM clears it. To use your self-DM (the DM with yourself) as an inbox, run `mother hub dms inbox
 <its D… id>`: every note you type there becomes a thing the hub routes or proposes, like `mother hub add` (posts made by apps,
 MOTHER's included, are skipped).
+
+Each source can be checked at its own pace. The watcher wakes on the shortest interval and polls a source only when its own is due; set `every_seconds` (working hours, 30-86400) and `idle_every_seconds` (outside them; `0` means only during working hours) under `hub.watch.<source>`, and leave a source out to keep the global `hub.every_seconds` / `hub.idle_every_seconds`:
+
+```json
+"watch": {
+  "mail":     {"every_seconds": 3600},
+  "calendar": {"every_seconds": 900, "lead_minutes": 15},
+  "tracker":  {"every_seconds": 600, "projects": ["PLAT"]},
+  "code":     {"every_seconds": 600}
+}
+```
+
+Here chat and WhatsApp stay on the default. `mother hub status` shows each source's interval and marks one STALE when its own last poll is more than twice its interval old; `mother hub check` warns when the calendar is checked less often than `lead_minutes`, because starting-soon alerts would arrive late.
 
 WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 

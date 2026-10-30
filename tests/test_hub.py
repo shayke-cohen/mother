@@ -265,9 +265,10 @@ class Watcher(unittest.TestCase):
         beat = self.poll()
         self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["tracker"], {"n": 0})
         self.assertEqual(self.inbox(), [])
-        self.assertEqual(beat["sources"], {"tracker": {"status": "ok"}})
+        self.assertEqual(beat["sources"], {"tracker": {"status": "ok", "at": "2026-10-29T10:00:00Z", "every_seconds": 120}})
         self.assertEqual(beat["errors"], [])
-        self.assertEqual(hub.load_json(self.ws, "watcher.json", {}), beat)
+        self.assertEqual(hub.load_json(self.ws, "watcher.json", {}), {k: v for k, v in beat.items() if k != "_attempted"})
+        self.assertEqual(beat["_attempted"], ["tracker"])
         self.assertEqual((beat["at"], beat["every_seconds"], beat["active"]), ("2026-10-29T10:00:00Z", 120, True))
 
     def test_new_items_appended_once_across_two_polls(self):
@@ -296,7 +297,7 @@ class Watcher(unittest.TestCase):
         FakeAdapter.fail = None
         FakeAdapter.items = ["PLAT-9"]
         beat = self.poll(8)
-        self.assertEqual(beat["sources"]["tracker"], {"status": "ok"})
+        self.assertEqual(beat["sources"]["tracker"]["status"], "ok")
         self.assertEqual([l["key"] for l in self.inbox() if l["kind"] == "update"], ["PLAT-9"])
         self.assertFalse((self.ws / "capabilities.json").exists())
         self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["_errored"], [])
@@ -329,13 +330,14 @@ class Watcher(unittest.TestCase):
         self.poll()
         FakeAdapter.notes = ["C00000001: lookback truncated"]
         beat = self.poll(2)
-        self.assertEqual(beat["sources"]["tracker"], {"status": "ok", "notes": ["C00000001: lookback truncated"]})
+        self.assertEqual({k: v for k, v in beat["sources"]["tracker"].items() if k in ("status", "notes")},
+                         {"status": "ok", "notes": ["C00000001: lookback truncated"]})
         self.assertEqual(beat["errors"], [])
         saved = json.loads((self.ws / ".mother" / "hub" / "watcher.json").read_text())
         self.assertEqual(saved["sources"]["tracker"]["notes"], ["C00000001: lookback truncated"])
         buf = io.StringIO()
         hub.status(self.ws, self.AT + timedelta(minutes=2), out=buf)
-        self.assertIn("tracker: ok\n    note: C00000001: lookback truncated", buf.getvalue())
+        self.assertRegex(buf.getvalue(), r"tracker: ok[^\n]*\n    note: C00000001: lookback truncated")
         FakeAdapter.notes = []
         self.assertNotIn("notes", self.poll(4)["sources"]["tracker"])
 
@@ -623,6 +625,301 @@ class Loop(unittest.TestCase):
         with self.assertRaises(ForbiddenTool):
             self.run_watch(None)
         self.assertTrue(self.made[0].closed)  # cleanup still ran
+
+
+class SourceIntervals(unittest.TestCase):
+    """Per-source check intervals: `hub.watch.<cap>.every_seconds` / `idle_every_seconds`."""
+    WORK = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)   # Thursday, inside active hours
+    SAT = datetime(2026, 10, 31, 10, 0, tzinfo=UTC)    # Saturday: outside
+
+    def make_adapter(self):
+        class A:
+            calls = 0
+            fail = None
+            READ_TOOLS = ()
+
+            @classmethod
+            def poll(cls, client, cursor, cfg, me, at):
+                cls.calls += 1
+                if cls.fail:
+                    raise McpError(cls.fail, "gone")
+                return {"lines": [], "cursor": {"n": cls.calls}, "partial": []}
+        return A
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.tracker, self.mail = self.make_adapter(), self.make_adapter()
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["tracker:jira"] = self.tracker
+        hub_sources.ADAPTERS["mail:gmail"] = self.mail
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        conn = {"command": "example-server", "args": [], "env": {}}
+        self.cfg = {"version": 1, "manager": {"email": "dana@example.com", "timezone": "UTC",
+                                              "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"]},
+                    "connectors": {"tracker": "jira", "mail": "gmail"},
+                    "hub": {"enabled": True, "every_seconds": 120, "idle_every_seconds": 600,
+                            "connections": {"tracker": conn, "mail": dict(conn)},
+                            "watch": {"tracker": {"projects": ["PLAT"], "every_seconds": 600}}}}
+        self.clients = {"tracker": object(), "mail": object()}
+
+    def poll(self, at, **kw):
+        return hub.poll_once(self.ws, self.cfg, at, self.clients, **kw)
+
+    def watch_cfg(self, cap, **kw):
+        self.cfg["hub"]["watch"].setdefault(cap, {}).update(kw)
+
+    def test_a_source_is_polled_only_when_its_own_interval_has_passed(self):
+        for m in range(0, 22, 2):  # a pass every 2 minutes for 20 minutes
+            self.poll(self.WORK + timedelta(minutes=m))
+        self.assertEqual(self.mail.calls, 11)    # the global 120 s
+        self.assertEqual(self.tracker.calls, 3)  # its own 600 s: at 0, 10 and 20 minutes
+
+    def test_the_last_attempt_is_recorded_per_source(self):
+        self.poll(self.WORK)
+        beat = self.poll(self.WORK + timedelta(minutes=2))
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["_due"],
+                         {"tracker": "2026-10-29T10:00:00Z", "mail": "2026-10-29T10:02:00Z"})
+        self.assertEqual((beat["sources"]["tracker"]["at"], beat["sources"]["tracker"]["every_seconds"]),
+                         ("2026-10-29T10:00:00Z", 600))
+        self.assertEqual((beat["sources"]["mail"]["at"], beat["sources"]["mail"]["every_seconds"]),
+                         ("2026-10-29T10:02:00Z", 120))
+        self.assertEqual(beat["every_seconds"], 120)  # the watcher wakes for the shortest
+
+    def test_a_skipped_source_keeps_its_status_and_a_due_one_changes_it(self):
+        self.poll(self.WORK)
+        self.tracker.fail = "unreachable"
+        beat = self.poll(self.WORK + timedelta(minutes=2))  # tracker not due: nothing is asked of it
+        self.assertEqual(beat["sources"]["tracker"]["status"], "ok")
+        self.assertEqual(beat["errors"], [])
+        self.assertEqual(self.tracker.calls, 1)
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {}).get("_errored", []), [])
+        beat = self.poll(self.WORK + timedelta(minutes=10))  # due: the failure is seen, one error line
+        self.assertEqual(beat["sources"]["tracker"]["status"], "couldnt_check")
+        self.assertEqual(beat["sources"]["tracker"]["since"], "2026-10-29T10:10:00Z")
+        beat = self.poll(self.WORK + timedelta(minutes=12))  # skipped again: still reported, not "ok"
+        self.assertEqual(beat["sources"]["tracker"]["status"], "couldnt_check")
+        self.assertEqual(beat["sources"]["tracker"]["since"], "2026-10-29T10:10:00Z")
+        self.assertEqual(beat["sources"]["tracker"]["at"], "2026-10-29T10:10:00Z")
+        self.assertEqual(len(beat["errors"]), 1)
+        errs = [l for l in hub.read_inbox(self.ws) if l["kind"] == "error"]
+        self.assertEqual(len(errs), 1)
+
+    def test_idle_overrides_including_zero(self):
+        self.watch_cfg("tracker", idle_every_seconds=0)   # only during working hours
+        self.watch_cfg("mail", idle_every_seconds=1800)
+        self.assertEqual(hub.interval(self.cfg, self.WORK), (True, 120))
+        self.assertEqual(hub.interval(self.cfg, self.SAT), (False, 1800))
+        self.poll(self.SAT)
+        self.poll(self.SAT + timedelta(minutes=30))
+        self.assertEqual(self.tracker.calls, 0)
+        self.assertEqual(self.mail.calls, 2)
+        beat = self.poll(self.SAT + timedelta(minutes=45))  # mail not due again yet
+        self.assertEqual(self.mail.calls, 2)
+        self.assertNotIn("tracker", beat["sources"])
+
+    def test_idle_zero_on_every_source_means_no_polling_outside_working_hours(self):
+        self.watch_cfg("tracker", idle_every_seconds=0)
+        self.watch_cfg("mail", idle_every_seconds=0)
+        active, secs = hub.interval(self.cfg, self.SAT)
+        self.assertFalse(active)
+        self.assertEqual(secs, int((hub.next_active_start(self.cfg, self.SAT) - self.SAT).total_seconds()))
+        # a source's own 0 beats a global idle that would poll
+        self.cfg["hub"]["idle_every_seconds"] = 600
+        self.assertEqual(hub.source_every(self.cfg, "mail", False), 0)
+
+    def test_a_source_idle_interval_can_poll_when_the_global_one_does_not(self):
+        self.cfg["hub"]["idle_every_seconds"] = 0
+        self.watch_cfg("mail", idle_every_seconds=900)
+        self.assertEqual(hub.interval(self.cfg, self.SAT), (False, 900))
+
+    def test_a_failing_source_that_is_not_due_does_not_churn_its_client(self):
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        self.cfg["workspace"] = {"home_machine": "laptop"}
+        self.watch_cfg("tracker", every_seconds=3600)
+        self.tracker.fail = "unreachable"
+        built = []
+
+        class Cl:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        def factory(cfg, have):
+            out = dict(have)
+            for cap in cfg["hub"]["connections"]:
+                if cap not in out:
+                    built.append(cap)
+                    out[cap] = Cl()
+            return out
+        now = [self.WORK]
+        stop = threading.Event()
+        slept = [0]
+
+        def sleep(n):
+            now[0] += timedelta(seconds=n)
+            slept[0] += n
+            if slept[0] >= 2 * 3600 + 600:
+                stop.set()
+        hub.watch(self.ws, self.cfg, clock=lambda: now[0], sleep=sleep, factory=factory, stop=stop)
+        self.assertEqual(built.count("tracker"), 3)   # once per hour (0, 1, 2 h), not once per 2 minute wake
+        self.assertEqual(self.tracker.calls, 3)
+        self.assertGreater(built.count("mail"), 0)
+        self.assertEqual(built.count("mail"), 1)      # the healthy hourly-or-faster source keeps its client
+
+    def test_a_period_change_makes_a_source_due(self):
+        self.watch_cfg("mail", every_seconds=3600, idle_every_seconds=1800)
+        fri_night = datetime(2026, 10, 30, 23, 0, tzinfo=UTC)   # Friday, after hours
+        self.poll(fri_night)
+        self.assertEqual(self.mail.calls, 1)
+        self.poll(fri_night + timedelta(minutes=10))            # same period, 10 min < 30: not due
+        self.assertEqual(self.mail.calls, 1)
+        mon_early = datetime(2026, 11, 2, 5, 50, tzinfo=UTC)
+        self.poll(mon_early)                                    # idle, the interval has long passed: due
+        self.assertEqual(self.mail.calls, 2)
+        self.poll(mon_early + timedelta(minutes=5))             # 5 min later, still idle: not due
+        self.assertEqual(self.mail.calls, 2)
+        self.poll(mon_early + timedelta(minutes=10))            # working hours begin: due at once, not an hour later
+        self.assertEqual(self.mail.calls, 3)
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["_due_period"]["mail"], "active")
+
+    def test_a_clock_stepped_back_counts_as_due(self):
+        self.watch_cfg("mail", every_seconds=3600)
+        self.poll(self.WORK)
+        self.poll(self.WORK - timedelta(minutes=5))
+        self.assertEqual(self.mail.calls, 2)
+
+    def test_the_wake_interval_is_the_shortest_among_enabled_sources(self):
+        self.cfg["hub"]["every_seconds"] = 300
+        self.watch_cfg("tracker", every_seconds=600)
+        self.watch_cfg("mail", every_seconds=3600)
+        self.assertEqual(hub.interval(self.cfg, self.WORK), (True, 600))
+        self.watch_cfg("mail", every_seconds=45)
+        self.assertEqual(hub.interval(self.cfg, self.WORK), (True, 45))
+        del self.cfg["connectors"]["mail"]  # a disabled source does not count
+        self.assertEqual(hub.interval(self.cfg, self.WORK), (True, 600))
+
+    def test_the_watcher_sleeps_the_shortest_interval_and_polls_each_when_due(self):
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        self.cfg["workspace"] = {"home_machine": "laptop"}
+        self.watch_cfg("tracker", every_seconds=300)
+        self.watch_cfg("mail", every_seconds=900)
+        now = [self.WORK]
+        slept = []
+        stop = threading.Event()
+
+        def sleep(n):
+            slept.append(n)
+            now[0] += timedelta(seconds=n)
+            if sum(slept) >= 1800:
+                stop.set()
+
+        hub.watch(self.ws, self.cfg, clock=lambda: now[0], sleep=sleep, factory=lambda cfg, have: self.clients,
+                  stop=stop)
+        self.assertEqual(sum(slept), 1800)
+        self.assertEqual(self.tracker.calls, 6)  # every 300 s: at 0, 5, ... 25 minutes (then it stops)
+        self.assertEqual(self.mail.calls, 2)     # every 900 s: at 0 and 15 minutes
+
+    def test_the_watcher_refuses_a_bad_per_source_interval(self):
+        for k, v in (("every_seconds", "soon"), ("every_seconds", 0), ("idle_every_seconds", -1)):
+            cfg = json.loads(json.dumps(self.cfg))
+            cfg["hub"]["watch"]["mail"] = {k: v}
+            self.assertIn("hub.watch.mail.%s" % k, hub.config_problem(cfg))
+        self.assertIsNone(hub.config_problem(self.cfg))
+
+    def test_smoke_ignores_intervals(self):
+        import io
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        self.cfg["hub"]["watch"]["tracker"]["every_seconds"] = 86400
+        self.cfg["hub"]["watch"]["mail"] = {"every_seconds": 86400}
+
+        class C:
+            tools = []
+
+            def close(self):
+                pass
+        buf = io.StringIO()
+        saved = hub.check
+        hub.check = lambda cfg, factory=None, out=None, **kw: 0
+        self.addCleanup(setattr, hub, "check", saved)
+        hub.smoke(self.cfg, self.WORK, buf, factory=lambda cfg, have: {"tracker": C(), "mail": C()},
+                  sleep=lambda s: None)
+        self.assertEqual((self.tracker.calls, self.mail.calls), (2, 2))
+
+    def test_status_judges_each_source_against_its_own_interval(self):
+        import io
+        at = self.WORK + timedelta(minutes=30)
+
+        def beat(tracker_ago, mail_ago, active=True):
+            hub.save_json(self.ws, "watcher.json", {
+                "at": hub_sources.iso(at - timedelta(seconds=30)), "every_seconds": 120, "active": active,
+                "sources": {"tracker": {"status": "ok", "every_seconds": 600,
+                                        "at": hub_sources.iso(at - timedelta(seconds=tracker_ago))},
+                            "mail": {"status": "ok", "every_seconds": 120,
+                                     "at": hub_sources.iso(at - timedelta(seconds=mail_ago))}}, "errors": []})
+
+        def run():
+            buf = io.StringIO()
+            return hub.status(self.ws, at, out=buf), buf.getvalue()
+        beat(900, 60)  # tracker's last poll is 15 min old: fine for a 10 minute source
+        rc, out = run()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("STALE", out)
+        self.assertIn("tracker: ok, every 600s, last poll 900s ago", out)
+        beat(1300, 60)  # older than 2 x 600 s
+        rc, out = run()
+        self.assertEqual(rc, 0)  # the watcher itself is fine
+        (tl,) = [l for l in out.splitlines() if l.strip().startswith("tracker:")]
+        (ml,) = [l for l in out.splitlines() if l.strip().startswith("mail:")]
+        self.assertIn("STALE", tl)
+        self.assertNotIn("STALE", ml)
+        beat(1300, 300)  # mail: 300 s > 2 x 120 s
+        self.assertIn("STALE", [l for l in run()[1].splitlines() if l.strip().startswith("mail:")][0])
+        beat(1300, 300, active=False)  # outside active hours nothing is stale
+        self.assertNotIn("STALE", run()[1])
+
+    def test_a_beat_without_per_source_fields_prints_as_before(self):
+        import io
+        hub.save_json(self.ws, "watcher.json", {"at": hub_sources.iso(self.WORK), "every_seconds": 120,
+                                                "active": True, "sources": {"tracker": {"status": "ok"}}, "errors": []})
+        buf = io.StringIO()
+        hub.status(self.ws, self.WORK, out=buf)
+        self.assertIn("  tracker: ok\n", buf.getvalue())
+
+    def test_calendar_warning_when_checked_less_often_than_the_lead(self):
+        import io
+        self.cfg["connectors"]["calendar"] = "google"
+        self.assertIsNone(hub.calendar_warning(self.cfg))                       # 120 s <= default 10 minutes
+        self.watch_cfg("calendar", every_seconds=900, lead_minutes=10)
+        self.assertEqual(hub.calendar_warning(self.cfg),
+                         "calendar is checked every 15 min; starting-soon alerts need <= 10 min (hub.watch.calendar.lead_minutes)")
+        self.watch_cfg("calendar", lead_minutes=15)
+        self.assertIsNone(hub.calendar_warning(self.cfg))
+        self.watch_cfg("calendar", lead_minutes=5)
+        buf = io.StringIO()
+        hub.save_json(self.ws, "watcher.json", {"at": hub_sources.iso(self.WORK), "every_seconds": 120,
+                                                "active": True, "sources": {}, "errors": []})
+        hub.status(self.ws, self.WORK, out=buf, cfg=self.cfg)
+        self.assertEqual(buf.getvalue().count("warning: calendar is checked every 15 min"), 1)
+        buf = io.StringIO()
+        conn = {"command": "example-server", "args": [], "env": {}}
+        self.cfg["hub"]["connections"]["calendar"] = conn
+
+        class C:
+            tools = []
+
+            def close(self):
+                pass
+        hub.check(self.cfg, factory=lambda cfg, have: {"calendar": C(), "tracker": C(), "mail": C()},
+                  gh_user=lambda: None, which=lambda n: "/bin/" + n, out=buf)
+        self.assertEqual(buf.getvalue().count("warning: calendar is checked every 15 min"), 1)
+        del self.cfg["connectors"]["calendar"]
+        self.assertIsNone(hub.calendar_warning(self.cfg))
 
 
 class Install(unittest.TestCase):
@@ -1789,7 +2086,7 @@ class WhatsAppWatcher(unittest.TestCase):
                     "workspace": {"home_machine": "examplehost"},
                     "connectors": {"whatsapp": "whatsapp"},
                     "whatsapp": {"enabled": True, "read": True, "send": False, "self_jid": SELF_JID},
-                    "hub": {"enabled": True, "connections": {"whatsapp": {"local": "whatsapp"}},
+                    "hub": {"enabled": True, "every_seconds": 30, "connections": {"whatsapp": {"local": "whatsapp"}},
                             "watch": {"whatsapp": {"groups": [GROUP_JID]}}}}
 
     def poll(self, reader, minutes=0):
@@ -1803,7 +2100,7 @@ class WhatsAppWatcher(unittest.TestCase):
         self.poll(r)
         r.items = [wa_item("lunch?", "2026-10-29T10:00:30Z")]
         beat = self.poll(r, 1)
-        self.assertEqual(beat["sources"]["whatsapp"], {"status": "ok"})
+        self.assertEqual(beat["sources"]["whatsapp"]["status"], "ok")
         (l,) = self.inbox()
         self.assertEqual((l["source"], l["kind"], l["key"]), ("whatsapp", "update", "wa:" + DM_JID))
         r.items = [wa_item("lunch?", "2026-10-29T10:00:30Z"),
@@ -1813,13 +2110,13 @@ class WhatsAppWatcher(unittest.TestCase):
 
     def test_disabled_read_off_and_off_home_are_couldnt_check_without_an_error_line(self):
         base = self.cfg
-        for edit, word in ((lambda c: c["whatsapp"].update(enabled=False), "whatsapp.enabled"),
+        for n, (edit, word) in enumerate(((lambda c: c["whatsapp"].update(enabled=False), "whatsapp.enabled"),
                            (lambda c: c["whatsapp"].update(read=False), "whatsapp.read"),
-                           (lambda c: c["workspace"].update(home_machine="elsewhere"), "home machine")):
+                           (lambda c: c["workspace"].update(home_machine="elsewhere"), "home machine"))):
             cfg = json.loads(json.dumps(base))
             edit(cfg)
             self.cfg = cfg
-            beat = self.poll(WaReader([wa_item("hi", "2026-10-29T10:00:30Z")]))
+            beat = self.poll(WaReader([wa_item("hi", "2026-10-29T10:00:30Z")]), n)
             ent = beat["sources"]["whatsapp"]
             self.assertEqual(ent["status"], "couldnt_check")
             self.assertIn(word, ent["reason"])
@@ -1972,7 +2269,7 @@ class WhatsAppWatcher(unittest.TestCase):
         self.poll(r)
         r.items = [wa_item("lunch?", "2026-10-29T10:00:30Z")]
         beat = self.poll(r, 1)
-        self.assertEqual(beat["sources"]["whatsapp"], {"status": "ok"})
+        self.assertEqual(beat["sources"]["whatsapp"]["status"], "ok")
         self.assertEqual(len(self.inbox()), 1)
         self.assertIsInstance(hub.build_clients(self.cfg, {})["whatsapp"], hub_sources.LocalWhatsApp)
         import io
