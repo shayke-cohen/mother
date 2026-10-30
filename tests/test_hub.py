@@ -1,6 +1,7 @@
 """Tests for lib/hub.py — thing keys, inbox and state files.
 Run: python3 -m unittest tests.test_hub -v
 """
+import io
 import json
 import re
 import os
@@ -215,7 +216,8 @@ class FakeAdapter:
             return {"lines": [], "cursor": {"n": 0}, "partial": []}
         new = cls.items[cursor["n"]:]
         return {"lines": [line(key=k, at="2026-10-29T09:%02d:00Z" % i) for i, k in enumerate(new)],
-                "cursor": {"n": len(cls.items)}, "partial": getattr(cls, "partial", [])}
+                "cursor": {"n": len(cls.items)}, "partial": getattr(cls, "partial", []),
+                "notes": getattr(cls, "notes", [])}
 
 
 class Watcher(unittest.TestCase):
@@ -233,7 +235,7 @@ class Watcher(unittest.TestCase):
                             "watch": {"tracker": {"projects": ["PLAT"]}}}}
         (self.ws / "config.json").write_text(json.dumps(self.cfg))
         FakeAdapter.items, FakeAdapter.fail, FakeAdapter.calls = [], None, 0
-        FakeAdapter.partial = []
+        FakeAdapter.partial, FakeAdapter.notes = [], []
         saved = dict(hub_sources.ADAPTERS)
         hub_sources.ADAPTERS["tracker:jira"] = FakeAdapter
         self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
@@ -312,6 +314,20 @@ class Watcher(unittest.TestCase):
         self.assertEqual(beat["sources"]["tracker"]["reason"], "search failed")
         self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["tracker"], {"n": 1})
         self.assertEqual([l["kind"] for l in self.inbox()], ["update"])
+
+    def test_notes_are_recorded_without_changing_the_status(self):
+        self.poll()
+        FakeAdapter.notes = ["C00000001: lookback truncated"]
+        beat = self.poll(2)
+        self.assertEqual(beat["sources"]["tracker"], {"status": "ok", "notes": ["C00000001: lookback truncated"]})
+        self.assertEqual(beat["errors"], [])
+        saved = json.loads((self.ws / ".mother" / "hub" / "watcher.json").read_text())
+        self.assertEqual(saved["sources"]["tracker"]["notes"], ["C00000001: lookback truncated"])
+        buf = io.StringIO()
+        hub.status(self.ws, self.AT + timedelta(minutes=2), out=buf)
+        self.assertIn("tracker: ok\n    note: C00000001: lookback truncated", buf.getvalue())
+        FakeAdapter.notes = []
+        self.assertNotIn("notes", self.poll(4)["sources"]["tracker"])
 
     def test_client_that_would_not_start_is_one_error(self):
         bad = {"tracker": McpError("dropped", "server exited")}

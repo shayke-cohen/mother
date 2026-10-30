@@ -43,8 +43,14 @@ def ts_iso(ts) -> str:
     return iso(datetime.fromtimestamp(float(ts), UTC))
 
 
-def _result(lines: List[dict], cursor: dict, partial: Optional[List[str]] = None) -> dict:
-    return {"lines": hub.coalesce(lines), "cursor": cursor, "partial": partial or []}
+def _result(lines: List[dict], cursor: dict, partial: Optional[List[str]] = None,
+            notes: Optional[List[str]] = None) -> dict:
+    """`partial`: sub-reads that failed (the source is `partial`). `notes`: expected limits that are not failures
+    (a busy channel's lookback page is full); they go in `watcher.json` without changing the status."""
+    out = {"lines": hub.coalesce(lines), "cursor": cursor, "partial": partial or []}
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 class Adapter:
@@ -81,7 +87,7 @@ class ChatSlack(Adapter):
         threads = dict(cursor.get("threads") or {})
         mine = me.get("chat") or ""
         marks = [m for m in me.get("marks") or [] if m]
-        lines, partial = [], []
+        lines, partial, notes = [], [], []
         seen = list(cursor.get("seen") or [])
         followed = [t for t in cfg.get("follow") or [] if isinstance(t, str)]
         for t in cursor.get("followed") or []:  # unfollowed since the last pass: stop polling it
@@ -130,8 +136,8 @@ class ChatSlack(Adapter):
                     "latest": "%.6f" % since, "limit": MAX_HISTORY + 1}) or {}).get("messages") or []
             except McpError as e:
                 partial.append("%s: lookback %s" % (ch, e.kind))
-            if len(back) > MAX_HISTORY:
-                partial.append("%s: lookback truncated" % ch)
+            if len(back) > MAX_HISTORY:  # a busy channel fills it every pass: a note, not a failure
+                notes.append("%s: lookback truncated" % ch)
                 back = back[:MAX_HISTORY]
             for m in back:
                 if m.get("ts"):
@@ -193,7 +199,7 @@ class ChatSlack(Adapter):
                 add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
         keep = dict(list(threads.items())[-MAX_THREADS:])
         return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:],
-                                                                     "followed": followed}, partial)
+                                                                     "followed": followed}, partial, notes)
 
 
 # --------------------------------------------------------------------------------------------------- mail

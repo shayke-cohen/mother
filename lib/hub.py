@@ -527,6 +527,9 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             errors.append("%s: %s" % (cap, sources[cap]["reason"]))
         else:
             sources[cap] = {"status": "ok"}
+        notes = [str(n)[:200] for n in res.get("notes") or []][:20]
+        if notes:  # expected limits (a busy channel), not failures: the status is unchanged
+            sources[cap]["notes"] = notes
         _set_errored(ws, cap, False)
     if poll and passed and isinstance(connectors.get("tracker"), str) and connectors.get("tracker"):
         auto_follow(ws, passed, at, _watch_cfg(cfg, h, "tracker").get("projects") or [], known)
@@ -1083,6 +1086,8 @@ def status(ws: Path, at: datetime, out=None) -> int:
     for cap, ent in sorted((w.get("sources") or {}).items()):
         why = ent.get("reason")
         print("  %s: %s%s" % (cap, ent.get("status"), " (%s)" % why if why else ""), file=out)
+        for n in ent.get("notes") or []:
+            print("    note: %s" % n, file=out)
     lagging = hub_lagging(w, h, at)
     if h.get("last_wake"):
         hage = _age(h["last_wake"], at)

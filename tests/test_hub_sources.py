@@ -287,10 +287,11 @@ class TestChat(unittest.TestCase):
         newest = {"C00000001/%.6f" % (NOW - 3000 - i) for i in range(10)}
         self.assertEqual({l["key"] for l in out["lines"]}, newest)  # most recent latest_reply first
 
-    def test_lookback_truncated_is_partial(self):
+    def test_lookback_truncated_is_a_note_not_partial(self):
         page = [msg(NOW - 5000 - i) for i in range(101)]
         out, _ = self.poll(history={"C00000001": page})
-        self.assertIn("C00000001: lookback truncated", out["partial"])
+        self.assertEqual(out["notes"], ["C00000001: lookback truncated"])
+        self.assertNotIn("C00000001: lookback truncated", out["partial"])
 
     def test_lookback_failure_is_partial_and_pass_goes_on(self):
         out, _ = self.poll(history={"C00000001": [msg(NOW - 100, text="new")]},

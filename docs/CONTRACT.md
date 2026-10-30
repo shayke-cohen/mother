@@ -919,7 +919,10 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   outside; at 0 it does not poll outside them and sleeps until the next window. It rotates the inbox when the local
   day changes (the file is named for the day that ended).
 - **`watcher.json`.** `{at, every_seconds, active, last_append_at?, sources: {<cap>: {status: ok|partial|couldnt_check, reason?,
-  since?}}, errors: [str]}`. `partial` carries the adapter's sub-read failures as `reason`; `couldnt_check` carries
+  since?, notes?}}, errors: [str]}`. `partial` carries the adapter's sub-read failures as `reason`; `notes` (at most 20)
+  are expected limits the adapter reported that are not failures (`<channel>: lookback truncated`): they never change
+  the status, never enter `errors`, are printed by `mother hub status` under the source, and the panel's `✓`/`~` reads
+  only the status; `couldnt_check` carries
   why (`no connection` when `hub.connections` has no entry for the capability, or the failure), `since` is when
   the status began, and `errors` lists `<cap>: <reason>` for every source not `ok`. `last_append_at` is the poll
   time of the last pass that appended a line the hub must decide (`update`, `error` or `sweep`; a `resolved` line
@@ -1004,14 +1007,15 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   server does not offer, or offers more than once, raises `McpError` instead: that source is `partial` (an
   optional sub-read) or `couldnt_check`, and the watcher goes on. GitHub goes through `gh api` with one
   pseudo-tool, `get`, limited to the path prefixes `search/issues?` and `repos/` and no method or field flags.
-  `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
+  `poll` returns `{lines, cursor, partial, notes?}` (the tracker adds `known_projects`, see Tracker auto-follow); the first poll (no cursor) returns no lines. The manager's own
   activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
   A DM conversation is one thing, keyed `<channel>/dm`, so the manager's reply resolves it; an unthreaded reply in a
   watched channel does not resolve the message it answers, the manager's own tracker comment, status, assignee and priority edits resolve (see Own tracker edits) (accepted gaps; a comment by
   the manager does resolve).
   **Replies in unfollowed threads.** For each watched channel (config plus `watch.json` follow.channels) the chat
   adapter reads the pass's history and a lookback history (`oldest` = 7 days ago, `latest` = the cursor, one page of
-  100; a fuller page marks the source `partial` "<channel>: lookback truncated", a failed read "<channel>: lookback
+  100; a fuller page is expected on a busy channel, so it is a note "<channel>: lookback truncated" in
+  `watcher.json` (the status is unchanged), while a failed read marks the source `partial` "<channel>: lookback
   <kind>" and the pass goes on) for parents. A parent
   with `reply_count > 0` and a `latest_reply` newer than the channel cursor less the 10-minute search overlap, in
   a thread not already followed or self-tracked, has its replies read with `get_thread_replies` and emitted as usual
