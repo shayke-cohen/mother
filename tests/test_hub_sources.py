@@ -166,13 +166,20 @@ def msg(ts, user="U00000009", text="hello", **kw):
 
 
 class TestChat(unittest.TestCase):
-    def poll(self, history=None, replies=None, search=None, cursor=None, cfg=None):
+    def poll(self, history=None, replies=None, search=None, cursor=None, cfg=None, lookback_error=None,
+             reply_errors=()):
         cur = cursor or {"ts": "%.6f" % (NOW - 600), "threads": {}}
 
-        def hist(a):
-            return {"ok": True, "messages": (history or {}).get(a["channel_id"], [])}
+        def hist(a):  # honours oldest/latest/limit like the real tool; newest first
+            if "latest" in a and lookback_error:
+                raise lookback_error
+            got = [m for m in (history or {}).get(a["channel_id"], [])
+                   if float(m["ts"]) > float(a.get("oldest", 0)) and float(m["ts"]) <= float(a.get("latest", 1e18))]
+            return {"ok": True, "messages": sorted(got, key=lambda m: -float(m["ts"]))[:a.get("limit", 100)]}
 
         def rep(a):
+            if a["thread_ts"] in reply_errors:
+                raise hub_mcp.McpError("server_error", "boom")
             return {"ok": True, "messages": (replies or {}).get(a["thread_ts"], [])}
 
         def srch(a):
@@ -199,6 +206,7 @@ class TestChat(unittest.TestCase):
         self.assertEqual(mention["also"], ["PLAT-12"])
         # an unwatched channel is never read
         self.assertEqual({a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history")}, {"C00000001"})
+        self.assertEqual(len([1 for n, a in f.calls if n.endswith("get_channel_history")]), 2)  # pass + lookback
 
     def test_dm_is_one_thing_and_manager_reply_resolves_it(self):
         search = {"is:dm": [{"ts": "%.6f" % (NOW - 90), "user": "U00000006", "text": "dm", "channel": {"id": "D00000001"}},
@@ -245,6 +253,10 @@ class TestChat(unittest.TestCase):
         r = msg(NOW - 120, text="reply", thread_ts="%.6f" % parent)
         out, f = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r]})
         self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("C00000001/%.6f" % parent, "update")])
+        main, back = [a for n, a in f.calls if n.endswith("get_channel_history")]
+        self.assertNotIn("latest", main)
+        self.assertEqual(float(back["latest"]), NOW - 600)  # the cursor
+        self.assertAlmostEqual(float(back["oldest"]), AT.timestamp() - 7 * 86400, places=3)
         self.assertNotIn("C00000001/%.6f" % parent, out["cursor"]["threads"])  # not added to the followed set
         mine = msg(NOW - 60, user="U00000000", text="ok", thread_ts="%.6f" % parent)
         out, _ = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r, mine]})
@@ -274,6 +286,28 @@ class TestChat(unittest.TestCase):
         self.assertIn("more than 10 active threads in C00000001", out["partial"])
         newest = {"C00000001/%.6f" % (NOW - 3000 - i) for i in range(10)}
         self.assertEqual({l["key"] for l in out["lines"]}, newest)  # most recent latest_reply first
+
+    def test_lookback_truncated_is_partial(self):
+        page = [msg(NOW - 5000 - i) for i in range(101)]
+        out, _ = self.poll(history={"C00000001": page})
+        self.assertIn("C00000001: lookback truncated", out["partial"])
+
+    def test_lookback_failure_is_partial_and_pass_goes_on(self):
+        out, _ = self.poll(history={"C00000001": [msg(NOW - 100, text="new")]},
+                           lookback_error=hub_mcp.McpError("server_error", "boom"))
+        self.assertEqual(len(out["lines"]), 1)
+        self.assertEqual(out["partial"], ["C00000001: lookback server_error"])
+
+    def test_unreadable_thread_is_partial_others_still_read(self):
+        hist, reps = [], {}
+        for i in range(2):
+            parent = NOW - 3000 - i
+            hist.append(self._parent(parent, NOW - 100 - i))
+            reps["%.6f" % parent] = [msg(NOW - 100 - i, thread_ts="%.6f" % parent)]
+        bad = "%.6f" % (NOW - 3000)
+        out, _ = self.poll(history={"C00000001": hist}, replies=reps, reply_errors=(bad,))
+        self.assertEqual(len(out["lines"]), 1)
+        self.assertEqual(out["partial"], ["C00000001/%s: replies unreadable" % bad])
 
     def test_followed_thread_always_read(self):
         parent = NOW - 3000

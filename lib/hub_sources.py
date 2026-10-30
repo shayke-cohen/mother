@@ -123,12 +123,16 @@ class ChatSlack(Adapter):
             # Replies in threads nobody follows: a parent with replies newer than the cursor (less the search
             # overlap). History lists parents by their own time, so an older parent needs a lookback read.
             heads = {m["ts"]: m for m in got if m.get("ts")}
+            back = []
             try:
                 back = (client.call("get_channel_history", {
                     "channel_id": ch, "oldest": "%.6f" % (at.timestamp() - THREAD_DAYS * 86400),
-                    "latest": "%.6f" % since, "limit": MAX_HISTORY}) or {}).get("messages") or []
-            except McpError:
-                back = []
+                    "latest": "%.6f" % since, "limit": MAX_HISTORY + 1}) or {}).get("messages") or []
+            except McpError as e:
+                partial.append("%s: lookback %s" % (ch, e.kind))
+            if len(back) > MAX_HISTORY:
+                partial.append("%s: lookback truncated" % ch)
+                back = back[:MAX_HISTORY]
             for m in back:
                 if m.get("ts"):
                     heads.setdefault(m["ts"], m)
@@ -144,7 +148,11 @@ class ChatSlack(Adapter):
             if len(active) > MAX_NEW_THREADS:
                 partial.append("more than %d active threads in %s" % (MAX_NEW_THREADS, ch))
             for _, tts in active[:MAX_NEW_THREADS]:
-                res = client.call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                try:
+                    res = client.call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                except McpError:
+                    partial.append("%s/%s: replies unreadable" % (ch, tts))
+                    continue
                 for m in (res or {}).get("messages") or []:
                     if m.get("ts") != tts:
                         add(ch, dict(m, thread_ts=tts), floor=since - SEARCH_OVERLAP)

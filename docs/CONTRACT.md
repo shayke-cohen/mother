@@ -1000,15 +1000,18 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
   activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
   A DM conversation is one thing, keyed `<channel>/dm`, so the manager's reply resolves it; an unthreaded reply in a
-  watched channel does not resolve the message it answers, the manager's own tracker comment, status, assignee and priority edits resolve (see Own tracker edits) (both accepted gaps; a comment by
+  watched channel does not resolve the message it answers, the manager's own tracker comment, status, assignee and priority edits resolve (see Own tracker edits) (accepted gaps; a comment by
   the manager does resolve).
   **Replies in unfollowed threads.** For each watched channel (config plus `watch.json` follow.channels) the chat
-  adapter reads the pass's history and a lookback history (the last 7 days, up to the cursor) for parents. A parent
+  adapter reads the pass's history and a lookback history (`oldest` = 7 days ago, `latest` = the cursor, one page of
+  100; a fuller page marks the source `partial` "<channel>: lookback truncated", a failed read "<channel>: lookback
+  <kind>" and the pass goes on) for parents. A parent
   with `reply_count > 0` and a `latest_reply` newer than the channel cursor less the 10-minute search overlap, in
   a thread not already followed or self-tracked, has its replies read with `get_thread_replies` and emitted as usual
   (key `<channel>/<thread_ts>`, deduped by the seen-set, the manager's own replies `resolved`). At most 10 such
   threads per channel per pass, newest `latest_reply` first; more mark the source `partial` ("more than 10 active
-  threads in <channel>"). These threads are not added to the persistent followed set (only the manager's own posts
+  threads in <channel>"); a thread whose replies cannot be read is `partial` "<channel>/<ts>: replies unreadable" and the
+  others still read. These threads are not added to the persistent followed set (only the manager's own posts
   do that). Followed threads (`watch.json` follow.threads) are always read.
   **Tracker auto-follow.** After a pass's lines are appended, a tracker key (`PROJ-n`) in any line's `key` or `also`
   whose project is not configured, followed, auto-followed, muted (as a key) or `unfollowed` is added to
