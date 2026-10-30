@@ -20,6 +20,7 @@ MAX_THREADS = 25
 MAX_MAIL = 20
 MAX_ISSUES = 50
 MAX_HISTORY = 100
+MAX_NEW_THREADS = 10  # unfollowed threads read per watched channel per pass
 MAIL_LINK = "https://mail.google.com/mail/u/0/#all/%s"
 THREAD_DAYS = 7
 SEARCH_OVERLAP = 600
@@ -119,6 +120,34 @@ class ChatSlack(Adapter):
                 partial.append("%s: more than %d new messages" % (ch, MAX_HISTORY))
             for m in got:
                 add(ch, m)
+            # Replies in threads nobody follows: a parent with replies newer than the cursor (less the search
+            # overlap). History lists parents by their own time, so an older parent needs a lookback read.
+            heads = {m["ts"]: m for m in got if m.get("ts")}
+            try:
+                back = (client.call("get_channel_history", {
+                    "channel_id": ch, "oldest": "%.6f" % (at.timestamp() - THREAD_DAYS * 86400),
+                    "latest": "%.6f" % since, "limit": MAX_HISTORY}) or {}).get("messages") or []
+            except McpError:
+                back = []
+            for m in back:
+                if m.get("ts"):
+                    heads.setdefault(m["ts"], m)
+            active = []
+            for tts, m in heads.items():
+                try:
+                    newest, n = float(m.get("latest_reply") or 0), int(m.get("reply_count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if n > 0 and newest > since - SEARCH_OVERLAP and "%s/%s" % (ch, tts) not in threads:
+                    active.append((newest, tts))
+            active.sort(reverse=True)
+            if len(active) > MAX_NEW_THREADS:
+                partial.append("more than %d active threads in %s" % (MAX_NEW_THREADS, ch))
+            for _, tts in active[:MAX_NEW_THREADS]:
+                res = client.call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                for m in (res or {}).get("messages") or []:
+                    if m.get("ts") != tts:
+                        add(ch, dict(m, thread_ts=tts), floor=since - SEARCH_OVERLAP)
 
         for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
             if "/" not in key:

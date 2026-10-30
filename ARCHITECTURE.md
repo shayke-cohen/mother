@@ -117,7 +117,6 @@ Accepted gaps (also in CONTRACT §5e):
 
 - The tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description), and without a changelog it cannot tell the manager's own changes to those four from anyone else's: they come through as updates (a comment by the manager does resolve).
 - An unthreaded reply in a watched channel does not resolve the message it answers; only a reply in the thread (or in a DM) does.
-- Replies in threads the watcher does not follow (ones the manager has not posted in) are not read.
 
 ## Invariants the code relies on
 

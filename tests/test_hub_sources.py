@@ -198,7 +198,7 @@ class TestChat(unittest.TestCase):
         mention = [l for l in out["lines"] if l["key"].startswith("C00000077")][0]
         self.assertEqual(mention["also"], ["PLAT-12"])
         # an unwatched channel is never read
-        self.assertEqual([a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history")], ["C00000001"])
+        self.assertEqual({a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history")}, {"C00000001"})
 
     def test_dm_is_one_thing_and_manager_reply_resolves_it(self):
         search = {"is:dm": [{"ts": "%.6f" % (NOW - 90), "user": "U00000006", "text": "dm", "channel": {"id": "D00000001"}},
@@ -235,6 +235,53 @@ class TestChat(unittest.TestCase):
                                                        msg(NOW - 120, text="reply", thread_ts="%.6f" % parent)]},
                            cursor=cur)
         self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [(pkey, "update")])
+
+    def _parent(self, ts, latest, n=1, **kw):
+        return msg(ts, reply_count=n, latest_reply="%.6f" % latest, **kw)
+
+    def test_new_reply_in_unfollowed_thread_is_read(self):
+        parent = NOW - 3000  # older than the cursor: found by the lookback read
+        p = self._parent(parent, NOW - 120)
+        r = msg(NOW - 120, text="reply", thread_ts="%.6f" % parent)
+        out, f = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r]})
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("C00000001/%.6f" % parent, "update")])
+        self.assertNotIn("C00000001/%.6f" % parent, out["cursor"]["threads"])  # not added to the followed set
+        mine = msg(NOW - 60, user="U00000000", text="ok", thread_ts="%.6f" % parent)
+        out, _ = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r, mine]})
+        self.assertIn("resolved", [l["kind"] for l in out["lines"]])
+
+    def test_old_threads_not_reread(self):
+        parent = NOW - 3000
+        p = self._parent(parent, NOW - 2000)
+        out, f = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p]})
+        self.assertEqual(out["lines"], [])
+        self.assertEqual([n for n, a in f.calls if n.endswith("get_thread_replies")], [])
+        p = self._parent(parent, NOW - 120)
+        r = msg(NOW - 120, thread_ts="%.6f" % parent)
+        out, _ = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r]})
+        again, f = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r]}, cursor=out["cursor"])
+        self.assertEqual(again["lines"], [])  # the seen-set dedupes a thread read again within the overlap
+
+    def test_thread_cap_marks_partial(self):
+        hist, reps = [], {}
+        for i in range(12):
+            parent = NOW - 3000 - i
+            hist.append(self._parent(parent, NOW - 100 - i))
+            reps["%.6f" % parent] = [msg(NOW - 100 - i, thread_ts="%.6f" % parent)]
+        out, f = self.poll(history={"C00000001": hist}, replies=reps)
+        self.assertEqual(len([1 for n, a in f.calls if n.endswith("get_thread_replies")]), 10)
+        self.assertEqual(len(out["lines"]), 10)
+        self.assertIn("more than 10 active threads in C00000001", out["partial"])
+        newest = {"C00000001/%.6f" % (NOW - 3000 - i) for i in range(10)}
+        self.assertEqual({l["key"] for l in out["lines"]}, newest)  # most recent latest_reply first
+
+    def test_followed_thread_always_read(self):
+        parent = NOW - 3000
+        pkey = "C00000001/%.6f" % parent
+        r = msg(NOW - 120, thread_ts="%.6f" % parent)
+        out, _ = self.poll(replies={"%.6f" % parent: [msg(parent), r]},
+                           cfg={"channels": ["C00000001"], "follow": [pkey]})
+        self.assertEqual([l["key"] for l in out["lines"]], [pkey])
 
     def test_own_activity_is_resolved_not_candidate(self):
         out, _ = self.poll(history={"C00000001": [msg(NOW - 100, user="U00000000", text="on it")]})
