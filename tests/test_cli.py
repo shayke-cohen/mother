@@ -1021,6 +1021,27 @@ class HubConfig(unittest.TestCase):
             self.assertEqual(r.returncode, 1, key)
             self.assertIn("hub." + key, r.stdout)
 
+    def test_hub_per_source_intervals_are_valid(self):
+        watch = {"chat": {"every_seconds": 30}, "mail": {"every_seconds": 3600, "idle_every_seconds": 0},
+                 "tracker": {"projects": ["PLAT"], "every_seconds": 600, "idle_every_seconds": 86400},
+                 "calendar": {"lead_minutes": 20, "every_seconds": 900}, "code": {"every_seconds": 600},
+                 "whatsapp": {"idle_every_seconds": 1800}}
+        r = self.status_with(lambda b: b.update(watch=watch))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_hub_bad_per_source_intervals_fail(self):
+        for src, key, val in (("mail", "every_seconds", 29), ("mail", "every_seconds", 86401),
+                              ("chat", "every_seconds", "10m"), ("code", "every_seconds", True),
+                              ("tracker", "idle_every_seconds", -1), ("calendar", "idle_every_seconds", 86401),
+                              ("whatsapp", "idle_every_seconds", 1.5)):
+            r = self.status_with(lambda b: b.update(watch={src: {key: val}}))
+            self.assertEqual(r.returncode, 1, (src, key, val))
+            self.assertIn("hub.watch.%s.%s" % (src, key), r.stdout)
+
+    def test_hub_calendar_interval_longer_than_lead_still_validates(self):
+        r = self.status_with(lambda b: b.update(watch={"calendar": {"lead_minutes": 5, "every_seconds": 3600}}))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_hub_watch_shape_fails(self):
         for watch in ({"chat": {"channels": "C1"}}, {"calendar": {"lead_minutes": "x"}}, {"nope": {}},
                       {"mail": {"ignore_senders": [1]}}, {"tracker": {"extra_jql": 3}}):

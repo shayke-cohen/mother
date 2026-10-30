@@ -128,9 +128,12 @@ HUB_KEYS = {"enabled", "every_seconds", "idle_every_seconds", "model", "max_card
             "update_ttl_hours", "connections", "watch"}
 HUB_CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
 HUB_CONN_KEYS = {"command", "args", "env", "cli", "local"}
-HUB_WATCH_KEYS = {"chat": {"channels"}, "mail": {"ignore_senders", "ignore_labels"},
-                  "tracker": {"projects", "extra_jql"}, "calendar": {"lead_minutes"}, "code": {"repos"},
-                  "whatsapp": {"groups"}}
+HUB_WATCH_INTERVALS = {"every_seconds", "idle_every_seconds"}
+HUB_WATCH_KEYS = {"chat": {"channels"} | HUB_WATCH_INTERVALS,
+                  "mail": {"ignore_senders", "ignore_labels"} | HUB_WATCH_INTERVALS,
+                  "tracker": {"projects", "extra_jql"} | HUB_WATCH_INTERVALS,
+                  "calendar": {"lead_minutes"} | HUB_WATCH_INTERVALS, "code": {"repos"} | HUB_WATCH_INTERVALS,
+                  "whatsapp": {"groups"} | HUB_WATCH_INTERVALS}
 
 
 TICK_EVERY = (30, 60, 120, 180, 240)
@@ -408,6 +411,10 @@ def validate_hub(h) -> list:
         for k, v in w.items():
             if k not in HUB_WATCH_KEYS[src]:
                 errs.append(f"unknown key {where}.{k}")
+            elif k in ("every_seconds", "idle_every_seconds"):
+                lo = 30 if k == "every_seconds" else 0
+                if not is_int(v) or not lo <= v <= 86400:
+                    errs.append(f"{where}.{k} must be an integer {lo}-86400")
             elif k == "lead_minutes":
                 if not is_int(v) or v < 0:
                     errs.append(f"{where}.{k} must be an integer >= 0")

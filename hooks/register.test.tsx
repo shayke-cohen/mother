@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { hubStatus } from './register'
+import { hubStatus, sourceStale } from './register'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-10-26T10:00:00Z')
@@ -737,6 +737,37 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await ui.find({ key: 'hub-restart' })).toBeUndefined()
     expect(out.fills).toEqual([])
     await ui.unmount()
+  })
+
+  test(`a source is marked stale against its own interval, not the watcher's, on ${surface}`, async ($, on) => {
+    const sources = {
+      chat: { status: 'ok', every_seconds: 120, at: iso(MIN) },
+      mail: { status: 'ok', every_seconds: 3600, at: iso(90 * MIN) },       // 90 min old, but hourly: fine
+      tracker: { status: 'ok', every_seconds: 600, at: iso(25 * MIN) },     // older than 2 x 10 min: stale
+      code: { status: 'ok' },                                                // no per-source fields: not judged
+    }
+    // the watcher itself polled a minute ago, so the hub stays alive: only the one source is marked
+    expect(hubStatus(bundle(watcher({ sources }), hubDoc(), null), NOW)).toBe(' · hub ●')
+    await boot($, on, hubFiles(watcher({ sources }), hubDoc(), null))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /chat ✓ ·/)).toBe(true)
+    expect(await hasText(ui, /mail ✓ ·/)).toBe(true)
+    expect(await hasText(ui, /tracker ✓ stale/)).toBe(true)
+    expect(await hasText(ui, /code ✓/)).toBe(true)
+    expect(await hasText(ui, /code ✓ stale/)).toBe(false)
+    expect(await hasText(ui, /^[▾▸] Hub ●$/)).toBe(true)
+    await ui.unmount()
+  })
+
+  test(`sourceStale: own interval, active hours only, ${surface}`, () => {
+    const row = (every: number, ago: number) => ({ every_seconds: every, at: iso(ago) })
+    expect(sourceStale(row(600, 19 * MIN), true, NOW)).toBe(false)
+    expect(sourceStale(row(600, 21 * MIN), true, NOW)).toBe(true)
+    expect(sourceStale(row(600, 21 * MIN), false, NOW)).toBe(false)   // outside active hours
+    expect(sourceStale(row(0, 21 * MIN), true, NOW)).toBe(false)      // not polled in this period
+    expect(sourceStale({ every_seconds: 600 }, true, NOW)).toBe(false)
+    expect(sourceStale({ every_seconds: 600, at: 'garbage' }, true, NOW)).toBe(false)
+    expect(sourceStale(null, true, NOW)).toBe(false)
   })
 
   test(`Restart hub shows when watcher.json is missing, and when it is stale, on ${surface}`, async ($, on) => {

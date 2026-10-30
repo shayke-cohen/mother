@@ -198,6 +198,19 @@ own reply in the DM clears it. To use your self-DM (the DM with yourself) as an 
 <its D… id>`: every note you type there becomes a thing the hub routes or proposes, like `mother hub add` (posts made by apps,
 MOTHER's included, are skipped).
 
+Each source can be checked at its own pace. The watcher wakes on the shortest interval and polls a source only when its own is due; set `every_seconds` (working hours, 30-86400) and `idle_every_seconds` (outside them; `0` means only during working hours) under `hub.watch.<source>`, and leave a source out to keep the global `hub.every_seconds` / `hub.idle_every_seconds`:
+
+```json
+"watch": {
+  "mail":     {"every_seconds": 3600},
+  "calendar": {"every_seconds": 900, "lead_minutes": 15},
+  "tracker":  {"every_seconds": 600, "projects": ["PLAT"]},
+  "code":     {"every_seconds": 600}
+}
+```
+
+Here chat and WhatsApp stay on the default. `mother hub status` shows each source's interval and marks one STALE when its own last poll is more than twice its interval old; `mother hub check` warns when the calendar is checked less often than `lead_minutes`, because starting-soon alerts would arrive late.
+
 WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 
 You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** and **Mute** on a hub session or hub update. It can't fetch the web or edit files; for those it proposes a session.
