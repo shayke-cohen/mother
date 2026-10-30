@@ -104,9 +104,10 @@ only in an interactive `/mother:doctor`.
 ```
 launchd: mother hub watch   (lib/hub.py + hub_mcp.py + hub_sources.py, no model, read-only allow-list)
   ├─ per connection: read-only MCP over stdio (or `gh`) → adapter → deterministic prefilter
+  ├─ chat also reads the DMs mapped in watch.json follow.dms (`mother hub dms set`) and the self-DM inbox (follow.inbox → `manual` lines)
   ├─ appends one line per changed thing to .mother/hub/inbox.jsonl; heartbeat in watcher.json
   └─ records nothing in capabilities.json: watcher.json plus one inbox `error` line are the record
-pinned desktop session (/mother:hub): Monitor on `tail --follow` wakes it on each new line; the cron fallback wakes it every 3 minutes and ends at once when `tail --once` prints nothing
+pinned desktop session (/mother:hub): Monitor on `tail --follow` wakes it on each new line (re-armed every 30 minutes in active hours; outside them a one-shot `/mother:hub` cron for the next window instead); the cron fallback wakes it every 3 minutes and ends at once when `tail --once` prints nothing
   ├─ mother hub decide   → log / Now row only │ send_message into the thing's session │ proposal card
   ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
   ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`); pending and unseen expire after update_ttl_hours working hours

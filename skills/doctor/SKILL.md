@@ -39,6 +39,13 @@ a call. Use `config.json` `connectors.*` to know which kinds matter; a kind set 
 not reported as a gap. WhatsApp is not an MCP connector (its reader is local, `mother whatsapp status`
 shows it), and the hub's `whatsapp` source needs no entry in `connectors`: never list it as a missing connector.
 
+**Hub DMs.** If `hub.enabled` is true and `hub.connections.chat` is set, run `mother hub dms show`. When it says no
+DMs are mapped, add one fix row: the watcher reads no DMs until the map is filled. To fill the DM map, list your
+DMs with the Slack connector (`slack_list_user_channels`, types im) in a normal MOTHER session, match user ids to
+the people in config, then run `mother hub dms set …` (one `<user id>=<DM id>` per person). You may do the listing
+and matching yourself in this session when the connector is there, and show the `mother hub dms set` command for
+the manager's yes; `mother hub dms inbox <self-DM id>` makes their self-DM an inbox.
+
 **The old panel plugin.** If `mother-now` is still installed (it shows in `claude plugin list`, or as a `mother-now` folder under the plugin directories), flag it in the report: "uninstall it: /plugin uninstall mother-now@mother" (the panel now ships inside `mother`, and two copies load twice). Do not run it for the manager.
 
 **Test every server of a kind, not only the main one.** Two servers often serve one kind (a corporate
