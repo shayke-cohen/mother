@@ -115,7 +115,7 @@ Now panel: Hub section (status, sessions, updates); the Open button fills the pr
 
 Accepted gaps (also in CONTRACT §5e):
 
-- The tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description), and without a changelog it cannot tell the manager's own changes to those four from anyone else's: they come through as updates (a comment by the manager does resolve).
+- The tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description). It reads the changelog to tell the manager's own status, assignee and priority edits from anyone else's: a line resolves only when every such change since the cursor is the manager's, and a changelog it cannot read leaves an update (a comment by the manager does resolve).
 - An unthreaded reply in a watched channel does not resolve the message it answers; only a reply in the thread (or in a DM) does.
 
 ## Invariants the code relies on

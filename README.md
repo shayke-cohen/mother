@@ -66,6 +66,11 @@ The approval guard is a hook, so it runs in **every** Claude Code session, not o
   `gh api -X DELETE` in any repo. Run those yourself in a terminal.
 - Calls that aren't outbound are untouched; your normal permission rules apply. (A second hook on reads exists
   only for channel reply sessions and exits immediately everywhere else.)
+- The guard is a Python process started on every tool call, so each call costs about a tenth of a second more.
+- Edits to `~/.claude/settings.json`, `settings.local.json`, `~/.claude.json` or anything under
+  `~/.claude/plugins/` ask in **every** session, since they could switch the guard off.
+- A session that ran `mother hub tail` is treated as a hub: it stays fenced to hub work (see below) even after
+  a newer hub starts (the guard remembers the last five), so use a fresh session for anything else.
 
 The Stop hook runs `mother sync`, which only acts on your workspace. Before you have one, it does nothing.
 
