@@ -457,7 +457,7 @@ def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
     if cap == "whatsapp":  # the adapter has no client config of its own: it needs the `whatsapp` block
         wa = (cfg or {}).get("whatsapp")
         wa = wa if isinstance(wa, dict) else {}
-        w["_local"] = {"enabled": wa.get("enabled") is True, "read": wa.get("read") is True,
+        w["_local"] = {"enabled": wa.get("enabled") is True, "read": wa.get("read", True) is True,
                        "self_jid": wa.get("self_jid") if isinstance(wa.get("self_jid"), str) else "",
                        "home": home_status(cfg) == 0}
     return w

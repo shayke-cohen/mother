@@ -1085,7 +1085,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `lib/whatsapp.py` (§5d) and nothing else: the client the watcher builds for it (`LocalWhatsApp`) has three
   methods, `head` (the newest message row id), `messages_after` (`read_messages_after`) and `ping` (one
   `recent_chats(limit=1)`), no send path, and never imports or calls the bridge; it needs no program on the
-  launchd `PATH`. It runs only when `whatsapp.enabled`, `whatsapp.read` and `whatsapp.self_jid` are set and this
+  launchd `PATH`. It runs only when `whatsapp.enabled` and `whatsapp.self_jid` are set, `whatsapp.read` is not
+  `false` (absent means on, as for `mother whatsapp read`), and this
   is the home machine; otherwise the source is `couldnt_check` with that reason (`whatsapp.read is not true in
   config.json`, `not the home machine …`), a config gap with no `error` line. A `ReaderError` (database missing,
   locked, `schema_changed`, or `denied`: Full Disk Access is missing) is `couldnt_check` with the reader's reason

@@ -1834,6 +1834,14 @@ class WhatsAppWatcher(unittest.TestCase):
         buf = io.StringIO()
         self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"whatsapp": r}, out=buf), 0, buf.getvalue())
 
+    def test_read_defaults_on_like_the_rest_of_whatsapp(self):
+        # `mother whatsapp setup` writes `enabled` but no `read`; lib/whatsapp.py treats a missing `read` as on
+        wa = dict(self.cfg["whatsapp"])
+        wa.pop("read", None)
+        self.assertTrue(hub._watch_cfg(dict(self.cfg, whatsapp=wa), {}, "whatsapp")["_local"]["read"])
+        wa["read"] = False
+        self.assertFalse(hub._watch_cfg(dict(self.cfg, whatsapp=wa), {}, "whatsapp")["_local"]["read"])
+
     def test_a_local_connection_needs_no_program_on_the_path(self):
         found, missing = hub.resolve_programs(self.cfg, which=lambda n: None)
         self.assertEqual((found, missing), ({}, []))
