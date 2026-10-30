@@ -41,8 +41,8 @@ shows it), and the hub's `whatsapp` source needs no entry in `connectors`: never
 
 **Hub DMs.** If `hub.enabled` is true and `hub.connections.chat` is set, run `mother hub dms show`. When it says no
 DMs are mapped, add one fix row: the watcher reads no DMs until the map is filled. To fill the DM map, list your
-DMs with the Slack connector (`slack_list_user_channels`, types im) in a normal MOTHER session, match user ids to
-the people in config, then run `mother hub dms set …` (one `<user id>=<DM id>` per person). You may do the listing
+DMs with the chat connector's DM listing (types im) in a normal MOTHER session, match user ids to
+the people in config, then run `mother hub dms set …` (one `<user id>=<DM id>` per person, never the manager's own id). You may do the listing
 and matching yourself in this session when the connector is there, and show the `mother hub dms set` command for
 the manager's yes; `mother hub dms inbox <self-DM id>` makes their self-DM an inbox.
 
@@ -110,7 +110,7 @@ through the approval guard and the manager approves it there.
 
 | Kind | Check | Leaves behind |
 |---|---|---|
-| chat `post` | Post `"[<agent> test] doctor check — ignore"` to the manager's own DM | One DM |
+| chat `post` | Post `"<signature>\n[<agent> test] doctor check — ignore"` (the signature on the first line, rules/outbound.md) to the manager's own DM | One DM |
 | tracker `create` → `comment` → `transition` | In a project the **manager names** (suggest a personal or sandbox one; never a team's live board by default): create `"[<agent> test] doctor check"`, add one comment, transition to the done/closed state (read available transitions first) | One closed item, labelled |
 | tracker `sprint` | Only on a sandbox board the manager names. Read the sprint list first. Sprint updates can be a **full replace** — send every field (name, state, start, end, goal) copied from the read. Names may be capped at 30 characters | Nothing, or one test sprint |
 | mail `draft` | Create a draft to the manager, subject `"[<agent> test] doctor check"` | One draft for the manager to discard |

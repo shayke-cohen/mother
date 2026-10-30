@@ -40,8 +40,9 @@ It writes the `runs.md` line from the **Runs note** below.
    - The headless runs need the same permission rules as unattended routines.
    - If both briefs come back as "couldn't check" everywhere, the run lacked permissions. Note it, and
      don't post the pair.
-3. **Post one DM** to `manager.chat_dm`:
+3. **Post one DM** to `manager.chat_dm`, with the signature (rules/outbound.md) on the first line:
    ```
+   <signature>
    A/B brief <pairs_so_far>/10 — pair <pair>. Which of these two briefs was more useful today?
    Reply in this thread: `ab x`, `ab y` or `ab same`, plus a few words on why.
 

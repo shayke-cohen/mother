@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck, the sprint plan and WhatsApp, covered by 834 automated tests. One manager's workspace has
+> routines, the meeting deck, the sprint plan and WhatsApp, covered by 841 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -190,12 +190,13 @@ so those turns cost little. Outside active hours it doesn't re-arm: it schedules
 start of your next active window and goes quiet until then.
 
 **DMs and your self-DM.** The watcher's Slack server can't list your DMs, so it reads a DM only when you map it. To
-fill the DM map, list your DMs with the Slack connector (`slack_list_user_channels`, types im) in a normal MOTHER
+fill the DM map, list your DMs with your chat connector's DM listing (types im) in a normal MOTHER
 session, match the user ids to the people in `config.json`, then run `mother hub dms set …`, for example
-`mother hub dms set U00000001=D00000001 U00000002=D00000002` (only people in config are accepted; `mother hub dms
+`mother hub dms set U00000001=D00000001 U00000002=D00000002` (only people in config are accepted, not your own id; `mother hub dms
 show` lists the map, `mother hub dms drop U00000001` removes one). A message from that person reaches the hub; your
 own reply in the DM clears it. To use your self-DM (the DM with yourself) as an inbox, run `mother hub dms inbox
-<its D… id>`: every note you post there becomes a thing the hub routes or proposes, like `mother hub add`.
+<its D… id>`: every note you type there becomes a thing the hub routes or proposes, like `mother hub add` (posts made by apps,
+MOTHER's included, are skipped).
 
 WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 

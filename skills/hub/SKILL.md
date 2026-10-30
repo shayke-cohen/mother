@@ -25,8 +25,9 @@ wake mechanism and catches up from the cursor.
    if a source fails), and carry on: lines catch up when it returns.
 2. If `hub.model` in `$W/config.json` is set and differs from this session's model, set it on this session with
    the session-model tool (the app asks the manager). Don't change anything else about the session.
-3. **Stop what an earlier start left**: stop any Monitor this session started for `mother hub tail`, and delete any
-   recurring cron prompt that runs `mother hub tail`.
+3. **Stop what an earlier start left**: stop any Monitor this session started for `mother hub tail`, delete any
+   recurring cron prompt that runs `mother hub tail`, and delete any pending one-shot `/mother:hub` cron prompt (an
+   off-hours wake this run replaces; list them first).
 4. **Catch up first**: run `mother hub tail --once` and handle every printed line as on any wake (below), down to
    the `decide` call. Only then start the wake mechanism, so the backlog is not printed to you twice. (A line you
    decide twice comes back `already_decided` and changes nothing.)
@@ -46,9 +47,9 @@ A Monitor lasts at most 30 minutes. Each expiry wakes you for one small model tu
 so keep that turn short (set `hub.model` to a small model to make it cheap). On the expiry notice:
 
 1. Run `mother hub tail --once` and handle any printed line as on any wake (it usually prints nothing).
-2. Run `mother hub status` and read the watcher line:
-   - **active hours**: re-arm the same Monitor (`mother hub tail --follow`, `timeout_ms` 1800000), then end the turn.
-   - **outside active hours**: do NOT re-arm. Create one non-recurring cron prompt (`recurring: false`) with the
+2. Run `mother hub status` and read its `now:` line (judged from the clock now, not the watcher's last pass):
+   - **`now: active hours`**: re-arm the same Monitor (`mother hub tail --follow`, `timeout_ms` 1800000), then end the turn.
+   - **`now: outside active hours`**: do NOT re-arm. Create one non-recurring cron prompt (`recurring: false`) with the
      exact prompt `/mother:hub` (the only other prompt the guard allows here) and the cron fields from the status
      line `next active window: … (one-shot cron: M H D Mo *)`. Then end the turn. That run restarts the hub at
      the start of the window and catches up on anything the watcher appended overnight.
@@ -151,10 +152,12 @@ A turn the manager typed (not a wake, not a line) is a request to you. Handle th
 | drop a card waiting for them | `mother hub pending drop <key> --json`, then `dismiss_task` with its `task_id` |
 
 **DMs and the self-DM inbox.** The watcher reads a DM only when it is in the DM map, and its own Slack server
-cannot list DMs. To fill the DM map, list your DMs with the Slack connector (`slack_list_user_channels`, types im)
-in a normal MOTHER session, match user ids to the people in config, then run `mother hub dms set …`, for example
-`mother hub dms set U00000001=D00000001 U00000002=D00000002`. A DM line has key `<DM id>/dm`: the person's message
-is an `update`, the manager's reply resolves it. A line from the inbox is a `manual` line like one `add` wrote.
+cannot list DMs. To fill the DM map, list your DMs with the chat connector's DM listing (types im, which gives each
+DM's id and the other person's user id) in a normal MOTHER session, match user ids to the people in config, then run `mother hub dms set …`, for example
+`mother hub dms set U00000001=D00000001 U00000002=D00000002` (never the manager's own id: their self-DM is the
+inbox). A DM line has key `<DM id>/dm`: the person's message
+is an `update`, the manager's reply resolves it. A line from the inbox is a `manual` line like one `add` wrote: only notes the manager typed there count, never a
+post an app or MOTHER made.
 
 **A session the manager asks for.** Link it to its key, so later lines route into it:
 1. Find the key (`PLAT-12`, `owner/repo#12`, `<channel>/<ts>`; for anything else the key `mother hub add` prints).
