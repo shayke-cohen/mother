@@ -154,6 +154,16 @@ keeps a short summary per thing, a summary of at most 300 characters, never full
 - People data is work items only: no performance assessments, no mood tracking. Setup offers a short
   "what the agent reads" note for the team.
 - Digests keep disagreements visible instead of smoothing them into one summary.
+- **Workspace shell allow-list.** In a MOTHER workspace session a shell command runs unasked only when it matches
+  the allow-list of commands the skills and routines use; anything else asks, so an injected `curl` or a
+  disguised interpreter can't slip past a deny-list.
+- **Signed grants.** Unattended writes need a grant citing the manager's own message. `mother grant add` is the
+  only writer, it signs the file with a key kept outside the workspace, the guard ignores unsigned grants, and
+  every `grant add` asks the manager, so a run fed a forged instruction can't grant itself anything.
+- **The hub fence.** The hub session reads text from anyone who can message the manager, so the guard lets it run
+  only exact command templates (`mother hub …`, a few read-only `gh` views), reads inside the workspace and
+  plugin, MCP reads that carry nothing out, and the in-app session tools. Any session that ran `mother hub tail`
+  stays fenced, so a takeover can't unfence an older hub.
 
 ## Ideas queue
 

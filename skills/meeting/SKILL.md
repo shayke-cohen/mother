@@ -66,7 +66,9 @@ number names its source and time (`meta.sources`, `meta.generated`). Put `teams/
 next to it with the goals and decisions in text.
 
 Then **publish** it where `teams[].meetings.weekly.publish` says (`file` = just the path; any other value = the page-hosting connector of that name the manager set up;
-publish under a stable slug such as `<team-slug>-<sprint-slug>-plan`, unlisted, and overwrite it on later runs) and DM the
+publish under a stable slug such as `<team-slug>-<sprint-slug>-plan`, unlisted, and overwrite it on later runs; the
+guard asks before that publish, which is fine in a session, but an unattended run (the `meeting-prep` routine)
+falls back to `file` and says in the DM that publishing needs the manager's OK) and DM the
 manager:
 
 1. the link and the 5 lines that matter most;

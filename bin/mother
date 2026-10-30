@@ -18,8 +18,15 @@ Commands:
                                bridge (send; the guard asks first), install/stop/status (`mother whatsapp help`); home machine only
   whatsapp setup | link | unlink
                                the manager's guided WhatsApp setup and device link; own terminal only (a TTY; the guard denies them to the agent)
-  hub watch|install|uninstall|check|status|tail|decide|session|done|snooze|show
+  hub watch|install|uninstall|check|smoke|status|tail|decide|session|pending|done|snooze|show
                                the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e)
+  hub add|follow|unfollow|mute|unmute|watching
+                               the manager's steering: hand the hub a link or note, and the watch and mute lists
+  grant add <scope> <target> --by <user-id> --cites <link|ts> [--uses N] [--hours H] [--run ID] | remove --run ID | list
+                               the only writer of .mother/grants.json for unattended runs (checked like the guard)
+  memory index <memory-file> [--title T] [--hook H] | check
+                               add one `- [Title](file.md) — hook` line to memory/MEMORY.md (idempotent); check
+                               lists unindexed memory files and index lines pointing at missing ones (JSON)
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   now merge|show|done|snooze|top|do
@@ -213,6 +220,8 @@ def validate(cfg: dict) -> list:
         errs.append("manager.chat_dm must be a string or a non-empty list of strings")
     if "chat_user" in mgr and not isinstance(mgr["chat_user"], str):
         errs.append("manager.chat_user must be a string")
+    if "tracker_account" in mgr and not isinstance(mgr["tracker_account"], str):
+        errs.append("manager.tracker_account must be a string")
     wd = mgr.get("workdays", DAYS[:5])
     if not isinstance(wd, list) or any(d not in DAYS for d in wd):
         errs.append(f"manager.workdays must be a list of {DAYS}")
@@ -320,6 +329,11 @@ def validate(cfg: dict) -> list:
                         errs.append(f"routines.commitments.{k} must be an integer {lo}-{hi}")
                 if "draft_nudges" in r and not isinstance(r["draft_nudges"], bool):
                     errs.append("routines.commitments.draft_nudges must be true or false")
+    pol = cfg.get("policy")
+    if pol is not None and not isinstance(pol, dict):
+        errs.append("policy must be an object")
+    elif isinstance(pol, dict) and "bypass_passes_asks" in pol and not isinstance(pol["bypass_passes_asks"], bool):
+        errs.append("policy.bypass_passes_asks must be true or false")
     if "whatsapp" in cfg:
         errs.extend(validate_whatsapp(cfg["whatsapp"]))
     if "hub" in cfg:
@@ -1231,6 +1245,134 @@ def cmd_hub(args):
     sys.exit(hub.main(args, ws, load_config(ws), _now()))
 
 
+def cmd_grant(args):
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import grants
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        sys.exit(grants.main(args, None, {}))
+    ws = workspace()
+    cfg = load_config(ws)
+    if validate(cfg):
+        die("config.json is invalid; run `mother status`")
+    sys.exit(grants.main(args, ws, cfg))
+
+
+# ---------------------------------------------------------------- memory index
+
+MEMORY_TITLE_MAX, MEMORY_HOOK_MAX = 80, 100
+
+
+def _one_line(text: str) -> str:
+    """Text as one plain line: control and format characters dropped, whitespace runs collapsed."""
+    import unicodedata
+    out = []
+    for ch in str(text or ""):
+        cat = unicodedata.category(ch)
+        if ch in "\t\n\r\x0b\x0c\x85  ":
+            out.append(" ")
+        elif cat in ("Cc", "Cf", "Co", "Cs", "Cn"):
+            continue
+        else:
+            out.append(ch)
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _frontmatter(path: Path) -> dict:
+    lines = path.read_text(errors="replace").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    found = {}
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            break
+        m = re.match(r"^(name|description):\s*(.*)$", ln)
+        if m:
+            found[m.group(1)] = m.group(2).strip().strip("\"'")
+    return found
+
+
+def memory_index(ws: Path, target: str, title=None, hook=None):
+    """(changed, line) after adding one index line for memory/<file>.md to memory/MEMORY.md; raises ValueError."""
+    mem = (ws / "memory").resolve()
+    cand = Path(target).expanduser()
+    if not cand.is_absolute():
+        cand = (Path.cwd() / cand) if (Path.cwd() / cand).exists() else (ws / cand) if (ws / cand).exists() \
+            else mem / cand
+    f = cand.resolve()
+    if f.parent != mem or f.suffix != ".md" or f.name.lower() == "memory.md" or not f.is_file():
+        raise ValueError("%s is not a memory file (an existing memory/<name>.md other than MEMORY.md)" % target)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.md", f.name):
+        raise ValueError("%s: a memory file name is letters, digits, '.', '_' and '-' only" % f.name)
+    idx = mem / "MEMORY.md"
+    if idx.exists() and re.search(r"\]\(%s\)" % re.escape(f.name), idx.read_text()):
+        return False, None  # already indexed: nothing to check or write
+    fm = _frontmatter(f)
+    t = _one_line(title if title is not None else fm.get("name") or f.stem).replace("[", "(").replace("]", ")")
+    h = re.sub(r"[\[\]()]", "", _one_line(hook if hook is not None else fm.get("description") or "")).strip()
+    if not t or not h:
+        raise ValueError("needs a title and a hook (--title/--hook, or name/description in the file's frontmatter)")
+    t, h = t[:MEMORY_TITLE_MAX], h[:MEMORY_HOOK_MAX]
+    line = "- [%s](%s) — %s" % (t, f.name, h)
+    lock = ws / ".mother" / "memory.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    with open(lock, "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if idx.exists():
+            cur = idx.read_text()
+        else:
+            tpl = TEMPLATE / "memory" / "MEMORY.md"
+            cur = tpl.read_text() if tpl.exists() else "# Memory index\n"
+        if re.search(r"\]\(%s\)" % re.escape(f.name), cur):
+            return False, line
+        new = cur + ("" if cur.endswith("\n") or not cur else "\n") + line + "\n"
+        tmp = idx.with_name(".MEMORY.md.%d.tmp" % os.getpid())
+        tmp.write_text(new)
+        os.replace(tmp, idx)
+    return True, line
+
+
+def memory_check(ws: Path) -> dict:
+    """Index drift: memory files with no index line, and index lines that link a missing file."""
+    mem = ws / "memory"
+    idx = mem / "MEMORY.md"
+    text = re.sub(r"`[^`\n]*`", "", idx.read_text()) if idx.exists() else ""  # not the examples in code spans
+    linked = set(re.findall(r"\]\(([^()\s]+\.md)\)", text))
+    files = sorted(f.name for f in mem.glob("*.md") if f.name != "MEMORY.md") if mem.is_dir() else []
+    return {"unindexed": [f for f in files if f not in linked],
+            "missing": sorted(x for x in linked if not (mem / x).is_file())}
+
+
+def cmd_memory(args):
+    usage = "usage: mother memory index <memory-file> [--title T] [--hook H] | check"
+    if args == ["check"]:
+        print(json.dumps(memory_check(workspace())))
+        return
+    if args[:1] != ["index"] or len(args) < 2:
+        print(usage, file=sys.stderr)
+        sys.exit(2)
+    rest, opts, pos = args[1:], {}, []
+    i = 0
+    while i < len(rest):
+        if rest[i] in ("--title", "--hook"):
+            if i + 1 >= len(rest):
+                print(usage, file=sys.stderr)
+                sys.exit(2)
+            opts[rest[i][2:]] = rest[i + 1]
+            i += 2
+        else:
+            pos.append(rest[i])
+            i += 1
+    if len(pos) != 1:
+        print(usage, file=sys.stderr)
+        sys.exit(2)
+    try:
+        changed, line = memory_index(workspace(), pos[0], opts.get("title"), opts.get("hook"))
+    except ValueError as e:
+        die(str(e))
+    print(json.dumps({"ok": True, "changed": changed, "line": line}, ensure_ascii=False))
+
+
 def cmd_eval(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import evals
@@ -1247,7 +1389,7 @@ def cmd_health(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "grant": cmd_grant, "memory": cmd_memory, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

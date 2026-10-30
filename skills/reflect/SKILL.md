@@ -17,18 +17,19 @@ Policy: `${CLAUDE_PLUGIN_ROOT}/rules/memory.md`, `rules/todos.md`, `rules/projec
 ## 0. Workspace
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 "Today" is in `manager.timezone`.
 
 ## 1. Gather the day's evidence
 
 - **Session transcripts** for this workspace: Claude Code keeps them under `~/.claude/projects/` in a
-  directory named after the workspace path (`/` → `-`).
-  ```bash
-  find ~/.claude/projects/"$(printf %s "$W" | tr '/' '-')"* -name '*.jsonl' -mtime -1 -size +1k 2>/dev/null
-  ```
+  directory named after the workspace path (`/` → `-`). Find today's with the Glob tool (pattern
+  `~/.claude/projects/<the workspace path with / turned into ->*/*.jsonl`) and search them with the Grep tool —
+  not the shell: in the workspace the guard asks before any shell command that reads `~/.claude`.
   They are large: grep for the manager's turns, corrections and repeated procedures; don't read them
   whole. Many sessions → sample the substantial ones.
 - **Workspace history**: `git log --since=midnight --stat` if the workspace is a git repo.
@@ -45,7 +46,8 @@ a project constraint, a pointer, a verified connector quirk — and above all **
 to how the agent works** (`type: feedback`, with **Why:** and **How to apply:**). Those are the
 highest-value memories and the easiest to lose.
 
-Apply `mother:remember`'s rules: dedupe first, distil, absolute dates, one index line each.
+Apply `mother:remember`'s rules: dedupe first, distil, absolute dates, one index line each, added with
+`mother memory index memory/<slug>.md` (never by editing `MEMORY.md`: the guard asks for that).
 
 ## 3. Sweep the open loops
 
@@ -85,9 +87,10 @@ and meeting files. Flag:
   flagging; prefer fixing the file to complaining about it.
 - **Index drift** — fix it:
   ```bash
-  for f in memory/*.md; do b=${f#memory/}; [ "$b" = MEMORY.md ] && continue; grep -q "($b)" memory/MEMORY.md || echo "unindexed: $b"; done
+  "${CLAUDE_PLUGIN_ROOT}/bin/mother" memory check
   ```
-  plus index lines pointing at missing files.
+  prints `{"unindexed": [...], "missing": [...]}`. Index each unindexed file with `mother memory index
+  memory/<file>`; an index line pointing at a missing file is reported to the manager, not edited away.
 - **People files** — `people/*.md` must hold work items only. Flag any line that reads as an assessment,
   mood or personal detail, and propose removing it.
 - **Blocked items** — anything in **Blocked** for 3+ weeks: the blocker may be gone, or it should go.

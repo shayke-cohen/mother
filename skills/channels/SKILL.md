@@ -26,6 +26,12 @@ External channels (`external: true`) only ever get drafts, and only the manager 
 **Run this loop on a cheap model** (Sonnet or Haiku). The thinking happens inside the sessions `CH run`
 starts. Start it with `/loop /mother:channels`; it paces itself.
 
+**Run the loop in its own session, started with `/mother:channels` or `/loop /mother:channels`; the first step
+is `mother channels plan`, as one plain command.** The guard records that session (from the workspace, never a
+session that reads hub lines) as the loop's, and `triage`, `approvals`, `run` and `done` run without a question
+only there. In any other session they ask, so don't run them from a brief, a card or a hub session. If they ask
+in the loop, tell the manager to start the loop again in a new session with `/loop /mother:channels`.
+
 ## Hard rules
 
 - **Post only what `CH` returns, byte for byte**: `text` and `blocks` for answers and sends, `dm_text` for
@@ -47,12 +53,14 @@ starts. Start it with `/loop /mother:channels`; it paces itself.
 ## Each tick
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
-CH="python3 ${CLAUDE_PLUGIN_ROOT}/bin/mother channels"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
 
-Shell variables don't carry over between Bash calls, and the guard denies a command name it can't compute:
-start each command with the `CH=` line (`CH="…"; $CH plan`) or write the command out.
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
+
+`$CH` below is shorthand for `python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels`: write it out in every command
+(`python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels plan`). Never put it in a shell variable: in the workspace
+the guard asks before any command whose name comes from a variable.
 
 Chat tools: `${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind chat --cap read|search|post [--target dm|other]`
 gives the server prefix to call for each. If `chat.read` isn't `ok` (pick exits 3), say so and stop: a loop that can't read is
@@ -107,7 +115,8 @@ not "all quiet".
 `<name>, mute` in a thread mutes that thread · a 👎 on any reply mutes the thread and sends its topic back
 to draft · `<name>, stop` stops that channel · `<name>, pause` stops every channel. Anyone may make the
 agent quieter. Only the manager turns it back on: `<name>, start` / `<name>, resume`, or
-`mother channels start --channel <id>` / `mother channels resume`.
+`mother channels start --channel <id>` / `mother channels resume`, which the guard always asks about
+(the manager runs them).
 
 ## Earned autonomy
 

@@ -13,8 +13,10 @@ DM; that post is the routine's, not this skill's.)
 ## 0. Workspace, config, capabilities
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 Read `config.json` (agent, manager, connectors, teams) and `capabilities.json`. "Today" is in
 `manager.timezone`.

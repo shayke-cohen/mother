@@ -1,0 +1,139 @@
+# Shell commands the skills and routines run, one per entry; entries are separated by a line `----`.
+# Each must run with no guard question in a workspace session (tests/test_redteam.py). $W is the workspace path.
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
+----
+cd $W
+----
+${CLAUDE_PLUGIN_ROOT}/bin/mother home check
+----
+mother status
+----
+git pull --rebase --autostash -q
+----
+printf '%s\n' "- 2026-10-29T06:00:00Z brief ok — 4 sources, DM sent" >> "$W/runs.md"
+----
+printf '%s\n' "- 2026-10-29T06:00:00Z digest ok — applied 2, staged 1, queue 3" >> teams/platform/runs.md
+----
+test -e .mother/PAUSED
+----
+${CLAUDE_PLUGIN_ROOT}/bin/mother health pick --kind chat --cap post --target dm
+----
+mother health pending
+----
+mother health classify --error "401 token expired"
+----
+mother health record --kind chat --cap read --server mcp__chat --status expired --class auth
+----
+mother health alert --kind chat --cap read --server mcp__chat
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" health summary
+----
+printf '%s' 'Good morning. Thursday, and the one thing first: the release review at ten.' | "${CLAUDE_PLUGIN_ROOT}/bin/mother" speak --name brief-2026-10-29
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" items check <<'READER'
+{"source": "mail", "coverage": {"status": "ok"}, "items": [{"link": "https://mail.example.com/x", "note": "$(not run)"}]}
+READER
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" now merge <<'TICK'
+{"items": []}
+TICK
+----
+mother hub decide <<'HUBEOF'
+[{"line_id": "chat:C00000001/1.0:1.0", "key": "C00000001/1.0", "decision": "log"}]
+HUBEOF
+----
+mother now show --json
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" runs --json
+----
+gh search prs --review-requested=@me --state=open --limit 10
+----
+gh search prs --author=@me --state=open --limit 10
+----
+gh pr list --repo acme/web --state all --search "updated:>=2026-10-28" --json number,title,author,state,mergedAt,reviewDecision,isDraft,updatedAt
+----
+gh auth status
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" memory check
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" memory index memory/sam-billing.md --title 'Sam — billing' --hook 'owns the billing migration'
+----
+git log --since=midnight --stat
+----
+git log -1 --format=%cr -- projects/plat/
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" grant remove --run digest
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" eval brief
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" eval verdict p1 x --note "tighter and cites more"
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels plan
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels done --action a1 --posted-ts 1793260000.000100
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" sync
+----
+cat projects/plat/PROJECT.md
+----
+ls -la projects/plat/files/
+----
+grep -n '`+plat`' todos/open.md
+----
+mkdir -p teams/platform/sprints teams/platform/meetings
+----
+ls teams/platform/sprints teams/platform/meetings | tail -5
+----
+grep -E '^\- #[0-9]+ \[proposed\]' teams/platform/intake.md
+----
+grep -ril "billing" memory/ --include='*.md'
+----
+cat teams/platform/TEAM.md teams/platform/roadmap.md
+----
+mkdir -p journal/brief projects/plat/files
+----
+date -u +%Y-%m-%d
+----
+mother hub status
+----
+mother hub show --json
+----
+claude mcp list
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/assets/plan/build.py" teams/platform/meetings/2026-10-29-plan.json teams/platform/meetings/2026-10-29-plan.html
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/assets/deck/build.py" teams/platform/meetings/2026-10-29-deck.json
+----
+mother health merge --file /tmp/health.json
+----
+mother items check --file /tmp/reader.json
+----
+glab auth status
+----
+gh issue view 12
+----
+gh pr checks 12
+----
+mother home show
+----
+mother register
+----
+mother scan
+----
+mother eval report
+----
+mother now top set 'fix the thing (urgent)?'
+----
+mother now snooze S1 1h
+----
+mother hub session seen PLAT-1
+----
+mother hub pending drop C00000001/1.0 --json
+----
+mother whatsapp status
+----
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels approvals <<'APPROVALS'
+{"drafts": {"a1": ["ok"]}}
+APPROVALS
+----
+cd memory && ls

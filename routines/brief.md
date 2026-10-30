@@ -46,14 +46,7 @@ dispatcher, do those first.
       runs note.
       `shared_path` is set when the file was also copied to a synced folder (`audio.save_to`, else iCloud
       Drive → `Mother/` when iCloud Drive is on): that already gets it to the phone.
-   3. **Share it under the brief**, if `shared_path` is null and the chat connector has a file-upload flow that
-      takes a file from disk (never pass the audio through the conversation as base64: a minute of audio is
-      ~100k tokens). Slack, when the token has `files:write` (Slack: `get_upload_url` with
-      `filename` = the file's name and `length` = `bytes` → `curl -sf -X POST -F file=@<path> "<upload_url>"`
-      → `complete_upload` with that file id, a title like "Brief — Sun 24 Oct (1:10)", `channel_id` =
-      `manager.chat_dm` and `thread_ts` = the brief's post). Only to the manager's own DM. A `missing_scope`
-      answer means no upload this time: don't retry it daily — note it in the runs note. If neither route
-      worked, keep the file and name its path in the runs note.
+   3. Don't upload it yet: that is step 6, the last thing this routine does.
 
 4. **Save the triage** to `journal/brief/<YYYY-MM-DD>.md`: the numbered Triage list exactly as posted,
    each line with its bucket and the action it names, plus the brief post's link. This is the only workspace
@@ -62,6 +55,19 @@ dispatcher, do those first.
    To-respond mail, create a mail **draft** reply in its thread (skill → Rules → Drafts in the manager's
    voice). Never send; the guard allows drafts. Mark those lines `(drafted)` in the triage file and say
    "<n> drafts ready in your mail" in a reply under the brief.
+6. **Upload the audio — after the runs line** (the dispatcher appends the runs.md line first, then runs this
+   step; record audio there as `synced`, `saved <path>` or `off`). Only when step 3 rendered a file, its
+   `shared_path` is null, and the chat connector has a file-upload flow that takes a file from disk (never pass
+   the audio through the conversation as base64: a minute of audio is ~100k tokens). Slack, when the token has
+   `files:write` (Slack: `get_upload_url` with `filename` = the file's name and `length` = `bytes` →
+   `curl -sf -X POST -F file=@<path> "<upload_url>"` → `complete_upload` with that file id, a title like
+   "Brief — Sun 24 Oct (1:10)", `channel_id` = `manager.chat_dm` and `thread_ts` = the brief's post). Only to
+   the manager's own DM.
+   The guard can't see where a `curl` sends data, so in the workspace it asks (PAUSED or a dry run denies it).
+   In a scheduled run nobody is there to answer, so don't make the call: reply in the brief's DM thread
+   "Audio not uploaded: the upload needs your OK. It's at <path>" (when a synced copy exists the step never
+   runs). In a run the manager started and is watching, try it once; if the question is refused, or the
+   answer is `missing_scope`, say the same in the thread and don't retry it daily.
 
 ## Triage answers
 
