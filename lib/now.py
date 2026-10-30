@@ -64,13 +64,21 @@ class Schedule:
     start: time
     end: time
     every: int
+    days: Optional[List[str]] = None  # days the tick and hub run (routines.tick.days); None = workdays
+
+    @property
+    def run_days(self) -> List[str]:
+        return self.days if self.days is not None else self.workdays
 
     @classmethod
     def from_config(cls, cfg):
         mgr = cfg.get("manager") or {}
         tick = (cfg.get("routines") or {}).get("tick") or {}
         a, b = (tick.get("active_hours") or DEFAULT_HOURS).split("-")
+        d = tick.get("days")
+        days = list(DAYS) if d == "all" else [x for x in d if x in DAYS] if isinstance(d, list) else None
         return cls(
+            days=days,
             tz=ZoneInfo(mgr.get("timezone") or "UTC"),
             workdays=list(mgr.get("workdays") or DEFAULT_WORKDAYS),
             start=time.fromisoformat(a.strip()),
@@ -217,11 +225,11 @@ def _in_quiet(cfg: dict, now: datetime) -> bool:
 
 def next_slot(now: datetime, s: Schedule) -> datetime:
     """First tick slot strictly after `now`: minute :05 of the active window, every s.every minutes,
-    on a workday, in s.tz."""
+    on a run day (routines.tick.days, default the workdays), in s.tz."""
     local = now.astimezone(s.tz)
     day = local.date()
     for _ in range(9):
-        if DAYS[day.weekday()] in s.workdays:
+        if DAYS[day.weekday()] in s.run_days:
             slot = datetime.combine(day, s.start, tzinfo=s.tz).replace(minute=5)
             end = datetime.combine(day, s.end, tzinfo=s.tz)
             while slot < end:

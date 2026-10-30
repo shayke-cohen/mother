@@ -4099,7 +4099,7 @@ def subagent_session(kind, tool, inp, cwd, ctx):
 # ------------------------------------------------------------------ the hub session
 
 HUB_DENY = "the hub session can only do hub work; ask the manager to open a session for this"
-HUB_NO_VERBS = {"install", "uninstall", "watch", "smoke"}   # persistent jobs and a 20 s live check: the manager starts these
+HUB_NO_VERBS = {"install", "uninstall", "watch", "smoke", "refresh"}   # persistent jobs and live checks: the manager starts these
 # Tools the hub session may use. HUB_PASS_TOOLS have no other rule anywhere in the guard, so hooks.json doesn't
 # hand them to it (tests/test_packaging.py checks every other tool name here is registered).
 HUB_PASS_TOOLS = {"CronList", "ToolSearch", "TodoWrite"}

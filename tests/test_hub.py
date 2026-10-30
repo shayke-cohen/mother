@@ -843,6 +843,39 @@ class SourceIntervals(unittest.TestCase):
         self.assertEqual(self.tracker.calls, 6)  # every 300 s: at 0, 5, ... 25 minutes (then it stops)
         self.assertEqual(self.mail.calls, 2)     # every 900 s: at 0 and 15 minutes
 
+    def test_a_refresh_request_polls_every_source_now_even_outside_hours(self):
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        self.cfg["workspace"] = {"home_machine": "laptop"}
+        self.cfg["hub"]["idle_every_seconds"] = 3600
+        now = [self.SAT]   # outside active hours: an idle pass would poll nothing due
+        hub.poll_once(self.ws, self.cfg, self.SAT - timedelta(minutes=1), self.clients)  # both just polled
+        before = (self.tracker.calls, self.mail.calls)
+        hub.save_json(self.ws, hub.REFRESH_FILE, {"at": "x"})
+        stop = threading.Event()
+        built = []
+
+        def factory(cfg, have):
+            built.append(sorted((cfg.get("hub") or {}).get("connections") or {}))
+            return dict(self.clients)
+
+        def sleep(n):
+            now[0] += timedelta(seconds=n)
+            stop.set()
+
+        hub.watch(self.ws, self.cfg, clock=lambda: now[0], sleep=sleep, factory=factory, stop=stop)
+        self.assertEqual((self.tracker.calls, self.mail.calls), (before[0] + 1, before[1] + 1))
+        self.assertEqual(built[0], ["mail", "tracker"])   # fresh clients for every source
+        self.assertFalse(hub.refresh_requested(self.ws))  # the request is consumed
+
+    def test_tick_days_all_make_the_hub_active_every_day(self):
+        self.assertFalse(hub.is_active(self.cfg, self.SAT))
+        self.cfg["routines"] = {"tick": {"days": "all"}}
+        self.assertTrue(hub.is_active(self.cfg, self.SAT))
+        self.cfg["routines"] = {"tick": {"days": ["Sat"]}}
+        self.assertTrue(hub.is_active(self.cfg, self.SAT))
+        self.assertFalse(hub.is_active(self.cfg, self.WORK))
+
     def test_the_watcher_refuses_a_bad_per_source_interval(self):
         for k, v in (("every_seconds", "soon"), ("every_seconds", 0), ("idle_every_seconds", -1)):
             cfg = json.loads(json.dumps(self.cfg))
@@ -994,6 +1027,44 @@ class Install(unittest.TestCase):
         self.assertEqual(hub.install(self.ws, self.cfg, plist_path=self.plist, ctl=ctl, which=self.which,
                                      python="/usr/bin/python3", mother="/plug/bin/mother", sleep=lambda s: None), 0)
         self.assertEqual([c[0] for c in self.calls].count("bootstrap"), 3)
+
+    def refresh(self, beat_after, **kw):
+        import io
+        out = io.StringIO()
+        asked = datetime(2026, 10, 30, 19, 0, tzinfo=UTC)
+
+        def sleep(n):  # the watcher answers the request on its next pass
+            if beat_after is not None:
+                hub.save_json(self.ws, "watcher.json", beat_after)
+                hub.clear_refresh(self.ws)
+        rc = hub.refresh(self.ws, self.cfg, asked, ctl=self.ctl, sleep=sleep, now=lambda: asked, timeout=6,
+                         plist_path=self.plist, out=out, installer=lambda: self.calls.append(("install",)) or 0, **kw)
+        return rc, out.getvalue()
+
+    def test_refresh_restarts_a_loaded_job_and_reports_each_source(self):
+        self.plist.parent.mkdir(parents=True)
+        self.plist.write_text("x")
+        beat = {"at": "2026-10-30T19:00:04Z", "sources": {"tracker": {"status": "ok"},
+                                                          "code": {"status": "couldnt_check", "reason": "gh down"}}}
+        rc, out = self.refresh(beat)
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.calls[0][:2], ("kickstart", "-k"))
+        self.assertNotIn(("install",), self.calls)
+        self.assertIn("tracker | ok | -", out)
+        self.assertIn("code | couldnt_check | gh down", out)
+
+    def test_refresh_installs_when_the_plist_is_missing(self):
+        rc, out = self.refresh({"at": "2026-10-30T19:00:04Z", "sources": {"tracker": {"status": "ok"}}})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls, [("install",)])
+
+    def test_refresh_times_out_when_no_pass_lands(self):
+        import io
+        from unittest import mock
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc, _ = self.refresh(None)
+        self.assertEqual(rc, 3)
+        self.assertIn("no pass", err.getvalue())
 
     def test_install_gives_up_after_the_retries(self):
         def ctl(*a):

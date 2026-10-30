@@ -21,7 +21,7 @@ import sys
 import time
 import unicodedata
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -265,11 +265,12 @@ def _parse_at(stamp) -> Optional[datetime]:
 
 
 def is_active(cfg: dict, at: datetime) -> bool:
-    """Inside the manager's active hours on a workday (routines.tick.active_hours, manager.workdays/timezone)."""
+    """Inside the tick's active hours on one of its days (routines.tick.active_hours and .days, default
+    manager.workdays; manager.timezone)."""
     import now as nowmod
     s = nowmod.Schedule.from_config(cfg)
     local = at.astimezone(s.tz)
-    return nowmod.DAYS[local.weekday()] in s.workdays and s.start <= local.time().replace(tzinfo=None) < s.end
+    return nowmod.DAYS[local.weekday()] in s.run_days and s.start <= local.time().replace(tzinfo=None) < s.end
 
 
 def next_active_start(cfg: dict, at: datetime) -> datetime:
@@ -279,7 +280,7 @@ def next_active_start(cfg: dict, at: datetime) -> datetime:
     day = local.date()
     for _ in range(9):
         start = datetime.combine(day, s.start, tzinfo=s.tz)
-        if nowmod.DAYS[day.weekday()] in s.workdays and start > local:
+        if nowmod.DAYS[day.weekday()] in s.run_days and start > local:
             return start
         day += timedelta(days=1)
     return local + timedelta(hours=1)
@@ -1009,13 +1010,21 @@ def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) 
             cap_log(ws)
             active, every = interval(cfg, at)
             idle0 = not active and not any(v > 0 for v in period_intervals(cfg, False).values())
-            if not idle0:  # build only what is due (or has no live client yet and is due): no server is started unused
-                due = set(due_caps(ws, cfg, at, active))
+            forced = refresh_requested(ws)  # `mother hub refresh`: every source, now, whatever the hour
+            if forced:  # fresh clients for every source: a dropped server is reconnected
+                for c in clients.values():
+                    if not isinstance(c, Exception):
+                        _close(c)
+                clients = {}
+            if not idle0 or forced:  # build only what is due (or has no live client yet and is due): no server is started unused
+                due = set(CAPS) if forced else set(due_caps(ws, cfg, at, active))
                 scoped = json.loads(json.dumps(cfg))
                 scoped.setdefault("hub", {})["connections"] = {
                     c: v for c, v in (_hub_cfg(cfg).get("connections") or {}).items() if c in due}
                 clients = factory(scoped, clients)
-            beat = poll_once(ws, cfg, at, clients, poll=not idle0)
+            beat = poll_once(ws, cfg, at, clients, poll=not idle0 or forced, force=forced)
+            if forced:
+                clear_refresh(ws)
             attempted = set(beat.get("_attempted") or [])
             for cap, ent in beat["sources"].items():  # a failed source gets a fresh client when next due
                 c = clients.get(cap)
@@ -1028,7 +1037,8 @@ def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) 
             # sleeps, so counting steps alone would come back late by however long it slept.
             waited = 0
             until = at + timedelta(seconds=beat["every_seconds"])
-            while not stop.is_set() and waited < beat["every_seconds"] and clock() < until:
+            while not stop.is_set() and waited < beat["every_seconds"] and clock() < until \
+                    and not refresh_requested(ws):
                 step = min(1, beat["every_seconds"] - waited)
                 sleep(step)
                 waited += step
@@ -1047,6 +1057,68 @@ def _close(c) -> None:
         pass
 
 
+REFRESH_FILE = "refresh.json"
+
+
+def refresh_requested(ws: Path) -> bool:
+    return (hub_dir(ws) / REFRESH_FILE).exists()
+
+
+def clear_refresh(ws: Path) -> None:
+    try:
+        (hub_dir(ws) / REFRESH_FILE).unlink()
+    except OSError:
+        pass
+
+
+def refresh(ws: Path, cfg: dict, at: datetime, ctl=None, sleep=time.sleep, now=None, timeout: float = 90,
+            plist_path=None, out=None, installer=None) -> int:
+    """Reconnect the watcher now: ask for a forced pass (`.mother/hub/refresh.json`), restart the launchd job so every
+    source gets a fresh connection (installing it when the plist is missing or the job isn't loaded), then wait up
+    to `timeout` seconds for that pass and print `cap | status | reason` per source. Exit 0 when every source is ok
+    or partial, 2 when one is not, 3 when no pass landed in time."""
+    out = out or sys.stdout
+    ctl = ctl or launchctl
+    now = now or (lambda: datetime.now(timezone.utc))
+    installer = installer or (lambda: install(ws, cfg, plist_path=plist_path, ctl=ctl))
+    code = home_status(cfg)
+    if code:
+        print("mother hub refresh: not the home machine (see `mother home check`)", file=sys.stderr)
+        return code
+    hub_dir(ws).mkdir(parents=True, exist_ok=True)
+    asked = now()
+    save_json(ws, REFRESH_FILE, {"at": _iso(asked)})
+    plist_path = Path(plist_path or default_plist_path())
+    rc = 1
+    if plist_path.exists():
+        rc, _ = ctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), LABEL))
+    if rc and installer() != 0:
+        clear_refresh(ws)
+        return 1
+    waited = 0.0
+    beat = {}
+    while waited < timeout:
+        sleep(2)
+        waited += 2
+        beat = load_json(ws, "watcher.json", {})
+        beat = beat if isinstance(beat, dict) else {}
+        landed = _parse_at(beat.get("at"))
+        if landed is not None and landed >= asked.replace(microsecond=0) and not refresh_requested(ws):
+            break
+    else:
+        print("mother hub refresh: the watcher made no pass within %ds (see %s)"
+              % (timeout, hub_dir(ws) / "watcher.log"), file=sys.stderr)
+        return 3
+    sources = beat.get("sources") or {}
+    for cap in CAPS:
+        ent = sources.get(cap)
+        if isinstance(ent, dict):
+            reason = " ".join(str(ent.get("reason") or "").split())[:120]
+            print("%s | %s | %s" % (cap, ent.get("status"), reason or "-"), file=out)
+    ok = bool(sources) and all(isinstance(e, dict) and e.get("status") in ("ok", "partial") for e in sources.values())
+    return 0 if ok else 2
+
+
 LABEL = "com.mother.hub"
 USAGE = """mother hub <verb>
   watch       run the watcher in the foreground (what the launchd job runs); home machine only
@@ -1054,6 +1126,8 @@ USAGE = """mother hub <verb>
   uninstall   unload the job and remove the plist
   check       one read per hub.connections entry, under the plist's environment: cap | ok/✗ | reason; exit 1 if any fails
   status      watcher and hub heartbeats; exit 2 if either is stale or the watcher never ran
+  refresh     reconnect now: restart the watcher job (install it if missing) and make it poll every source at once,
+              whatever the hour; prints cap | status | reason; exit 2 if a source fails, 3 if no pass within 90 s
   smoke       check, then two polling passes 20 s apart into a throwaway copy of the state (never the real inbox);
               prints source | status | lines | reason, no content; exit 2 if a source cannot be read
   tail        [--once] [--follow]  inbox lines after hub.json inbox_cursor, one JSON line per key (the hub's Monitor runs --follow)
@@ -2258,6 +2332,8 @@ def main(args, ws, cfg, at) -> int:
         return status(ws, at, cfg=cfg)
     if verb == "smoke":
         return smoke(cfg, at)
+    if verb == "refresh":
+        return refresh(ws, cfg, at)
     as_json = "--json" in rest
     rest = [a for a in rest if a != "--json"]
     if verb == "tail":

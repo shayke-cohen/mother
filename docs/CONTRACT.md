@@ -433,7 +433,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   of tokens separated by single spaces, each token plain characters (`A-Za-z0-9_.:/@=,+-`, and `#` only inside a
   token, as in `owner/repo#45`) or a single-quoted string with no `'`, newline or tab; no other character (no
   `"`, `$`, backtick, `;&|<>(){}\`, `*?[]~!`), and no control character other than newline and tab nor Unicode space
-  or format character anywhere. The commands: `mother hub <verb>` (not `install`, `uninstall`, `watch` or `smoke`),
+  or format character anywhere. The commands: `mother hub <verb>` (not `install`, `uninstall`, `watch`, `smoke` or `refresh`),
   `mother home check`, `mother now show`, `mother path`, `pwd`, `date` (a `+format` argument only); the one stdin
   form, the first line exactly `mother hub decide <<'HUBEOF'`, a body, and a last line exactly `HUBEOF` (no body
   line equals it after stripping spaces and tabs); and `gh pr view|checks <N>`, `gh issue view <N>`,
@@ -977,8 +977,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   lines to the inbox, and only then saves that source's cursor in `cursors.json` (`{<cap>: cursor, _last_sweep}`), so
   a crash repeats lines rather than losing them; a failing source keeps its cursor. Every source has its own interval: `hub.watch.<cap>.every_seconds` /
   `idle_every_seconds` when set, else the global ones. The watcher sleeps the shortest interval among the enabled
-  sources for the current period (`every_seconds` inside active hours, `routines.tick.active_hours` on
-  `manager.workdays` in `manager.timezone`; `idle_every_seconds` outside), and each pass polls only the sources that
+  sources for the current period (`every_seconds` inside active hours, `routines.tick.active_hours` on the tick's
+  days — `routines.tick.days`: `all`, a list, or `workdays`/absent for `manager.workdays` — in `manager.timezone`;
+  `idle_every_seconds` outside), and each pass polls only the sources that
   are due: `cursors.json` `_due` (`{<cap>: ISO time of the last attempt, successful or not}`) is compared with the
   source's interval, and a source never attempted is due. A source runs on the first wake at or after its due time (an
   interval that is not a multiple of the wake interval runs up to one wake late); it is also due at once when the
@@ -989,7 +990,14 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `watcher.json` (not `couldnt_check`) and its error/transition logic does not run; an interval of 0 outside active
   hours (the source's own or, when it sets none, the global one) means it is not polled there, and when no source
   polls outside active hours the watcher does not poll and sleeps until the next window. `mother hub smoke` ignores
-  intervals (it polls every source twice). It rotates the inbox when the local
+  intervals (it polls every source twice). **Refresh.** `mother hub refresh` (home machine only; the hub session
+  may not run it) writes `.mother/hub/refresh.json` `{at}`, then `launchctl kickstart -k gui/<uid>/com.mother.hub`
+  when the plist exists, else (or when that fails) `install`. The watcher checks for the file before every pass and
+  at every 1 s step of its wait: when present it closes every client, builds a fresh one for every connection,
+  makes one pass with every source forced (in or out of active hours), and deletes the file. `refresh` waits up to
+  90 s for a `watcher.json` `at` at or after its request with the file gone, prints `cap | status | reason`, and
+  exits 0 when every source is `ok` or `partial`, 2 otherwise, 3 when no pass landed (1 when install failed). The
+  Now panel's **Refresh** button runs it. It rotates the inbox when the local
   day changes (the file is named for the day that ended).
 - **`watcher.json`.** `{at, every_seconds, active, last_append_at?, sources: {<cap>: {status: ok|partial|couldnt_check, reason?,
   since?, notes?, every_seconds?, at?}}, errors: [str]}`. Top-level `every_seconds` is the watcher's wake interval (the
