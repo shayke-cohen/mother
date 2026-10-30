@@ -71,7 +71,11 @@ export type NowDoc = {
 }
 
 // The hub's files in <workspace>/.mother/hub/ (docs/CONTRACT.md §5e, lib/hub.py). Readers tolerate any field missing.
-export type WatcherSource = { status: 'ok' | 'partial' | 'couldnt_check'; reason?: string; since?: string }
+export type WatcherSource = {
+  status: 'ok' | 'partial' | 'couldnt_check'; reason?: string; since?: string
+  every_seconds?: number   // this source's own interval for the current period (0: not polled now)
+  at?: string              // this source's last poll
+}
 
 export type WatcherDoc = {
   at: string

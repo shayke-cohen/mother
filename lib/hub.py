@@ -231,7 +231,7 @@ def rotate_inbox(ws: Path, at: datetime) -> None:
 
 # ------------------------------------------------------------------------------------------------- watcher
 CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
-DEFAULTS = {"every_seconds": 120, "idle_every_seconds": 600, "sweep_minutes": 30}
+DEFAULTS = {"every_seconds": 120, "idle_every_seconds": 3600, "sweep_minutes": 30}
 
 
 def connector_of(cfg: dict, cap: str):
@@ -285,16 +285,51 @@ def next_active_start(cfg: dict, at: datetime) -> datetime:
     return local + timedelta(hours=1)
 
 
-def interval(cfg: dict, at: datetime) -> Tuple[bool, int]:
-    """(inside active hours, seconds to sleep before the next poll). Outside active hours it is
-    `idle_every_seconds`, or, when that is 0, the time until the next active window opens."""
+def source_every(cfg: dict, cap: str, active: bool) -> int:
+    """Seconds between polls of one source in this period: `hub.watch.<cap>.every_seconds` / `idle_every_seconds`
+    when set, else the global `every_seconds` / `idle_every_seconds`. 0 means the source is not polled in the period."""
     h = _hub_cfg(cfg)
-    if is_active(cfg, at):
-        return True, int(h.get("every_seconds", DEFAULTS["every_seconds"]))
-    idle = int(h.get("idle_every_seconds", DEFAULTS["idle_every_seconds"]))
-    if idle > 0:
-        return False, idle
+    w = (h.get("watch") or {}).get(cap)
+    w = w if isinstance(w, dict) else {}
+    key, dflt = ("every_seconds", DEFAULTS["every_seconds"]) if active else ("idle_every_seconds", DEFAULTS["idle_every_seconds"])
+    v = w.get(key, h.get(key, dflt))
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return dflt
+
+
+def period_intervals(cfg: dict, active: bool) -> Dict[str, int]:
+    """Per enabled source (a capability in `connectors` with an adapter key) its interval for the period; with no
+    enabled source, `{"*": <the global interval>}` so the watcher still has a beat."""
+    caps = [c for c in CAPS if connector_of(cfg, c)]
+    return {c: source_every(cfg, c, active) for c in caps} or {"*": source_every(cfg, "*", active)}
+
+
+def interval(cfg: dict, at: datetime) -> Tuple[bool, int]:
+    """(inside active hours, seconds to sleep before the next poll): the shortest interval among the enabled
+    sources for the period. Outside active hours, when no source polls (all idle intervals 0), the time until the
+    next active window opens."""
+    active = is_active(cfg, at)
+    pos = [v for v in period_intervals(cfg, active).values() if v > 0]
+    if pos:
+        return active, min(pos)
+    if active:
+        return True, DEFAULTS["every_seconds"]
     return False, max(1, int((next_active_start(cfg, at) - at).total_seconds()))
+
+
+def calendar_warning(cfg: dict) -> Optional[str]:
+    """One line when the calendar is checked less often than its `lead_minutes` (default 10), or None."""
+    if not connector_of(cfg, "calendar"):
+        return None
+    w = (_hub_cfg(cfg).get("watch") or {}).get("calendar")
+    lead = (w or {}).get("lead_minutes", 10) if isinstance(w, dict) else 10
+    every = source_every(cfg, "calendar", True)
+    if not isinstance(lead, int) or isinstance(lead, bool) or every <= lead * 60:
+        return None
+    return "calendar is checked every %g min; starting-soon alerts need <= %d min (hub.watch.calendar.lead_minutes)" % (
+        every / 60.0, lead)
 
 
 def _as_list(v) -> List[str]:
@@ -576,13 +611,44 @@ def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
     return w
 
 
-def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = True) -> dict:
+def _is_due(last, every: int, at: datetime, period: str = "", last_period: str = "") -> bool:
+    """A source is due when it has never been attempted, `every` seconds have passed since its last attempt, the
+    clock stepped back past it, or the period (active / idle hours) changed since that attempt."""
+    import hub_sources
+    if period and last_period and period != last_period:
+        return True
+    try:
+        elapsed = (at - hub_sources.parse_iso(last)).total_seconds()
+    except (TypeError, ValueError, AttributeError):
+        return True
+    return elapsed < 0 or elapsed >= every
+
+
+def due_caps(ws: Path, cfg: dict, at: datetime, active: bool) -> List[str]:
+    """The enabled sources `poll_once` would poll now (not forced)."""
+    cur = load_json(ws, "cursors.json", {})
+    cur = cur if isinstance(cur, dict) else {}
+    last = cur.get("_due") if isinstance(cur.get("_due"), dict) else {}
+    per = cur.get("_due_period") if isinstance(cur.get("_due_period"), dict) else {}
+    period = "active" if active else "idle"
+    out = []
+    for cap in CAPS:
+        if not connector_of(cfg, cap):
+            continue
+        each = source_every(cfg, cap, active)
+        if each > 0 and _is_due(last.get(cap), each, at, period, per.get(cap, "")):
+            out.append(cap)
+    return out
+
+
+def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = True, force: bool = False) -> dict:
     """One pass over the sources; returns the heartbeat it wrote to watcher.json.
 
     For each capability in `connectors` that has an adapter: poll, coalesce, append to the inbox, and only then
     save the cursor (a crash between the two repeats lines rather than losing them). A failing source keeps its
     cursor; on the first failing pass one `error` line is appended (the health records are not touched). `clients` maps capability -> ReadOnlyClient (or the exception that building it raised).
-    With `poll=False` only the heartbeat is refreshed (idle hours with no polling)."""
+    With `poll=False` only the heartbeat is refreshed (idle hours with no polling). A source is polled only when
+    due (its own interval since its last attempt, `cursors.json` `_due`); `force` polls every source (`smoke`)."""
     import hub_sources
     from hub_mcp import ForbiddenTool
     h = _hub_cfg(cfg)
@@ -590,6 +656,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     old = load_json(ws, "watcher.json", {})
     old_src = old.get("sources") if isinstance(old, dict) and isinstance(old.get("sources"), dict) else {}
     active, every = interval(cfg, at)
+    due_at = {}  # type: Dict[str, str]  # sources attempted this pass
     sources = {}  # type: Dict[str, dict]
     errors = []
     woke = False  # a line the hub must decide (anything but `resolved`) was appended this pass
@@ -603,10 +670,20 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     mute = live_mute(h["watch"].get("mute") or {}, at)
     passed = []  # every line of this pass, for auto-follow
     known = None  # the tracker's real project keys, when its adapter could read them this pass
+    due_now = set(due_caps(ws, cfg, at, active)) if poll else set()
     for cap in CAPS if poll else ():
         connector = connector_of(cfg, cap)
         if not connector:
             continue
+        each = source_every(cfg, cap, active)
+        prev0 = old_src.get(cap)
+        if not force and cap not in due_now:
+            if isinstance(prev0, dict):  # not due: it keeps what it last reported
+                sources[cap] = dict(prev0, every_seconds=each)
+                if prev0.get("status") != "ok":
+                    errors.append("%s: %s" % (cap, prev0.get("reason") or prev0.get("status")))
+            continue
+        due_at[cap] = stamp
         conns = h.get("connections") if isinstance(h.get("connections"), dict) else {}
         adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, connector))
         client = clients.get(cap)
@@ -668,6 +745,21 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         if notes:  # expected limits (a busy channel), not failures: the status is unchanged
             sources[cap]["notes"] = notes
         _set_errored(ws, cap, False)
+    for cap in due_at:
+        if cap in sources:
+            sources[cap]["at"] = stamp
+            sources[cap]["every_seconds"] = source_every(cfg, cap, active)
+    if due_at:
+        with locked(ws):
+            cur = load_json(ws, "cursors.json", {})
+            cur = cur if isinstance(cur, dict) else {}
+            d = cur.get("_due") if isinstance(cur.get("_due"), dict) else {}
+            d.update(due_at)
+            cur["_due"] = d
+            per = cur.get("_due_period") if isinstance(cur.get("_due_period"), dict) else {}
+            per.update({c: "active" if active else "idle" for c in due_at})
+            cur["_due_period"] = per
+            save_json(ws, "cursors.json", cur)
     if poll and passed and isinstance(connectors.get("tracker"), str) and connectors.get("tracker"):
         auto_follow(ws, passed, at, _watch_cfg(cfg, h, "tracker").get("projects") or [], known)
     if poll:
@@ -678,6 +770,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         beat["last_append_at"] = last
     with locked(ws):
         save_json(ws, "watcher.json", beat)
+    beat = dict(beat, _attempted=sorted(due_at))  # for the watcher loop only; never written to watcher.json
     return beat
 
 
@@ -863,6 +956,12 @@ def config_problem(cfg: dict) -> Optional[str]:
         v = h[k]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or v < low:
             return "hub.%s must be a number >= %d, not %r" % (k, low, v)
+    for cap, w in ((h.get("watch") or {}).items() if isinstance(h.get("watch"), dict) else ()):
+        for k, low in (("every_seconds", 1), ("idle_every_seconds", 0)):
+            if isinstance(w, dict) and k in w:
+                v = w[k]
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v < low:
+                    return "hub.watch.%s.%s must be a number >= %d, not %r" % (cap, k, low, v)
     try:
         import now as nowmod
         nowmod.Schedule.from_config(cfg)
@@ -909,13 +1008,18 @@ def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) 
                     _log("inbox rotation failed: %s" % e)
             cap_log(ws)
             active, every = interval(cfg, at)
-            idle0 = not active and int(_hub_cfg(cfg).get("idle_every_seconds", DEFAULTS["idle_every_seconds"])) == 0
-            if not idle0:
-                clients = factory(cfg, clients)
+            idle0 = not active and not any(v > 0 for v in period_intervals(cfg, False).values())
+            if not idle0:  # build only what is due (or has no live client yet and is due): no server is started unused
+                due = set(due_caps(ws, cfg, at, active))
+                scoped = json.loads(json.dumps(cfg))
+                scoped.setdefault("hub", {})["connections"] = {
+                    c: v for c, v in (_hub_cfg(cfg).get("connections") or {}).items() if c in due}
+                clients = factory(scoped, clients)
             beat = poll_once(ws, cfg, at, clients, poll=not idle0)
-            for cap, ent in beat["sources"].items():  # a failed source gets a fresh client next pass
+            attempted = set(beat.get("_attempted") or [])
+            for cap, ent in beat["sources"].items():  # a failed source gets a fresh client when next due
                 c = clients.get(cap)
-                if ent.get("status") == "couldnt_check" and c is not None:
+                if cap in attempted and ent.get("status") == "couldnt_check" and c is not None:
                     clients.pop(cap, None)
                     if not isinstance(c, Exception):
                         _close(c)
@@ -1035,7 +1139,11 @@ def launchctl(*args) -> Tuple[int, str]:
     return p.returncode, (p.stdout or "").strip()
 
 
-def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=None, mother=None) -> int:
+BOOTSTRAP_TRIES = 5  # `bootout` returns before the old job is gone; `bootstrap` fails (EIO) until it is
+
+
+def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=None, mother=None,
+            sleep=time.sleep) -> int:
     ctl = ctl or launchctl
     plist_path = Path(plist_path or default_plist_path())
     code = home_status(cfg)
@@ -1059,7 +1167,12 @@ def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=N
     plist_path.write_text(plist(ws, cfg, python, mother, found))
     domain = "gui/%d" % os.getuid()
     ctl("bootout", "%s/%s" % (domain, LABEL))  # a reinstall replaces the loaded job; not loaded is fine
-    rc, out = ctl("bootstrap", domain, str(plist_path))
+    for attempt in range(BOOTSTRAP_TRIES):
+        rc, out = ctl("bootstrap", domain, str(plist_path))
+        if not rc:
+            break
+        if attempt + 1 < BOOTSTRAP_TRIES:
+            sleep(1)
     if rc:
         print("mother hub install: launchctl bootstrap failed: %s" % out, file=sys.stderr)
         return 1
@@ -1159,6 +1272,9 @@ def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
             os.environ["PATH"] = saved
     for cap, ok, why in rows:
         print("%s | %s | %s" % (cap, "ok" if ok else "\u2717", why), file=out)
+    warn = calendar_warning(cfg)
+    if warn:
+        print("warning: %s" % warn, file=out)
     return 0 if all(r[1] for r in rows) else 1
 
 
@@ -1182,10 +1298,10 @@ def smoke(cfg: dict, at: datetime, out=None, factory=None, sleep=time.sleep) -> 
             ws = Path(tmp)
             (ws / "config.json").write_text(json.dumps(cfg))
             clients = factory(cfg, {})
-            poll_once(ws, cfg, at, clients)
+            poll_once(ws, cfg, at, clients, force=True)
             sleep(20)
             clients = factory(cfg, clients)  # a server that died is started again, as the watcher does
-            beat = poll_once(ws, cfg, at + timedelta(seconds=20), clients)
+            beat = poll_once(ws, cfg, at + timedelta(seconds=20), clients, force=True)
             counts = {}  # type: Dict[str, int]
             for l in read_inbox(ws):
                 if l.get("kind") != "error":
@@ -1260,9 +1376,18 @@ def status(ws: Path, at: datetime, out=None, cfg=None) -> int:
                   % (nxt.isoformat(), loc.minute, loc.hour, loc.day, loc.month), file=out)
     for cap, ent in sorted((w.get("sources") or {}).items()):
         why = ent.get("reason")
-        print("  %s: %s%s" % (cap, ent.get("status"), " (%s)" % why if why else ""), file=out)
+        extra = ""
+        severy, sage = ent.get("every_seconds"), _age(ent.get("at"), at)
+        if isinstance(severy, (int, float)) and not isinstance(severy, bool) and severy > 0 and sage is not None:
+            extra = ", every %ds, last poll %ds ago" % (severy, sage)
+            if active and sage > 2 * severy:
+                extra += ", STALE"
+        print("  %s: %s%s%s" % (cap, ent.get("status"), " (%s)" % why if why else "", extra), file=out)
         for n in ent.get("notes") or []:
             print("    note: %s" % n, file=out)
+    warn = calendar_warning(cfg) if cfg is not None else None
+    if warn:
+        print("warning: %s" % warn, file=out)
     lagging = hub_lagging(w, h, at)
     if h.get("last_wake"):
         hage = _age(h["last_wake"], at)
