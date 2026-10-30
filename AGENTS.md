@@ -18,6 +18,7 @@ Read next, in this order, as the task needs:
 python3 -m unittest discover tests          # whole suite: ~240 tests, ~4-5 minutes (channels, guard, health, cli are the slow ones)
 python3 -m unittest tests.test_guard        # one module, while iterating
 python3 -m unittest tests.test_guard.TestGrants   # one class (or .TestGrants.test_name for one test)
+claude plugin validate . && claude plugin test .  # the Now panel (hooks/register.tsx) and the manifests
 
 # A throwaway workspace. MOTHER_STATE_DIR keeps `init` from repointing the real ~/.mother/workspace.
 export MOTHER_STATE_DIR="$(mktemp -d)"

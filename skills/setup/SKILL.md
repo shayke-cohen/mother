@@ -160,10 +160,10 @@ In this order, reporting each step's result:
      exits 2 with "crosses midnight in this machine's time zone" in `errors`, tick was left out: register the
      tasks it did print, then offer narrower `active_hours` and register again. If `mother runs` later says
      "re-run mother register (time-zone offset changed)", register again and update the tick task's cron.
-   - **The Now panel (offer, after the tick is registered).** "Want the list beside the chat? Run
-     `/plugin install mother-now@mother`, then `/now-panel` opens it." Mention its one setting, `mother_bin`: the
-     default points at the marketplace clone; it can be set to the installed plugin's `bin/mother`. Don't
-     install it yourself.
+   - **The Now panel (mention, after the tick is registered).** "Want the list beside the chat? `/now-panel`
+     opens it." It ships in this plugin; there is nothing to install. If `claude plugin list` shows the old
+     separate `mother-now` plugin, tell the manager to run `/plugin uninstall mother-now@mother` once (don't run
+     it yourself). Its one setting, `mother_bin`, is empty by default (this plugin's own `bin/mother`).
    - **The doctor runs daily** (see the proposal above): register it from the confirmed config, which
      sets it to `days: "all"` ahead of the first routine. Never rewrite its schedule silently.
    - Cron runs in the **machine's** local time. If `manager.timezone` differs from the machine's, convert

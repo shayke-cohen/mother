@@ -6,12 +6,12 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME_DIRS = ["agents", "bin", "lib", "hooks", "skills", "routines", "rules", "assets", "templates", ".claude-plugin", "mods",
+RUNTIME_DIRS = ["agents", "bin", "lib", "hooks", "skills", "routines", "rules", "assets", "templates", ".claude-plugin", "types",
                 "bridge"]
 SKIP_PARTS = {"__pycache__", "node_modules"}  # node_modules: installed by `npm ci`, never shipped
-# Written by the Claude Code engine when it loads a mod (its API types and a tsconfig that extends them);
-# local to each machine, never shipped.
-ENGINE_WRITTEN = ("mods/now/tsconfig.json", "mods/now/.claude-plugin/types/")
+# Written by the Claude Code engine when it loads the panel's hooks module (its API types; the tsconfig.json
+# beside them lands at the repo root, outside RUNTIME_DIRS); local to each machine, never shipped.
+ENGINE_WRITTEN = (".claude-plugin/types/",)
 
 
 class PackagingTest(unittest.TestCase):

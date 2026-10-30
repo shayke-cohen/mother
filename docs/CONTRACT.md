@@ -7,9 +7,12 @@ Every part of v0 is built against this file. Change it first, then the code.
 **Plugin** (this repo, installed via `/plugin install mother@mother`):
 
 ```
-.claude-plugin/plugin.json, marketplace.json
+.claude-plugin/plugin.json, marketplace.json   plugin.json also names `types` and the Now panel's userConfig
+                           `mother_bin` (empty default = `${plugin root}/bin/mother`; a leading `~` is $HOME)
 bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now
-hooks/hooks.json           PreToolUse → hooks/guard.py (every other tool via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`
+hooks/hooks.json           `modules: ["./register.tsx"]` (the Now panel); PreToolUse → hooks/guard.py (every other tool
+                           via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`. A panel module that fails to
+                           load leaves the command hooks running
 hooks/guard.py             approval guard (see §5)
 hooks/guard_fast.py        the guard's fast path: every tool the main matcher doesn't take; escalates to guard.py for
                            channel roles, MOTHER's sub-agents, hub and hub-fed sessions and the grant key (see §5)
@@ -20,8 +23,8 @@ lib/                       channels.py (§5b), items.py (reader evidence check),
 assets/deck/               meeting deck template.html + build.py
 rules/                     default policy text skills cite: outbound.md, privacy.md, memory.md, todos.md, projects.md, teams.md
 templates/workspace/       files `mother init` copies into a new workspace
-mods/now/                  the Now panel, a second plugin in the same marketplace (`/plugin install mother-now@mother`):
-                           .claude-plugin/plugin.json (userConfig `mother_bin`), hooks/register.tsx (+ tests), types/index.d.ts;
+hooks/register.tsx         the Now panel, a hooks module of the mother plugin (tests: hooks/register.test.tsx, run by
+                           `claude plugin test .`; state contract: types/index.d.ts, `PluginState['mother']`);
                            opens with `/now-panel` (the engine reserves `/now` for the mother:now skill);
                            reads `.mother/now.json` and the hub's `.mother/hub/hub.json`, `sessions.json`, `watcher.json` (§5e), writes only through
                            `mother now done|snooze|top` and `mother hub done|snooze|session seen|add|follow|mute` ("Send to hub" on an item with an http(s) link runs `add -- <link>`; Mute on a hub session row and a hub update row runs `mute -- <key>`; Follow there follows what the key belongs to: `PROJ-n` runs `follow --project -- PROJ`, `owner/repo#n` runs `follow --repo -- owner/repo`, `<channel>/<ts>` runs `follow --thread -- <channel>/<ts>`, and a row whose key is none of these (`mail:`, `cal:`, `manual:`) shows no Follow; each toasts the verb's first output line, or its first stderr line on failure), no network or MCP calls;

@@ -4,13 +4,13 @@ import type { Hook, Register, Timer } from 'claude-code'
 import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
 
 // State the Now panel (Task 9) draws from. Keys are declared in types/index.d.ts.
-export const docAtom = atom({ plugin: 'mother-now', key: 'doc' } as const, null)
-export const errorAtom = atom({ plugin: 'mother-now', key: 'error' } as const, null)
-export const workspaceAtom = atom({ plugin: 'mother-now', key: 'workspace' } as const, null)
-export const snoozingAtom = atom({ plugin: 'mother-now', key: 'snoozing' } as const, null)
-export const selectedAtom = atom({ plugin: 'mother-now', key: 'selected' } as const, null)
-export const expandedAtom = atom({ plugin: 'mother-now', key: 'expanded' } as const, null)
-export const hubAtom = atom({ plugin: 'mother-now', key: 'hub' } as const, null)
+export const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)
+export const errorAtom = atom({ plugin: 'mother', key: 'error' } as const, null)
+export const workspaceAtom = atom({ plugin: 'mother', key: 'workspace' } as const, null)
+export const snoozingAtom = atom({ plugin: 'mother', key: 'snoozing' } as const, null)
+export const selectedAtom = atom({ plugin: 'mother', key: 'selected' } as const, null)
+export const expandedAtom = atom({ plugin: 'mother', key: 'expanded' } as const, null)
+export const hubAtom = atom({ plugin: 'mother', key: 'hub' } as const, null)
 
 const PANE = 'mother-now'
 const SNOOZES = ['1h', 'tomorrow', 'next-week'] as const
@@ -18,7 +18,6 @@ const TOP_MAX = 3
 
 export const POLL_MS = 60_000
 export const TOASTED_CAP = 500
-const DEFAULT_BIN = '~/.claude/plugins/marketplaces/mother/bin/mother'
 
 // The engine interface a hook receives; the helpers below take it so Task 9 can pass its own `$`.
 export type Dollar = Parameters<Hook<'session.start'>>[0]
@@ -84,7 +83,9 @@ export function hubStatus(h: HubBundle, nowMs: number): string {
   return (health === 'alive' ? ' · hub ●' : health === 'stale' ? ' · hub ◌ stale' : ' · hub ✗') + (n > 0 ? ` · ${n} waiting` : '')
 }
 
+// Empty (the default) means this plugin's own bin/mother: the panel ships inside the mother plugin.
 export async function motherBin($: Dollar, configured: string): Promise<string> {
+  if (!configured) return $.plugin.root + '/bin/mother'
   if (configured !== '~' && !configured.startsWith('~/')) return configured
   const home = (await $.env.get('HOME')) ?? ''
   return home + configured.slice(1)
@@ -749,7 +750,7 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
 export const COMMAND = 'now-panel'
 
 export const register: Register = (on, options) => {
-  const configured = String(options.mother_bin ?? DEFAULT_BIN)
+  const configured = String(options.mother_bin ?? '').trim()
   const loader = newLoader()
   let timer: Timer | undefined
 

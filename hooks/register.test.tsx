@@ -37,6 +37,8 @@ function doc(over: Record<string, unknown> = {}) {
 
 // Set by one test: the engine refuses the command name, as it does for a name another plugin's skill holds.
 let refuseCommand = false
+// The default mother_bin is empty: the panel runs this plugin's own bin/mother. boot() reads it off the first run.
+let BIN = ''
 
 for (const surface of ['terminal', 'desktop'] as const) {
   // The files the fake host holds: path -> { text, mtimeMs }.
@@ -78,6 +80,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     })
     await $.session.start({ cwd: '/', surface, isInteractive: true })
     await clock.settle()
+    BIN = out.argv[0]?.[1] ?? ''   // the first run is always `mother path`
     return { clock, out }
   }
   const last = (o: { status: (string | undefined)[] }) => o.status[o.status.length - 1]
@@ -87,7 +90,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const files = { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }
     const { out } = await boot($, on, files)
     expect(last(out)).toBe('◆ 3 on you · 2 neglected · tracker ✗')
-    expect(out.argv[0]).toEqual(['python3', '/home/m/.claude/plugins/marketplaces/mother/bin/mother', 'path'])
+    expect(out.argv[0]).toEqual(['python3', BIN, 'path'])
+    // empty mother_bin = the plugin's own script, an absolute path inside this plugin
+    expect(BIN.startsWith('/') && BIN.endsWith('/bin/mother') && !BIN.includes('~')).toBe(true)
+  })
+
+  test(`a configured ~ path for mother_bin is expanded, on ${surface}`, { options: { mother_bin: '~/src/mother/bin/mother' } }, async ($, on) => {
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
+    expect(out.argv[0]).toEqual(['python3', '/home/m/src/mother/bin/mother', 'path'])
   })
 
   test(`a partly checked source shows ~, not ✗, on ${surface}`, async ($, on) => {
@@ -213,14 +223,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
   })
 
   const PANE = {
-    plugin: 'mother-now', component: 'Pane', requestId: 'mother-now',
+    plugin: 'mother', component: 'Pane', requestId: 'mother-now',
     props: { title: 'Now', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
   } as const
   const texts = async (ui: any) => [...await ui.findAll({ type: 'Text' }), ...await ui.findAll({ type: 'Button' })].map((t: any) => t.text as string)
   const hasText = async (ui: any, re: RegExp) => (await texts(ui)).some((t: string) => re.test(t))
   const nowCalls = (out: { argv: string[][] }) => out.argv.filter(a => a[2] === 'now').map(a => a.slice(3))
   const TOP1 = [{ rank: 1, title: 'T1', why: '', link: null, item_id: null, set_by: 'agent', state: 'open' }]
-  const BIN = '/home/m/.claude/plugins/marketplaces/mother/bin/mother'
   const hotkeys = async (ui: any) => {
     const all = await ui.findAll({ type: 'Button' })
     return all.filter((b: any) => b.props.hotkey).map((b: any) => `${b.props.hotkey}:${b.key}`)
