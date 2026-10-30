@@ -422,12 +422,18 @@ class TestChat(unittest.TestCase):
 
     def test_inbox_turns_the_managers_notes_into_manual_lines(self):
         me = dict(ME, marks=["Agnes (AI)"])
+        typed = {"client_msg_id": "c-1"}
         hist = {"D00000009": [
-            msg(NOW - 100, user="U00000000", text="look at https://example.com/browse/PLAT-7 today"),
-            msg(NOW - 90, user="U00000000", text="call the venue"),
-            msg(NOW - 80, user="U00000000", text=":sparkles: *Agnes (AI)* · on behalf of Dana\nbrief"),
-            msg(NOW - 70, user="U00000000", text="via an app", bot_id="B1"),
-            msg(NOW - 60, user="U00000007", text="not the manager")]}
+            msg(NOW - 100, user="U00000000", text="look at https://example.com/browse/PLAT-7 today", **typed),
+            msg(NOW - 90, user="U00000000", text="call the venue", **typed),
+            msg(NOW - 80, user="U00000000", text=":sparkles: *Agnes (AI)* · on behalf of Dana\nbrief", app_id="A1"),
+            msg(NOW - 75, user="U00000000", text="Your brief for today: PLAT-7 moved", app_id="A1"),  # unsigned app post
+            msg(NOW - 72, user="U00000000", text="typed by an app", app_id="A1", client_msg_id="c-2"),
+            msg(NOW - 70, user="U00000000", text="via a bot", bot_id="B1", client_msg_id="c-3"),
+            msg(NOW - 68, user="U00000000", text="bot profile", bot_profile={"name": "x"}, client_msg_id="c-4"),
+            msg(NOW - 66, user="U00000000", text="no client id"),
+            msg(NOW - 64, user="U00000000", text="joined", subtype="channel_join", client_msg_id="c-5"),
+            msg(NOW - 60, user="U00000007", text="not the manager", client_msg_id="c-6")]}
 
         def h(a):
             got = [m for m in hist.get(a["channel_id"], []) if float(m["ts"]) > float(a.get("oldest", 0))
@@ -442,13 +448,50 @@ class TestChat(unittest.TestCase):
         self.assertEqual(out["lines"][0]["link"], "https://example.com/browse/PLAT-7")
         self.assertEqual(got[1][:2], ("chat", "manual"))
         self.assertTrue(got[1][2].startswith("manual:"))
-        self.assertEqual(len(got), 2)
+        self.assertEqual(len(got), 2, got)
         again = hs.ChatSlack.poll(client, out["cursor"], {"channels": [], "inbox": "D00000009"}, me,
                                   AT + timedelta(seconds=1))
         self.assertEqual(again["lines"], [])
         # a manual line is never muted, and the inbox key is never a DM key that a reply could resolve
         self.assertFalse(hs.hub.is_muted(out["lines"][1], {"keys": [out["lines"][1]["key"]], "people": ["U00000000"],
                                                            "channels": ["D00000009"]}))
+
+    def test_search_never_touches_an_inbox_note(self):
+        note = msg(NOW - 100, user="U00000000", text="call the venue", client_msg_id="c-1")
+        hit = dict(note, channel={"id": "D00000009"})
+        cfg = {"channels": [], "inbox": "D00000009"}
+        out, _ = self.poll(search={"is:dm": [hit]}, cfg=cfg)  # history has not got it yet; search has
+        self.assertEqual(out["lines"], [])
+        self.assertNotIn("D00000009:%s" % note["ts"], out["cursor"]["seen"])
+        out, _ = self.poll(history={"D00000009": [note]}, search={"is:dm": [hit]}, cfg=cfg,
+                           cursor=dict(out["cursor"], ts="%.6f" % (NOW - 600)))
+        self.assertEqual([(l["kind"], l["key"][:7]) for l in out["lines"]], [("manual", "manual:")])
+
+    def test_who_names_people_from_config_and_keeps_raw_ids_for_checks(self):
+        me = dict(ME, people={"U00000001": "Agnes", "U00000000": "Dana"})
+        cfg = {"channels": ["C00000001"], "dms": {"U00000001": "D00000001"}}
+        hist = {"C00000001": [msg(NOW - 100, user="U00000001", text="hi"),
+                              msg(NOW - 95, user="", user_id="U00000005", text="via user_id"),
+                              msg(NOW - 90, user="", username="deploybot", text="deployed"),
+                              msg(NOW - 85, user="", bot_profile={"name": "ci"}, text="green")],
+                "D00000001": [msg(NOW - 80, user="U00000001", text="dm question")]}
+
+        def h(a):
+            got = [m for m in hist.get(a["channel_id"], []) if float(m["ts"]) > float(a.get("oldest", 0))
+                   and float(m["ts"]) <= float(a.get("latest", 1e18))]
+            return {"messages": got}
+        client, _ = ro({"get_channel_history": h, "get_thread_replies": lambda a: {"messages": []},
+                        "search-messages": lambda a: {"messages": {"matches": []}}}, hs.ChatSlack.READ_TOOLS)
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, cfg, me, AT)
+        whos = sorted(l["who"] for l in out["lines"])
+        self.assertEqual(whos, sorted(["Agnes <U00000001>", "U00000005", "deploybot", "ci", "Agnes <U00000001>"]))
+        self.assertTrue(hs.hub.is_muted([l for l in out["lines"] if l["key"] == "D00000001/dm"][0],
+                                        {"people": ["U00000001"]}))
+        # the manager's reply still resolves, judged on the raw id
+        hist["D00000001"].append(msg(NOW - 70, user="U00000000", text="done"))
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, cfg, me, AT)
+        (dm,) = [l for l in out["lines"] if l["key"] == "D00000001/dm"]
+        self.assertEqual((dm["kind"], dm["who"]), ("resolved", "Dana <U00000000>"))
 
     def test_inbox_read_failure_is_partial(self):
         def hist(a):

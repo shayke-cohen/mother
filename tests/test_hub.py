@@ -88,6 +88,16 @@ class TestMe(unittest.TestCase):
         self.assertEqual(me("D00000001")["chat"], "")
         self.assertEqual(me("D00000001", self.PEOPLE)["code"], "dana")
 
+    def test_chat_user_comes_first_and_people_are_named(self):
+        m = hub.build_me({"manager": {"email": "dana@example.com", "chat_user": "U00000007",
+                                      "chat_dm": ["U00000001", "D00000001"]}, "teams": self.PEOPLE})
+        self.assertEqual(m["chat"], "U00000007")
+        self.assertEqual(hub.build_me({"manager": {"chat_user": "D00000001", "chat_dm": "U00000001"}})["chat"],
+                         "U00000001")  # a channel id in chat_user is not a user
+        self.assertEqual(m["people"], {"U00000042": ""})
+        named = hub.build_me({"teams": [{"people": [{"name": "Agnes", "chat": "U00000001"}]}]})
+        self.assertEqual(named["people"], {"U00000001": "Agnes"})
+
     def test_marks_from_agent(self):
         m = hub.build_me({"agent": {"name": "Agnes", "signature": "-- Agnes for Dana"}})
         self.assertEqual(m["marks"], ["Agnes (AI)", "-- Agnes for Dana"])
@@ -439,7 +449,7 @@ class Watcher(unittest.TestCase):
     def test_me_comes_from_manager_and_matching_person(self):
         self.cfg["teams"] = [{"people": [{"name": "Dana Levi", "email": "dana@example.com", "code": "danal"}]}]
         self.assertEqual(hub.build_me(self.cfg), {"email": "dana@example.com", "chat": "U00000000", "code": "danal",
-                                                  "tracker_account": "", "marks": []})
+                                                  "tracker_account": "", "marks": [], "people": {}})
 
     def test_home_status(self):
         os.environ["MOTHER_HOSTNAME"] = "laptop"
@@ -1638,7 +1648,13 @@ class Dms(unittest.TestCase):
         self.assertIn("U00000008", err)
         self.assertNotIn("U00000001,", err)
         self.assertEqual(hub.load_watch(self.ws)["follow"]["dms"], {})  # nothing written
-        self.assertEqual(self.run_verb("dms", "set", "U00000000=D00000003")[0], 0)  # the manager is in config
+        rc, _, err = self.run_verb("dms", "set", "U00000000=D00000003")  # the manager: that is the inbox
+        self.assertEqual(rc, 2)
+        self.assertIn("inbox", err)
+        self.cfg["manager"]["chat_user"] = "U00000002"  # chat_user wins: Sam is now the manager
+        self.assertEqual(self.run_verb("dms", "set", "U00000002=D00000002")[0], 2)
+        self.assertEqual(self.run_verb("dms", "set", "U00000000=D00000003")[0], 2)  # no longer a person in config
+        del self.cfg["manager"]["chat_user"]
         for bad in ("U00000001", "U00000001=C00000001", "u1=D00000001", "U00000001=D0000000;x", "=D00000001"):
             self.assertEqual(self.run_verb("dms", "set", bad)[0], 2, bad)
         self.assertEqual(self.run_verb("dms", "set")[0], 2)
@@ -1652,9 +1668,28 @@ class Dms(unittest.TestCase):
         self.assertEqual(self.run_verb("dms", "inbox", "none")[0], 0)
         self.assertEqual(hub.load_watch(self.ws)["follow"]["inbox"], "")
 
+    def test_inbox_and_dm_ids_never_overlap(self):
+        self.run_verb("dms", "inbox", "D00000009")
+        rc, _, err = self.run_verb("dms", "set", "U00000001=D00000009")
+        self.assertEqual(rc, 2)
+        self.assertIn("inbox", err)
+        self.run_verb("dms", "set", "U00000001=D00000001")
+        self.assertEqual(self.run_verb("dms", "inbox", "D00000001")[0], 2)
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["inbox"], "D00000009")
+
+    def test_merged_map_keeps_only_people_still_in_config(self):
+        hub.save_json(self.ws, "watch.json", {"follow": {
+            "dms": {"U00000001": "D00000001", "U00000002": "D00000002", "U00000000": "D00000003",
+                    "U00000008": "D00000008"}, "inbox": "D00000002"}})
+        m = hub.merged_watch(self.cfg, hub.load_watch(self.ws))
+        self.assertEqual(m["chat"]["dms"], {"U00000001": "D00000001"})  # Sam's id is the inbox; the manager; gone
+        self.assertEqual(hub.effective_cfg(self.cfg, hub.load_watch(self.ws))["hub"]["watch"]["chat"]["dms"],
+                         {"U00000001": "D00000001"})
+
     def test_empty_show_says_how_to_fill_it(self):
         out = self.run_verb("dms", "show")[1]
-        self.assertIn("slack_list_user_channels", out)
+        self.assertIn("DM listing (types im)", out)
+        self.assertNotIn("slack", out.lower())
         self.assertIn("mother hub dms set", out)
 
     def test_damaged_entries_are_dropped_and_merged_for_the_adapter(self):
@@ -1667,18 +1702,41 @@ class Dms(unittest.TestCase):
         self.assertEqual((m["chat"]["dms"], m["chat"]["inbox"]), ({"U00000001": "D00000001"}, "D00000009"))
         self.assertIn("chat dms: U00000001=D00000001", self.run_verb("watching")[1])
 
+    def status_at(self, at, beat_active):
+        hub.save_json(self.ws, "watcher.json", {"at": hub_sources.iso(at), "every_seconds": 600,
+                                                "active": beat_active, "sources": {}, "errors": []})
+        buf = io.StringIO()
+        hub.status(self.ws, at, out=buf, cfg=self.cfg)
+        return buf.getvalue()
+
     def test_status_outside_active_hours_names_the_next_window(self):
         self.cfg["routines"] = {"tick": {"active_hours": "08:00-18:00"}}
         self.cfg["manager"]["workdays"] = ["Mon", "Tue", "Wed", "Thu", "Fri"]
-        at = datetime(2026, 10, 29, 20, 0, tzinfo=UTC)  # Thursday evening
-        hub.save_json(self.ws, "watcher.json", {"at": hub_sources.iso(at), "every_seconds": 600, "active": False,
-                                                "sources": {}, "errors": []})
-        buf = io.StringIO()
-        hub.status(self.ws, at, out=buf, cfg=self.cfg)
-        self.assertIn("next active window: 2026-10-30T08:00:00+00:00", buf.getvalue())
+        out = self.status_at(datetime(2026, 10, 29, 20, 0, tzinfo=UTC), beat_active=True)  # Thu evening, old beat
+        self.assertIn("now: outside active hours", out)  # judged now, not from the heartbeat's flag
+        self.assertIn("next active window: 2026-10-30T08:00:00+00:00", out)
         local = datetime(2026, 10, 30, 8, 0, tzinfo=UTC).astimezone()
-        self.assertIn("one-shot cron: %d %d %d %d *" % (local.minute, local.hour, local.day, local.month),
-                      buf.getvalue())
+        self.assertIn("one-shot cron: %d %d %d %d *" % (local.minute, local.hour, local.day, local.month), out)
+        # Friday evening: the next window is Monday morning
+        out = self.status_at(datetime(2026, 10, 30, 19, 0, tzinfo=UTC), beat_active=True)
+        self.assertIn("next active window: 2026-11-02T08:00:00+00:00", out)
+
+    def test_status_inside_active_hours_prints_no_window(self):
+        self.cfg["routines"] = {"tick": {"active_hours": "08:00-18:00"}}
+        out = self.status_at(datetime(2026, 10, 29, 10, 0, tzinfo=UTC), beat_active=False)  # stale flag says off
+        self.assertIn("now: active hours", out)
+        self.assertNotIn("next active window", out)
+
+    def test_status_next_window_in_a_dst_timezone(self):
+        # Europe/Berlin leaves summer time on Sunday 25 October 2026: Friday 23rd evening -> Monday 26th 08:00 CET
+        self.cfg["manager"]["timezone"] = "Europe/Berlin"
+        self.cfg["manager"]["workdays"] = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        self.cfg["routines"] = {"tick": {"active_hours": "08:00-18:00"}}
+        out = self.status_at(datetime(2026, 10, 23, 17, 30, tzinfo=UTC), beat_active=True)  # 19:30 CEST
+        self.assertIn("now: outside active hours", out)
+        self.assertIn("next active window: 2026-10-26T08:00:00+01:00", out)
+        local = datetime(2026, 10, 26, 7, 0, tzinfo=UTC).astimezone()
+        self.assertIn("one-shot cron: %d %d %d %d *" % (local.minute, local.hour, local.day, local.month), out)
 
 
 SELF_JID = "15550000009@s.whatsapp.net"

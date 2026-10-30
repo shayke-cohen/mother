@@ -68,6 +68,12 @@ class Adapter:
         raise NotImplementedError
 
 
+def sender(msg: dict) -> str:
+    """The raw author id of a chat message: `user`, else `user_id`, else `username`, else `bot_profile.name`."""
+    bp = msg.get("bot_profile") if isinstance(msg.get("bot_profile"), dict) else {}
+    return str(_first(msg.get("user"), msg.get("user_id"), msg.get("username"), bp.get("name")) or "")
+
+
 def _first(*vals):
     for v in vals:
         if v:
@@ -98,23 +104,32 @@ class ChatSlack(Adapter):
             threads.setdefault(t, since)
 
         dms = {ch: u for u, ch in (cfg.get("dms") or {}).items() if isinstance(u, str) and isinstance(ch, str)}
+        inbox = cfg.get("inbox") or ""
+        names = me.get("people") or {}
+
+        def named(raw):  # `Name <U…>` for a person in config, else the raw id
+            return "%s <%s>" % (names[raw], raw) if names.get(raw) else raw
 
         def add(ch, msg, link="", floor=since, dm=False):
             ts = msg.get("ts")
+            if ch == inbox:
+                return  # the inbox is read by note() only: search never resolves or marks one of its notes seen
             if not ts or float(ts) <= floor or "%s:%s" % (ch, ts) in seen:
                 return
             seen.append("%s:%s" % (ch, ts))  # every path (history, replies, search) shares this set
-            who = msg.get("user") or msg.get("username") or ""
+            raw = sender(msg)
             first = (msg.get("text") or "").lstrip().split("\n", 1)[0]
-            if marks and any(k in first for k in marks) and (not msg.get("user") or who == mine or msg.get("bot_id")):
+            if marks and any(k in first for k in marks) and (not (msg.get("user") or msg.get("user_id"))
+                                                            or raw == mine or msg.get("bot_id")):
                 return  # MOTHER's own signed post: neither news nor the manager's reply
-            if ch in dms and who not in (dms[ch], mine):
+            if ch in dms and raw not in (dms[ch], mine):
                 return  # a mapped DM: only the other person and the manager count
+            who = named(raw)
             tts = msg.get("thread_ts")
             # a DM conversation is one thing: the manager's reply resolves it
             key = hub.thing_key("chat", {"channel": ch, "ts": "dm" if dm else ts, "thread_ts": None if dm else tts})
             text = msg.get("text") or ""
-            if mine and who == mine:
+            if mine and raw == mine:
                 if not dm:
                     threads.setdefault(key, float(ts))
                 lines.append(hub.make_line("chat", "resolved", key, ts_iso(ts), title=text[:80], who=who,
@@ -124,20 +139,22 @@ class ChatSlack(Adapter):
                                        summary=text, also=hub.extract_also(text), uid=ts))
 
         def note(ch, msg):
-            """A message in the self-DM inbox: the manager's own note becomes a `manual` line; anything else
-            (another author, a bot, an app, MOTHER's signed post, a join or edit event) is ignored."""
+            """A message in the self-DM inbox: only a note the manager typed becomes a `manual` line. Typed means
+            posted as the manager with a `client_msg_id` (the client sets it) and no `app_id`, `bot_id`,
+            `bot_profile` or `subtype`: a post made through an app (MOTHER via a connector) always carries
+            `app_id`, signed or not, so it never loops back as a note."""
             ts = msg.get("ts")
             if not ts or float(ts) <= since or "%s:%s" % (ch, ts) in seen:
                 return
             seen.append("%s:%s" % (ch, ts))
             text = msg.get("text") or ""
-            first = text.lstrip().split("\n", 1)[0]
-            if not mine or msg.get("user") != mine or msg.get("bot_id") or msg.get("subtype") \
-                    or (marks and any(k in first for k in marks)) or not text.strip():
+            if not mine or msg.get("user") != mine or not msg.get("client_msg_id") or msg.get("app_id") \
+                    or msg.get("bot_id") or msg.get("bot_profile") or msg.get("subtype") or not text.strip():
                 return
             text = hub.plain(text)
             url = re.search(r"https?://[^\s<>|]+", text)
-            lines.append(hub.make_line("chat", "manual", hub.manual_key(text), ts_iso(ts), title=text[:80], who=mine,
+            lines.append(hub.make_line("chat", "manual", hub.manual_key(text), ts_iso(ts), title=text[:80],
+                                       who=named(mine),
                                        link=url.group(0) if url else "", summary=text,
                                        also=[a for a in hub.extract_also(text) if a != hub.manual_key(text)],
                                        uid=ts))
@@ -196,7 +213,6 @@ class ChatSlack(Adapter):
                 read(ch, dm=True)
             except McpError as e:
                 partial.append("%s: history %s" % (ch, e.kind))
-        inbox = cfg.get("inbox") or ""
         if inbox:  # the manager's self-DM: each note of theirs is a `manual` line
             try:
                 res = client.call("get_channel_history", {"channel_id": inbox, "oldest": "%.6f" % since,

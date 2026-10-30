@@ -289,7 +289,8 @@ class E2E(unittest.TestCase):
         self.verb(0, "dms", "inbox", "D00000009")
         self.poll(0)
         # the stand-in server answers every history read with the same page
-        page = [self.msg(2, "remember to call the venue", user=ME),
+        page = [self.msg(2, "remember to call the venue", user=ME, client_msg_id="c-1"),
+                self.msg(2, "Your brief: nothing new", user=ME, secs=0.5, app_id="A1"),
                 self.msg(2, "can you look at PLAT-1?", user="U00000001", secs=1)]
         self.poll(2, history=page)
         got = sorted((l["kind"], l["key"]) for l in self.tail())

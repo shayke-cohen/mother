@@ -300,11 +300,12 @@ _CHAT_USER = re.compile(r"^U[A-Z0-9]{2,}$")
 
 
 def build_me(cfg: dict) -> dict:
-    """What the adapters need to recognise the manager: email, chat user id (the first `U…` id in manager.chat_dm,
-    else the matching people entry's `chat`; a `D…` DM channel id is not a user), code login, and `marks`, the
-    text MOTHER signs its own posts with (agent name `(AI)` and any configured signature)."""
+    """What the adapters need to recognise the manager: email, chat user id (manager.chat_user, else the first
+    `U…` id in manager.chat_dm, else the matching people entry's `chat`; a `D…` DM channel id is not a user), code
+    login, `marks`, the text MOTHER signs its own posts with (agent name `(AI)` and any configured signature), and
+    `people`, the config's chat user ids with names (for `who`)."""
     m = (cfg or {}).get("manager") or {}
-    users = [x for x in _as_list(m.get("chat_dm")) if _CHAT_USER.match(x)]
+    users = [x for x in _as_list(m.get("chat_user")) + _as_list(m.get("chat_dm")) if _CHAT_USER.match(x)]
     me = {"email": m.get("email") or "", "chat": users[0] if users else "", "code": m.get("code") or "",
           "tracker_account": m.get("tracker_account") if isinstance(m.get("tracker_account"), str) else ""}
     a = (cfg or {}).get("agent") or {}
@@ -316,7 +317,26 @@ def build_me(cfg: dict) -> dict:
             if isinstance(p, dict) and me["email"] and (p.get("email") or "").lower() == me["email"].lower():
                 me["chat"] = me["chat"] or p.get("chat") or ""
                 me["code"] = me["code"] or p.get("code") or ""
+    me["people"] = config_people(cfg)
     return me
+
+
+def config_people(cfg: dict) -> Dict[str, str]:
+    """`{chat user id: name}` for every `teams[].people[].chat` in config (the name may be "")."""
+    found = {}  # type: Dict[str, str]
+    teams = (cfg or {}).get("teams")
+    for team in teams if isinstance(teams, list) else []:
+        people = team.get("people") if isinstance(team, dict) else None
+        for p in people if isinstance(people, list) else []:
+            if isinstance(p, dict) and isinstance(p.get("chat"), str) and _CHAT_USER.match(p["chat"]):
+                found.setdefault(p["chat"], str(p.get("name") or "").strip())
+    return found
+
+
+def dm_people(cfg: dict) -> Dict[str, str]:
+    """The user ids a DM may be mapped for: people in config, never the manager (their self-DM is the inbox)."""
+    mine = build_me(cfg).get("chat") or ""
+    return {u: n for u, n in config_people(cfg).items() if u != mine}
 
 
 def _ttl(cfg: dict) -> float:
@@ -417,8 +437,11 @@ def merged_watch(cfg: dict, watch: dict) -> dict:
     out["tracker"]["auto"] = [k for k in autos if k not in sure]  # only these are dropped on repeated failure
     join("code", "repos", f.get("repos") or [])
     join("whatsapp", "groups", f.get("whatsapp") or [])
-    out["chat"]["dms"] = dict(f.get("dms") or {})  # only watch.json holds the DM map and the inbox
-    out["chat"]["inbox"] = f.get("inbox") or ""
+    # only watch.json holds the DM map and the inbox; a DM is read only for a person still in config
+    inbox = f.get("inbox") or ""
+    ok = dm_people(cfg)
+    out["chat"]["dms"] = {u: d for u, d in (f.get("dms") or {}).items() if u in ok and d != inbox}
+    out["chat"]["inbox"] = inbox
     out["mute"] = {k: list((watch.get("mute") or {}).get(k) or []) for k in ("keys", "people", "channels")}
     return out
 
@@ -1144,12 +1167,15 @@ def status(ws: Path, at: datetime, out=None, cfg=None) -> int:
     print("watcher: last poll %s (%s), every %ds, %s%s" % (
         w["at"], "unreadable time" if age is None else "%ds ago" % age, every,
         "active hours" if active else "outside active hours", ", STALE" if wstale else ""), file=out)
-    if not active and cfg is not None:  # what the hub skill schedules its next wake for (a one-shot `/mother:hub`)
+    if cfg is not None:  # judged now, from config: the heartbeat's `active` can be a pass old
         try:
-            nxt = next_active_start(cfg, at)
+            now_active = is_active(cfg, at)
+            nxt = None if now_active else next_active_start(cfg, at)
         except Exception:
-            nxt = None
-        if nxt is not None:
+            now_active, nxt = None, None
+        if now_active is not None:
+            print("now: %s" % ("active hours" if now_active else "outside active hours"), file=out)
+        if nxt is not None:  # what the hub skill schedules its next wake for (a one-shot `/mother:hub`)
             loc = nxt.astimezone()  # cron runs on this machine's clock
             print("next active window: %s (one-shot cron: %d %d %d %d *)"
                   % (nxt.isoformat(), loc.minute, loc.hour, loc.day, loc.month), file=out)
@@ -1870,24 +1896,12 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
     return 0
 
 
-DMS_HINT = ("to fill the DM map, list your DMs with the Slack connector (`slack_list_user_channels`, types im) in a "
+DMS_HINT = ("to fill the DM map, list your DMs with the chat connector's DM listing (types im) in a "
             "normal MOTHER session, match user ids to the people in config, then run "
             "`mother hub dms set <user id>=<DM id> …` (e.g. `mother hub dms set U00000001=D00000001`)")
 _DM_PAIR = re.compile(r"^(U[A-Z0-9]{2,})=(D[A-Z0-9]{2,})$")
 
 
-def config_people(cfg: dict) -> Dict[str, str]:
-    """Chat user ids the config knows: every `teams[].people[].chat` (with the person's name) and the manager's."""
-    found = {}  # type: Dict[str, str]
-    for team in (cfg or {}).get("teams") or []:
-        people = team.get("people") if isinstance(team, dict) else None
-        for p in people if isinstance(people, list) else []:
-            if isinstance(p, dict) and isinstance(p.get("chat"), str) and _CHAT_USER.match(p["chat"]):
-                found.setdefault(p["chat"], str(p.get("name") or ""))
-    mine = build_me(cfg).get("chat") or ""
-    if mine:
-        found.setdefault(mine, "you")
-    return found
 
 
 def dms_cmd(ws: Path, cfg: dict, args, as_json: bool, out) -> int:
@@ -1914,14 +1928,24 @@ def dms_cmd(ws: Path, cfg: dict, args, as_json: bool, out) -> int:
                 print("mother hub dms set: %r is not <user id>=<DM id> (U… = D…)" % a, file=sys.stderr)
                 return 2
             pairs.append((m.group(1), m.group(2)))
-        known = config_people(cfg)
+        mine = build_me(cfg).get("chat") or ""
+        if mine in [u for u, _ in pairs]:
+            print("mother hub dms set: %s is you; your self-DM is the inbox (`mother hub dms inbox <D id>`)" % mine,
+                  file=sys.stderr)
+            return 2
+        known = dm_people(cfg)
         bad = [u for u, _ in pairs if u not in known]
         if bad:
-            print("mother hub dms set: not a person in config.json (teams[].people[].chat or the manager): %s"
+            print("mother hub dms set: not a person in config.json (teams[].people[].chat): %s"
                   % ", ".join(dict.fromkeys(bad)), file=sys.stderr)
             return 2
         with locked(ws):
             w = load_watch(ws)
+            clash = [d for _, d in pairs if d == w["follow"]["inbox"]]
+            if clash:
+                print("mother hub dms set: %s is the inbox (your self-DM), not a DM with someone" % clash[0],
+                      file=sys.stderr)
+                return 2
             changed = any(w["follow"]["dms"].get(u) != d for u, d in pairs)
             w["follow"]["dms"].update(dict(pairs))
             if changed:
@@ -1941,6 +1965,10 @@ def dms_cmd(ws: Path, cfg: dict, args, as_json: bool, out) -> int:
         val = "" if rest[0] == "none" else rest[0]
         with locked(ws):
             w = load_watch(ws)
+            if val and val in w["follow"]["dms"].values():
+                print("mother hub dms inbox: %s is mapped as a DM with someone; drop that first" % val,
+                      file=sys.stderr)
+                return 2
             changed = w["follow"]["inbox"] != val
             w["follow"]["inbox"] = val
             if changed:
