@@ -1009,9 +1009,11 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   inbox append; the next pass polls it. A project in `auto` that fails two passes in a row is removed, recorded in
   `unfollowed` and reported by one `error` line (`watcher:tracker:<PROJ>`); configured and followed projects only
   mark the source `partial`, as before. **Own tracker edits.** For each issue whose status, assignee or priority
-  changed, the tracker adapter reads `get-issue-changelog` once; when the latest change to those fields was made by
+  changed, the tracker adapter reads `get-issue-changelog` (paged oldest first: one read for `total`, then the last 50
+  entries; without a `total`, up to 5 pages until `isLast`; offsets like `+0300` are normalised); when the latest change to those fields was made by
   the manager (`manager.tracker_account` as `accountId`, or `manager.email`) the line is `resolved`; a changelog
-  failure or an unreadable answer leaves it an `update`.
+  failure or an unreadable answer (only the `values` shape is read) leaves it an `update`. `mother hub check`
+  requires `get-issue-changelog` on the tracker server (a missing tool is a missing read tool).
   A code PR leaving the review-requested set resolves its key; CI is green only when every check run is completed.
   The manager is recognised by `manager.email`, a chat user id (the first `U…` id in `manager.chat_dm`, a string
   or a list; else the `chat` of the `people` entry with the manager's email; a `D…` DM channel id is not a user),

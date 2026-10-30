@@ -404,11 +404,61 @@ class TestTracker(unittest.TestCase):
                                   self.history("2026-10-29T09:56:00.000+0000", theirs, "labels")]}
         out, f = self.changelog_poll(h)
         self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("PLAT-1", "resolved")])
-        self.assertEqual([c[1]["issueKey"] for c in f.calls if c[0].endswith("changelog")], ["PLAT-1"])
+        self.assertEqual([c[1]["issueKey"] for c in f.calls if c[0].endswith("changelog")], ["PLAT-1"] * 2)
         # by account id alone
         h2 = lambda a: {"values": [self.history("2026-10-29T09:55:00.000+0000", {"accountId": "acc9"})]}
         out, _ = self.changelog_poll(h2, me=dict(ME, email="", tracker_account="acc9"))
         self.assertEqual(out["lines"][0]["kind"], "resolved")
+
+    def paged(self, entries, total=True):
+        calls = []
+
+        def h(a):
+            calls.append(a)
+            start, n = a.get("startAt", 0), a["maxResults"]
+            out = {"values": entries[start:start + n], "isLast": start + n >= len(entries)}
+            if total:
+                out["total"] = len(entries)
+            return out
+        return h, calls
+
+    def test_latest_change_read_from_last_page(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        ents = [self.history("2026-10-0%dT09:00:00.000+0000" % (1 + n // 40), theirs, "labels") for n in range(118)]
+        ents += [self.history("2026-10-29T09:51:00.000+0000", theirs), self.history("2026-10-29T09:55:00.000+0000", mine)]
+        h, calls = self.paged(ents)
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        self.assertEqual([(c["startAt"], c["maxResults"]) for c in calls], [(0, 1), (70, 50)])
+        # an old own edit on page 1, the latest change is someone else's
+        ents2 = [self.history("2026-10-01T09:00:00.000+0000", mine)] + ents[:118] + \
+            [self.history("2026-10-29T09:55:00.000+0000", theirs)]
+        h, _ = self.paged(ents2)
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+
+    def test_no_total_pages_until_last_capped(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        ents = [self.history("2026-10-01T09:00:00.000+0000", {"accountId": "x"}, "labels")] * 130
+        ents.append(self.history("2026-10-29T09:55:00.000+0000", mine))
+        h, calls = self.paged(ents, total=False)
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        self.assertEqual(len(calls), 3)
+        h, calls = self.paged(ents * 10, total=False)
+        self.changelog_poll(h)
+        self.assertEqual(len(calls), 6)  # the total probe plus 5 pages
+
+    def test_offsets_are_normalised(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        # 12:30+0300 is 09:30Z, earlier than 09:45+0000 even though it sorts later as text
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:45:00.000+0000", mine),
+                                              self.history("2026-10-29T12:30:00.000+0300", theirs)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        self.assertEqual(hs.parse_iso("2026-10-29T12:30:00.000+0300"), hs.parse_iso("2026-10-29T09:30:00Z"))
 
     def test_others_change_is_update(self):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}

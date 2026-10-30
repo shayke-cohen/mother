@@ -30,7 +30,7 @@ def iso(dt: datetime) -> str:
 
 
 def parse_iso(s: str) -> datetime:
-    s = (s or "").replace("Z", "+00:00")
+    s = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", (s or "").replace("Z", "+00:00"))
     try:
         d = datetime.fromisoformat(s)
     except ValueError:
@@ -359,24 +359,43 @@ class TrackerJira(Adapter):
         return out
 
     @classmethod
+    def _changelog_tail(cls, client, key) -> list:
+        """The newest changelog entries (the tool pages oldest first): one read for `total`, then the last 50.
+        Without a `total`, pages are read until `isLast`, at most 5."""
+        name = "get-issue-changelog"
+        head = client.call(name, {"issueKey": key, "startAt": 0, "maxResults": 1})
+        head = head if isinstance(head, dict) else {}
+        total = head.get("total")
+        if isinstance(total, int) and not isinstance(total, bool):
+            res = client.call(name, {"issueKey": key, "startAt": max(0, total - 50), "maxResults": 50})
+            vals = res.get("values") if isinstance(res, dict) else None
+            return vals if isinstance(vals, list) else []
+        out = []
+        for n in range(5):
+            res = client.call(name, {"issueKey": key, "startAt": n * 100, "maxResults": 100})
+            res = res if isinstance(res, dict) else {}
+            out.extend(res.get("values") if isinstance(res.get("values"), list) else [])
+            if res.get("isLast") is not False:
+                break
+        return out
+
+    @classmethod
     def _own_change(cls, client, key, email, account) -> bool:
-        """True when the latest change to status / assignee / priority of `key` was made by the manager. One
-        changelog read; any failure or unreadable answer is False (the caller reports an update)."""
+        """True when the latest change to status / assignee / priority of `key` was made by the manager. Two
+        changelog reads (see `_changelog_tail`); any failure or unreadable answer is False (the caller reports an update)."""
         try:
-            res = client.call("get-issue-changelog", {"issueKey": key, "maxResults": 100}) or {}
+            hist = cls._changelog_tail(client, key)
         except (McpError, ForbiddenTool):  # also a server that lacks the tool: never silence the line
             return False
-        res = res if isinstance(res, dict) else {}
-        hist = res.get("values") or res.get("histories") or (res.get("changelog") or {}).get("histories") or []
         best = None
-        for h in hist if isinstance(hist, list) else []:
+        for h in hist:
             if not isinstance(h, dict) or not h.get("created"):
                 continue
             if not any(isinstance(it, dict) and str(it.get("field", "")).lower() in cls.WATCHED
                        for it in h.get("items") or []):
                 continue
             try:
-                when = parse_iso(h["created"].replace("+0000", "+00:00"))
+                when = parse_iso(h["created"])
             except (ValueError, TypeError):
                 continue
             if best is None or when > best[0]:
