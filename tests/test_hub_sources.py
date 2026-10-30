@@ -170,12 +170,12 @@ class TestChat(unittest.TestCase):
              reply_errors=()):
         cur = cursor or {"ts": "%.6f" % (NOW - 600), "threads": {}}
 
-        def hist(a):  # honours oldest/latest/limit like the real tool; newest first
+        def hist(a):  # honours oldest/latest/limit like the real tool
             if "latest" in a and lookback_error:
                 raise lookback_error
             got = [m for m in (history or {}).get(a["channel_id"], [])
                    if float(m["ts"]) > float(a.get("oldest", 0)) and float(m["ts"]) <= float(a.get("latest", 1e18))]
-            return {"ok": True, "messages": sorted(got, key=lambda m: -float(m["ts"]))[:a.get("limit", 100)]}
+            return {"ok": True, "messages": sorted(got, key=lambda m: float(m["ts"]))[:a.get("limit", 100)]}
 
         def rep(a):
             if a["thread_ts"] in reply_errors:
