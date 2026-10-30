@@ -533,6 +533,25 @@ class Loop(unittest.TestCase):
                       stop=self.stop)  # returns: the process exits 0, so launchd does not respawn it
         return err.getvalue()
 
+    def test_the_wait_follows_the_wall_clock_across_a_mac_sleep(self):
+        # time.sleep pauses while the Mac sleeps; the next pass must come when the clock says, not after
+        # the full interval of awake time
+        polls = []
+
+        def sleep(n):
+            self.slept.append(n)
+            self.now += timedelta(seconds=n) if len(self.slept) != 3 else timedelta(hours=2)  # the Mac slept
+            if len(polls) >= 2:
+                self.stop.set()
+
+        def factory(cfg, have):
+            polls.append(self.now)
+            return self.factory(cfg, have)
+        hub.watch(self.ws, self.cfg, clock=lambda: self.now, sleep=sleep, factory=factory, stop=self.stop)
+        self.assertEqual(len(polls), 2)
+        # the second pass came right after the jump (2 s awake + 2 h asleep), not 118 more seconds later
+        self.assertEqual(polls[1] - polls[0], timedelta(seconds=2, hours=2))
+
     def test_not_home_or_not_enabled_returns_with_one_line(self):
         self.after = None
         self.cfg["workspace"]["home_machine"] = "elsewhere"

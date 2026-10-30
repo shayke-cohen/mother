@@ -92,6 +92,19 @@ class TestClient(unittest.TestCase):
         self.assertIn(cm.exception.kind, health.CLASSES)
         self.assertEqual(c.call("gw__get_x", {}), {"ok": 1})  # respawned lazily
 
+    def test_unrelated_messages_do_not_extend_the_timeout(self):
+        # a server that keeps talking (notifications) but never answers must still time out on schedule
+        import time as _t
+        c = self.client({"tools": ["gw__get_x", "gw__busy"], "results": {"gw__get_x": {"ok": 1}},
+                         "chatty": {"gw__busy": 6}})
+        c.timeout = 1
+        c.start()
+        t0 = _t.monotonic()
+        with self.assertRaises(hub_mcp.McpError) as cm:
+            c.call("gw__busy", {})
+        self.assertEqual(cm.exception.kind, "unreachable")
+        self.assertLess(_t.monotonic() - t0, 4)
+
     def test_restart_is_per_call_not_per_lifetime(self):
         c = self.client({"tools": ["gw__get_x"], "results": {"gw__get_x": {"ok": 1}}}, FAKE_MCP_DIE_AFTER="1")
         c.start()

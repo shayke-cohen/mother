@@ -8,6 +8,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 from typing import Any, Dict, List, Set
 
 import health
@@ -78,9 +79,10 @@ class Client:
         if notify:
             return None
         want = self._id
+        deadline = time.monotonic() + self.timeout  # one deadline per call: notifications don't extend it
         while True:
             try:
-                r = self._q.get(timeout=self.timeout)
+                r = self._q.get(timeout=max(0.0, deadline - time.monotonic()))
             except queue.Empty:
                 self.close()
                 raise McpError("unreachable", "no reply to %s within %ss" % (method, self.timeout))
