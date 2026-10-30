@@ -2791,7 +2791,7 @@ def sl_hidden_paths(words, cwd, ws, plugin):
 
 
 MOTHER_VERBS = {"path", "version", "help", "-h", "--help", "status", "runs", "scan", "sync", "now", "hub", "health",
-                "items", "memory", "speak", "channels", "whatsapp", "grant", "home", "eval", "register"}
+                "items", "memory", "speak", "channels", "whatsapp", "grant", "home", "eval", "register", "inbox"}
 
 
 def _sl_mother(args):

@@ -275,6 +275,31 @@ def _header(msg: dict, name: str) -> str:
 class MailGmail(Adapter):
     SOURCE = "mail"
     READ_TOOLS = {"list-emails", "read-email"}
+    # `mother inbox` only (never the watcher): reversible, seen by no one else, and let through by the guard.
+    TRIAGE = {"archive": ("archive-message", "in:inbox"), "read": ("mark-as-read", "in:inbox is:unread")}
+    TRIAGE_MAX = 100
+
+    @staticmethod
+    def thread_of(x: str) -> Optional[str]:
+        """The thread id in a `mail:<id>` key or a mail web link (`…#<label>/<id>`), else None."""
+        m = re.fullmatch(r"mail:([A-Za-z0-9]+)", x) or re.fullmatch(r"https://mail\.google\.com/mail/[^#\s]*#[\w-]+/([A-Za-z0-9]+)", x)
+        return m.group(1) if m else None
+
+    @classmethod
+    def triage_messages(cls, client, verb: str, threads: List[str]) -> Dict[str, List[str]]:
+        """{thread: message ids to change}: the thread's messages in the inbox (archive) or unread there (read),
+        from one listing; a thread the listing does not show is its own first message id."""
+        listed = client.call("list-emails", {"query": cls.TRIAGE[verb][1], "maxResults": cls.TRIAGE_MAX}) or {}
+        out = {t: [] for t in threads}  # type: Dict[str, List[str]]
+        for ref in listed.get("messages") or []:
+            if ref.get("threadId") in out and ref.get("id"):
+                out[ref["threadId"]].append(ref["id"])
+        return {t: ids or [t] for t, ids in out.items()}
+
+    @classmethod
+    def triage_call(cls, verb: str, message_id: str):
+        """(tool suffix, arguments) that archives or marks read one message."""
+        return cls.TRIAGE[verb][0], {"messageId": message_id}
 
     @classmethod
     def poll(cls, client, cursor, cfg, me, at):

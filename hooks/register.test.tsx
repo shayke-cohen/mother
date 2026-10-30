@@ -59,7 +59,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     on('prompt.fill', (_: any, e: any) => { out.fills.push({ text: e.text, mode: e.mode }); return { isFilled: true } })
     on('process.run', (_: any, e: any) => {
       out.argv.push([...e.argv])
-      if (cli && (e.argv[2] === 'now' || e.argv[2] === 'hub')) {
+      if (cli && ['now', 'hub', 'inbox'].includes(e.argv[2])) {
         const r = cli([...e.argv])
         return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
@@ -427,6 +427,63 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await fp.press({ key: 'fp-rel-b' })               // a related item: the pane follows it
     expect(await hasText(fp, /Other B/)).toBe(true)
     await fp.unmount()
+  })
+
+  const mailItem = (tid: string, title: string) => {
+    const it = kinded('mail', 'mail_needs_reply', title, 'https://mail.google.com/mail/u/0/#all/' + tid)
+    it.id = 'mail:' + it.link + ':mail_needs_reply'
+    return it
+  }
+  const mine = (out: { argv: string[][] }) => out.argv.filter(a => ['now', 'hub', 'inbox'].includes(a[2])).map(a => a.slice(2))
+
+  test(`a mail row archives or marks read with no model, then Archive marks it done, on ${surface}`, async ($, on) => {
+    const m = mailItem('T1', 'Budget question')
+    const d = doc({ items: [m, item('b', 'on_you', 'open')], counts: { on_you: 2, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'read-' + m.id })
+    await ui.press({ key: 'archive-' + m.id })
+    expect(mine(out)).toEqual([['inbox', 'read', '--', m.link], ['inbox', 'archive', '--', m.link], ['now', 'done', m.id]])
+    await ui.press({ key: 'row-b' })
+    expect(await ui.find({ key: 'archive-b' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test(`a section with two or more mail rows offers Archive all, and Done all marks every row done, on ${surface}`, async ($, on) => {
+    const m1 = mailItem('T1', 'One'), m2 = mailItem('T2', 'Two')
+    const d = doc({ items: [m1, m2, item('c', 'on_you', 'open')], counts: { on_you: 3, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'archive-all-on_you' }))?.text).toBe('Archive 2 mail')
+    await ui.press({ key: 'archive-all-on_you' })
+    expect(mine(out)).toEqual([['inbox', 'archive', '--', m1.link, m2.link], ['now', 'done', m1.id], ['now', 'done', m2.id]])
+    out.argv.length = 0
+    await ui.press({ key: 'done-all-on_you' })
+    expect(mine(out)).toEqual([['now', 'done', m1.id], ['now', 'done', m2.id], ['now', 'done', 'c']])
+    await ui.unmount()
+  })
+
+  test(`a failed archive leaves the row on the list, on ${surface}`, async ($, on) => {
+    const m = mailItem('T1', 'Budget question')
+    const d = doc({ items: [m], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT',
+      (argv: string[]) => argv[2] === 'inbox' ? { exitCode: 1, stderr: "mother inbox: couldn't archive mail:T1: 403\n" } : { exitCode: 0 })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'archive-' + m.id })
+    expect(mine(out)).toEqual([['inbox', 'archive', '--', m.link]])
+    expect(out.toasts).toContain("mother inbox: couldn't archive mail:T1: 403")
+    await ui.unmount()
+  })
+
+  test(`a hub update about a mail thread can be archived, then is done, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'mail:T1', title: 'New mail', why: 'w', link: null, at: iso(MIN), state: 'open' },
+                     { id: 'U2', key: 'PLAT-5', title: 'Spec', why: 'w', link: null, at: iso(MIN), state: 'open' }]
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'hub-archive-U2' })).toBeUndefined()
+    await ui.press({ key: 'hub-archive-U1' })
+    expect(mine(out)).toEqual([['inbox', 'archive', '--', 'mail:T1'], ['hub', 'done', 'U1']])
+    await ui.unmount()
   })
 
   test(`the focus pane with nothing on the list says so, on ${surface}`, async ($, on) => {

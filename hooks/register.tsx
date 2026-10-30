@@ -282,10 +282,13 @@ export function ago(iso: string | undefined | null, nowMs: number): string {
 
 // ---- writes ----------------------------------------------------------------------------------------
 
-// Run one `mother now …` verb, then re-read now.json at once. A failure toasts the first line of stderr.
-async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null, group = 'now', toastOut = false): Promise<void> {
+// Run one `mother now …` verb (or `hub`, `inbox`), then re-read now.json at once. A failure toasts the first
+// line of stderr. True when it exited 0.
+async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null, group = 'now', toastOut = false): Promise<boolean> {
+  let ok = false
   try {
     const ran = await $.process.run(['python3', bin, group, ...args])
+    ok = ran.exitCode === 0
     if (ran.exitCode === 0 && toastOut) {
       const first = String(ran.stdout ?? '').split('\n').find(l => l.trim())
       if (first) $.ui.toast(first.trim())
@@ -299,6 +302,7 @@ async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId
   }
   await load($, bin, loader).catch(() => undefined)
   if (rowId) await update($, snoozingAtom, cur => (cur === rowId ? null : cur))
+  return ok
 }
 
 // The rank a new Top 3 entry takes: the next free one, else the highest rank not done; null = none.
@@ -462,6 +466,10 @@ export function ignoreArgs(scope: string, x: string): string[] {
   return ['mute', '--', x]
 }
 
+// A Now item about a mail thread, which `mother inbox` can archive or mark read.
+const isMail = (i: NowItem): boolean => i.id.startsWith('mail:') && isUrl(i.link)
+type Go = (args: string[], rowId?: string | null) => Promise<boolean>
+
 // Every source of a row as chips: the tick's labelled `links` first, then `link` and each http(s) `also`
 // they miss, one chip per url.
 export function linkChips(links: Chip[] | null | undefined, link: string | null | undefined, also: string[] | null | undefined): Chip[] {
@@ -492,10 +500,10 @@ const LIMITS: Record<NowItem['section'], number> = { on_you: 5, neglected: 3, su
 const SECTIONS: [NowItem['section'], string][] = [['on_you', 'On you'], ['neglected', 'Neglected'], ['suggestion', 'Suggestions']]
 
 function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, snoozing: string | null, selected: string | null,
-                  expandedList: string[] | null, nowMs: number, go: (args: string[], rowId?: string | null) => Promise<void>,
-                  hub: HubBundle, goHub: (args: string[], rowId?: string | null) => Promise<void>, surface: string) {
+                  expandedList: string[] | null, nowMs: number, go: (args: string[], rowId?: string | null) => Promise<boolean>,
+                  hub: HubBundle, goHub: (args: string[], rowId?: string | null) => Promise<boolean>, surface: string, goInbox: Go) {
   const { Box, Text, Button, Link, Select } = ui
-  const hubNode = hubSection($, ui, surface, hub, snoozing, new Set(expandedList ?? []), nowMs, goHub)
+  const hubNode = hubSection($, ui, surface, hub, snoozing, new Set(expandedList ?? []), nowMs, goHub, goInbox)
   if (!doc) {
     return (
       <Box flexDirection="column">
@@ -580,6 +588,8 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
                 : <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => fill(askPrompt(i.title, i.why, i.link))}>Ask Mother</Button>}
               {isUrl(i.link) ? <Button key={'tohub-' + i.id} onPress={() => goHub(['add', '--', i.link])}>Send to hub</Button> : null}
               <Button key={'done-' + i.id} hotkey={hot(i.id, 'd')} onPress={() => go(['done', i.id], i.id)}>Done</Button>
+              {isMail(i) ? <Button key={'archive-' + i.id} onPress={async () => { if (await goInbox(['archive', '--', i.link], i.id)) await go(['done', i.id], i.id) }}>Archive</Button> : null}
+              {isMail(i) ? <Button key={'read-' + i.id} onPress={() => goInbox(['read', '--', i.link], i.id)}>Mark read</Button> : null}
               <Button key={'snooze-' + i.id} hotkey={hot(i.id, 's')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
               {isUrl(i.link)
                 ? <Button key={'ignore-' + i.id} onPress={() => update($, snoozingAtom, cur => (cur === 'ignore:' + i.id ? null : 'ignore:' + i.id))}>Ignore…</Button>
@@ -606,9 +616,19 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
     const all = items.filter(i => i.section === kind)
     if (all.length === 0) return null
     const hidden = all.length - visible(kind).length
+    const mail = all.filter(isMail)
+    const doneAll = async (list: NowItem[]) => { for (const x of list) await go(['done', x.id]) }
     return (
       <Box key={kind} flexDirection="column">
         {heading(name, all.length)}
+        {all.length >= 2 ? (
+          <Box key={'batch-' + kind} flexWrap="wrap" gap="xs">
+            {mail.length >= 2
+              ? <Button key={'archive-all-' + kind} plain dimColor onPress={async () => { if (await goInbox(['archive', '--', ...mail.map(x => x.link)])) await doneAll(mail) }}>{`Archive ${mail.length} mail`}</Button>
+              : null}
+            <Button key={'done-all-' + kind} plain dimColor onPress={() => doneAll(all)}>Done all</Button>
+          </Box>
+        ) : null}
         {visible(kind).map(row)}
         {all.length > LIMITS[kind]
           ? <Button key={'more-' + kind} plain dimColor onPress={() => toggle(kind)}>{hidden > 0 ? `Show ${hidden} more` : 'Show fewer'}</Button>
@@ -724,8 +744,8 @@ const SECTION_NAME: Record<NowItem['section'], string> = { on_you: 'On you', neg
 const RELATED_MAX = 5
 
 function focusTree($: Dollar, ui: Ui, doc: NowDoc | null, picking: string | null, selected: string | null, nowMs: number,
-                   go: (args: string[], rowId?: string | null) => Promise<void>, hub: HubBundle,
-                   goHub: (args: string[], rowId?: string | null) => Promise<void>) {
+                   go: (args: string[], rowId?: string | null) => Promise<boolean>, hub: HubBundle,
+                   goHub: (args: string[], rowId?: string | null) => Promise<boolean>, goInbox: Go) {
   const { Box, Text, Button, Link, Select } = ui
   const items = doc?.items ?? []
   const topItem = /^top:(\d+)$/.exec(selected ?? '')
@@ -776,6 +796,8 @@ function focusTree($: Dollar, ui: Ui, doc: NowDoc | null, picking: string | null
               {g === 'Triage' ? (
                 <Box key="fp-triage" flexWrap="wrap" gap="xs">
                   <Button key="fp-done" onPress={() => go(['done', i.id])}>Done</Button>
+                  {isMail(i) ? <Button key="fp-archive" onPress={async () => { if (await goInbox(['archive', '--', i.link])) await go(['done', i.id]) }}>Archive</Button> : null}
+                  {isMail(i) ? <Button key="fp-read" onPress={() => goInbox(['read', '--', i.link])}>Mark read</Button> : null}
                   <Button key="fp-snooze" onPress={() => update($, snoozingAtom, cur => (cur === 'fp-snooze' ? null : 'fp-snooze'))}>Snooze</Button>
                   {isUrl(i.link) ? <Button key="fp-ignore" onPress={() => update($, snoozingAtom, cur => (cur === 'fp-ignore' ? null : 'fp-ignore'))}>Ignore…</Button> : null}
                   {rank !== null ? <Button key="fp-maketop" onPress={() => go(['top', 'swap', String(rank), i.id])}>Make top 3</Button> : null}
@@ -806,7 +828,7 @@ function focusTree($: Dollar, ui: Ui, doc: NowDoc | null, picking: string | null
 // What the manager ignored (`mother hub mute`, in watch.json), collapsed at the foot of the pane: each value
 // with what it is and its expiry, and Unignore (`unmute -- <value>`). Nothing muted draws nothing.
 function ignoredSection(ui: Ui, watch: HubWatch | null, expanded: Set<string>, toggle: (name: string) => unknown,
-                        at: (iso: string | null | undefined) => string, goHub: (args: string[], rowId?: string | null) => Promise<void>) {
+                        at: (iso: string | null | undefined) => string, goHub: (args: string[], rowId?: string | null) => Promise<boolean>) {
   const { Box, Text, Button } = ui
   const m = watch?.mute
   const until = m?.until ?? {}
@@ -843,14 +865,14 @@ export function sessionForItem(sessions: HubSessions | null, i: NowItem): [strin
 }
 
 // Open a session: fill the prompt (the way in on a surface that cannot open the link) and run `session seen`.
-function openSession($: Dollar, goHub: (args: string[], rowId?: string | null) => Promise<void>, key: string, v: HubSession) {
+function openSession($: Dollar, goHub: (args: string[], rowId?: string | null) => Promise<boolean>, key: string, v: HubSession) {
   void $.prompt.fill({ text: `Open my "${v.title}" session`, mode: 'replace' })
   void goHub(['session', 'seen', key])
 }
 
 // The Hub section: first in the pane. Open by default when something waits; `hub` in `expanded` flips that.
 function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing: string | null, expanded: Set<string>, nowMs: number,
-                    goHub: (args: string[], rowId?: string | null) => Promise<void>) {
+                    goHub: (args: string[], rowId?: string | null) => Promise<boolean>, goInbox: Go) {
   const { Box, Text, Button, Link, Select } = ui
   const health = hubHealth(hb, nowMs)
   if (health === 'none') return null
@@ -942,6 +964,9 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                     <Text dimColor>{` ${u.key} · ${ago(u.at, nowMs)} `}</Text>
                     {isUrl(u.link) ? <Link href={u.link}>↗</Link> : null}
                     <Button key={'hub-done-' + u.id} onPress={() => goHub(['done', u.id], 'hub:' + u.id)}>Done</Button>
+                    {/^mail:/.test(u.key)
+                      ? <Button key={'hub-archive-' + u.id} onPress={async () => { if (await goInbox(['archive', '--', u.key])) await goHub(['done', u.id], 'hub:' + u.id) }}>Archive</Button>
+                      : null}
                     {followArgs(u.key) ? <Button key={'hub-follow-' + u.id} onPress={() => goHub(followArgs(u.key) as string[])}>Follow</Button> : null}
                     <Button key={'hub-mute-' + u.id} onPress={() => pickIgnore('hub:' + u.id)}>Ignore…</Button>
                     <Button key={'hub-snooze-' + u.id} onPress={() => update($, snoozingAtom, cur => (cur === 'hub:' + u.id ? null : 'hub:' + u.id))}>Snooze</Button>
@@ -1021,8 +1046,9 @@ export const register: Register = (on, options) => {
     const bin = await motherBin($, configured)
     const go = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId)
     const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub', ['add', 'mute'].includes(args[0]))
+    const goInbox = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'inbox', true)
     return focusTree($, $.ui.resolve(e), await read($, docAtom), await read($, snoozingAtom), await read($, selectedAtom),
-      await $.clock.now(), go, (await read($, hubAtom)) ?? NO_HUB, goHub)
+      await $.clock.now(), go, (await read($, hubAtom)) ?? NO_HUB, goHub, goInbox)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -1031,6 +1057,6 @@ export const register: Register = (on, options) => {
     const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub', ['add', 'follow', 'mute', 'unmute'].includes(args[0]))
     return paneTree($, $.ui.resolve(e), await read($, docAtom), await read($, errorAtom), await read($, snoozingAtom),
       await read($, selectedAtom), await read($, expandedAtom), await $.clock.now(), go,
-      (await read($, hubAtom)) ?? NO_HUB, goHub, e.surface)
+      (await read($, hubAtom)) ?? NO_HUB, goHub, e.surface, (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'inbox', true))
   })
 }

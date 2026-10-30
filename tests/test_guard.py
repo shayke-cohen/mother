@@ -1853,6 +1853,14 @@ class HubRole(GuardCase):
             if ";" not in cmd:
                 self.assertNotIn("single-quoted string", why, cmd)
 
+    def test_inbox_triage_passes_a_workspace_session_but_not_the_hub_role(self):
+        # archive and mark-read are reversible and seen by no one else: the same call as an MCP archive, unasked
+        for cmd in ("mother inbox archive -- mail:T00000001", "mother inbox read mail:T00000001 mail:T00000002"):
+            self.expect("none", "Bash", {"command": cmd}, session="local_other", cwd=self.ws)
+        self.start()
+        why = self.as_hub("Bash", {"command": "mother inbox archive -- mail:T00000001"}, "deny")
+        self.assertIn("hub session can only do hub work", why)
+
     def test_dms_verbs_pass_the_hub_role_and_the_workspace(self):
         cmds = ("mother hub dms set U00000001=D00000001 U00000002=D00000002", "mother hub dms show --json",
                 "mother hub dms drop U00000001", "mother hub dms inbox D00000009", "mother hub dms inbox none")

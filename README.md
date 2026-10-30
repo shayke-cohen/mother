@@ -106,6 +106,9 @@ Why is CI red? for a PR, Find related PRs and Find the owner for a ticket. Each 
 Enter, and anything that reaches another person comes back as a draft. **Focus** (`f`) opens a second pane with the
 selected item in full: its sources and timeline, every action grouped as Respond, Investigate, Delegate and Triage,
 Run in a session (the hub), Tell Mother… for your own words, and related items from the same team.
+Mail rows also get **Archive** and **Mark read**, done straight through the hub's mail connection with no model
+(`mother inbox`, still checked by the guard); a section with several rows gets **Done all**, and **Archive N mail**
+when two or more are mail.
 Its one setting, `mother_bin` (userConfig), is the path to the `mother` script it calls for `mother path` and
 the `mother now` edits. Left empty (the default) it runs this plugin's own `bin/mother`, the same version the
 hooks run; set it only to point the panel at another copy (a leading `~` is your home folder).
@@ -239,6 +242,7 @@ Useful commands in your terminal:
 | `mother memory index <file>` | Add one index line for `memory/<file>.md` to `memory/MEMORY.md` (idempotent); the only unprompted writer of the index. `memory check` lists drift |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
+| `mother inbox archive\|read <mail:ID \| link>...` | Archive or mark read whole mail threads with no model in the loop, through the hub's mail connection; the guard's classifier is asked first, nothing changes while paused, and each thread is logged to `.mother/guard.log`. The Now panel's Archive, Mark read and Archive N mail buttons run it |
 | `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `smoke` runs `check` and two polling passes 20 s apart into a throwaway copy of the state and prints per-source status and line counts (never content; exit 2 if a source cannot be read), `watch` runs it in the foreground; `add <link-or-text>` hands the hub something by hand, `follow`/`unfollow`/`mute`/`unmute` edit its machine-local watch list, `watching` prints it; `dms set|drop|show|inbox` maps DMs with people in config and the self-DM inbox |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
