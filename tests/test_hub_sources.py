@@ -481,7 +481,7 @@ class TestTracker(unittest.TestCase):
     def test_own_status_change_is_resolved(self):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
         theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
-        h = lambda a: {"total": 3, "values": [self.history("2026-10-29T09:51:00.000+0000", theirs),
+        h = lambda a: {"total": 3, "values": [self.history("2026-10-29T09:41:00.000+0000", theirs),
                                   self.history("2026-10-29T09:55:00.000+0000", mine),
                                   self.history("2026-10-29T09:56:00.000+0000", theirs, "labels")]}
         out, f = self.changelog_poll(h)
@@ -508,7 +508,7 @@ class TestTracker(unittest.TestCase):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
         theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
         ents = [self.history("2026-10-0%dT09:00:00.000+0000" % (1 + n // 40), theirs, "labels") for n in range(118)]
-        ents += [self.history("2026-10-29T09:51:00.000+0000", theirs), self.history("2026-10-29T09:55:00.000+0000", mine)]
+        ents += [self.history("2026-10-29T09:41:00.000+0000", theirs), self.history("2026-10-29T09:55:00.000+0000", mine)]
         h, calls = self.paged(ents)
         out, _ = self.changelog_poll(h)
         self.assertEqual(out["lines"][0]["kind"], "resolved")
@@ -545,12 +545,30 @@ class TestTracker(unittest.TestCase):
     def test_offsets_are_normalised(self):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
         theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
-        # 12:30+0300 is 09:30Z, earlier than 09:45+0000 even though it sorts later as text
-        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:45:00.000+0000", mine),
+        # 12:30+0300 is 09:30Z, before the cursor (09:50Z) even though it sorts later than 09:55+0000 as text
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:55:00.000+0000", mine),
                                               self.history("2026-10-29T12:30:00.000+0300", theirs)]}
         out, _ = self.changelog_poll(h)
         self.assertEqual(out["lines"][0]["kind"], "resolved")
         self.assertEqual(hs.parse_iso("2026-10-29T12:30:00.000+0300"), hs.parse_iso("2026-10-29T09:30:00Z"))
+
+    def test_any_others_change_since_the_cursor_is_update(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        # the manager changed it last, but someone else changed a watched field after the cursor too
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:52:00.000+0000", theirs, "assignee"),
+                                              self.history("2026-10-29T09:55:00.000+0000", mine)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+        # only the manager's changes since the cursor (two of them): resolved
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:52:00.000+0000", mine, "priority"),
+                                              self.history("2026-10-29T09:55:00.000+0000", mine)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        # no watched change since the cursor at all: nothing to attribute, so it stays an update
+        h = lambda a: {"total": 1, "values": [self.history("2026-10-29T09:40:00.000+0000", mine)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
 
     def test_others_change_is_update(self):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}

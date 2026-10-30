@@ -448,7 +448,7 @@ class TrackerJira(Adapter):
                 kind = "resolved"
             elif any(k in cls.WATCHED for k in changed) and (email or account) \
                     and ("comments" not in changed or (email and author == email)) \
-                    and cls._own_change(client, key, email, account):
+                    and cls._own_change(client, key, email, account, since):
                 kind = "resolved"
             lines.append(hub.make_line("tracker", kind, hub.thing_key("tracker", {"key": key}),
                                        iso(parse_iso(f["updated"])) if f.get("updated") else iso(at),
@@ -490,14 +490,19 @@ class TrackerJira(Adapter):
         return []  # cap reached, empty page or no `isLast`: the newest entries were not seen, so claim nothing
 
     @classmethod
-    def _own_change(cls, client, key, email, account) -> bool:
-        """True when the latest change to status / assignee / priority of `key` was made by the manager. Two
-        changelog reads (see `_changelog_tail`); any failure or unreadable answer is False (the caller reports an update)."""
+    def _own_change(cls, client, key, email, account, since=None) -> bool:
+        """True when every change to status / assignee / priority of `key` newer than `since` (the cursor) was made
+        by the manager, and there is at least one; without `since`, when the latest such change was. Two changelog
+        reads (see `_changelog_tail`); any failure or unreadable answer is False (the caller reports an update)."""
         try:
             hist = cls._changelog_tail(client, key)
         except (McpError, ForbiddenTool):  # also a server that lacks the tool: never silence the line
             return False
-        best = None
+
+        def mine(who):
+            return isinstance(who, dict) and (bool(account and who.get("accountId") == account)
+                                              or bool(email and str(who.get("emailAddress", "")).lower() == email))
+        best, newer = None, []
         for h in hist:
             if not isinstance(h, dict) or not h.get("created"):
                 continue
@@ -510,10 +515,11 @@ class TrackerJira(Adapter):
                 continue
             if best is None or when > best[0]:
                 best = (when, h.get("author"))
-        who = (best[1] if best else None) or {}
-        return bool(best) and isinstance(who, dict) and (
-            bool(account and who.get("accountId") == account)
-            or bool(email and str(who.get("emailAddress", "")).lower() == email))
+            if since is not None and when > since:
+                newer.append(h.get("author"))
+        if since is not None:  # someone else's change in the same window is news, whoever changed it last
+            return bool(newer) and all(mine(w) for w in newer)
+        return bool(best) and mine(best[1] or {})
 
 
 # ------------------------------------------------------------------------------------------------ calendar
