@@ -4338,6 +4338,24 @@ def hub_simple_command(cmd):
     return prog, argv[1:]
 
 
+HUB_CHARSET_RULE = ("a hub command is one line of tokens separated by single spaces, each made of "
+                    "`A-Za-z0-9_.:/@=,+-` (and `#` inside a token) or one single-quoted string with no `'`; "
+                    "single-quote a link that has `?`, `&`, `%` or `~`")
+
+
+def hub_charset_only(cmd):
+    """True when `cmd` reads as a `mother hub <verb>` the hub may run, refused only by the token rules (a
+    character outside the charset, a double quote, two spaces): its deny names the rule so it can be fixed."""
+    if hub_odd_chars(cmd) or "\n" in cmd.rstrip("\n"):
+        return False
+    words = cmd.replace("${CLAUDE_PLUGIN_ROOT}", os.path.dirname(HERE)).split()
+    if len(words) < 3 or words[1] != "hub" or words[2] in HUB_NO_VERBS:
+        return False
+    prog = words[0]
+    return prog == "mother" or (prog.startswith("/") and os.path.realpath(prog) == os.path.realpath(
+        os.path.join(os.path.dirname(HERE), "bin", "mother")))
+
+
 def hub_is_tail(tool, inp):
     if tool != "Bash":
         return False
@@ -4430,7 +4448,12 @@ def hub_session(tool, inp, cwd, ctx, sid=None):
         return None if target in (None, "", "self", sid) else deny
     if tool == "Bash":
         cmd = str(inp.get("command") or "")
-        return None if hub_bash_ok(hub_simple_command(cmd)) else deny
+        parsed = hub_simple_command(cmd)
+        if hub_bash_ok(parsed):
+            return None
+        if parsed is None and hub_charset_only(cmd):
+            return "deny", "%s (Bash): %s." % (HUB_DENY, HUB_CHARSET_RULE)
+        return deny
     if tool in ("Read", "Grep", "Glob", "LS"):
         ws = os.path.realpath(ctx.ws)
         plugin = os.path.realpath(os.path.dirname(HERE))

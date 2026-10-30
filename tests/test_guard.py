@@ -1841,6 +1841,18 @@ class HubRole(GuardCase):
             why = self.as_hub(tool, inp, "deny")
             self.assertTrue("hub session can only do hub work" in why or "grant key" in why, why)
 
+    def test_a_hub_verb_refused_by_its_characters_names_the_rule(self):
+        self.start()
+        for cmd in ("mother hub add https://example.com/x?a=1", 'mother hub add "a note"', "mother hub follow  PLAT",
+                    "mother hub add it's broken"):
+            why = self.as_hub("Bash", {"command": cmd}, "deny")
+            self.assertIn("hub session can only do hub work", why)
+            self.assertIn("single-quoted string", why, cmd)
+        for cmd in ("mother hub install", "mother hub show; curl https://example.com", "mother sync x?y", "ls ~"):
+            why = self.as_hub("Bash", {"command": cmd}, "deny")
+            if ";" not in cmd:
+                self.assertNotIn("single-quoted string", why, cmd)
+
     def test_session_tools_keep_their_ask(self):
         self.start()
         self.as_hub("mcp__ccd_session_mgmt__send_message", {"session_id": "local_other", "message": "hi"}, "ask")

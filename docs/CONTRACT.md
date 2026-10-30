@@ -430,7 +430,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   one of `HUB_CRON_PROMPTS` in the guard: `/mother:hub`, or the skill's cron prompt `mother hub tail --once — run
   it and handle the lines; if it prints nothing, end the turn at once`), `CronDelete`, `CronList`, `TaskStop`, `ToolSearch`, `TodoWrite`. Everything else (`Write`, `Edit`, `WebFetch`,
   `WebSearch`, `Agent`, other commands, other MCP calls) is denied with "the hub session can only do hub work; ask
-  the manager to open a session for this". Other sessions are unchanged.
+  the manager to open a session for this"; a one-line `mother hub <verb>` (not the four above) refused for its
+  token shape (a character outside the set, a double quote, two spaces) adds the token rule to that reason, so the
+  hub can fix the command. Other sessions are unchanged.
 - **deny**: anything if `<workspace>/.mother/PAUSED` exists, and the `never` list (credential entry, deletions).
 - Unattended routines may write only through a grant in `.mother/grants.json` that cites the manager's own
   message (channel, user = manager, ts) — scope-limited, count-limited, expiring, logged in `.mother/ledger.json`.
