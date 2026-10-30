@@ -1093,7 +1093,7 @@ change when a line already links `(<name>.md)`. Atomic, under `.mother/memory.lo
 ## 7. Skills in v0
 
 `setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
-(connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap), `reflect`, `todo`, `project`,
+(connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap; the unattended `meeting-prep` routine never calls a page connector's publish tool, which asks: it publishes as `file` and says in the DM that publishing needs the manager's OK), `reflect`, `todo`, `project`,
 `team`, `remember`, `whatsapp` (read chats, send through `mother whatsapp send`, which asks; §5d), `hub` (the manager's pinned hub session: wakes on the watcher's inbox through a Monitor on `mother hub tail --follow`, or a 3-minute cron running `tail --once`; decides each line with `mother hub decide`, routes it with the in-app message tool, raises cards with `start_session` `own_initiative`, and reconciles sessions on a `sweep` line; §5e), `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
 
 ## 8. Writing rules for everything in this repo
