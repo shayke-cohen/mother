@@ -962,6 +962,31 @@ class Install(unittest.TestCase):
         self.assertTrue(d["StandardOutPath"].endswith(".mother/hub/watcher.log"))
         self.assertTrue(any(c[0] == "bootstrap" for c in self.calls))
 
+    def test_install_retries_bootstrap_while_the_old_job_unloads(self):
+        # `bootout` returns before the old job is gone, so the first `bootstrap` of a reinstall can fail (EIO)
+        fails = [1, 1]
+
+        def ctl(*a):
+            self.calls.append(a)
+            if a[0] == "bootstrap" and fails:
+                fails.pop()
+                return 5, "Bootstrap failed: 5: Input/output error"
+            return 0, ""
+        self.assertEqual(hub.install(self.ws, self.cfg, plist_path=self.plist, ctl=ctl, which=self.which,
+                                     python="/usr/bin/python3", mother="/plug/bin/mother", sleep=lambda s: None), 0)
+        self.assertEqual([c[0] for c in self.calls].count("bootstrap"), 3)
+
+    def test_install_gives_up_after_the_retries(self):
+        def ctl(*a):
+            self.calls.append(a)
+            return (5, "Bootstrap failed: 5: Input/output error") if a[0] == "bootstrap" else (0, "")
+        self.assertEqual(hub.install(self.ws, self.cfg, plist_path=self.plist, ctl=ctl, which=self.which,
+                                     python="/usr/bin/python3", mother="/plug/bin/mother", sleep=lambda s: None), 1)
+        self.assertEqual([c[0] for c in self.calls].count("bootstrap"), hub.BOOTSTRAP_TRIES)
+
+    def test_idle_default_is_an_hour(self):
+        self.assertEqual(hub.DEFAULTS["idle_every_seconds"], 3600)
+
     def test_install_fails_on_missing_command(self):
         self.which = {"gh": "/opt/homebrew/bin/gh"}.get
         self.assertEqual(self.run_install(), 1)
