@@ -6,6 +6,7 @@ Run: python3 -m unittest tests.test_guard -v
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1865,6 +1866,37 @@ class HubRole(GuardCase):
                           ("mcp__ccd_session__dismiss_task", {"task_id": "t1"}),
                           ("mcp__ccd_session_mgmt__list_sessions", {})):
             self.as_hub(tool, inp, "none")
+
+    def test_every_command_in_the_hub_skill_passes_the_hub_role(self):
+        """Each `mother …` command the hub skill shows, with its placeholders filled, runs in the hub session."""
+        self.start()
+        with open(os.path.join(ROOT, "skills", "hub", "SKILL.md")) as f:
+            skill = f.read()
+        fill = {"<key>": "PLAT-9", "<slug>": "plat-9", "<name>": "plat-9", "<title>": "'PLAT-9: a look'",
+                "<task_id>": "t1", "<session id>": "local_x", "<url>": "https://example.com/browse/PLAT-9",
+                "<link-or-text>": "https://example.com/browse/PLAT-9", "<x>": "PLAT",
+                "<the entry's also, comma-separated>": "PLAT-8,acme/web#3", "<N>": "5"}
+        not_run = {"mother hub watch", "mother hub install", "mother approve"}  # named, never run by the hub
+        cmds = set()
+        for m in re.finditer(r"`((?:\$\{CLAUDE_PLUGIN_ROOT\}/bin/)?mother [^`]+)`", skill):
+            cmd = re.sub(r"\s*\n\s*", " ", m.group(1))  # a command wrapped across lines
+            for k, v in fill.items():
+                cmd = cmd.replace(k, v)
+            cmd = re.sub(r"\[([^\]]*)\]", r"\1", cmd)  # optional parts given
+            if cmd.endswith(" <<'HUBEOF'"):
+                cmd += "\n[]\nHUBEOF"
+            if cmd in not_run or "…" in cmd:
+                continue
+            self.assertNotIn("<", cmd.split("\n")[0].replace("<<'HUBEOF'", ""), cmd)
+            cmds.add(cmd)
+        for cmd in ("mother hub add 'https://example.com/browse/PLAT-9' --key PLAT-9",
+                    "mother hub pending raised PLAT-9 --name plat-9", "mother hub pending drop PLAT-9 --json"):
+            self.assertIn(cmd, cmds)
+        self.assertGreater(len(cmds), 15)
+        for cmd in sorted(cmds):
+            self.as_hub("Bash", {"command": cmd}, "none")
+        self.as_hub("mcp__ccd_session__start_session", {"initiation": "user_asked", "name": "plat-9", "title": "t",
+                                                        "prompt": "x"}, "ask")
 
     def test_recording_needs_workspace_cwd_and_no_subagent(self):
         path = os.path.join(self.ws, ".mother", "hub", "hub-session.json")

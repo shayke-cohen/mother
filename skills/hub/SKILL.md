@@ -109,7 +109,7 @@ A `sweep` line means look at the app, not at a source. `list_sessions` with `lin
 
 - for each card that was started (a session whose `name` equals the stamped `name` of a pending entry with
   `raised_at`; `session add` refuses any other key): `mother hub session add <key> --id <session id> --name <name> --title <title> [--link <url>] --also <the entry's also,
-  comma-separated> --json`. If the output has `catch_up`, something arrived after the card was raised: send one
+  comma-separated> --json` (a `--title` with a space is one single-quoted string without `'`; drop apostrophes). If the output has `catch_up`, something arrived after the card was raised: send one
   message into the new session with its link, `read` and `next_step` (your own words from when you decided it),
   then nothing more for it;
 - for each live session in `mother hub show --json` with `unseen` > 0 whose `lastActivityAt` in the listing is
@@ -131,12 +131,26 @@ A turn the manager typed (not a wake, not a line) is a request to you. Handle th
 | what is watched or muted | `mother hub watching` (`--json` for the full lists), then tell it in a few lines |
 | what is going on | `mother hub show --json`, summarised: sessions, cards waiting, open updates |
 | send something into a session that follows a key | `mother hub session for <key>`, then the in-app message tool, as under Route |
-| open a session for something | the new-session tool, initiation `user_asked`, with a brief as under Raising cards. The guard asks the manager; their approval is the consent. It does not count against the card budget |
+| open a session for something | the steps under **A session the manager asks for**, below |
 | drop a card waiting for them | `mother hub pending drop <key> --json`, then `dismiss_task` with its `task_id` |
+
+**A session the manager asks for.** Link it to its key, so later lines route into it:
+1. Find the key (`PLAT-12`, `owner/repo#12`, `<channel>/<ts>`; for anything else the key `mother hub add` prints).
+   If no line printed this turn carries it, add one: `mother hub add '<link-or-text>' --key <key>` (or without
+   `--key` to let it pick), then `mother hub tail --once` and take the new line's `id` from its output.
+2. Decide that line `propose` (with every other printed line, as in Record) with `title`, `link`, `read`,
+   `next_step` and `name` = the card slug of the key (as under Raising cards).
+3. Start the session with the new-session tool, initiation `user_asked`, `name` = that slug and a brief as under
+   Raising cards. The guard asks the manager; their approval is the consent. It does not count against the card
+   budget.
+4. Right after it starts, `mother hub pending raised <key> --name <slug>`, before raising any other card, so no
+   `own_initiative` card is raised for it too. The next sweep's `session add` adopts the session by its `name`.
+   If the manager declines, `mother hub pending drop <key> --json` and say so.
 
 Command rules in this session: single-space tokens only; characters `A-Za-z0-9_.:/@=,+-` (and `#` inside a token), or one
 single-quoted string with no `'`. A value that could begin with `-` goes after `--`
-(`mother hub follow -- <key>`). `manual` lines (what `add` writes) are always routed or proposed, never logged.
+(`mother hub follow -- <key>`). A link that contains `?`, `&`, `%` or `~` is always single-quoted, even alone.
+`manual` lines (what `add` writes) are always routed or proposed, never logged.
 
 **Limits.** The hub can't fetch the web, edit files or run other commands, and it sends nothing to people. For any of
 those, propose a session (a card, or `user_asked` when the manager asked for one now) and say so; don't try a

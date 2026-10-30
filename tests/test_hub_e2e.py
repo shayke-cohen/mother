@@ -291,6 +291,25 @@ class E2E(unittest.TestCase):
         self.assertEqual((r["decision"], r["session_id"]), ("route", "S1"))
         self.assertEqual(self.sessions()["PLAT-1"]["unseen"], 1)
 
+    def test_a_session_the_manager_asks_for_is_linked_to_its_key(self):
+        """The hub skill's steps: add a manual line, decide propose with the slug, stamp it raised (the session was
+        started `user_asked` with that name), and the sweep's `session add` adopts it; later lines route to it."""
+        self.poll(0)
+        self.verb(2, "add", "https://example.com/browse/PLAT-7 needs a look", "--key", "PLAT-7")
+        (line,) = [l for l in self.tail() if l["key"] == "PLAT-7"]
+        res = hub.decide(self.ws, self.cfg, self.at(2), [{"line_id": line["id"], "key": "PLAT-7",
+                                                          "decision": "propose", "name": "plat-7", "title": "Look"}])
+        self.assertEqual(res[0]["decision"], "propose")
+        self.verb(2, "pending", "raised", "PLAT-7", "--name", "plat-7")
+        self.assertTrue(self.hub_json()["pending"][0]["raised_at"])
+        self.verb(3, "session", "add", "PLAT-7", "--id", "S7", "--name", "plat-7", "--title", "Look")
+        self.assertEqual(self.hub_json()["pending"], [])
+        FakeTracker.items.append("PLAT-7")
+        self.poll(4)
+        _, res = self.wake(4)
+        (r,) = [r for r in res if r["key"] == "PLAT-7"]
+        self.assertEqual((r["decision"], r["session_id"]), ("route", "S7"))
+
     def test_a_mentioned_unwatched_project_is_followed_and_polled_next_pass(self):
         self.poll(0)
         self.poll(2, history=[self.msg(2, "WEB-5 is broken again; UTF-8 and ISO-8601 are not projects")])
