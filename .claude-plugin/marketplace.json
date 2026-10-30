@@ -3,7 +3,6 @@
   "owner": { "name": "Shay Cohen", "url": "https://github.com/shayke-cohen" },
   "metadata": { "description": "MOTHER: a chief of staff for people managers, built on Claude Code." },
   "plugins": [
-    { "name": "mother", "source": "./", "description": "Named manager agent: setup interview, connector doctor, daily and weekly routines, decision queue, meeting mode with tracker write-back." },
-    { "name": "mother-now", "source": "./mods/now", "description": "The Now panel for MOTHER: what's on you and what the team is neglecting, beside the chat." }
+    { "name": "mother", "source": "./", "description": "Named manager agent: setup interview, connector doctor, daily and weekly routines, decision queue, meeting mode with tracker write-back, and the Now panel beside the chat." }
   ]
 }

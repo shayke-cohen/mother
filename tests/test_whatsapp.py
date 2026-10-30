@@ -281,6 +281,34 @@ class TestReader(Base):
         out = whatsapp.read_messages(None, SINCE, limit=2)
         self.assertEqual([i["text"] for i in out["items"]], ["a stranger writes", "note to self"])
 
+    def test_after_a_row_id_in_insertion_order_even_when_dated_older(self):
+        self.build()
+        self.assertEqual(whatsapp.max_pk(), len(MSGS))
+        out = whatsapp.read_messages_after(6)
+        self.assertEqual([i["pk"] for i in out["items"]], [7, 8, 9])  # the status chat (row 10) is left out
+        self.assertEqual([i["text"] for i in out["items"]], ["note to self", "from a hidden id", "levi here"])
+        self.assertEqual(out["items"][0]["link"], "whatsapp://%s/S2" % SELF)
+        self.assertEqual([i["pk"] for i in whatsapp.read_messages_after(0, limit=2)["items"]], [1, 2])  # oldest first
+        self.assertEqual(whatsapp.read_messages_after(len(MSGS))["items"], [])
+        self.assertNotIn("a status update", json.dumps(whatsapp.read_messages_after(0, limit=50)))
+
+    def test_after_leaves_out_channels_and_status_but_read_does_not(self):
+        chats = CHATS + [(9, "120363999999999999@newsletter", "A Channel", 0), (10, "status@s.whatsapp.net", "S", 0)]
+        msgs = MSGS + [{"chat": 9, "text": "channel post", "date": core("2026-10-26T12:00:00Z"), "stanza": "N1"},
+                       {"chat": 10, "text": "odd status", "date": core("2026-10-26T12:01:00Z"), "stanza": "N2"}]
+        fixture_db(self.db, chats, msgs)
+        got = json.dumps(whatsapp.read_messages_after(0, limit=50))
+        self.assertNotIn("channel post", got)
+        self.assertNotIn("odd status", got)
+        self.assertIn("note to self", got)
+        self.assertIn("channel post", json.dumps(whatsapp.read_messages(None, SINCE)))  # `read` is unchanged
+
+    def test_after_reports_an_unreadable_database(self):
+        out = whatsapp.read_messages_after(0)
+        self.assertEqual((out["status"], out["reason"]), ("couldnt_check", "missing"))
+        with self.assertRaises(whatsapp.ReaderError):
+            whatsapp.max_pk()
+
     def test_a_hidden_id_chat_is_read_by_name(self):
         self.build()
         out = whatsapp.read_messages(self.chat("Hidden One"))

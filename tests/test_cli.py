@@ -994,6 +994,21 @@ class HubConfig(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("hub.connections.fax", r.stdout)
 
+    def test_hub_whatsapp_connection_is_local_only(self):
+        r = self.status_with(lambda b: b.update(connections={"whatsapp": {"local": "whatsapp"}},
+                                                watch={"whatsapp": {"groups": ["15550000002-1700000000@g.us"]}}))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for conn in ({"command": "example-mcp"}, {"local": "other"}, {"local": "whatsapp", "command": "x"}, {}):
+            r = self.status_with(lambda b: b.update(connections={"whatsapp": conn}))
+            self.assertEqual(r.returncode, 1, conn)
+            self.assertIn("hub.connections.whatsapp", r.stdout)
+        r = self.status_with(lambda b: b.update(connections={"chat": {"local": "whatsapp"}}))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hub.connections.chat", r.stdout)
+        r = self.status_with(lambda b: b.update(watch={"whatsapp": {"groups": "x"}}))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("hub.watch.whatsapp.groups", r.stdout)
+
     def test_hub_cards_capped_at_3(self):
         r = self.status_with(lambda b: b.update(max_cards_per_wake=4))
         self.assertEqual(r.returncode, 1)

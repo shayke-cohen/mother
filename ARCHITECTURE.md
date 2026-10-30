@@ -30,7 +30,8 @@ holds code a later session would run.
 | Path | What it is | Notes |
 |---|---|---|
 | `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
-| `hooks/hooks.json` | Wires the hooks | PreToolUse → guard (every tool it has a rule for; tests/test_packaging.py checks); Stop and SessionEnd → `mother sync --quiet` |
+| `hooks/hooks.json` | Wires the hooks | `modules` → `hooks/register.tsx` (the Now panel); PreToolUse → guard (every tool it has a rule for; tests/test_packaging.py checks); Stop and SessionEnd → `mother sync --quiet`. The command hooks run even if the panel module fails to load |
+| `hooks/register.tsx`, `types/index.d.ts` | The Now panel, a hooks module (mod API, early access) in the same plugin: `/now-panel`, status line, toasts | Reads `.mother/now.json` and the hub's files; writes only through `mother now …` / `mother hub …`. `mother_bin` userConfig, empty = `${plugin root}/bin/mother`. Tests: `claude plugin test .` (`hooks/register.test.tsx`) |
 | `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. `hooks/guard_fast.py` takes every tool the main matcher doesn't and escalates to the guard for channel roles, MOTHER's sub-agents, hub and hub-fed sessions and the grant key; otherwise it passes without loading the guard. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
 | `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval`, `health` to `lib/` |
 | `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
@@ -42,7 +43,7 @@ holds code a later session would run.
 | `lib/now.py` | Deterministic core of the hourly tick and Now panel (working hours, signal thresholds, merge into `now.json`, the `mother now` verbs) | Python 3.9 stdlib only |
 | `lib/hub.py` | State core of the watcher and hub: thing keys, inbox lines, `.mother/hub/` files (atomic, locked) | Python 3.9 stdlib only |
 | `lib/hub_mcp.py` | Minimal MCP stdio client plus the read-only wrapper the watcher uses | Allow-list enforced before send. CONTRACT §5e |
-| `lib/hub_sources.py` | Per-capability poll adapters and the deterministic prefilter | Product-specific tool names live only here. CONTRACT §5e |
+| `lib/hub_sources.py` | Per-capability poll adapters and the deterministic prefilter | Product-specific tool names live only here. The `whatsapp` adapter reads through `LocalWhatsApp` (the reader functions of `lib/whatsapp.py` only: no bridge, no send). CONTRACT §5e |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
 | `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |

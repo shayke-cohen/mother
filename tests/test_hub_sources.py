@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.join(ROOT, "lib"))
 import health  # noqa: E402
 import hub_mcp  # noqa: E402
 import hub_sources as hs  # noqa: E402
+import whatsapp  # noqa: E402
+from hub_mcp import McpError as McpErrorAlias  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("guard", os.path.join(ROOT, "hooks", "guard.py"))
 guard = importlib.util.module_from_spec(_spec)
@@ -142,8 +144,11 @@ class TestReadOnlyMissingTools(unittest.TestCase):
 class TestAdapterShape(unittest.TestCase):
     def test_every_adapter_read_tools_are_reads(self):
         self.assertEqual(set(hs.ADAPTERS), {"chat:slack", "mail:gmail", "tracker:jira", "calendar:google",
-                                            "code:github"})
+                                            "code:github", "whatsapp:whatsapp"})
         for key, a in hs.ADAPTERS.items():
+            if key.startswith("whatsapp:"):
+                self.assertEqual(a.READ_TOOLS, set())  # no tools at all: it reads the local database
+                continue
             self.assertTrue(a.READ_TOOLS, key)
             for t in a.READ_TOOLS:
                 lead = t.replace("-", "_").split("_")[0]
@@ -152,6 +157,8 @@ class TestAdapterShape(unittest.TestCase):
     def test_first_poll_returns_cursor_only(self):
         for key, a in hs.ADAPTERS.items():
             cap = key.split(":")[0]
+            if cap == "whatsapp":
+                continue  # TestWhatsApp.test_first_poll_returns_cursor_only
             handlers = {t: (lambda args: {}) for t in a.READ_TOOLS}
             client = hs.GhClient(runner=lambda p: {}) if cap == "code" else ro(handlers, a.READ_TOOLS)[0]
             out = a.poll(client, None, {}, ME, AT)
@@ -844,3 +851,210 @@ class TestCode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SELF = "15550000009@s.whatsapp.net"
+DANA = "15550000001@s.whatsapp.net"
+TEAM = "15550000002-1700000000@g.us"
+OPS = "15550000003-1700000001@g.us"
+
+
+class FakeReader:
+    """Stands in for hub_sources.LocalWhatsApp: rows have a `pk` (insertion order), whatever their `at`."""
+
+    def __init__(self, items=(), error=None, head=0):
+        self.items = list(items)
+        self.error = error
+        self.head_pk = head
+        self.calls = []
+
+    def head(self):
+        if self.error:
+            raise self.error
+        return self.head_pk
+
+    def messages_after(self, pk, limit):
+        self.calls.append((pk, limit))
+        if self.error:
+            raise self.error
+        return [i for i in self.items if i["pk"] > pk][:limit]
+
+
+_PK = [0]
+
+
+def wa(text, at, chat=DANA, sid="S1", sender="Dana", from_me=False, name="Dana", pk=None):
+    _PK[0] += 1
+    return {"pk": pk or _PK[0], "chat": chat, "chat_name": name, "from_me": from_me,
+            "sender": "me" if from_me else sender, "text": text, "at": at, "link": "whatsapp://%s/%s" % (chat, sid)}
+
+
+class TestWhatsApp(unittest.TestCase):
+    CFG = {"_local": {"enabled": True, "read": True, "home": True, "self_jid": SELF}, "groups": [TEAM]}
+    CURSOR = {"pk": 0, "open": {}}
+
+    def setUp(self):
+        _PK[0] = 0
+
+    def poll(self, items=(), cursor=CURSOR, cfg=None, reader=None, me=None):
+        reader = reader or FakeReader(items)
+        self.reader = reader
+        return hs.WhatsApp.poll(reader, cursor, cfg or self.CFG, me or ME, AT)
+
+    def test_first_poll_sets_the_cursor_at_the_newest_row_and_reads_no_backlog(self):
+        r = FakeReader([wa("hi", "2026-10-29T09:59:00Z")], head=41)
+        out = self.poll(cursor=None, reader=r)
+        self.assertEqual(out["lines"], [])
+        self.assertEqual(out["cursor"], {"pk": 41, "open": {}})
+        self.assertEqual(r.calls, [])
+        out = self.poll(cursor={"ts": "2026-10-29T09:55:00Z", "seen": []}, reader=r)  # an old-style cursor restarts
+        self.assertEqual(out["cursor"], {"pk": 41, "open": {}})
+
+    def test_dm_is_a_candidate(self):
+        out = self.poll([wa("can you look at PLAT-7 today?", "2026-10-29T09:58:00Z", sid="S9")])
+        (l,) = out["lines"]
+        self.assertEqual((l["source"], l["kind"], l["key"]), ("whatsapp", "update", "wa:" + DANA))
+        self.assertEqual(l["who"], "Dana")
+        self.assertEqual(l["link"], "whatsapp://send?phone=15550000001")
+        self.assertEqual(l["also"], ["PLAT-7"])
+        self.assertEqual(l["id"], "whatsapp:wa:%s:S9" % DANA)
+        self.assertEqual(l["at"], "2026-10-29T09:58:00Z")
+        self.assertEqual(out["cursor"]["pk"], 1)
+
+    def test_who_is_the_name_without_the_jid(self):
+        out = self.poll([wa("hi", "2026-10-29T09:58:00Z", sender="+15550000001")])
+        self.assertEqual(out["lines"][0]["who"], "+15550000001")
+
+    def test_one_line_per_chat_and_text_is_capped_and_cleaned(self):
+        out = self.poll([wa("first", "2026-10-29T09:57:00Z", sid="A"),
+                         wa("second‮\nline", "2026-10-29T09:58:00Z", sid="B")])
+        (l,) = out["lines"]
+        self.assertEqual(l["summary"], "second line")
+        out = self.poll([wa("x" * 500 + "\x1b", "2026-10-29T09:57:00Z")])
+        self.assertLessEqual(len(out["lines"][0]["summary"]), 300)
+        self.assertLessEqual(len(out["lines"][0]["title"]), 80)
+        self.assertNotIn("\x1b", out["lines"][0]["summary"])
+
+    def test_group_needs_a_mention_unless_listed(self):
+        quiet = wa("lunch?", "2026-10-29T09:58:00Z", chat=OPS, sender="Agnes", name="Ops", sid="Q")
+        self.assertEqual(self.poll([quiet])["lines"], [])
+        mention = wa("@15550000009 can you approve?", "2026-10-29T09:58:30Z", chat=OPS, sender="Agnes", name="Ops",
+                     sid="M")
+        (l,) = self.poll([quiet, mention])["lines"]
+        self.assertEqual((l["key"], l["who"], l["link"]), ("wa:" + OPS, "Agnes", ""))
+        self.assertTrue(l["title"].startswith("Ops: "))
+        near = wa("@155500000090 not me", "2026-10-29T09:58:30Z", chat=OPS, name="Ops", sid="N")
+        self.assertEqual(self.poll([near])["lines"], [])
+
+    def test_listed_or_followed_group_is_read_whole(self):
+        team = wa("standup moved", "2026-10-29T09:58:00Z", chat=TEAM, sender="Agnes", name="Team")
+        (l,) = self.poll([team])["lines"]
+        self.assertEqual(l["key"], "wa:" + TEAM)
+        cfg = dict(self.CFG, groups=[OPS])  # followed groups arrive in the same list
+        self.assertEqual(self.poll([team], cfg=cfg)["lines"], [])
+        quiet = wa("lunch?", "2026-10-29T09:58:00Z", chat=OPS, name="Ops")
+        self.assertEqual(len(self.poll([quiet], cfg=cfg)["lines"]), 1)
+
+    def test_own_reply_resolves_with_no_content(self):
+        out = self.poll([wa("ping", "2026-10-29T09:57:00Z", sid="A"),
+                         wa("on it", "2026-10-29T09:58:00Z", sid="B", from_me=True)])
+        (l,) = out["lines"]
+        self.assertEqual((l["kind"], l["key"]), ("resolved", "wa:" + DANA))
+        self.assertEqual((l["title"], l["summary"], l["who"]), ("", "", ""))
+        self.assertEqual(out["cursor"]["open"], {})
+        out = self.poll([wa("ping", "2026-10-29T09:57:00Z", sid="A")])
+        self.assertEqual(out["cursor"]["open"], {"wa:" + DANA: "2026-10-29T09:57:00Z"})
+        out = self.poll([wa("on it", "2026-10-29T09:58:00Z", sid="B", from_me=True)], cursor=out["cursor"])
+        self.assertEqual([x["kind"] for x in out["lines"]], ["resolved"])
+
+    def test_own_message_with_no_open_candidate_is_nothing_in_a_dm_or_a_group(self):
+        out = self.poll([wa("hi", "2026-10-29T09:58:00Z", from_me=True),
+                         wa("hi all", "2026-10-29T09:58:00Z", chat=OPS, from_me=True, name="Ops")])
+        self.assertEqual(out["lines"], [])
+
+    def test_own_reply_after_a_mention_resolves_the_group(self):
+        m = wa("@15550000009 ok?", "2026-10-29T09:57:00Z", chat=OPS, name="Ops", sid="M")
+        r = wa("yes", "2026-10-29T09:58:00Z", chat=OPS, name="Ops", sid="R", from_me=True)
+        self.assertEqual([x["kind"] for x in self.poll([m, r])["lines"]], ["resolved"])
+
+    def test_the_agents_own_signed_message_is_neither(self):
+        me = dict(ME, marks=["Mother (AI)"])
+        out = self.poll([wa("ping", "2026-10-29T09:57:00Z", sid="A"),
+                         wa("sent\n\n*Mother (AI)* on behalf of Dana", "2026-10-29T09:58:00Z", sid="B",
+                            from_me=True)], me=me)
+        self.assertEqual([x["kind"] for x in out["lines"]], ["update"])
+
+    def test_cursor_follows_the_row_id_and_nothing_repeats(self):
+        first = self.poll([wa("hello", "2026-10-29T09:58:00Z", sid="S1")])
+        self.assertEqual(len(first["lines"]), 1)
+        self.assertEqual(self.reader.calls, [(0, 201)])
+        again = self.poll([wa("hello", "2026-10-29T09:58:00Z", sid="S1", pk=1),
+                           wa("and more", "2026-10-29T09:59:00Z", sid="S2", pk=2)], cursor=first["cursor"])
+        self.assertEqual([l["id"] for l in again["lines"]], ["whatsapp:wa:%s:S2" % DANA])
+        self.assertEqual(self.reader.calls, [(1, 201)])
+        self.assertEqual(self.poll([], cursor=again["cursor"])["cursor"]["pk"], 2)
+
+    def test_a_late_synced_message_dated_before_the_last_pass_is_not_lost(self):
+        first = self.poll([wa("fresh", "2026-10-29T09:58:00Z", sid="N1")])
+        self.assertEqual(first["cursor"]["pk"], 1)
+        # the Mac slept: WhatsApp stores a message sent at 09:30 only now (a higher row id, an older date)
+        late = wa("sent while the laptop slept", "2026-10-29T09:30:00Z", sid="L1")
+        out = self.poll([wa("fresh", "2026-10-29T09:58:00Z", sid="N1", pk=1), late], cursor=first["cursor"])
+        (l,) = out["lines"]
+        self.assertEqual((l["summary"], l["at"]), ("sent while the laptop slept", "2026-10-29T09:30:00Z"))
+        self.assertEqual(out["cursor"]["pk"], 2)
+
+    def test_more_than_the_limit_is_partial_and_the_next_pass_continues(self):
+        items = [wa("m%d" % i, "2026-10-29T09:58:00Z", sid="S%d" % i, chat=TEAM, name="Team") for i in range(250)]
+        out = self.poll(items)
+        self.assertEqual(out["partial"], ["more than 200 WhatsApp messages waiting; the rest are read next pass"])
+        self.assertEqual(out["cursor"]["pk"], 200)
+        rest = self.poll(items, cursor=out["cursor"])
+        self.assertEqual(rest["partial"], [])
+        self.assertEqual(rest["cursor"]["pk"], 250)
+        self.assertEqual(rest["lines"][0]["summary"], "m249")  # one line per chat: the newest of the rest
+
+    def test_unreadable_database_raises_with_the_reason(self):
+        with self.assertRaises(McpErrorAlias) as cm:
+            self.poll(reader=FakeReader(error=whatsapp.ReaderError("denied")))
+        self.assertIn("Full Disk Access", cm.exception.message)
+        with self.assertRaises(McpErrorAlias) as cm:
+            self.poll(reader=FakeReader(error=whatsapp.ReaderError("locked")), cursor=None)
+        self.assertIn("locked", cm.exception.message)
+
+    def test_gap_reasons(self):
+        def gap(**kw):
+            local = dict(self.CFG["_local"], **kw)
+            return hs.WhatsApp.gap(dict(self.CFG, _local=local))
+        self.assertIsNone(gap())
+        self.assertIn("whatsapp.enabled", gap(enabled=False))
+        self.assertIn("whatsapp.read", gap(read=False))
+        self.assertIn("home machine", gap(home=False))
+        self.assertIn("self_jid", gap(self_jid=""))
+        self.assertIn("whatsapp", hs.WhatsApp.gap({}))  # fails closed
+
+    def test_local_reader_has_no_send_path_and_never_touches_the_bridge(self):
+        import inspect
+        public = {n for n in dir(hs.LocalWhatsApp()) if not n.startswith("_")}
+        self.assertEqual(public, {"head", "messages_after", "ping"})
+        src = inspect.getsource(hs)
+        for word in ("bridge_call", "cmd_send", "_exchange", "_start_bridge", "install_bridge"):
+            self.assertNotIn(word, src)
+
+    def test_local_reader_reads_through_whatsapp_read_functions(self):
+        calls = []
+        saved = (whatsapp.read_messages_after, whatsapp.recent_chats, whatsapp.max_pk)
+        self.addCleanup(lambda: (setattr(whatsapp, "read_messages_after", saved[0]),
+                                 setattr(whatsapp, "recent_chats", saved[1]), setattr(whatsapp, "max_pk", saved[2])))
+        whatsapp.read_messages_after = lambda pk, limit=100: (
+            calls.append((pk, limit)) or {"status": "ok", "items": [{"x": 1}]})
+        whatsapp.recent_chats = lambda limit=30, query=None: calls.append(("chats", limit)) or []
+        whatsapp.max_pk = lambda: 7
+        r = hs.LocalWhatsApp()
+        self.assertEqual(r.head(), 7)
+        self.assertEqual(r.messages_after(3, 5), [{"x": 1}])
+        r.ping()
+        self.assertEqual(calls, [(3, 5), ("chats", 1)])
+        whatsapp.read_messages_after = lambda *a, **kw: {"status": "couldnt_check", "reason": "denied", "items": []}
+        with self.assertRaises(whatsapp.ReaderError):
+            r.messages_after(3, 5)

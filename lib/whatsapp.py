@@ -302,20 +302,49 @@ def read_messages(chat: dict = None, since_iso: str = None, limit: int = DEFAULT
         rows = _query(sql, params + [int(limit)])
     except ReaderError as e:
         return _couldnt(e.reason)
-    items = []
-    for jid, pname, stype, from_me, text, mtype, mdate, stanza, member in reversed(rows):
-        name = chat_name({"jid": jid, "name": pname, "group": stype == GROUP_SESSION,
-                          "hidden_id": (jid or "").endswith("@lid")})
-        if from_me:
-            sender = "me"
-        elif stype == GROUP_SESSION:
-            sender = member or "a member"
-        else:
-            sender = name
-        items.append({"chat": jid, "chat_name": name, "from_me": bool(from_me), "sender": sender,
-                      "text": text if mtype in TEXT_TYPES and text is not None else "[media]",
-                      "at": core_ts(mdate), "link": "whatsapp://%s/%s" % (jid, stanza)})
-    return {"status": "ok", "items": items}
+    return {"status": "ok", "items": [_item(r) for r in reversed(rows)]}
+
+
+def _item(row, pk=None) -> dict:
+    jid, pname, stype, from_me, text, mtype, mdate, stanza, member = row[:9]
+    name = chat_name({"jid": jid, "name": pname, "group": stype == GROUP_SESSION,
+                      "hidden_id": (jid or "").endswith("@lid")})
+    if from_me:
+        sender = "me"
+    elif stype == GROUP_SESSION:
+        sender = member or "a member"
+    else:
+        sender = name
+    it = {"chat": jid, "chat_name": name, "from_me": bool(from_me), "sender": sender,
+          "text": text if mtype in TEXT_TYPES and text is not None else "[media]",
+          "at": core_ts(mdate), "link": "whatsapp://%s/%s" % (jid, stanza)}
+    if pk is not None:
+        it["pk"] = pk
+    return it
+
+
+def max_pk() -> int:
+    """The newest message row id (0 for an empty database). Raises ReaderError."""
+    rows = _query("SELECT MAX(Z_PK) FROM ZWAMESSAGE")
+    return int(rows[0][0] or 0) if rows else 0
+
+
+def read_messages_after(pk: int, limit: int = DEFAULT_LIMIT) -> dict:
+    """Messages inserted after row `pk` (insertion order, not send time, so a message WhatsApp stores late is still
+    seen), oldest first, across chats, broadcast, status and Channels (newsletters) excluded, for the hub watcher only; the first `limit` rows after `pk`. Items are
+    reader items plus `pk`. Raises nothing: `{"status": "couldnt_check", "reason"}` as `read_messages`."""
+    sql = ("SELECT s.ZCONTACTJID, s.ZPARTNERNAME, s.ZSESSIONTYPE, m.ZISFROMME, m.ZTEXT, m.ZMESSAGETYPE, "
+           "m.ZMESSAGEDATE, m.ZSTANZAID, COALESCE(g.ZCONTACTNAME, g.ZFIRSTNAME), m.Z_PK "
+           "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK "
+           "LEFT JOIN ZWAGROUPMEMBER g ON m.ZGROUPMEMBER = g.Z_PK "
+           "WHERE s.ZCONTACTJID IS NOT NULL AND s.ZCONTACTJID NOT LIKE '%broadcast' "
+           "AND s.ZCONTACTJID NOT LIKE '%@newsletter' AND s.ZCONTACTJID NOT LIKE '%status%' AND m.Z_PK > ? "
+           "ORDER BY m.Z_PK ASC LIMIT ?")
+    try:
+        rows = _query(sql, [int(pk), int(limit)])
+    except ReaderError as e:
+        return _couldnt(e.reason)
+    return {"status": "ok", "items": [_item(r, r[9]) for r in rows]}
 
 
 # ---------------------------------------------------------------- CLI: chats, read

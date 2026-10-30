@@ -73,6 +73,7 @@ suggested next step, and then the quoted title, who and summary under its label.
 line as `propose`.
 
 **Propose.** Deciding `propose` does not raise a card by itself; it puts the item in `pending`.
+0. A `whatsapp` line (key `wa:<jid>`) gets no re-check: there is no connector to read it through. Decide from the line. Any reply to it is drafted in a work session and sent with MOTHER's WhatsApp send command (the `whatsapp` skill), which asks the manager first; this session never runs it.
 1. Re-check once: read the line's `link` through the capability that owns it (`chat.read`, `tracker.read`,
    `mail.read` or `code.read`; resolve the connector from `capabilities.json`). One read, no more. For code, the only shell reads this session may run are `gh pr view|checks <N>`, `gh issue view <N>`, `gh run view <N>` (`glab mr …` likewise), each with at most `--repo owner/repo`, `--json fields` and `--comments`, as separate tokens. If the thing is
    closed, or the manager has already replied or acted, decide `log` instead.
@@ -125,7 +126,7 @@ A turn the manager typed (not a wake, not a line) is a request to you. Handle th
 
 | The manager asks | You run |
 |---|---|
-| follow / stop following a project, channel, thread or repo | `mother hub follow <x>` / `mother hub unfollow <x>`; add `--project`, `--channel`, `--thread` or `--repo` when the type is not obvious |
+| follow / stop following a project, channel, thread or repo | `mother hub follow <x>` / `mother hub unfollow <x>`; add `--project`, `--channel`, `--thread`, `--repo` or `--whatsapp` (a WhatsApp chat JID) when the type is not obvious |
 | mute / unmute a person, channel or key | `mother hub mute <x>` / `mother hub unmute <x>` |
 | hand you something to look at | `mother hub add <link-or-text>` (text with a space goes in one single-quoted string without `'`; drop apostrophes). The next wake routes or proposes it |
 | what is watched or muted | `mother hub watching` (`--json` for the full lists), then tell it in a few lines |

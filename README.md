@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck, the sprint plan and WhatsApp, covered by 486 automated tests. One manager's workspace has
+> routines, the meeting deck, the sprint plan and WhatsApp, covered by 819 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -95,19 +95,60 @@ python3 ~/.claude/plugins/marketplaces/mother/bin/mother link
 
 It symlinks `mother` into `~/.local/bin`. Pass another directory if that one isn't on your PATH.
 
-**The Now panel (optional).** The tick's list can sit beside the chat, with a status line
-(`◆ 2 on you · 1 neglected`) and Done, Snooze, Make top 3 and Do it buttons. It is a second plugin in the same
-marketplace:
-
-```
-/plugin install mother-now@mother
-```
-
-Open it with `/now-panel` (`/now` is MOTHER's chat skill, which prints the same list in the conversation). It reads `.mother/now.json` on the machine the tick runs on and makes no network calls.
+**The Now panel.** The tick's list can sit beside the chat, with a status line
+(`◆ 2 on you · 1 neglected`) and Done, Snooze, Make top 3 and Do it buttons. It ships inside the `mother` plugin
+(a hooks module beside the guard), so there is nothing more to install. Open it with `/now-panel` (`/now` is
+MOTHER's chat skill, which prints the same list in the conversation). It reads `.mother/now.json` on the machine
+the tick runs on and makes no network calls.
 Its one setting, `mother_bin` (userConfig), is the path to the `mother` script it calls for `mother path` and
-the `mother now` edits. The default, `~/.claude/plugins/marketplaces/mother/bin/mother`, is the marketplace
-clone; set it to the installed plugin's `bin/mother` (the versioned copy under `~/.claude/plugins/`) if you want
-the panel to run exactly the version the tick runs.
+the `mother now` edits. Left empty (the default) it runs this plugin's own `bin/mother`, the same version the
+hooks run; set it only to point the panel at another copy (a leading `~` is your home folder).
+
+If you installed the panel before it moved into `mother` (the separate `mother-now` plugin), remove that one
+once, so the panel isn't loaded twice:
+
+```
+/plugin uninstall mother-now@mother
+```
+
+**Turn on the hub (optional).** The hub watches your sources and routes updates into your sessions (see "The hub"
+below). On the home machine, add a `hub` block to `config.json` with `enabled: true` and one connection per source
+you want watched:
+
+```json
+"hub": {
+  "enabled": true,
+  "connections": {
+    "chat":     {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/chat/mcp"]},
+    "mail":     {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/mail/mcp"]},
+    "tracker":  {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/tracker/mcp"]},
+    "calendar": {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/calendar/mcp"]},
+    "code":     {"cli": "gh"},
+    "whatsapp": {"local": "whatsapp"}
+  }
+}
+```
+
+The first four are MCP servers the watcher starts itself (here through a gateway proxy; use whatever command
+starts yours), `gh` is the code host's command line, and `whatsapp` reads the local WhatsApp database (it needs
+`whatsapp.enabled` and `whatsapp.read`). Leave out any you don't want. Then:
+
+```
+mother hub smoke      # reads each source twice, 20 s apart, in a throwaway copy; prints status and counts, never content
+mother hub install    # runs the watcher under launchd on this machine
+```
+
+**Disk access for the watcher.** The launchd watcher is a bare `python3` process, not your terminal, so reading the
+WhatsApp database needs its own Full Disk Access grant (System Settings > Privacy & Security > Full Disk Access >
+`+`). Add the interpreter the job runs: it is the first entry of `ProgramArguments` in
+`~/Library/LaunchAgents/com.mother.hub.plist` (`/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' ~/Library/LaunchAgents/com.mother.hub.plist`;
+it is the `python3` that `mother hub install` found, often `/usr/bin/python3`, and you may have to press Cmd+Shift+G in
+the file picker to type the path), then run `mother hub install` again so the job restarts. A passing `mother hub
+smoke` run from your terminal does not prove the watcher has this grant, because the terminal has its own.
+Without it the Now panel shows `whatsapp ✗` and `mother hub status` says the source is `couldnt_check (denied)`.
+
+Finally run `/mother:hub` once in a pinned session, in normal permission mode (not bypass), and leave it open: it
+wakes on each update and routes it. `mother hub status` shows whether the watcher and hub are keeping up.
 
 **Another computer, same workspace:** install the plugin, run `mother link` as above, then
 `mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines
@@ -128,7 +169,7 @@ Day to day you mostly read what it sends you and answer in one line. The default
 | one-on-one | 07:30 workdays | Prep for each of today's 1:1s (a shareable agenda kept apart from private prep) and a note when a report's 1:1s have lapsed |
 | reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
 | doctor | daily | Re-tests every connector, heals what it can (retry, reconnect, switch to a backup server) and alerts once per broken connector |
-| tick | hourly 06:05-21:05 workdays | A short Now list, kept quiet: what is blocked on you, what the team is neglecting, suggestions waiting for a yes, and your Top 3 today. Read it with `/mother:now` or the Now panel (`mother-now`, see Install); it sends nothing unless `routines.tick.notify` is `dm` |
+| tick | hourly 06:05-21:05 workdays | A short Now list, kept quiet: what is blocked on you, what the team is neglecting, suggestions waiting for a yes, and your Top 3 today. Read it with `/mother:now` or the Now panel (`/now-panel`, see Install); it sends nothing unless `routines.tick.notify` is `dm` |
 | meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |
 
 You can also just ask: "brief me", "what's open", "remember that …", "add a todo …", "take notes on the
@@ -142,6 +183,8 @@ The hub is optional and runs on your home machine. Set the `hub` block in `confi
 `mother hub install` (it polls your sources read-only and appends what changed to a local inbox), then run
 `/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
 session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
+
+WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 
 You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** and **Mute** on a hub session or hub update. It can't fetch the web or edit files; for those it proposes a session.
 

@@ -120,7 +120,7 @@ export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watc
 
 declare module 'claude-code' {
   interface PluginState {
-    'mother-now': {
+    mother: {
       doc: NowDoc | null
       error: string | null
       workspace: string | null

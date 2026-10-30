@@ -18,6 +18,7 @@ Read next, in this order, as the task needs:
 python3 -m unittest discover tests          # whole suite: ~240 tests, ~4-5 minutes (channels, guard, health, cli are the slow ones)
 python3 -m unittest tests.test_guard        # one module, while iterating
 python3 -m unittest tests.test_guard.TestGrants   # one class (or .TestGrants.test_name for one test)
+claude plugin validate . && claude plugin test .  # the Now panel (hooks/register.tsx) and the manifests
 
 # A throwaway workspace. MOTHER_STATE_DIR keeps `init` from repointing the real ~/.mother/workspace.
 export MOTHER_STATE_DIR="$(mktemp -d)"
@@ -48,7 +49,7 @@ To try an unreleased change end to end in Claude Code: `claude --plugin-dir /pat
   about a connector calls `mother health record` / `merge`; it never edits the file, which other runs
   read under a lock.
 - **Every runtime file is tracked.** `tests/test_packaging.py` fails if anything under `agents/ bin/ lib/
-  hooks/ skills/ routines/ rules/ assets/ templates/ .claude-plugin/` isn't in git. `git add` new files.
+  hooks/ skills/ routines/ rules/ assets/ templates/ types/ .claude-plugin/` isn't in git. `git add` new files.
 - **Skill descriptions are routing.** A `SKILL.md` `description` is matched against every user request in
   every session where the plugin is on. Keep it short, specific, and phrased as "Use when / Use for …".
 

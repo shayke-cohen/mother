@@ -5,3 +5,7 @@ bridge/whatsapp/node_modules/
 # A workspace never lives inside the plugin repo
 /workspace/
 .superpowers/
+
+# Written by the Claude Code engine when it loads the Now panel module; local to each machine
+/tsconfig.json
+/.claude-plugin/types/
