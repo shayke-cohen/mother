@@ -27,7 +27,7 @@ hooks/register.tsx         the Now panel, a hooks module of the mother plugin (t
                            `claude plugin test .`; state contract: types/index.d.ts, `PluginState['mother']`);
                            opens with `/now-panel` (the engine reserves `/now` for the mother:now skill);
                            reads `.mother/now.json` and the hub's `.mother/hub/hub.json`, `sessions.json`, `watcher.json` (§5e), writes only through
-                           `mother now done|snooze|top` and `mother hub done|snooze|session seen|add|follow|mute` ("Send to hub" on an item with an http(s) link runs `add -- <link>`; Mute on a hub session row and a hub update row runs `mute -- <key>`; Follow there follows what the key belongs to: `PROJ-n` runs `follow --project -- PROJ`, `owner/repo#n` runs `follow --repo -- owner/repo`, `<channel>/<ts>` runs `follow --thread -- <channel>/<ts>`, and a row whose key is none of these (`mail:`, `cal:`, `manual:`) shows no Follow; each toasts the verb's first output line, or its first stderr line on failure), no network or MCP calls;
+                           `mother now done|snooze|top` and `mother hub done|snooze|session seen|add|follow|mute` ("Send to hub" on an item with an http(s) link runs `add -- <link>`; Mute on a hub session row and a hub update row runs `mute -- <key>`; Follow there follows what the key belongs to: `wa:<group jid>@g.us` runs `follow --whatsapp -- <jid>`, `PROJ-n` runs `follow --project -- PROJ`, `owner/repo#n` runs `follow --repo -- owner/repo`, `<channel>/<ts>` runs `follow --thread -- <channel>/<ts>`, and a row whose key is none of these (`mail:`, `cal:`, `manual:`, and `wa:` for a DM or hidden-id chat) shows no Follow; each toasts the verb's first output line, or its first stderr line on failure), no network or MCP calls;
                            a Hub section (health, Sessions, Waiting for you to start, Hub updates, Recently routed) and `hub ●|◌ stale|✗ · N waiting` on the status line (✗: `watcher.json` missing or its `at` older than max(10 min, 2x `every_seconds`); ◌ stale, only while `active`: `at` older than 2x `every_seconds`, or `last_append_at` later than `hub.json` `last_wake` (or no wake) and older than 2x `every_seconds`)
 tests/                     stdlib unittest; `python3 -m unittest discover tests`
 ```
@@ -835,9 +835,9 @@ is set without `MOTHER_WORKSPACE`, as in throwaway test workspaces.
   scope, by the manager's threat model: the locks are for mistakes and injected instructions. The bridge
   checks that `to` matches `jid` for `me`, numbers and JIDs, not for a name. In `bypassPermissions` a send
   asks nothing, as for chat.
-- **Never.** Storing a chat body in the workspace; a first message to someone with no history; sending by any
+- **Never.** Storing a chat body in the workspace (the one exception is the hub watcher, next bullet); a first message to someone with no history; sending by any
   path the guard cannot see; assessing a person from their messages.
-- **The hub watcher.** The same reader feeds the hub's `whatsapp` source (§5e, "WhatsApp source"): DMs and watched groups, read-only, home machine only, and only while `whatsapp.enabled` and `whatsapp.read` are true. For it the reader also has `max_pk()` (the newest `ZWAMESSAGE.Z_PK`) and `read_messages_after(pk, limit=100)`: the first `limit` messages with a larger `Z_PK`, oldest first, across chats, broadcast and status chats excluded, in the `read` item shape plus `pk`.
+- **The hub watcher.** Exception to "never store a chat body": the watcher keeps summaries of at most 300 characters and `wa:<jid>` keys in `.mother/hub/` (the inbox, kept 7 days; machine-local and gitignored) and the hub routes those summaries into the manager's own sessions. Nothing is committed or synced, and no full message is kept. The same reader feeds the hub's `whatsapp` source (§5e, "WhatsApp source"): DMs and watched groups, read-only, home machine only, and only while `whatsapp.enabled` and `whatsapp.read` are true. For it the reader also has `max_pk()` (the newest `ZWAMESSAGE.Z_PK`) and `read_messages_after(pk, limit=100)`: the first `limit` messages with a larger `Z_PK`, oldest first, across chats, broadcast and status chats and Channels (`@newsletter`) excluded (this path only; `read` is unchanged), in the `read` item shape plus `pk`.
 
 ## 5e. Hub (`lib/hub*.py`, `mother hub`)
 
@@ -906,7 +906,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   (`<channel>/<ts>`), a repo (`owner/repo`) or a WhatsApp chat (`<digits>@s.whatsapp.net` or `<digits>[-<digits>]@g.us`, kept in `follow.whatsapp`), else exit 2 (`unfollow` of a project also drops it from `auto` and records it in `unfollowed`, which `follow` clears;
   `unfollow` of something `config.json` lists, in `hub.watch` or as a team's tracker project, adds "; still watched
   from config.json" to its output, since config is never rewritten);
-  `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, a WhatsApp JID (stored as the key `wa:<jid>`), or anything else as a
+  `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, a WhatsApp JID (`…@s.whatsapp.net`, `…@g.us` or `…@lid`; stored as the key `wa:<jid>`; any `wa:`-prefixed value is a key), or anything else as a
   key; `watching [--json]` prints the merged list (tracker projects with every team's tracker project, as polled) and the mutes; `add <link-or-text> [--key K]` (K only of `A-Za-z0-9_.:/@=,+-` and `#` after the first character, as a hub
   command token; else exit 2) appends one
   `manual` line (source `manual`; key = `--key`, else a chat message link's thread key, else the first tracker or

@@ -1727,7 +1727,7 @@ def add_cmd(ws: Path, at: datetime, args, out) -> int:
     return 0
 
 
-_WA_JID = re.compile(r"^(\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us)$", re.ASCII)
+_WA_JID = re.compile(r"^(\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us|\d{6,30}@lid)$", re.ASCII)
 _FORCE = {"project": ("projects", _PROJECT), "channel": ("channels", _CHANNEL), "thread": ("threads", _THREAD),
           "repo": ("repos", _REPO), "whatsapp": ("whatsapp", _WA_JID)}
 _STRICT_CHANNEL = re.compile(r"^[CG][A-Z0-9]{8,}$")
@@ -1755,7 +1755,7 @@ def classify_follow(x: str, force: Optional[str] = None, known_channels=()):
 def classify_mute(x: str):
     if _WA_JID.match(x):
         return "keys", "wa:" + x
-    if x.startswith("wa:") and _WA_JID.match(x[3:]):
+    if x.startswith("wa:"):
         return "keys", x
     if _CHAT_USER.match(x) or ("@" in x and "/" not in x):
         return "people", x

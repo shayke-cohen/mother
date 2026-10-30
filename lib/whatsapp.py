@@ -331,13 +331,14 @@ def max_pk() -> int:
 
 def read_messages_after(pk: int, limit: int = DEFAULT_LIMIT) -> dict:
     """Messages inserted after row `pk` (insertion order, not send time, so a message WhatsApp stores late is still
-    seen), oldest first, across chats, broadcast and status excluded; the first `limit` rows after `pk`. Items are
+    seen), oldest first, across chats, broadcast, status and Channels (newsletters) excluded, for the hub watcher only; the first `limit` rows after `pk`. Items are
     reader items plus `pk`. Raises nothing: `{"status": "couldnt_check", "reason"}` as `read_messages`."""
     sql = ("SELECT s.ZCONTACTJID, s.ZPARTNERNAME, s.ZSESSIONTYPE, m.ZISFROMME, m.ZTEXT, m.ZMESSAGETYPE, "
            "m.ZMESSAGEDATE, m.ZSTANZAID, COALESCE(g.ZCONTACTNAME, g.ZFIRSTNAME), m.Z_PK "
            "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK "
            "LEFT JOIN ZWAGROUPMEMBER g ON m.ZGROUPMEMBER = g.Z_PK "
-           "WHERE s.ZCONTACTJID IS NOT NULL AND s.ZCONTACTJID NOT LIKE '%broadcast' AND m.Z_PK > ? "
+           "WHERE s.ZCONTACTJID IS NOT NULL AND s.ZCONTACTJID NOT LIKE '%broadcast' "
+           "AND s.ZCONTACTJID NOT LIKE '%@newsletter' AND s.ZCONTACTJID NOT LIKE '%status%' AND m.Z_PK > ? "
            "ORDER BY m.Z_PK ASC LIMIT ?")
     try:
         rows = _query(sql, [int(pk), int(limit)])

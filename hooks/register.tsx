@@ -392,13 +392,15 @@ type Ui = ReturnType<Dollar['ui']['resolve']>
 const isUrl = (link: string | null | undefined): link is string => !!link && /^https?:\/\//.test(link)
 
 // What Follow watches for a row key: a tracker item follows its project, a pull request its repo, a chat
-// thread itself. Mail, calendar and manual keys have nothing to follow, so the row shows no Follow button.
+// thread itself, a WhatsApp group its JID. Mail, calendar and manual keys have nothing to follow, so the row shows no Follow button.
 export function followArgs(key: string): string[] | null {
   let m = /^([A-Z][A-Z0-9]+)-\d+$/.exec(key)
   if (m) return ['follow', '--project', '--', m[1]]
   m = /^([\w.-]+\/[\w.-]+)#\d+$/.exec(key)
   if (m) return ['follow', '--repo', '--', m[1]]
   if (/^[CG][A-Z0-9]+\/\d+\.\d+$/.test(key)) return ['follow', '--thread', '--', key]
+  m = /^wa:(\d{6,30}(?:-\d+)?@g\.us)$/.exec(key)
+  if (m) return ['follow', '--whatsapp', '--', m[1]]
   return null
 }
 

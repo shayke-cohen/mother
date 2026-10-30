@@ -923,6 +923,23 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
+  test(`Follow on a WhatsApp group row runs follow --whatsapp, a DM row has none, Mute runs mute -- <key>, on ${surface}`, async ($, on) => {
+    const g = 'wa:15550000002-1700000000@g.us'
+    const dm = 'wa:15550000001@s.whatsapp.net'
+    const lid = 'wa:987654321012345@lid'
+    const ss = sessionsDoc({ [g]: session({ unseen: 1 }), [dm]: session({ unseen: 1 }), [lid]: session({ unseen: 1 }) })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'sess-follow-' + g })
+    await ui.press({ key: 'sess-mute-' + lid })
+    expect(await ui.find({ key: 'sess-follow-' + dm })).toBeUndefined()
+    expect(await ui.find({ key: 'sess-follow-' + lid })).toBeUndefined()
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
+      ['python3', BIN, 'hub', 'follow', '--whatsapp', '--', '15550000002-1700000000@g.us'],
+      ['python3', BIN, 'hub', 'mute', '--', lid]])
+    await ui.unmount()
+  })
+
   test(`a hub session row whose key has nothing to follow shows no Follow, on ${surface}`, async ($, on) => {
     const ss = sessionsDoc({ 'mail:t1': session({ unseen: 1 }), 'cal:e1': session({ unseen: 1 }), 'manual:abc123': session({ unseen: 1 }) })
     await boot($, on, hubFiles(watcher(), hubDoc(), ss))

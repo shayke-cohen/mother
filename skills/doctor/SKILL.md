@@ -39,6 +39,8 @@ a call. Use `config.json` `connectors.*` to know which kinds matter; a kind set 
 not reported as a gap. WhatsApp is not an MCP connector (its reader is local, `mother whatsapp status`
 shows it), and the hub's `whatsapp` source needs no entry in `connectors`: never list it as a missing connector.
 
+**The old panel plugin.** If `mother-now` is still installed (it shows in `claude plugin list`, or as a `mother-now` folder under the plugin directories), flag it in the report: "uninstall it: /plugin uninstall mother-now@mother" (the panel now ships inside `mother`, and two copies load twice). Do not run it for the manager.
+
 **Test every server of a kind, not only the main one.** Two servers often serve one kind (a corporate
 gateway plus claude.ai connectors); record, per capability, which of them work. It is common for one to
 post but not search and the other to search but not post. Take each server's URL host from `claude mcp list`

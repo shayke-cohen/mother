@@ -1793,6 +1793,17 @@ class WhatsAppWatcher(unittest.TestCase):
         self.assertEqual(hub.load_watch(self.ws)["mute"]["keys"], ["wa:" + DM_JID])
         self.assertEqual(hub.load_watch(self.ws)["mute"]["people"], [])
 
+    def test_mute_a_hidden_id_chat_as_the_panel_sends_it(self):
+        lid = "987654321012345@lid"
+        self.assertEqual(hub.classify_mute(lid), ("keys", "wa:" + lid))
+        self.assertEqual(hub.classify_mute("wa:" + lid), ("keys", "wa:" + lid))
+        self.assertEqual(hub.classify_mute("wa:anything"), ("keys", "wa:anything"))
+        self.assertEqual(hub.classify_follow(lid), ("whatsapp", lid))
+        l = line(source="whatsapp", key="wa:" + lid, who="a chat")
+        self.assertTrue(hub.is_muted(l, {"keys": ["wa:" + lid]}))
+        self.assertEqual(self.run_verb("mute", "--", "wa:" + lid)[0], 0)
+        self.assertEqual(hub.load_watch(self.ws)["mute"], {"keys": ["wa:" + lid], "people": [], "channels": []})
+
     def test_whatsapp_text_never_auto_follows_a_project(self):
         r = WaReader()
         self.poll(r)
