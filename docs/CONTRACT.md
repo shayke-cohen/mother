@@ -892,13 +892,18 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   names the missing ones), `gh` must answer `gh api
   user`; it prints `cap | ok/✗ | reason` and exits 1 if any fails. `status` prints the `watcher.json` and
   `hub.json` (`last_wake`) heartbeats and exits 2 only when the watcher never ran or its `at` is older than 2x
-  `watcher.json` `every_seconds` while `active`. The hub line is printed with `STALE` (the exit code is unchanged)
+  `watcher.json` `every_seconds` while `active`. Outside active hours it also prints `next active window: <ISO time
+  in manager.timezone> (one-shot cron: M H D Mo *)`, the cron fields in this machine's local time: what the hub skill
+  schedules its next `/mother:hub` wake for. The hub line is printed with `STALE` (the exit code is unchanged)
   when, while `active`, `watcher.json` `last_append_at` is later than `hub.json` `last_wake` (or the hub never
   woke) and older than 2x `every_seconds`: the hub has not caught up with a line it must decide. An old
   `last_wake` with nothing appended since is a quiet day, not stale; a missing `hub.json` prints `hub: never woke`.
 - **Watch list and `manual` lines.** `watch.json` (machine-local, atomic, under `hub.lock`) is
-  `{version: 1, follow: {projects, channels, threads, repos, whatsapp}, mute: {keys, people, channels}, auto: {projects:
-  [{key, from, at}]}, unfollowed: [project]}`; a missing or damaged file is empty. Each polling pass merges it with `hub.watch`
+  `{version: 1, follow: {projects, channels, threads, repos, whatsapp, dms, inbox}, mute: {keys, people, channels}, auto: {projects:
+  [{key, from, at}]}, unfollowed: [project]}`; a missing or damaged file is empty. `follow.dms` is a map
+  `{<chat user id U…>: <DM channel id D…>}` (a pair of another shape is dropped on load) and `follow.inbox` the
+  manager's self-DM channel id (`D…`) or `""`; both live only in `watch.json` and are merged as `chat.dms` and
+  `chat.inbox`. Each polling pass merges it with `hub.watch`
   (`merged_watch`: `whatsapp.groups` + followed WhatsApp chats, `chat.channels` + followed channels, `chat.follow` + followed threads, `tracker.projects` +
   followed and auto projects, `code.repos` + followed repos, plus the `mute` block) and hands the adapters that
   effective config; `hub.watch` itself is never rewritten. Verbs, all writing only `.mother/hub/`: `follow <x>` /
@@ -918,6 +923,16 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   routes or proposes it, never only logs it. `add` strips control and format characters from the text, key and
   link (a link not matching `^https?://\S+$` is left out and stays in the text); its id ends in a random suffix.
   `--` ends the flags of `add`, `follow`, `unfollow`, `mute` and `unmute`: what follows is the value, even one that starts with `-`.
+  `dms set <U…>=<D…> [<U…>=<D…> …]` maps DMs (a user id already mapped is repointed); every user id must be in
+  config (`teams[].people[].chat`, or the manager's chat user id as recognised below), else it exits 2 naming the
+  ones that are not and writes nothing; a token not of the form `U[A-Z0-9]+=D[A-Z0-9]+` exits 2. `dms drop <U…>`
+  removes one; `dms inbox <D…>` sets the self-DM inbox and `dms inbox none` clears it; `dms show [--json]` prints
+  the map (with each person's name from config) and the inbox, and, when the map is empty, how to fill it: list the
+  DMs with the claude.ai Slack connector (`slack_list_user_channels`, types `im`, which gives each DM's id and the
+  other user's id) in a normal MOTHER session, match the user ids to people in config, then run `mother hub dms set`.
+  The watcher's own gateway cannot list DMs (its channel list has none) and its search lacks the scope, so this map
+  is the only way it reads a DM. Every token of these verbs is in the hub command charset. `watching` prints the
+  map as `chat dms:` and the inbox as `chat inbox:`.
   A bare uppercase token given to `follow` is a project; it is a channel only when it is `C`/`G` plus 8 or more
   characters and already a known channel, or with `--channel`; `--project|--channel|--thread|--repo|--whatsapp` force the type.
   The chat adapter remembers which threads came from the follow list (`followed` in its cursor) and drops one when
@@ -1040,6 +1055,16 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   threads in <channel>"); a thread whose replies cannot be read is `partial` "<channel>/<ts>: replies unreadable" and the
   others still read. These threads are not added to the persistent followed set (only the manager's own posts
   do that). Followed threads (`watch.json` follow.threads) are always read.
+  **Mapped DMs and the inbox.** Each DM in `chat.dms` is read exactly like a watched channel (the pass's history from
+  the cursor with the 100-message cap and `partial` "<D…>: more than 100 new messages", the lookback and the active
+  thread replies, the same seen-set), but every message is keyed `<D…>/dm`; only the mapped person's messages are
+  `update` lines and the manager's own message `resolved`; anyone else's is ignored. A DM whose history read fails
+  marks the source `partial` "<D…>: history <kind>" and the pass goes on. `chat.inbox` (the self-DM) is read every
+  pass (history only, same cap and seen-set; a failure is `partial` "inbox <D…>: history <kind>"): a message authored
+  by the manager's chat user id becomes a `manual` line (source `chat`, key as `mother hub add` picks it from the
+  text, else `manual:<sha1 prefix>`; `link` the first URL), never resolved, muted or collapsed; a message by anyone
+  else, from a bot or app (`bot_id`), with a `subtype`, or carrying MOTHER's signature yields nothing. Both are read
+  before the search sub-reads, so search never re-emits them.
   **Tracker auto-follow.** After a pass's lines are appended, a tracker key (`PROJ-n`) in any line's `key` or `also`
   whose project is a real project (below) and is not configured, followed, auto-followed, muted (as a key) or
   `unfollowed` is added to `auto.projects` (`{key, from, at}`; at most 20, the oldest dropped), under `hub.lock` and
@@ -1133,7 +1158,7 @@ change when a line already links `(<name>.md)`. Atomic, under `.mother/memory.lo
 
 `setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
 (connect-the-dots), `meeting` (prep deck · meeting mode · apply results · recap; the unattended `meeting-prep` routine never calls a page connector's publish tool, which asks: it publishes as `file` and says in the DM that publishing needs the manager's OK), `reflect`, `todo`, `project`,
-`team`, `remember`, `whatsapp` (read chats, send through `mother whatsapp send`, which asks; §5d), `hub` (the manager's pinned hub session: wakes on the watcher's inbox through a Monitor on `mother hub tail --follow`, or a 3-minute cron running `tail --once`; decides each line with `mother hub decide`, routes it with the in-app message tool, raises cards with `start_session` `own_initiative`, and reconciles sessions on a `sweep` line; §5e), `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
+`team`, `remember`, `whatsapp` (read chats, send through `mother whatsapp send`, which asks; §5d), `hub` (the manager's pinned hub session: wakes on the watcher's inbox through a Monitor on `mother hub tail --follow` (re-armed when it ends, inside active hours only; outside them it schedules one non-recurring cron prompt `/mother:hub` for the next active window instead), or a 3-minute cron running `tail --once`; decides each line with `mother hub decide`, routes it with the in-app message tool, raises cards with `start_session` `own_initiative`, and reconciles sessions on a `sweep` line; §5e), `now` (shows the tick's list; `mother now do <S-id>` runs one suggestion on the manager's typed request, handing dots and digest items to their own handlers; done, snooze and Top 3 edits). Descriptions stay short and specific: they are matched against every request.
 
 ## 8. Writing rules for everything in this repo
 

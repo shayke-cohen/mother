@@ -280,6 +280,27 @@ class E2E(unittest.TestCase):
                  if json.loads(l)["name"].endswith("get_channel_history")}
         self.assertEqual(asked, {CH, "C00000002"})  # still read; the lines are dropped before the inbox
 
+    def test_a_mapped_dm_and_the_self_dm_inbox_reach_the_hub(self):
+        cfg = json.loads(json.dumps(self.cfg))
+        cfg["hub"]["watch"]["chat"]["channels"] = []
+        cfg["teams"] = [{"slug": "web", "people": [{"name": "Agnes", "chat": "U00000001"}]}]
+        self.cfg = cfg
+        self.verb(0, "dms", "set", "U00000001=D00000001")
+        self.verb(0, "dms", "inbox", "D00000009")
+        self.poll(0)
+        # the stand-in server answers every history read with the same page
+        page = [self.msg(2, "remember to call the venue", user=ME),
+                self.msg(2, "can you look at PLAT-1?", user="U00000001", secs=1)]
+        self.poll(2, history=page)
+        got = sorted((l["kind"], l["key"]) for l in self.tail())
+        self.assertIn(("update", "D00000001/dm"), got)
+        manual = [k for kind, k in got if kind == "manual"]
+        self.assertEqual(len(manual), 1)
+        self.assertTrue(manual[0].startswith("manual:"))
+        asked = {json.loads(l)["arguments"].get("channel_id") for l in Path(self.log).read_text().splitlines()
+                 if json.loads(l)["name"].endswith("get_channel_history")}
+        self.assertEqual(asked, {"D00000001", "D00000009"})
+
     def test_add_of_a_link_routes_to_its_session(self):
         self.poll(0)
         self.open_session_for("PLAT-1", "S1", 2)

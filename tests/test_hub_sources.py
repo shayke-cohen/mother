@@ -367,6 +367,98 @@ class TestChat(unittest.TestCase):
         out, _ = self.poll(history={"C00000001": [msg(NOW - 100, text="x" * 900)]})
         self.assertEqual(len(out["lines"][0]["summary"]), 300)
 
+    # -- DMs with people in config (watch.json follow.dms) and the self-DM inbox (follow.inbox)
+    def test_mapped_dm_is_read_like_a_channel(self):
+        cfg = {"channels": [], "dms": {"U00000001": "D00000001"}}
+        hist = {"D00000001": [msg(NOW - 100, user="U00000001", text="can you look at PLAT-3?"),
+                              msg(NOW - 2000, user="U00000001", text="before the cursor")]}
+        out, f = self.poll(history=hist, cfg=cfg)
+        self.assertEqual([(l["key"], l["kind"], l["who"]) for l in out["lines"]],
+                         [("D00000001/dm", "update", "U00000001")])
+        self.assertEqual(out["lines"][0]["also"], ["PLAT-3"])
+        reads = [a for n, a in f.calls if n.endswith("get_channel_history")]
+        self.assertEqual(reads[0]["channel_id"], "D00000001")
+        self.assertEqual(reads[0]["oldest"], "%.6f" % (NOW - 600))
+        self.assertEqual(out["partial"], [])
+        again, _ = self.poll(history={"D00000001": [msg(NOW - 100, user="U00000001", text="x")]}, cfg=cfg,
+                             cursor=dict(out["cursor"], ts="%.6f" % (NOW - 600)))
+        self.assertEqual(again["lines"], [])  # the seen-set dedupes it
+
+    def test_mapped_dm_manager_reply_resolves_and_strangers_are_ignored(self):
+        cfg = {"channels": [], "dms": {"U00000001": "D00000001"}}
+        hist = {"D00000001": [msg(NOW - 100, user="U00000001", text="question"),
+                              msg(NOW - 90, user="U00000007", text="someone else"),
+                              msg(NOW - 80, user="U00000000", text="answered")]}
+        out, _ = self.poll(history=hist, cfg=cfg)
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("D00000001/dm", "resolved")])
+        out, _ = self.poll(history={"D00000001": [msg(NOW - 90, user="U00000007", text="someone else")]}, cfg=cfg)
+        self.assertEqual(out["lines"], [])
+
+    def test_mapped_dm_thread_reply_folds_into_the_dm(self):
+        cfg = {"channels": [], "dms": {"U00000001": "D00000001"}}
+        parent = NOW - 3000
+        p = msg(parent, user="U00000001", reply_count=1, latest_reply="%.6f" % (NOW - 120))
+        out, _ = self.poll(history={"D00000001": [p]}, cfg=cfg,
+                           replies={"%.6f" % parent: [p, msg(NOW - 120, user="U00000001", text="and?",
+                                                              thread_ts="%.6f" % parent)]})
+        self.assertEqual([(l["key"], l["summary"]) for l in out["lines"]], [("D00000001/dm", "and?")])
+
+    def test_mapped_dm_cap_and_failure_are_partial(self):
+        cfg = {"channels": ["C00000001"], "dms": {"U00000001": "D00000001", "U00000002": "D00000002"}}
+        page = [msg(NOW - 500 + i, user="U00000001") for i in range(101)]
+        out, _ = self.poll(history={"D00000001": page}, cfg=cfg)
+        self.assertTrue(any("D00000001: more than 100" in p for p in out["partial"]), out["partial"])
+
+        def hist(a):
+            if a["channel_id"] == "D00000002":
+                raise hub_mcp.McpError("server_error", "boom")
+            return {"messages": [msg(NOW - 100, text="ok")] if a["channel_id"] == "C00000001" and "latest" not in a
+                    else []}
+        client, _ = ro({"get_channel_history": hist, "get_thread_replies": lambda a: {"messages": []},
+                        "search-messages": lambda a: {"messages": {"matches": []}}}, hs.ChatSlack.READ_TOOLS)
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, cfg, ME, AT)
+        self.assertIn("D00000002: history server_error", out["partial"])
+        self.assertEqual(len(out["lines"]), 1)  # the channel still read
+
+    def test_inbox_turns_the_managers_notes_into_manual_lines(self):
+        me = dict(ME, marks=["Agnes (AI)"])
+        hist = {"D00000009": [
+            msg(NOW - 100, user="U00000000", text="look at https://example.com/browse/PLAT-7 today"),
+            msg(NOW - 90, user="U00000000", text="call the venue"),
+            msg(NOW - 80, user="U00000000", text=":sparkles: *Agnes (AI)* · on behalf of Dana\nbrief"),
+            msg(NOW - 70, user="U00000000", text="via an app", bot_id="B1"),
+            msg(NOW - 60, user="U00000007", text="not the manager")]}
+
+        def h(a):
+            got = [m for m in hist.get(a["channel_id"], []) if float(m["ts"]) > float(a.get("oldest", 0))
+                   and float(m["ts"]) <= float(a.get("latest", 1e18))]
+            return {"messages": got}
+        client, f = ro({"get_channel_history": h, "get_thread_replies": lambda a: {"messages": []},
+                        "search-messages": lambda a: {"messages": {"matches": []}}}, hs.ChatSlack.READ_TOOLS)
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}},
+                                {"channels": [], "inbox": "D00000009"}, me, AT)
+        got = [(l["source"], l["kind"], l["key"]) for l in out["lines"]]
+        self.assertEqual(got[0], ("chat", "manual", "PLAT-7"))
+        self.assertEqual(out["lines"][0]["link"], "https://example.com/browse/PLAT-7")
+        self.assertEqual(got[1][:2], ("chat", "manual"))
+        self.assertTrue(got[1][2].startswith("manual:"))
+        self.assertEqual(len(got), 2)
+        again = hs.ChatSlack.poll(client, out["cursor"], {"channels": [], "inbox": "D00000009"}, me,
+                                  AT + timedelta(seconds=1))
+        self.assertEqual(again["lines"], [])
+        # a manual line is never muted, and the inbox key is never a DM key that a reply could resolve
+        self.assertFalse(hs.hub.is_muted(out["lines"][1], {"keys": [out["lines"][1]["key"]], "people": ["U00000000"],
+                                                           "channels": ["D00000009"]}))
+
+    def test_inbox_read_failure_is_partial(self):
+        def hist(a):
+            raise hub_mcp.McpError("server_error", "boom")
+        client, _ = ro({"get_channel_history": hist, "get_thread_replies": lambda a: {"messages": []},
+                        "search-messages": lambda a: {"messages": {"matches": []}}}, hs.ChatSlack.READ_TOOLS)
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}},
+                                {"channels": [], "inbox": "D00000009"}, ME, AT)
+        self.assertEqual(out["partial"], ["inbox D00000009: history server_error"])
+
 
 def mail_msg(i, sender="Sam <sam@example.com>", subj="Question", labels=("INBOX",), thread=None):
     return {"id": i, "threadId": thread or "t" + i, "labelIds": list(labels), "snippet": "snip",

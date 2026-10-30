@@ -97,6 +97,8 @@ class ChatSlack(Adapter):
         for t in followed:
             threads.setdefault(t, since)
 
+        dms = {ch: u for u, ch in (cfg.get("dms") or {}).items() if isinstance(u, str) and isinstance(ch, str)}
+
         def add(ch, msg, link="", floor=since, dm=False):
             ts = msg.get("ts")
             if not ts or float(ts) <= floor or "%s:%s" % (ch, ts) in seen:
@@ -106,6 +108,8 @@ class ChatSlack(Adapter):
             first = (msg.get("text") or "").lstrip().split("\n", 1)[0]
             if marks and any(k in first for k in marks) and (not msg.get("user") or who == mine or msg.get("bot_id")):
                 return  # MOTHER's own signed post: neither news nor the manager's reply
+            if ch in dms and who not in (dms[ch], mine):
+                return  # a mapped DM: only the other person and the manager count
             tts = msg.get("thread_ts")
             # a DM conversation is one thing: the manager's reply resolves it
             key = hub.thing_key("chat", {"channel": ch, "ts": "dm" if dm else ts, "thread_ts": None if dm else tts})
@@ -119,14 +123,35 @@ class ChatSlack(Adapter):
             lines.append(hub.make_line("chat", "update", key, ts_iso(ts), title=text[:80], who=who, link=link,
                                        summary=text, also=hub.extract_also(text), uid=ts))
 
-        for ch in cfg.get("channels") or []:
+        def note(ch, msg):
+            """A message in the self-DM inbox: the manager's own note becomes a `manual` line; anything else
+            (another author, a bot, an app, MOTHER's signed post, a join or edit event) is ignored."""
+            ts = msg.get("ts")
+            if not ts or float(ts) <= since or "%s:%s" % (ch, ts) in seen:
+                return
+            seen.append("%s:%s" % (ch, ts))
+            text = msg.get("text") or ""
+            first = text.lstrip().split("\n", 1)[0]
+            if not mine or msg.get("user") != mine or msg.get("bot_id") or msg.get("subtype") \
+                    or (marks and any(k in first for k in marks)) or not text.strip():
+                return
+            text = hub.plain(text)
+            url = re.search(r"https?://[^\s<>|]+", text)
+            lines.append(hub.make_line("chat", "manual", hub.manual_key(text), ts_iso(ts), title=text[:80], who=mine,
+                                       link=url.group(0) if url else "", summary=text,
+                                       also=[a for a in hub.extract_also(text) if a != hub.manual_key(text)],
+                                       uid=ts))
+
+        def read(ch, dm=False):
+            """One watched channel (or mapped DM): this pass's history, then replies in active threads."""
             res = client.call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % since,
                                                       "limit": MAX_HISTORY + 1})
             got = (res or {}).get("messages") or []
             if len(got) > MAX_HISTORY:
                 partial.append("%s: more than %d new messages" % (ch, MAX_HISTORY))
+                got = got[:MAX_HISTORY]
             for m in got:
-                add(ch, m)
+                add(ch, m, dm=dm)
             # Replies in threads nobody follows: a parent with replies newer than the cursor (less the search
             # overlap). History lists parents by their own time, so an older parent needs a lookback read.
             heads = {m["ts"]: m for m in got if m.get("ts")}
@@ -162,7 +187,27 @@ class ChatSlack(Adapter):
                     continue
                 for m in (res or {}).get("messages") or []:
                     if m.get("ts") != tts:
-                        add(ch, dict(m, thread_ts=tts), floor=since - SEARCH_OVERLAP)
+                        add(ch, dict(m, thread_ts=tts), floor=since - SEARCH_OVERLAP, dm=dm)
+
+        for ch in cfg.get("channels") or []:
+            read(ch)
+        for ch in dms:  # DMs with people in config (`mother hub dms set`); a DM that fails is partial
+            try:
+                read(ch, dm=True)
+            except McpError as e:
+                partial.append("%s: history %s" % (ch, e.kind))
+        inbox = cfg.get("inbox") or ""
+        if inbox:  # the manager's self-DM: each note of theirs is a `manual` line
+            try:
+                res = client.call("get_channel_history", {"channel_id": inbox, "oldest": "%.6f" % since,
+                                                          "limit": MAX_HISTORY + 1})
+                got = (res or {}).get("messages") or []
+                if len(got) > MAX_HISTORY:
+                    partial.append("inbox %s: more than %d new messages" % (inbox, MAX_HISTORY))
+                for m in got[:MAX_HISTORY]:
+                    note(inbox, m)
+            except McpError as e:
+                partial.append("inbox %s: history %s" % (inbox, e.kind))
 
         for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
             if "/" not in key:

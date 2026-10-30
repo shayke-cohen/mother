@@ -1594,6 +1594,93 @@ class Direct(unittest.TestCase):
         self.assertEqual(self.cfg["hub"]["watch"]["tracker"]["projects"], ["PLAT"])  # config untouched
 
 
+class Dms(unittest.TestCase):
+    """`mother hub dms`: the DM map (watch.json follow.dms) and the self-DM inbox (follow.inbox)."""
+    AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.cfg = {"manager": {"timezone": "UTC", "email": "dana@example.com", "chat_dm": "U00000000"},
+                    "teams": [{"slug": "web", "people": [{"name": "Agnes", "chat": "U00000001"},
+                                                         {"name": "Sam", "chat": "U00000002"}]}]}
+
+    def run_verb(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        real = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+        try:
+            rc = hub.main(list(args), self.ws, self.cfg, self.AT)
+        finally:
+            sys.stdout, sys.stderr = real
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_set_show_drop(self):
+        rc, out, _ = self.run_verb("dms", "set", "U00000001=D00000001", "U00000002=D00000002")
+        self.assertEqual(rc, 0)
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["dms"],
+                         {"U00000001": "D00000001", "U00000002": "D00000002"})
+        rc, out, _ = self.run_verb("dms", "show")
+        self.assertIn("U00000001 (Agnes) = D00000001", out)
+        doc = json.loads(self.run_verb("dms", "show", "--json")[1])
+        self.assertEqual(doc, {"dms": {"U00000001": "D00000001", "U00000002": "D00000002"}, "inbox": ""})
+        self.assertEqual(self.run_verb("dms", "drop", "U00000002")[0], 0)
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["dms"], {"U00000001": "D00000001"})
+        self.assertIn("no change", self.run_verb("dms", "drop", "U00000002")[1])
+        # set again replaces that person's DM id
+        self.run_verb("dms", "set", "U00000001=D00000005")
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["dms"], {"U00000001": "D00000005"})
+
+    def test_set_takes_only_people_in_config(self):
+        rc, _, err = self.run_verb("dms", "set", "U00000001=D00000001", "U00000008=D00000008")
+        self.assertEqual(rc, 2)
+        self.assertIn("U00000008", err)
+        self.assertNotIn("U00000001,", err)
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["dms"], {})  # nothing written
+        self.assertEqual(self.run_verb("dms", "set", "U00000000=D00000003")[0], 0)  # the manager is in config
+        for bad in ("U00000001", "U00000001=C00000001", "u1=D00000001", "U00000001=D0000000;x", "=D00000001"):
+            self.assertEqual(self.run_verb("dms", "set", bad)[0], 2, bad)
+        self.assertEqual(self.run_verb("dms", "set")[0], 2)
+        self.assertEqual(self.run_verb("dms", "nope")[0], 2)
+
+    def test_inbox_set_and_clear(self):
+        self.assertEqual(self.run_verb("dms", "inbox", "D00000009")[0], 0)
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["inbox"], "D00000009")
+        self.assertIn("inbox: D00000009", self.run_verb("dms", "show")[1])
+        self.assertEqual(self.run_verb("dms", "inbox", "C00000009")[0], 2)
+        self.assertEqual(self.run_verb("dms", "inbox", "none")[0], 0)
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["inbox"], "")
+
+    def test_empty_show_says_how_to_fill_it(self):
+        out = self.run_verb("dms", "show")[1]
+        self.assertIn("slack_list_user_channels", out)
+        self.assertIn("mother hub dms set", out)
+
+    def test_damaged_entries_are_dropped_and_merged_for_the_adapter(self):
+        hub.save_json(self.ws, "watch.json", {"follow": {"dms": {"U00000001": "D00000001", "x": "D1", "U00000002": 5},
+                                                         "inbox": ["D00000009"]}})
+        w = hub.load_watch(self.ws)
+        self.assertEqual((w["follow"]["dms"], w["follow"]["inbox"]), ({"U00000001": "D00000001"}, ""))
+        hub.save_json(self.ws, "watch.json", {"follow": {"dms": {"U00000001": "D00000001"}, "inbox": "D00000009"}})
+        m = hub.merged_watch(self.cfg, hub.load_watch(self.ws))
+        self.assertEqual((m["chat"]["dms"], m["chat"]["inbox"]), ({"U00000001": "D00000001"}, "D00000009"))
+        self.assertIn("chat dms: U00000001=D00000001", self.run_verb("watching")[1])
+
+    def test_status_outside_active_hours_names_the_next_window(self):
+        self.cfg["routines"] = {"tick": {"active_hours": "08:00-18:00"}}
+        self.cfg["manager"]["workdays"] = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        at = datetime(2026, 10, 29, 20, 0, tzinfo=UTC)  # Thursday evening
+        hub.save_json(self.ws, "watcher.json", {"at": hub_sources.iso(at), "every_seconds": 600, "active": False,
+                                                "sources": {}, "errors": []})
+        buf = io.StringIO()
+        hub.status(self.ws, at, out=buf, cfg=self.cfg)
+        self.assertIn("next active window: 2026-10-30T08:00:00+00:00", buf.getvalue())
+        local = datetime(2026, 10, 30, 8, 0, tzinfo=UTC).astimezone()
+        self.assertIn("one-shot cron: %d %d %d %d *" % (local.minute, local.hour, local.day, local.month),
+                      buf.getvalue())
+
+
 SELF_JID = "15550000009@s.whatsapp.net"
 DM_JID = "15550000001@s.whatsapp.net"
 GROUP_JID = "15550000002-1700000000@g.us"
