@@ -13,6 +13,7 @@ export const expandedAtom = atom({ plugin: 'mother', key: 'expanded' } as const,
 export const hubAtom = atom({ plugin: 'mother', key: 'hub' } as const, null)
 
 const PANE = 'mother-now'
+const FOCUS = 'mother-focus'
 const SNOOZES = ['1h', 'tomorrow', 'next-week'] as const
 const TOP_MAX = 3
 
@@ -310,10 +311,10 @@ export function lowestOpenRank(top: NowTop[]): number | null {
 // The row a focused element belongs to: an item id, or `top:<rank>` for a Top 3 entry; null for the
 // controls that are not a row's own (the snooze Select, the swap hint).
 export function rowOfElement(key: string | undefined): string | null {
-  if (!key || key.startsWith('snooze-pick-')) return null
+  if (!key || key.startsWith('snooze-pick-') || key.startsWith('ignore-pick-')) return null
   const top = /^top-(?:row|done|doit|ask)-(\d+)$/.exec(key)
   if (top) return 'top:' + top[1]
-  return /^(?:row|done|snooze|maketop|doit|ask|act\d+)-(.+)$/.exec(key)?.[1] ?? null
+  return /^(?:row|done|snooze|maketop|doit|ask|act\d+|quick\d+|focus|ignore)-(.+)$/.exec(key)?.[1] ?? null
 }
 
 // ---- suggested prompts -----------------------------------------------------------------------------
@@ -382,6 +383,50 @@ export function suggestedPrompts(doc: NowDoc, top: NowTop[], nowMs: number): Sug
 export function askPrompt(title: string, why: string | null | undefined, link: string | null | undefined): string {
   return `Help me close this out: "${title}"` + (why ? ` — ${why}` : '') + (link ? ` (${link})` : '')
     + '. What is the fastest next step? Draft anything that reaches another person; don\'t send.'
+}
+
+// ---- quick actions ---------------------------------------------------------------------------------
+
+// What the panel offers to do about an item, from its kind (the id's first part) and signal alone: no model
+// call. Each fills the prompt (never submits); the tick's own `actions` come first, above these.
+export type QuickGroup = 'Respond' | 'Investigate' | 'Delegate' | 'Triage'
+export type Quick = { group: QuickGroup; label: string; text: string }
+const QUICK_IN_ROW = 3
+const DRAFT = " Draft anything that reaches another person; don't send."
+
+export function quickActions(i: NowItem): Quick[] {
+  const kind = i.id.split(':')[0]
+  const ref = `"${i.title}"` + (i.link ? ` (${i.link})` : '')
+  const q = (group: QuickGroup, label: string, text: string): Quick => ({ group, label, text: text + DRAFT })
+  const out: Quick[] = []
+  if (kind === 'chat' || kind === 'mail' || ['unanswered_mention', 'mail_needs_reply', 'outside_question'].includes(i.signal)) {
+    out.push(q('Respond', 'Draft a reply', `Read ${ref} in full and draft my reply, in my voice, as a draft for me to check.`))
+    out.push(q('Respond', 'Summarize the thread', `Summarize ${ref}: who asked what, what was decided, and what is still open on me.`))
+    out.push(q('Investigate', 'Find related tickets', `Find tracker tickets and PRs related to ${ref}, and say which one it belongs to, or that none does.`))
+    out.push(q('Delegate', 'Turn into a ticket', `Propose a tracker ticket for ${ref}: title, description, team and who should own it, with the source linked. Create nothing until I say yes.`))
+  } else if (kind === 'pr') {
+    if (i.signal === 'review_requested') out.push(q('Respond', 'Review brief', `Give me a review brief for ${ref}: what changed, the risky parts, what to check first, and any open comments.`))
+    out.push(q('Investigate', 'Why is CI red?', `Check the checks on ${ref}. If any fail, find the failing step and the likely cause from its log.`))
+    if (i.signal === 'pr_no_reviewer') out.push(q('Delegate', 'Find a reviewer', `Suggest a reviewer for ${ref} from the code owners and who last changed these files, and draft the review request.`))
+    if (i.signal === 'pr_changes_silent' || i.signal === 'pr_approved_unmerged') out.push(q('Delegate', 'Nudge the author', `Draft a short nudge to the author of ${ref} about what it is waiting on.`))
+  } else if (kind === 'ticket') {
+    out.push(q('Investigate', 'Find related PRs and commits', `Find the PRs, branches and commits that mention ${ref}, and say how far the work got.`))
+    out.push(q('Investigate', 'Investigate in the code', `Investigate ${ref} in the team's repos: where the problem likely lives and what a fix would touch.`))
+    out.push(q('Delegate', 'Find the owner and draft a DM', `Find who owns the code behind ${ref} (code owners, recent changes), propose assigning it to them, and draft the DM. Assign nothing until I say yes.`))
+  } else if (kind === 'repo' || kind === 'build' || i.signal === 'default_branch_red') {
+    out.push(q('Investigate', 'Find the breaking change', `Find the commit that turned ${ref} red, from the first failing run and its log.`))
+    out.push(q('Delegate', 'Draft a heads-up to its author', `Draft a heads-up to the author of the change that broke ${ref}, with the failing check linked.`))
+  } else if (kind === 'event') {
+    out.push(q('Respond', 'Prep me for it', `Prep me for ${ref}: who is coming, what is open between us, and what I should bring.`))
+  } else {
+    out.push(q('Investigate', "What's this about?", `Tell me what ${ref} is about and what closes it.`))
+  }
+  // A ticket and a red branch already name their owner above; everything else can be handed on.
+  if (!(kind === 'ticket' || kind === 'repo' || kind === 'build' || i.signal === 'default_branch_red')) {
+    out.push(q('Delegate', 'Hand it to someone', `Who on my teams is best placed to take ${ref}, by what they own? Draft the hand-off message.`))
+  }
+  out.push(q('Triage', 'Make it a todo', `Add ${ref} to my todos with the link, and mark it done in the Now list.`))
+  return out
 }
 
 // ---- the pane --------------------------------------------------------------------------------------
@@ -526,6 +571,10 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
                   hotkey={n === 0 ? hot(i.id, 'x') : undefined}
                   onPress={() => fill(a.prompt || `mother now do ${a.id}`)}>{n === 0 && !a.label ? 'Do it' : a.label || a.id}</Button>
               ))}
+              {quickActions(i).slice(0, QUICK_IN_ROW).map((qa, n) => (
+                <Button key={`quick${n}-` + i.id} onPress={() => fill(qa.text)}>{qa.label}</Button>
+              ))}
+              <Button key={'focus-' + i.id} hotkey={hot(i.id, 'f')} onPress={() => { void select(i.id); void $.ui.open({ id: FOCUS, title: 'Focus' }) }}>Focus</Button>
               {sess
                 ? <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => openSession($, goHub, sess[0], sess[1])}>Open session</Button>
                 : <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => fill(askPrompt(i.title, i.why, i.link))}>Ask Mother</Button>}
@@ -664,6 +713,92 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
       {ignoredSection(ui, hub.watch, expanded, toggle, at, goHub)}
       {noItems && health.length === 0 && top.length === 0
         ? <Text>{`Nothing on you. Next check ${at(doc.next_at)}.`}</Text> : null}
+    </Box>
+  )
+}
+
+// The focus pane: one item in full, beside the Now pane. It follows the selected row (a Top 3 entry shows
+// its item), else the first item. Every action fills the prompt or runs the same verbs as the Now pane.
+const QUICK_GROUPS: QuickGroup[] = ['Respond', 'Investigate', 'Delegate', 'Triage']
+const SECTION_NAME: Record<NowItem['section'], string> = { on_you: 'On you', neglected: 'Neglected', suggestion: 'Suggestion' }
+const RELATED_MAX = 5
+
+function focusTree($: Dollar, ui: Ui, doc: NowDoc | null, picking: string | null, selected: string | null, nowMs: number,
+                   go: (args: string[], rowId?: string | null) => Promise<void>, hub: HubBundle,
+                   goHub: (args: string[], rowId?: string | null) => Promise<void>) {
+  const { Box, Text, Button, Link, Select } = ui
+  const items = doc?.items ?? []
+  const topItem = /^top:(\d+)$/.exec(selected ?? '')
+  const wanted = topItem ? (doc?.top ?? []).find(e => String(e.rank) === topItem[1])?.item_id : selected
+  const i = items.find(x => x.id === wanted) ?? items[0]
+  if (!i) return <Box flexDirection="column"><Text dimColor>Select an item in the Now panel.</Text></Box>
+  const at = (iso: string | undefined | null) => clock(iso, doc?.timezone)
+  const fill = (text: string) => { void $.prompt.fill({ text, mode: 'replace' }) }
+  const select = (id: string) => update($, selectedAtom, () => id)
+  const heading = (text: string) => <Box key={'fh-' + text} marginTop={1}><Text weight="semibold">{text}</Text></Box>
+  const quick = quickActions(i)
+  const sess = sessionForItem(hub.sessions, i)
+  const mine = new Set([i.link, ...(i.also ?? [])])
+  const related = items.filter(x => x.id !== i.id && ((i.team && x.team === i.team) || [x.link, ...(x.also ?? [])].some(k => mine.has(k))))
+    .slice(0, RELATED_MAX)
+  const rank = lowestOpenRank(doc?.top_date === localDate(nowMs, doc?.timezone) ? doc?.top ?? [] : [])
+  const meta = [SECTION_NAME[i.section], i.team, i.signal.replace(/_/g, ' ')].filter(Boolean).join(' · ')
+  return (
+    <Box flexDirection="column">
+      <Text weight="semibold" size="heading" wrap="wrap">{i.title}</Text>
+      <Text dimColor>{meta}</Text>
+      {i.why ? <Text wrap="wrap">{i.why}</Text> : null}
+      <Text dimColor wrap="wrap">{`raised ${age(i.since, nowMs)} ago · first seen ${at(i.first_seen)} · checked ${at(i.last_seen)}`
+        + (i.unverified_since ? ` · unverified since ${at(i.unverified_since)}` : '')}</Text>
+      <Box key="fp-chips" flexWrap="wrap" gap="xs">
+        {linkChips(i.links, i.link, i.also).map((c, n) => <Link key={'fp-chip-' + n} href={c.url}>{c.label}</Link>)}
+      </Box>
+      {(i.actions ?? []).length > 0 ? heading('Suggested') : null}
+      {(i.actions ?? []).length > 0 ? (
+        <Box key="fp-suggested" flexWrap="wrap" gap="xs">
+          {(i.actions ?? []).map((a, n) => (
+            <Button key={'fp-act' + n} variant={n === 0 ? 'primary' : undefined} onPress={() => fill(a.prompt || `mother now do ${a.id}`)}>{a.label || a.id}</Button>
+          ))}
+        </Box>
+      ) : null}
+      {QUICK_GROUPS.map(g => {
+        const mineQ = quick.map((qa, n) => [qa, n] as [Quick, number]).filter(([qa]) => qa.group === g)
+        return (
+          <Box key={'fp-group-' + g} flexDirection="column">
+            {heading(g)}
+            <Box flexWrap="wrap" gap="xs">
+              {mineQ.map(([qa, n]) => <Button key={'fp-q' + n} onPress={() => fill(qa.text)}>{qa.label}</Button>)}
+              {g === 'Investigate'
+                ? (sess
+                    ? <Button key="fp-hub" onPress={() => openSession($, goHub, sess[0], sess[1])}>Open session</Button>
+                    : isUrl(i.link) ? <Button key="fp-hub" onPress={() => goHub(['add', '--', i.link])}>Run in a session</Button> : null)
+                : null}
+              {g === 'Triage' ? (
+                <Box key="fp-triage" flexWrap="wrap" gap="xs">
+                  <Button key="fp-done" onPress={() => go(['done', i.id])}>Done</Button>
+                  <Button key="fp-snooze" onPress={() => update($, snoozingAtom, cur => (cur === 'fp-snooze' ? null : 'fp-snooze'))}>Snooze</Button>
+                  {isUrl(i.link) ? <Button key="fp-ignore" onPress={() => update($, snoozingAtom, cur => (cur === 'fp-ignore' ? null : 'fp-ignore'))}>Ignore…</Button> : null}
+                  {rank !== null ? <Button key="fp-maketop" onPress={() => go(['top', 'swap', String(rank), i.id])}>Make top 3</Button> : null}
+                </Box>
+              ) : null}
+            </Box>
+          </Box>
+        )
+      })}
+      {picking === 'fp-snooze'
+        ? <Select key="fp-snooze-pick" label="Snooze for" options={SNOOZES.map(value => ({ value }))} onSelect={value => go(['snooze', i.id, value], 'fp-snooze')} />
+        : null}
+      {picking === 'fp-ignore' && isUrl(i.link)
+        ? <Select key="fp-ignore-pick" label="Ignore" options={ignoreOptions(i.id.startsWith('chat:'))}
+            onSelect={async value => { await goHub(ignoreArgs(value, i.link), 'fp-ignore'); await go(['done', i.id]) }} />
+        : null}
+      <Box marginTop={1}>
+        <Button key="fp-tell" onPress={() => fill(`About "${i.title}"` + (i.link ? ` (${i.link})` : '') + ': ')}>Tell Mother…</Button>
+      </Box>
+      {related.length > 0 ? heading('Related') : null}
+      {related.map(r => (
+        <Button key={'fp-rel-' + r.id} plain dimColor onPress={() => select(r.id)}>{`▸ ${r.title} · ${age(r.since, nowMs)}`}</Button>
+      ))}
     </Box>
   )
 }
@@ -880,6 +1015,14 @@ export const register: Register = (on, options) => {
     const row = rowOfElement(e.element ?? (e as { key?: string }).key)
     if (row) await update($, selectedAtom, () => row)
     return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: FOCUS }, async ($, e) => {
+    const bin = await motherBin($, configured)
+    const go = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId)
+    const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub', ['add', 'mute'].includes(args[0]))
+    return focusTree($, $.ui.resolve(e), await read($, docAtom), await read($, snoozingAtom), await read($, selectedAtom),
+      await $.clock.now(), go, (await read($, hubAtom)) ?? NO_HUB, goHub)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

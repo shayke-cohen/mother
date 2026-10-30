@@ -100,6 +100,12 @@ It symlinks `mother` into `~/.local/bin`. Pass another directory if that one isn
 (a hooks module beside the guard), so there is nothing more to install. Open it with `/now-panel` (`/now` is
 MOTHER's chat skill, which prints the same list in the conversation). It reads `.mother/now.json` on the machine
 the tick runs on and makes no network calls.
+Open an item and it shows a chip for each of its sources (thread, channel, mail, ticket, PR, build) and up to three
+quick actions picked by what the item is: Draft a reply and Summarize the thread for chat and mail, Review brief and
+Why is CI red? for a PR, Find related PRs and Find the owner for a ticket. Each one only fills the prompt; you press
+Enter, and anything that reaches another person comes back as a draft. **Focus** (`f`) opens a second pane with the
+selected item in full: its sources and timeline, every action grouped as Respond, Investigate, Delegate and Triage,
+Run in a session (the hub), Tell Mother… for your own words, and related items from the same team.
 Its one setting, `mother_bin` (userConfig), is the path to the `mother` script it calls for `mother path` and
 the `mother now` edits. Left empty (the default) it runs this plugin's own `bin/mother`, the same version the
 hooks run; set it only to point the panel at another copy (a leading `~` is your home folder).

@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { hubStatus } from './register'
+import { hubStatus, quickActions } from './register'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-10-26T10:00:00Z')
@@ -355,6 +355,88 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
+  const FOCUS = { ...PANE, requestId: 'mother-focus', props: { ...PANE.props, title: 'Focus' } } as const
+  const kinded = (kind: string, signal: string, title: string, link: string) => {
+    const it: any = item('x', 'on_you', 'open', title)
+    it.id = `${kind}:${link}:${signal}`
+    it.signal = signal
+    it.link = link
+    it.why = 'Asked 5 working hours ago'
+    return it
+  }
+
+  test(`quick actions follow the item's kind and never send, on ${surface}`, async () => {
+    const chat = quickActions(kinded('chat', 'unanswered_mention', 'Release question', 'https://example.com/t/1'))
+    expect(chat.map(q => q.label)).toEqual(['Draft a reply', 'Summarize the thread', 'Find related tickets',
+      'Turn into a ticket', 'Hand it to someone', 'Make it a todo'])
+    for (const q of chat) {
+      expect(q.text).toContain('"Release question" (https://example.com/t/1)')
+      expect(q.text).toMatch(/don't send/)
+    }
+    expect(quickActions(kinded('pr', 'review_requested', 'Review api#7', 'https://example.com/acme/api/pull/7')).map(q => q.label))
+      .toEqual(['Review brief', 'Why is CI red?', 'Hand it to someone', 'Make it a todo'])
+    expect(quickActions(kinded('pr', 'pr_no_reviewer', 'api#8', 'https://example.com/acme/api/pull/8')).map(q => q.label))
+      .toEqual(['Why is CI red?', 'Find a reviewer', 'Hand it to someone', 'Make it a todo'])
+    expect(quickActions(kinded('ticket', 'bug_unowned', 'Login broken', 'https://example.com/browse/PLAT-2')).map(q => q.label))
+      .toEqual(['Find related PRs and commits', 'Investigate in the code', 'Find the owner and draft a DM', 'Make it a todo'])
+    expect(quickActions(kinded('repo', 'default_branch_red', 'api main red', 'https://example.com/acme/api/commits/main')).map(q => q.label))
+      .toEqual(['Find the breaking change', 'Draft a heads-up to its author', 'Make it a todo'])
+    expect(quickActions(kinded('todo', 'promise_due', 'Send the plan', 'https://example.com/x')).map(q => q.label))
+      .toEqual(["What's this about?", 'Hand it to someone', 'Make it a todo'])
+    expect(chat.map(q => q.group)).toEqual(['Respond', 'Respond', 'Investigate', 'Delegate', 'Delegate', 'Triage'])
+  })
+
+  test(`an open row shows three quick actions that fill the prompt, plus Focus, on ${surface}`, async ($, on) => {
+    const it = kinded('chat', 'unanswered_mention', 'Release question', 'https://example.com/t/1')
+    const d = doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.findAll({ type: 'Button' })).filter((b: any) => String(b.key).startsWith('quick')).map((b: any) => b.text))
+      .toEqual(['Draft a reply', 'Summarize the thread', 'Find related tickets'])
+    await ui.press({ key: 'quick1-' + it.id })
+    expect(out.fills).toEqual([{ text: quickActions(it)[1].text, mode: 'replace' }])
+    expect(out.submits).toBe(0)
+    await ui.press({ key: 'focus-' + it.id })
+    expect(out.opened).toContain('mother-focus')
+    await ui.unmount()
+  })
+
+  test(`the focus pane follows the selected row: links, timeline, grouped actions, triage, on ${surface}`, async ($, on) => {
+    const a = kinded('chat', 'unanswered_mention', 'Release question', 'https://example.com/t/1')
+    a.links = [{ label: 'Channel', url: 'https://example.com/c' }]
+    a.team = 'platform'
+    a.actions = [{ id: 'S1', label: 'Draft the cutoff reply', prompt: 'mother now do S1', task: 'draft' }]
+    const b: any = item('b', 'on_you', 'open', 'Other B')
+    b.team = 'platform'
+    const d = doc({ items: [a, b], counts: { on_you: 2, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const fp = await $.ui.mount({ ...FOCUS, surface })
+    expect(await hasText(fp, /Release question/)).toBe(true)
+    for (const h of [/^Suggested$/, /^Respond$/, /^Investigate$/, /^Delegate$/, /^Triage$/, /^Related$/]) expect(await hasText(fp, h)).toBe(true)
+    expect(await hasText(fp, /raised 2h ago/)).toBe(true)
+    expect((await chipsOf(fp)).map(([l]) => l)).toEqual(['Channel', 'Source'])
+    await fp.press({ key: 'fp-act0' })
+    expect(out.fills[0]).toEqual({ text: 'mother now do S1', mode: 'replace' })
+    await fp.press({ key: 'fp-tell' })
+    expect(out.fills[1]).toEqual({ text: 'About "Release question" (https://example.com/t/1): ', mode: 'replace' })
+    await fp.press({ key: 'fp-done' })
+    expect(nowCalls(out)).toEqual([['done', a.id]])
+    await fp.press({ key: 'fp-ignore' })
+    await fp.select({ key: 'fp-ignore-pick', value: 'week' })
+    expect(out.argv.filter(x => x[2] === 'hub').map(x => x.slice(3))).toEqual([['mute', '--for', '1w', '--', a.link]])
+    await fp.press({ key: 'fp-rel-b' })               // a related item: the pane follows it
+    expect(await hasText(fp, /Other B/)).toBe(true)
+    await fp.unmount()
+  })
+
+  test(`the focus pane with nothing on the list says so, on ${surface}`, async ($, on) => {
+    const d = doc({ items: [], counts: { on_you: 0, neglected: 0, suggestion: 0 }, coverage: {} })
+    await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const fp = await $.ui.mount({ ...FOCUS, surface })
+    expect(await hasText(fp, /Select an item in the Now panel/)).toBe(true)
+    await fp.unmount()
+  })
+
   test(`Done runs mother now done and re-reads at once, on ${surface}`, async ($, on) => {
     const files: Record<string, { text: string; mtimeMs: number }> = { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }
     const after = doc({ items: [item('b', 'on_you', 'open', 'Only B')], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
@@ -410,7 +492,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     d.items[0].actions = [{ id: 'S2', label: 'Draft a nudge', prompt: 'mother now do S2', task: 'draft a nudge to the reviewer' }]
     const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hotkeys(ui)).toEqual(['x:doit-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['x:doit-a', 'f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     expect((await ui.find({ key: 'doit-a' }))?.text).toBe('Draft a nudge')   // the action's own label
     await ui.press({ key: 'doit-a' })
     expect(out.fills).toEqual([{ text: 'mother now do S2', mode: 'replace' }])
@@ -423,7 +505,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc({ top, top_date: '2026-10-25' })), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hasText(ui, /Top 3 today|Old one/)).toBe(false)
-    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     await ui.unmount()
   })
 
@@ -533,7 +615,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`with no focus event the first row holds the hotkeys, on ${surface}`, async ($, on) => {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     expect((await ui.find({ key: 'row-a' }))?.props.autoFocus).toBe(true)
     expect(await ui.find({ key: 'done-b' })).toBeUndefined()     // only the selected row draws its buttons
     await ui.unmount()
@@ -543,7 +625,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } })
     const ui = await $.ui.mount({ ...PANE, surface })
     await $.ui.focus({ requestId: 'mother-now', key: 'snooze-b' } as any)
-    expect(await hotkeys(ui)).toEqual(['a:ask-b', 'd:done-b', 's:snooze-b', 't:maketop-b'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-b', 'a:ask-b', 'd:done-b', 's:snooze-b', 't:maketop-b'])
     await ui.unmount()
   })
 
@@ -568,7 +650,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hotkeys(ui)).toEqual(['a:top-ask-1', 'd:top-done-1'])
     await $.ui.focus({ requestId: 'mother-now', key: 'row-a' } as any)
-    expect(await hotkeys(ui)).toEqual(['a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
+    expect(await hotkeys(ui)).toEqual(['f:focus-a', 'a:ask-a', 'd:done-a', 's:snooze-a', 't:maketop-a'])
     await ui.unmount()
   })
 
