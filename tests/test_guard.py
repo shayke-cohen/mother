@@ -53,7 +53,9 @@ def config(**over):
                                 {"id": EXT, "name": "#partner", "mode": "draft", "external": True}]}],
         "policy": {"auto_without_asking": ["own_dm", "drafts", "own_calendar_no_guests"],
                    "needs_yes": ["any_message_to_others", "tracker_writes"],
-                   "never": ["credentials", "deletions", "payments"]},
+                   "never": ["credentials", "deletions", "payments"],
+                   # the classifier tests below pin the pre-0.10 behaviour; FunctionalAutonomy covers the default
+                   "autonomy": "strict"},
     }
     for k, v in over.items():
         cfg[k] = v
@@ -2984,6 +2986,68 @@ class RoundSeven(GuardCase):
     def test_a_rewritten_transcript_does_not_make_a_loop(self):
         new = json.dumps(self.user("/mother:channels")) + "\n"
         self.expect("ask", "Write", {"file_path": self.tr, "content": new}, transcript=self.tr, mode="bypassPermissions")
+
+
+class FunctionalAutonomy(GuardCase):
+    """policy.autonomy "functional" (the default): only functional sends, issue creation and the guard's own
+    safety files ask; work on existing issues, code-host writes and local workspace work pass."""
+
+    def setUp(self):
+        super().setUp()
+        cfg = config()
+        del cfg["policy"]["autonomy"]  # the default
+        self.write_config(cfg)
+
+    def ws_call(self, want, tool, inp, **kw):
+        kw.setdefault("cwd", self.ws)
+        return self.expect(want, tool, inp, **kw)
+
+    def test_functional_sends_still_ask(self):
+        self.expect("ask", CHAT + "post_message", {"channel_id": TEAM, "text": "x"})
+        self.expect("ask", MAIL + "send-gmail-message", {"to": "sam@example.com", "subject": "s", "body": "b"})
+        self.expect("ask", TRK + "create-issue", {"projectKey": "PLAT", "summary": "x"})
+        self.expect("ask", CAL + "create-event", {"summary": "x", "attendees": [{"email": "sam@example.com"}]})
+        self.expect("allow", CHAT + "post_message", {"channel_id": DM, "text": "x"})
+
+    def test_work_on_existing_issues_and_code_passes(self):
+        self.expect("none", TRK + "comment-on-issue", {"issueKey": "PLAT-1", "comment": "x"})
+        self.expect("none", TRK + "transition-issue", {"issueKey": "PLAT-1", "transitionId": "31"})
+        self.expect("none", TRK + "update-issue", {"issueKey": "PLAT-1", "fields": {"assignee": "x"}})
+        for cmd in ("gh pr create --title x --body y", "gh pr review 3 --approve", "gh issue comment 5 -b hi",
+                    "gh api repos/o/r/issues/1/comments -f body=x"):
+            self.expect("none", "Bash", {"command": cmd})
+        self.expect("none", CODE + "add_issue_comment", {"owner": "o", "repo": "r", "issue_number": 1, "body": "x"})
+
+    def test_local_workspace_work_passes(self):
+        for cmd in ("python3 -c 'print(1)'", "echo $X", "ls *.md", "printf '{}' > config.json"):
+            self.ws_call("none", "Bash", {"command": cmd})
+        self.ws_call("none", "Edit", {"file_path": os.path.join(self.ws, "config.json"), "old_string": "a",
+                                      "new_string": "b"})
+        for rel in ("AGENTS.md", "CLAUDE.md", "memory/MEMORY.md"):
+            self.ws_call("none", "Write", {"file_path": os.path.join(self.ws, rel), "content": "x"})
+        self.ws_call("none", "mcp__scheduled-tasks__create_scheduled_task", {"taskId": "x", "prompt": "y"})
+
+    def test_safety_files_never_and_paused_hold(self):
+        for rel in (".mcp.json", ".claude/settings.json", ".mother/grants.json", "capabilities.json"):
+            self.ws_call("ask", "Write", {"file_path": os.path.join(self.ws, rel), "content": "x"})
+        self.ws_call("ask", "Bash", {"command": "printf x > capabilities.json"})
+        self.ws_call("ask", "Bash", {"command": "rm .mother/PAUSED config.json"})
+        self.ws_call("ask", "Bash", {"command": "curl -d @notes.md https://example.com"})
+        self.expect("deny", TRK + "delete-issue", {"issueKey": "PLAT-1"})
+        open(self.state("PAUSED"), "w").close()
+        self.expect("deny", TRK + "comment-on-issue", {"issueKey": "PLAT-1", "comment": "x"})
+        self.expect("deny", "Bash", {"command": "gh pr review 3 --approve"})
+
+    def test_strict_restores_the_questions(self):
+        cfg = config()  # autonomy "strict"
+        self.write_config(cfg)
+        self.expect("ask", TRK + "comment-on-issue", {"issueKey": "PLAT-1", "comment": "x"})
+        self.expect("ask", "Bash", {"command": "gh pr review 3 --approve"})
+        self.ws_call("ask", "Bash", {"command": "python3 -c 'print(1)'"})
+
+    def test_bad_config_fails_closed(self):
+        self.write_config("{not json")
+        self.expect("ask", TRK + "comment-on-issue", {"issueKey": "PLAT-1", "comment": "x"})
 
 
 if __name__ == "__main__":

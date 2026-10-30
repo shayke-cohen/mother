@@ -169,6 +169,7 @@
       "deletions",
       "payments"
     ],
-    "bypass_passes_asks": false
+    "bypass_passes_asks": false,
+    "autonomy": "functional"
   }
 }

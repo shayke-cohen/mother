@@ -22,6 +22,14 @@ The pinned hub session reads untrusted source summaries, so the guard fences it 
 Reading anything and local work (memory, todos, files in the workspace) is not outbound at all. Nor is archiving mail or marking it read: it is reversible and no one else sees it. The guard lets those mail calls through, and `mother inbox archive|read` (the Now panel's Archive and Mark read) asks the guard's own classifier before each one, writes nothing while MOTHER is paused, and logs each thread to `.mother/guard.log`. Trashing mail still asks (`mail_trash`). Neither are the desktop app's own session tools (raising a session card, messaging one of the manager's sessions): they reach only the manager, and the guard matches them by exact name. Because a message can carry text quoted from a source, the guard asks before a message goes into a session the hub does not route to (one that is not `live` in `.mother/hub/sessions.json`; from the workspace, a message by name goes without asking only to `main` or a live hub session's name), and before a session is started right away rather than raised as a card.
 
 **Needs a yes** (`policy.needs_yes`). The agent drafts it, shows it, and the human confirms in the prompt.
+Under the default `policy.autonomy: "functional"`, only the functional ones keep their question: messages and mail
+to others, invites with guests, mail rules, shared docs, trashing mail, and **creating** a tracker issue. Work on
+existing issues (comment, transition, update, sprint moves) and code-host writes (PRs, reviews, comments) go
+without asking, still signed. Set `"strict"` to make every row below ask again.
+
+**Decisions stay the manager's.** No hook can see a decision, so this one is on the agent: a business or product
+call (scope, priority, who owns what, dropping or committing to work, anything that speaks for the team) is
+proposed with a recommendation and waits for a yes, whatever the guard allows.
 
 | Name | Means |
 |---|---|
