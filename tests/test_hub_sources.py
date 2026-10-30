@@ -399,14 +399,14 @@ class TestTracker(unittest.TestCase):
     def test_own_status_change_is_resolved(self):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
         theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
-        h = lambda a: {"values": [self.history("2026-10-29T09:51:00.000+0000", theirs),
+        h = lambda a: {"total": 3, "values": [self.history("2026-10-29T09:51:00.000+0000", theirs),
                                   self.history("2026-10-29T09:55:00.000+0000", mine),
                                   self.history("2026-10-29T09:56:00.000+0000", theirs, "labels")]}
         out, f = self.changelog_poll(h)
         self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("PLAT-1", "resolved")])
         self.assertEqual([c[1]["issueKey"] for c in f.calls if c[0].endswith("changelog")], ["PLAT-1"] * 2)
         # by account id alone
-        h2 = lambda a: {"values": [self.history("2026-10-29T09:55:00.000+0000", {"accountId": "acc9"})]}
+        h2 = lambda a: {"total": 1, "values": [self.history("2026-10-29T09:55:00.000+0000", {"accountId": "acc9"})]}
         out, _ = self.changelog_poll(h2, me=dict(ME, email="", tracker_account="acc9"))
         self.assertEqual(out["lines"][0]["kind"], "resolved")
 
@@ -446,9 +446,19 @@ class TestTracker(unittest.TestCase):
         out, _ = self.changelog_poll(h)
         self.assertEqual(out["lines"][0]["kind"], "resolved")
         self.assertEqual(len(calls), 3)
-        h, calls = self.paged(ents * 10, total=False)
-        self.changelog_poll(h)
-        self.assertEqual(len(calls), 6)  # the total probe plus 5 pages
+
+    def test_capped_or_unterminated_history_stays_update(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        old_own = self.history("2026-10-01T09:00:00.000+0000", mine)
+        filler = self.history("2026-10-02T09:00:00.000+0000", {"accountId": "x"}, "labels")
+        h, calls = self.paged([old_own] + [filler] * 600, total=False)  # more than 5 pages
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+        self.assertEqual(len(calls), 6)
+        base, _ = self.paged([old_own], total=False)  # no isLast in the answer
+        h2 = lambda a: {k: v for k, v in base(a).items() if k != "isLast"}
+        out, _ = self.changelog_poll(h2)
+        self.assertEqual(out["lines"][0]["kind"], "update")
 
     def test_offsets_are_normalised(self):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
@@ -463,7 +473,7 @@ class TestTracker(unittest.TestCase):
     def test_others_change_is_update(self):
         mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
         theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
-        h = lambda a: {"values": [self.history("2026-10-29T09:51:00.000+0000", mine),
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:51:00.000+0000", mine),
                                   self.history("2026-10-29T09:55:00.000+0000", theirs)]}
         out, _ = self.changelog_poll(h)
         self.assertEqual(out["lines"][0]["kind"], "update")

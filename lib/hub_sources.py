@@ -361,7 +361,8 @@ class TrackerJira(Adapter):
     @classmethod
     def _changelog_tail(cls, client, key) -> list:
         """The newest changelog entries (the tool pages oldest first): one read for `total`, then the last 50.
-        Without a `total`, pages are read until `isLast`, at most 5."""
+        Without a `total`, pages are read until `isLast` is true, at most 5;
+        past the cap, or when `isLast` is missing, nothing is returned."""
         name = "get-issue-changelog"
         head = client.call(name, {"issueKey": key, "startAt": 0, "maxResults": 1})
         head = head if isinstance(head, dict) else {}
@@ -374,10 +375,11 @@ class TrackerJira(Adapter):
         for n in range(5):
             res = client.call(name, {"issueKey": key, "startAt": n * 100, "maxResults": 100})
             res = res if isinstance(res, dict) else {}
-            out.extend(res.get("values") if isinstance(res.get("values"), list) else [])
-            if res.get("isLast") is not False:
-                break
-        return out
+            vals = res.get("values") if isinstance(res.get("values"), list) else []
+            out.extend(vals)
+            if res.get("isLast") is True:
+                return out
+        return []  # cap reached, empty page or no `isLast`: the newest entries were not seen, so claim nothing
 
     @classmethod
     def _own_change(cls, client, key, email, account) -> bool:
