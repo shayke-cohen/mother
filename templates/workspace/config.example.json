@@ -8,6 +8,7 @@
   },
   "manager": {
     "email": "dana@example.com",
+    "tracker_account": "",
     "timezone": "Europe/London",
     "workdays": [
       "Mon",
@@ -167,6 +168,7 @@
       "credentials",
       "deletions",
       "payments"
-    ]
+    ],
+    "bypass_passes_asks": false
   }
 }

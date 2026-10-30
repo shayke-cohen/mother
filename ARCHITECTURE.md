@@ -30,13 +30,14 @@ holds code a later session would run.
 | Path | What it is | Notes |
 |---|---|---|
 | `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
-| `hooks/hooks.json` | Wires the hooks | PreToolUse → guard; Stop and SessionEnd → `mother sync --quiet` |
-| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
+| `hooks/hooks.json` | Wires the hooks | PreToolUse → guard (every tool it has a rule for; tests/test_packaging.py checks); Stop and SessionEnd → `mother sync --quiet` |
+| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. `hooks/guard_fast.py` takes every tool the main matcher doesn't and escalates to the guard for channel roles, MOTHER's sub-agents, hub and hub-fed sessions and the grant key; otherwise it passes without loading the guard. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
 | `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval`, `health` to `lib/` |
 | `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
 | `lib/channels.py` | Reply-mode engine behind `mother:channels` | The skill does chat I/O; this decides who, when, and what. CONTRACT §5b |
 | `lib/whatsapp.py` | `mother whatsapp`: chats and read from the local WhatsApp database, send through the bridge, setup and link | Home machine only; the guard asks before each send to someone else. CONTRACT §5d |
 | `bridge/whatsapp/` | Send-only WhatsApp bridge (Node, Baileys linked device) on a 0600 Unix socket | Optional; `checks.mjs` = pure send rules (cap, gap), `bridge.mjs` = socket + WhatsApp. CONTRACT §5d |
+| `lib/grants.py` | `mother grant add\|remove\|list`: the one writer of `.mother/grants.json` for unattended runs | Checks each grant with the guard's own `valid_grant` before writing; the guard asks for any other write. CONTRACT §5 |
 | `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
 | `lib/now.py` | Deterministic core of the hourly tick and Now panel (working hours, signal thresholds, merge into `now.json`, the `mother now` verbs) | Python 3.9 stdlib only |
 | `lib/hub.py` | State core of the watcher and hub: thing keys, inbox lines, `.mother/hub/` files (atomic, locked) | Python 3.9 stdlib only |
@@ -114,9 +115,8 @@ Now panel: Hub section (status, sessions, updates); the Open button fills the pr
 
 Accepted gaps (also in CONTRACT §5e):
 
-- The tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description), and without a changelog it cannot tell the manager's own changes to those four from anyone else's: they come through as updates (a comment by the manager does resolve).
+- The tracker adapter misses edits to fields other than status, assignee, priority and comments (labels, summary, description). It reads the changelog to tell the manager's own status, assignee and priority edits from anyone else's: a line resolves only when every such change since the cursor is the manager's, and a changelog it cannot read leaves an update (a comment by the manager does resolve).
 - An unthreaded reply in a watched channel does not resolve the message it answers; only a reply in the thread (or in a DM) does.
-- Replies in threads the watcher does not follow (ones the manager has not posted in) are not read.
 
 ## Invariants the code relies on
 

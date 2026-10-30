@@ -9,7 +9,7 @@ The hourly tick writes `<workspace>/.mother/now.json`: what is blocked on the ma
 neglecting, suggestions waiting for a yes, and today's Top 3. This skill reads that list and edits the
 manager's view of it. It never scans a source itself; that is the tick's job.
 
-`W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"`. Every edit goes through `${CLAUDE_PLUGIN_ROOT}/bin/mother now …`;
+the output of `"${CLAUDE_PLUGIN_ROOT}/bin/mother" path`, written out literally (no shell variable). Every edit goes through `${CLAUDE_PLUGIN_ROOT}/bin/mother now …`;
 never edit `now.json` or `now-state.json` by hand.
 
 ## Show

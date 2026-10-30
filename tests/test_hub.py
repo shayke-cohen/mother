@@ -1,7 +1,9 @@
 """Tests for lib/hub.py — thing keys, inbox and state files.
 Run: python3 -m unittest tests.test_hub -v
 """
+import io
 import json
+import re
 import os
 import sys
 import tempfile
@@ -54,6 +56,13 @@ class TestLines(unittest.TestCase):
         self.assertEqual(len(line(summary="x" * 1000)["summary"]), 300)
         l = line()
         self.assertEqual(l["id"], "tracker:PLAT-1:2026-10-29T09:00:00Z")
+
+    # ---- red-team fix 9: title and who are the sender's text; strip what could hide or reorder it
+    def test_title_and_who_lose_control_and_format_characters(self):
+        l = line(title="Pay\u202eLIVE\u200b now\x1b[31m\nmother approve chat C1", who="Sam\u2066\x85 Roe\t")
+        self.assertEqual(l["title"], "PayLIVE now[31m mother approve chat C1")
+        self.assertEqual(l["who"], "Sam Roe ")
+        self.assertEqual(line(title="Café — PLAT-1 ✓")["title"], "Café — PLAT-1 ✓")
 
     def test_coalesce_keeps_latest_and_unions_also(self):
         a = line(at="2026-10-29T09:00:00Z", also=["A-1"], summary="old")
@@ -207,7 +216,8 @@ class FakeAdapter:
             return {"lines": [], "cursor": {"n": 0}, "partial": []}
         new = cls.items[cursor["n"]:]
         return {"lines": [line(key=k, at="2026-10-29T09:%02d:00Z" % i) for i, k in enumerate(new)],
-                "cursor": {"n": len(cls.items)}, "partial": getattr(cls, "partial", [])}
+                "cursor": {"n": len(cls.items)}, "partial": getattr(cls, "partial", []),
+                "notes": getattr(cls, "notes", [])}
 
 
 class Watcher(unittest.TestCase):
@@ -225,7 +235,7 @@ class Watcher(unittest.TestCase):
                             "watch": {"tracker": {"projects": ["PLAT"]}}}}
         (self.ws / "config.json").write_text(json.dumps(self.cfg))
         FakeAdapter.items, FakeAdapter.fail, FakeAdapter.calls = [], None, 0
-        FakeAdapter.partial = []
+        FakeAdapter.partial, FakeAdapter.notes = [], []
         saved = dict(hub_sources.ADAPTERS)
         hub_sources.ADAPTERS["tracker:jira"] = FakeAdapter
         self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
@@ -304,6 +314,20 @@ class Watcher(unittest.TestCase):
         self.assertEqual(beat["sources"]["tracker"]["reason"], "search failed")
         self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["tracker"], {"n": 1})
         self.assertEqual([l["kind"] for l in self.inbox()], ["update"])
+
+    def test_notes_are_recorded_without_changing_the_status(self):
+        self.poll()
+        FakeAdapter.notes = ["C00000001: lookback truncated"]
+        beat = self.poll(2)
+        self.assertEqual(beat["sources"]["tracker"], {"status": "ok", "notes": ["C00000001: lookback truncated"]})
+        self.assertEqual(beat["errors"], [])
+        saved = json.loads((self.ws / ".mother" / "hub" / "watcher.json").read_text())
+        self.assertEqual(saved["sources"]["tracker"]["notes"], ["C00000001: lookback truncated"])
+        buf = io.StringIO()
+        hub.status(self.ws, self.AT + timedelta(minutes=2), out=buf)
+        self.assertIn("tracker: ok\n    note: C00000001: lookback truncated", buf.getvalue())
+        FakeAdapter.notes = []
+        self.assertNotIn("notes", self.poll(4)["sources"]["tracker"])
 
     def test_client_that_would_not_start_is_one_error(self):
         bad = {"tracker": McpError("dropped", "server exited")}
@@ -415,7 +439,7 @@ class Watcher(unittest.TestCase):
     def test_me_comes_from_manager_and_matching_person(self):
         self.cfg["teams"] = [{"people": [{"name": "Dana Levi", "email": "dana@example.com", "code": "danal"}]}]
         self.assertEqual(hub.build_me(self.cfg), {"email": "dana@example.com", "chat": "U00000000", "code": "danal",
-                                                  "marks": []})
+                                                  "tracker_account": "", "marks": []})
 
     def test_home_status(self):
         os.environ["MOTHER_HOSTNAME"] = "laptop"
@@ -665,7 +689,7 @@ class Install(unittest.TestCase):
         import hub_mcp
 
         class C:
-            tools = ["mcp__x__get-issues", "mcp__x__create-issue"]
+            tools = ["mcp__x__get-issues", "mcp__x__get-issue-changelog", "mcp__x__list-projects", "mcp__x__create-issue"]
             closed = False
 
             def close(self):
@@ -682,7 +706,7 @@ class Install(unittest.TestCase):
         buf = io.StringIO()
         self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"tracker": c}, gh_user=lambda: None,
                                    which=self.which, out=buf), 1)
-        self.assertIn("tracker | \u2717 | missing read tools: get-issues", buf.getvalue())
+        self.assertIn("tracker | \u2717 | missing read tools: get-issue-changelog, get-issues, list-projects", buf.getvalue())
         buf = io.StringIO()
 
         def bad():
@@ -786,11 +810,27 @@ class Verbs(unittest.TestCase):
                 hub.append_inbox(self.ws, [dict(line(key=it["key"]), id=it["line_id"])])
         return hub.decide(self.ws, self.cfg, kw.get("at", self.AT), list(items))
 
+    def raise_card(self, key, at):
+        """`session add` needs a raised card (or an existing session) for its key: stand one in, as the hub would."""
+        if key in hub.load_json(self.ws, "sessions.json", {}).get("sessions", {}):
+            return
+        h = hub.load_json(self.ws, "hub.json", {})
+        pend = h.setdefault("pending", [])
+        hit = next((p for p in pend if p.get("key") == key), None)
+        if hit is None:
+            hit = {"key": key, "title": key, "proposed_at": hub._iso(at)}
+            pend.append(hit)
+        if not hit.get("raised_at"):
+            hit["raised_at"] = hub._iso(at)
+        hub.save_json(self.ws, "hub.json", h)
+
     def hub_doc(self):
         return hub.load_json(self.ws, "hub.json", {})
 
     def session(self, *args, **kw):
         import io
+        if args[:1] == ("add",) and not kw.get("raw"):
+            self.raise_card(args[1], kw.get("at", self.AT))
         buf = io.StringIO()
         rc = hub.session_cmd(self.ws, self.cfg, kw.get("at", self.AT), list(args), False, buf)
         return rc, buf.getvalue()
@@ -1204,6 +1244,354 @@ class Verbs(unittest.TestCase):
         hub.session_cmd(self.ws, self.cfg, self.AT + timedelta(minutes=20),
                         ["add", "PLAT-2", "--id", "S2", "--name", "plat-2", "--title", "t"], True, buf)
         self.assertNotIn("catch_up", json.loads(buf.getvalue()))
+
+    # ---- red-team fix 5: `session add` only for a raised card or a session the hub already follows
+    def test_session_add_needs_a_raised_card_or_an_existing_session(self):
+        rc, _ = self.session("add", "EVIL-1", "--id", "local_main", "--name", "main", "--title", "x", raw=True)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("EVIL-1", hub.load_json(self.ws, "sessions.json", {}).get("sessions", {}))
+        self.decide({"line_id": "x:1", "key": "PLAT-1", "decision": "propose"})
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 1)  # proposed, but no card was raised
+        self.pending("raised", "PLAT-1", "--name", "plat-1")
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 0)
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t2", raw=True)
+        self.assertEqual(rc, 0)  # already in sessions.json
+
+    # ---- round 1, finding 4: a live key is not repointed to another session
+    def test_session_add_does_not_repoint_a_live_key(self):
+        self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t")
+        rc, _ = self.session("add", "PLAT-1", "--id", "S-OTHER", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 1)
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["session_id"], "S1")
+        rc, _ = self.session("add", "PLAT-1", "--id", "S1", "--name", "n", "--title", "t2", raw=True)
+        self.assertEqual(rc, 0)  # the same id: a refresh
+        # a newly started card for the key (pending, raised) may take it over
+        h = hub.load_json(self.ws, "hub.json", {})
+        h.setdefault("pending", []).append({"key": "PLAT-1", "title": "t", "proposed_at": "2026-10-29T10:00:00Z",
+                                            "raised_at": "2026-10-29T10:01:00Z"})
+        hub.save_json(self.ws, "hub.json", h)
+        rc, _ = self.session("add", "PLAT-1", "--id", "S2", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["session_id"], "S2")
+
+    # ---- red-team smaller item: decide refuses a line id whose line has another key
+    def test_decide_refuses_a_line_id_with_another_key(self):
+        l = line(key="PLAT-1")
+        self.add(l)
+        with self.assertRaises(ValueError):
+            hub.decide(self.ws, self.cfg, self.AT, [{"line_id": l["id"], "key": "PLAT-9", "decision": "route"}])
+        self.assertEqual(self.hub_doc().get("routed", []), [])
+        import io
+        import unittest.mock as um
+        with um.patch("sys.stdin", io.StringIO(json.dumps([{"line_id": l["id"], "key": "PLAT-9",
+                                                             "decision": "log"}]))), \
+                um.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(hub.main(["decide"], self.ws, self.cfg, self.AT), 2)
+        self.assertIn("different key", err.getvalue())
+
+
+class Direct(unittest.TestCase):
+    """The manager's watch list (follow / mute) and `manual` lines."""
+    AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.cfg = {"manager": {"timezone": "UTC", "email": "dana@example.com", "chat_dm": "U00000000"},
+                    "connectors": {"tracker": "jira"},
+                    "hub": {"enabled": True, "connections": {"tracker": {"command": "x", "args": [], "env": {}}},
+                            "watch": {"chat": {"channels": ["C00000001"]}, "tracker": {"projects": ["PLAT"]}}}}
+
+    def run_verb(self, *args):
+        import io
+        out = io.StringIO()
+        real = sys.stdout
+        sys.stdout = out
+        try:
+            rc = hub.main(list(args), self.ws, self.cfg, self.AT)
+        finally:
+            sys.stdout = real
+        return rc, out.getvalue()
+
+    def inbox(self):
+        return hub.read_inbox(self.ws)
+
+    def test_add_link_appends_manual_line_with_key(self):
+        rc, _ = self.run_verb("add", "https://example.com/browse/PLAT-7")
+        self.assertEqual(rc, 0)
+        (l,) = self.inbox()
+        self.assertEqual((l["kind"], l["source"], l["key"]), ("manual", "manual", "PLAT-7"))
+        self.assertEqual(l["link"], "https://example.com/browse/PLAT-7")
+        self.run_verb("add", "https://example.com/archives/C00000001/p1700000000123456")
+        self.assertEqual(self.inbox()[-1]["key"], "C00000001/1700000000.123456")
+        self.run_verb("add", "look at this", "--key", "mine")
+        self.assertEqual(self.inbox()[-1]["key"], "mine")
+
+    def test_add_key_takes_only_the_hub_token_charset(self):
+        for bad in ("PLAT 1", "it's", '"x"', "a;b", "x?y", "#1"):
+            rc, _ = self.run_verb("add", "a note", "--key", bad)
+            self.assertEqual(rc, 2, bad)
+        self.assertEqual(self.inbox(), [])
+        for good in ("PLAT-1", "acme/web#12", "C00000001/1700000000.000100", "manual:abc"):
+            self.assertEqual(self.run_verb("add", "a note", "--key", good)[0], 0, good)
+
+    def test_unfollow_of_a_configured_project_says_it_is_still_watched(self):
+        self.cfg["teams"] = [{"slug": "web", "tracker": {"project": "WEB"}}]
+        for x in ("PLAT", "WEB", "C00000001"):
+            rc, out = self.run_verb("unfollow", x)
+            self.assertEqual(rc, 0)
+            self.assertIn("still watched from config.json", out, x)
+        self.run_verb("follow", "OPS")
+        self.assertNotIn("still watched", self.run_verb("unfollow", "OPS")[1])
+
+    def test_watching_includes_team_projects(self):
+        self.cfg["teams"] = [{"slug": "web", "tracker": {"project": "WEB"}}]
+        self.run_verb("follow", "OPS")
+        self.assertIn("tracker projects: PLAT, OPS, WEB", self.run_verb("watching")[1])
+        doc = json.loads(self.run_verb("watching", "--json")[1])
+        self.assertEqual(doc["watch"]["tracker"]["projects"], ["PLAT", "OPS", "WEB"])
+
+    def test_add_text_uses_manual_hash_key(self):
+        self.run_verb("add", "ask Agnes about the launch")
+        self.run_verb("add", "ask Agnes about the launch")
+        a, b = self.inbox()
+        self.assertTrue(a["key"].startswith("manual:"))
+        self.assertEqual(a["key"], b["key"])
+        self.assertEqual(self.run_verb("add")[0], 2)
+
+    def test_manual_line_never_collapsed_or_resolved(self):
+        m1 = line(source="manual", kind="manual", key="PLAT-1", at="2026-10-29T09:00:00Z")
+        m2 = line(source="manual", kind="manual", key="PLAT-1", at="2026-10-29T09:00:00Z", summary="again")
+        res = line(kind="resolved", key="PLAT-1", at="2026-10-29T09:30:00Z")
+        upd = line(kind="update", key="PLAT-1", at="2026-10-29T09:10:00Z")
+        self.assertEqual(len(hub.coalesce([m1, upd, m2, res])), 3)
+        self.assertEqual(sum(1 for l in hub.coalesce([m1, m2]) if l["kind"] == "manual"), 2)
+        hub.append_inbox(self.ws, [m1, upd, res])
+        h = {"pending": [], "updates": [{"id": "U1", "key": "PLAT-1", "state": "open"}], "routed": []}
+        hub.save_json(self.ws, "hub.json", h)
+        out = hub.digest(self.ws, hub.read_inbox(self.ws))
+        self.assertEqual([l["kind"] for l in out], ["manual"])
+        self.assertEqual(len(hub.load_json(self.ws, "hub.json", {})["updates"]), 1)  # not resolved away
+        self.assertTrue(hub._must_decide([m1, res]))
+
+    def test_follow_classifies_targets(self):
+        self.run_verb("follow", "--channel", "C00000002")
+        self.run_verb("follow", "--channel", "G00000003")
+        for x, part in (("WEB", "projects"), ("C00000002", "channels"), ("G00000003", "channels"),
+                        ("C00000002/1700000000.000100", "threads"), ("example/repo", "repos")):
+            self.assertEqual(self.run_verb("follow", x)[0], 0, x)
+            self.assertIn(x, hub.load_watch(self.ws)["follow"][part])
+        self.assertEqual(self.run_verb("follow", "no good")[0], 2)
+        self.assertEqual(self.run_verb("follow", "plat-1")[0], 2)
+        self.run_verb("follow", "WEB")
+        self.assertEqual(hub.load_watch(self.ws)["follow"]["projects"], ["WEB"])
+
+    def test_double_dash_ends_flags_for_add_follow_and_mute(self):
+        self.assertEqual(self.run_verb("follow", "--", "WEB")[0], 0)
+        self.assertIn("WEB", hub.load_watch(self.ws)["follow"]["projects"])
+        self.assertEqual(self.run_verb("follow", "--project", "--", "CORE")[0], 0)
+        self.assertEqual(self.run_verb("mute", "--", "PLAT-9")[0], 0)
+        self.assertIn("PLAT-9", hub.load_watch(self.ws)["mute"]["keys"])
+        self.assertEqual(self.run_verb("unmute", "--", "PLAT-9")[0], 0)
+        self.assertEqual(self.run_verb("add", "--", "https://example.com/browse/PLAT-7")[0], 0)
+        (l,) = self.inbox()
+        self.assertEqual((l["key"], l["link"]), ("PLAT-7", "https://example.com/browse/PLAT-7"))
+        self.assertEqual(self.run_verb("follow", "--")[0], 2)
+
+    def test_follow_bare_token_is_project_unless_known_or_forced(self):
+        for x in ("CORE2024", "GROWTH1", "C00000099"):
+            self.run_verb("follow", x)
+        f = hub.load_watch(self.ws)["follow"]
+        self.assertEqual(f["projects"], ["CORE2024", "GROWTH1", "C00000099"])
+        self.run_verb("follow", "--channel", "C00000098")
+        self.run_verb("follow", "C00000001")  # already a configured channel
+        f = hub.load_watch(self.ws)["follow"]
+        self.assertEqual((f["channels"], f["projects"]), (["C00000098", "C00000001"], ["CORE2024", "GROWTH1", "C00000099"]))
+        self.assertEqual(self.run_verb("follow", "--repo", "WEB")[0], 2)
+
+    def test_mute_email_is_exact(self):
+        mute = {"people": ["bob@example.com"]}
+        self.assertTrue(hub.is_muted(line(who="Bob <bob@example.com>"), mute))
+        self.assertTrue(hub.is_muted(line(who="BOB@example.com"), mute))
+        self.assertFalse(hub.is_muted(line(who="Rob <rbob@example.com>"), mute))
+        self.assertFalse(hub.is_muted(line(who="bob@example.com.evil.net"), mute))
+
+    def test_add_strips_control_chars_and_bad_links(self):
+        self.run_verb("add", "see https://example.com/x\x1b[31m\x07 \u202ehi", "--key", "k\x1by")
+        (l,) = self.inbox()
+        for f in ("summary", "title", "link", "key"):
+            self.assertFalse(any(c in l[f] for c in "\x1b\x07\u202e"), f)
+        self.assertEqual(l["key"], "ky")
+        self.assertRegex(l["link"], r"^https?://\S+$")
+
+    def test_identical_adds_in_one_second_both_reach_tail(self):
+        self.run_verb("add", "same thing")
+        self.run_verb("add", "same thing")
+        ids = [l["id"] for l in self.inbox()]
+        self.assertEqual(len(set(ids)), 2)
+        import io
+        buf = io.StringIO()
+        hub.tail(self.ws, out=buf, err=io.StringIO())
+        self.assertEqual(len(buf.getvalue().splitlines()), 2)
+
+    def test_unfollow_thread_stops_polling(self):
+        import types
+        t = "C00000001/1700000000.000100"
+        client = types.SimpleNamespace(calls=[], call=None)
+
+        def call(name, args):
+            client.calls.append((name, dict(args)))
+            return {"messages": []}
+        client.call = call
+        cur = {"ts": "%.6f" % (self.AT.timestamp() - 60), "threads": {}}
+        cfg = {"follow": [t]}
+        res = hub_sources.ChatSlack.poll(client, cur, cfg, {}, self.AT)
+        self.assertIn(t, res["cursor"]["threads"])
+        res = hub_sources.ChatSlack.poll(client, res["cursor"], {"follow": []}, {}, self.AT)
+        self.assertNotIn(t, res["cursor"]["threads"])
+
+    def test_unfollow_removes(self):
+        self.run_verb("follow", "WEB")
+        w = hub.load_watch(self.ws)
+        w["auto"]["projects"] = [{"key": "WEB", "from": "PLAT-1", "at": "x"}]
+        hub.save_watch(self.ws, w)
+        self.assertEqual(self.run_verb("unfollow", "WEB")[0], 0)
+        w = hub.load_watch(self.ws)
+        self.assertEqual((w["follow"]["projects"], w["auto"]["projects"]), ([], []))
+        self.assertEqual(self.run_verb("unfollow", "WEB")[0], 0)  # absent: no change, no error
+
+    def test_mute_classifies_and_unmutes(self):
+        for x in ("PLAT-9", "U00000009", "agnes@example.com", "C00000009"):
+            self.run_verb("mute", x)
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual((m["keys"], m["people"], m["channels"]),
+                         (["PLAT-9"], ["U00000009", "agnes@example.com"], ["C00000009"]))
+        self.run_verb("unmute", "PLAT-9")
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["keys"], [])
+
+    def test_mute_drops_watcher_lines_not_manual(self):
+        class A:
+            SOURCE = "tracker"
+            READ_TOOLS = set()
+            seen = None
+
+            @classmethod
+            def poll(cls, client, cursor, cfg, me, at):
+                cls.seen = cfg
+                if cursor is None:
+                    return {"lines": [], "cursor": {"n": 1}, "partial": []}
+                return {"lines": [line(key="PLAT-1"), line(key="PLAT-2", also=["PLAT-8"]),
+                                  line(key="PLAT-3", who="U00000009"), line(key="PLAT-4", who="Agnes <a@example.com>"),
+                                  line(source="chat", key="C00000009/1.0", who="U1"),
+                                  line(source="manual", kind="manual", key="PLAT-1")], "cursor": {"n": 2},
+                        "partial": []}
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["tracker:jira"] = A
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        for x in ("PLAT-1", "PLAT-8", "U00000009", "a@example.com", "C00000009"):
+            self.run_verb("mute", x)
+        self.run_verb("follow", "WEB")
+        clients = {"tracker": object()}
+        hub.poll_once(self.ws, self.cfg, self.AT, clients)
+        hub.poll_once(self.ws, self.cfg, self.AT + timedelta(minutes=2), clients)
+        self.assertEqual([(l["source"], l["key"]) for l in self.inbox()], [("manual", "PLAT-1")])
+        self.assertEqual(set(A.seen["projects"]), {"PLAT", "WEB"})
+
+    def poll_with(self, adapter, minutes=0):
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["tracker:jira"] = adapter
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        return hub.poll_once(self.ws, self.cfg, self.AT + timedelta(minutes=minutes), {"tracker": object()})
+
+    def adapter(self, keys, drop=None, known="all"):
+        if known == "all":  # every key-shaped token names a real project
+            known = sorted({x.split("-")[0] for k, a in keys for x in [k] + list(a) if re.match(r"^[A-Z][A-Z0-9]+-", x)})
+
+        class A:
+            READ_TOOLS = set()
+            seen = []
+
+            @classmethod
+            def poll(cls, client, cursor, cfg, me, at):
+                cls.seen.append(cfg)
+                if cursor is None:
+                    return {"lines": [], "cursor": {"n": 1}, "partial": [], "known_projects": known}
+                out = {"lines": [line(key=k, also=a) for k, a in keys], "cursor": {"n": 2}, "partial": [],
+                       "known_projects": known}
+                if drop:
+                    out["drop_auto"] = drop
+                return out
+        return A
+
+    def test_mention_of_unwatched_project_auto_follows(self):
+        A = self.adapter([("PLAT-1", ["WEB-4"]), ("C00000001/1.0", ["OPS-2", "plat-9"]), ("MUTED-1", []),
+                          ("GONE-1", [])])
+        self.run_verb("mute", "MUTED")
+        self.run_verb("unfollow", "GONE")
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        w = hub.load_watch(self.ws)
+        self.assertEqual([a["key"] for a in w["auto"]["projects"]], ["WEB", "OPS"])
+        self.assertEqual(w["auto"]["projects"][0]["from"], "WEB-4")
+        self.assertTrue(w["auto"]["projects"][0]["at"].startswith("2026-10-29"))
+        self.poll_with(A, 4)  # now polled, and not added twice
+        self.assertEqual(set(A.seen[-1]["projects"]), {"PLAT", "WEB", "OPS"})
+        self.assertEqual(len(hub.load_watch(self.ws)["auto"]["projects"]), 2)
+        self.run_verb("follow", "GONE")  # follow clears the unfollow record
+        self.assertEqual(hub.load_watch(self.ws)["unfollowed"], [])
+
+    def test_auto_follow_takes_only_real_projects(self):
+        A = self.adapter([("C00000001/1.0", ["UTF-8", "ISO-8601", "GPT-4", "WEB-4"])], known=["PLAT", "WEB"])
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        self.assertEqual([a["key"] for a in hub.load_watch(self.ws)["auto"]["projects"]], ["WEB"])
+
+    def test_auto_follow_takes_nothing_when_projects_could_not_be_read(self):
+        A = self.adapter([("C00000001/1.0", ["WEB-4"])], known=None)
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        self.assertEqual(hub.load_watch(self.ws)["auto"]["projects"], [])
+
+    def test_auto_projects_capped_at_20(self):
+        keys = [("P%02d-1" % n, []) for n in range(25)]
+        A = self.adapter(keys)
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        got = [a["key"] for a in hub.load_watch(self.ws)["auto"]["projects"]]
+        self.assertEqual(len(got), 20)
+        self.assertEqual(got[-1], "P24")
+        self.assertNotIn("P00", got)
+
+    def test_auto_project_dropped_after_two_failures(self):
+        hub.save_json(self.ws, "watch.json", {"auto": {"projects": [{"key": "WEB", "from": "WEB-1", "at": "x"}]}})
+        A = self.adapter([], drop=["WEB"])
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        w = hub.load_watch(self.ws)
+        self.assertEqual(w["auto"]["projects"], [])
+        self.assertEqual(w["unfollowed"], ["WEB"])
+        self.run_verb("unfollow", "PLAT")
+        self.assertIn("PLAT", hub.load_watch(self.ws)["unfollowed"])
+
+    def test_watching_merges_config_and_file(self):
+        self.run_verb("follow", "WEB")
+        self.run_verb("follow", "--channel", "C00000002")
+        self.run_verb("follow", "C00000002/1700000000.000100")
+        self.run_verb("follow", "example/repo")
+        self.run_verb("mute", "PLAT-9")
+        rc, out = self.run_verb("watching", "--json")
+        doc = json.loads(out)["watch"]
+        self.assertEqual(doc["chat"]["channels"], ["C00000001", "C00000002"])
+        self.assertEqual(doc["chat"]["follow"], ["C00000002/1700000000.000100"])
+        self.assertEqual(doc["tracker"]["projects"], ["PLAT", "WEB"])
+        self.assertEqual(doc["code"]["repos"], ["example/repo"])
+        self.assertEqual(doc["mute"]["keys"], ["PLAT-9"])
+        text = self.run_verb("watching")[1]
+        self.assertIn("tracker projects: PLAT, WEB", text)
+        self.assertEqual(self.cfg["hub"]["watch"]["tracker"]["projects"], ["PLAT"])  # config untouched
 
 
 if __name__ == "__main__":

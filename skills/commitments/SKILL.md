@@ -17,8 +17,10 @@ Policy: `${CLAUDE_PLUGIN_ROOT}/rules/todos.md`, `rules/privacy.md`, `rules/outbo
 ## 0. Workspace, config, capabilities
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 Read `config.json` (`routines.commitments`: `no_reply_days`, default 3; `lookback_days`, default 14) and
 `capabilities.json`. A source whose read capability isn't `ok` is named under **Couldn't check** and excluded;

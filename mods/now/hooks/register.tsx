@@ -281,9 +281,13 @@ export function ago(iso: string | undefined | null, nowMs: number): string {
 // ---- writes ----------------------------------------------------------------------------------------
 
 // Run one `mother now …` verb, then re-read now.json at once. A failure toasts the first line of stderr.
-async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null, group = 'now'): Promise<void> {
+async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null, group = 'now', toastOut = false): Promise<void> {
   try {
     const ran = await $.process.run(['python3', bin, group, ...args])
+    if (ran.exitCode === 0 && toastOut) {
+      const first = String(ran.stdout ?? '').split('\n').find(l => l.trim())
+      if (first) $.ui.toast(first.trim())
+    }
     if (ran.exitCode !== 0) {
       const line = String(ran.stderr ?? '').split('\n').find(l => l.trim()) ?? `mother ${group} ${args[0]} failed`
       $.ui.toast(line.trim())
@@ -386,6 +390,17 @@ type Ui = ReturnType<Dollar['ui']['resolve']>
 // A link the surface can open; a workspace path (`teams/x/intake.md#1`) stays in the Ask prompt instead.
 const isUrl = (link: string | null | undefined): link is string => !!link && /^https?:\/\//.test(link)
 
+// What Follow watches for a row key: a tracker item follows its project, a pull request its repo, a chat
+// thread itself. Mail, calendar and manual keys have nothing to follow, so the row shows no Follow button.
+export function followArgs(key: string): string[] | null {
+  let m = /^([A-Z][A-Z0-9]+)-\d+$/.exec(key)
+  if (m) return ['follow', '--project', '--', m[1]]
+  m = /^([\w.-]+\/[\w.-]+)#\d+$/.exec(key)
+  if (m) return ['follow', '--repo', '--', m[1]]
+  if (/^[CG][A-Z0-9]+\/\d+\.\d+$/.test(key)) return ['follow', '--thread', '--', key]
+  return null
+}
+
 // Rows a section draws before "Show all"; the rest wait behind the toggle.
 const LIMITS: Record<NowItem['section'], number> = { on_you: 5, neglected: 3, suggestion: 3 }
 const SECTIONS: [NowItem['section'], string][] = [['on_you', 'On you'], ['neglected', 'Neglected'], ['suggestion', 'Suggestions']]
@@ -467,6 +482,7 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
               {sess
                 ? <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => openSession($, goHub, sess[0], sess[1])}>Open session</Button>
                 : <Button key={'ask-' + i.id} hotkey={hot(i.id, 'a')} onPress={() => fill(askPrompt(i.title, i.why, i.link))}>Ask Mother</Button>}
+              {isUrl(i.link) ? <Button key={'tohub-' + i.id} onPress={() => goHub(['add', '--', i.link])}>Send to hub</Button> : null}
               <Button key={'done-' + i.id} hotkey={hot(i.id, 'd')} onPress={() => go(['done', i.id], i.id)}>Done</Button>
               <Button key={'snooze-' + i.id} hotkey={hot(i.id, 's')} onPress={() => update($, snoozingAtom, cur => (cur === i.id ? null : i.id))}>Snooze</Button>
               {rank !== null && !inTop.has(i.id)
@@ -675,6 +691,8 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                   {(v.unseen ?? 0) > 0 ? <Text color="warning">{'new update '}</Text> : null}
                   <Text dimColor>{ago(v.last_routed_at, nowMs) ? ago(v.last_routed_at, nowMs) + ' ' : ''}</Text>
                   <Button key={'sess-open-' + key} onPress={() => openSession($, goHub, key, v)}>Open</Button>
+                  {followArgs(key) ? <Button key={'sess-follow-' + key} onPress={() => goHub(followArgs(key) as string[])}>Follow</Button> : null}
+                  <Button key={'sess-mute-' + key} onPress={() => goHub(['mute', '--', key])}>Mute</Button>
                 </Box>
               ))}
             </Box>
@@ -701,6 +719,8 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                     <Text dimColor>{` ${u.key} · ${ago(u.at, nowMs)} `}</Text>
                     {isUrl(u.link) ? <Link href={u.link}>↗</Link> : null}
                     <Button key={'hub-done-' + u.id} onPress={() => goHub(['done', u.id], 'hub:' + u.id)}>Done</Button>
+                    {followArgs(u.key) ? <Button key={'hub-follow-' + u.id} onPress={() => goHub(followArgs(u.key) as string[])}>Follow</Button> : null}
+                    <Button key={'hub-mute-' + u.id} onPress={() => goHub(['mute', '--', u.key])}>Mute</Button>
                     <Button key={'hub-snooze-' + u.id} onPress={() => update($, snoozingAtom, cur => (cur === 'hub:' + u.id ? null : 'hub:' + u.id))}>Snooze</Button>
                   </Box>
                   {u.why ? <Text dimColor wrap="wrap">{u.why}</Text> : null}
@@ -773,7 +793,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const bin = await motherBin($, configured)
     const go = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId)
-    const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub')
+    const goHub = (args: string[], rowId: string | null = null) => run($, bin, loader, args, rowId, 'hub', args[0] === 'add' || args[0] === 'follow' || args[0] === 'mute')
     return paneTree($, $.ui.resolve(e), await read($, docAtom), await read($, errorAtom), await read($, snoozingAtom),
       await read($, selectedAtom), await read($, expandedAtom), await $.clock.now(), go,
       (await read($, hubAtom)) ?? NO_HUB, goHub, e.surface)

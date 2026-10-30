@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,7 +42,7 @@ class Fake:
 
 def ro(handlers, suffixes):
     f = Fake(handlers)
-    return hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, suffixes)), f
+    return hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, suffixes), suffixes), f
 
 
 class TestClient(unittest.TestCase):
@@ -166,13 +166,20 @@ def msg(ts, user="U00000009", text="hello", **kw):
 
 
 class TestChat(unittest.TestCase):
-    def poll(self, history=None, replies=None, search=None, cursor=None, cfg=None):
+    def poll(self, history=None, replies=None, search=None, cursor=None, cfg=None, lookback_error=None,
+             reply_errors=()):
         cur = cursor or {"ts": "%.6f" % (NOW - 600), "threads": {}}
 
-        def hist(a):
-            return {"ok": True, "messages": (history or {}).get(a["channel_id"], [])}
+        def hist(a):  # honours oldest/latest/limit like the real tool
+            if "latest" in a and lookback_error:
+                raise lookback_error
+            got = [m for m in (history or {}).get(a["channel_id"], [])
+                   if float(m["ts"]) > float(a.get("oldest", 0)) and float(m["ts"]) <= float(a.get("latest", 1e18))]
+            return {"ok": True, "messages": sorted(got, key=lambda m: float(m["ts"]))[:a.get("limit", 100)]}
 
         def rep(a):
+            if a["thread_ts"] in reply_errors:
+                raise hub_mcp.McpError("server_error", "boom")
             return {"ok": True, "messages": (replies or {}).get(a["thread_ts"], [])}
 
         def srch(a):
@@ -198,7 +205,8 @@ class TestChat(unittest.TestCase):
         mention = [l for l in out["lines"] if l["key"].startswith("C00000077")][0]
         self.assertEqual(mention["also"], ["PLAT-12"])
         # an unwatched channel is never read
-        self.assertEqual([a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history")], ["C00000001"])
+        self.assertEqual({a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history")}, {"C00000001"})
+        self.assertEqual(len([1 for n, a in f.calls if n.endswith("get_channel_history")]), 2)  # pass + lookback
 
     def test_dm_is_one_thing_and_manager_reply_resolves_it(self):
         search = {"is:dm": [{"ts": "%.6f" % (NOW - 90), "user": "U00000006", "text": "dm", "channel": {"id": "D00000001"}},
@@ -235,6 +243,80 @@ class TestChat(unittest.TestCase):
                                                        msg(NOW - 120, text="reply", thread_ts="%.6f" % parent)]},
                            cursor=cur)
         self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [(pkey, "update")])
+
+    def _parent(self, ts, latest, n=1, **kw):
+        return msg(ts, reply_count=n, latest_reply="%.6f" % latest, **kw)
+
+    def test_new_reply_in_unfollowed_thread_is_read(self):
+        parent = NOW - 3000  # older than the cursor: found by the lookback read
+        p = self._parent(parent, NOW - 120)
+        r = msg(NOW - 120, text="reply", thread_ts="%.6f" % parent)
+        out, f = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r]})
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("C00000001/%.6f" % parent, "update")])
+        main, back = [a for n, a in f.calls if n.endswith("get_channel_history")]
+        self.assertNotIn("latest", main)
+        self.assertEqual(float(back["latest"]), NOW - 600)  # the cursor
+        self.assertAlmostEqual(float(back["oldest"]), AT.timestamp() - 7 * 86400, places=3)
+        self.assertNotIn("C00000001/%.6f" % parent, out["cursor"]["threads"])  # not added to the followed set
+        mine = msg(NOW - 60, user="U00000000", text="ok", thread_ts="%.6f" % parent)
+        out, _ = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r, mine]})
+        self.assertIn("resolved", [l["kind"] for l in out["lines"]])
+
+    def test_old_threads_not_reread(self):
+        parent = NOW - 3000
+        p = self._parent(parent, NOW - 2000)
+        out, f = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p]})
+        self.assertEqual(out["lines"], [])
+        self.assertEqual([n for n, a in f.calls if n.endswith("get_thread_replies")], [])
+        p = self._parent(parent, NOW - 120)
+        r = msg(NOW - 120, thread_ts="%.6f" % parent)
+        out, _ = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r]})
+        again, f = self.poll(history={"C00000001": [p]}, replies={"%.6f" % parent: [p, r]}, cursor=out["cursor"])
+        self.assertEqual(again["lines"], [])  # the seen-set dedupes a thread read again within the overlap
+
+    def test_thread_cap_marks_partial(self):
+        hist, reps = [], {}
+        for i in range(12):
+            parent = NOW - 3000 - i
+            hist.append(self._parent(parent, NOW - 100 - i))
+            reps["%.6f" % parent] = [msg(NOW - 100 - i, thread_ts="%.6f" % parent)]
+        out, f = self.poll(history={"C00000001": hist}, replies=reps)
+        self.assertEqual(len([1 for n, a in f.calls if n.endswith("get_thread_replies")]), 10)
+        self.assertEqual(len(out["lines"]), 10)
+        self.assertIn("more than 10 active threads in C00000001", out["partial"])
+        newest = {"C00000001/%.6f" % (NOW - 3000 - i) for i in range(10)}
+        self.assertEqual({l["key"] for l in out["lines"]}, newest)  # most recent latest_reply first
+
+    def test_lookback_truncated_is_a_note_not_partial(self):
+        page = [msg(NOW - 5000 - i) for i in range(101)]
+        out, _ = self.poll(history={"C00000001": page})
+        self.assertEqual(out["notes"], ["C00000001: lookback truncated"])
+        self.assertNotIn("C00000001: lookback truncated", out["partial"])
+
+    def test_lookback_failure_is_partial_and_pass_goes_on(self):
+        out, _ = self.poll(history={"C00000001": [msg(NOW - 100, text="new")]},
+                           lookback_error=hub_mcp.McpError("server_error", "boom"))
+        self.assertEqual(len(out["lines"]), 1)
+        self.assertEqual(out["partial"], ["C00000001: lookback server_error"])
+
+    def test_unreadable_thread_is_partial_others_still_read(self):
+        hist, reps = [], {}
+        for i in range(2):
+            parent = NOW - 3000 - i
+            hist.append(self._parent(parent, NOW - 100 - i))
+            reps["%.6f" % parent] = [msg(NOW - 100 - i, thread_ts="%.6f" % parent)]
+        bad = "%.6f" % (NOW - 3000)
+        out, _ = self.poll(history={"C00000001": hist}, replies=reps, reply_errors=(bad,))
+        self.assertEqual(len(out["lines"]), 1)
+        self.assertEqual(out["partial"], ["C00000001/%s: replies unreadable" % bad])
+
+    def test_followed_thread_always_read(self):
+        parent = NOW - 3000
+        pkey = "C00000001/%.6f" % parent
+        r = msg(NOW - 120, thread_ts="%.6f" % parent)
+        out, _ = self.poll(replies={"%.6f" % parent: [msg(parent), r]},
+                           cfg={"channels": ["C00000001"], "follow": [pkey]})
+        self.assertEqual([l["key"] for l in out["lines"]], [pkey])
 
     def test_own_activity_is_resolved_not_candidate(self):
         out, _ = self.poll(history={"C00000001": [msg(NOW - 100, user="U00000000", text="on it")]})
@@ -357,7 +439,8 @@ class TestTracker(unittest.TestCase):
             if not a.get("projectKey"):
                 raise hub_mcp.McpError("other", "Invalid arguments for `get-issues`: Missing required parameter `projectKey`.")
             return handler(a) if handler else {"issues": issues}
-        client, f = ro({"get-issues": get_issues}, hs.TrackerJira.READ_TOOLS)
+        client, f = ro({"get-issues": get_issues, "get-issue-changelog": lambda a: {"values": []}},
+                       hs.TrackerJira.READ_TOOLS)
         cur = {"since": "2026-10-29T09:50:00Z", "fp": fp}
         return hs.TrackerJira.poll(client, cur, cfg or {"projects": ["PLAT"], "extra_jql": "labels != x"}, ME, AT), f
 
@@ -366,7 +449,7 @@ class TestTracker(unittest.TestCase):
             return {"issues": [issue(a["projectKey"] + "-1", status="Done")]}
         out, f = self.run_poll([], {"PLAT-1": dict(self.BASE), "OPS-1": dict(self.BASE)},
                                cfg={"projects": ["PLAT", "OPS", "PLAT"]}, handler=h)
-        self.assertEqual([c[1]["projectKey"] for c in f.calls], ["PLAT", "OPS"])
+        self.assertEqual([c[1]["projectKey"] for c in f.calls if c[0].endswith("get-issues")], ["PLAT", "OPS"])
         self.assertIn("project = OPS", f.calls[1][1]["jql"])
         self.assertEqual(sorted(l["key"] for l in out["lines"]), ["OPS-1", "PLAT-1"])
         self.assertEqual(out["partial"], [])
@@ -383,6 +466,203 @@ class TestTracker(unittest.TestCase):
         self.assertIn("BAD", out["partial"][0])
         self.assertEqual(out["cursor"]["fp"]["OPS-1"]["status"], "Done")
         self.assertIn("BAD-9", out["cursor"]["fp"])  # the failed project's fingerprints are kept
+
+    def changelog_poll(self, handler, me=None, issues=None):
+        def get_issues(a):
+            return {"issues": issues or [issue("PLAT-1", status="Done")]}
+        client, f = ro({"get-issues": get_issues, "get-issue-changelog": handler}, hs.TrackerJira.READ_TOOLS)
+        cur = {"since": "2026-10-29T09:50:00Z", "fp": {"PLAT-1": dict(self.BASE)}}
+        return hs.TrackerJira.poll(client, cur, {"projects": ["PLAT"]}, me or ME, AT), f
+
+    @staticmethod
+    def history(created, author, field="status"):
+        return {"created": created, "author": author, "items": [{"field": field}]}
+
+    def test_own_status_change_is_resolved(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        h = lambda a: {"total": 3, "values": [self.history("2026-10-29T09:41:00.000+0000", theirs),
+                                  self.history("2026-10-29T09:55:00.000+0000", mine),
+                                  self.history("2026-10-29T09:56:00.000+0000", theirs, "labels")]}
+        out, f = self.changelog_poll(h)
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("PLAT-1", "resolved")])
+        self.assertEqual([c[1]["issueKey"] for c in f.calls if c[0].endswith("changelog")], ["PLAT-1"] * 2)
+        # by account id alone
+        h2 = lambda a: {"total": 1, "values": [self.history("2026-10-29T09:55:00.000+0000", {"accountId": "acc9"})]}
+        out, _ = self.changelog_poll(h2, me=dict(ME, email="", tracker_account="acc9"))
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+
+    def paged(self, entries, total=True):
+        calls = []
+
+        def h(a):
+            calls.append(a)
+            start, n = a.get("startAt", 0), a["maxResults"]
+            out = {"values": entries[start:start + n], "isLast": start + n >= len(entries)}
+            if total:
+                out["total"] = len(entries)
+            return out
+        return h, calls
+
+    def test_latest_change_read_from_last_page(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        ents = [self.history("2026-10-0%dT09:00:00.000+0000" % (1 + n // 40), theirs, "labels") for n in range(118)]
+        ents += [self.history("2026-10-29T09:41:00.000+0000", theirs), self.history("2026-10-29T09:55:00.000+0000", mine)]
+        h, calls = self.paged(ents)
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        self.assertEqual([(c["startAt"], c["maxResults"]) for c in calls], [(0, 1), (70, 50)])
+        # an old own edit on page 1, the latest change is someone else's
+        ents2 = [self.history("2026-10-01T09:00:00.000+0000", mine)] + ents[:118] + \
+            [self.history("2026-10-29T09:55:00.000+0000", theirs)]
+        h, _ = self.paged(ents2)
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+
+    def test_no_total_pages_until_last_capped(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        ents = [self.history("2026-10-01T09:00:00.000+0000", {"accountId": "x"}, "labels")] * 130
+        ents.append(self.history("2026-10-29T09:55:00.000+0000", mine))
+        h, calls = self.paged(ents, total=False)
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        self.assertEqual(len(calls), 3)
+
+    def test_capped_or_unterminated_history_stays_update(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        old_own = self.history("2026-10-01T09:00:00.000+0000", mine)
+        filler = self.history("2026-10-02T09:00:00.000+0000", {"accountId": "x"}, "labels")
+        h, calls = self.paged([old_own] + [filler] * 600, total=False)  # more than 5 pages
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+        self.assertEqual(len(calls), 6)
+        base, _ = self.paged([old_own], total=False)  # no isLast in the answer
+        h2 = lambda a: {k: v for k, v in base(a).items() if k != "isLast"}
+        out, _ = self.changelog_poll(h2)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+
+    def test_offsets_are_normalised(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        # 12:30+0300 is 09:30Z, before the cursor (09:50Z) even though it sorts later than 09:55+0000 as text
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:55:00.000+0000", mine),
+                                              self.history("2026-10-29T12:30:00.000+0300", theirs)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        self.assertEqual(hs.parse_iso("2026-10-29T12:30:00.000+0300"), hs.parse_iso("2026-10-29T09:30:00Z"))
+
+    def test_any_others_change_since_the_cursor_is_update(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        # the manager changed it last, but someone else changed a watched field after the cursor too
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:52:00.000+0000", theirs, "assignee"),
+                                              self.history("2026-10-29T09:55:00.000+0000", mine)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+        # only the manager's changes since the cursor (two of them): resolved
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:52:00.000+0000", mine, "priority"),
+                                              self.history("2026-10-29T09:55:00.000+0000", mine)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+        # no watched change since the cursor at all: nothing to attribute, so it stays an update
+        h = lambda a: {"total": 1, "values": [self.history("2026-10-29T09:40:00.000+0000", mine)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+
+    def test_others_change_is_update(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        h = lambda a: {"total": 2, "values": [self.history("2026-10-29T09:51:00.000+0000", mine),
+                                  self.history("2026-10-29T09:55:00.000+0000", theirs)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+
+    def test_changelog_failure_falls_back_to_update(self):
+        def boom(a):
+            raise hub_mcp.McpError("other", "nope")
+        out, _ = self.changelog_poll(boom)
+        self.assertEqual([l["kind"] for l in out["lines"]], ["update"])
+        out, _ = self.changelog_poll(lambda a: "garbage")
+        self.assertEqual([l["kind"] for l in out["lines"]], ["update"])
+
+    def test_no_changelog_call_for_label_only_or_unchanged(self):
+        client, f = ro({"get-issues": lambda a: {"issues": [issue("PLAT-1", labels=["x"])]},
+                        "get-issue-changelog": lambda a: {}}, hs.TrackerJira.READ_TOOLS)
+        hs.TrackerJira.poll(client, {"since": "2026-10-29T09:50:00Z", "fp": {"PLAT-1": dict(self.BASE)}},
+                            {"projects": ["PLAT"]}, ME, AT)
+        self.assertEqual([c for c in f.calls if c[0].endswith("changelog")], [])
+
+    def test_auto_project_failure_counter_and_drop(self):
+        broken = []
+
+        def h(a):
+            if a["projectKey"] in broken:
+                raise hub_mcp.McpError("other", "no such project")
+            return {"issues": []}
+        client, _ = ro({"get-issues": h}, hs.TrackerJira.READ_TOOLS)
+        cfg = {"projects": ["WEB", "PLAT"], "auto": ["WEB"]}
+        cur = {"since": "2026-10-29T09:50:00Z", "fp": {}}
+        out = hs.TrackerJira.poll(client, cur, cfg, ME, AT)  # read once: from now on its failures count
+        self.assertEqual(out["cursor"]["auto_read"], ["WEB"])
+        broken.append("WEB")
+        out = hs.TrackerJira.poll(client, out["cursor"], cfg, ME, AT)
+        self.assertEqual(out["cursor"]["fails"], {"WEB": 1})
+        self.assertNotIn("drop_auto", out)
+        out = hs.TrackerJira.poll(client, out["cursor"], cfg, ME, AT)
+        self.assertEqual(out["drop_auto"], ["WEB"])
+        self.assertEqual([(l["kind"], l["key"]) for l in out["lines"]], [("error", "watcher:tracker:WEB")])
+        self.assertEqual(out["cursor"]["fails"], {})
+        # a configured project never counts
+        out = hs.TrackerJira.poll(client, {"since": cur["since"], "fp": {}}, {"projects": ["WEB"]}, ME, AT)
+        self.assertEqual(out["cursor"]["fails"], {})
+
+    def test_auto_project_never_read_is_dropped_silently(self):
+        def h(a):
+            if a["projectKey"] == "WEB":
+                raise hub_mcp.McpError("other", "no such project")
+            return {"issues": []}
+        client, _ = ro({"get-issues": h}, hs.TrackerJira.READ_TOOLS)
+        out = hs.TrackerJira.poll(client, {"since": "2026-10-29T09:50:00Z", "fp": {}},
+                                  {"projects": ["WEB", "PLAT"], "auto": ["WEB"]}, ME, AT)
+        self.assertEqual(out["drop_auto"], ["WEB"])
+        self.assertEqual((out["lines"], out["partial"]), ([], []))
+        self.assertEqual(out["cursor"]["fails"], {})
+
+    def projects_poll(self, handler, cursor=None, at=AT):
+        client, f = ro({"get-issues": lambda a: {"issues": []}, "list-projects": handler}, hs.TrackerJira.READ_TOOLS)
+        cur = cursor if cursor is not None else {"since": "2026-10-29T09:50:00Z", "fp": {}}
+        return hs.TrackerJira.poll(client, cur, {"projects": ["PLAT"]}, ME, at), f
+
+    def test_real_project_keys_are_read_paged_and_cached_for_a_day(self):
+        def h(a):
+            start = a["startAt"]
+            vals = [{"key": "P%03d" % n} for n in range(start, min(start + a["maxResults"], 150))]
+            return {"values": vals, "total": 150, "isLast": start + a["maxResults"] >= 150}
+        out, f = self.projects_poll(h)
+        self.assertEqual(len(out["known_projects"]), 150)
+        self.assertEqual([c[1]["startAt"] for c in f.calls if c[0].endswith("list-projects")], [0, 100])
+        self.assertEqual(out["cursor"]["projects"]["at"], "2026-10-29T10:00:00Z")
+        later, f2 = self.projects_poll(h, out["cursor"], AT + timedelta(hours=23))
+        self.assertEqual(len(later["known_projects"]), 150)
+        self.assertEqual([c for c in f2.calls if c[0].endswith("list-projects")], [])  # from the cache
+        nextday, f3 = self.projects_poll(lambda a: [{"key": "PLAT"}], out["cursor"], AT + timedelta(hours=25))
+        self.assertEqual(nextday["known_projects"], ["PLAT"])
+        self.assertEqual(len([c for c in f3.calls if c[0].endswith("list-projects")]), 1)
+
+    def test_failed_project_list_gives_none_and_keeps_the_old_cache(self):
+        def boom(a):
+            raise hub_mcp.McpError("other", "nope")
+        old = {"since": "2026-10-29T09:50:00Z", "fp": {}, "projects": {"at": "2026-10-27T10:00:00Z", "keys": ["PLAT"]}}
+        out, _ = self.projects_poll(boom, old)
+        self.assertIsNone(out["known_projects"])
+        self.assertEqual(out["cursor"]["projects"], old["projects"])
+        self.assertEqual(out["partial"], [])
+        out, _ = self.projects_poll(lambda a: "garbage")
+        self.assertIsNone(out["known_projects"])
+        # a server without the tool: none, and the source still polls
+        out, _ = TestTracker.run_poll(self, [], {})
+        self.assertIsNone(out["known_projects"])
 
     def test_no_projects_is_a_config_gap(self):
         self.assertEqual(hs.TrackerJira.gap({"projects": []}), "no tracker projects configured")

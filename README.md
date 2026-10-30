@@ -66,6 +66,11 @@ The approval guard is a hook, so it runs in **every** Claude Code session, not o
   `gh api -X DELETE` in any repo. Run those yourself in a terminal.
 - Calls that aren't outbound are untouched; your normal permission rules apply. (A second hook on reads exists
   only for channel reply sessions and exits immediately everywhere else.)
+- The guard is a Python process started on every tool call, so each call costs about a tenth of a second more.
+- Edits to `~/.claude/settings.json`, `settings.local.json`, `~/.claude.json` or anything under
+  `~/.claude/plugins/` ask in **every** session, since they could switch the guard off.
+- A session that ran `mother hub tail` is treated as a hub: it stays fenced to hub work (see below) even after
+  a newer hub starts (the guard remembers the last five), so use a fresh session for anything else.
 
 The Stop hook runs `mother sync`, which only acts on your workspace. Before you have one, it does nothing.
 
@@ -138,6 +143,8 @@ The hub is optional and runs on your home machine. Set the `hub` block in `confi
 `/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
 session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
 
+You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** and **Mute** on a hub session or hub update. It can't fetch the web or edit files; for those it proposes a session.
+
 ### Replying in team channels
 
 Each channel in `config.json` has a reply mode: `off`, `watch` (read for digests only), `mention` (answers in
@@ -165,9 +172,11 @@ Useful commands in your terminal:
 | `mother sync` | Commit and push the workspace now (also runs automatically at the end of each turn) |
 | `mother register` | Print the scheduled-task definitions for the enabled routines |
 | `mother health` | Connector health: which server serves each capability, the failure log and a 7-day summary (`mother health help`) |
+| `mother grant add` | Add a guard grant for an unattended run, checked exactly as the guard will (`remove --run ID`, `list`); the only writer of `.mother/grants.json`; the guard asks you before each `add`; grants are signed with `~/.mother/grant.key` |
+| `mother memory index <file>` | Add one index line for `memory/<file>.md` to `memory/MEMORY.md` (idempotent); the only unprompted writer of the index. `memory check` lists drift |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
-| `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `watch` runs it in the foreground |
+| `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `smoke` runs `check` and two polling passes 20 s apart into a throwaway copy of the state and prints per-source status and line counts (never content; exit 2 if a source cannot be read), `watch` runs it in the foreground; `add <link-or-text>` hands the hub something by hand, `follow`/`unfollow`/`mute`/`unmute` edit its machine-local watch list, `watching` prints it |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
 | `mother channels pause` / `resume` | Stop or restart replies in every channel |

@@ -20,6 +20,7 @@ MAX_THREADS = 25
 MAX_MAIL = 20
 MAX_ISSUES = 50
 MAX_HISTORY = 100
+MAX_NEW_THREADS = 10  # unfollowed threads read per watched channel per pass
 MAIL_LINK = "https://mail.google.com/mail/u/0/#all/%s"
 THREAD_DAYS = 7
 SEARCH_OVERLAP = 600
@@ -30,7 +31,7 @@ def iso(dt: datetime) -> str:
 
 
 def parse_iso(s: str) -> datetime:
-    s = (s or "").replace("Z", "+00:00")
+    s = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", (s or "").replace("Z", "+00:00"))
     try:
         d = datetime.fromisoformat(s)
     except ValueError:
@@ -42,8 +43,14 @@ def ts_iso(ts) -> str:
     return iso(datetime.fromtimestamp(float(ts), UTC))
 
 
-def _result(lines: List[dict], cursor: dict, partial: Optional[List[str]] = None) -> dict:
-    return {"lines": hub.coalesce(lines), "cursor": cursor, "partial": partial or []}
+def _result(lines: List[dict], cursor: dict, partial: Optional[List[str]] = None,
+            notes: Optional[List[str]] = None) -> dict:
+    """`partial`: sub-reads that failed (the source is `partial`). `notes`: expected limits that are not failures
+    (a busy channel's lookback page is full); they go in `watcher.json` without changing the status."""
+    out = {"lines": hub.coalesce(lines), "cursor": cursor, "partial": partial or []}
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 class Adapter:
@@ -80,9 +87,13 @@ class ChatSlack(Adapter):
         threads = dict(cursor.get("threads") or {})
         mine = me.get("chat") or ""
         marks = [m for m in me.get("marks") or [] if m]
-        lines, partial = [], []
+        lines, partial, notes = [], [], []
         seen = list(cursor.get("seen") or [])
-        for t in cfg.get("follow") or []:
+        followed = [t for t in cfg.get("follow") or [] if isinstance(t, str)]
+        for t in cursor.get("followed") or []:  # unfollowed since the last pass: stop polling it
+            if t not in followed:
+                threads.pop(t, None)
+        for t in followed:
             threads.setdefault(t, since)
 
         def add(ch, msg, link="", floor=since, dm=False):
@@ -115,6 +126,42 @@ class ChatSlack(Adapter):
                 partial.append("%s: more than %d new messages" % (ch, MAX_HISTORY))
             for m in got:
                 add(ch, m)
+            # Replies in threads nobody follows: a parent with replies newer than the cursor (less the search
+            # overlap). History lists parents by their own time, so an older parent needs a lookback read.
+            heads = {m["ts"]: m for m in got if m.get("ts")}
+            back = []
+            try:
+                back = (client.call("get_channel_history", {
+                    "channel_id": ch, "oldest": "%.6f" % (at.timestamp() - THREAD_DAYS * 86400),
+                    "latest": "%.6f" % since, "limit": MAX_HISTORY + 1}) or {}).get("messages") or []
+            except McpError as e:
+                partial.append("%s: lookback %s" % (ch, e.kind))
+            if len(back) > MAX_HISTORY:  # a busy channel fills it every pass: a note, not a failure
+                notes.append("%s: lookback truncated" % ch)
+                back = back[:MAX_HISTORY]
+            for m in back:
+                if m.get("ts"):
+                    heads.setdefault(m["ts"], m)
+            active = []
+            for tts, m in heads.items():
+                try:
+                    newest, n = float(m.get("latest_reply") or 0), int(m.get("reply_count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if n > 0 and newest > since - SEARCH_OVERLAP and "%s/%s" % (ch, tts) not in threads:
+                    active.append((newest, tts))
+            active.sort(reverse=True)
+            if len(active) > MAX_NEW_THREADS:
+                partial.append("more than %d active threads in %s" % (MAX_NEW_THREADS, ch))
+            for _, tts in active[:MAX_NEW_THREADS]:
+                try:
+                    res = client.call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                except McpError:
+                    partial.append("%s/%s: replies unreadable" % (ch, tts))
+                    continue
+                for m in (res or {}).get("messages") or []:
+                    if m.get("ts") != tts:
+                        add(ch, dict(m, thread_ts=tts), floor=since - SEARCH_OVERLAP)
 
         for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
             if "/" not in key:
@@ -151,7 +198,8 @@ class ChatSlack(Adapter):
                     continue
                 add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
         keep = dict(list(threads.items())[-MAX_THREADS:])
-        return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:]}, partial)
+        return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:],
+                                                                     "followed": followed}, partial, notes)
 
 
 # --------------------------------------------------------------------------------------------------- mail
@@ -227,7 +275,11 @@ class MailGmail(Adapter):
 # ------------------------------------------------------------------------------------------------- tracker
 class TrackerJira(Adapter):
     SOURCE = "tracker"
-    READ_TOOLS = {"get-issues"}
+    READ_TOOLS = {"get-issues", "get-issue-changelog", "list-projects"}
+    WATCHED = ("status", "assignee", "priority")
+    AUTO_FAILS = 2  # consecutive failing passes before an auto-followed project is dropped
+    PROJECTS_EVERY = 24 * 3600  # how often the list of real project keys is re-read
+    PROJECT_PAGES = 20  # list-projects pages of 100 read at most
     FIELDS = ["summary", "status", "assignee", "reporter", "priority", "updated", "created", "comment", "labels"]
 
     @staticmethod
@@ -250,18 +302,62 @@ class TrackerJira(Adapter):
     @classmethod
     def _fetch(cls, client, cfg, minutes, n):
         """(issues, failed): the read tool needs a projectKey, so one call per project; a failing project is
-        skipped (named in `failed`) and the others still poll."""
-        issues, failed = [], []
+        skipped (named in `failed`, and in `bad` by project) and the others still poll."""
+        issues, failed, bad = [], [], []
         for project in cls._projects(cfg):
             try:
                 res = client.call("get-issues", {"projectKey": project, "jql": cls._jql(cfg, project, minutes),
                                                  "fields": cls.FIELDS, "maxResults": n}) or {}
             except McpError as e:
                 failed.append("%s: %s" % (project, e.kind))
+                bad.append(project)
                 continue
             got = res.get("issues") or []
             issues.append((project, got))
-        return issues, failed
+        return issues, failed, bad
+
+    @classmethod
+    def _list_projects(cls, client) -> List[str]:
+        """Every project key the tracker lists, paging 100 at a time. Raises McpError when a page fails or is
+        unreadable, or past the page cap (a partial list would hide real projects)."""
+        keys = []
+        for n in range(cls.PROJECT_PAGES):
+            res = client.call("list-projects", {"startAt": n * 100, "maxResults": 100})
+            if isinstance(res, list):
+                vals, last = res, len(res) < 100
+            elif isinstance(res, dict):
+                vals = next((res[k] for k in ("values", "projects", "items") if isinstance(res.get(k), list)), None)
+                if vals is None:
+                    raise McpError("other", "list-projects: unreadable answer")
+                total = res.get("total")
+                last = res.get("isLast") is True or len(vals) < 100 or (
+                    isinstance(total, int) and not isinstance(total, bool) and (n + 1) * 100 >= total)
+            else:
+                raise McpError("other", "list-projects: unreadable answer")
+            keys.extend(v["key"] for v in vals if isinstance(v, dict) and isinstance(v.get("key"), str) and v["key"])
+            if last:
+                return list(dict.fromkeys(keys))
+        raise McpError("other", "list-projects: more than %d pages" % cls.PROJECT_PAGES)
+
+    @classmethod
+    def _real_projects(cls, client, cursor, at):
+        """(project keys or None, the cache to keep). The keys are cached in the cursor (`projects: {at, keys}`)
+        and re-read at most once a day; when a re-read fails the old cache is kept for the next try and this pass
+        gets None (auto-follow nothing)."""
+        cache = (cursor or {}).get("projects")
+        cache = cache if isinstance(cache, dict) and isinstance(cache.get("keys"), list) else None
+        if cache:
+            try:
+                if 0 <= (at - parse_iso(cache["at"])).total_seconds() < cls.PROJECTS_EVERY:
+                    return [k for k in cache["keys"] if isinstance(k, str)], cache
+            except (KeyError, TypeError, ValueError):
+                pass
+        try:
+            keys = cls._list_projects(client)
+        except McpError:
+            return None, cache
+        cache = {"at": iso(at), "keys": keys}
+        return keys, cache
 
     @staticmethod
     def _fp(f: dict) -> dict:
@@ -273,6 +369,10 @@ class TrackerJira(Adapter):
 
     @classmethod
     def poll(cls, client, cursor, cfg, me, at):
+        """`known_projects` in the result is the tracker's real project keys (None when they could not be read
+        this pass): auto-follow takes only projects in it. An auto-followed project that has never been read
+        successfully and fails is dropped silently; one that has been read is dropped after AUTO_FAILS passes."""
+        known, cache = cls._real_projects(client, cursor, at)
         if cursor is None:
             fp = {}
             try:  # seed fingerprints so the first real poll can tell a field change from a label edit
@@ -281,13 +381,43 @@ class TrackerJira(Adapter):
                     fp[i["key"]] = dict(cls._fp(i.get("fields") or {}), u=(i.get("fields") or {}).get("updated", ""))
             except McpError:
                 pass
-            return _result([], {"since": iso(at), "fp": fp})
+            cur = {"since": iso(at), "fp": fp}
+            if cache:
+                cur["projects"] = cache
+            out = _result([], cur)
+            out["known_projects"] = known
+            return out
         since = parse_iso(cursor["since"])
+        auto = set(cfg.get("auto") or [])
+        fails = {p: n for p, n in (cursor.get("fails") or {}).items() if p in auto and isinstance(n, int)}
+        read_ok = {p for p in cursor.get("auto_read") or [] if p in auto}
         fps = dict(cursor.get("fp") or {})
         minutes = int(math.ceil((at - since).total_seconds() / 60.0)) + 2
         email = (me.get("email") or "").lower()
+        account = me.get("tracker_account") or ""
         lines, partial = [], []
-        pages, failed = cls._fetch(client, cfg, minutes, MAX_ISSUES + 1)
+        pages, failed, bad = cls._fetch(client, cfg, minutes, MAX_ISSUES + 1)
+        drop = []
+        for project in cls._projects(cfg):  # consecutive failures of an auto-followed project
+            if project not in auto:
+                continue
+            if project in bad and project not in read_ok:  # never read: a guess that was wrong, drop it quietly
+                fails.pop(project, None)
+                drop.append(project)
+                failed = [f for f, b_ in zip(failed, bad) if b_ != project]
+                bad = [b_ for b_ in bad if b_ != project]
+            elif project in bad:
+                fails[project] = fails.get(project, 0) + 1
+                if fails[project] >= cls.AUTO_FAILS:
+                    fails.pop(project)
+                    drop.append(project)
+                    lines.append(hub.make_line("tracker", "error", "watcher:tracker:%s" % project, iso(at),
+                                               title="stopped following tracker project %s" % project,
+                                               summary="it failed %d passes in a row; `mother hub follow %s` to retry"
+                                                       % (cls.AUTO_FAILS, project)))
+            else:
+                fails.pop(project, None)
+                read_ok.add(project)
         got = []
         for project, page in pages:
             if len(page) > MAX_ISSUES:
@@ -316,6 +446,10 @@ class TrackerJira(Adapter):
             kind = "update"
             if changed == ["comments"] and email and author == email:
                 kind = "resolved"
+            elif any(k in cls.WATCHED for k in changed) and (email or account) \
+                    and ("comments" not in changed or (email and author == email)) \
+                    and cls._own_change(client, key, email, account, since):
+                kind = "resolved"
             lines.append(hub.make_line("tracker", kind, hub.thing_key("tracker", {"key": key}),
                                        iso(parse_iso(f["updated"])) if f.get("updated") else iso(at),
                                        title=(f.get("summary") or "")[:120], who=who, link=link,
@@ -323,7 +457,69 @@ class TrackerJira(Adapter):
                                        also=hub.extract_also(f.get("summary") or "")))
         # prune the least recently updated, not the oldest inserted
         keep = dict(sorted(fps.items(), key=lambda kv: kv[1].get("u", ""))[-500:])
-        return _result(lines, {"since": iso(at), "fp": keep}, partial)
+        cur = {"since": iso(at), "fp": keep, "fails": fails, "auto_read": sorted(read_ok)}
+        if cache:
+            cur["projects"] = cache
+        out = _result(lines, cur, partial)
+        out["known_projects"] = known
+        if drop:
+            out["drop_auto"] = drop
+        return out
+
+    @classmethod
+    def _changelog_tail(cls, client, key) -> list:
+        """The newest changelog entries (the tool pages oldest first): one read for `total`, then the last 50.
+        Without a `total`, pages are read until `isLast` is true, at most 5;
+        past the cap, or when `isLast` is missing, nothing is returned."""
+        name = "get-issue-changelog"
+        head = client.call(name, {"issueKey": key, "startAt": 0, "maxResults": 1})
+        head = head if isinstance(head, dict) else {}
+        total = head.get("total")
+        if isinstance(total, int) and not isinstance(total, bool):
+            res = client.call(name, {"issueKey": key, "startAt": max(0, total - 50), "maxResults": 50})
+            vals = res.get("values") if isinstance(res, dict) else None
+            return vals if isinstance(vals, list) else []
+        out = []
+        for n in range(5):
+            res = client.call(name, {"issueKey": key, "startAt": n * 100, "maxResults": 100})
+            res = res if isinstance(res, dict) else {}
+            vals = res.get("values") if isinstance(res.get("values"), list) else []
+            out.extend(vals)
+            if res.get("isLast") is True:
+                return out
+        return []  # cap reached, empty page or no `isLast`: the newest entries were not seen, so claim nothing
+
+    @classmethod
+    def _own_change(cls, client, key, email, account, since=None) -> bool:
+        """True when every change to status / assignee / priority of `key` newer than `since` (the cursor) was made
+        by the manager, and there is at least one; without `since`, when the latest such change was. Two changelog
+        reads (see `_changelog_tail`); any failure or unreadable answer is False (the caller reports an update)."""
+        try:
+            hist = cls._changelog_tail(client, key)
+        except (McpError, ForbiddenTool):  # also a server that lacks the tool: never silence the line
+            return False
+
+        def mine(who):
+            return isinstance(who, dict) and (bool(account and who.get("accountId") == account)
+                                              or bool(email and str(who.get("emailAddress", "")).lower() == email))
+        best, newer = None, []
+        for h in hist:
+            if not isinstance(h, dict) or not h.get("created"):
+                continue
+            if not any(isinstance(it, dict) and str(it.get("field", "")).lower() in cls.WATCHED
+                       for it in h.get("items") or []):
+                continue
+            try:
+                when = parse_iso(h["created"])
+            except (ValueError, TypeError):
+                continue
+            if best is None or when > best[0]:
+                best = (when, h.get("author"))
+            if since is not None and when > since:
+                newer.append(h.get("author"))
+        if since is not None:  # someone else's change in the same window is news, whoever changed it last
+            return bool(newer) and all(mine(w) for w in newer)
+        return bool(best) and mine(best[1] or {})
 
 
 # ------------------------------------------------------------------------------------------------ calendar

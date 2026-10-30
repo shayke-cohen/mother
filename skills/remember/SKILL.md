@@ -9,8 +9,10 @@ Write one durable fact into `memory/` so future sessions and routines find it. F
 `${CLAUDE_PLUGIN_ROOT}/rules/memory.md`.
 
 ```bash
-W="${MOTHER_WORKSPACE:-$(cat ~/.mother/workspace)}"; cd "$W"
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" path
 ```
+
+Its output is the workspace, `$W` below: write the path out literally (and `cd` to it if this session isn't there yet). Never put it in a shell variable or use `$(…)`: in the workspace the guard asks before any command with a `$` expansion, and an unattended run has no one to answer.
 
 ## 1. Is it worth storing?
 
@@ -52,11 +54,15 @@ differently). Add `[[links]]` to related memories; a link to a file that doesn't
 
 ## 5. Update the index — not optional
 
-Exactly one line in `memory/MEMORY.md` (create it from `templates/MEMORY.md` if missing):
+Exactly one line in `memory/MEMORY.md`, added with the CLI (it creates the index if missing, writes
+`- [Title](slug.md) — short hook`, and does nothing when the file is already indexed):
 
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" memory index memory/<slug>.md --title '<Title>' --hook '<short hook>'
 ```
-- [Title](slug.md) — short hook
-```
+
+Don't edit `MEMORY.md` with Write/Edit or the shell: the guard asks the manager for that (later sessions obey
+it), and in an unattended run nobody answers. To change an existing line, ask the manager.
 
 A memory missing from the index is lost.
 

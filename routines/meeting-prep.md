@@ -10,7 +10,11 @@ Runs at `teams[].meetings.weekly.prep_at` for one team (the pointer names it). E
 review — the default is the morning of the meeting.
 
 1. Follow the `mother:meeting` skill, section **1. Prep**, for this team: build the sprint plan, publish it
-   where `meetings.weekly.publish` says.
+   where `meetings.weekly.publish` says. This run is unattended: a page connector's publish tool asks the
+   manager (the guard treats it as an unknown outbound write), and no one is here to answer. So when `publish`
+   is anything but `file`, don't call that tool: publish as `file` (the plan's path under
+   `teams/<slug>/meetings/`) and say in the DM that publishing to `<publish>` needs the manager's OK — they can
+   say "share the deck" in a session, where the ask is fine.
    The deck's Unowned intake also reads `teams/<slug>/meetings/<meeting date>-hygiene.md` when it exists
    (skill §1, "Unowned intake"): its owners stay proposals, deduped by ticket key behind `intake.md`. No file →
    intake as before.
