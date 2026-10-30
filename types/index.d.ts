@@ -17,6 +17,8 @@ export type NowItem = {
   link: string
   also: string[]
   links?: { label: string; url: string }[]   // labelled source links from the tick (CONTRACT §1)
+  from?: string | null                       // the sender (chat user id or email), for Ignore by sender
+  similar?: { words: string[]; channel?: string } | null   // the tick's "similar messages" rule for Ignore
   team: string | null
   since: string
   first_seen: string
@@ -117,7 +119,7 @@ export type HubSession = {
 export type HubSessions = { version: 1; sessions: Record<string, HubSession> }
 
 // watch.json (`mother hub follow|mute`); the panel reads only `mute`. `until`: muted value -> ISO end of a `--for` mute.
-export type HubWatch = { version: 1; mute?: { keys?: string[]; people?: string[]; channels?: string[]; until?: Record<string, string> } }
+export type HubWatch = { version: 1; mute?: { keys?: string[]; people?: string[]; channels?: string[]; topics?: string[]; until?: Record<string, string> } }
 
 // What the panel holds of the hub files; null = the file is missing (or never read).
 export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null; watch: HubWatch | null }

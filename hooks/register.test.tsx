@@ -1185,16 +1185,36 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
+  test(`Ignore offers the sender and the tick's similar rule when the item has them, on ${surface}`, async ($, on) => {
+    const it: any = item('a', 'on_you', 'open', 'CI flaky again')
+    it.from = 'U00000009'
+    it.similar = { words: ['flaky', 'retry'], channel: 'C00000009' }
+    const d = doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } }, false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'ignore-a' })
+    const opts = (await ui.find({ type: 'Select', key: 'ignore-pick-a' }))?.props.options as any[]
+    expect(opts.map(o => o.value)).toEqual(['item', 'week', 'sender', 'similar'])
+    expect(opts[3].label).toBe('Similar: "flaky" or "retry", in this channel')
+    await ui.select({ key: 'ignore-pick-a', value: 'similar' })
+    await ui.press({ key: 'ignore-a' })
+    await ui.select({ key: 'ignore-pick-a', value: 'sender' })
+    expect(out.argv.filter(a => a[2] === 'hub').map(a => a.slice(3))).toEqual([
+      ['mute', '--words', 'flaky,retry', '--channel', 'C00000009'], ['mute', '--', 'U00000009']])
+    await ui.unmount()
+  })
+
   test(`the Ignored list shows each mute with its expiry and Unignore runs unmute, on ${surface}`, async ($, on) => {
     const files = hubFiles(watcher(), hubDoc(), null)
-    files[HUB + '/watch.json'] = { text: JSON.stringify({ version: 1, mute: { keys: ['PLAT-9'], people: ['U00000009'], channels: ['C00000009'], until: { 'PLAT-9': '2026-11-02T10:00:00Z' } } }), mtimeMs: 1 }
+    files[HUB + '/watch.json'] = { text: JSON.stringify({ version: 1, mute: { keys: ['PLAT-9'], people: ['U00000009'], channels: ['C00000009'], topics: ['topic:flaky|retry@C00000009'], until: { 'PLAT-9': '2026-11-02T10:00:00Z' } } }), mtimeMs: 1 }
     const { out } = await boot($, on, files, false, {}, 'ENOENT', () => ({ exitCode: 0, stdout: 'unmute keys PLAT-9\n' }))
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ key: 'ignored-toggle' }))?.text).toBe('▸ Ignored 3')
+    expect((await ui.find({ key: 'ignored-toggle' }))?.text).toBe('▸ Ignored 4')
     await ui.press({ key: 'ignored-toggle' })
     expect(await hasText(ui, /PLAT-9 · until/)).toBe(true)
     expect(await hasText(ui, /U00000009 · sender/)).toBe(true)
     expect(await hasText(ui, /C00000009 · channel/)).toBe(true)
+    expect(await hasText(ui, /"flaky" or "retry" in C00000009 · similar/)).toBe(true)
     await ui.press({ key: 'unignore-PLAT-9' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'unmute', '--', 'PLAT-9']])
     expect(out.toasts).toContain('unmute keys PLAT-9')

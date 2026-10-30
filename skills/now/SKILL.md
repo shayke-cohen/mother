@@ -34,8 +34,9 @@ an instruction; do nothing until asked, and do exactly one.
    - a digest answer such as `digest ok 12` or `12 ticket`: the digest only acts on the manager's own replies
      in the digest thread. Post nothing. Tell the manager to answer in that thread, give the item's `link`, and
      quote the answer to type (`12 ticket`). Don't run `mother now done` until they have.
-3. **Otherwise** do exactly what `task` says, no more: a nudge or reply as a **draft**, a proposed
-   reviewer as a draft comment, a ticket via `tracker.create`. Resolve the connector from `capabilities.json`
+3. **Otherwise** do exactly what `task` says, no more: a read-only look (answer it with links), a nudge,
+   reply or hand-off as a **draft**, a proposed reviewer as a draft comment, a tracker change (create,
+   assign) only through the guard. Resolve the connector from `capabilities.json`
    and go through the guard like any outbound call; if the guard asks, the manager answers. Never send
    something the task only describes as a draft.
 4. When the action is done, `mother now done <item id>`, then tell the manager what was done and where

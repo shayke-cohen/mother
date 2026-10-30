@@ -456,13 +456,22 @@ export function chipLabel(url: string, fallback: string): string {
 // The Ignore picker: just this, this for a week, and (for a chat thread key or link) its whole channel.
 // `x` is what `mother hub mute` is given: a hub key or an item's link.
 const THREAD_KEY = /^[CG][A-Z0-9]+\/\d+\.\d+$/
-export function ignoreOptions(chat: boolean): { value: string; label: string }[] {
+// A Now item adds its sender (`from`) and the tick's "similar messages" rule (`similar`) when it has them.
+export type Similar = { words: string[]; channel?: string }
+const orWords = (words: string[]) => words.map(w => `"${w}"`).join(' or ')
+export function ignoreOptions(chat: boolean, from?: string | null, similar?: Similar | null): { value: string; label: string }[] {
   return [{ value: 'item', label: 'Just this' }, { value: 'week', label: 'This, for a week' },
-          ...(chat ? [{ value: 'channel', label: 'The whole channel' }] : [])]
+          ...(chat ? [{ value: 'channel', label: 'The whole channel' }] : []),
+          ...(from ? [{ value: 'sender', label: 'Everything from this sender' }] : []),
+          ...(similar?.words?.length ? [{ value: 'similar', label: `Similar: ${orWords(similar.words)}${similar.channel ? ', in this channel' : ''}` }] : [])]
 }
-export function ignoreArgs(scope: string, x: string): string[] {
+export function ignoreArgs(scope: string, x: string, from?: string | null, similar?: Similar | null): string[] {
   if (scope === 'week') return ['mute', '--for', '1w', '--', x]
   if (scope === 'channel') return ['mute', '--scope', 'channel', '--', x]
+  if (scope === 'sender' && from) return ['mute', '--', from]
+  if (scope === 'similar' && similar?.words?.length) {
+    return ['mute', '--words', similar.words.join(','), ...(similar.channel ? ['--channel', similar.channel] : [])]
+  }
   return ['mute', '--', x]
 }
 
@@ -603,8 +612,8 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
                   onSelect={value => go(['snooze', i.id, value], i.id)} />
               : null}
             {snoozing === 'ignore:' + i.id && isUrl(i.link)
-              ? <Select key={'ignore-pick-' + i.id} label="Ignore" options={ignoreOptions(i.id.startsWith('chat:'))}
-                  onSelect={async value => { await goHub(ignoreArgs(value, i.link), i.id); await go(['done', i.id], i.id) }} />
+              ? <Select key={'ignore-pick-' + i.id} label="Ignore" options={ignoreOptions(i.id.startsWith('chat:'), i.from, i.similar)}
+                  onSelect={async value => { if (await goHub(ignoreArgs(value, i.link, i.from, i.similar), 'ignore:' + i.id)) await go(['done', i.id], i.id) }} />
               : null}
           </Box>
         ) : null}
@@ -811,8 +820,8 @@ function focusTree($: Dollar, ui: Ui, doc: NowDoc | null, picking: string | null
         ? <Select key="fp-snooze-pick" label="Snooze for" options={SNOOZES.map(value => ({ value }))} onSelect={value => go(['snooze', i.id, value], 'fp-snooze')} />
         : null}
       {picking === 'fp-ignore' && isUrl(i.link)
-        ? <Select key="fp-ignore-pick" label="Ignore" options={ignoreOptions(i.id.startsWith('chat:'))}
-            onSelect={async value => { await goHub(ignoreArgs(value, i.link), 'fp-ignore'); await go(['done', i.id]) }} />
+        ? <Select key="fp-ignore-pick" label="Ignore" options={ignoreOptions(i.id.startsWith('chat:'), i.from, i.similar)}
+            onSelect={async value => { if (await goHub(ignoreArgs(value, i.link, i.from, i.similar), 'fp-ignore')) await go(['done', i.id]) }} />
         : null}
       <Box marginTop={1}>
         <Button key="fp-tell" onPress={() => fill(`About "${i.title}"` + (i.link ? ` (${i.link})` : '') + ': ')}>Tell Mother…</Button>
@@ -834,7 +843,8 @@ function ignoredSection(ui: Ui, watch: HubWatch | null, expanded: Set<string>, t
   const until = m?.until ?? {}
   const rows: [string, string][] = [...(m?.keys ?? []).map(v => [v, 'item'] as [string, string]),
                                     ...(m?.people ?? []).map(v => [v, 'sender'] as [string, string]),
-                                    ...(m?.channels ?? []).map(v => [v, 'channel'] as [string, string])]
+                                    ...(m?.channels ?? []).map(v => [v, 'channel'] as [string, string]),
+                                    ...(m?.topics ?? []).map(v => [v, 'similar'] as [string, string])]
   if (rows.length === 0) return null
   const open = expanded.has('ignored')
   return (
@@ -842,12 +852,18 @@ function ignoredSection(ui: Ui, watch: HubWatch | null, expanded: Set<string>, t
       <Button key="ignored-toggle" plain dimColor onPress={() => toggle('ignored')}>{`${open ? '▾' : '▸'} Ignored ${rows.length}`}</Button>
       {open ? rows.map(([v, kind]) => (
         <Box key={'ign-' + v} paddingLeft={2} flexWrap="wrap">
-          <Text dimColor>{`${v} · ${until[v] ? 'until ' + at(until[v]) : kind} `}</Text>
+          <Text dimColor>{`${topicText(v)} · ${until[v] ? 'until ' + at(until[v]) : kind} `}</Text>
           <Button key={'unignore-' + v} onPress={() => goHub(['unmute', '--', v])}>Unignore</Button>
         </Box>
       )) : null}
     </Box>
   )
+}
+
+// `topic:flaky|retry@C1` -> `"flaky" or "retry" in C1`; any other value as it is.
+function topicText(v: string): string {
+  const m = /^topic:([^@]+)(?:@(.+))?$/.exec(v)
+  return m ? orWords(m[1].split('|')) + (m[2] ? ` in ${m[2]}` : '') : v
 }
 
 // The live session an item belongs to: its link (or the key it names) is a session key, the session's own
@@ -936,7 +952,7 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                   ))}
                   {snoozing === 'ignore:sess:' + key
                     ? <Select key={'sess-ignore-pick-' + key} label="Ignore" options={ignoreOptions(THREAD_KEY.test(key))}
-                        onSelect={value => goHub(ignoreArgs(value, key))} />
+                        onSelect={value => goHub(ignoreArgs(value, key), 'ignore:sess:' + key)} />
                     : null}
                 </Box>
               ))}
@@ -974,7 +990,7 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                   {u.why ? <Text dimColor wrap="wrap">{u.why}</Text> : null}
                   {snoozing === 'ignore:hub:' + u.id
                     ? <Select key={'hub-ignore-pick-' + u.id} label="Ignore" options={ignoreOptions(THREAD_KEY.test(u.key))}
-                        onSelect={async value => { await goHub(ignoreArgs(value, u.key)); await goHub(['done', u.id], 'hub:' + u.id) }} />
+                        onSelect={async value => { if (await goHub(ignoreArgs(value, u.key), 'ignore:hub:' + u.id)) await goHub(['done', u.id], 'hub:' + u.id) }} />
                     : null}
                   {snoozing === 'hub:' + u.id
                     ? <Select key={'hub-snooze-pick-' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}

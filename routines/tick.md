@@ -149,7 +149,7 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    Sources read as `ok` appear in `coverage` as `{"status": "ok", "reason": ""}`.
 
 5. **Judge.** Apply the thresholds above in working time and build `candidates`:
-   `{"kind", "signal", "title", "why", "link", "also": [], "links": [{"label","url"}], "team", "since", "actions": [{"label","prompt"}]}`.
+   `{"kind", "signal", "title", "why", "link", "also": [], "links": [{"label","url"}], "team", "since", "actions": [{"label","prompt"}], "from"?, "similar"?}`.
    - `signal` is one of the names above; `kind` is the item's kind in the id (`pr`, `ticket`, `mail`,
      `chat`, `event`, `todo`, `digest`, …); `since` is an ISO time from the source (when the review was
      requested, the mention sent, the ticket last moved), never "now"; `team` is the team slug or `""`.
@@ -170,16 +170,27 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
      A chat item gets its thread and its channel; a PR its ticket and its failing build; a ticket the thread
      or mail that raised it. The panel shows them as one-click chips, so the manager never has to search for
      the source. Put only links you read this tick; never build a url you didn't see.
-   - `actions` are `{"label","prompt"}` (merge stores your `prompt` as the action's `task` and gives the panel its own `mother now do <S-id>` prompt). They come only from these kinds, each a tick-owned suggestion the `mother:now` skill will run on
-     the manager's yes: a nudge **draft** in the manager's DM or a mail draft (never sent); a reply **draft**
-     for `mail_needs_reply`, `unanswered_mention` and `outside_question`, in the manager's DM or as a mail
-     draft (never sent); a proposed
-     reviewer for an unreviewed PR as a draft comment; a ticket for a meeting action item (tracker create,
-     via grant or approval); a draft question to the person out today about reassigning their in-progress
-     ticket. Give each a short `label` and a `prompt` that says what to do in the action's own words (the
-     panel adds `mother now do`), e.g. `"draft a nudge to the reviewer of platform-api#412"`. An action
-     folded from another routine keeps that routine's handler in the prompt (`dots do A3`). An item no listed
-     kind fits gets no action.
+   - `actions` are `{"label","prompt"}` (merge stores your `prompt` as the action's `task` and gives the panel
+     its own `mother now do <S-id>` prompt). Give **every** item up to three (merge keeps the first three),
+     written from what you actually read, most useful first; the `mother:now` skill runs one on the manager's
+     yes. Each is one of: a read-only look ("check whether PLAT-88's fix is in today's release build",
+     "find which commit turned api main red"); a **draft** (a reply or nudge in the manager's DM or as a mail
+     draft, a review comment, a hand-off message; never sent); or a tracker change the guard will ask about
+     (create a ticket for a meeting action item, assign PLAT-12 to its code owner). Name the people, ticket,
+     PR and the decision involved, so the action is specific to this item ("draft a reply to Dana confirming
+     the Thursday cutoff"), not a generic verb the panel already offers ("reply", "summarize"). Give each a
+     short `label` (at most 40 characters) and a `prompt` in the action's own words (the panel adds
+     `mother now do`). An action folded from another routine keeps that routine's handler in the prompt
+     (`dots do A3`). Never an action that scores, ranks or judges a person; a hand-off names an owner by what
+     they own, never by load.
+   - `from` (optional) is the sender of a chat or mail item, as a chat user id (`U…`) or an email, so the
+     panel can offer "Everything from this sender". Leave it out for anything else.
+   - `similar` (optional) is a rule the panel offers as "Ignore similar" when the item is plainly one of a
+     repeating kind of noise (bot alerts, newsletters, automated notices): `{"words": [1-5 words of 3-30
+     letters or digits that such messages always contain], "channel": "C…" (only for chat, when the noise
+     lives in one channel)}`. The manager sees the words before anything is muted; it then matches, without a
+     model, any later item or watcher line whose title (or summary) has one of the words, in that channel if
+     given. Leave it out for a message from a person.
    - **Top 3 today.** On the **first tick of the local day**, always set `top` (at most three):
      `{"title","why","link","item_id"?}`. Choose from today's on-you items, todos due today or overdue
      (`todos/open.md`, Yours), promises due today (`journal/commitments/`), prep for today's important

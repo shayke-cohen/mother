@@ -130,6 +130,7 @@ SECTIONS = ["on_you", "neglected", "suggestion"]
 SUGGESTION_LAPSE_DAYS = 3
 VERSION = 1
 LINKS_MAX = 8
+ACTIONS_MAX = 3
 LINK_LABEL_MAX = 24
 TOP_MAX = 3
 
@@ -167,6 +168,27 @@ def _links(raw) -> list:
         if len(out) == LINKS_MAX:
             break
     return out
+
+
+def _sender(v) -> Optional[str]:
+    """The candidate's `from`: a chat user id or an email (lower case), else None. Only for Ignore by sender."""
+    v = v.strip() if isinstance(v, str) else ""
+    if re.fullmatch(r"U[A-Z0-9]{2,}", v):
+        return v
+    return v.lower() if re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", v) else None
+
+
+def _similar(v) -> Optional[dict]:
+    """The tick's proposed "similar messages" rule, `{words, channel}`, when `mother hub mute --words` would take it."""
+    import hub
+    if not isinstance(v, dict) or not isinstance(v.get("words"), list) or len(v["words"]) > 5:
+        return None
+    channel = v.get("channel") if isinstance(v.get("channel"), str) else ""
+    topic = hub.topic_value([w for w in v["words"] if isinstance(w, str)], channel)
+    if topic is None:
+        return None
+    words = topic[len("topic:"):].split("@", 1)[0].split("|")
+    return {"words": words, "channel": channel}
 
 
 def item_id(c: dict) -> str:
@@ -354,7 +376,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         old = prev_items.get(iid)
         old_ids = {a["label"]: a["id"] for a in (old or {}).get("actions") or []}
         actions = []
-        for a in c.get("actions") or []:
+        for a in (c.get("actions") or [])[:ACTIONS_MAX]:
             if not isinstance(a, dict) or not a.get("label"):
                 dropped += 1
                 continue
@@ -370,6 +392,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
         items.append({
             "id": iid, "section": section, "signal": sig, "title": c["title"], "why": c.get("why", ""),
             "link": c["link"], "also": list(c.get("also") or []), "links": _links(c.get("links")), "team": c.get("team"),
+            "from": _sender(c.get("from")), "similar": _similar(c.get("similar")),
             "since": c["since"], "first_seen": first_seen, "last_seen": _iso(now),
             "state": effect or ("open" if old else "new"),
             "snooze_until": None, "actions": actions,

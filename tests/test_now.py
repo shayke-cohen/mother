@@ -168,6 +168,24 @@ class Merge(unittest.TestCase):
         kept = now.merge(inp(), first, {}, CFG, NOW + timedelta(hours=1))
         self.assertEqual(kept["items"][0]["links"], links)
 
+    def test_sender_and_similar_rule_are_kept_only_when_well_formed(self):
+        out = now.merge(inp(cand("unanswered_mention", kind="chat", link="https://example.com/t/1", **{"from": "U00000009"},
+                                 similar={"words": ["Flaky", "retry"], "channel": "C00000009"}),
+                            cand("mail_needs_reply", kind="mail", link="https://example.com/m/1", **{"from": "Agnes@Example.com"},
+                                 similar={"words": ["ok"]}),
+                            cand("review_requested", link="https://example.com/pr/1", **{"from": "Agnes"},
+                                 similar="flaky")), None, {}, CFG, NOW)
+        got = {i["link"]: (i["from"], i["similar"]) for i in out["items"]}
+        self.assertEqual(got["https://example.com/t/1"], ("U00000009", {"words": ["flaky", "retry"], "channel": "C00000009"}))
+        self.assertEqual(got["https://example.com/m/1"], ("agnes@example.com", None))   # "ok" is too short a word
+        self.assertEqual(got["https://example.com/pr/1"], (None, None))
+        self.assertEqual(out["dropped"], 0)
+
+    def test_at_most_three_actions_per_item(self):
+        acts = [{"label": "A%d" % n, "prompt": "p%d" % n} for n in range(5)]
+        out = now.merge(inp(cand("review_requested", actions=acts)), None, {}, CFG, NOW)
+        self.assertEqual([a["label"] for a in out["items"][0]["actions"]], ["A0", "A1", "A2"])
+
     def test_ignored_items_are_left_out_and_counted(self):
         chat = "https://example.com/archives/C00000009/p1700000000123456"
         mute = {"keys": ["PLAT-3"], "people": [], "channels": ["C00000009"], "until": {}}

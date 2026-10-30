@@ -1520,6 +1520,37 @@ class Direct(unittest.TestCase):
         self.assertTrue(hub.item_muted({"link": "https://example.com/x", "links": [{"label": "P", "url": "https://example.com/page"}]}, mute))
         self.assertFalse(hub.item_muted({"link": "https://example.com/browse/PLAT-4", "also": []}, mute))
 
+    def test_mute_words_stores_a_topic_rule_and_unmute_takes_it_back(self):
+        rc, out = self.run_verb("mute", "--words", "Flaky, retry,flaky", "--channel", "C00000009", "--for", "1w")
+        self.assertEqual(rc, 0, out)
+        m = hub.load_watch(self.ws)["mute"]
+        self.assertEqual(m["topics"], ["topic:flaky|retry@C00000009"])
+        self.assertIn("topic:flaky|retry@C00000009", m["until"])
+        self.run_verb("mute", "--words", "deploy")
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["topics"], ["topic:flaky|retry@C00000009", "topic:deploy"])
+        self.run_verb("unmute", "--", "topic:deploy")
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["topics"], ["topic:flaky|retry@C00000009"])
+        for bad in (["mute", "--words", "ab"], ["mute", "--words", "a b c"], ["mute", "--words", "x1,x2,x3,x4,x5,x6"],
+                    ["mute", "--words", "flaky", "--", "PLAT-1"], ["mute", "--words", "flaky", "--channel", "nope"],
+                    ["mute", "--", "topic:no spaces"]):
+            self.assertEqual(self.run_verb(*bad)[0], 2, bad)
+
+    def test_topic_and_sender_mutes_match_lines_and_items(self):
+        mute = {"keys": [], "people": ["U00000009", "agnes@example.com"], "channels": [],
+                "topics": ["topic:flaky|retry@C00000009", "topic:newsletter"]}
+        self.assertTrue(hub.is_muted(line(source="chat", key="C00000009/1.0", title="CI is FLAKY again"), mute))
+        self.assertFalse(hub.is_muted(line(source="chat", key="C00000001/1.0", title="CI is flaky again"), mute))
+        self.assertFalse(hub.is_muted(line(source="chat", key="C00000009/1.0", title="unflakyness"), mute))
+        self.assertTrue(hub.is_muted(line(source="mail", key="mail:t1", title="x", summary="the weekly newsletter"), mute))
+        chat = "https://example.com/archives/C00000009/p1700000000123456"
+        self.assertTrue(hub.item_muted({"link": chat, "title": "Retry the build?"}, mute))
+        self.assertFalse(hub.item_muted({"link": "https://example.com/x", "title": "Retry the build?"}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/x", "title": "Our newsletter"}, mute))
+        self.assertTrue(hub.item_muted({"link": "https://example.com/x", "title": "t", "from": "Agnes@Example.com"}, mute))
+        self.assertFalse(hub.item_muted({"link": "https://example.com/x", "title": "t", "from": "U00000001"}, mute))
+        self.assertEqual(hub.live_mute(dict(mute, until={"topic:newsletter": "2026-10-01T00:00:00Z"}), self.AT)["topics"],
+                         ["topic:flaky|retry@C00000009"])
+
     def test_mute_drops_watcher_lines_not_manual(self):
         class A:
             SOURCE = "tracker"
@@ -1985,7 +2016,7 @@ class WhatsAppWatcher(unittest.TestCase):
         l = line(source="whatsapp", key="wa:" + lid, who="a chat")
         self.assertTrue(hub.is_muted(l, {"keys": ["wa:" + lid]}))
         self.assertEqual(self.run_verb("mute", "--", "wa:" + lid)[0], 0)
-        self.assertEqual(hub.load_watch(self.ws)["mute"], {"keys": ["wa:" + lid], "people": [], "channels": [], "until": {}})
+        self.assertEqual(hub.load_watch(self.ws)["mute"], {"keys": ["wa:" + lid], "people": [], "channels": [], "topics": [], "until": {}})
 
     def test_whatsapp_text_never_auto_follows_a_project(self):
         r = WaReader()

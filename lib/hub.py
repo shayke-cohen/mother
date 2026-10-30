@@ -387,7 +387,7 @@ def pending_work(ws: Path, cfg: dict, at: datetime) -> bool:
 
 _EMPTY_WATCH = {"version": 1, "follow": {"projects": [], "channels": [], "threads": [], "repos": [], "whatsapp": [],
                                          "dms": {}, "inbox": ""},
-                "mute": {"keys": [], "people": [], "channels": [], "until": {}}, "auto": {"projects": []},
+                "mute": {"keys": [], "people": [], "channels": [], "topics": [], "until": {}}, "auto": {"projects": []},
                 "unfollowed": []}
 _DM_CHANNEL = re.compile(r"^D[A-Z0-9]{2,}$")
 
@@ -414,7 +414,8 @@ def load_watch(ws: Path) -> dict:
             out[part][k] = list(dict.fromkeys(x for x in (got.get(k) or []) if isinstance(x, str) and x)) \
                 if isinstance(got.get(k), list) else []
     got = (doc.get("mute") or {}).get("until") if isinstance(doc.get("mute"), dict) else None
-    listed = {x for k in ("keys", "people", "channels") for x in out["mute"][k]}
+    out["mute"]["topics"] = [t for t in out["mute"]["topics"] if _TOPIC.match(t)]
+    listed = {x for k in MUTE_LISTS for x in out["mute"][k]}
     out["mute"]["until"] = {v: t for v, t in got.items() if v in listed and isinstance(t, str) and _parse_at(t)} \
         if isinstance(got, dict) else {}
     auto = doc.get("auto") if isinstance(doc.get("auto"), dict) else {}
@@ -458,16 +459,36 @@ def merged_watch(cfg: dict, watch: dict) -> dict:
     ok = dm_people(cfg)
     out["chat"]["dms"] = {u: d for u, d in (f.get("dms") or {}).items() if u in ok and d != inbox}
     out["chat"]["inbox"] = inbox
-    out["mute"] = {k: list((watch.get("mute") or {}).get(k) or []) for k in ("keys", "people", "channels")}
+    out["mute"] = {k: list((watch.get("mute") or {}).get(k) or []) for k in MUTE_LISTS}
     out["mute"]["until"] = dict((watch.get("mute") or {}).get("until") or {})
     return out
+
+
+MUTE_LISTS = ("keys", "people", "channels", "topics")
+# A "similar messages" rule: 1-5 words (any of them, whole words, any case) in the title or summary, optionally
+# only in one chat channel. Stored as one string so `until`, `unmute` and the Ignored list treat it like any value.
+_TOPIC = re.compile(r"^topic:([a-z0-9][\w-]{2,29}(?:\|[a-z0-9][\w-]{2,29}){0,4})(?:@([CG][A-Z0-9]{6,}))?$")
+
+
+def topic_value(words, channel: str = "") -> Optional[str]:
+    """`topic:<w>|<w>[@<channel>]` from a word list, or None when a word or the channel is not acceptable."""
+    ws = list(dict.fromkeys(w.strip().lower() for w in words if w.strip()))
+    v = "topic:" + "|".join(ws) + ("@" + channel if channel else "")
+    return v if ws and _TOPIC.match(v) else None
+
+
+def _topic_hit(value: str, text: str, channels) -> bool:
+    m = _TOPIC.match(value)
+    if not m or (m.group(2) and m.group(2) not in channels):
+        return False
+    return any(re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(w), text or "", re.I) for w in m.group(1).split("|"))
 
 
 def live_mute(mute: dict, at: datetime) -> dict:
     """The mutes still in force at `at`: a value muted `--for` a while drops out once its `until` has passed."""
     until = mute.get("until") or {}
     gone = {v for v, t in until.items() if (_parse_at(t) or at) <= at}
-    out = {k: [x for x in mute.get(k) or [] if x not in gone] for k in ("keys", "people", "channels")}
+    out = {k: [x for x in mute.get(k) or [] if x not in gone] for k in MUTE_LISTS}
     out["until"] = {v: t for v, t in until.items() if v not in gone}
     return out
 
@@ -487,12 +508,18 @@ def item_keys(item: dict) -> set:
 
 
 def item_muted(item: dict, mute: dict) -> bool:
-    """A Now item the manager ignored: any of its keys is muted, or a chat thread it names is in a muted channel."""
+    """A Now item the manager ignored: any of its keys is muted, its sender (`from`) is a muted person, a chat
+    thread it names is in a muted channel, or its title matches a topic rule."""
     keys = item_keys(item)
     if keys & set(mute.get("keys") or []):
         return True
-    chans = set(mute.get("channels") or [])
-    return any(_THREAD.match(k) and k.split("/", 1)[0] in chans for k in keys)
+    sender = str(item.get("from") or "").strip().lower()
+    if sender and sender in [p.lower() for p in mute.get("people") or []]:
+        return True
+    chans = {k.split("/", 1)[0] for k in keys if _THREAD.match(k)}
+    if chans & set(mute.get("channels") or []):
+        return True
+    return any(_topic_hit(t, item.get("title") or "", chans) for t in mute.get("topics") or [])
 
 
 def effective_cfg(cfg: dict, watch: dict) -> dict:
@@ -522,10 +549,11 @@ def is_muted(line: dict, mute: dict) -> bool:
         jid = str(line.get("key"))[3:]
         if jid in keys or jid.lower() in [p.lower() for p in mute.get("people") or []]:
             return True
-    if line.get("source") == "chat" and "/" in str(line.get("key")):
-        if line["key"].split("/", 1)[0] in (mute.get("channels") or []):
-            return True
-    return False
+    chan = line["key"].split("/", 1)[0] if line.get("source") == "chat" and "/" in str(line.get("key")) else ""
+    if chan and chan in (mute.get("channels") or []):
+        return True
+    text = "%s %s" % (line.get("title") or "", line.get("summary") or "")
+    return any(_topic_hit(t, text, {chan} if chan else set()) for t in mute.get("topics") or [])
 
 
 def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
@@ -932,6 +960,7 @@ USAGE = """mother hub <verb>
   follow      [--project|--channel|--thread|--repo|--whatsapp] <PROJECT | channel id | channel/ts | owner/repo | WhatsApp JID>  watch it too (`unfollow` stops)
   mute        [--for Nd|Nw] [--scope item|channel] <key | link | U-id | email | channel id | WhatsApp JID>
               drop its watcher lines and its Now items (`unmute` undoes); --scope channel mutes a thread's channel
+              mute --words w1,w2 [--channel C]: a rule for similar messages (any word, whole word, any case)
   watching    [--json]  the merged watch list (config plus follows) and the mutes
   dms         set <user id>=<DM id> [...] | drop <user id> | inbox <self-DM id>|none | show [--json]
               DMs with people in config the watcher reads, and the self-DM it reads as your inbox"""
@@ -1853,6 +1882,8 @@ def classify_follow(x: str, force: Optional[str] = None, known_channels=()):
 
 
 def classify_mute(x: str):
+    if x.startswith("topic:"):
+        return ("topics", x) if _TOPIC.match(x) else None
     if _WA_JID.match(x):
         return "keys", "wa:" + x
     if x.startswith("wa:"):
@@ -1881,7 +1912,7 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out, at: date
         print("chat dms: %s" % (", ".join("%s=%s" % kv for kv in sorted(dms.items())) or "- (%s)" % DMS_HINT), file=out)
         print("chat inbox: %s" % (merged["chat"].get("inbox") or "-"), file=out)
         until = merged["mute"].get("until") or {}
-        for k in ("keys", "people", "channels"):
+        for k in MUTE_LISTS:
             print("mute %s: %s" % (k, ", ".join(v + (" (until %s)" % until[v] if v in until else "")
                                                 for v in merged["mute"][k]) or "-"), file=out)
         return 0
@@ -1900,14 +1931,22 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out, at: date
     span, scope = None, "item"
     if verb == "mute":  # `--for 1d|2w` ends the mute then; `--scope channel` mutes the channel a chat key or link is in
         try:
-            pos, opts = _parse_flags(args, {"for", "scope"})
+            pos, opts = _parse_flags(args, {"for", "scope", "words", "channel"})
         except ValueError as e:
             print("mother hub mute: %s" % e, file=sys.stderr)
             return 2
-        if set(opts) - {"for", "scope"}:
-            print("mother hub mute: unknown flag --%s" % sorted(set(opts) - {"for", "scope"})[0], file=sys.stderr)
+        if set(opts) - {"for", "scope", "words", "channel"}:
+            print("mother hub mute: unknown flag --%s" % sorted(set(opts) - {"for", "scope", "words", "channel"})[0],
+                  file=sys.stderr)
             return 2
         args = pos
+        if "words" in opts or "channel" in opts:  # a "similar messages" rule takes no value of its own
+            topic = topic_value(str(opts.get("words") or "").split(","), str(opts.get("channel") or ""))
+            if pos + tail_args or "words" not in opts or topic is None or len(str(opts["words"]).split(",")) > 5:
+                print("mother hub mute: --words takes 1-5 comma-separated words of 3-30 letters, digits, - or _ "
+                      "(and --channel a channel id), and no other value", file=sys.stderr)
+                return 2
+            args, tail_args = [], [topic]
         if "for" in opts:
             m = re.fullmatch(r"([1-9]\d?)([dw])", str(opts["for"]))
             if not m or int(m.group(1)) * (7 if m.group(2) == "w" else 1) > 90:
