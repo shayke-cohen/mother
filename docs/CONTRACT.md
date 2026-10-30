@@ -898,9 +898,12 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   followed and auto projects, `code.repos` + followed repos, plus the `mute` block) and hands the adapters that
   effective config; `hub.watch` itself is never rewritten. Verbs, all writing only `.mother/hub/`: `follow <x>` /
   `unfollow <x>` classify `x` as a project (`[A-Z][A-Z0-9]+`), a channel (`C…`/`G…` id), a thread
-  (`<channel>/<ts>`) or a repo (`owner/repo`), else exit 2 (`unfollow` of a project also drops it from `auto` and records it in `unfollowed`, which `follow` clears);
+  (`<channel>/<ts>`) or a repo (`owner/repo`), else exit 2 (`unfollow` of a project also drops it from `auto` and records it in `unfollowed`, which `follow` clears;
+  `unfollow` of something `config.json` lists, in `hub.watch` or as a team's tracker project, adds "; still watched
+  from config.json" to its output, since config is never rewritten);
   `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, or anything else as a
-  key; `watching [--json]` prints the merged list and the mutes; `add <link-or-text> [--key K]` appends one
+  key; `watching [--json]` prints the merged list (tracker projects with every team's tracker project, as polled) and the mutes; `add <link-or-text> [--key K]` (K only of `A-Za-z0-9_.:/@=,+-` and `#` after the first character, as a hub
+  command token; else exit 2) appends one
   `manual` line (source `manual`; key = `--key`, else a chat message link's thread key, else the first tracker or
   PR key in the text, else `manual:<sha1 prefix>`; `link` is the first URL; id carries a hash so two adds in a
   second stay distinct). Before appending, the watcher drops a line whose key or `also` key is a muted key, whose

@@ -1330,6 +1330,30 @@ class Direct(unittest.TestCase):
         self.run_verb("add", "look at this", "--key", "mine")
         self.assertEqual(self.inbox()[-1]["key"], "mine")
 
+    def test_add_key_takes_only_the_hub_token_charset(self):
+        for bad in ("PLAT 1", "it's", '"x"', "a;b", "x?y", "#1"):
+            rc, _ = self.run_verb("add", "a note", "--key", bad)
+            self.assertEqual(rc, 2, bad)
+        self.assertEqual(self.inbox(), [])
+        for good in ("PLAT-1", "acme/web#12", "C00000001/1700000000.000100", "manual:abc"):
+            self.assertEqual(self.run_verb("add", "a note", "--key", good)[0], 0, good)
+
+    def test_unfollow_of_a_configured_project_says_it_is_still_watched(self):
+        self.cfg["teams"] = [{"slug": "web", "tracker": {"project": "WEB"}}]
+        for x in ("PLAT", "WEB", "C00000001"):
+            rc, out = self.run_verb("unfollow", x)
+            self.assertEqual(rc, 0)
+            self.assertIn("still watched from config.json", out, x)
+        self.run_verb("follow", "OPS")
+        self.assertNotIn("still watched", self.run_verb("unfollow", "OPS")[1])
+
+    def test_watching_includes_team_projects(self):
+        self.cfg["teams"] = [{"slug": "web", "tracker": {"project": "WEB"}}]
+        self.run_verb("follow", "OPS")
+        self.assertIn("tracker projects: PLAT, OPS, WEB", self.run_verb("watching")[1])
+        doc = json.loads(self.run_verb("watching", "--json")[1])
+        self.assertEqual(doc["watch"]["tracker"]["projects"], ["PLAT", "OPS", "WEB"])
+
     def test_add_text_uses_manual_hash_key(self):
         self.run_verb("add", "ask Agnes about the launch")
         self.run_verb("add", "ask Agnes about the launch")

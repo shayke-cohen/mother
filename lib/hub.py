@@ -1651,6 +1651,9 @@ def manual_key(text: str) -> str:
     return "manual:" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
 
 
+_KEY_TOKEN = re.compile(r"[A-Za-z0-9_.:/@=,+-][A-Za-z0-9_.:/@=,+#-]{0,199}")  # the hub role's plain token
+
+
 def add_cmd(ws: Path, at: datetime, args, out) -> int:
     try:
         pos, opts = _parse_flags(args, {"key"})
@@ -1663,6 +1666,9 @@ def add_cmd(ws: Path, at: datetime, args, out) -> int:
         return 2
     text = plain(text)
     key = plain(opts.get("key")).strip() if isinstance(opts.get("key"), str) else ""
+    if key and not _KEY_TOKEN.fullmatch(key):  # the hub can only name a key in a plain command token
+        print("mother hub add: --key takes letters, digits and _.:/@=,+-# only (no space or quote)", file=sys.stderr)
+        return 2
     key = key or manual_key(text)
     stamp = _iso(at)
     url = _URL.search(text)
@@ -1709,6 +1715,7 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
     if verb == "watching":
         w = load_watch(ws)
         merged = merged_watch(cfg, w)
+        merged["tracker"]["projects"] = _watch_cfg(cfg, {"watch": merged}, "tracker")["projects"]  # + teams'
         if as_json:
             print(json.dumps({"watch": merged, "follow": w["follow"], "mute": w["mute"], "auto": w["auto"]},
                              indent=2, sort_keys=True), file=out)
@@ -1770,7 +1777,15 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
                     changed = True
         if changed:
             save_watch(ws, w)
-    print("%s %s %s%s" % (verb, name, found[1], "" if changed else " (no change)"), file=out)
+    still = ""
+    if verb == "unfollow":  # config.json lists are never rewritten: say why it is still polled
+        base = merged_watch(cfg, {})
+        conf = {"projects": _watch_cfg(cfg, _hub_cfg(cfg), "tracker").get("projects") or [],
+                "channels": base["chat"].get("channels") or [], "threads": base["chat"].get("follow") or [],
+                "repos": base["code"].get("repos") or []}
+        if found[1] in conf.get(name, []):
+            still = "; still watched from config.json"
+    print("%s %s %s%s%s" % (verb, name, found[1], "" if changed else " (no change)", still), file=out)
     return 0
 
 
