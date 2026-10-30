@@ -104,6 +104,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `workspace.git_remote` | str or null | null = local only |
 | `workspace.home_machine` | str or null | hostname allowed to run routines; null = routines refuse to run until set |
 | `connectors.{chat,tracker,mail,calendar,code}` | str | `slack`/`teams`, `jira`/`linear`/`monday`/`none`, … |
+| `connectors.whatsapp` | str, optional | `whatsapp`: names the hub watcher's local WhatsApp source (§5e); no MCP connector is involved |
 | `teams[]` | list | `slug, name, tracker{project,board}, repos[], meetings{}, sprint{length,starts}, channels[], people[]` |
 | `people[]` (per team) | | `name, email, chat, code`, optional `one_on_one {cadence_days (3-90, default 14), title}` for 1:1 prep and drift |
 | `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, role: standup|team|product|support|announcements, quiet_hours ("HH:MM-HH:MM", default manager.quiet_hours), max_replies_per_hour (default 6), auto_topics: [slug] (auto mode)` |
@@ -114,7 +115,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.tick` | map, optional | the hourly pulse behind the Now list (`mother now`); absent = off. `every` (minutes, one of 30, 60, 120, 180, 240; default 60), `active_hours` (`"HH:MM-HH:MM"`, start before end, default `"06:00-22:00"`, in `manager.timezone`; no tick runs outside it), `days` (`workdays` / `all` / a day / list of days; not `monthly:`), `thresholds` (map signal -> `Nh`, `Nd` or `0`, counted in working time; default per signal), `signals` (map signal -> `true`/`false`; all on by default, and a signal whose source connector is `none` is off), `notify` (`none` default, or `dm` = one DM to `manager.chat_dm` for a new on-you item; never while `now.json.quiet`), `slow_every` (integer 1-6, default 3: every Nth slot scans every signal, the others only the on-you signals and `default_branch_red`), `max_age_days` (integer 0-365, default 30: work whose `since` is older is left off the list, except workspace signals; `0` = no cap). Default thresholds: `review_requested` 4h, `unanswered_mention` 2h, `decision_open` 1d, `mail_needs_reply` 4h, `pr_no_reviewer` 1d, `pr_approved_unmerged` 2d, `pr_changes_silent` 3d, `default_branch_red` 2h, `ticket_stalled` 3d, `bug_unowned` 1d, `blocker_cleared` 1d, `outside_question` 4h, `action_item_no_ticket` 1d, the rest 0. Signals: on you `review_requested`, `unanswered_mention`, `decision_open`, `ticket_waiting_on_you`, `mail_needs_reply`, `invite_unanswered`, `promise_due`, `suggestion_waiting`; neglected `pr_no_reviewer`, `pr_approved_unmerged`, `pr_changes_silent`, `default_branch_red`, `ticket_stalled`, `bug_unowned`, `blocker_cleared`, `sprint_at_risk`, `outside_question`, `action_item_no_ticket`, `one_on_one_drift`. Unknown keys or signals fail `mother status`. |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
 | `whatsapp` | map, optional | WhatsApp read and send from the manager's own number (§5d). `enabled` (bool), `self_jid` (the manager's own JID, `<digits>@s.whatsapp.net`; required when `enabled`), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `read`, `send` (bool). Other unknown keys fail. The keys of the earlier design, `allow`, `approve_via` and `max_prompts_per_day`, are accepted with any value and ignored; `mother whatsapp setup` drops them the next time it writes the block, and they are removed one release after WhatsApp ships. The block is written by `mother whatsapp setup`, run by the manager in their own terminal (§5d); the agent never edits it. JIDs are phone numbers: they live in `config.json` and tool output only, never in memory, journal or people files. |
-| `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `connections` (map from capability `chat|mail|tracker|calendar|code` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required), `watch` (`chat.channels` [id], `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str]). Unknown keys fail `mother status`. |
+| `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `connections` (map from capability `chat|mail|tracker|calendar|code|whatsapp` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required; the `whatsapp` capability takes only `{local: "whatsapp"}`, the local database, and no other capability may use `local`), `watch` (`chat.channels` [id], `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str], `whatsapp.groups` [group JID]). Unknown keys fail `mother status`. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 | `policy.bypass_passes_asks` | bool, optional | default `false`: in a session whose cwd is the workspace, a guard ask stays an ask in `bypassPermissions` mode. `true` restores the pass (§5). Any other type fails `mother status` |
@@ -836,6 +837,7 @@ is set without `MOTHER_WORKSPACE`, as in throwaway test workspaces.
   asks nothing, as for chat.
 - **Never.** Storing a chat body in the workspace; a first message to someone with no history; sending by any
   path the guard cannot see; assessing a person from their messages.
+- **The hub watcher.** The same reader feeds the hub's `whatsapp` source (§5e, "WhatsApp source"): DMs and watched groups, read-only, home machine only, and only while `whatsapp.enabled` and `whatsapp.read` are true.
 
 ## 5e. Hub (`lib/hub*.py`, `mother hub`)
 
@@ -867,7 +869,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   a `resolved` line never replaces an `update` whose `at` is the same or later. Appends and rotation both run under `hub.lock`. Rotation moves the inbox to `inbox-YYYY-MM-DD.jsonl` and folds any leftover `inbox.jsonl.*.rotating`
   file from a crash into the dated file, and deletes dated files 7 or more days old.
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
-  connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below) and
+  connection; for the local WhatsApp source, one chat-list read, never a message), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below) and
   the manager's verbs `add`, `follow`, `unfollow`, `mute`, `unmute`, `watching` (watch list, below).
   `smoke` (the manager's live check, not the hub session's) runs `check`, then two `poll_once` passes 20 seconds
   apart in a throwaway directory holding only a copy of `config.json` (a fresh `.mother/hub/`; the real inbox,
@@ -897,14 +899,14 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **Watch list and `manual` lines.** `watch.json` (machine-local, atomic, under `hub.lock`) is
   `{version: 1, follow: {projects, channels, threads, repos}, mute: {keys, people, channels}, auto: {projects:
   [{key, from, at}]}, unfollowed: [project]}`; a missing or damaged file is empty. Each polling pass merges it with `hub.watch`
-  (`merged_watch`: `chat.channels` + followed channels, `chat.follow` + followed threads, `tracker.projects` +
+  (`merged_watch`: `whatsapp.groups` + followed WhatsApp chats, `chat.channels` + followed channels, `chat.follow` + followed threads, `tracker.projects` +
   followed and auto projects, `code.repos` + followed repos, plus the `mute` block) and hands the adapters that
   effective config; `hub.watch` itself is never rewritten. Verbs, all writing only `.mother/hub/`: `follow <x>` /
   `unfollow <x>` classify `x` as a project (`[A-Z][A-Z0-9]+`), a channel (`C…`/`G…` id), a thread
-  (`<channel>/<ts>`) or a repo (`owner/repo`), else exit 2 (`unfollow` of a project also drops it from `auto` and records it in `unfollowed`, which `follow` clears;
+  (`<channel>/<ts>`), a repo (`owner/repo`) or a WhatsApp chat (`<digits>@s.whatsapp.net` or `<digits>[-<digits>]@g.us`, kept in `follow.whatsapp`), else exit 2 (`unfollow` of a project also drops it from `auto` and records it in `unfollowed`, which `follow` clears;
   `unfollow` of something `config.json` lists, in `hub.watch` or as a team's tracker project, adds "; still watched
   from config.json" to its output, since config is never rewritten);
-  `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, or anything else as a
+  `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, a WhatsApp JID (stored as the key `wa:<jid>`), or anything else as a
   key; `watching [--json]` prints the merged list (tracker projects with every team's tracker project, as polled) and the mutes; `add <link-or-text> [--key K]` (K only of `A-Za-z0-9_.:/@=,+-` and `#` after the first character, as a hub
   command token; else exit 2) appends one
   `manual` line (source `manual`; key = `--key`, else a chat message link's thread key, else the first tracker or
@@ -917,7 +919,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   link (a link not matching `^https?://\S+$` is left out and stays in the text); its id ends in a random suffix.
   `--` ends the flags of `add`, `follow`, `unfollow`, `mute` and `unmute`: what follows is the value, even one that starts with `-`.
   A bare uppercase token given to `follow` is a project; it is a channel only when it is `C`/`G` plus 8 or more
-  characters and already a known channel, or with `--channel`; `--project|--channel|--thread|--repo` force the type.
+  characters and already a known channel, or with `--channel`; `--project|--channel|--thread|--repo|--whatsapp` force the type.
   The chat adapter remembers which threads came from the follow list (`followed` in its cursor) and drops one when
   it leaves the list, so `unfollow` stops polling it; threads the adapter tracks itself stay.
 - **The watcher** (`hub.watch(ws, cfg)`, started by `mother hub watch`). It writes one line to its log and
@@ -1078,6 +1080,26 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   The calendar list tool has no recurrence-expansion argument (its inputSchema is calendarId, timeMin, timeMax), so
   starting-soon sees recurring meetings only when the tool returns the expanded instance.
   Errors carry a `health.CLASSES` kind: a timeout is `unreachable`, a closed server `dropped`.
+- **WhatsApp source** (capability `whatsapp`, adapter `whatsapp:whatsapp`, connection `{"local": "whatsapp"}`,
+  `connectors.whatsapp` = `whatsapp`). Reads the local database through `lib/whatsapp.py` (§5d) and nothing else:
+  the client the watcher builds for it (`LocalWhatsApp`) has two methods, `messages` (`read_messages` across
+  chats) and `ping` (one `recent_chats(limit=1)`), no send path, and never imports or calls the bridge; it
+  needs no program on the launchd `PATH`. It runs only when `whatsapp.enabled`, `whatsapp.read` and
+  `whatsapp.self_jid` are set and this is the home machine; otherwise the source is `couldnt_check` with that
+  reason (`whatsapp.read is not true in config.json`, `not the home machine …`), a config gap with no `error` line.
+  A `ReaderError` (database missing, locked, `schema_changed`, or `denied`: Full Disk Access is missing) is
+  `couldnt_check` with the reader's reason and, on the ok-to-failing transition, one `error` line like any source.
+  Candidates are messages newer than the cursor less a 2-minute overlap (deduped by stanza id in a seen-set of at
+  most 500; at most 200 per pass, more is `partial`) in a DM, or in a group that is listed in
+  `hub.watch.whatsapp.groups` or followed (`follow --whatsapp <jid>`), or, for any other group, only when the text
+  holds `@<digits of self_jid>`. One thing per chat, key `wa:<chat JID>`; `who` is `<name> <jid>` for a DM and the
+  member's name in a group; `title` is the text (a group's with the chat name first), at most 80 characters;
+  `summary` at most 300, both cleaned as other sources'; `link` is `whatsapp://send?phone=<digits>` for a DM and
+  empty for a group. The manager's own message (`from_me`) in a DM, or in a group after a candidate, is a
+  `resolved` line for that key; a message carrying MOTHER's signature is neither. `mute <jid>` (key `wa:<jid>`) and
+  mute by key drop its lines. Text from WhatsApp never auto-follows anything (auto-follow is tracker-validated).
+  The first poll returns no lines; the cursor is `{ts, seen, open}`. `check` prints `whatsapp | ok | local
+  database readable` (or the reason), `smoke` the usual counts; neither prints a message or JID.
 
 ## 6. Sync (`bin/mother sync`)
 

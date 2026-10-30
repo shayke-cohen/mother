@@ -126,10 +126,11 @@ WA_USER_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net", re.ASCII)
 
 HUB_KEYS = {"enabled", "every_seconds", "idle_every_seconds", "model", "max_cards_per_wake", "sweep_minutes",
             "update_ttl_hours", "connections", "watch"}
-HUB_CAPS = ("chat", "mail", "tracker", "calendar", "code")
-HUB_CONN_KEYS = {"command", "args", "env", "cli"}
+HUB_CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
+HUB_CONN_KEYS = {"command", "args", "env", "cli", "local"}
 HUB_WATCH_KEYS = {"chat": {"channels"}, "mail": {"ignore_senders", "ignore_labels"},
-                  "tracker": {"projects", "extra_jql"}, "calendar": {"lead_minutes"}, "code": {"repos"}}
+                  "tracker": {"projects", "extra_jql"}, "calendar": {"lead_minutes"}, "code": {"repos"},
+                  "whatsapp": {"groups"}}
 
 
 TICK_EVERY = (30, 60, 120, 180, 240)
@@ -377,7 +378,12 @@ def validate_hub(h) -> list:
         for k in c:
             if k not in HUB_CONN_KEYS:
                 errs.append(f"unknown key {where}.{k}")
-        if "cli" in c:
+        if cap == "whatsapp" or "local" in c:
+            if cap != "whatsapp" or c.get("local") != "whatsapp":
+                errs.append(f'{where} must be {{"local": "whatsapp"}} (and only the whatsapp capability takes it)')
+            elif set(c) != {"local"}:
+                errs.append(f"{where} takes only local")
+        elif "cli" in c:
             if c["cli"] != "gh":
                 errs.append(f'{where}.cli must be "gh"')
         elif not (isinstance(c.get("command"), str) and c["command"]):

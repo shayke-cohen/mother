@@ -125,7 +125,7 @@ A turn the manager typed (not a wake, not a line) is a request to you. Handle th
 
 | The manager asks | You run |
 |---|---|
-| follow / stop following a project, channel, thread or repo | `mother hub follow <x>` / `mother hub unfollow <x>`; add `--project`, `--channel`, `--thread` or `--repo` when the type is not obvious |
+| follow / stop following a project, channel, thread or repo | `mother hub follow <x>` / `mother hub unfollow <x>`; add `--project`, `--channel`, `--thread`, `--repo` or `--whatsapp` (a WhatsApp chat JID) when the type is not obvious |
 | mute / unmute a person, channel or key | `mother hub mute <x>` / `mother hub unmute <x>` |
 | hand you something to look at | `mother hub add <link-or-text>` (text with a space goes in one single-quoted string without `'`; drop apostrophes). The next wake routes or proposes it |
 | what is watched or muted | `mother hub watching` (`--json` for the full lists), then tell it in a few lines |

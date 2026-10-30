@@ -81,6 +81,8 @@ def thing_key(source: str, ref: dict) -> str:
         return "mail:%s" % ref["thread_id"]
     if source == "calendar":
         return "cal:%s" % ref["event_id"]
+    if source == "whatsapp":
+        return "wa:%s" % ref["jid"]
     raise ValueError("unknown source: %r" % (source,))
 
 
@@ -228,7 +230,7 @@ def rotate_inbox(ws: Path, at: datetime) -> None:
 
 
 # ------------------------------------------------------------------------------------------------- watcher
-CAPS = ("chat", "mail", "tracker", "calendar", "code")
+CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
 DEFAULTS = {"every_seconds": 120, "idle_every_seconds": 600, "sweep_minutes": 30}
 
 
@@ -343,7 +345,7 @@ def pending_work(ws: Path, cfg: dict, at: datetime) -> bool:
     return False
 
 
-_EMPTY_WATCH = {"version": 1, "follow": {"projects": [], "channels": [], "threads": [], "repos": []},
+_EMPTY_WATCH = {"version": 1, "follow": {"projects": [], "channels": [], "threads": [], "repos": [], "whatsapp": []},
                 "mute": {"keys": [], "people": [], "channels": []}, "auto": {"projects": []}, "unfollowed": []}
 
 
@@ -376,7 +378,7 @@ def merged_watch(cfg: dict, watch: dict) -> dict:
     `chat.follow` = thread keys, `tracker.projects`, `code.repos`), plus a `mute` block."""
     w = _hub_cfg(cfg).get("watch")
     out = json.loads(json.dumps(w)) if isinstance(w, dict) else {}
-    for cap in ("chat", "tracker", "code"):
+    for cap in ("chat", "tracker", "code", "whatsapp"):
         if not isinstance(out.get(cap), dict):
             out[cap] = {}
     f = watch.get("follow") or {}
@@ -392,6 +394,7 @@ def merged_watch(cfg: dict, watch: dict) -> dict:
     sure = set(f.get("projects") or []) | set((_hub_cfg(cfg).get("watch") or {}).get("tracker", {}).get("projects") or [])
     out["tracker"]["auto"] = [k for k in autos if k not in sure]  # only these are dropped on repeated failure
     join("code", "repos", f.get("repos") or [])
+    join("whatsapp", "groups", f.get("whatsapp") or [])
     out["mute"] = {k: list((watch.get("mute") or {}).get(k) or []) for k in ("keys", "people", "channels")}
     return out
 
@@ -419,6 +422,10 @@ def is_muted(line: dict, mute: dict) -> bool:
         p = p.lower()
         if who and (who == p or (inner and inner.group(1).strip() == p)):
             return True
+    if line.get("source") == "whatsapp":  # a chat JID is a key, a person or (as `mute <jid>` stores it) `wa:<jid>`
+        jid = str(line.get("key"))[3:]
+        if jid in keys or jid.lower() in [p.lower() for p in mute.get("people") or []]:
+            return True
     if line.get("source") == "chat" and "/" in str(line.get("key")):
         if line["key"].split("/", 1)[0] in (mute.get("channels") or []):
             return True
@@ -436,6 +443,12 @@ def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
             if p:
                 keys.append(p)
         w["projects"] = list(dict.fromkeys(k for k in keys if isinstance(k, str) and k))
+    if cap == "whatsapp":  # the adapter has no client config of its own: it needs the `whatsapp` block
+        wa = (cfg or {}).get("whatsapp")
+        wa = wa if isinstance(wa, dict) else {}
+        w["_local"] = {"enabled": wa.get("enabled") is True, "read": wa.get("read") is True,
+                       "self_jid": wa.get("self_jid") if isinstance(wa.get("self_jid"), str) else "",
+                       "home": home_status(cfg) == 0}
     return w
 
 
@@ -660,6 +673,11 @@ def build_clients(cfg: dict, have: dict) -> dict:
         if adapter is None:
             continue
         try:
+            if conn.get("local"):  # the local WhatsApp database: a reader, no server and no tools
+                if conn["local"] != "whatsapp":
+                    raise McpError("other", "unsupported local source: %s" % conn["local"])
+                out[cap] = hub_sources.LocalWhatsApp()
+                continue
             if conn.get("cli"):  # cli wins over command
                 if conn["cli"] != "gh":
                     raise McpError("other", "unsupported cli: %s" % conn["cli"])
@@ -815,8 +833,8 @@ USAGE = """mother hub <verb>
   snooze      <U-id> 1h|tomorrow|next-week
   show        [--json]  pending proposals, updates and sessions
   add         <link-or-text> [--key K]  hand the hub a thing by hand (a `manual` line it always routes or proposes)
-  follow      [--project|--channel|--thread|--repo] <PROJECT | channel id | channel/ts | owner/repo>  watch it too (`unfollow` stops)
-  mute        <key | U-id | email | channel id>  drop its watcher lines (`unmute` undoes)
+  follow      [--project|--channel|--thread|--repo|--whatsapp] <PROJECT | channel id | channel/ts | owner/repo | WhatsApp JID>  watch it too (`unfollow` stops)
+  mute        <key | U-id | email | channel id | WhatsApp JID>  drop its watcher lines (`unmute` undoes)
   watching    [--json]  the merged watch list (config plus follows) and the mutes"""
 
 
@@ -840,6 +858,8 @@ def resolve_programs(cfg: dict, which=None) -> Tuple[Dict[str, str], List[str]]:
     which = which or shutil.which
     found, missing = {}, []
     for cap, conn in _conns(cfg).items():
+        if conn.get("local"):
+            continue  # nothing to run
         name = _program(conn)
         path = which(name) if name else None
         if path:
@@ -966,6 +986,21 @@ def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
             adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, ((cfg or {}).get("connectors") or {}).get(cap)))
             if adapter is None:
                 rows.append((cap, False, "no adapter for connectors.%s" % cap))
+                continue
+            if conn.get("local"):  # the WhatsApp database: readable, and switched on in config
+                why = adapter.gap(_watch_cfg(cfg, _hub_cfg(cfg), cap))
+                if why:
+                    rows.append((cap, False, why))
+                    continue
+                got = factory({"hub": {"connections": {cap: conn}}, "connectors": (cfg or {}).get("connectors")}, {})
+                c = got.get(cap)
+                try:
+                    if c is None or isinstance(c, Exception):
+                        raise RuntimeError(str(c) if c is not None else "no client")
+                    c.ping()
+                    rows.append((cap, True, "local database readable"))
+                except Exception as e:
+                    rows.append((cap, False, hub_sources.wa_problem(e.reason) if hasattr(e, "reason") else str(e)))
                 continue
             if conn.get("cli"):
                 try:
@@ -1681,8 +1716,9 @@ def add_cmd(ws: Path, at: datetime, args, out) -> int:
     return 0
 
 
+_WA_JID = re.compile(r"^(\d{6,15}@s\.whatsapp\.net|\d{6,30}(-\d+)?@g\.us)$", re.ASCII)
 _FORCE = {"project": ("projects", _PROJECT), "channel": ("channels", _CHANNEL), "thread": ("threads", _THREAD),
-          "repo": ("repos", _REPO)}
+          "repo": ("repos", _REPO), "whatsapp": ("whatsapp", _WA_JID)}
 _STRICT_CHANNEL = re.compile(r"^[CG][A-Z0-9]{8,}$")
 
 
@@ -1692,6 +1728,8 @@ def classify_follow(x: str, force: Optional[str] = None, known_channels=()):
     if force:
         name, pat = _FORCE[force]
         return (name, x) if pat.match(x) else None
+    if _WA_JID.match(x):
+        return "whatsapp", x
     if _THREAD.match(x):
         return "threads", x
     if _STRICT_CHANNEL.match(x) and x in known_channels:
@@ -1704,6 +1742,8 @@ def classify_follow(x: str, force: Optional[str] = None, known_channels=()):
 
 
 def classify_mute(x: str):
+    if _WA_JID.match(x):
+        return "keys", "wa:" + x
     if _CHAT_USER.match(x) or ("@" in x and "/" not in x):
         return "people", x
     if _CHANNEL.match(x) and any(c.isdigit() for c in x):
@@ -1720,7 +1760,8 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
             print(json.dumps({"watch": merged, "follow": w["follow"], "mute": w["mute"], "auto": w["auto"]},
                              indent=2, sort_keys=True), file=out)
             return 0
-        for cap, fld in (("chat", "channels"), ("chat", "follow"), ("tracker", "projects"), ("code", "repos")):
+        for cap, fld in (("chat", "channels"), ("chat", "follow"), ("tracker", "projects"), ("code", "repos"),
+                         ("whatsapp", "groups")):
             print("%s %s: %s" % (cap, "threads" if fld == "follow" else fld,
                                  ", ".join(merged.get(cap, {}).get(fld) or []) or "-"), file=out)
         for k in ("keys", "people", "channels"):
@@ -1732,24 +1773,24 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
         cut = args.index("--")
         args, tail_args = args[:cut], args[cut + 1:]
     if verb in ("follow", "unfollow"):
-        flags = [a for a in args if a in ("--project", "--channel", "--thread", "--repo")]
+        flags = [a for a in args if a in ("--project", "--channel", "--thread", "--repo", "--whatsapp")]
         args = [a for a in args if a not in flags]
         if len(flags) > 1:
-            print("mother hub %s: give at most one of --project --channel --thread --repo" % verb, file=sys.stderr)
+            print("mother hub %s: give at most one of --project --channel --thread --repo --whatsapp" % verb, file=sys.stderr)
             return 2
         force = flags[0][2:] if flags else None
     args = args + tail_args
     if len(args) != 1 or (not tail_args and args[0].startswith("--")):
         print("usage: mother hub %s <%s>" % (verb, "key|person|channel" if "mute" in verb
-                                             else "[--project|--channel|--thread|--repo] "
-                                                  "project|channel-id|channel/ts|owner/repo"), file=sys.stderr)
+                                             else "[--project|--channel|--thread|--repo|--whatsapp] "
+                                                  "project|channel-id|channel/ts|owner/repo|whatsapp-jid"), file=sys.stderr)
         return 2
     x = args[0]
     known = set(merged_watch(cfg, load_watch(ws)).get("chat", {}).get("channels") or [])
     mute = verb in ("mute", "unmute")
     found = classify_mute(x) if mute else classify_follow(x, force, known)
     if found is None:
-        print("mother hub %s: cannot tell what %r is (a project key, channel id, channel/ts or owner/repo)"
+        print("mother hub %s: cannot tell what %r is (a project key, channel id, channel/ts, owner/repo or WhatsApp JID)"
               % (verb, x), file=sys.stderr)
         return 2
     part, name = "mute" if mute else "follow", found[0]
@@ -1782,7 +1823,7 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
         base = merged_watch(cfg, {})
         conf = {"projects": _watch_cfg(cfg, _hub_cfg(cfg), "tracker").get("projects") or [],
                 "channels": base["chat"].get("channels") or [], "threads": base["chat"].get("follow") or [],
-                "repos": base["code"].get("repos") or []}
+                "repos": base["code"].get("repos") or [], "whatsapp": base["whatsapp"].get("groups") or []}
         if found[1] in conf.get(name, []):
             still = "; still watched from config.json"
     print("%s %s %s%s%s" % (verb, name, found[1], "" if changed else " (no change)", still), file=out)

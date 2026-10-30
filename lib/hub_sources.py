@@ -4,6 +4,7 @@ Each adapter polls one capability through a `hub_mcp.ReadOnlyClient` (code: thro
 `{lines, cursor, partial}`. Tool names are matched by suffix, so the gateway prefix does not matter. Product
 specifics live here and nowhere else. `cursor=None` is the first poll: it returns no lines and a cursor at `at`.
 """
+import hashlib
 import json
 import math
 import re
@@ -699,10 +700,133 @@ class CodeGithub(Adapter):
         return _result(lines, {"since": iso(at), "ci": ci, "branch": branches, "rr": rr})
 
 
+# ----------------------------------------------------------------------------------------------- whatsapp
+WA_OVERLAP = 120  # seconds of the last pass re-read; the seen-set drops what was already handled
+WA_MAX = 200  # messages per pass (one more is read, to know there were more)
+WA_SEEN = 500
+WA_OPEN = 100
+WA_WHY = {"denied": "grant Full Disk Access to the app that runs the watcher (System Settings > Privacy & Security)",
+          "missing": "the WhatsApp database was not found", "locked": "the WhatsApp database is locked",
+          "schema_changed": "the WhatsApp database has a layout MOTHER does not know"}
+
+
+def wa_problem(reason: str) -> str:
+    why = WA_WHY.get(reason)
+    return "WhatsApp database unreadable (%s)%s" % (reason, ": " + why if why else "")
+
+
+class LocalWhatsApp(object):
+    """The watcher's WhatsApp reader: the local database through `whatsapp.read_messages` / `recent_chats` and
+    nothing else. It has no send path and never imports or calls the bridge; read-only by construction."""
+
+    def messages(self, since_iso: str, limit: int) -> List[dict]:
+        import whatsapp
+        got = whatsapp.read_messages(None, since_iso, limit)
+        if got.get("status") != "ok":
+            raise whatsapp.ReaderError(got.get("reason") or "error")
+        return list(got.get("items") or [])
+
+    def ping(self) -> None:
+        """One chat-list read (no message content); raises whatsapp.ReaderError when the database is unreadable."""
+        import whatsapp
+        whatsapp.recent_chats(limit=1)
+
+
+def user_number(jid: str) -> str:
+    """The digits of a user JID (`<digits>@s.whatsapp.net`), else empty."""
+    m = re.fullmatch(r"(\d{6,15})@s\.whatsapp\.net", jid or "", re.ASCII)
+    return m.group(1) if m else ""
+
+
+class WhatsApp(Adapter):
+    """Direct messages to the manager and the groups they watch (or that mention them), from the local database.
+    `cfg` is `hub.watch.whatsapp` (`groups`: group JIDs, config plus followed) and `_local`, the `whatsapp` block's
+    `enabled`/`read`/`self_jid` and whether this is the home machine, which `hub._watch_cfg` adds."""
+    SOURCE = "whatsapp"
+    READ_TOOLS = set()  # no MCP tools: the client is a LocalWhatsApp
+
+    @classmethod
+    def gap(cls, cfg: dict) -> Optional[str]:
+        loc = cfg.get("_local") if isinstance(cfg, dict) else None
+        if not isinstance(loc, dict):
+            return "whatsapp is not configured"
+        if loc.get("enabled") is not True:
+            return "whatsapp.enabled is not true in config.json"
+        if loc.get("read") is not True:
+            return "whatsapp.read is not true in config.json"
+        if not loc.get("home"):
+            return "not the home machine: WhatsApp is read only where its database is"
+        if not loc.get("self_jid"):
+            return "whatsapp.self_jid is not set in config.json"
+        return None
+
+    @classmethod
+    def poll(cls, client, cursor, cfg, me, at):
+        import whatsapp
+        if cursor is None:
+            return _result([], {"ts": iso(at), "seen": [], "open": {}})
+        number = str((cfg.get("_local") or {}).get("self_jid") or "").split("@")[0]
+        mention = re.compile(r"@%s(?!\d)" % re.escape(number)) if number else None
+        groups = set(x for x in cfg.get("groups") or [] if isinstance(x, str))
+        marks = [m for m in me.get("marks") or [] if m]
+        since = parse_iso(cursor["ts"]) - timedelta(seconds=WA_OVERLAP)
+        try:
+            items = client.messages(iso(since), WA_MAX + 1)
+        except whatsapp.ReaderError as e:
+            raise McpError("other", wa_problem(e.reason))
+        partial = []
+        if len(items) > WA_MAX:
+            items = items[-WA_MAX:]
+            partial.append("more than %d WhatsApp messages since the last pass" % WA_MAX)
+        seen = list(cursor.get("seen") or [])
+        known = set(seen)
+        opened = dict(cursor.get("open") or {})
+        lines = []
+        for it in items:
+            chat = it.get("chat") or ""
+            text = it.get("text") or ""
+            when = it.get("at") or iso(at)
+            link = it.get("link") or ""
+            stanza = link.rsplit("/", 1)[-1] if link.startswith("whatsapp://") and "/" in link[11:] else ""
+            if not stanza or stanza == "None":
+                stanza = hashlib.sha1(("%s|%s|%s" % (chat, when, text)).encode("utf-8")).hexdigest()[:16]
+            sid = "whatsapp://%s/%s" % (chat, stanza)
+            if not chat or sid in known:
+                continue
+            known.add(sid)
+            seen.append(sid)
+            key = "wa:" + chat
+            group = chat.endswith("@g.us")
+            if it.get("from_me"):
+                if marks and any(k in text for k in marks):
+                    continue  # the agent's own signed message: neither news nor the manager's reply
+                if group and key not in opened:
+                    continue
+                opened.pop(key, None)
+                lines.append(hub.make_line("whatsapp", "resolved", key, when, title=text[:80],
+                                           summary=hub.plain(text), uid=stanza))
+                continue
+            if group and chat not in groups and not (mention and mention.search(text)):
+                continue
+            sender = it.get("sender") or ""
+            if group:
+                who, title, url = sender, "%s: %s" % (it.get("chat_name") or "group", text), ""
+            else:
+                who = "%s <%s>" % (sender, chat) if sender else chat
+                title = text
+                url = "whatsapp://send?phone=%s" % user_number(chat) if user_number(chat) else ""
+            opened[key] = when
+            lines.append(hub.make_line("whatsapp", "update", key, when, title=title[:80], who=who, link=url,
+                                       summary=hub.plain(text), also=hub.extract_also(text), uid=stanza))
+        keep = sorted(opened.items(), key=lambda kv: kv[1])[-WA_OPEN:]
+        return _result(lines, {"ts": iso(at), "seen": seen[-WA_SEEN:], "open": dict(keep)}, partial)
+
+
 ADAPTERS = {
     "chat:slack": ChatSlack,
     "mail:gmail": MailGmail,
     "tracker:jira": TrackerJira,
     "calendar:google": CalendarGoogle,
     "code:github": CodeGithub,
+    "whatsapp:whatsapp": WhatsApp,
 }  # type: Dict[str, Type[Adapter]]
