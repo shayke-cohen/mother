@@ -138,7 +138,7 @@
   "hub": {
     "enabled": false,
     "every_seconds": 120,
-    "idle_every_seconds": 600,
+    "idle_every_seconds": 3600,
     "model": null,
     "max_cards_per_wake": 3,
     "sweep_minutes": 30,

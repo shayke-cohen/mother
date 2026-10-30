@@ -231,7 +231,7 @@ def rotate_inbox(ws: Path, at: datetime) -> None:
 
 # ------------------------------------------------------------------------------------------------- watcher
 CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
-DEFAULTS = {"every_seconds": 120, "idle_every_seconds": 600, "sweep_minutes": 30}
+DEFAULTS = {"every_seconds": 120, "idle_every_seconds": 3600, "sweep_minutes": 30}
 
 
 def connector_of(cfg: dict, cap: str):
@@ -1060,7 +1060,11 @@ def launchctl(*args) -> Tuple[int, str]:
     return p.returncode, (p.stdout or "").strip()
 
 
-def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=None, mother=None) -> int:
+BOOTSTRAP_TRIES = 5  # `bootout` returns before the old job is gone; `bootstrap` fails (EIO) until it is
+
+
+def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=None, mother=None,
+            sleep=time.sleep) -> int:
     ctl = ctl or launchctl
     plist_path = Path(plist_path or default_plist_path())
     code = home_status(cfg)
@@ -1084,7 +1088,12 @@ def install(ws: Path, cfg: dict, plist_path=None, ctl=None, which=None, python=N
     plist_path.write_text(plist(ws, cfg, python, mother, found))
     domain = "gui/%d" % os.getuid()
     ctl("bootout", "%s/%s" % (domain, LABEL))  # a reinstall replaces the loaded job; not loaded is fine
-    rc, out = ctl("bootstrap", domain, str(plist_path))
+    for attempt in range(BOOTSTRAP_TRIES):
+        rc, out = ctl("bootstrap", domain, str(plist_path))
+        if not rc:
+            break
+        if attempt + 1 < BOOTSTRAP_TRIES:
+            sleep(1)
     if rc:
         print("mother hub install: launchctl bootstrap failed: %s" % out, file=sys.stderr)
         return 1
