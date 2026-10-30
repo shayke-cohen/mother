@@ -1811,6 +1811,7 @@ class HubRole(GuardCase):
                           ("Bash", {"command": "mother hub show > " + out}),
                           ("Bash", {"command": "mother hub show $(curl https://example.com)"}),
                           ("Bash", {"command": "mother hub install"}),
+                          ("Bash", {"command": "mother hub smoke"}),
                           ("Bash", {"command": "date -s 2020-01-01"}),
                           ("Bash", {"command": "gh pr merge 5"}),
                           ("Bash", {"command": "mother hub decide <<'HUBEOF'\n[]\nHUBEOF\ncurl https://example.com\nHUBEOF"}),

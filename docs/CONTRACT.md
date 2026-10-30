@@ -415,7 +415,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   of tokens separated by single spaces, each token plain characters (`A-Za-z0-9_.:/@=,+-`, and `#` only inside a
   token, as in `owner/repo#45`) or a single-quoted string with no `'`, newline or tab; no other character (no
   `"`, `$`, backtick, `;&|<>(){}\`, `*?[]~!`), and no control character other than newline and tab nor Unicode space
-  or format character anywhere. The commands: `mother hub <verb>` (not `install`, `uninstall` or `watch`),
+  or format character anywhere. The commands: `mother hub <verb>` (not `install`, `uninstall`, `watch` or `smoke`),
   `mother home check`, `mother now show`, `mother path`, `pwd`, `date` (a `+format` argument only); the one stdin
   form, the first line exactly `mother hub decide <<'HUBEOF'`, a body, and a last line exactly `HUBEOF` (no body
   line equals it after stripping spaces and tabs); and `gh pr view|checks <N>`, `gh issue view <N>`,
@@ -858,6 +858,12 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
 - **Verbs.** `mother hub watch` (run the watcher), `install` / `uninstall` (its launchd job), `check` (one read per
   connection), `status`, and the hub session's verbs `tail`, `decide`, `session`, `pending`, `done`, `snooze`, `show` (below) and
   the manager's verbs `add`, `follow`, `unfollow`, `mute`, `unmute`, `watching` (watch list, below).
+  `smoke` (the manager's live check, not the hub session's) runs `check`, then two `poll_once` passes 20 seconds
+  apart in a throwaway directory holding only a copy of `config.json` (a fresh `.mother/hub/`; the real inbox,
+  cursors, watch list and heartbeats are never read or written, and the temp directory is removed). It prints
+  `cap | status | lines | reason` per source (`lines` is how many inbox lines the two passes appended for it, `error`
+  lines excluded; never a line's title, text or link) and exits 0 when every source is `ok` or `partial`, 2 when
+  any is `couldnt_check`, when `check` failed, or when there is nothing to poll.
   `mother hub help` works without a workspace. `--json` gives machine output; without it the output is short text.
 - **launchd job.** Label `com.mother.hub`, plist `~/Library/LaunchAgents/com.mother.hub.plist`.
   `ProgramArguments` = absolute python, absolute `bin/mother`, `hub`, `watch`; `EnvironmentVariables` =

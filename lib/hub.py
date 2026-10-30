@@ -795,6 +795,8 @@ USAGE = """mother hub <verb>
   uninstall   unload the job and remove the plist
   check       one read per hub.connections entry, under the plist's environment: cap | ok/✗ | reason; exit 1 if any fails
   status      watcher and hub heartbeats; exit 2 if either is stale or the watcher never ran
+  smoke       check, then two polling passes 20 s apart into a throwaway copy of the state (never the real inbox);
+              prints source | status | lines | reason, no content; exit 2 if a source cannot be read
   tail        [--once] [--follow]  inbox lines after hub.json inbox_cursor, one JSON line per key (the hub's Monitor runs --follow)
   decide      stdin: one decision object or a list {line_id, key, decision: log|now|route|propose|error, ...}
   pending     raised <key> --name <slug> [--task <task_id>] | drop <key>
@@ -985,6 +987,53 @@ def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
     for cap, ok, why in rows:
         print("%s | %s | %s" % (cap, "ok" if ok else "\u2717", why), file=out)
     return 0 if all(r[1] for r in rows) else 1
+
+
+def smoke(cfg: dict, at: datetime, out=None, factory=None, sleep=time.sleep) -> int:
+    """A read-only live check of the whole watcher path: `check`, then two `poll_once` passes 20 seconds apart into
+    a throwaway workspace (only `config.json` is copied; the real inbox, cursors and watch list are never read or
+    written). Prints `cap | status | lines | reason` per enabled source and never a line's content. Exit 0 when
+    every source is ok or partial, 2 when any is not (or the check failed or there is nothing to poll)."""
+    import tempfile
+    out = out or sys.stdout
+    factory = factory or build_clients
+    if check(cfg, factory=factory, out=out) != 0:
+        print("smoke: check failed; no polling pass was made", file=out)
+        return 2
+    found, _ = resolve_programs(cfg)
+    saved = os.environ.get("PATH")
+    os.environ["PATH"] = launch_path(found)
+    clients = {}  # type: dict
+    try:
+        with tempfile.TemporaryDirectory(prefix="mother-hub-smoke-") as tmp:
+            ws = Path(tmp)
+            (ws / "config.json").write_text(json.dumps(cfg))
+            clients = factory(cfg, {})
+            poll_once(ws, cfg, at, clients)
+            sleep(20)
+            clients = factory(cfg, clients)  # a server that died is started again, as the watcher does
+            beat = poll_once(ws, cfg, at + timedelta(seconds=20), clients)
+            counts = {}  # type: Dict[str, int]
+            for l in read_inbox(ws):
+                if l.get("kind") != "error":
+                    counts[l.get("source")] = counts.get(l.get("source"), 0) + 1
+    finally:
+        for c in clients.values():
+            if c is not None and not isinstance(c, Exception):
+                _close(c)
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+    sources = beat.get("sources") or {}
+    for cap in CAPS:
+        ent = sources.get(cap)
+        if ent is None:
+            continue
+        reason = " ".join(str(ent.get("reason") or "").split())[:120]
+        print("%s | %s | %d | %s" % (cap, ent.get("status"), counts.get(cap, 0), reason or "-"), file=out)
+    ok = bool(sources) and all((e or {}).get("status") in ("ok", "partial") for e in sources.values())
+    return 0 if ok else 2
 
 
 def _missing_reads(tools, suffixes) -> List[str]:
@@ -1730,6 +1779,8 @@ def main(args, ws, cfg, at) -> int:
         return check(cfg)
     if verb == "status":
         return status(ws, at)
+    if verb == "smoke":
+        return smoke(cfg, at)
     as_json = "--json" in rest
     rest = [a for a in rest if a != "--json"]
     if verb == "tail":
