@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck, the sprint plan and WhatsApp, covered by 486 automated tests. One manager's workspace has
+> routines, the meeting deck, the sprint plan and WhatsApp, covered by 817 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -111,6 +111,36 @@ once, so the panel isn't loaded twice:
 /plugin uninstall mother-now@mother
 ```
 
+**Turn on the hub (optional).** The hub watches your sources and routes updates into your sessions (see "The hub"
+below). On the home machine, add a `hub` block to `config.json` with `enabled: true` and one connection per source
+you want watched:
+
+```json
+"hub": {
+  "enabled": true,
+  "connections": {
+    "chat":     {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/chat/mcp"]},
+    "mail":     {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/mail/mcp"]},
+    "tracker":  {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/tracker/mcp"]},
+    "calendar": {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/calendar/mcp"]},
+    "code":     {"cli": "gh"},
+    "whatsapp": {"local": "whatsapp"}
+  }
+}
+```
+
+The first four are MCP servers the watcher starts itself (here through a gateway proxy; use whatever command
+starts yours), `gh` is the code host's command line, and `whatsapp` reads the local WhatsApp database (it needs
+`whatsapp.enabled` and `whatsapp.read`). Leave out any you don't want. Then:
+
+```
+mother hub smoke      # reads each source twice, 20 s apart, in a throwaway copy; prints status and counts, never content
+mother hub install    # runs the watcher under launchd on this machine
+```
+
+Finally run `/mother:hub` once in a pinned session, in normal permission mode (not bypass), and leave it open: it
+wakes on each update and routes it. `mother hub status` shows whether the watcher and hub are keeping up.
+
 **Another computer, same workspace:** install the plugin, run `mother link` as above, then
 `mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines
 (`mother home show`), so don't register them on the second one.
@@ -145,7 +175,7 @@ The hub is optional and runs on your home machine. Set the `hub` block in `confi
 `/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
 session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
 
-WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": "whatsapp"` under `connectors` and `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
+WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 
 You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** and **Mute** on a hub session or hub update. It can't fetch the web or edit files; for those it proposes a session.
 

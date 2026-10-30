@@ -73,6 +73,7 @@ suggested next step, and then the quoted title, who and summary under its label.
 line as `propose`.
 
 **Propose.** Deciding `propose` does not raise a card by itself; it puts the item in `pending`.
+0. A `whatsapp` line (key `wa:<jid>`) gets no re-check: there is no connector to read it through. Decide from the line. Any reply to it is drafted in a work session and sent with MOTHER's WhatsApp send command (the `whatsapp` skill), which asks the manager first; this session never runs it.
 1. Re-check once: read the line's `link` through the capability that owns it (`chat.read`, `tracker.read`,
    `mail.read` or `code.read`; resolve the connector from `capabilities.json`). One read, no more. For code, the only shell reads this session may run are `gh pr view|checks <N>`, `gh issue view <N>`, `gh run view <N>` (`glab mr …` likewise), each with at most `--repo owner/repo`, `--json fields` and `--comments`, as separate tokens. If the thing is
    closed, or the manager has already replied or acted, decide `log` instead.

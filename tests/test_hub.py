@@ -1605,10 +1605,15 @@ class WaReader:
     def __init__(self, items=(), error=None):
         self.items, self.error, self.pings = list(items), error, 0
 
-    def messages(self, since_iso, limit):
+    def head(self):
         if self.error:
             raise self.error
-        return list(self.items)
+        return max([i["pk"] for i in self.items] or [0])
+
+    def messages_after(self, pk, limit):
+        if self.error:
+            raise self.error
+        return [i for i in self.items if i["pk"] > pk][:limit]
 
     def ping(self):
         self.pings += 1
@@ -1617,7 +1622,7 @@ class WaReader:
 
 
 def wa_item(text, at, chat=DM_JID, sid="S1", from_me=False, sender="Dana"):
-    return {"chat": chat, "chat_name": "Dana", "from_me": from_me, "sender": "me" if from_me else sender,
+    return {"pk": int(re.sub(r"\D", "", sid) or 0) + 100 * (1 if from_me else 0), "chat": chat, "chat_name": "Dana", "from_me": from_me, "sender": "me" if from_me else sender,
             "text": text, "at": at, "link": "whatsapp://%s/%s" % (chat, sid)}
 
 
@@ -1776,6 +1781,47 @@ class WhatsAppWatcher(unittest.TestCase):
         self.assertIn("whatsapp | ok | ", buf.getvalue())
         self.assertNotIn("secret", buf.getvalue())
         self.assertNotIn(DM_JID, buf.getvalue())
+
+    def test_mute_wa_key_as_the_panel_and_the_hub_skill_send_it(self):
+        for jid, who in ((DM_JID, "Dana"), (GROUP_JID, "Agnes")):
+            kind, value = hub.classify_mute("wa:" + jid)
+            self.assertEqual((kind, value), ("keys", "wa:" + jid))
+            l = line(source="whatsapp", key="wa:" + jid, who=who)
+            self.assertTrue(hub.is_muted(l, {kind: [value]}))
+        self.assertEqual(hub.classify_mute("wa:nonsense")[0], "keys")  # not a JID: still just a key
+        self.assertEqual(self.run_verb("mute", "--", "wa:" + DM_JID)[0], 0)
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["keys"], ["wa:" + DM_JID])
+        self.assertEqual(hub.load_watch(self.ws)["mute"]["people"], [])
+
+    def test_whatsapp_text_never_auto_follows_a_project(self):
+        r = WaReader()
+        self.poll(r)
+        r.items = [wa_item("please see PLAT-7 today", "2026-10-29T10:00:30Z")]
+        self.cfg["connectors"]["tracker"] = "jira"
+        saved = dict(hub_sources.ADAPTERS)
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        real = hub.auto_follow
+        seen = []
+        hub.auto_follow = lambda ws, lines, at, watched=(), known=None: seen.append(lines) or real(
+            ws, lines, at, watched, ["PLAT"])
+        self.addCleanup(lambda: setattr(hub, "auto_follow", real))
+        self.poll(r, 1)
+        self.assertEqual(hub.load_watch(self.ws)["auto"]["projects"], [])
+        self.assertEqual(real(self.ws, self.inbox(), self.AT, (), ["PLAT"]), [])
+        self.assertEqual(hub.load_watch(self.ws)["auto"]["projects"], [])
+
+    def test_the_local_connection_alone_enables_the_source(self):
+        del self.cfg["connectors"]
+        r = WaReader()
+        self.poll(r)
+        r.items = [wa_item("lunch?", "2026-10-29T10:00:30Z")]
+        beat = self.poll(r, 1)
+        self.assertEqual(beat["sources"]["whatsapp"], {"status": "ok"})
+        self.assertEqual(len(self.inbox()), 1)
+        self.assertIsInstance(hub.build_clients(self.cfg, {})["whatsapp"], hub_sources.LocalWhatsApp)
+        import io
+        buf = io.StringIO()
+        self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"whatsapp": r}, out=buf), 0, buf.getvalue())
 
     def test_a_local_connection_needs_no_program_on_the_path(self):
         found, missing = hub.resolve_programs(self.cfg, which=lambda n: None)

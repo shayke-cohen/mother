@@ -104,7 +104,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `workspace.git_remote` | str or null | null = local only |
 | `workspace.home_machine` | str or null | hostname allowed to run routines; null = routines refuse to run until set |
 | `connectors.{chat,tracker,mail,calendar,code}` | str | `slack`/`teams`, `jira`/`linear`/`monday`/`none`, … |
-| `connectors.whatsapp` | str, optional | `whatsapp`: names the hub watcher's local WhatsApp source (§5e); no MCP connector is involved |
+| `connectors.whatsapp` | str, optional | `whatsapp`. Not needed: the hub watcher's local WhatsApp source (§5e) is enabled by `hub.connections.whatsapp` alone, and no MCP connector is involved, so the doctor never lists it |
 | `teams[]` | list | `slug, name, tracker{project,board}, repos[], meetings{}, sprint{length,starts}, channels[], people[]` |
 | `people[]` (per team) | | `name, email, chat, code`, optional `one_on_one {cadence_days (3-90, default 14), title}` for 1:1 prep and drift |
 | `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, role: standup|team|product|support|announcements, quiet_hours ("HH:MM-HH:MM", default manager.quiet_hours), max_replies_per_hour (default 6), auto_topics: [slug] (auto mode)` |
@@ -837,7 +837,7 @@ is set without `MOTHER_WORKSPACE`, as in throwaway test workspaces.
   asks nothing, as for chat.
 - **Never.** Storing a chat body in the workspace; a first message to someone with no history; sending by any
   path the guard cannot see; assessing a person from their messages.
-- **The hub watcher.** The same reader feeds the hub's `whatsapp` source (§5e, "WhatsApp source"): DMs and watched groups, read-only, home machine only, and only while `whatsapp.enabled` and `whatsapp.read` are true.
+- **The hub watcher.** The same reader feeds the hub's `whatsapp` source (§5e, "WhatsApp source"): DMs and watched groups, read-only, home machine only, and only while `whatsapp.enabled` and `whatsapp.read` are true. For it the reader also has `max_pk()` (the newest `ZWAMESSAGE.Z_PK`) and `read_messages_after(pk, limit=100)`: the first `limit` messages with a larger `Z_PK`, oldest first, across chats, broadcast and status chats excluded, in the `read` item shape plus `pk`.
 
 ## 5e. Hub (`lib/hub*.py`, `mother hub`)
 
@@ -897,7 +897,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   woke) and older than 2x `every_seconds`: the hub has not caught up with a line it must decide. An old
   `last_wake` with nothing appended since is a quiet day, not stale; a missing `hub.json` prints `hub: never woke`.
 - **Watch list and `manual` lines.** `watch.json` (machine-local, atomic, under `hub.lock`) is
-  `{version: 1, follow: {projects, channels, threads, repos}, mute: {keys, people, channels}, auto: {projects:
+  `{version: 1, follow: {projects, channels, threads, repos, whatsapp}, mute: {keys, people, channels}, auto: {projects:
   [{key, from, at}]}, unfollowed: [project]}`; a missing or damaged file is empty. Each polling pass merges it with `hub.watch`
   (`merged_watch`: `whatsapp.groups` + followed WhatsApp chats, `chat.channels` + followed channels, `chat.follow` + followed threads, `tracker.projects` +
   followed and auto projects, `code.repos` + followed repos, plus the `mute` block) and hands the adapters that
@@ -1080,26 +1080,32 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   The calendar list tool has no recurrence-expansion argument (its inputSchema is calendarId, timeMin, timeMax), so
   starting-soon sees recurring meetings only when the tool returns the expanded instance.
   Errors carry a `health.CLASSES` kind: a timeout is `unreachable`, a closed server `dropped`.
-- **WhatsApp source** (capability `whatsapp`, adapter `whatsapp:whatsapp`, connection `{"local": "whatsapp"}`,
-  `connectors.whatsapp` = `whatsapp`). Reads the local database through `lib/whatsapp.py` (§5d) and nothing else:
-  the client the watcher builds for it (`LocalWhatsApp`) has two methods, `messages` (`read_messages` across
-  chats) and `ping` (one `recent_chats(limit=1)`), no send path, and never imports or calls the bridge; it
-  needs no program on the launchd `PATH`. It runs only when `whatsapp.enabled`, `whatsapp.read` and
-  `whatsapp.self_jid` are set and this is the home machine; otherwise the source is `couldnt_check` with that
-  reason (`whatsapp.read is not true in config.json`, `not the home machine …`), a config gap with no `error` line.
-  A `ReaderError` (database missing, locked, `schema_changed`, or `denied`: Full Disk Access is missing) is
-  `couldnt_check` with the reader's reason and, on the ok-to-failing transition, one `error` line like any source.
-  Candidates are messages newer than the cursor less a 2-minute overlap (deduped by stanza id in a seen-set of at
-  most 500; at most 200 per pass, more is `partial`) in a DM, or in a group that is listed in
-  `hub.watch.whatsapp.groups` or followed (`follow --whatsapp <jid>`), or, for any other group, only when the text
-  holds `@<digits of self_jid>`. One thing per chat, key `wa:<chat JID>`; `who` is `<name> <jid>` for a DM and the
-  member's name in a group; `title` is the text (a group's with the chat name first), at most 80 characters;
-  `summary` at most 300, both cleaned as other sources'; `link` is `whatsapp://send?phone=<digits>` for a DM and
-  empty for a group. The manager's own message (`from_me`) in a DM, or in a group after a candidate, is a
-  `resolved` line for that key; a message carrying MOTHER's signature is neither. `mute <jid>` (key `wa:<jid>`) and
-  mute by key drop its lines. Text from WhatsApp never auto-follows anything (auto-follow is tracker-validated).
-  The first poll returns no lines; the cursor is `{ts, seen, open}`. `check` prints `whatsapp | ok | local
-  database readable` (or the reason), `smoke` the usual counts; neither prints a message or JID.
+- **WhatsApp source** (capability `whatsapp`, adapter `whatsapp:whatsapp`, connection `{"local": "whatsapp"}`; the
+  adapter is taken from that connection, `connectors.whatsapp` is not required). Reads the local database through
+  `lib/whatsapp.py` (§5d) and nothing else: the client the watcher builds for it (`LocalWhatsApp`) has three
+  methods, `head` (the newest message row id), `messages_after` (`read_messages_after`) and `ping` (one
+  `recent_chats(limit=1)`), no send path, and never imports or calls the bridge; it needs no program on the
+  launchd `PATH`. It runs only when `whatsapp.enabled`, `whatsapp.read` and `whatsapp.self_jid` are set and this
+  is the home machine; otherwise the source is `couldnt_check` with that reason (`whatsapp.read is not true in
+  config.json`, `not the home machine …`), a config gap with no `error` line. A `ReaderError` (database missing,
+  locked, `schema_changed`, or `denied`: Full Disk Access is missing) is `couldnt_check` with the reader's reason
+  and, on the ok-to-failing transition, one `error` line like any source. The cursor is `{pk, open}`: `pk`, the
+  newest `ZWAMESSAGE.Z_PK` handled, so a message WhatsApp stores late (after the Mac slept, or the app
+  restarted) is still read although its send date is older than the last pass; the first poll sets `pk` to the
+  current newest row and returns no lines (no backlog flood; so does a cursor without a `pk`); `open` maps a chat
+  key to the date of a candidate the manager has not answered (at most 100). At most 200 messages are handled per
+  pass; when more are waiting the source is `partial` and the next pass continues from the cursor, so nothing
+  is lost. Candidates are messages in a DM, in a group listed in `hub.watch.whatsapp.groups` or followed
+  (`follow --whatsapp <jid>`), or, in any other group, only when the text holds `@<digits of self_jid>`. One thing
+  per chat, key `wa:<chat JID>`; `who` is the sender's name (the reader's name for a DM, the member's name in a
+  group; a number only when there is no name); `title` is the text (a group's with the chat name first), at most 80
+  characters; `summary` at most 300, both cleaned as other sources'; `link` is `whatsapp://send?phone=<digits>`
+  for a DM and empty for a group. The manager's own message (`from_me`) in a chat with an open candidate (DM or
+  group) is a `resolved` line for that key with an empty title, who and summary; with none open it is nothing, and
+  a message carrying MOTHER's signature is neither. `mute <jid>` or `mute wa:<jid>` (stored as the key `wa:<jid>`)
+  and mute by key drop its lines. Text from WhatsApp never auto-follows anything: `auto_follow` skips these
+  lines. `check` prints `whatsapp | ok | local database readable` (or the reason), `smoke` the usual counts;
+  neither prints a message or JID.
 
 ## 6. Sync (`bin/mother sync`)
 

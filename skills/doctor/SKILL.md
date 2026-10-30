@@ -36,7 +36,8 @@ keyword queries, then group results by server prefix (`mcp__<server>__…`):
 
 Also run `claude mcp list` if available: a server marked as needing authentication is `expired` without
 a call. Use `config.json` `connectors.*` to know which kinds matter; a kind set to `none` is skipped and
-not reported as a gap.
+not reported as a gap. WhatsApp is not an MCP connector (its reader is local, `mother whatsapp status`
+shows it), and the hub's `whatsapp` source needs no entry in `connectors`: never list it as a missing connector.
 
 **Test every server of a kind, not only the main one.** Two servers often serve one kind (a corporate
 gateway plus claude.ai connectors); record, per capability, which of them work. It is common for one to

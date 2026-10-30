@@ -281,6 +281,23 @@ class TestReader(Base):
         out = whatsapp.read_messages(None, SINCE, limit=2)
         self.assertEqual([i["text"] for i in out["items"]], ["a stranger writes", "note to self"])
 
+    def test_after_a_row_id_in_insertion_order_even_when_dated_older(self):
+        self.build()
+        self.assertEqual(whatsapp.max_pk(), len(MSGS))
+        out = whatsapp.read_messages_after(6)
+        self.assertEqual([i["pk"] for i in out["items"]], [7, 8, 9])  # the status chat (row 10) is left out
+        self.assertEqual([i["text"] for i in out["items"]], ["note to self", "from a hidden id", "levi here"])
+        self.assertEqual(out["items"][0]["link"], "whatsapp://%s/S2" % SELF)
+        self.assertEqual([i["pk"] for i in whatsapp.read_messages_after(0, limit=2)["items"]], [1, 2])  # oldest first
+        self.assertEqual(whatsapp.read_messages_after(len(MSGS))["items"], [])
+        self.assertNotIn("a status update", json.dumps(whatsapp.read_messages_after(0, limit=50)))
+
+    def test_after_reports_an_unreadable_database(self):
+        out = whatsapp.read_messages_after(0)
+        self.assertEqual((out["status"], out["reason"]), ("couldnt_check", "missing"))
+        with self.assertRaises(whatsapp.ReaderError):
+            whatsapp.max_pk()
+
     def test_a_hidden_id_chat_is_read_by_name(self):
         self.build()
         out = whatsapp.read_messages(self.chat("Hidden One"))

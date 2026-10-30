@@ -234,6 +234,17 @@ CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
 DEFAULTS = {"every_seconds": 120, "idle_every_seconds": 600, "sweep_minutes": 30}
 
 
+def connector_of(cfg: dict, cap: str):
+    """`connectors.<cap>`; for `whatsapp`, which needs no MCP connector, also the `local` connection."""
+    v = ((cfg or {}).get("connectors") or {}).get(cap)
+    if isinstance(v, str) and v:
+        return v
+    conn = (_hub_cfg(cfg).get("connections") or {}).get(cap)
+    if cap == "whatsapp" and isinstance(conn, dict) and conn.get("local") == "whatsapp":
+        return "whatsapp"
+    return None
+
+
 def _hub_cfg(cfg: dict) -> dict:
     h = (cfg or {}).get("hub")
     return h if isinstance(h, dict) else {}
@@ -480,8 +491,8 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     passed = []  # every line of this pass, for auto-follow
     known = None  # the tracker's real project keys, when its adapter could read them this pass
     for cap in CAPS if poll else ():
-        connector = connectors.get(cap)
-        if not isinstance(connector, str) or not connector:
+        connector = connector_of(cfg, cap)
+        if not connector:
             continue
         conns = h.get("connections") if isinstance(h.get("connections"), dict) else {}
         adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, connector))
@@ -571,8 +582,8 @@ def auto_follow(ws: Path, lines: List[dict], at: datetime, watched=(), real=None
     real = set(real)
     found = {}  # type: Dict[str, str]
     for l in lines:
-        if l.get("kind") == "manual":
-            continue
+        if l.get("kind") == "manual" or l.get("source") == "whatsapp":
+            continue  # a person's WhatsApp text never makes the watcher follow anything
         for k in [l.get("key")] + list(l.get("also") or []):
             m = _PROJECT_OF.match(k) if isinstance(k, str) else None
             if m and m.group(1) in real:  # `UTF-8`, `ISO-8601` look like keys but name no project
@@ -669,7 +680,7 @@ def build_clients(cfg: dict, have: dict) -> dict:
         conn = conns.get(cap)
         if not isinstance(conn, dict) or (cap in out and not isinstance(out[cap], Exception)):
             continue
-        adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, ((cfg or {}).get("connectors") or {}).get(cap)))
+        adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, connector_of(cfg, cap)))
         if adapter is None:
             continue
         try:
@@ -983,7 +994,7 @@ def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
             conn = conns.get(cap)
             if conn is None:
                 continue
-            adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, ((cfg or {}).get("connectors") or {}).get(cap)))
+            adapter = hub_sources.ADAPTERS.get("%s:%s" % (cap, connector_of(cfg, cap)))
             if adapter is None:
                 rows.append((cap, False, "no adapter for connectors.%s" % cap))
                 continue
@@ -1744,6 +1755,8 @@ def classify_follow(x: str, force: Optional[str] = None, known_channels=()):
 def classify_mute(x: str):
     if _WA_JID.match(x):
         return "keys", "wa:" + x
+    if x.startswith("wa:") and _WA_JID.match(x[3:]):
+        return "keys", x
     if _CHAT_USER.match(x) or ("@" in x and "/" not in x):
         return "people", x
     if _CHANNEL.match(x) and any(c.isdigit() for c in x):
