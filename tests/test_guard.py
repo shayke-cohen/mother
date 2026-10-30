@@ -1853,6 +1853,20 @@ class HubRole(GuardCase):
             if ";" not in cmd:
                 self.assertNotIn("single-quoted string", why, cmd)
 
+    def test_dms_verbs_pass_the_hub_role_and_the_workspace(self):
+        cmds = ("mother hub dms set U00000001=D00000001 U00000002=D00000002", "mother hub dms show --json",
+                "mother hub dms drop U00000001", "mother hub dms inbox D00000009", "mother hub dms inbox none")
+        for cmd in cmds:  # an ordinary workspace session: the shell allow-list
+            self.expect("none", "Bash", {"command": cmd}, session="local_other", cwd=self.ws)
+        self.start()
+        for cmd in cmds:
+            self.as_hub("Bash", {"command": cmd}, "none")
+        self.as_hub("Bash", {"command": "mother hub dms set U00000001=D00000001 | sh"}, "deny")
+        # outside active hours the hub schedules its own wake: a one-shot cron with exactly `/mother:hub`
+        self.as_hub("CronCreate", {"cron": "0 8 30 10 *", "prompt": "/mother:hub", "recurring": False}, "none")
+        self.as_hub("CronCreate", {"cron": "0 8 30 10 *", "prompt": "/mother:hub at 08:00", "recurring": False},
+                    "deny")
+
     def test_session_tools_keep_their_ask(self):
         self.start()
         self.as_hub("mcp__ccd_session_mgmt__send_message", {"session_id": "local_other", "message": "hi"}, "ask")

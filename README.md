@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck, the sprint plan and WhatsApp, covered by 820 automated tests. One manager's workspace has
+> routines, the meeting deck, the sprint plan and WhatsApp, covered by 841 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -184,6 +184,20 @@ The hub is optional and runs on your home machine. Set the `hub` block in `confi
 `/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
 session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
 
+Each wake is a model turn, and the Monitor that wakes the hub lasts at most 30 minutes, so the hub re-arms it every
+30 minutes inside your active hours even on a quiet day. Set `hub.model` to a small, fast model
+so those turns cost little. Outside active hours it doesn't re-arm: it schedules one `/mother:hub` run for the
+start of your next active window and goes quiet until then.
+
+**DMs and your self-DM.** The watcher's Slack server can't list your DMs, so it reads a DM only when you map it. To
+fill the DM map, list your DMs with your chat connector's DM listing (types im) in a normal MOTHER
+session, match the user ids to the people in `config.json`, then run `mother hub dms set …`, for example
+`mother hub dms set U00000001=D00000001 U00000002=D00000002` (only people in config are accepted, not your own id; `mother hub dms
+show` lists the map, `mother hub dms drop U00000001` removes one). A message from that person reaches the hub; your
+own reply in the DM clears it. To use your self-DM (the DM with yourself) as an inbox, run `mother hub dms inbox
+<its D… id>`: every note you type there becomes a thing the hub routes or proposes, like `mother hub add` (posts made by apps,
+MOTHER's included, are skipped).
+
 WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 
 You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** and **Mute** on a hub session or hub update. It can't fetch the web or edit files; for those it proposes a session.
@@ -219,7 +233,7 @@ Useful commands in your terminal:
 | `mother memory index <file>` | Add one index line for `memory/<file>.md` to `memory/MEMORY.md` (idempotent); the only unprompted writer of the index. `memory check` lists drift |
 | `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
 | `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
-| `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `smoke` runs `check` and two polling passes 20 s apart into a throwaway copy of the state and prints per-source status and line counts (never content; exit 2 if a source cannot be read), `watch` runs it in the foreground; `add <link-or-text>` hands the hub something by hand, `follow`/`unfollow`/`mute`/`unmute` edit its machine-local watch list, `watching` prints it |
+| `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `smoke` runs `check` and two polling passes 20 s apart into a throwaway copy of the state and prints per-source status and line counts (never content; exit 2 if a source cannot be read), `watch` runs it in the foreground; `add <link-or-text>` hands the hub something by hand, `follow`/`unfollow`/`mute`/`unmute` edit its machine-local watch list, `watching` prints it; `dms set|drop|show|inbox` maps DMs with people in config and the self-DM inbox |
 | `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
 | `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
 | `mother channels pause` / `resume` | Stop or restart replies in every channel |

@@ -25,8 +25,9 @@ wake mechanism and catches up from the cursor.
    if a source fails), and carry on: lines catch up when it returns.
 2. If `hub.model` in `$W/config.json` is set and differs from this session's model, set it on this session with
    the session-model tool (the app asks the manager). Don't change anything else about the session.
-3. **Stop what an earlier start left**: stop any Monitor this session started for `mother hub tail`, and delete any
-   recurring cron prompt that runs `mother hub tail`.
+3. **Stop what an earlier start left**: stop any Monitor this session started for `mother hub tail`, delete any
+   recurring cron prompt that runs `mother hub tail`, and delete any pending one-shot `/mother:hub` cron prompt (an
+   off-hours wake this run replaces; list them first).
 4. **Catch up first**: run `mother hub tail --once` and handle every printed line as on any wake (below), down to
    the `decide` call. Only then start the wake mechanism, so the backlog is not printed to you twice. (A line you
    decide twice comes back `already_decided` and changes nothing.)
@@ -34,11 +35,24 @@ wake mechanism and catches up from the cursor.
 
    | Mechanism | How | Use when |
    |---|---|---|
-   | Monitor (preferred) | Monitor on `mother hub tail --follow`; each printed line is an event | the Monitor tool is available |
+   | Monitor (preferred) | Monitor on `mother hub tail --follow` with `timeout_ms` 1800000 (30 minutes, the platform's cap); each printed line is an event | the Monitor tool is available |
    | Cron fallback | a recurring cron prompt every 3 minutes that starts exactly `mother hub tail --once` (the guard allows no other cron prompt here): "mother hub tail --once — run it and handle the lines; if it prints nothing, end the turn at once" | no Monitor tool, or it stopped and won't restart |
 
-   Tell the manager which one is running, then end the turn. If a Monitor stops later, the hub goes quiet until
-   `/mother:hub` is run again; the panel shows `hub stale`.
+   Tell the manager which one is running, then end the turn. If a Monitor stops for any reason other than its
+   timeout, the hub goes quiet until `/mother:hub` is run again; the panel shows `hub stale`.
+
+## When the Monitor expires
+
+A Monitor lasts at most 30 minutes. Each expiry wakes you for one small model turn, even when nothing happened,
+so keep that turn short (set `hub.model` to a small model to make it cheap). On the expiry notice:
+
+1. Run `mother hub tail --once` and handle any printed line as on any wake (it usually prints nothing).
+2. Run `mother hub status` and read its `now:` line (judged from the clock now, not the watcher's last pass):
+   - **`now: active hours`**: re-arm the same Monitor (`mother hub tail --follow`, `timeout_ms` 1800000), then end the turn.
+   - **`now: outside active hours`**: do NOT re-arm. Create one non-recurring cron prompt (`recurring: false`) with the
+     exact prompt `/mother:hub` (the only other prompt the guard allows here) and the cron fields from the status
+     line `next active window: … (one-shot cron: M H D Mo *)`. Then end the turn. That run restarts the hub at
+     the start of the window and catches up on anything the watcher appended overnight.
 
 ## Each wake
 
@@ -130,10 +144,20 @@ A turn the manager typed (not a wake, not a line) is a request to you. Handle th
 | mute / unmute a person, channel or key | `mother hub mute <x>` / `mother hub unmute <x>` |
 | hand you something to look at | `mother hub add <link-or-text>` (text with a space goes in one single-quoted string without `'`; drop apostrophes). The next wake routes or proposes it |
 | what is watched or muted | `mother hub watching` (`--json` for the full lists), then tell it in a few lines |
+| read my DMs with someone in config | `mother hub dms set U00000001=D00000001` (one `<user id>=<DM id>` per person; only people in `config.json` are accepted) / `mother hub dms drop U00000001` / `mother hub dms show`. You can't list DMs here: if the manager doesn't have the ids, tell them to fill the map from a normal MOTHER session (below) |
+| use my self-DM as an inbox | `mother hub dms inbox D00000009` (their self-DM's id; `mother hub dms inbox none` stops it). Each note they post there becomes a `manual` line |
 | what is going on | `mother hub show --json`, summarised: sessions, cards waiting, open updates |
 | send something into a session that follows a key | `mother hub session for <key>`, then the in-app message tool, as under Route |
 | open a session for something | the steps under **A session the manager asks for**, below |
 | drop a card waiting for them | `mother hub pending drop <key> --json`, then `dismiss_task` with its `task_id` |
+
+**DMs and the self-DM inbox.** The watcher reads a DM only when it is in the DM map, and its own Slack server
+cannot list DMs. To fill the DM map, list your DMs with the chat connector's DM listing (types im, which gives each
+DM's id and the other person's user id) in a normal MOTHER session, match user ids to the people in config, then run `mother hub dms set …`, for example
+`mother hub dms set U00000001=D00000001 U00000002=D00000002` (never the manager's own id: their self-DM is the
+inbox). A DM line has key `<DM id>/dm`: the person's message
+is an `update`, the manager's reply resolves it. A line from the inbox is a `manual` line like one `add` wrote: only notes the manager typed there count, never a
+post an app or MOTHER made.
 
 **A session the manager asks for.** Link it to its key, so later lines route into it:
 1. Find the key (`PLAT-12`, `owner/repo#12`, `<channel>/<ts>`; for anything else the key `mother hub add` prints).

@@ -61,7 +61,8 @@ with blocks shows it as a small grey footer: the body in `section` blocks, then 
 with the signature, since that is the notification fallback and what the hook reads. Send signed chat
 posts with link previews off (`unfurl_links: false`, `unfurl_media: false`): a signature that links
 somewhere would otherwise put a preview card under every message. Messages to the
-manager's own DM don't need it. The hook checks the signature only on grant-backed writes (below): a
+manager's own DM carry it too, on the first line: the hub watcher reads the manager's self-DM as an inbox and
+skips anything an app posted, and the signature is the second guard against MOTHER reading its own post as a note. The hook checks the signature only on grant-backed writes (below): a
 grant-backed chat post, thread reply or tracker comment must contain `{name} (AI)` (or the full
 `agent.signature`), in its `text` and in its `blocks` if it has any, or it falls back to ask.
 Everywhere else, signing is the skill's job.
