@@ -24,7 +24,7 @@ mods/now/                  the Now panel, a second plugin in the same marketplac
                            .claude-plugin/plugin.json (userConfig `mother_bin`), hooks/register.tsx (+ tests), types/index.d.ts;
                            opens with `/now-panel` (the engine reserves `/now` for the mother:now skill);
                            reads `.mother/now.json` and the hub's `.mother/hub/hub.json`, `sessions.json`, `watcher.json` (§5e), writes only through
-                           `mother now done|snooze|top` and `mother hub done|snooze|session seen`, no network or MCP calls;
+                           `mother now done|snooze|top` and `mother hub done|snooze|session seen|add|follow|mute` ("Send to hub" on an item with an http(s) link runs `add -- <link>`; Follow and Mute on a hub session row and a hub update row run `follow|mute -- <key>`; each toasts the verb's first output line, or its first stderr line on failure), no network or MCP calls;
                            a Hub section (health, Sessions, Waiting for you to start, Hub updates, Recently routed) and `hub ●|◌ stale|✗ · N waiting` on the status line (✗: `watcher.json` missing or its `at` older than max(10 min, 2x `every_seconds`); ◌ stale, only while `active`: `at` older than 2x `every_seconds`, or `last_append_at` later than `hub.json` `last_wake` (or no wake) and older than 2x `every_seconds`)
 tests/                     stdlib unittest; `python3 -m unittest discover tests`
 ```
@@ -895,6 +895,7 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   (a `manual` line in a batch suppresses the `resolved` handling of that key in the same batch), and `tail` always prints it; the hub
   routes or proposes it, never only logs it. `add` strips control and format characters from the text, key and
   link (a link not matching `^https?://\S+$` is left out and stays in the text); its id ends in a random suffix.
+  `--` ends the flags of `add`, `follow`, `unfollow`, `mute` and `unmute`: what follows is the value, even one that starts with `-`.
   A bare uppercase token given to `follow` is a project; it is a channel only when it is `C`/`G` plus 8 or more
   characters and already a known channel, or with `--channel`; `--project|--channel|--thread|--repo` force the type.
   The chat adapter remembers which threads came from the follow list (`followed` in its cursor) and drops one when

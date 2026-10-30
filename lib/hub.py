@@ -1373,6 +1373,9 @@ def _parse_flags(args, valued) -> Tuple[List[str], dict]:
     i = 0
     while i < len(args):
         a = args[i]
+        if a == "--":  # everything after it is positional
+            pos.extend(args[i + 1:])
+            break
         if a.startswith("--") and a[2:] in valued:
             if i + 1 >= len(args):
                 raise ValueError("%s needs a value" % a)
@@ -1656,6 +1659,10 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
             print("mute %s: %s" % (k, ", ".join(merged["mute"][k]) or "-"), file=out)
         return 0
     force = None
+    tail_args = []
+    if "--" in args:  # `--` ends the flags: what follows is the value, even one that starts with `-`
+        cut = args.index("--")
+        args, tail_args = args[:cut], args[cut + 1:]
     if verb in ("follow", "unfollow"):
         flags = [a for a in args if a in ("--project", "--channel", "--thread", "--repo")]
         args = [a for a in args if a not in flags]
@@ -1663,7 +1670,8 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
             print("mother hub %s: give at most one of --project --channel --thread --repo" % verb, file=sys.stderr)
             return 2
         force = flags[0][2:] if flags else None
-    if len(args) != 1 or args[0].startswith("--"):
+    args = args + tail_args
+    if len(args) != 1 or (not tail_args and args[0].startswith("--")):
         print("usage: mother hub %s <%s>" % (verb, "key|person|channel" if "mute" in verb
                                              else "[--project|--channel|--thread|--repo] "
                                                   "project|channel-id|channel/ts|owner/repo"), file=sys.stderr)

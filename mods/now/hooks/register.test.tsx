@@ -871,6 +871,56 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
+  test(`Send to hub on a Now item with a link runs mother hub add -- <link> and toasts its first line, on ${surface}`, async ($, on) => {
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }, false, {}, 'ENOENT',
+      () => ({ exitCode: 0, stdout: 'added a\nmore\n' }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'tohub-a' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'add', '--', 'https://example.com/a']])
+    expect(out.toasts).toContain('added a')
+    await ui.unmount()
+  })
+
+  test(`Send to hub is absent without an http(s) link, on ${surface}`, async ($, on) => {
+    const it = { ...item('a', 'on_you', 'open'), link: 'mailto:x@example.com' }
+    await boot($, on, { [PATH]: { text: JSON.stringify(doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 } })), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'tohub-a' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test(`a failed hub verb toasts its first stderr line, on ${surface}`, async ($, on) => {
+    const { out } = await boot($, on, { [PATH]: { text: JSON.stringify(doc()), mtimeMs: 1 } }, false, {}, 'ENOENT',
+      () => ({ exitCode: 2, stderr: '\nmother hub add: bad\nusage' }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'tohub-a' })
+    expect(out.toasts).toContain('mother hub add: bad')
+    await ui.unmount()
+  })
+
+  test(`Follow and Mute on a hub session row run mother hub follow|mute -- <key>, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) })
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), ss), false, {}, 'ENOENT', () => ({ exitCode: 0, stdout: 'following PLAT-2\n' }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'sess-follow-PLAT-2' })
+    await ui.press({ key: 'sess-mute-PLAT-2' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
+      ['python3', BIN, 'hub', 'follow', '--', 'PLAT-2'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-2']])
+    expect(out.toasts).toContain('following PLAT-2')
+    await ui.unmount()
+  })
+
+  test(`Follow and Mute on a hub update row run mother hub follow|mute -- <key>, on ${surface}`, async ($, on) => {
+    const updates = [{ id: 'U1', key: 'PLAT-5', title: 'Spec changed', why: 'w', link: null, at: iso(MIN), state: 'open' }]
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc({ updates }), null), false, {}, 'ENOENT', () => ({ exitCode: 0 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'hub-follow-U1' })
+    await ui.press({ key: 'hub-mute-U1' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([
+      ['python3', BIN, 'hub', 'follow', '--', 'PLAT-5'], ['python3', BIN, 'hub', 'mute', '--', 'PLAT-5']])
+    await ui.unmount()
+  })
+
   test(`a done or snoozed hub update is not listed, on ${surface}`, async ($, on) => {
     const updates = [{ id: 'U1', key: 'K', title: 'Closed one', why: 'w', link: null, at: iso(MIN), state: 'done' },
                      { id: 'U2', key: 'K2', title: 'Later one', why: 'w', link: null, at: iso(MIN), state: 'snoozed', snooze_until: iso(-MIN) }]

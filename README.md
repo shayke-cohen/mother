@@ -138,6 +138,8 @@ The hub is optional and runs on your home machine. Set the `hub` block in `confi
 `/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
 session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
 
+You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** and **Mute** on a hub session or hub update. It can't fetch the web or edit files; for those it proposes a session.
+
 ### Replying in team channels
 
 Each channel in `config.json` has a reply mode: `off`, `watch` (read for digests only), `mention` (answers in

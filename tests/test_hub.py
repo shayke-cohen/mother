@@ -1348,6 +1348,18 @@ class Direct(unittest.TestCase):
         self.run_verb("follow", "WEB")
         self.assertEqual(hub.load_watch(self.ws)["follow"]["projects"], ["WEB"])
 
+    def test_double_dash_ends_flags_for_add_follow_and_mute(self):
+        self.assertEqual(self.run_verb("follow", "--", "WEB")[0], 0)
+        self.assertIn("WEB", hub.load_watch(self.ws)["follow"]["projects"])
+        self.assertEqual(self.run_verb("follow", "--project", "--", "CORE")[0], 0)
+        self.assertEqual(self.run_verb("mute", "--", "PLAT-9")[0], 0)
+        self.assertIn("PLAT-9", hub.load_watch(self.ws)["mute"]["keys"])
+        self.assertEqual(self.run_verb("unmute", "--", "PLAT-9")[0], 0)
+        self.assertEqual(self.run_verb("add", "--", "https://example.com/browse/PLAT-7")[0], 0)
+        (l,) = self.inbox()
+        self.assertEqual((l["key"], l["link"]), ("PLAT-7", "https://example.com/browse/PLAT-7"))
+        self.assertEqual(self.run_verb("follow", "--")[0], 2)
+
     def test_follow_bare_token_is_project_unless_known_or_forced(self):
         for x in ("CORE2024", "GROWTH1", "C00000099"):
             self.run_verb("follow", x)
