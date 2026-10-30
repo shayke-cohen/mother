@@ -357,7 +357,8 @@ class TestTracker(unittest.TestCase):
             if not a.get("projectKey"):
                 raise hub_mcp.McpError("other", "Invalid arguments for `get-issues`: Missing required parameter `projectKey`.")
             return handler(a) if handler else {"issues": issues}
-        client, f = ro({"get-issues": get_issues}, hs.TrackerJira.READ_TOOLS)
+        client, f = ro({"get-issues": get_issues, "get-issue-changelog": lambda a: {"values": []}},
+                       hs.TrackerJira.READ_TOOLS)
         cur = {"since": "2026-10-29T09:50:00Z", "fp": fp}
         return hs.TrackerJira.poll(client, cur, cfg or {"projects": ["PLAT"], "extra_jql": "labels != x"}, ME, AT), f
 
@@ -366,7 +367,7 @@ class TestTracker(unittest.TestCase):
             return {"issues": [issue(a["projectKey"] + "-1", status="Done")]}
         out, f = self.run_poll([], {"PLAT-1": dict(self.BASE), "OPS-1": dict(self.BASE)},
                                cfg={"projects": ["PLAT", "OPS", "PLAT"]}, handler=h)
-        self.assertEqual([c[1]["projectKey"] for c in f.calls], ["PLAT", "OPS"])
+        self.assertEqual([c[1]["projectKey"] for c in f.calls if c[0].endswith("get-issues")], ["PLAT", "OPS"])
         self.assertIn("project = OPS", f.calls[1][1]["jql"])
         self.assertEqual(sorted(l["key"] for l in out["lines"]), ["OPS-1", "PLAT-1"])
         self.assertEqual(out["partial"], [])
@@ -383,6 +384,73 @@ class TestTracker(unittest.TestCase):
         self.assertIn("BAD", out["partial"][0])
         self.assertEqual(out["cursor"]["fp"]["OPS-1"]["status"], "Done")
         self.assertIn("BAD-9", out["cursor"]["fp"])  # the failed project's fingerprints are kept
+
+    def changelog_poll(self, handler, me=None, issues=None):
+        def get_issues(a):
+            return {"issues": issues or [issue("PLAT-1", status="Done")]}
+        client, f = ro({"get-issues": get_issues, "get-issue-changelog": handler}, hs.TrackerJira.READ_TOOLS)
+        cur = {"since": "2026-10-29T09:50:00Z", "fp": {"PLAT-1": dict(self.BASE)}}
+        return hs.TrackerJira.poll(client, cur, {"projects": ["PLAT"]}, me or ME, AT), f
+
+    @staticmethod
+    def history(created, author, field="status"):
+        return {"created": created, "author": author, "items": [{"field": field}]}
+
+    def test_own_status_change_is_resolved(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        h = lambda a: {"values": [self.history("2026-10-29T09:51:00.000+0000", theirs),
+                                  self.history("2026-10-29T09:55:00.000+0000", mine),
+                                  self.history("2026-10-29T09:56:00.000+0000", theirs, "labels")]}
+        out, f = self.changelog_poll(h)
+        self.assertEqual([(l["key"], l["kind"]) for l in out["lines"]], [("PLAT-1", "resolved")])
+        self.assertEqual([c[1]["issueKey"] for c in f.calls if c[0].endswith("changelog")], ["PLAT-1"])
+        # by account id alone
+        h2 = lambda a: {"values": [self.history("2026-10-29T09:55:00.000+0000", {"accountId": "acc9"})]}
+        out, _ = self.changelog_poll(h2, me=dict(ME, email="", tracker_account="acc9"))
+        self.assertEqual(out["lines"][0]["kind"], "resolved")
+
+    def test_others_change_is_update(self):
+        mine = {"accountId": "acc9", "emailAddress": "dana@example.com"}
+        theirs = {"accountId": "acc2", "emailAddress": "sam@example.com"}
+        h = lambda a: {"values": [self.history("2026-10-29T09:51:00.000+0000", mine),
+                                  self.history("2026-10-29T09:55:00.000+0000", theirs)]}
+        out, _ = self.changelog_poll(h)
+        self.assertEqual(out["lines"][0]["kind"], "update")
+
+    def test_changelog_failure_falls_back_to_update(self):
+        def boom(a):
+            raise hub_mcp.McpError("other", "nope")
+        out, _ = self.changelog_poll(boom)
+        self.assertEqual([l["kind"] for l in out["lines"]], ["update"])
+        out, _ = self.changelog_poll(lambda a: "garbage")
+        self.assertEqual([l["kind"] for l in out["lines"]], ["update"])
+
+    def test_no_changelog_call_for_label_only_or_unchanged(self):
+        client, f = ro({"get-issues": lambda a: {"issues": [issue("PLAT-1", labels=["x"])]},
+                        "get-issue-changelog": lambda a: {}}, hs.TrackerJira.READ_TOOLS)
+        hs.TrackerJira.poll(client, {"since": "2026-10-29T09:50:00Z", "fp": {"PLAT-1": dict(self.BASE)}},
+                            {"projects": ["PLAT"]}, ME, AT)
+        self.assertEqual([c for c in f.calls if c[0].endswith("changelog")], [])
+
+    def test_auto_project_failure_counter_and_drop(self):
+        def h(a):
+            if a["projectKey"] == "WEB":
+                raise hub_mcp.McpError("other", "no such project")
+            return {"issues": []}
+        client, _ = ro({"get-issues": h}, hs.TrackerJira.READ_TOOLS)
+        cfg = {"projects": ["WEB", "PLAT"], "auto": ["WEB"]}
+        cur = {"since": "2026-10-29T09:50:00Z", "fp": {}}
+        out = hs.TrackerJira.poll(client, cur, cfg, ME, AT)
+        self.assertEqual(out["cursor"]["fails"], {"WEB": 1})
+        self.assertNotIn("drop_auto", out)
+        out = hs.TrackerJira.poll(client, out["cursor"], cfg, ME, AT)
+        self.assertEqual(out["drop_auto"], ["WEB"])
+        self.assertEqual([(l["kind"], l["key"]) for l in out["lines"]], [("error", "watcher:tracker:WEB")])
+        self.assertEqual(out["cursor"]["fails"], {})
+        # a configured project never counts
+        out = hs.TrackerJira.poll(client, {"since": cur["since"], "fp": {}}, {"projects": ["WEB"]}, ME, AT)
+        self.assertEqual(out["cursor"]["fails"], {})
 
     def test_no_projects_is_a_config_gap(self):
         self.assertEqual(hs.TrackerJira.gap({"projects": []}), "no tracker projects configured")

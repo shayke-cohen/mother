@@ -292,7 +292,8 @@ def build_me(cfg: dict) -> dict:
     text MOTHER signs its own posts with (agent name `(AI)` and any configured signature)."""
     m = (cfg or {}).get("manager") or {}
     users = [x for x in _as_list(m.get("chat_dm")) if _CHAT_USER.match(x)]
-    me = {"email": m.get("email") or "", "chat": users[0] if users else "", "code": m.get("code") or ""}
+    me = {"email": m.get("email") or "", "chat": users[0] if users else "", "code": m.get("code") or "",
+          "tracker_account": m.get("tracker_account") if isinstance(m.get("tracker_account"), str) else ""}
     a = (cfg or {}).get("agent") or {}
     me["marks"] = ["%s (AI)" % a["name"]] if isinstance(a.get("name"), str) and a["name"] else []
     if isinstance(a.get("signature"), str) and a["signature"].strip():
@@ -343,7 +344,7 @@ def pending_work(ws: Path, cfg: dict, at: datetime) -> bool:
 
 
 _EMPTY_WATCH = {"version": 1, "follow": {"projects": [], "channels": [], "threads": [], "repos": []},
-                "mute": {"keys": [], "people": [], "channels": []}, "auto": {"projects": []}}
+                "mute": {"keys": [], "people": [], "channels": []}, "auto": {"projects": []}, "unfollowed": []}
 
 
 def load_watch(ws: Path) -> dict:
@@ -360,6 +361,8 @@ def load_watch(ws: Path) -> dict:
     out["auto"]["projects"] = [a for a in (auto.get("projects") or []) if isinstance(a, dict)
                                and isinstance(a.get("key"), str) and a["key"]] \
         if isinstance(auto.get("projects"), list) else []
+    out["unfollowed"] = [x for x in doc.get("unfollowed") or [] if isinstance(x, str) and x] \
+        if isinstance(doc.get("unfollowed"), list) else []
     return out
 
 
@@ -384,7 +387,10 @@ def merged_watch(cfg: dict, watch: dict) -> dict:
 
     join("chat", "channels", f.get("channels") or [])
     join("chat", "follow", f.get("threads") or [])
-    join("tracker", "projects", list(f.get("projects") or []) + [a["key"] for a in (watch.get("auto") or {}).get("projects") or []])
+    autos = [a["key"] for a in (watch.get("auto") or {}).get("projects") or []]
+    join("tracker", "projects", list(f.get("projects") or []) + autos)
+    sure = set(f.get("projects") or []) | set((_hub_cfg(cfg).get("watch") or {}).get("tracker", {}).get("projects") or [])
+    out["tracker"]["auto"] = [k for k in autos if k not in sure]  # only these are dropped on repeated failure
     join("code", "repos", f.get("repos") or [])
     out["mute"] = {k: list((watch.get("mute") or {}).get(k) or []) for k in ("keys", "people", "channels")}
     return out
@@ -458,6 +464,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     eff = effective_cfg(cfg, load_watch(ws))
     h = _hub_cfg(eff)
     mute = h["watch"].get("mute") or {}
+    passed = []  # every line of this pass, for auto-follow
     for cap in CAPS if poll else ():
         connector = connectors.get(cap)
         if not isinstance(connector, str) or not connector:
@@ -503,6 +510,9 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         res["lines"] = [l for l in res["lines"] if not is_muted(l, mute)]
         append_inbox(ws, res["lines"])
         woke = _must_decide(res["lines"]) or woke
+        passed.extend(res["lines"])
+        if res.get("drop_auto"):
+            drop_auto(ws, res["drop_auto"])
         with locked(ws):
             cursors = load_json(ws, "cursors.json", {})
             cursors = cursors if isinstance(cursors, dict) else {}
@@ -515,6 +525,8 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         else:
             sources[cap] = {"status": "ok"}
         _set_errored(ws, cap, False)
+    if poll and passed and isinstance(connectors.get("tracker"), str) and connectors.get("tracker"):
+        auto_follow(ws, passed, at, _watch_cfg(cfg, h, "tracker").get("projects") or [])
     if poll:
         woke = _maybe_sweep(ws, cfg, at, stamp) or woke
     beat = {"at": stamp, "every_seconds": every, "active": active, "sources": sources, "errors": errors}
@@ -524,6 +536,50 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     with locked(ws):
         save_json(ws, "watcher.json", beat)
     return beat
+
+
+AUTO_MAX = 20
+_PROJECT_OF = re.compile(r"^([A-Z][A-Z0-9]+)-\d+$")
+
+
+def auto_follow(ws: Path, lines: List[dict], at: datetime, watched=()) -> List[str]:
+    """Tracker projects that came up in a pass's lines (`key` and `also`) and are not watched, muted or unfollowed
+    join `watch.json` `auto.projects` (newest last; past 20 the oldest go). Returns the keys added. Runs after the
+    lines are appended and takes `hub.lock` itself."""
+    found = {}  # type: Dict[str, str]
+    for l in lines:
+        if l.get("kind") == "manual":
+            continue
+        for k in [l.get("key")] + list(l.get("also") or []):
+            m = _PROJECT_OF.match(k) if isinstance(k, str) else None
+            if m:
+                found.setdefault(m.group(1), k)
+    if not found:
+        return []
+    added = []
+    with locked(ws):
+        w = load_watch(ws)
+        known = set(watched) | set(w["follow"]["projects"]) | {a["key"] for a in w["auto"]["projects"]}
+        skip = known | set(w["mute"]["keys"]) | set(w["unfollowed"])
+        for proj, src in found.items():
+            if proj not in skip:
+                w["auto"]["projects"].append({"key": proj, "from": src, "at": _iso(at)})
+                added.append(proj)
+        if added:
+            w["auto"]["projects"] = w["auto"]["projects"][-AUTO_MAX:]
+            save_watch(ws, w)
+    return added
+
+
+def drop_auto(ws: Path, projects) -> None:
+    """Stop following auto projects (they failed repeatedly) and remember it so they are not re-followed."""
+    with locked(ws):
+        w = load_watch(ws)
+        keep = [a for a in w["auto"]["projects"] if a["key"] not in projects]
+        if len(keep) != len(w["auto"]["projects"]):
+            w["auto"]["projects"] = keep
+            w["unfollowed"] = list(dict.fromkeys(w["unfollowed"] + list(projects)))
+            save_watch(ws, w)
 
 
 def _failed(ws, cap, stamp, ent) -> bool:
@@ -1628,6 +1684,9 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
             changed = found[1] not in lst
             if changed:
                 lst.append(found[1])
+            if verb == "follow" and name == "projects" and found[1] in w["unfollowed"]:
+                w["unfollowed"].remove(found[1])
+                changed = True
         else:
             changed = found[1] in lst
             if changed:
@@ -1637,6 +1696,9 @@ def watch_cmd(ws: Path, cfg: dict, verb: str, args, as_json: bool, out) -> int:
                 keep = [a for a in auto if a.get("key") != found[1]]
                 changed = changed or len(keep) != len(auto)
                 w["auto"]["projects"] = keep
+                if found[1] not in w["unfollowed"]:
+                    w["unfollowed"].append(found[1])  # so it is not auto-followed again
+                    changed = True
         if changed:
             save_watch(ws, w)
     print("%s %s %s%s" % (verb, name, found[1], "" if changed else " (no change)"), file=out)

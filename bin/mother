@@ -218,6 +218,8 @@ def validate(cfg: dict) -> list:
         errs.append("manager.chat_dm must be a string or a non-empty list of strings")
     if "chat_user" in mgr and not isinstance(mgr["chat_user"], str):
         errs.append("manager.chat_user must be a string")
+    if "tracker_account" in mgr and not isinstance(mgr["tracker_account"], str):
+        errs.append("manager.tracker_account must be a string")
     wd = mgr.get("workdays", DAYS[:5])
     if not isinstance(wd, list) or any(d not in DAYS for d in wd):
         errs.append(f"manager.workdays must be a list of {DAYS}")

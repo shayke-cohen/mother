@@ -95,6 +95,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `agent.signature` | str, optional | default below |
 | `manager.chat_dm` | str or list | the manager's DM: user id and/or DM channel id |
 | `manager.chat_user` | str, optional | the manager's own user id, used to verify grant sources |
+| `manager.tracker_account` | str, optional | the manager's tracker account id; the hub watcher uses it (and `manager.email`) to tell the manager's own tracker edits from others' |
 | `agent.name`, `agent.emoji`, `agent.manager`, `agent.manager_short` | str | signature `"{emoji} *{name} (AI)* · on behalf of {manager_short}"` |
 | `manager.email`, `manager.timezone`, `manager.workdays`, `manager.chat_dm` | | `chat_dm` = the manager's DM channel/user id: the only always-allowed outbound target |
 | `workspace.git_remote` | str or null | null = local only |
@@ -878,12 +879,12 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `last_wake` with nothing appended since is a quiet day, not stale; a missing `hub.json` prints `hub: never woke`.
 - **Watch list and `manual` lines.** `watch.json` (machine-local, atomic, under `hub.lock`) is
   `{version: 1, follow: {projects, channels, threads, repos}, mute: {keys, people, channels}, auto: {projects:
-  [{key, from, at}]}}`; a missing or damaged file is empty. Each polling pass merges it with `hub.watch`
+  [{key, from, at}]}, unfollowed: [project]}`; a missing or damaged file is empty. Each polling pass merges it with `hub.watch`
   (`merged_watch`: `chat.channels` + followed channels, `chat.follow` + followed threads, `tracker.projects` +
   followed and auto projects, `code.repos` + followed repos, plus the `mute` block) and hands the adapters that
   effective config; `hub.watch` itself is never rewritten. Verbs, all writing only `.mother/hub/`: `follow <x>` /
   `unfollow <x>` classify `x` as a project (`[A-Z][A-Z0-9]+`), a channel (`C…`/`G…` id), a thread
-  (`<channel>/<ts>`) or a repo (`owner/repo`), else exit 2 (`unfollow` of a project also drops it from `auto`);
+  (`<channel>/<ts>`) or a repo (`owner/repo`), else exit 2 (`unfollow` of a project also drops it from `auto` and records it in `unfollowed`, which `follow` clears);
   `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, or anything else as a
   key; `watching [--json]` prints the merged list and the mutes; `add <link-or-text> [--key K]` appends one
   `manual` line (source `manual`; key = `--key`, else a chat message link's thread key, else the first tracker or
@@ -999,10 +1000,18 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `poll` returns `{lines, cursor, partial}`; the first poll (no cursor) returns no lines. The manager's own
   activity yields a `resolved` line for its key, never an `update`. A code CI line uses key `owner/repo#ci-<branch>`.
   A DM conversation is one thing, keyed `<channel>/dm`, so the manager's reply resolves it; an unthreaded reply in a
-  watched channel does not resolve the message it answers, the manager's own tracker field changes are
-  indistinguishable from others' without a changelog and come through as updates, and replies in threads the
-  watcher does not follow (ones the manager has not posted in) are not read (all three accepted gaps; a comment by
+  watched channel does not resolve the message it answers, the manager's own tracker comment, status, assignee and priority edits resolve (see Own tracker edits), and replies in threads the
+  watcher does not follow (ones the manager has not posted in) are not read (both accepted gaps; a comment by
   the manager does resolve).
+  **Tracker auto-follow.** After a pass's lines are appended, a tracker key (`PROJ-n`) in any line's `key` or `also`
+  whose project is not configured, followed, auto-followed, muted (as a key) or `unfollowed` is added to
+  `auto.projects` (`{key, from, at}`; at most 20, the oldest dropped), under `hub.lock` and separately from the
+  inbox append; the next pass polls it. A project in `auto` that fails two passes in a row is removed, recorded in
+  `unfollowed` and reported by one `error` line (`watcher:tracker:<PROJ>`); configured and followed projects only
+  mark the source `partial`, as before. **Own tracker edits.** For each issue whose status, assignee or priority
+  changed, the tracker adapter reads `get-issue-changelog` once; when the latest change to those fields was made by
+  the manager (`manager.tracker_account` as `accountId`, or `manager.email`) the line is `resolved`; a changelog
+  failure or an unreadable answer leaves it an `update`.
   A code PR leaving the review-requested set resolves its key; CI is green only when every check run is completed.
   The manager is recognised by `manager.email`, a chat user id (the first `U…` id in `manager.chat_dm`, a string
   or a list; else the `chat` of the `people` entry with the manager's email; a `D…` DM channel id is not a user),

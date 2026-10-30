@@ -232,7 +232,9 @@ class MailGmail(Adapter):
 # ------------------------------------------------------------------------------------------------- tracker
 class TrackerJira(Adapter):
     SOURCE = "tracker"
-    READ_TOOLS = {"get-issues"}
+    READ_TOOLS = {"get-issues", "get-issue-changelog"}
+    WATCHED = ("status", "assignee", "priority")
+    AUTO_FAILS = 2  # consecutive failing passes before an auto-followed project is dropped
     FIELDS = ["summary", "status", "assignee", "reporter", "priority", "updated", "created", "comment", "labels"]
 
     @staticmethod
@@ -255,18 +257,19 @@ class TrackerJira(Adapter):
     @classmethod
     def _fetch(cls, client, cfg, minutes, n):
         """(issues, failed): the read tool needs a projectKey, so one call per project; a failing project is
-        skipped (named in `failed`) and the others still poll."""
-        issues, failed = [], []
+        skipped (named in `failed`, and in `bad` by project) and the others still poll."""
+        issues, failed, bad = [], [], []
         for project in cls._projects(cfg):
             try:
                 res = client.call("get-issues", {"projectKey": project, "jql": cls._jql(cfg, project, minutes),
                                                  "fields": cls.FIELDS, "maxResults": n}) or {}
             except McpError as e:
                 failed.append("%s: %s" % (project, e.kind))
+                bad.append(project)
                 continue
             got = res.get("issues") or []
             issues.append((project, got))
-        return issues, failed
+        return issues, failed, bad
 
     @staticmethod
     def _fp(f: dict) -> dict:
@@ -288,11 +291,29 @@ class TrackerJira(Adapter):
                 pass
             return _result([], {"since": iso(at), "fp": fp})
         since = parse_iso(cursor["since"])
+        auto = set(cfg.get("auto") or [])
+        fails = {p: n for p, n in (cursor.get("fails") or {}).items() if p in auto and isinstance(n, int)}
         fps = dict(cursor.get("fp") or {})
         minutes = int(math.ceil((at - since).total_seconds() / 60.0)) + 2
         email = (me.get("email") or "").lower()
+        account = me.get("tracker_account") or ""
         lines, partial = [], []
-        pages, failed = cls._fetch(client, cfg, minutes, MAX_ISSUES + 1)
+        pages, failed, bad = cls._fetch(client, cfg, minutes, MAX_ISSUES + 1)
+        drop = []
+        for project in cls._projects(cfg):  # consecutive failures of an auto-followed project
+            if project not in auto:
+                continue
+            if project in bad:
+                fails[project] = fails.get(project, 0) + 1
+                if fails[project] >= cls.AUTO_FAILS:
+                    fails.pop(project)
+                    drop.append(project)
+                    lines.append(hub.make_line("tracker", "error", "watcher:tracker:%s" % project, iso(at),
+                                               title="stopped following tracker project %s" % project,
+                                               summary="it failed %d passes in a row; `mother hub follow %s` to retry"
+                                                       % (cls.AUTO_FAILS, project)))
+            else:
+                fails.pop(project, None)
         got = []
         for project, page in pages:
             if len(page) > MAX_ISSUES:
@@ -321,6 +342,10 @@ class TrackerJira(Adapter):
             kind = "update"
             if changed == ["comments"] and email and author == email:
                 kind = "resolved"
+            elif any(k in cls.WATCHED for k in changed) and (email or account) \
+                    and ("comments" not in changed or (email and author == email)) \
+                    and cls._own_change(client, key, email, account):
+                kind = "resolved"
             lines.append(hub.make_line("tracker", kind, hub.thing_key("tracker", {"key": key}),
                                        iso(parse_iso(f["updated"])) if f.get("updated") else iso(at),
                                        title=(f.get("summary") or "")[:120], who=who, link=link,
@@ -328,7 +353,38 @@ class TrackerJira(Adapter):
                                        also=hub.extract_also(f.get("summary") or "")))
         # prune the least recently updated, not the oldest inserted
         keep = dict(sorted(fps.items(), key=lambda kv: kv[1].get("u", ""))[-500:])
-        return _result(lines, {"since": iso(at), "fp": keep}, partial)
+        out = _result(lines, {"since": iso(at), "fp": keep, "fails": fails}, partial)
+        if drop:
+            out["drop_auto"] = drop
+        return out
+
+    @classmethod
+    def _own_change(cls, client, key, email, account) -> bool:
+        """True when the latest change to status / assignee / priority of `key` was made by the manager. One
+        changelog read; any failure or unreadable answer is False (the caller reports an update)."""
+        try:
+            res = client.call("get-issue-changelog", {"issueKey": key, "maxResults": 100}) or {}
+        except (McpError, ForbiddenTool):  # also a server that lacks the tool: never silence the line
+            return False
+        res = res if isinstance(res, dict) else {}
+        hist = res.get("values") or res.get("histories") or (res.get("changelog") or {}).get("histories") or []
+        best = None
+        for h in hist if isinstance(hist, list) else []:
+            if not isinstance(h, dict) or not h.get("created"):
+                continue
+            if not any(isinstance(it, dict) and str(it.get("field", "")).lower() in cls.WATCHED
+                       for it in h.get("items") or []):
+                continue
+            try:
+                when = parse_iso(h["created"].replace("+0000", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            if best is None or when > best[0]:
+                best = (when, h.get("author"))
+        who = (best[1] if best else None) or {}
+        return bool(best) and isinstance(who, dict) and (
+            bool(account and who.get("accountId") == account)
+            or bool(email and str(who.get("emailAddress", "")).lower() == email))
 
 
 # ------------------------------------------------------------------------------------------------ calendar

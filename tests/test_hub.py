@@ -422,7 +422,7 @@ class Watcher(unittest.TestCase):
     def test_me_comes_from_manager_and_matching_person(self):
         self.cfg["teams"] = [{"people": [{"name": "Dana Levi", "email": "dana@example.com", "code": "danal"}]}]
         self.assertEqual(hub.build_me(self.cfg), {"email": "dana@example.com", "chat": "U00000000", "code": "danal",
-                                                  "marks": []})
+                                                  "tracker_account": "", "marks": []})
 
     def test_home_status(self):
         os.environ["MOTHER_HOSTNAME"] = "laptop"
@@ -672,7 +672,7 @@ class Install(unittest.TestCase):
         import hub_mcp
 
         class C:
-            tools = ["mcp__x__get-issues", "mcp__x__create-issue"]
+            tools = ["mcp__x__get-issues", "mcp__x__get-issue-changelog", "mcp__x__create-issue"]
             closed = False
 
             def close(self):
@@ -689,7 +689,7 @@ class Install(unittest.TestCase):
         buf = io.StringIO()
         self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"tracker": c}, gh_user=lambda: None,
                                    which=self.which, out=buf), 1)
-        self.assertIn("tracker | \u2717 | missing read tools: get-issues", buf.getvalue())
+        self.assertIn("tracker | \u2717 | missing read tools: get-issue-changelog, get-issues", buf.getvalue())
         buf = io.StringIO()
 
         def bad():
@@ -1446,6 +1446,66 @@ class Direct(unittest.TestCase):
         hub.poll_once(self.ws, self.cfg, self.AT + timedelta(minutes=2), clients)
         self.assertEqual([(l["source"], l["key"]) for l in self.inbox()], [("manual", "PLAT-1")])
         self.assertEqual(set(A.seen["projects"]), {"PLAT", "WEB"})
+
+    def poll_with(self, adapter, minutes=0):
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["tracker:jira"] = adapter
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        return hub.poll_once(self.ws, self.cfg, self.AT + timedelta(minutes=minutes), {"tracker": object()})
+
+    def adapter(self, keys, drop=None):
+        class A:
+            READ_TOOLS = set()
+            seen = []
+
+            @classmethod
+            def poll(cls, client, cursor, cfg, me, at):
+                cls.seen.append(cfg)
+                if cursor is None:
+                    return {"lines": [], "cursor": {"n": 1}, "partial": []}
+                out = {"lines": [line(key=k, also=a) for k, a in keys], "cursor": {"n": 2}, "partial": []}
+                if drop:
+                    out["drop_auto"] = drop
+                return out
+        return A
+
+    def test_mention_of_unwatched_project_auto_follows(self):
+        A = self.adapter([("PLAT-1", ["WEB-4"]), ("C00000001/1.0", ["OPS-2", "plat-9"]), ("MUTED-1", []),
+                          ("GONE-1", [])])
+        self.run_verb("mute", "MUTED")
+        self.run_verb("unfollow", "GONE")
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        w = hub.load_watch(self.ws)
+        self.assertEqual([a["key"] for a in w["auto"]["projects"]], ["WEB", "OPS"])
+        self.assertEqual(w["auto"]["projects"][0]["from"], "WEB-4")
+        self.assertTrue(w["auto"]["projects"][0]["at"].startswith("2026-10-29"))
+        self.poll_with(A, 4)  # now polled, and not added twice
+        self.assertEqual(set(A.seen[-1]["projects"]), {"PLAT", "WEB", "OPS"})
+        self.assertEqual(len(hub.load_watch(self.ws)["auto"]["projects"]), 2)
+        self.run_verb("follow", "GONE")  # follow clears the unfollow record
+        self.assertEqual(hub.load_watch(self.ws)["unfollowed"], [])
+
+    def test_auto_projects_capped_at_20(self):
+        keys = [("P%02d-1" % n, []) for n in range(25)]
+        A = self.adapter(keys)
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        got = [a["key"] for a in hub.load_watch(self.ws)["auto"]["projects"]]
+        self.assertEqual(len(got), 20)
+        self.assertEqual(got[-1], "P24")
+        self.assertNotIn("P00", got)
+
+    def test_auto_project_dropped_after_two_failures(self):
+        hub.save_json(self.ws, "watch.json", {"auto": {"projects": [{"key": "WEB", "from": "WEB-1", "at": "x"}]}})
+        A = self.adapter([], drop=["WEB"])
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        w = hub.load_watch(self.ws)
+        self.assertEqual(w["auto"]["projects"], [])
+        self.assertEqual(w["unfollowed"], ["WEB"])
+        self.run_verb("unfollow", "PLAT")
+        self.assertIn("PLAT", hub.load_watch(self.ws)["unfollowed"])
 
     def test_watching_merges_config_and_file(self):
         self.run_verb("follow", "WEB")

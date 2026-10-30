@@ -8,6 +8,7 @@
   },
   "manager": {
     "email": "dana@example.com",
+    "tracker_account": "",
     "timezone": "Europe/London",
     "workdays": [
       "Mon",
