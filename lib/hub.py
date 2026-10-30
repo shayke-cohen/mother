@@ -465,6 +465,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     h = _hub_cfg(eff)
     mute = h["watch"].get("mute") or {}
     passed = []  # every line of this pass, for auto-follow
+    known = None  # the tracker's real project keys, when its adapter could read them this pass
     for cap in CAPS if poll else ():
         connector = connectors.get(cap)
         if not isinstance(connector, str) or not connector:
@@ -511,6 +512,8 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         append_inbox(ws, res["lines"])
         woke = _must_decide(res["lines"]) or woke
         passed.extend(res["lines"])
+        if cap == "tracker" and isinstance(res.get("known_projects"), list):
+            known = res["known_projects"]
         if res.get("drop_auto"):
             drop_auto(ws, res["drop_auto"])
         with locked(ws):
@@ -526,7 +529,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             sources[cap] = {"status": "ok"}
         _set_errored(ws, cap, False)
     if poll and passed and isinstance(connectors.get("tracker"), str) and connectors.get("tracker"):
-        auto_follow(ws, passed, at, _watch_cfg(cfg, h, "tracker").get("projects") or [])
+        auto_follow(ws, passed, at, _watch_cfg(cfg, h, "tracker").get("projects") or [], known)
     if poll:
         woke = _maybe_sweep(ws, cfg, at, stamp) or woke
     beat = {"at": stamp, "every_seconds": every, "active": active, "sources": sources, "errors": errors}
@@ -542,17 +545,21 @@ AUTO_MAX = 20
 _PROJECT_OF = re.compile(r"^([A-Z][A-Z0-9]+)-\d+$")
 
 
-def auto_follow(ws: Path, lines: List[dict], at: datetime, watched=()) -> List[str]:
-    """Tracker projects that came up in a pass's lines (`key` and `also`) and are not watched, muted or unfollowed
-    join `watch.json` `auto.projects` (newest last; past 20 the oldest go). Returns the keys added. Runs after the
-    lines are appended and takes `hub.lock` itself."""
+def auto_follow(ws: Path, lines: List[dict], at: datetime, watched=(), real=None) -> List[str]:
+    """Tracker projects that came up in a pass's lines (`key` and `also`), are real projects (in `real`, the
+    tracker's project keys; None, when they could not be read, follows nothing) and are not watched, muted or
+    unfollowed join `watch.json` `auto.projects` (newest last; past 20 the oldest go). Returns the keys added. Runs
+    after the lines are appended and takes `hub.lock` itself."""
+    if real is None:
+        return []
+    real = set(real)
     found = {}  # type: Dict[str, str]
     for l in lines:
         if l.get("kind") == "manual":
             continue
         for k in [l.get("key")] + list(l.get("also") or []):
             m = _PROJECT_OF.match(k) if isinstance(k, str) else None
-            if m:
+            if m and m.group(1) in real:  # `UTF-8`, `ISO-8601` look like keys but name no project
                 found.setdefault(m.group(1), k)
     if not found:
         return []

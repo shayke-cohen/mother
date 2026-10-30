@@ -1021,16 +1021,22 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   others still read. These threads are not added to the persistent followed set (only the manager's own posts
   do that). Followed threads (`watch.json` follow.threads) are always read.
   **Tracker auto-follow.** After a pass's lines are appended, a tracker key (`PROJ-n`) in any line's `key` or `also`
-  whose project is not configured, followed, auto-followed, muted (as a key) or `unfollowed` is added to
-  `auto.projects` (`{key, from, at}`; at most 20, the oldest dropped), under `hub.lock` and separately from the
-  inbox append; the next pass polls it. A project in `auto` that fails two passes in a row is removed, recorded in
-  `unfollowed` and reported by one `error` line (`watcher:tracker:<PROJ>`); configured and followed projects only
-  mark the source `partial`, as before. **Own tracker edits.** For each issue whose status, assignee or priority
+  whose project is a real project (below) and is not configured, followed, auto-followed, muted (as a key) or
+  `unfollowed` is added to `auto.projects` (`{key, from, at}`; at most 20, the oldest dropped), under `hub.lock` and
+  separately from the inbox append; the next pass polls it. Real projects are the keys the tracker's
+  `list-projects` read tool returns (paged 100 at a time, at most 20 pages), cached in the tracker cursor as
+  `projects: {at, keys}` and re-read at most once a day; a pass in which they cannot be read (the tool fails, is
+  missing, or answers in an unreadable shape) keeps the old cache for the next try and auto-follows nothing, so
+  `UTF-8` or `ISO-8601` in chat text is never followed. The cursor's `auto_read` lists the auto projects that have
+  been read successfully at least once. An auto project that fails before any successful read is removed and
+  recorded in `unfollowed` silently (no `error` line, no `partial`); one that has been read and then fails two passes
+  in a row is removed, recorded in `unfollowed` and reported by one `error` line (`watcher:tracker:<PROJ>`);
+  configured and followed projects only mark the source `partial`, as before. **Own tracker edits.** For each issue whose status, assignee or priority
   changed, the tracker adapter reads `get-issue-changelog` (paged oldest first: one read for `total`, then the last 50
   entries; without a `total`, up to 5 pages until `isLast` is true, and past the cap or with no `isLast` the line stays an `update`; offsets like `+0300` are normalised); when the latest change to those fields was made by
   the manager (`manager.tracker_account` as `accountId`, or `manager.email`) the line is `resolved`; a changelog
   failure or an unreadable answer (only the `values` shape is read) leaves it an `update`. `mother hub check`
-  requires `get-issue-changelog` on the tracker server (a missing tool is a missing read tool).
+  requires `get-issue-changelog` and `list-projects` on the tracker server (a missing tool is a missing read tool).
   A code PR leaving the review-requested set resolves its key; CI is green only when every check run is completed.
   The manager is recognised by `manager.email`, a chat user id (the first `U…` id in `manager.chat_dm`, a string
   or a list; else the `chat` of the `people` entry with the manager's email; a `D…` DM channel id is not a user),

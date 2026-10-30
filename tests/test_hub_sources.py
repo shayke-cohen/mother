@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,7 +42,7 @@ class Fake:
 
 def ro(handlers, suffixes):
     f = Fake(handlers)
-    return hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, suffixes)), f
+    return hub_mcp.ReadOnlyClient(f, hub_mcp.resolve_tools(f.tools, suffixes), suffixes), f
 
 
 class TestClient(unittest.TestCase):
@@ -575,14 +575,19 @@ class TestTracker(unittest.TestCase):
         self.assertEqual([c for c in f.calls if c[0].endswith("changelog")], [])
 
     def test_auto_project_failure_counter_and_drop(self):
+        broken = []
+
         def h(a):
-            if a["projectKey"] == "WEB":
+            if a["projectKey"] in broken:
                 raise hub_mcp.McpError("other", "no such project")
             return {"issues": []}
         client, _ = ro({"get-issues": h}, hs.TrackerJira.READ_TOOLS)
         cfg = {"projects": ["WEB", "PLAT"], "auto": ["WEB"]}
         cur = {"since": "2026-10-29T09:50:00Z", "fp": {}}
-        out = hs.TrackerJira.poll(client, cur, cfg, ME, AT)
+        out = hs.TrackerJira.poll(client, cur, cfg, ME, AT)  # read once: from now on its failures count
+        self.assertEqual(out["cursor"]["auto_read"], ["WEB"])
+        broken.append("WEB")
+        out = hs.TrackerJira.poll(client, out["cursor"], cfg, ME, AT)
         self.assertEqual(out["cursor"]["fails"], {"WEB": 1})
         self.assertNotIn("drop_auto", out)
         out = hs.TrackerJira.poll(client, out["cursor"], cfg, ME, AT)
@@ -592,6 +597,53 @@ class TestTracker(unittest.TestCase):
         # a configured project never counts
         out = hs.TrackerJira.poll(client, {"since": cur["since"], "fp": {}}, {"projects": ["WEB"]}, ME, AT)
         self.assertEqual(out["cursor"]["fails"], {})
+
+    def test_auto_project_never_read_is_dropped_silently(self):
+        def h(a):
+            if a["projectKey"] == "WEB":
+                raise hub_mcp.McpError("other", "no such project")
+            return {"issues": []}
+        client, _ = ro({"get-issues": h}, hs.TrackerJira.READ_TOOLS)
+        out = hs.TrackerJira.poll(client, {"since": "2026-10-29T09:50:00Z", "fp": {}},
+                                  {"projects": ["WEB", "PLAT"], "auto": ["WEB"]}, ME, AT)
+        self.assertEqual(out["drop_auto"], ["WEB"])
+        self.assertEqual((out["lines"], out["partial"]), ([], []))
+        self.assertEqual(out["cursor"]["fails"], {})
+
+    def projects_poll(self, handler, cursor=None, at=AT):
+        client, f = ro({"get-issues": lambda a: {"issues": []}, "list-projects": handler}, hs.TrackerJira.READ_TOOLS)
+        cur = cursor if cursor is not None else {"since": "2026-10-29T09:50:00Z", "fp": {}}
+        return hs.TrackerJira.poll(client, cur, {"projects": ["PLAT"]}, ME, at), f
+
+    def test_real_project_keys_are_read_paged_and_cached_for_a_day(self):
+        def h(a):
+            start = a["startAt"]
+            vals = [{"key": "P%03d" % n} for n in range(start, min(start + a["maxResults"], 150))]
+            return {"values": vals, "total": 150, "isLast": start + a["maxResults"] >= 150}
+        out, f = self.projects_poll(h)
+        self.assertEqual(len(out["known_projects"]), 150)
+        self.assertEqual([c[1]["startAt"] for c in f.calls if c[0].endswith("list-projects")], [0, 100])
+        self.assertEqual(out["cursor"]["projects"]["at"], "2026-10-29T10:00:00Z")
+        later, f2 = self.projects_poll(h, out["cursor"], AT + timedelta(hours=23))
+        self.assertEqual(len(later["known_projects"]), 150)
+        self.assertEqual([c for c in f2.calls if c[0].endswith("list-projects")], [])  # from the cache
+        nextday, f3 = self.projects_poll(lambda a: [{"key": "PLAT"}], out["cursor"], AT + timedelta(hours=25))
+        self.assertEqual(nextday["known_projects"], ["PLAT"])
+        self.assertEqual(len([c for c in f3.calls if c[0].endswith("list-projects")]), 1)
+
+    def test_failed_project_list_gives_none_and_keeps_the_old_cache(self):
+        def boom(a):
+            raise hub_mcp.McpError("other", "nope")
+        old = {"since": "2026-10-29T09:50:00Z", "fp": {}, "projects": {"at": "2026-10-27T10:00:00Z", "keys": ["PLAT"]}}
+        out, _ = self.projects_poll(boom, old)
+        self.assertIsNone(out["known_projects"])
+        self.assertEqual(out["cursor"]["projects"], old["projects"])
+        self.assertEqual(out["partial"], [])
+        out, _ = self.projects_poll(lambda a: "garbage")
+        self.assertIsNone(out["known_projects"])
+        # a server without the tool: none, and the source still polls
+        out, _ = TestTracker.run_poll(self, [], {})
+        self.assertIsNone(out["known_projects"])
 
     def test_no_projects_is_a_config_gap(self):
         self.assertEqual(hs.TrackerJira.gap({"projects": []}), "no tracker projects configured")

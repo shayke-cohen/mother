@@ -269,9 +269,11 @@ class MailGmail(Adapter):
 # ------------------------------------------------------------------------------------------------- tracker
 class TrackerJira(Adapter):
     SOURCE = "tracker"
-    READ_TOOLS = {"get-issues", "get-issue-changelog"}
+    READ_TOOLS = {"get-issues", "get-issue-changelog", "list-projects"}
     WATCHED = ("status", "assignee", "priority")
     AUTO_FAILS = 2  # consecutive failing passes before an auto-followed project is dropped
+    PROJECTS_EVERY = 24 * 3600  # how often the list of real project keys is re-read
+    PROJECT_PAGES = 20  # list-projects pages of 100 read at most
     FIELDS = ["summary", "status", "assignee", "reporter", "priority", "updated", "created", "comment", "labels"]
 
     @staticmethod
@@ -308,6 +310,49 @@ class TrackerJira(Adapter):
             issues.append((project, got))
         return issues, failed, bad
 
+    @classmethod
+    def _list_projects(cls, client) -> List[str]:
+        """Every project key the tracker lists, paging 100 at a time. Raises McpError when a page fails or is
+        unreadable, or past the page cap (a partial list would hide real projects)."""
+        keys = []
+        for n in range(cls.PROJECT_PAGES):
+            res = client.call("list-projects", {"startAt": n * 100, "maxResults": 100})
+            if isinstance(res, list):
+                vals, last = res, len(res) < 100
+            elif isinstance(res, dict):
+                vals = next((res[k] for k in ("values", "projects", "items") if isinstance(res.get(k), list)), None)
+                if vals is None:
+                    raise McpError("other", "list-projects: unreadable answer")
+                total = res.get("total")
+                last = res.get("isLast") is True or len(vals) < 100 or (
+                    isinstance(total, int) and not isinstance(total, bool) and (n + 1) * 100 >= total)
+            else:
+                raise McpError("other", "list-projects: unreadable answer")
+            keys.extend(v["key"] for v in vals if isinstance(v, dict) and isinstance(v.get("key"), str) and v["key"])
+            if last:
+                return list(dict.fromkeys(keys))
+        raise McpError("other", "list-projects: more than %d pages" % cls.PROJECT_PAGES)
+
+    @classmethod
+    def _real_projects(cls, client, cursor, at):
+        """(project keys or None, the cache to keep). The keys are cached in the cursor (`projects: {at, keys}`)
+        and re-read at most once a day; when a re-read fails the old cache is kept for the next try and this pass
+        gets None (auto-follow nothing)."""
+        cache = (cursor or {}).get("projects")
+        cache = cache if isinstance(cache, dict) and isinstance(cache.get("keys"), list) else None
+        if cache:
+            try:
+                if 0 <= (at - parse_iso(cache["at"])).total_seconds() < cls.PROJECTS_EVERY:
+                    return [k for k in cache["keys"] if isinstance(k, str)], cache
+            except (KeyError, TypeError, ValueError):
+                pass
+        try:
+            keys = cls._list_projects(client)
+        except McpError:
+            return None, cache
+        cache = {"at": iso(at), "keys": keys}
+        return keys, cache
+
     @staticmethod
     def _fp(f: dict) -> dict:
         c = f.get("comment") or {}
@@ -318,6 +363,10 @@ class TrackerJira(Adapter):
 
     @classmethod
     def poll(cls, client, cursor, cfg, me, at):
+        """`known_projects` in the result is the tracker's real project keys (None when they could not be read
+        this pass): auto-follow takes only projects in it. An auto-followed project that has never been read
+        successfully and fails is dropped silently; one that has been read is dropped after AUTO_FAILS passes."""
+        known, cache = cls._real_projects(client, cursor, at)
         if cursor is None:
             fp = {}
             try:  # seed fingerprints so the first real poll can tell a field change from a label edit
@@ -326,10 +375,16 @@ class TrackerJira(Adapter):
                     fp[i["key"]] = dict(cls._fp(i.get("fields") or {}), u=(i.get("fields") or {}).get("updated", ""))
             except McpError:
                 pass
-            return _result([], {"since": iso(at), "fp": fp})
+            cur = {"since": iso(at), "fp": fp}
+            if cache:
+                cur["projects"] = cache
+            out = _result([], cur)
+            out["known_projects"] = known
+            return out
         since = parse_iso(cursor["since"])
         auto = set(cfg.get("auto") or [])
         fails = {p: n for p, n in (cursor.get("fails") or {}).items() if p in auto and isinstance(n, int)}
+        read_ok = {p for p in cursor.get("auto_read") or [] if p in auto}
         fps = dict(cursor.get("fp") or {})
         minutes = int(math.ceil((at - since).total_seconds() / 60.0)) + 2
         email = (me.get("email") or "").lower()
@@ -340,7 +395,12 @@ class TrackerJira(Adapter):
         for project in cls._projects(cfg):  # consecutive failures of an auto-followed project
             if project not in auto:
                 continue
-            if project in bad:
+            if project in bad and project not in read_ok:  # never read: a guess that was wrong, drop it quietly
+                fails.pop(project, None)
+                drop.append(project)
+                failed = [f for f, b_ in zip(failed, bad) if b_ != project]
+                bad = [b_ for b_ in bad if b_ != project]
+            elif project in bad:
                 fails[project] = fails.get(project, 0) + 1
                 if fails[project] >= cls.AUTO_FAILS:
                     fails.pop(project)
@@ -351,6 +411,7 @@ class TrackerJira(Adapter):
                                                        % (cls.AUTO_FAILS, project)))
             else:
                 fails.pop(project, None)
+                read_ok.add(project)
         got = []
         for project, page in pages:
             if len(page) > MAX_ISSUES:
@@ -390,7 +451,11 @@ class TrackerJira(Adapter):
                                        also=hub.extract_also(f.get("summary") or "")))
         # prune the least recently updated, not the oldest inserted
         keep = dict(sorted(fps.items(), key=lambda kv: kv[1].get("u", ""))[-500:])
-        out = _result(lines, {"since": iso(at), "fp": keep, "fails": fails}, partial)
+        cur = {"since": iso(at), "fp": keep, "fails": fails, "auto_read": sorted(read_ok)}
+        if cache:
+            cur["projects"] = cache
+        out = _result(lines, cur, partial)
+        out["known_projects"] = known
         if drop:
             out["drop_auto"] = drop
         return out

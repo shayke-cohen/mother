@@ -2,6 +2,7 @@
 Run: python3 -m unittest tests.test_hub -v
 """
 import json
+import re
 import os
 import sys
 import tempfile
@@ -672,7 +673,7 @@ class Install(unittest.TestCase):
         import hub_mcp
 
         class C:
-            tools = ["mcp__x__get-issues", "mcp__x__get-issue-changelog", "mcp__x__create-issue"]
+            tools = ["mcp__x__get-issues", "mcp__x__get-issue-changelog", "mcp__x__list-projects", "mcp__x__create-issue"]
             closed = False
 
             def close(self):
@@ -689,7 +690,7 @@ class Install(unittest.TestCase):
         buf = io.StringIO()
         self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"tracker": c}, gh_user=lambda: None,
                                    which=self.which, out=buf), 1)
-        self.assertIn("tracker | \u2717 | missing read tools: get-issue-changelog, get-issues", buf.getvalue())
+        self.assertIn("tracker | \u2717 | missing read tools: get-issue-changelog, get-issues, list-projects", buf.getvalue())
         buf = io.StringIO()
 
         def bad():
@@ -1465,7 +1466,10 @@ class Direct(unittest.TestCase):
         self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
         return hub.poll_once(self.ws, self.cfg, self.AT + timedelta(minutes=minutes), {"tracker": object()})
 
-    def adapter(self, keys, drop=None):
+    def adapter(self, keys, drop=None, known="all"):
+        if known == "all":  # every key-shaped token names a real project
+            known = sorted({x.split("-")[0] for k, a in keys for x in [k] + list(a) if re.match(r"^[A-Z][A-Z0-9]+-", x)})
+
         class A:
             READ_TOOLS = set()
             seen = []
@@ -1474,8 +1478,9 @@ class Direct(unittest.TestCase):
             def poll(cls, client, cursor, cfg, me, at):
                 cls.seen.append(cfg)
                 if cursor is None:
-                    return {"lines": [], "cursor": {"n": 1}, "partial": []}
-                out = {"lines": [line(key=k, also=a) for k, a in keys], "cursor": {"n": 2}, "partial": []}
+                    return {"lines": [], "cursor": {"n": 1}, "partial": [], "known_projects": known}
+                out = {"lines": [line(key=k, also=a) for k, a in keys], "cursor": {"n": 2}, "partial": [],
+                       "known_projects": known}
                 if drop:
                     out["drop_auto"] = drop
                 return out
@@ -1497,6 +1502,18 @@ class Direct(unittest.TestCase):
         self.assertEqual(len(hub.load_watch(self.ws)["auto"]["projects"]), 2)
         self.run_verb("follow", "GONE")  # follow clears the unfollow record
         self.assertEqual(hub.load_watch(self.ws)["unfollowed"], [])
+
+    def test_auto_follow_takes_only_real_projects(self):
+        A = self.adapter([("C00000001/1.0", ["UTF-8", "ISO-8601", "GPT-4", "WEB-4"])], known=["PLAT", "WEB"])
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        self.assertEqual([a["key"] for a in hub.load_watch(self.ws)["auto"]["projects"]], ["WEB"])
+
+    def test_auto_follow_takes_nothing_when_projects_could_not_be_read(self):
+        A = self.adapter([("C00000001/1.0", ["WEB-4"])], known=None)
+        self.poll_with(A)
+        self.poll_with(A, 2)
+        self.assertEqual(hub.load_watch(self.ws)["auto"]["projects"], [])
 
     def test_auto_projects_capped_at_20(self):
         keys = [("P%02d-1" % n, []) for n in range(25)]

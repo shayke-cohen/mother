@@ -31,16 +31,17 @@ class FakeTracker:
     """Stands in for the tracker adapter; records the watch config of every pass."""
     items = []
     cfgs = []
+    known = ["PLAT", "WEB"]  # the tracker's real projects
 
     @classmethod
     def poll(cls, client, cursor, cfg, me, at):
         cls.cfgs.append(dict(cfg))
         if cursor is None:
-            return {"lines": [], "cursor": {"n": 0}, "partial": []}
+            return {"lines": [], "cursor": {"n": 0}, "partial": [], "known_projects": cls.known}
         new = cls.items[cursor["n"]:]
         return {"lines": [hub.make_line("tracker", "update", k, hub._iso(at), title=k, who="Agnes",
                                         link="https://example.com/browse/" + k, summary="changed")
-                          for k in new], "cursor": {"n": len(cls.items)}, "partial": []}
+                          for k in new], "cursor": {"n": len(cls.items)}, "partial": [], "known_projects": cls.known}
 
 
 def conn(fixture, log):
@@ -292,7 +293,7 @@ class E2E(unittest.TestCase):
 
     def test_a_mentioned_unwatched_project_is_followed_and_polled_next_pass(self):
         self.poll(0)
-        self.poll(2, history=[self.msg(2, "WEB-5 is broken again")])
+        self.poll(2, history=[self.msg(2, "WEB-5 is broken again; UTF-8 and ISO-8601 are not projects")])
         auto = hub.load_watch(self.ws)["auto"]["projects"]
         self.assertEqual([a["key"] for a in auto], ["WEB"])
         self.assertEqual(FakeTracker.cfgs[-1]["projects"], ["PLAT"])  # not in the pass that found it
