@@ -149,7 +149,7 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
    Sources read as `ok` appear in `coverage` as `{"status": "ok", "reason": ""}`.
 
 5. **Judge.** Apply the thresholds above in working time and build `candidates`:
-   `{"kind", "signal", "title", "why", "link", "also": [], "team", "since", "actions": [{"label","prompt"}]}`.
+   `{"kind", "signal", "title", "why", "link", "also": [], "links": [{"label","url"}], "team", "since", "actions": [{"label","prompt"}]}`.
    - `signal` is one of the names above; `kind` is the item's kind in the id (`pr`, `ticket`, `mail`,
      `chat`, `event`, `todo`, `digest`, …); `since` is an ISO time from the source (when the review was
      requested, the mention sent, the ticket last moved), never "now"; `team` is the team slug or `""`.
@@ -165,6 +165,11 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
      (default 30, `0` = off), except the workspace signals (`decision_open`, `promise_due`,
      `suggestion_waiting`, `action_item_no_ticket`, `one_on_one_drift`). Don't send those; they are backlog. A person is named only as the work needs, never with a
      count, score or judgement. `also` holds other keys for the same work (a ticket for a PR).
+   - `links` are every source you saw for the work, each an http(s) `url` with a short `label` (at most 24
+     characters) saying what it is: `Thread`, `Channel`, `Mail`, `PLAT-12`, `api#412`, `CI run`, `Invite`.
+     A chat item gets its thread and its channel; a PR its ticket and its failing build; a ticket the thread
+     or mail that raised it. The panel shows them as one-click chips, so the manager never has to search for
+     the source. Put only links you read this tick; never build a url you didn't see.
    - `actions` are `{"label","prompt"}` (merge stores your `prompt` as the action's `task` and gives the panel its own `mother now do <S-id>` prompt). They come only from these kinds, each a tick-owned suggestion the `mother:now` skill will run on
      the manager's yes: a nudge **draft** in the manager's DM or a mail draft (never sent); a reply **draft**
      for `mail_needs_reply`, `unanswered_mention` and `outside_question`, in the manager's DM or as a mail

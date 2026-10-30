@@ -145,6 +145,29 @@ class Merge(unittest.TestCase):
         out = now.merge(inp(cand("suggestion_waiting", kind="sug")), None, {}, CFG, NOW)
         self.assertEqual(out["items"][0]["section"], "on_you")
 
+    def test_links_are_kept_cleaned_and_capped(self):
+        links = ([{"label": "Thread", "url": "https://example.com/t/1"},
+                  {"label": "Thread again", "url": "https://example.com/t/1"},     # same url: dropped
+                  {"label": "", "url": "https://example.com/x"},                   # no label
+                  {"label": "Local", "url": "teams/x/intake.md#1"},                # not http(s)
+                  {"label": "A label much longer than twenty-four", "url": "https://example.com/long"},
+                  "not a dict"]
+                 + [{"label": "L%d" % n, "url": "https://example.com/n/%d" % n} for n in range(10)])
+        out = now.merge(inp(cand("review_requested", links=links)), None, {}, CFG, NOW)
+        kept = out["items"][0]["links"]
+        self.assertEqual(kept[0], {"label": "Thread", "url": "https://example.com/t/1"})
+        self.assertEqual(kept[1], {"label": "A label much longer than", "url": "https://example.com/long"})
+        self.assertEqual(len(kept), 8)
+        self.assertEqual(out["dropped"], 0)
+
+    def test_links_default_empty_and_carry_on_a_kept_item(self):
+        out = now.merge(inp(cand("review_requested")), None, {}, CFG, NOW)
+        self.assertEqual(out["items"][0]["links"], [])
+        links = [{"label": "Channel", "url": "https://example.com/c"}]
+        first = now.merge(inp(cand("review_requested", links=links)), None, {}, CFG, NOW)
+        kept = now.merge(inp(), first, {}, CFG, NOW + timedelta(hours=1))
+        self.assertEqual(kept["items"][0]["links"], links)
+
     def test_action_ids_are_stable(self):
         acts = [{"label": "Nudge", "prompt": "x"}]
         c = cand("review_requested", actions=acts)

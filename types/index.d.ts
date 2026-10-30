@@ -16,6 +16,7 @@ export type NowItem = {
   why: string
   link: string
   also: string[]
+  links?: { label: string; url: string }[]   // labelled source links from the tick (CONTRACT §1)
   team: string | null
   since: string
   first_seen: string

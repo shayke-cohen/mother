@@ -129,6 +129,8 @@ def threshold_hours(signal: str, cfg: dict, s: Schedule) -> Optional[float]:
 SECTIONS = ["on_you", "neglected", "suggestion"]
 SUGGESTION_LAPSE_DAYS = 3
 VERSION = 1
+LINKS_MAX = 8
+LINK_LABEL_MAX = 24
 TOP_MAX = 3
 
 
@@ -146,6 +148,25 @@ def _too_old(sig: str, since: datetime, cfg: dict, now: datetime) -> bool:
 def _keys(sig: str, link: str, also) -> set:
     """Every (signal, link) pair that names the same work: the item's link and its `also` links."""
     return {(sig, k) for k in [link] + list(also or []) if k}
+
+
+def _links(raw) -> list:
+    """The candidate's labelled source links, cleaned: http(s) url, a label (trimmed), no repeated url, at most
+    LINKS_MAX. A bad entry is skipped; it is not a malformed candidate."""
+    out, urls = [], set()
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        url, label = e.get("url"), e.get("label")
+        if not isinstance(url, str) or not re.match(r"https?://", url) or url in urls:
+            continue
+        if not isinstance(label, str) or not label.strip():
+            continue
+        urls.add(url)
+        out.append({"label": label.strip()[:LINK_LABEL_MAX].rstrip(), "url": url})
+        if len(out) == LINKS_MAX:
+            break
+    return out
 
 
 def item_id(c: dict) -> str:
@@ -341,7 +362,7 @@ def merge(inp: dict, prev: Optional[dict], state: dict, cfg: dict, now: datetime
             continue
         items.append({
             "id": iid, "section": section, "signal": sig, "title": c["title"], "why": c.get("why", ""),
-            "link": c["link"], "also": list(c.get("also") or []), "team": c.get("team"),
+            "link": c["link"], "also": list(c.get("also") or []), "links": _links(c.get("links")), "team": c.get("team"),
             "since": c["since"], "first_seen": first_seen, "last_seen": _iso(now),
             "state": effect or ("open" if old else "new"),
             "snooze_until": None, "actions": actions,

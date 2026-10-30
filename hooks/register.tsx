@@ -391,6 +391,31 @@ type Ui = ReturnType<Dollar['ui']['resolve']>
 // A link the surface can open; a workspace path (`teams/x/intake.md#1`) stays in the Ask prompt instead.
 const isUrl = (link: string | null | undefined): link is string => !!link && /^https?:\/\//.test(link)
 
+export type Chip = { label: string; url: string }
+
+// A label from the path shape alone, never the host: `…/browse/PLAT-2` -> `PLAT-2`, `…/owner/repo/pull/7`
+// (or `/-/merge_requests/7`, `/issues/7`) -> `repo#7`; else the caller's fallback.
+export function chipLabel(url: string, fallback: string): string {
+  const path = url.split(/[?#]/)[0].replace(/\/+$/, '')
+  let m = /\/browse\/([A-Z][A-Z0-9]+-\d+)$/.exec(path)
+  if (m) return m[1]
+  m = /\/[\w.-]+\/([\w.-]+)(?:\/-)?\/(?:pull|pulls|merge_requests|issues)\/(\d+)$/.exec(path)
+  if (m) return m[1] + '#' + m[2]
+  return fallback
+}
+
+// Every source of a row as chips: the tick's labelled `links` first, then `link` and each http(s) `also`
+// they miss, one chip per url.
+export function linkChips(links: Chip[] | null | undefined, link: string | null | undefined, also: string[] | null | undefined): Chip[] {
+  const out: Chip[] = []
+  const seen = new Set<string>()
+  const add = (url: string, label: string) => { if (!seen.has(url)) { seen.add(url); out.push({ label, url }) } }
+  for (const l of links ?? []) if (l && isUrl(l.url) && l.label) add(l.url, l.label)
+  if (isUrl(link)) add(link, chipLabel(link, 'Source'))
+  for (const a of also ?? []) if (isUrl(a)) add(a, chipLabel(a, 'Link'))
+  return out
+}
+
 // What Follow watches for a row key: a tracker item follows its project, a pull request its repo, a chat
 // thread itself, a WhatsApp group its JID. Mail, calendar and manual keys have nothing to follow, so the row shows no Follow button.
 export function followArgs(key: string): string[] | null {
@@ -463,6 +488,7 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
     const open = i.id === current
     const sess = sessionOf(i)
     const meta = [i.team, age(i.since, nowMs)].filter(Boolean).join(' · ')
+    const chips = open ? linkChips(i.links, i.link, i.also) : []
     return (
       <Box key={'item-' + i.id} flexDirection="column">
         <Box>
@@ -476,6 +502,11 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
         {open ? (
           <Box flexDirection="column" paddingLeft={2}>
             {i.why ? <Text dimColor wrap="wrap">{i.why}</Text> : null}
+            {chips.length > 1 || (chips.length === 1 && chips[0].url !== i.link) ? (
+              <Box key={'chips-' + i.id} flexWrap="wrap" gap="xs">
+                {chips.map((c, n) => <Link key={`chip-${i.id}-${n}`} href={c.url}>{c.label}</Link>)}
+              </Box>
+            ) : null}
             <Box flexWrap="wrap" gap="xs">
               {(i.actions ?? []).map((a, n) => (
                 <Button key={n === 0 ? 'doit-' + i.id : `act${n}-` + i.id} variant={n === 0 ? 'primary' : undefined}
@@ -696,6 +727,9 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
                   <Button key={'sess-open-' + key} onPress={() => openSession($, goHub, key, v)}>Open</Button>
                   {followArgs(key) ? <Button key={'sess-follow-' + key} onPress={() => goHub(followArgs(key) as string[])}>Follow</Button> : null}
                   <Button key={'sess-mute-' + key} onPress={() => goHub(['mute', '--', key])}>Mute</Button>
+                  {linkChips(null, null, v.also).filter(c => c.url !== v.link).map((c, n) => (
+                    <Link key={`chip-sess-${key}-${n}`} href={c.url}>{c.label}</Link>
+                  ))}
                 </Box>
               ))}
             </Box>

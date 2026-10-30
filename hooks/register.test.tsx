@@ -84,6 +84,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
     return { clock, out }
   }
   const last = (o: { status: (string | undefined)[] }) => o.status[o.status.length - 1]
+  // Link chips as [label, href]; a Link's text is its href then its label. The row's own ↗ is not a chip.
+  const chipsOf = async (ui: any): Promise<[string, string][]> => (await ui.findAll({ type: 'Link' }))
+    .map((l: any) => [String(l.text).slice(String(l.props.href).length), String(l.props.href)] as [string, string])
+    .filter(([label]) => label !== '↗')
   const PATH = WS + '/.mother/now.json'
 
   test(`status line counts and a failing source, on ${surface}`, async ($, on) => {
@@ -322,6 +326,32 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await hasText(ui, /^ ?1d ?$/)).toBe(true)
     expect(await hasText(ui, /unverified/)).toBe(true)
     expect((await ui.find({ type: 'Link' }))?.props.href).toBe('https://example.com/a')
+    await ui.unmount()
+  })
+
+  test(`an open row draws a chip per source: links first, then link and http also, on ${surface}`, async ($, on) => {
+    const it: any = item('a', 'on_you', 'open', 'Review A')
+    it.link = 'https://example.com/acme/api/pull/7'
+    it.links = [{ label: 'Thread', url: 'https://example.com/t/1' }, { label: 'Channel', url: 'https://example.com/c' }]
+    it.also = ['https://example.com/browse/PLAT-2', 'PLAT-2', 'https://example.com/t/1', 'https://example.com/other']
+    const d = doc({ items: [it], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await chipsOf(ui)).toEqual([
+      ['Thread', 'https://example.com/t/1'],
+      ['Channel', 'https://example.com/c'],
+      ['api#7', 'https://example.com/acme/api/pull/7'],
+      ['PLAT-2', 'https://example.com/browse/PLAT-2'],
+      ['Link', 'https://example.com/other'],
+    ])
+    await ui.unmount()
+  })
+
+  test(`a row with only its link draws no chip line, on ${surface}`, async ($, on) => {
+    const d = doc({ items: [item('a', 'on_you', 'open')], counts: { on_you: 1, neglected: 0, suggestion: 0 }, coverage: {} })
+    await boot($, on, { [PATH]: { text: JSON.stringify(d), mtimeMs: 1 } })
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await chipsOf(ui)).toEqual([])
     await ui.unmount()
   })
 
@@ -776,6 +806,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await boot($, on, hubFiles(watcher(), hubDoc(), sessionsDoc({ 'PLAT-2': session({ unseen: 1 }) })))
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hasAny(ui, /Fix the login/)).toBe(true)           // N > 0: open
+    await ui.unmount()
+  })
+
+  test(`a session row draws a chip for each http also, on ${surface}`, async ($, on) => {
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 1, also: ['https://example.com/acme/api/pull/9', 'PLAT-2'] }) })
+    await boot($, on, hubFiles(watcher(), hubDoc(), ss))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await chipsOf(ui)).filter(([, href]) => /^https:/.test(href))).toEqual([['api#9', 'https://example.com/acme/api/pull/9']])
     await ui.unmount()
   })
 
