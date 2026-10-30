@@ -85,6 +85,16 @@ export function sourceStale(row: { every_seconds?: number; at?: string } | null 
   return !Number.isNaN(at) && nowMs - at > 2 * row.every_seconds * 1000
 }
 
+// One source in the hub's health line: ✓ / ~ / ✗, plus how old the reading is when it isn't ✓ (a ✗ from two
+// hours ago, before a VPN came back, reads very differently from one a minute old), and `stale` as before.
+export function sourceMark(cap: string, row: { status?: string; at?: string; every_seconds?: number } | null | undefined,
+                           active: boolean | undefined, nowMs: number): string {
+  const st = row?.status
+  const m = st === 'ok' ? '✓' : st === 'partial' ? '~' : '✗'
+  const old = st !== 'ok' && row?.at ? ` ${ago(row.at, nowMs)} ago` : ''
+  return `${cap} ${m}${old}${sourceStale(row, active, nowMs) ? ' stale' : ''}`
+}
+
 export function hubStatus(h: HubBundle, nowMs: number): string {
   const health = hubHealth(h, nowMs)
   if (health === 'none') return ''
@@ -698,9 +708,9 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
   const setAt = top[0]?.set_at ? ` at ${at(top[0].set_at)}` : ''
   const noItems = items.every(i => !SECTIONS.some(([k]) => k === i.section))
 
+  // Order: what to do first (Top 3), then quick asks, the hub's waiting work, the full lists. Health is one line.
   return (
     <Box flexDirection="column">
-      {hubNode}
       <Box>
         <Text weight="semibold">{`Now · ${at(doc.generated_at)} · next ${at(doc.next_at)}`}</Text>
       </Box>
@@ -721,14 +731,6 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
           ) : null}
         </Box>
       ) : null}
-      {prompts.length > 0 && !(noItems && top.length === 0 && health.length === 0) ? (
-        <Box key="prompts" flexDirection="column">
-          {heading('Ask Mother')}
-          <Box flexWrap="wrap" gap="xs">
-            {prompts.map((p, n) => <Button key={'prompt-' + p.id} variant={n === 0 ? 'primary' : undefined} onPress={() => fill(p.text)}>{p.label}</Button>)}
-          </Box>
-        </Box>
-      ) : null}
       {top.length > 0 ? (
         <Box key="top" flexDirection="column">
           <Box marginTop={1}>
@@ -746,6 +748,14 @@ function paneTree($: Dollar, ui: Ui, doc: NowDoc | null, error: string | null, s
           ) : null}
         </Box>
       ) : null}
+      {prompts.length > 0 && !(noItems && top.length === 0 && health.length === 0) ? (
+        <Box key="prompts" flexDirection="column" marginTop={1}>
+          <Box flexWrap="wrap" gap="xs">
+            {prompts.map((p, n) => <Button key={'prompt-' + p.id} variant={n === 0 ? 'primary' : undefined} onPress={() => fill(p.text)}>{p.label}</Button>)}
+          </Box>
+        </Box>
+      ) : null}
+      {hubNode}
       {SECTIONS.map(([kind, name]) => section(kind, name))}
       {ignoredSection(ui, hub.watch, expanded, toggle, at, goHub)}
       {noItems && health.length === 0 && top.length === 0
@@ -894,7 +904,16 @@ function openSession($: Dollar, goHub: (args: string[], rowId?: string | null) =
   void goHub(['session', 'seen', key])
 }
 
-// The Hub section: first in the pane. Open by default when something waits; `hub` in `expanded` flips that.
+// `mother hub refresh`: restart the watcher, reconnect every source and poll it now. It can take a minute, so the
+// button reads "Refreshing…" until it returns (run() clears the row marker), and the result is one toast.
+async function refreshHub($: Dollar, goHub: (args: string[], rowId?: string | null) => Promise<boolean>): Promise<void> {
+  await update($, snoozingAtom, () => 'hub:refresh')
+  $.ui.toast('Refreshing the hub: reconnecting every source…')
+  const ok = await goHub(['refresh'], 'hub:refresh')
+  $.ui.toast(ok ? 'Hub refreshed: every source answered' : 'Hub refreshed: some sources still fail (see the hub line)')
+}
+
+// The Hub section: after Top 3 and the asks. Open by default when something waits; `hub` in `expanded` flips that.
 function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing: string | null, expanded: Set<string>, nowMs: number,
                     goHub: (args: string[], rowId?: string | null) => Promise<boolean>, goInbox: Go) {
   const { Box, Text, Button, Link, Select } = ui
@@ -918,12 +937,12 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
   // Open button (it fills the prompt) is the way in there.
   const canLink = (l: string) => surface === 'terminal' || /^https?:\/\//.test(l)
   const sources = Object.entries(hb.watcher?.sources ?? {})
-  const mark = (st: string) => (st === 'ok' ? '✓' : st === 'partial' ? '~' : '✗')
   const healthLine = [
-    hb.watcher ? `watcher polled ${ago(hb.watcher.at, nowMs)} ago` : 'watcher not running',
-    ...sources.map(([cap, row]) => `${cap} ${mark(row?.status)}${sourceStale(row, hb.watcher?.active, nowMs) ? ' stale' : ''}`),
+    hb.watcher ? `watcher polled ${ago(hb.watcher.at, nowMs)} ago${hb.watcher.active === false ? ' (idle hours)' : ''}` : 'watcher not running',
+    ...sources.map(([cap, row]) => sourceMark(cap, row, hb.watcher?.active, nowMs)),
     hb.hub?.last_wake ? `hub woke ${ago(hb.hub.last_wake, nowMs)} ago` : 'hub never woke',
   ].join(' · ')
+  const refreshing = snoozing === 'hub:refresh'
   const sessions = liveSessions(hb.sessions)
   const pending = hb.hub?.pending ?? []
   const routed = (hb.hub?.routed ?? []).slice(-ROUTED_SHOWN).reverse()
@@ -934,6 +953,9 @@ function hubSection($: Dollar, ui: Ui, surface: string, hb: HubBundle, snoozing:
       <Box>
         <Button key="hub-toggle" plain onPress={() => toggle('hub')}>{`${open ? '▾' : '▸'} Hub ${label}`}</Button>
         {waiting > 0 ? <Text dimColor>{` ${waiting} waiting `}</Text> : null}
+        <Button key="hub-refresh" plain dimColor={refreshing} onPress={() => { if (!refreshing) void refreshHub($, goHub) }}>
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </Button>
         {health !== 'alive'
           ? <Button key="hub-restart" onPress={() => { void $.prompt.fill({ text: '/mother:hub', mode: 'replace' }) }}>Restart hub</Button>
           : null}
