@@ -267,7 +267,8 @@ class Watcher(unittest.TestCase):
         self.assertEqual(self.inbox(), [])
         self.assertEqual(beat["sources"], {"tracker": {"status": "ok", "at": "2026-10-29T10:00:00Z", "every_seconds": 120}})
         self.assertEqual(beat["errors"], [])
-        self.assertEqual(hub.load_json(self.ws, "watcher.json", {}), beat)
+        self.assertEqual(hub.load_json(self.ws, "watcher.json", {}), {k: v for k, v in beat.items() if k != "_attempted"})
+        self.assertEqual(beat["_attempted"], ["tracker"])
         self.assertEqual((beat["at"], beat["every_seconds"], beat["active"]), ("2026-10-29T10:00:00Z", 120, True))
 
     def test_new_items_appended_once_across_two_polls(self):
@@ -732,6 +733,64 @@ class SourceIntervals(unittest.TestCase):
         self.cfg["hub"]["idle_every_seconds"] = 0
         self.watch_cfg("mail", idle_every_seconds=900)
         self.assertEqual(hub.interval(self.cfg, self.SAT), (False, 900))
+
+    def test_a_failing_source_that_is_not_due_does_not_churn_its_client(self):
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+        self.cfg["workspace"] = {"home_machine": "laptop"}
+        self.watch_cfg("tracker", every_seconds=3600)
+        self.tracker.fail = "unreachable"
+        built = []
+
+        class Cl:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        def factory(cfg, have):
+            out = dict(have)
+            for cap in cfg["hub"]["connections"]:
+                if cap not in out:
+                    built.append(cap)
+                    out[cap] = Cl()
+            return out
+        now = [self.WORK]
+        stop = threading.Event()
+        slept = [0]
+
+        def sleep(n):
+            now[0] += timedelta(seconds=n)
+            slept[0] += n
+            if slept[0] >= 2 * 3600 + 600:
+                stop.set()
+        hub.watch(self.ws, self.cfg, clock=lambda: now[0], sleep=sleep, factory=factory, stop=stop)
+        self.assertEqual(built.count("tracker"), 3)   # once per hour (0, 1, 2 h), not once per 2 minute wake
+        self.assertEqual(self.tracker.calls, 3)
+        self.assertGreater(built.count("mail"), 0)
+        self.assertEqual(built.count("mail"), 1)      # the healthy hourly-or-faster source keeps its client
+
+    def test_a_period_change_makes_a_source_due(self):
+        self.watch_cfg("mail", every_seconds=3600, idle_every_seconds=1800)
+        fri_night = datetime(2026, 10, 30, 23, 0, tzinfo=UTC)   # Friday, after hours
+        self.poll(fri_night)
+        self.assertEqual(self.mail.calls, 1)
+        self.poll(fri_night + timedelta(minutes=10))            # same period, 10 min < 30: not due
+        self.assertEqual(self.mail.calls, 1)
+        mon_early = datetime(2026, 11, 2, 5, 50, tzinfo=UTC)
+        self.poll(mon_early)                                    # idle, the interval has long passed: due
+        self.assertEqual(self.mail.calls, 2)
+        self.poll(mon_early + timedelta(minutes=5))             # 5 min later, still idle: not due
+        self.assertEqual(self.mail.calls, 2)
+        self.poll(mon_early + timedelta(minutes=10))            # working hours begin: due at once, not an hour later
+        self.assertEqual(self.mail.calls, 3)
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {})["_due_period"]["mail"], "active")
+
+    def test_a_clock_stepped_back_counts_as_due(self):
+        self.watch_cfg("mail", every_seconds=3600)
+        self.poll(self.WORK)
+        self.poll(self.WORK - timedelta(minutes=5))
+        self.assertEqual(self.mail.calls, 2)
 
     def test_the_wake_interval_is_the_shortest_among_enabled_sources(self):
         self.cfg["hub"]["every_seconds"] = 300

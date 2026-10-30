@@ -534,13 +534,34 @@ def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
     return w
 
 
-def _is_due(last, every: int, at: datetime) -> bool:
-    """A source is due when it has never been attempted, or `every` seconds have passed since its last attempt."""
+def _is_due(last, every: int, at: datetime, period: str = "", last_period: str = "") -> bool:
+    """A source is due when it has never been attempted, `every` seconds have passed since its last attempt, the
+    clock stepped back past it, or the period (active / idle hours) changed since that attempt."""
     import hub_sources
+    if period and last_period and period != last_period:
+        return True
     try:
-        return (at - hub_sources.parse_iso(last)).total_seconds() >= every
+        elapsed = (at - hub_sources.parse_iso(last)).total_seconds()
     except (TypeError, ValueError, AttributeError):
         return True
+    return elapsed < 0 or elapsed >= every
+
+
+def due_caps(ws: Path, cfg: dict, at: datetime, active: bool) -> List[str]:
+    """The enabled sources `poll_once` would poll now (not forced)."""
+    cur = load_json(ws, "cursors.json", {})
+    cur = cur if isinstance(cur, dict) else {}
+    last = cur.get("_due") if isinstance(cur.get("_due"), dict) else {}
+    per = cur.get("_due_period") if isinstance(cur.get("_due_period"), dict) else {}
+    period = "active" if active else "idle"
+    out = []
+    for cap in CAPS:
+        if not connector_of(cfg, cap):
+            continue
+        each = source_every(cfg, cap, active)
+        if each > 0 and _is_due(last.get(cap), each, at, period, per.get(cap, "")):
+            out.append(cap)
+    return out
 
 
 def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = True, force: bool = False) -> dict:
@@ -572,15 +593,14 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     mute = h["watch"].get("mute") or {}
     passed = []  # every line of this pass, for auto-follow
     known = None  # the tracker's real project keys, when its adapter could read them this pass
-    last_due = load_json(ws, "cursors.json", {}).get("_due") if poll else None
-    last_due = last_due if isinstance(last_due, dict) else {}
+    due_now = set(due_caps(ws, cfg, at, active)) if poll else set()
     for cap in CAPS if poll else ():
         connector = connector_of(cfg, cap)
         if not connector:
             continue
         each = source_every(cfg, cap, active)
         prev0 = old_src.get(cap)
-        if not force and (each <= 0 or not _is_due(last_due.get(cap), each, at)):
+        if not force and cap not in due_now:
             if isinstance(prev0, dict):  # not due: it keeps what it last reported
                 sources[cap] = dict(prev0, every_seconds=each)
                 if prev0.get("status") != "ok":
@@ -659,6 +679,9 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             d = cur.get("_due") if isinstance(cur.get("_due"), dict) else {}
             d.update(due_at)
             cur["_due"] = d
+            per = cur.get("_due_period") if isinstance(cur.get("_due_period"), dict) else {}
+            per.update({c: "active" if active else "idle" for c in due_at})
+            cur["_due_period"] = per
             save_json(ws, "cursors.json", cur)
     if poll and passed and isinstance(connectors.get("tracker"), str) and connectors.get("tracker"):
         auto_follow(ws, passed, at, _watch_cfg(cfg, h, "tracker").get("projects") or [], known)
@@ -670,6 +693,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         beat["last_append_at"] = last
     with locked(ws):
         save_json(ws, "watcher.json", beat)
+    beat = dict(beat, _attempted=sorted(due_at))  # for the watcher loop only; never written to watcher.json
     return beat
 
 
@@ -908,12 +932,17 @@ def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) 
             cap_log(ws)
             active, every = interval(cfg, at)
             idle0 = not active and not any(v > 0 for v in period_intervals(cfg, False).values())
-            if not idle0:
-                clients = factory(cfg, clients)
+            if not idle0:  # build only what is due (or has no live client yet and is due): no server is started unused
+                due = set(due_caps(ws, cfg, at, active))
+                scoped = json.loads(json.dumps(cfg))
+                scoped.setdefault("hub", {})["connections"] = {
+                    c: v for c, v in (_hub_cfg(cfg).get("connections") or {}).items() if c in due}
+                clients = factory(scoped, clients)
             beat = poll_once(ws, cfg, at, clients, poll=not idle0)
-            for cap, ent in beat["sources"].items():  # a failed source gets a fresh client next pass
+            attempted = set(beat.get("_attempted") or [])
+            for cap, ent in beat["sources"].items():  # a failed source gets a fresh client when next due
                 c = clients.get(cap)
-                if ent.get("status") == "couldnt_check" and c is not None:
+                if cap in attempted and ent.get("status") == "couldnt_check" and c is not None:
                     clients.pop(cap, None)
                     if not isinstance(c, Exception):
                         _close(c)
