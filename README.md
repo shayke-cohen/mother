@@ -8,7 +8,7 @@ A chief of staff for people managers, built on [Claude Code](https://claude.com/
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
 > **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck, the sprint plan and WhatsApp, covered by 863 automated tests. One manager's workspace has
+> routines, the meeting deck, the sprint plan and WhatsApp, covered by 865 automated tests. One manager's workspace has
 > run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
 > [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -149,11 +149,12 @@ mother hub install    # runs the watcher under launchd on this machine
 
 **Disk access for the watcher.** The launchd watcher is a bare `python3` process, not your terminal, so reading the
 WhatsApp database needs its own Full Disk Access grant (System Settings > Privacy & Security > Full Disk Access >
-`+`). Add the interpreter the job runs: it is the first entry of `ProgramArguments` in
-`~/Library/LaunchAgents/com.mother.hub.plist` (`/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' ~/Library/LaunchAgents/com.mother.hub.plist`;
-it is the `python3` that `mother hub install` found, often `/usr/bin/python3`, and you may have to press Cmd+Shift+G in
-the file picker to type the path), then run `mother hub install` again so the job restarts. A passing `mother hub
-smoke` run from your terminal does not prove the watcher has this grant, because the terminal has its own.
+`+`). Add the program macOS actually runs for the job, which is not always the path in the plist: a framework
+Python (Xcode's or python.org's) re-launches itself as `Python.app`. Find it while the watcher runs with
+`ps -o command= -p $(pgrep -f "mother hub watch")`; if it ends in `…/Resources/Python.app/Contents/MacOS/Python`,
+add that `Python.app` (press Cmd+Shift+G in the file picker to type the path). Then run `mother hub install` again so
+the job restarts. A passing `mother hub smoke` run from your terminal does not prove the watcher has this grant,
+because the terminal has its own.
 Without it the Now panel shows `whatsapp ✗` and `mother hub status` says the source is `couldnt_check (denied)`.
 
 Finally run `/mother:hub` once in a pinned session, in normal permission mode (not bypass), and leave it open: it

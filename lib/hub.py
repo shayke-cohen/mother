@@ -1024,8 +1024,11 @@ def watch(ws: Path, cfg: dict, clock=None, sleep=None, factory=None, stop=None) 
                     if not isinstance(c, Exception):
                         _close(c)
             prev_at = at
+            # Wait in 1 s steps, by the wall clock as well as by the steps: time.sleep pauses while the Mac
+            # sleeps, so counting steps alone would come back late by however long it slept.
             waited = 0
-            while not stop.is_set() and waited < beat["every_seconds"]:
+            until = at + timedelta(seconds=beat["every_seconds"])
+            while not stop.is_set() and waited < beat["every_seconds"] and clock() < until:
                 step = min(1, beat["every_seconds"] - waited)
                 sleep(step)
                 waited += step

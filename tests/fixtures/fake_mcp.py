@@ -43,6 +43,14 @@ for raw in sys.stdin:
         calls += 1
         if p["name"] in fx.get("sleep", {}):
             time.sleep(fx["sleep"][p["name"]])
+        if p["name"] in fx.get("chatty", {}):  # send unrelated notifications instead of a reply, for N seconds
+            end = time.time() + fx["chatty"][p["name"]]
+            while time.time() < end:
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/message",
+                                             "params": {"level": "info", "data": "working"}}) + "\n")
+                sys.stdout.flush()
+                time.sleep(0.2)
+            continue
         if die and calls > die:
             sys.exit(0)
         if p["name"] in fx.get("errors", {}):
