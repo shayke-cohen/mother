@@ -461,6 +461,12 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   Plus `answer` (`+ thread`), written by `mother channels`: one signed reply in one thread of a `mention`/`auto`
   channel, citing whoever addressed the agent if the channel's `trigger` allows them; rate-capped by
   `max_replies_per_hour` in the ledger (`rules/outbound.md`).
+  Every `mother grant add` asks, so in an unattended `digest` or `dots` run it waits: the run applies nothing that
+  grant covers, marks those items `waiting: grant approval` (an intake status, `waiting: grant approval (reply <ts>)`,
+  in `rules/teams.md`; `A<n> — waiting: grant approval` in the dots file), replies once in its own DM thread to the
+  manager listing them and saying they apply the next time the manager runs digest or dots in a session ("apply
+  digest answers" / "apply dots answers"), and says so in its runs note. An interactive run retries waiting items
+  first (an intake reply older than 96 h sends the item back to `proposed`; a dots action lapses after 3 days).
 - **WhatsApp (`mother whatsapp send`, §5d)** works like a chat message. Action: `{"kind": "whatsapp", "op":
   "send"|"state"|"compound"|"unknown"|"computed"|"terminal", "category": "own_dm" (a send to the manager's own
   chat) | "any_message_to_others" (any other send, and `compound`/`unknown`) | "whatsapp_state" (for `state`) |

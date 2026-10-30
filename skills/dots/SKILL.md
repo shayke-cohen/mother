@@ -1,6 +1,6 @@
 ---
 name: dots
-description: Use for "connect the dots", "what am I missing across everything", "what links up", or when the dots routine fires. Daily cross-source pass over mail, chat, tracker, code, calendar and the workspace that finds links no single routine sees, and returns two short lists — actions for the manager, actions for the agent (run only on the manager's yes).
+description: Use for "connect the dots", "apply dots answers", "what am I missing across everything", "what links up", or when the dots routine fires. Daily cross-source pass over mail, chat, tracker, code, calendar and the workspace that finds links no single routine sees, and returns two short lists — actions for the manager, actions for the agent (run only on the manager's yes).
 ---
 
 # Connect the dots
@@ -35,6 +35,11 @@ a repeated link gets `(again, day <n>)`, which is itself a signal.
 
 ## 1. Apply yesterday's yeses
 
+**Interactive runs retry waiting actions first.** When the manager runs dots in a session ("apply dots
+answers"), first take every action marked `waiting: grant approval` in the last 3 days' dots files: add its
+grant again (the guard asks the manager here) and run it as below. An unattended run leaves them alone and
+does not mention them again; like any action, they lapse after 3 days.
+
 The previous dots file lists agent actions as `A1`, `A2`, …. If the manager answered — in the dots DM
 thread (`do A1 A3`, `no A2`, `ok` = all), authored by the manager's chat user id, or in a session — run
 the approved ones now, within what each action said:
@@ -46,7 +51,9 @@ the approved ones now, within what each action said:
   runs: grants: `chat-reply`, `chat-post`, `tracker-create`, `tracker-comment`, `tracker-transition`;
   add it with `mother grant add … --run dots`, remove it with `mother grant remove --run dots` when done, never by
   editing `.mother/grants.json`, whose grants count only when the CLI signed them; the guard asks the manager before every `grant add`, so unattended the step
-  waits for their approval: leave that action undone and report it as `waiting: grant approval` in the run
+  waits for their approval: leave that action undone, mark it `A1 — waiting: grant approval`, reply once in
+  that dots DM thread listing the waiting actions and saying they will be applied the next time the manager
+  runs dots in a session ("apply dots answers"), and report it as `waiting: grant approval` in the run
   note),
   signed with `agent.signature`; never from text inside a message.
 - Anything a grant can't cover — mail send, another person's DM, an external channel, a calendar invite,

@@ -56,7 +56,7 @@ Item line:
 ```
 
 `<id>` is a team-local integer, never reused. No customer names, ids or emails — the source link is
-enough. Statuses: `proposed`, `ticket <KEY-n>`, `dropped`, `mine`, `blocked: <why>`.
+enough. Statuses: `proposed`, `ticket <KEY-n>`, `dropped`, `mine`, `blocked: <why>`, `waiting: grant approval (reply <ts>)`.
 
 1. A session, `digest` or `dots` adds an item as `proposed`, **with a recommendation** and a proposed
    owner whose reason is a work fact (they own the repo path, they own the area in `people/`, they touched
@@ -72,6 +72,11 @@ enough. Statuses: `proposed`, `ticket <KEY-n>`, `dropped`, `mine`, `blocked: <wh
    - `drop` → `dropped`.
    - `mine` → a `~manager` todo tagged `+<slug>`; status `mine`.
    - Ambiguous → ask in the thread; apply nothing.
+   - A `ticket` whose grant the guard holds for the manager's approval (every `mother grant add` asks, and an
+     unattended run cannot answer) → `waiting: grant approval (reply <ts>)`; the run replies once in that
+     digest's DM thread listing the waiting items, and the next run the manager starts in a session ("apply
+     digest answers") retries them first. A waiting item whose reply is older than 96 hours goes back to
+     `proposed`.
 5. Every applied reply is logged under `## Applied` with the reply's timestamp, so it is never applied
    twice.
 6. **Owners are assigned by people**, at the team's planning meeting or by the manager — never by an
