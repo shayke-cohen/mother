@@ -145,6 +145,7 @@ starts yours), `gh` is the code host's command line, and `whatsapp` reads the lo
 ```
 mother hub smoke      # reads each source twice, 20 s apart, in a throwaway copy; prints status and counts, never content
 mother hub install    # runs the watcher under launchd on this machine
+mother hub refresh    # reconnect now: restarts the watcher and polls every source at once (the panel's Refresh button)
 ```
 
 **Disk access for the watcher.** The launchd watcher is a bare `python3` process, not your terminal, so reading the

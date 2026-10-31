@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { hubStatus, quickActions, sourceStale } from './register'
+import { hubStatus, quickActions, sourceMark, sourceStale } from './register'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-10-26T10:00:00Z')
@@ -295,7 +295,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     const all = await texts(ui)
     const at = (re: RegExp) => all.findIndex(t => re.test(t))
-    const order = [/^⚠ .*1 routine missed.*couldn't check tracker/, /^Ask Mother$/, /Top 3 today/, /^On you 1$/, /^Neglected 1$/, /^Suggestions 1$/].map(at)
+    const order = [/^⚠ .*1 routine missed.*couldn't check tracker/, /Top 3 today/, /^On you 1$/, /^Neglected 1$/, /^Suggestions 1$/].map(at)
     expect(order.every(i => i >= 0)).toBe(true)
     expect([...order].sort((a, b) => a - b)).toEqual(order)
     expect(all.some(t => /^Now · 09:05 · next 10:05$/.test(t))).toBe(true)
@@ -849,6 +849,13 @@ for (const surface of ['terminal', 'desktop'] as const) {
   }
   const bundle = (w: any, h: any, ss: any) => ({ watcher: w, hub: h, sessions: ss })
 
+  test(`sourceMark: a failed source says how old its reading is, on ${surface}`, () => {
+    expect(sourceMark('code', { status: 'ok', at: iso(90 * MIN) }, false, NOW)).toBe('code ✓')
+    expect(sourceMark('chat', { status: 'couldnt_check', at: iso(120 * MIN) }, false, NOW)).toMatch(/^chat ✗ 2h ago$/)
+    expect(sourceMark('mail', { status: 'partial', at: iso(5 * MIN) }, false, NOW)).toMatch(/^mail ~ 5m ago$/)
+    expect(sourceMark('tracker', null, false, NOW)).toBe('tracker ✗')
+  })
+
   test(`hubStatus: absent, alive, stale, down and waiting, on ${surface}`, () => {
     expect(hubStatus(bundle(null, null, null), NOW)).toBe('')
     expect(hubStatus(bundle(watcher(), hubDoc(), null), NOW)).toBe(' · hub ●')
@@ -893,11 +900,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
-  test(`the Hub section is first, with the health row; Restart hub only when not alive, on ${surface}`, async ($, on) => {
+  test(`the Hub section follows the Now header, with the health row and Refresh; Restart hub only when not alive, on ${surface}`, async ($, on) => {
     const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), null))
     const ui = await $.ui.mount({ ...PANE, surface })
     const all = await texts(ui)
-    expect(all.findIndex(t => /polled 1m ago/.test(t))).toBeLessThan(all.findIndex(t => /^Now · /.test(t)))
+    expect(all.findIndex(t => /polled 1m ago/.test(t))).toBeGreaterThan(all.findIndex(t => /^Now · /.test(t)))
+    expect((await ui.find({ key: 'hub-refresh' }))?.text).toBe('Refresh')
     expect(all.some(t => /^[▾▸] Hub ●$/.test(t))).toBe(true)
     expect(await hasText(ui, /polled 1m ago/)).toBe(true)
     expect(await hasText(ui, /chat ✓/)).toBe(true)
@@ -1073,6 +1081,15 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await hasText(ui, /Spec changed/)).toBe(true)
     await ui.press({ key: 'hub-done-U1' })
     expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'done', 'U1']])
+    await ui.unmount()
+  })
+
+  test(`Refresh on the hub row runs mother hub refresh and toasts the result, on ${surface}`, async ($, on) => {
+    const { out } = await boot($, on, hubFiles(watcher(), hubDoc(), null), false, {}, 'ENOENT', () => ({ exitCode: 2 }))
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'hub-refresh' })
+    expect(out.argv.filter(a => a[2] === 'hub')).toEqual([['python3', BIN, 'hub', 'refresh']])
+    expect(out.toasts.some((t: string) => /some sources still fail/.test(t))).toBe(true)
     await ui.unmount()
   })
 

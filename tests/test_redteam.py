@@ -57,7 +57,7 @@ def config():
             "connectors": {"chat": "slack", "tracker": "jira", "mail": "gmail", "calendar": "google"},
             "teams": [{"slug": "platform", "name": "Platform", "tracker": {"project": "PLAT", "board": 1},
                        "channels": [{"id": "C00000001", "name": "#platform", "mode": "mention", "trigger": "team"}]}],
-            "policy": {}}
+            "policy": {"autonomy": "strict"}}  # the corpus's wants; FUNCTIONAL_OPENS below is what the default adds
 
 
 def expected(call, session, mode):
@@ -204,6 +204,30 @@ class RedTeam(unittest.TestCase):
                                 atk["id"], n, session, mode, want, got, call.get("fix", "-"), why[:110]))
         self.assertGreater(rows, 400)
         self.assertEqual(bad, [], "\n%d of %d rows differ:\n%s" % (failures, rows, "\n".join(bad)))
+
+    def test_functional_autonomy_opens_only_work_on_existing_issues(self):
+        """The default policy.autonomy "functional" lets a workspace session comment on and transition existing
+        tracker issues unasked (the manager's choice, 2026-10-30). Every other attack row must decide exactly as
+        under "strict", and a hub-fed session keeps the question even for those."""
+        cfg = config()
+        cfg["policy"] = {}
+        with open(os.path.join(self.ws, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        opened = []
+        for atk in corpus():
+            for n, call in enumerate(atk["calls"]):
+                sessions = [call["session"]] if call.get("session") else SESSIONS
+                for session in sessions:
+                    for mode in MODES:
+                        want = expected(call, session, mode)
+                        got, _ = self.decide(call, session, mode)
+                        if got != want:
+                            opened.append((atk["id"], n, session, call["tool"].split("__")[-1], want, got))
+        self.assertTrue(opened, "functional autonomy should open something; is the default still strict?")
+        for row in opened:
+            self.assertEqual(row[2], "card", row)
+            self.assertIn(row[3], ("comment-on-issue", "transition-issue", "update-issue"), row)
+            self.assertEqual((row[4], row[5]), ("ask", "none"), row)
 
     def test_routine_commands_run_without_a_question(self):
         """Every shell command the skills and routines run in a workspace session is on the allow-list: no question

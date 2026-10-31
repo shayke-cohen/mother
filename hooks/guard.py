@@ -57,6 +57,7 @@ DEFAULT_NEEDS_YES = ["any_message_to_others", "tracker_writes", "calendar_with_g
                      "standing_rules", "docs_writes", "mail_trash"]
 ALWAYS_NEVER = ["credentials", "deletions", "payments"]
 
+
 # Grant scopes an unattended run may hold, with the ceiling on uses per cited source message.
 GRANT_SCOPES = {"chat-post": 3, "chat-reply": 3, "answer": 1, "tracker-create": 5, "tracker-comment": 5,
                 "tracker-transition": 10}
@@ -258,6 +259,35 @@ def policy_lists(cfg):
     never = set(ALWAYS_NEVER) | set(as_list(pol.get("never")))
     auto -= never
     return auto, never
+
+
+def autonomy(cfg):
+    """"functional" unless policy.autonomy is "strict" (the pre-0.10 behaviour: every outbound write asks)."""
+    pol = cfg.get("policy") if isinstance(cfg, dict) else None
+    return "strict" if isinstance(pol, dict) and pol.get("autonomy") == "strict" else "functional"
+
+
+def functional_pass(tool, a, ctx):
+    """True when, under functional autonomy, this ask becomes no decision: work on an existing tracker issue
+    (comment, transition, update, sprint moves) and code-host writes other than merging or approving. Everything
+    else keeps its question, above all the shell allow-list, the guard's own files and the standing instructions:
+    those are what stop a message's injected text from exfiltrating or persisting (tests/test_redteam.py)."""
+    if not ctx.ok or autonomy(ctx.cfg) != "functional":  # an invalid config fails closed
+        return False
+    if hub_fed(ctx):  # its context starts with outside text: a write there stays a question (red team C03, T01-T02)
+        return False
+    if a["category"] == "tracker_writes":  # classify_tracker's op: create, comment, transition, update, sprint
+        return a["kind"] == "tracker" and a.get("op") in ("comment", "transition", "update", "sprint")
+    if a["category"] == "code_host_comments":
+        what = (tool + " " + str(a.get("text") or "") + " " + str(a.get("what") or "")).casefold()
+        return not CODE_DECISION_RE.search(what)
+    return False
+
+
+# Merging or approving changes what ships: a decision, so it keeps its question under functional autonomy.
+CODE_DECISION_RE = re.compile(r"\b(?:pr|mr)\s+merge\b|\bmr\s+approve\b|--approve\b|-a\b(?=.*\bpr\s+review\b)"
+                              r"|merge_?pull_?request|mergepullrequest|enablepullrequestautomerge|/merge\b"
+                              r"|\bapprove\b|[\"']?event[\"']?\s*[:=]\s*[\"']?approve")
 
 
 def grant_limits(cfg):
@@ -4042,7 +4072,7 @@ def subagent_session(kind, tool, inp, cwd, ctx):
 # ------------------------------------------------------------------ the hub session
 
 HUB_DENY = "the hub session can only do hub work; ask the manager to open a session for this"
-HUB_NO_VERBS = {"install", "uninstall", "watch", "smoke"}   # persistent jobs and a 20 s live check: the manager starts these
+HUB_NO_VERBS = {"install", "uninstall", "watch", "smoke", "refresh"}   # persistent jobs and live checks: the manager starts these
 # Tools the hub session may use. HUB_PASS_TOOLS have no other rule anywhere in the guard, so hooks.json doesn't
 # hand them to it (tests/test_packaging.py checks every other tool name here is registered).
 HUB_PASS_TOOLS = {"CronList", "ToolSearch", "TodoWrite"}
@@ -4557,6 +4587,11 @@ def run(raw):
             r = "deny", "%s: dry run (%s is set), nothing leaves the machine." % (a["what"], DRY_RUN_ENV)
         else:
             r = stamp_block(tool, a, ctx) or decide(a, ctx, payload.get("transcript_path"))
+        # Functional autonomy (policy.autonomy, default): only a functional send, a decision someone else sees or
+        # the guard's own safety files keep their question. Denies are untouched (PAUSED, never-list, dry run).
+        if r[0] == "ask" and functional_pass(tool, a, ctx):
+            log(ctx, tool, a, "pass", "autonomy functional: " + r[1])
+            return None
         # The manager chose bypass mode for this session: an ask becomes no decision, so Claude Code's own
         # mode applies, WhatsApp sends included (as for chat). Denies (PAUSED, the never-list, dry run, the
         # WhatsApp state and setup rules) and the guard's self-edit check still hold.

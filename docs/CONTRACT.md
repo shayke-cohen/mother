@@ -118,6 +118,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 3600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `connections` (map from capability `chat|mail|tracker|calendar|code|whatsapp` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required; the `whatsapp` capability takes only `{local: "whatsapp"}`, the local database, and no other capability may use `local`), `watch` (`chat.channels` [id], `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str], `whatsapp.groups` [group JID]; and for every source `every_seconds` (int 30-86400) and `idle_every_seconds` (int 0-86400; 0 = only during working hours), which override the global intervals for that source alone, under `chat|mail|tracker|calendar|code|whatsapp`: e.g. `mail` 3600, `calendar` 900, `tracker` 600, `code` 600, `chat` and `whatsapp` on the defaults. `chat.every_seconds` also paces the pick-up of notes typed in the self-DM inbox and of DMs with people (they are read by the chat source). The hub-lag and stale thresholds (2x the watcher's `every_seconds`) scale with the wake interval, which is the shortest source interval: with every source slow, the hub is judged against that slower beat. None is needed, so `config.example.json` sets none. A calendar checked less often than `calendar.lead_minutes` is allowed; `mother hub check` / `status` only warn). Unknown keys fail `mother status`. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
+| `policy.autonomy` | `"functional"` (default) or `"strict"`, optional | `functional`: commenting on, transitioning and updating existing tracker issues, and code-host writes other than merging or approving, go without a question outside hub-fed sessions (§5, "Functional autonomy"); every other ask stands. `strict`: every ask stands, as before 0.10. Any other value fails `mother status` |
 | `policy.bypass_passes_asks` | bool, optional | default `false`: in a session whose cwd is the workspace, a guard ask stays an ask in `bypassPermissions` mode. `true` restores the pass (§5). Any other type fails `mother status` |
 
 The CLI validates this (`mother status`) and fails loudly on unknown keys or a wrong type.
@@ -225,6 +226,18 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `bypassPermissions`, an ask gets no output and is logged as `pass` only when the session's cwd is outside the
   workspace, or `policy.bypass_passes_asks` is `true` (an invalid config counts as `false`). An ask for the guard's
   own files, `grants.json` or a persona file never passes.
+- **Functional autonomy** (`policy.autonomy`, default `"functional"`). After the rules below decide, an **ask**
+  becomes no decision (logged `pass`, reason prefixed `autonomy functional:`) when the config is valid, the session
+  is not hub-fed (§5e), and the action is either a tracker write (`kind: "tracker"`) whose op is `comment`,
+  `transition`, `update` or `sprint` (`create` still asks), or a `code_host_comments` write whose tool name, text
+  and description match none of `pr|mr merge`, `mr approve`, `--approve`, `merge_pull_request`,
+  `mergePullRequest`, `enablePullRequestAutoMerge`, `/merge`, `approve`, `event: APPROVE` (merging and approving
+  are decisions). Every other ask stands: sends and posts to others, invites with guests, mail rules, shared docs,
+  mail trash, issue creation, the workspace shell allow-list, `outbound_unknown`, the guard's own files, config,
+  grants, persona files and `home_settings`. Denies are untouched (PAUSED, the never-list, `MOTHER_DRY_RUN`, hub
+  and sub-agent fences). `tests/test_redteam.py` pins the corpus under `"strict"` and fails if `"functional"`
+  changes any row other than a workspace session's comment, transition or update of an existing issue.
+  `"strict"` turns this off.
 - **ask, every session and mode** (`kind: "grants"`, `op: "cli"`): a shell command whose text, with quotes and
   backslashes dropped and casefolded, has `grant add` (or `grant` followed by a word holding `$` or a backtick):
   `mother grant add` in any form. Never passed by bypass, whatever `policy.bypass_passes_asks` says; **deny** under
@@ -419,7 +432,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   of tokens separated by single spaces, each token plain characters (`A-Za-z0-9_.:/@=,+-`, and `#` only inside a
   token, as in `owner/repo#45`) or a single-quoted string with no `'`, newline or tab; no other character (no
   `"`, `$`, backtick, `;&|<>(){}\`, `*?[]~!`), and no control character other than newline and tab nor Unicode space
-  or format character anywhere. The commands: `mother hub <verb>` (not `install`, `uninstall`, `watch` or `smoke`),
+  or format character anywhere. The commands: `mother hub <verb>` (not `install`, `uninstall`, `watch`, `smoke` or `refresh`),
   `mother home check`, `mother now show`, `mother path`, `pwd`, `date` (a `+format` argument only); the one stdin
   form, the first line exactly `mother hub decide <<'HUBEOF'`, a body, and a last line exactly `HUBEOF` (no body
   line equals it after stripping spaces and tabs); and `gh pr view|checks <N>`, `gh issue view <N>`,
@@ -963,8 +976,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   lines to the inbox, and only then saves that source's cursor in `cursors.json` (`{<cap>: cursor, _last_sweep}`), so
   a crash repeats lines rather than losing them; a failing source keeps its cursor. Every source has its own interval: `hub.watch.<cap>.every_seconds` /
   `idle_every_seconds` when set, else the global ones. The watcher sleeps the shortest interval among the enabled
-  sources for the current period (`every_seconds` inside active hours, `routines.tick.active_hours` on
-  `manager.workdays` in `manager.timezone`; `idle_every_seconds` outside), and each pass polls only the sources that
+  sources for the current period (`every_seconds` inside active hours, `routines.tick.active_hours` on the tick's
+  days — `routines.tick.days`: `all`, a list, or `workdays`/absent for `manager.workdays` — in `manager.timezone`;
+  `idle_every_seconds` outside), and each pass polls only the sources that
   are due: `cursors.json` `_due` (`{<cap>: ISO time of the last attempt, successful or not}`) is compared with the
   source's interval, and a source never attempted is due. A source runs on the first wake at or after its due time (an
   interval that is not a multiple of the wake interval runs up to one wake late); it is also due at once when the
@@ -975,7 +989,14 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `watcher.json` (not `couldnt_check`) and its error/transition logic does not run; an interval of 0 outside active
   hours (the source's own or, when it sets none, the global one) means it is not polled there, and when no source
   polls outside active hours the watcher does not poll and sleeps until the next window. `mother hub smoke` ignores
-  intervals (it polls every source twice). It rotates the inbox when the local
+  intervals (it polls every source twice). **Refresh.** `mother hub refresh` (home machine only; the hub session
+  may not run it) writes `.mother/hub/refresh.json` `{at}`, then `launchctl kickstart -k gui/<uid>/com.mother.hub`
+  when the plist exists, else (or when that fails) `install`. The watcher checks for the file before every pass and
+  at every 1 s step of its wait: when present it closes every client, builds a fresh one for every connection,
+  makes one pass with every source forced (in or out of active hours), and deletes the file. `refresh` waits up to
+  90 s for a `watcher.json` `at` at or after its request with the file gone, prints `cap | status | reason`, and
+  exits 0 when every source is `ok` or `partial`, 2 otherwise, 3 when no pass landed (1 when install failed). The
+  Now panel's **Refresh** button runs it. It rotates the inbox when the local
   day changes (the file is named for the day that ended).
 - **`watcher.json`.** `{at, every_seconds, active, last_append_at?, sources: {<cap>: {status: ok|partial|couldnt_check, reason?,
   since?, notes?, every_seconds?, at?}}, errors: [str]}`. Top-level `every_seconds` is the watcher's wake interval (the
