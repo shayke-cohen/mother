@@ -57,10 +57,6 @@ DEFAULT_NEEDS_YES = ["any_message_to_others", "tracker_writes", "calendar_with_g
                      "standing_rules", "docs_writes", "mail_trash"]
 ALWAYS_NEVER = ["credentials", "deletions", "payments"]
 
-# policy.autonomy "functional" (the default): an ask stands only for a functional send, a decision another person
-# sees, or the guard's own safety files; everything else the guard would ask about passes (rules/outbound.md).
-FUNCTIONAL_ASKS = {"any_message_to_others", "calendar_with_guests", "standing_rules", "docs_writes", "mail_trash"}
-APP_LOCAL_TOOL_RE = re.compile(r"^mcp__(?:scheduled-tasks|ccd_[a-z_]+)__")
 
 # Grant scopes an unattended run may hold, with the ceiling on uses per cited source message.
 GRANT_SCOPES = {"chat-post": 3, "chat-reply": 3, "answer": 1, "tracker-create": 5, "tracker-comment": 5,
@@ -272,44 +268,26 @@ def autonomy(cfg):
 
 
 def functional_pass(tool, a, ctx):
-    """True when, under functional autonomy, this ask becomes no decision. Still asks: a send or post to someone
-    else, an invite with guests, mail rules, shared docs, mail trash, creating a tracker issue, a data send the
-    guard can't place, and the guard's own files, grants, Claude Code's settings and the manager-only verbs."""
-    if not ctx.ok or autonomy(ctx.cfg) != "functional" or a["category"] in FUNCTIONAL_ASKS:  # fail closed
+    """True when, under functional autonomy, this ask becomes no decision: work on an existing tracker issue
+    (comment, transition, update, sprint moves) and code-host writes other than merging or approving. Everything
+    else keeps its question, above all the shell allow-list, the guard's own files and the standing instructions:
+    those are what stop a message's injected text from exfiltrating or persisting (tests/test_redteam.py)."""
+    if not ctx.ok or autonomy(ctx.cfg) != "functional":  # an invalid config fails closed
         return False
-    k, c = a["kind"], a["category"]
-    if k in ("shell_unlisted", "session") or c == "code_host_comments":
-        return True
-    if c == "tracker_writes":  # classify_tracker's op: create, comment, transition, update, sprint
-        return a.get("kind") == "tracker" and a.get("op") in ("comment", "transition", "update", "sprint")
-    if k == "config":
-        return a.get("op") == "workspace_config"
-    if k == "persona":
-        return a.get("op") == "instructions"
-    if k == "outbound_unknown":
-        return bool(APP_LOCAL_TOOL_RE.match(tool))
+    if hub_fed(ctx):  # its context starts with outside text: a write there stays a question (red team C03, T01-T02)
+        return False
+    if a["category"] == "tracker_writes":  # classify_tracker's op: create, comment, transition, update, sprint
+        return a["kind"] == "tracker" and a.get("op") in ("comment", "transition", "update", "sprint")
+    if a["category"] == "code_host_comments":
+        what = (tool + " " + str(a.get("text") or "") + " " + str(a.get("what") or "")).casefold()
+        return not CODE_DECISION_RE.search(what)
     return False
 
 
-INSTRUCTION_NAMES_RE = re.compile(r"(?<![\w.-])(?:agents|claude|memory)\.md(?![\w.-])")
-SETTINGS_NAMES_RE = re.compile(r"\.mcp\.json|(?<![\w-])\.claude(?![\w-])|(?<![\w-])\.git(?![\w-])"
-                               r"|(?:^|[\s/=])memory/\S*[*?\[$]")
-GUARD_STATE_NAMES_RE = re.compile(r"(?<![\w.-])(?:guard(?:_fast)?\.py|hooks\.json|paused|ledger\.json|guard\.log"
-                                  r"|grants\.json|capabilities\.json)(?![\w.-])|\.claude/plugins|claude_plugin_root"
-                                  r"|\.mother/workspace")
-
-
-def shell_op(cmd):
-    """The op a shell config/persona ask carries: "workspace_config" when it names config.json and nothing of the
-    guard's own state, "instructions" when it names AGENTS.md / CLAUDE.md / MEMORY.md and no settings file."""
-    t = re.sub(r"[\"'\\]", "", run_text(cmd, quotes=False)).casefold()
-    if GUARD_STATE_NAMES_RE.search(t) or SETTINGS_NAMES_RE.search(t):
-        return None
-    if re.search(r"(?<![\w.-])config\.json(?![\w.-])", t):
-        return "workspace_config"
-    if INSTRUCTION_NAMES_RE.search(t):
-        return "instructions"
-    return None
+# Merging or approving changes what ships: a decision, so it keeps its question under functional autonomy.
+CODE_DECISION_RE = re.compile(r"\b(?:pr|mr)\s+merge\b|\bmr\s+approve\b|--approve\b|-a\b(?=.*\bpr\s+review\b)"
+                              r"|merge_?pull_?request|mergepullrequest|enablepullrequestautomerge|/merge\b"
+                              r"|\bapprove\b|[\"']?event[\"']?\s*[:=]\s*[\"']?approve")
 
 
 def grant_limits(cfg):
@@ -2044,14 +2022,13 @@ def classify_bash(cmd, cwd, ctx):
         if prot == "persona":
             return act("persona", "persona_files", "a shell command that could change the workspace's standing "
                                                    "instructions (AGENTS.md, CLAUDE.md, .mcp.json, .claude/, "
-                                                   "MEMORY.md)", op=shell_op(cmd))
+                                                   "MEMORY.md)")
     if touched:
         # config.json holds the whatsapp block: only `mother whatsapp setup`, in the manager's terminal, changes it
         if wa_shell_names_config(cmd) and wa_block_now(ctx):
             return wa_act("terminal", "a shell write to config.json, which holds the whatsapp block (MOTHER's "
                                       "WhatsApp setup)")
-        return act("config", "guard_config", "a shell command that could change the guard's own files",
-                   op=shell_op(cmd))
+        return act("config", "guard_config", "a shell command that could change the guard's own files")
     short = cmd.strip()[:160]
     if GH_CRED_RE.search(run):
         return act("credential", "credentials", "storing a credential on the code host: " + short)
@@ -2510,10 +2487,10 @@ def classify_shell(cmd, cwd, ctx):
         return act("grants", "grants_file", "a shell command on .mother/ (%s): %s" % (why, short))
     if kind == "persona":
         return act("persona", "persona_files", "a shell command on the workspace's standing instructions (%s): %s"
-                   % (why, short), op=shell_op(cmd))
+                   % (why, short))
     if kind == "config":
         return act("config", "guard_config", "a shell command on config.json or capabilities.json (%s): %s"
-                   % (why, short), op=shell_op(cmd))
+                   % (why, short))
     if kind == "home_settings":
         return act("home_settings", "home_settings", "a shell command on ~/.claude (%s): %s" % (why, short))
     return act("shell_unlisted", "shell_unlisted", "a shell command outside the workspace allow-list (%s): %s"
@@ -3288,9 +3265,7 @@ def classify(tool, inp, cwd, ctx):
                 return wa_act("terminal", "an edit that changes the whatsapp block of config.json (MOTHER's "
                                           "WhatsApp setup)")
             if fp.casefold() in protected_paths(ctx):
-                return act("config", "guard_config", "an edit to the guard's own files: " + fp,
-                           op="workspace_config" if ctx.ws and fp.casefold() == _cf(os.path.join(ctx.ws, "config.json"))
-                           else None)
+                return act("config", "guard_config", "an edit to the guard's own files: " + fp)
             if ctx.ws and fp.casefold() == _cf(os.path.join(ctx.ws, "capabilities.json")):
                 return act("config", "guard_config", "an edit to capabilities.json (written only by `mother health`): "
                            + fp)
@@ -3301,9 +3276,7 @@ def classify(tool, inp, cwd, ctx):
             if fp.casefold() == grants_path(ctx):
                 return act("grants", "grants_file", "an edit to .mother/grants.json")
             if persona_path(fp, ctx):
-                rel = os.path.relpath(fp.casefold(), _cf(ctx.ws)).replace(os.sep, "/")
-                return act("persona", "persona_files", "an edit to the workspace's standing instructions: " + fp,
-                           op="instructions" if rel in ("agents.md", "claude.md", "memory/memory.md") else None)
+                return act("persona", "persona_files", "an edit to the workspace's standing instructions: " + fp)
         return None
     if tool == "Monitor":
         a = classify_shell(str(inp.get("command") or ""), cwd, ctx)

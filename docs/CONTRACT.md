@@ -118,7 +118,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 3600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `connections` (map from capability `chat|mail|tracker|calendar|code|whatsapp` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required; the `whatsapp` capability takes only `{local: "whatsapp"}`, the local database, and no other capability may use `local`), `watch` (`chat.channels` [id], `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str], `whatsapp.groups` [group JID]; and for every source `every_seconds` (int 30-86400) and `idle_every_seconds` (int 0-86400; 0 = only during working hours), which override the global intervals for that source alone, under `chat|mail|tracker|calendar|code|whatsapp`: e.g. `mail` 3600, `calendar` 900, `tracker` 600, `code` 600, `chat` and `whatsapp` on the defaults. `chat.every_seconds` also paces the pick-up of notes typed in the self-DM inbox and of DMs with people (they are read by the chat source). The hub-lag and stale thresholds (2x the watcher's `every_seconds`) scale with the wake interval, which is the shortest source interval: with every source slow, the hub is judged against that slower beat. None is needed, so `config.example.json` sets none. A calendar checked less often than `calendar.lead_minutes` is allowed; `mother hub check` / `status` only warn). Unknown keys fail `mother status`. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
-| `policy.autonomy` | `"functional"` (default) or `"strict"`, optional | `functional`: a guard ask stands only for a functional send or decision another person sees (`any_message_to_others`, `calendar_with_guests`, `standing_rules`, `docs_writes`, `mail_trash`), creating a tracker issue, a data send the guard can't place, and the guard's own safety files (§5, "Functional autonomy"); every other ask is no decision. `strict`: every ask stands, as before 0.10. Any other value fails `mother status` |
+| `policy.autonomy` | `"functional"` (default) or `"strict"`, optional | `functional`: commenting on, transitioning and updating existing tracker issues, and code-host writes other than merging or approving, go without a question outside hub-fed sessions (§5, "Functional autonomy"); every other ask stands. `strict`: every ask stands, as before 0.10. Any other value fails `mother status` |
 | `policy.bypass_passes_asks` | bool, optional | default `false`: in a session whose cwd is the workspace, a guard ask stays an ask in `bypassPermissions` mode. `true` restores the pass (§5). Any other type fails `mother status` |
 
 The CLI validates this (`mother status`) and fails loudly on unknown keys or a wrong type.
@@ -227,18 +227,17 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   workspace, or `policy.bypass_passes_asks` is `true` (an invalid config counts as `false`). An ask for the guard's
   own files, `grants.json` or a persona file never passes.
 - **Functional autonomy** (`policy.autonomy`, default `"functional"`). After the rules below decide, an **ask**
-  becomes no decision (logged `pass`, reason prefixed `autonomy functional:`) when the config is valid and the
-  action is one of: `shell_unlisted`; `kind: "session"`; `code_host_comments`; a tracker write whose op is
-  `comment`, `transition`, `update` or `sprint` (`create` still asks); `kind: "config"` with `op:
-  "workspace_config"` (an Edit/Write of the workspace `config.json`, or a shell write naming `config.json` and none
-  of `guard.py`, `guard_fast.py`, `hooks.json`, `PAUSED`, `ledger.json`, `guard.log`, `grants.json`,
-  `capabilities.json`, `.claude/plugins`, `${CLAUDE_PLUGIN_ROOT}`, `.mother/workspace`, `.mcp.json`, `.claude`,
-  `.git`); `kind: "persona"` with `op: "instructions"` (the workspace `AGENTS.md`, `CLAUDE.md`, `memory/MEMORY.md`,
-  same exclusions for shell writes); `outbound_unknown` from a tool named `mcp__scheduled-tasks__…` or
-  `mcp__ccd_…__…`. Every category in `any_message_to_others`, `calendar_with_guests`, `standing_rules`,
-  `docs_writes`, `mail_trash` keeps its ask, as do `grants`, `home_settings`, `manager_only`, WhatsApp, the rest
-  of `outbound_unknown`, and any ask while the config is invalid. Denies are untouched (PAUSED, the never-list,
-  `MOTHER_DRY_RUN`, hub and sub-agent fences). `"strict"` turns this off.
+  becomes no decision (logged `pass`, reason prefixed `autonomy functional:`) when the config is valid, the session
+  is not hub-fed (§5e), and the action is either a tracker write (`kind: "tracker"`) whose op is `comment`,
+  `transition`, `update` or `sprint` (`create` still asks), or a `code_host_comments` write whose tool name, text
+  and description match none of `pr|mr merge`, `mr approve`, `--approve`, `merge_pull_request`,
+  `mergePullRequest`, `enablePullRequestAutoMerge`, `/merge`, `approve`, `event: APPROVE` (merging and approving
+  are decisions). Every other ask stands: sends and posts to others, invites with guests, mail rules, shared docs,
+  mail trash, issue creation, the workspace shell allow-list, `outbound_unknown`, the guard's own files, config,
+  grants, persona files and `home_settings`. Denies are untouched (PAUSED, the never-list, `MOTHER_DRY_RUN`, hub
+  and sub-agent fences). `tests/test_redteam.py` pins the corpus under `"strict"` and fails if `"functional"`
+  changes any row other than a workspace session's comment, transition or update of an existing issue.
+  `"strict"` turns this off.
 - **ask, every session and mode** (`kind: "grants"`, `op: "cli"`): a shell command whose text, with quotes and
   backslashes dropped and casefolded, has `grant add` (or `grant` followed by a word holding `$` or a backtick):
   `mother grant add` in any form. Never passed by bypass, whatever `policy.bypass_passes_asks` says; **deny** under
