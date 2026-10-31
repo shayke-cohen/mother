@@ -150,12 +150,14 @@ mother hub refresh    # reconnect now: restarts the watcher and polls every sour
 
 **Disk access for the watcher.** The launchd watcher is a bare `python3` process, not your terminal, so reading the
 WhatsApp database needs its own Full Disk Access grant (System Settings > Privacy & Security > Full Disk Access >
-`+`). Add the program macOS actually runs for the job, which is not always the path in the plist: a framework
-Python (Xcode's or python.org's) re-launches itself as `Python.app`. Find it while the watcher runs with
-`ps -o command= -p $(pgrep -f "mother hub watch")`; if it ends in `…/Resources/Python.app/Contents/MacOS/Python`,
-add that `Python.app` (press Cmd+Shift+G in the file picker to type the path). Then run `mother hub install` again so
-the job restarts. A passing `mother hub smoke` run from your terminal does not prove the watcher has this grant,
-because the terminal has its own.
+`+`). macOS charges the access to the **app that contains** the Python the job runs, not to the binary in the plist.
+With Xcode's Python (`/Applications/Xcode.app/Contents/Developer/usr/bin/python3`, the stock `python3` on a Mac with
+Xcode) that app is **Xcode** itself: add `Xcode.app`. Adding its `Python.app` or the `python3` launcher does nothing
+(seen on macOS 26: the privacy log names `subject=com.apple.dt.Xcode`). A python.org Python re-launches itself as its
+own `Python.app`, and that is the one to add. To see who macOS checks, run the watcher and then
+`log show --last 2m --predicate 'process == "tccd"' | grep -A2 python3` and read the `AUTHREQ_SUBJECT` line. Then
+run `mother hub refresh`. A passing `mother hub smoke` run from your terminal does not prove the watcher has this
+grant, because the terminal has its own.
 Without it the Now panel shows `whatsapp ✗` and `mother hub status` says the source is `couldnt_check (denied)`.
 
 Finally run `/mother:hub` once in a pinned session, in normal permission mode (not bypass), and leave it open: it

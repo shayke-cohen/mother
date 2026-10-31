@@ -2844,6 +2844,22 @@ def _sl_mother(args):
 PLUGIN_SCRIPTS = ("assets/plan/build.py", "assets/deck/build.py")
 
 
+def is_mother_bin(path, plugin):
+    """`path` is this plugin's bin/mother, or another installed version's: a sibling `<cache>/<version>/bin/mother`
+    of the running copy, or a marketplace checkout's under ~/.claude/plugins/marketplaces/ (where ~/.local/bin/mother
+    points). Every one of them sits under ~/.claude/plugins, which no session may write unasked (home_settings)."""
+    rp = os.path.realpath(path)
+    if rp == os.path.realpath(os.path.join(plugin, "bin", "mother")):
+        return True
+    if os.path.basename(rp) != "mother" or os.path.basename(os.path.dirname(rp)) != "bin":
+        return False
+    root = os.path.dirname(os.path.dirname(rp))
+    plugins = os.path.realpath(os.path.join(os.path.expanduser("~"), ".claude", "plugins"))
+    sibling = os.path.dirname(root) == os.path.dirname(os.path.realpath(plugin)) and inside(root, plugins)
+    market = os.path.dirname(root) == os.path.join(plugins, "marketplaces")
+    return bool(sibling or market) and os.path.isfile(rp)
+
+
 def _sl_stage(st, cwd, ws, ctx, plugin):
     """Check one stage; returns the new cwd (for `cd`)."""
     words = st["words"]
@@ -2852,9 +2868,8 @@ def _sl_stage(st, cwd, ws, ctx, plugin):
     if re.match(r"^[A-Za-z_]\w*=", words[0]):
         _sl_fail("a variable assignment")
     prog, args = words[0], words[1:]
-    mother_bin = os.path.realpath(os.path.join(plugin, "bin", "mother"))
-    is_mother = prog == "mother" or ("/" in prog and os.path.realpath(prog) == mother_bin) or (
-        prog in ("python3", "python") and args and "/" in args[0] and os.path.realpath(args[0]) == mother_bin)
+    is_mother = prog == "mother" or ("/" in prog and is_mother_bin(prog, plugin)) or (
+        prog in ("python3", "python") and args and "/" in args[0] and is_mother_bin(args[0], plugin))
     plugin_script = prog in ("python3", "python") and args and "/" in args[0] and os.path.realpath(args[0]) in \
         {os.path.realpath(os.path.join(plugin, x)) for x in PLUGIN_SCRIPTS}
     if is_mother:
@@ -3360,7 +3375,7 @@ def green(a, ctx, auto):
 
 # ------------------------------------------------------------------ session approvals (attended runs)
 
-APPROVE_RE = re.compile(r"^\s*mother approve (tracker|chat) ([A-Za-z0-9_-]+)\s*$", re.I)
+APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))\s*$", re.I)
 APPROVE_ANY_RE = re.compile(r"^\s*mother\s*approve\b", re.I | re.M)
 LINE_BREAKS_RE = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 SESSION_APPROVAL_MAX_HOURS = 12
@@ -3414,6 +3429,9 @@ def session_approvals(transcript, max_hours=SESSION_APPROVAL_MAX_HOURS, now=None
                 m = APPROVE_RE.match(ln)
                 if not m:
                     break
+                if m.group(3):  # `mother approve shell`: the workspace allow-list's questions, this session
+                    found.add(("shell", "*"))
+                    continue
                 scope = m.group(1).lower()
                 found.add((scope, m.group(2).upper() if scope == "tracker" else m.group(2)))
     return found
@@ -3719,6 +3737,13 @@ def bypass_passes(ctx):
     return bool(ctx.ok) and ((ctx.cfg.get("policy") or {}).get("bypass_passes_asks") is True)
 
 
+def shell_in_bypass(ctx, a):
+    """policy.shell_in_bypass is true and this is a shell allow-list ask in a session that isn't hub-fed: the
+    manager chose bypass mode, so the shell's own question goes; every other ask keeps its rule."""
+    return a["kind"] == "shell_unlisted" and bool(ctx.ok) \
+        and ((ctx.cfg.get("policy") or {}).get("shell_in_bypass") is True) and not hub_fed(ctx)
+
+
 def paused(ctx):
     if not ctx.ws:
         return None
@@ -3786,7 +3811,10 @@ def decide(a, ctx, transcript=None):
     if a["kind"] == "session":  # the manager's own sessions: always a question, never PAUSED or the never-list
         return "ask", "%s. Confirm it." % a["what"]
     if a["kind"] == "shell_unlisted":  # not outbound by itself: a question, PAUSED or not
-        return "ask", "%s. Confirm it." % a["what"]
+        if not hub_fed(ctx) and ("shell", "*") in session_approvals(transcript):
+            return "allow", "%s: covered by the manager's `mother approve shell` line in this session." % a["what"]
+        return "ask", "%s. Confirm it. (`mother approve shell` at the start of your message lets this session's " \
+                      "shell commands through for 12 h.)" % a["what"]
     if a["kind"] == "home_settings":
         return "ask", "%s. Claude Code's own settings decide which plugins and hooks run; confirm this is you." % \
             a["what"]
@@ -4599,7 +4627,7 @@ def run(raw):
         # files, grants.json and the persona files always ask.
         if r[0] == "ask" and a["kind"] not in ("config", "grants", "persona", "home_settings", "manager_only") \
                 and payload.get("permission_mode") == "bypassPermissions" \
-                and (bypass_passes(ctx) or not in_workspace(payload.get("cwd"), ctx)):
+                and (bypass_passes(ctx) or shell_in_bypass(ctx, a) or not in_workspace(payload.get("cwd"), ctx)):
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])
             return None
     except Exception as e:  # fail closed on anything that might be outbound; WhatsApp fails to deny

@@ -1071,30 +1071,47 @@ def clear_refresh(ws: Path) -> None:
         pass
 
 
+def this_mother() -> str:
+    return os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin", "mother"))
+
+
+def job_is_current(plist_path: Path, ctl, mother=None) -> bool:
+    """The watcher job is loaded and its plist runs `mother` (default: this copy's bin/mother)."""
+    import plistlib
+    try:
+        args = plistlib.loads(Path(plist_path).read_bytes()).get("ProgramArguments") or []
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if len(args) < 2 or os.path.realpath(str(args[1])) != os.path.realpath(mother or this_mother()):
+        return False
+    rc, _ = ctl("print", "gui/%d/%s" % (os.getuid(), LABEL))
+    return rc == 0
+
+
 def refresh(ws: Path, cfg: dict, at: datetime, ctl=None, sleep=time.sleep, now=None, timeout: float = 90,
-            plist_path=None, out=None, installer=None) -> int:
-    """Reconnect the watcher now: ask for a forced pass (`.mother/hub/refresh.json`), restart the launchd job so every
-    source gets a fresh connection (installing it when the plist is missing or the job isn't loaded), then wait up
-    to `timeout` seconds for that pass and print `cap | status | reason` per source. Exit 0 when every source is ok
-    or partial, 2 when one is not, 3 when no pass landed in time."""
+            plist_path=None, out=None, installer=None, mother=None) -> int:
+    """Reconnect the watcher now. When the launchd job is loaded and runs this copy of `bin/mother`, only ask it for a
+    forced pass (`.mother/hub/refresh.json`): it drops every client and reconnects each source within a second.
+    Otherwise (no plist, not loaded, or an older plugin's path) install it first, then ask. Wait up to `timeout`
+    seconds for that pass and print `cap | status | reason` per source. Exit 0 when every source is ok or partial,
+    2 when one is not, 3 when no pass landed in time, 1 when the install failed. No `kickstart -k`: it waits for the
+    old watcher to close its servers, which can outlast any sane limit."""
     out = out or sys.stdout
     ctl = ctl or launchctl
     now = now or (lambda: datetime.now(timezone.utc))
+    plist_path = Path(plist_path or default_plist_path())
     installer = installer or (lambda: install(ws, cfg, plist_path=plist_path, ctl=ctl))
     code = home_status(cfg)
     if code:
         print("mother hub refresh: not the home machine (see `mother home check`)", file=sys.stderr)
         return code
     hub_dir(ws).mkdir(parents=True, exist_ok=True)
+    if not job_is_current(plist_path, ctl, mother):
+        clear_refresh(ws)  # the old watcher must not take the request on its way out
+        if installer() != 0:
+            return 1
     asked = now()
     save_json(ws, REFRESH_FILE, {"at": _iso(asked)})
-    plist_path = Path(plist_path or default_plist_path())
-    rc = 1
-    if plist_path.exists():
-        rc, _ = ctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), LABEL))
-    if rc and installer() != 0:
-        clear_refresh(ws)
-        return 1
     waited = 0.0
     beat = {}
     while waited < timeout:

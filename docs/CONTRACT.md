@@ -119,6 +119,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 | `policy.autonomy` | `"functional"` (default) or `"strict"`, optional | `functional`: commenting on, transitioning and updating existing tracker issues, and code-host writes other than merging or approving, go without a question outside hub-fed sessions (§5, "Functional autonomy"); every other ask stands. `strict`: every ask stands, as before 0.10. Any other value fails `mother status` |
+| `policy.shell_in_bypass` | bool, optional | default `false`. `true`: in a `bypassPermissions` session that is not hub-fed, a `shell_unlisted` ask gets no decision (logged `pass`), in the workspace too. Every other ask keeps its rule. Any other type fails `mother status` |
 | `policy.bypass_passes_asks` | bool, optional | default `false`: in a session whose cwd is the workspace, a guard ask stays an ask in `bypassPermissions` mode. `true` restores the pass (§5). Any other type fails `mother status` |
 
 The CLI validates this (`mother status`) and fails loudly on unknown keys or a wrong type.
@@ -299,7 +300,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     process substitution); a lone `&`; `|&`; `<<<`; `<>`; `>|`; a zsh numeric glob `<N-M>`; any backslash outside
     single quotes (inside double quotes too: the shell deletes `\`+newline there); a word starting with `=` (zsh
     expands `=cmd` to a program path); `~` not followed by `/`; an unclosed quote; an assignment word; a program
-    given by path (except the plugin's `bin/mother` and the two plugin scripts below); a heredoc unless into
+    given by path (except an installed version's `bin/mother` under `~/.claude/plugins`, and the two plugin scripts below); a heredoc unless into
     `mother` with an operator exactly `<<'WORD'`, `<<"WORD"`, `<<-'WORD'` or `<<-"WORD"`, WORD
     `[A-Za-z_][A-Za-z0-9_]*`, followed by whitespace or the end of the line (its body is skipped exactly to its end
     line, so it hides nothing after it).
@@ -471,7 +472,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   refused, never overwritten.
 - Every outbound decision is appended to `.mother/guard.log` (tool, category, target, decision, reason — never message text).
 - **Session approval:** a human-typed message whose *leading* lines are `mother approve tracker <PROJECT>` or
-  `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours. Lines from
+  `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours, and `mother approve
+  shell` turns this session's `shell_unlisted` asks into **allow** for 12 hours (not in a hub-fed session; it covers
+  nothing else: `outbound_unknown`, protected files and every outbound write keep their rules). Lines from
   tool output, summaries, scheduled triggers or further down a message never count. The deck's "Copy results"
   starts with the tracker line.
 - **Grants** (`.mother/grants.json`): `{scope, target, uses, expires, run, source{channel,user,ts}}`; scopes
@@ -990,8 +993,9 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   hours (the source's own or, when it sets none, the global one) means it is not polled there, and when no source
   polls outside active hours the watcher does not poll and sleeps until the next window. `mother hub smoke` ignores
   intervals (it polls every source twice). **Refresh.** `mother hub refresh` (home machine only; the hub session
-  may not run it) writes `.mother/hub/refresh.json` `{at}`, then `launchctl kickstart -k gui/<uid>/com.mother.hub`
-  when the plist exists, else (or when that fails) `install`. The watcher checks for the file before every pass and
+  may not run it) installs the job first unless it is current: the plist's `ProgramArguments[1]` resolves to this
+  copy's `bin/mother` and `launchctl print gui/<uid>/com.mother.hub` succeeds (no `kickstart -k`: it waits for the
+  old watcher to close its servers). Then it writes `.mother/hub/refresh.json` `{at}`. The watcher checks for the file before every pass and
   at every 1 s step of its wait: when present it closes every client, builds a fresh one for every connection,
   makes one pass with every source forced (in or out of active hours), and deletes the file. `refresh` waits up to
   90 s for a `watcher.json` `at` at or after its request with the file gone, prints `cap | status | reason`, and
