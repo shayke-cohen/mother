@@ -154,6 +154,186 @@ class TestReadOnlyMissingTools(unittest.TestCase):
         self.assertTrue(any("search-messages" in p or "other" in p for p in out["partial"]), out["partial"])
 
 
+class TestPacing(unittest.TestCase):
+    """Per-conversation tiers, away mode and the 429 backoff of the chat source."""
+    CH, DM, INBOX = "C00000001", "D00000002", "D00000099"
+
+    def setUp(self):
+        self.history = {}
+        self.error = None  # an McpError every call raises once set
+
+    def client(self):
+        def hist(a):
+            if self.error:
+                raise self.error
+            got = [m for m in self.history.get(a["channel_id"], [])
+                   if float(m["ts"]) > float(a.get("oldest", 0)) and float(m["ts"]) <= float(a.get("latest", 1e18))]
+            return {"ok": True, "messages": sorted(got, key=lambda m: float(m["ts"]))}
+
+        def srch(a):
+            if self.error:
+                raise self.error
+            return {"ok": True, "messages": {"matches": []}}
+        return ro({"get_channel_history": hist, "get_thread_replies": lambda a: {"messages": []},
+                   "search-messages": srch}, hs.ChatSlack.READ_TOOLS)
+
+    def poll(self, cursor, at, **cfg):
+        client, f = self.client()
+        base = {"channels": [self.CH], "dms": {"U00000002": self.DM}, "inbox": self.INBOX}
+        base.update(cfg)
+        return hs.ChatSlack.poll(client, cursor, base, ME, at), f
+
+    @staticmethod
+    def read(f):
+        """Conversations read this pass (history calls without `latest`, which is the lookback)."""
+        return [a["channel_id"] for n, a in f.calls if n.endswith("get_channel_history") and "latest" not in a]
+
+    @staticmethod
+    def searched(f):
+        return any(n.endswith("search-messages") for n, _ in f.calls)
+
+    def test_tier_rules(self):
+        p = hs.pacing({})
+        self.assertEqual(hs.tier({}, NOW, p), "cold")
+        self.assertEqual(hs.tier({"act": NOW - 29 * 60}, NOW, p), "hot")  # anyone, last 30 min
+        self.assertEqual(hs.tier({"act": NOW - 31 * 60}, NOW, p), "warm")
+        self.assertEqual(hs.tier({"act": NOW - 3 * 3600, "mine": NOW - 3 * 3600}, NOW, p), "warm")
+        self.assertEqual(hs.tier({"act": NOW - 3 * 3600, "mine": NOW - 119 * 60}, NOW, p), "hot")  # the manager, 2h
+        self.assertEqual(hs.tier({"act": NOW - 25 * 3600}, NOW, p), "cold")
+        self.assertEqual(hs.tier({}, NOW, p, followed=True), "hot")
+        self.assertEqual([hs.tier_every(t, p) for t in ("hot", "warm", "cold")], [120, 600, 2700])
+        self.assertEqual(hs.tier_every("cold", p, dm=True), 600)  # a DM is never colder than 10 min
+        self.assertEqual([hs.tier_every(t, p, away=True) for t in ("hot", "warm", "cold")], [900, 900, 2700])
+        self.assertEqual(hs.tier_every("hot", p, dm=True, away=True), 600)
+
+    def test_pacing_reads_config_and_ignores_bad_values(self):
+        p = hs.pacing({"_pacing": {"cold_seconds": 3600, "warm_seconds": "x", "hot_seconds": 0, "bogus": 5}})
+        self.assertEqual((p["cold_seconds"], p["warm_seconds"], p["hot_seconds"]), (3600, 600, 120))
+        self.assertNotIn("bogus", p)
+
+    def test_cold_channel_is_read_on_its_tier_and_inbox_every_pass(self):
+        cur = {"ts": "%.6f" % (NOW - 120), "threads": {}}
+        out, f = self.poll(cur, AT)  # first pass on tiers: everything is read once
+        self.assertEqual(sorted(self.read(f)), sorted([self.CH, self.DM, self.INBOX]))
+        self.assertTrue(self.searched(f))
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=2))  # quiet channel: cold; quiet DM: 10 min
+        self.assertEqual(self.read(f), [self.INBOX])
+        self.assertTrue(self.searched(f))  # the mentions search is the catch-all, on the hot tier
+        self.assertEqual(out["pacing"], {"away": False, "every": {"600": 1, "2700": 1}})
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=10))
+        self.assertEqual(sorted(self.read(f)), sorted([self.DM, self.INBOX]))
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=46))
+        self.assertIn(self.CH, self.read(f))
+
+    def test_activity_makes_a_channel_hot_and_no_message_is_lost(self):
+        cur = {"ts": "%.6f" % (NOW - 120), "threads": {}}
+        out, _ = self.poll(cur, AT)
+        self.history[self.CH] = [msg(NOW + 30, text="first"), msg(NOW + 200, text="second")]
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=10))  # passes go on; the cold channel waits
+        self.assertNotIn(self.CH, self.read(f))
+        self.assertEqual(out["lines"], [])
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=50))  # cold: due again at 45 min
+        self.assertEqual([l["title"] for l in out["lines"]], ["first", "second"])  # since its last read, not the pass
+        self.assertEqual(out["cursor"]["convs"][self.CH]["act"], NOW + 200)
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=52))  # a post 48 min ago: warm, not yet due
+        self.assertNotIn(self.CH, self.read(f))
+        self.history[self.CH].append(msg(NOW + 52 * 60, text="now"))
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=60))  # warm: 10 min after the last read
+        self.assertIn(self.CH, self.read(f))
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=62))  # posted 8 min ago: hot, 2 min
+        self.assertIn(self.CH, self.read(f))
+
+    def test_manager_post_or_mention_keeps_it_hot_for_two_hours(self):
+        cur = {"ts": "%.6f" % (NOW - 120), "threads": {}}
+        self.history[self.CH] = [msg(NOW - 100, user=ME["chat"], text="mine")]
+        out, _ = self.poll(cur, AT)
+        self.assertEqual(out["cursor"]["me_at"], "%.6f" % (NOW - 100))
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=90))
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=92))
+        self.assertIn(self.CH, self.read(f))  # 92 min after the manager's post: still every 2 min
+
+    def test_lookback_seeds_the_tier_of_a_first_read(self):
+        self.history[self.CH] = [msg(NOW - 3600, text="an hour ago")]
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        self.assertEqual(out["cursor"]["convs"][self.CH]["act"], NOW - 3600)
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=10))
+        self.assertIn(self.CH, self.read(f))  # warm (an hour ago), not cold
+
+    def test_a_hub_session_keeps_its_channel_hot(self):
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=2), _hot=["%s/1788000000.000100" % self.CH])
+        self.assertIn(self.CH, self.read(f))
+
+    def test_away_slows_everything_but_the_inbox(self):
+        self.history[self.CH] = [msg(NOW - 60, text="busy")]
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=2), _away=True)
+        self.assertEqual(self.read(f), [self.INBOX])  # hot, but away: 15 min
+        self.assertFalse(self.searched(f))  # the search slows down with them
+        self.assertTrue(out["pacing"]["away"])
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=4))  # back: the hot channel is due at once
+        self.assertIn(self.CH, self.read(f))
+        self.assertTrue(self.searched(f))
+
+    def test_force_reads_everything(self):
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        out, f = self.poll(out["cursor"], AT + timedelta(seconds=20), _force=True)
+        self.assertEqual(sorted(self.read(f)), sorted([self.CH, self.DM, self.INBOX]))
+        self.assertTrue(self.searched(f))
+
+    def test_429_stops_the_pass_honours_retry_after_and_alerts_once(self):
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        self.error = McpErrorAlias("other", "Request failed with status code 429 ratelimited", retry_after=30)
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=2))
+        self.assertEqual(len(f.calls), 1)  # the rest of the pass is skipped
+        errs = [l for l in out["lines"] if l["kind"] == "error"]
+        self.assertEqual([(l["key"], l["title"]) for l in errs], [("watcher:chat", "chat source rate limited")])
+        self.assertTrue(any("429" in x for x in out["partial"]))
+        self.assertEqual(out["cursor"]["limited"]["until"], NOW + 150)
+        out2, f = self.poll(out["cursor"], AT + timedelta(minutes=2, seconds=20))  # inside Retry-After: no call
+        self.assertEqual(f.calls, [])
+        self.assertEqual(out2["cursor"], out["cursor"])
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=4))  # still 429: same outage, no second line
+        self.assertEqual([l for l in out["lines"] if l["kind"] == "error"], [])
+        self.error = None
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=6))  # it recovers
+        self.assertNotIn("limited", out["cursor"])
+        self.assertEqual(out["partial"], [])
+
+    def test_429_without_retry_after_backs_off_exponentially_and_a_later_outage_alerts_again(self):
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        self.error = McpErrorAlias("other", "ratelimited")
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=2))
+        self.assertEqual(out["cursor"]["limited"]["until"], NOW + 120 + 120)
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=4))
+        self.assertEqual(out["cursor"]["limited"]["until"], NOW + 240 + 240)  # doubled
+        self.error = None
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=10))
+        self.error = McpErrorAlias("other", "status code 429")
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=50))  # 46 min after the last 429: a new outage
+        self.assertEqual([l["key"] for l in out["lines"] if l["kind"] == "error"], ["watcher:chat"])
+        self.assertEqual(out["cursor"]["limited"]["n"], 1)
+
+    def test_other_errors_are_not_rate_limits(self):
+        self.assertFalse(hs.is_rate_limited(McpErrorAlias("other", "weird failure")))
+        self.assertTrue(hs.is_rate_limited(McpErrorAlias("other", '{"error":"ratelimited","status":429}')))
+
+    def test_retry_after_is_read_from_the_error_text(self):
+        self.assertEqual(hub_mcp.retry_after('{"status":429,"headers":{"retry-after":"42"}}'), 42)
+        self.assertEqual(hub_mcp.retry_after("Retry-After: 7"), 7)
+        self.assertIsNone(hub_mcp.retry_after("status 429"))
+
+    def test_retry_after_survives_the_cut_message(self):
+        c = TestClient("client")
+        c.setUp()
+        long = "x" * 400 + ' "retry_after": 33'
+        cl = c.client({"tools": ["gw__get_x"], "errors": {"gw__get_x": long}})
+        cl.start()
+        with self.assertRaises(hub_mcp.McpError) as cm:
+            cl.call("gw__get_x", {})
+        self.assertEqual(cm.exception.retry_after, 33)
+
+
 class TestAdapterShape(unittest.TestCase):
     def test_every_adapter_read_tools_are_reads(self):
         self.assertEqual(set(hs.ADAPTERS), {"chat:slack", "mail:gmail", "tracker:jira", "calendar:google",

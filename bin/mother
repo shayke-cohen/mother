@@ -54,7 +54,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.11.4"
+VERSION = "0.12.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -128,7 +128,12 @@ WA_USER_JID_RE = re.compile(r"\d{6,15}@s\.whatsapp\.net", re.ASCII)
 
 
 HUB_KEYS = {"enabled", "every_seconds", "idle_every_seconds", "model", "max_cards_per_wake", "sweep_minutes",
-            "update_ttl_hours", "connections", "watch"}
+            "update_ttl_hours", "connections", "watch", "pacing"}
+# hub.pacing: the chat source's per-conversation tiers, away mode and 429 backoff (lib/hub_sources.py PACING)
+HUB_PACING = {"hot_seconds": (30, 3600), "warm_seconds": (60, 7200), "cold_seconds": (300, 14400),
+              "dm_max_seconds": (60, 3600), "away_seconds": (120, 7200), "hot_mine_minutes": (1, 1440),
+              "hot_any_minutes": (1, 1440), "warm_hours": (1, 168), "away_idle_minutes": (1, 240),
+              "away_quiet_minutes": (1, 240), "backoff_seconds": (10, 1800), "outage_minutes": (1, 240)}
 HUB_CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
 HUB_CONN_KEYS = {"command", "args", "env", "cli", "local"}
 HUB_WATCH_INTERVALS = {"every_seconds", "idle_every_seconds"}
@@ -375,6 +380,15 @@ def validate_hub(h) -> list:
             errs.append(f"hub.{k} must be an integer {lo}-{hi}")
     if h.get("model") is not None and not isinstance(h["model"], str):
         errs.append("hub.model must be a string or null")
+    pace = h.get("pacing", {})
+    if not isinstance(pace, dict):
+        errs.append("hub.pacing must be an object")
+        pace = {}
+    for k, v in pace.items():
+        if k not in HUB_PACING:
+            errs.append(f"unknown key hub.pacing.{k}")
+        elif not is_int(v) or not HUB_PACING[k][0] <= v <= HUB_PACING[k][1]:
+            errs.append(f"hub.pacing.{k} must be an integer {HUB_PACING[k][0]}-{HUB_PACING[k][1]}")
     conns = h.get("connections", {})
     if not isinstance(conns, dict):
         errs.append("hub.connections must be an object")

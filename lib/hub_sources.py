@@ -82,6 +82,57 @@ def _first(*vals):
 
 
 # --------------------------------------------------------------------------------------------------- chat
+# Pacing (`hub.pacing`, all optional): each conversation is read on its own tier, from the activity its reads saw.
+# hot: the manager posted or was mentioned there in the last `hot_mine_minutes`, anyone posted in the last
+# `hot_any_minutes`, or a live hub session follows it. warm: anyone posted in the last `warm_hours`. cold: the rest.
+# Away (see hub.presence), every tier is at least `away_seconds`. A DM is never slower than `dm_max_seconds`. The
+# self-DM inbox is read every pass. The mentions search runs on the hot tier (away: `away_seconds`) and catches
+# what a cold channel has not been read for yet.
+PACING = {"hot_seconds": 120, "warm_seconds": 600, "cold_seconds": 2700, "dm_max_seconds": 600,
+          "away_seconds": 900, "hot_mine_minutes": 120, "hot_any_minutes": 30, "warm_hours": 24,
+          "away_idle_minutes": 15, "away_quiet_minutes": 30, "backoff_seconds": 120, "outage_minutes": 30}
+MAX_BACKOFF = 1800
+_RATE = re.compile(r"\b429\b|ratelimited|rate[ _-]?limit", re.I)
+
+
+def pacing(cfg: dict) -> dict:
+    """`PACING` overlaid with the positive integers in `cfg["_pacing"]` (the watcher passes `hub.pacing`)."""
+    got = cfg.get("_pacing") if isinstance(cfg, dict) and isinstance(cfg.get("_pacing"), dict) else {}
+    out = dict(PACING)
+    for k, v in got.items():
+        if k in out and isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            out[k] = v
+    return out
+
+
+def tier(conv: dict, at_ts: float, p: dict, followed: bool = False) -> str:
+    """`hot`, `warm` or `cold` for one conversation's activity record ({"act": ts, "mine": ts})."""
+    act, mine = float(conv.get("act") or 0), float(conv.get("mine") or 0)
+    if followed or at_ts - mine < p["hot_mine_minutes"] * 60 or at_ts - act < p["hot_any_minutes"] * 60:
+        return "hot"
+    return "warm" if at_ts - act < p["warm_hours"] * 3600 else "cold"
+
+
+def tier_every(name: str, p: dict, dm: bool = False, away: bool = False) -> int:
+    """Seconds between reads of a conversation on tier `name`."""
+    s = p[name + "_seconds"]
+    if away:
+        s = max(s, p["away_seconds"])
+    return min(s, p["dm_max_seconds"]) if dm else s
+
+
+class RateLimited(Exception):
+    """The chat server said 429: stop this pass. `retry_after` is its Retry-After in seconds, when it gave one."""
+
+    def __init__(self, retry_after: Optional[int]):
+        super().__init__("rate limited")
+        self.retry_after = retry_after
+
+
+def is_rate_limited(e: Exception) -> bool:
+    return bool(_RATE.search(str(getattr(e, "message", None) or e)))
+
+
 class ChatSlack(Adapter):
     SOURCE = "chat"
     READ_TOOLS = {"get_channel_history", "get_thread_replies", "search-messages"}
@@ -90,13 +141,26 @@ class ChatSlack(Adapter):
     def poll(cls, client, cursor, cfg, me, at):
         if cursor is None:
             return _result([], {"ts": "%.6f" % at.timestamp(), "threads": {}})
+        now = at.timestamp()
+        p = pacing(cfg)
+        away = cfg.get("_away") is True
+        force = cfg.get("_force") is True  # `mother hub refresh` / smoke: every conversation and the search, now
+        limited = dict(cursor.get("limited") or {})
+        if limited and now < float(limited.get("until") or 0):  # honour Retry-After: no call at all
+            return _result([], dict(cursor), ["rate limited, backing off until %s" % ts_iso(limited["until"])])
+        if limited and now - float(limited.get("last") or 0) > p["outage_minutes"] * 60:
+            limited = {}  # quiet long enough: the outage is over, the next 429 is a new one
         since = float(cursor["ts"])
         threads = dict(cursor.get("threads") or {})
+        convs = {k: dict(v) for k, v in (cursor.get("convs") or {}).items() if isinstance(v, dict)}
+        me_at = float(cursor.get("me_at") or 0)
         mine = me.get("chat") or ""
         marks = [m for m in me.get("marks") or [] if m]
         lines, partial, notes = [], [], []
         seen = list(cursor.get("seen") or [])
         followed = [t for t in cfg.get("follow") or [] if isinstance(t, str)]
+        hot_keys = set(followed) | {k for k in cfg.get("_hot") or [] if isinstance(k, str)}
+        hot_chans = {k.split("/", 1)[0] for k in hot_keys}
         for t in cursor.get("followed") or []:  # unfollowed since the last pass: stop polling it
             if t not in followed:
                 threads.pop(t, None)
@@ -106,6 +170,41 @@ class ChatSlack(Adapter):
         dms = {ch: u for u, ch in (cfg.get("dms") or {}).items() if isinstance(u, str) and isinstance(ch, str)}
         inbox = cfg.get("inbox") or ""
         names = me.get("people") or {}
+        tiers = {}  # type: Dict[str, int]
+
+        def call(name, args):
+            try:
+                return client.call(name, args)
+            except McpError as e:
+                if is_rate_limited(e):
+                    raise RateLimited(getattr(e, "retry_after", None))
+                raise
+
+        def touch(conv, msg):
+            """Record a message's time as the conversation's activity, and as the manager's when it is theirs or
+            names them."""
+            try:
+                ts = float(msg.get("ts") or 0)
+            except (TypeError, ValueError):
+                return
+            nonlocal me_at
+            c = convs.setdefault(conv, {})
+            c["act"] = max(float(c.get("act") or 0), ts)
+            text = msg.get("text") or ""
+            if mine and (sender(msg) == mine or "<@%s>" % mine in text):
+                c["mine"] = max(float(c.get("mine") or 0), ts)
+            if mine and sender(msg) == mine:
+                me_at = max(me_at, ts)
+
+        def due(conv, dm=False):
+            """True when this conversation's tier says it is time to read it again."""
+            c = convs.get(conv) or {}
+            hot = conv in hot_keys or (conv in hot_chans if "/" not in conv else False)
+            every = tier_every(tier(c, now, p, hot), p, dm=dm, away=away)
+            tiers[conv] = every
+            if force or not c.get("read"):
+                return True  # never read on a tier (new, or the cursor predates tiers): read it now
+            return now - float(c["read"]) >= every - 5  # a pass that runs a few seconds early counts
 
         def named(raw):  # `Name <U…>` for a person in config, else the raw id
             return "%s <%s>" % (names[raw], raw) if names.get(raw) else raw
@@ -114,6 +213,8 @@ class ChatSlack(Adapter):
             ts = msg.get("ts")
             if ch == inbox:
                 return  # the inbox is read by note() only: search never resolves or marks one of its notes seen
+            if ts:
+                touch(ch, msg)
             if not ts or float(ts) <= floor or "%s:%s" % (ch, ts) in seen:
                 return
             seen.append("%s:%s" % (ch, ts))  # every path (history, replies, search) shares this set
@@ -143,6 +244,7 @@ class ChatSlack(Adapter):
             posted as the manager with a `client_msg_id` (the client sets it) and no `app_id`, `bot_id`,
             `bot_profile` or `subtype`: a post made through an app (MOTHER via a connector) always carries
             `app_id`, signed or not, so it never loops back as a note."""
+            nonlocal me_at
             ts = msg.get("ts")
             if not ts or float(ts) <= since or "%s:%s" % (ch, ts) in seen:
                 return
@@ -151,6 +253,7 @@ class ChatSlack(Adapter):
             if not mine or msg.get("user") != mine or not msg.get("client_msg_id") or msg.get("app_id") \
                     or msg.get("bot_id") or msg.get("bot_profile") or msg.get("subtype") or not text.strip():
                 return
+            me_at = max(me_at, float(ts))  # a note typed from any device: the manager is around
             text = hub.plain(text)
             url = re.search(r"https?://[^\s<>|]+", text)
             lines.append(hub.make_line("chat", "manual", hub.manual_key(text), ts_iso(ts), title=text[:80],
@@ -160,23 +263,23 @@ class ChatSlack(Adapter):
                                        uid=ts))
 
         def read(ch, dm=False):
-            """One watched channel (or mapped DM): this pass's history, then replies in active threads."""
-            res = client.call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % since,
-                                                      "limit": MAX_HISTORY + 1})
+            """One watched channel (or mapped DM): history since its last read, then replies in active threads."""
+            mark = float((convs.get(ch) or {}).get("read") or since)
+            res = call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % mark, "limit": MAX_HISTORY + 1})
             got = (res or {}).get("messages") or []
             if len(got) > MAX_HISTORY:
                 partial.append("%s: more than %d new messages" % (ch, MAX_HISTORY))
                 got = got[:MAX_HISTORY]
             for m in got:
-                add(ch, m, dm=dm)
-            # Replies in threads nobody follows: a parent with replies newer than the cursor (less the search
+                add(ch, m, floor=mark, dm=dm)
+            # Replies in threads nobody follows: a parent with replies newer than the last read (less the search
             # overlap). History lists parents by their own time, so an older parent needs a lookback read.
             heads = {m["ts"]: m for m in got if m.get("ts")}
             back = []
             try:
-                back = (client.call("get_channel_history", {
-                    "channel_id": ch, "oldest": "%.6f" % (at.timestamp() - THREAD_DAYS * 86400),
-                    "latest": "%.6f" % since, "limit": MAX_HISTORY + 1}) or {}).get("messages") or []
+                back = (call("get_channel_history", {
+                    "channel_id": ch, "oldest": "%.6f" % (now - THREAD_DAYS * 86400),
+                    "latest": "%.6f" % mark, "limit": MAX_HISTORY + 1}) or {}).get("messages") or []
             except McpError as e:
                 partial.append("%s: lookback %s" % (ch, e.kind))
             if len(back) > MAX_HISTORY:  # a busy channel fills it every pass: a note, not a failure
@@ -184,6 +287,7 @@ class ChatSlack(Adapter):
                 back = back[:MAX_HISTORY]
             for m in back:
                 if m.get("ts"):
+                    touch(ch, m)  # older history seeds the tier of a conversation read for the first time
                     heads.setdefault(m["ts"], m)
             active = []
             for tts, m in heads.items():
@@ -191,77 +295,119 @@ class ChatSlack(Adapter):
                     newest, n = float(m.get("latest_reply") or 0), int(m.get("reply_count") or 0)
                 except (TypeError, ValueError):
                     continue
-                if n > 0 and newest > since - SEARCH_OVERLAP and "%s/%s" % (ch, tts) not in threads:
+                if newest:
+                    touch(ch, {"ts": newest})  # a reply in a thread is activity in the channel
+                if n > 0 and newest > mark - SEARCH_OVERLAP and "%s/%s" % (ch, tts) not in threads:
                     active.append((newest, tts))
             active.sort(reverse=True)
             if len(active) > MAX_NEW_THREADS:
                 partial.append("more than %d active threads in %s" % (MAX_NEW_THREADS, ch))
             for _, tts in active[:MAX_NEW_THREADS]:
                 try:
-                    res = client.call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                    res = call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
                 except McpError:
                     partial.append("%s/%s: replies unreadable" % (ch, tts))
                     continue
                 for m in (res or {}).get("messages") or []:
                     if m.get("ts") != tts:
-                        add(ch, dict(m, thread_ts=tts), floor=since - SEARCH_OVERLAP, dm=dm)
+                        add(ch, dict(m, thread_ts=tts), floor=mark - SEARCH_OVERLAP, dm=dm)
+            convs.setdefault(ch, {})["read"] = now
 
-        for ch in cfg.get("channels") or []:
-            read(ch)
-        for ch in dms:  # DMs with people in config (`mother hub dms set`); a DM that fails is partial
-            try:
-                read(ch, dm=True)
-            except McpError as e:
-                partial.append("%s: history %s" % (ch, e.kind))
-        if inbox:  # the manager's self-DM: each note of theirs is a `manual` line
-            try:
-                res = client.call("get_channel_history", {"channel_id": inbox, "oldest": "%.6f" % since,
-                                                          "limit": MAX_HISTORY + 1})
-                got = (res or {}).get("messages") or []
-                if len(got) > MAX_HISTORY:
-                    partial.append("inbox %s: more than %d new messages" % (inbox, MAX_HISTORY))
-                for m in got[:MAX_HISTORY]:
-                    note(inbox, m)
-            except McpError as e:
-                partial.append("inbox %s: history %s" % (inbox, e.kind))
+        search_ts = float(cursor.get("search_ts") or since)
+        searched = False
+        try:
+            if inbox:  # the manager's self-DM, first and every pass: each note of theirs is a `manual` line
+                try:
+                    res = call("get_channel_history", {"channel_id": inbox, "oldest": "%.6f" % since,
+                                                       "limit": MAX_HISTORY + 1})
+                    got = (res or {}).get("messages") or []
+                    if len(got) > MAX_HISTORY:
+                        partial.append("inbox %s: more than %d new messages" % (inbox, MAX_HISTORY))
+                    for m in got[:MAX_HISTORY]:
+                        note(inbox, m)
+                except McpError as e:
+                    partial.append("inbox %s: history %s" % (inbox, e.kind))
+            for ch in dms:  # DMs with people in config (`mother hub dms set`); a DM that fails is partial
+                if due(ch, dm=True):
+                    try:
+                        read(ch, dm=True)
+                    except McpError as e:
+                        partial.append("%s: history %s" % (ch, e.kind))
+            for ch in cfg.get("channels") or []:
+                if due(ch):
+                    read(ch)
 
-        for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
-            if "/" not in key:
-                continue
-            ch, tts = key.split("/", 1)
-            if float(tseen) < at.timestamp() - THREAD_DAYS * 86400:
-                del threads[key]
-                continue
-            res = client.call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
-            for m in (res or {}).get("messages") or []:
-                if m.get("ts") == tts:
+            for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
+                if "/" not in key:
                     continue
-                if float(m.get("ts", 0)) > float(tseen):
-                    add(ch, dict(m, thread_ts=tts), floor=float(tseen))
-                    threads[key] = max(float(threads[key]), float(m["ts"]))
-
-        # Search indexes late and `after` is exclusive by day: look back a day, overlap 10 minutes, dedupe by ts.
-        floor = since - SEARCH_OVERLAP
-        day = (datetime.fromtimestamp(since, UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
-        for label, text in (("mentions", "<@%s>" % mine), ("DMs", "is:dm")):
-            if label == "mentions" and not mine:
-                continue
-            try:
-                res = client.call("search-messages", {"searchText": text, "after": day}) or {}
-            except McpError as e:
-                low = str(getattr(e, "message", e)).lower()
-                scope = e.kind == "missing_scope" or re.search(r"missing[_ ]scope|insufficient scope", low)
-                partial.append("%s: %s" % (label, "missing scope" if scope else e.kind))
-                continue
-            box = res.get("messages", res)
-            for m in (box.get("matches") if isinstance(box, dict) else None) or []:
-                ch = (m.get("channel") or {}).get("id") or m.get("channel_id") or ""
-                if not ch:
+                ch, tts = key.split("/", 1)
+                if float(tseen) < now - THREAD_DAYS * 86400:
+                    del threads[key]
                     continue
-                add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
+                c = convs.setdefault(key, {})
+                c["act"] = max(float(c.get("act") or 0), float(tseen))
+                if not due(key):
+                    continue
+                res = call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                for m in (res or {}).get("messages") or []:
+                    if m.get("ts") == tts:
+                        continue
+                    touch(key, m)
+                    if float(m.get("ts", 0)) > float(tseen):
+                        add(ch, dict(m, thread_ts=tts), floor=float(tseen))
+                        threads[key] = max(float(threads[key]), float(m["ts"]))
+                c["read"] = now
+
+            # Search indexes late and `after` is exclusive by day: look back a day, overlap 10 minutes, dedupe by
+            # ts. It runs on the hot tier and reaches back to the last search, so a cold channel's mention is not
+            # left for its next read.
+            if force or now - search_ts >= tier_every("hot", p, away=away) - 5:
+                floor = search_ts - SEARCH_OVERLAP
+                day = (datetime.fromtimestamp(search_ts, UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+                for label, text in (("mentions", "<@%s>" % mine), ("DMs", "is:dm")):
+                    if label == "mentions" and not mine:
+                        continue
+                    try:
+                        res = call("search-messages", {"searchText": text, "after": day}) or {}
+                    except McpError as e:
+                        low = str(getattr(e, "message", e)).lower()
+                        scope = e.kind == "missing_scope" or re.search(r"missing[_ ]scope|insufficient scope", low)
+                        partial.append("%s: %s" % (label, "missing scope" if scope else e.kind))
+                        continue
+                    box = res.get("messages", res)
+                    for m in (box.get("matches") if isinstance(box, dict) else None) or []:
+                        ch = (m.get("channel") or {}).get("id") or m.get("channel_id") or ""
+                        if not ch:
+                            continue
+                        add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
+                searched = True
+            limited = {}  # a whole pass without a 429
+        except RateLimited as e:
+            # Skip the rest of the pass. What was read keeps its read time; the rest is read next pass. One
+            # `watcher:chat` error line per outage: a 429 within `outage_minutes` of the last one is the same outage.
+            n = int(limited.get("n") or 0) + 1
+            wait = e.retry_after if e.retry_after else min(p["backoff_seconds"] * 2 ** (n - 1), MAX_BACKOFF)
+            if not limited:
+                lines.append(hub.make_line("chat", "error", "watcher:chat", iso(at), title="chat source rate limited",
+                                           summary="the chat server returned 429 (rate limited); backing off "
+                                                   "%ds and reading less often until it stops" % wait))
+            limited = {"first": limited.get("first", now), "last": now, "until": now + wait, "n": n}
+            partial.append("rate limited (429): backing off %ds" % wait)
         keep = dict(list(threads.items())[-MAX_THREADS:])
-        return _result(lines, {"ts": "%.6f" % at.timestamp(), "threads": keep, "seen": seen[-300:],
-                                                                     "followed": followed}, partial, notes)
+        live = set(cfg.get("channels") or []) | set(dms) | set(keep)
+        out = {"ts": "%.6f" % now, "threads": keep, "seen": seen[-300:], "followed": followed,
+               "convs": {k: v for k, v in convs.items() if k in live},
+               "search_ts": "%.6f" % (now if searched else search_ts)}
+        if me_at:
+            out["me_at"] = "%.6f" % me_at
+        if limited:
+            out["limited"] = limited
+        res = _result(lines, out, partial, notes)
+        counts = {}  # type: Dict[str, int]
+        for every in tiers.values():
+            counts[str(every)] = counts.get(str(every), 0) + 1
+        res["pacing"] = {"away": away, "every": counts}  # conversations per interval, for `mother hub status`
+        return res
 
 
 # --------------------------------------------------------------------------------------------------- mail
@@ -871,6 +1017,7 @@ class WhatsApp(Adapter):
             partial.append("more than %d WhatsApp messages waiting; the rest are read next pass" % WA_MAX)
         pk = cursor["pk"]
         opened = dict(cursor.get("open") or {})
+        me_at = str(cursor.get("me_at") or "")
         lines = []
         for it in items:
             pk = max(pk, it.get("pk") or 0)
@@ -888,6 +1035,7 @@ class WhatsApp(Adapter):
             if it.get("from_me"):
                 if marks and any(k in text for k in marks):
                     continue  # the agent's own signed message: neither news nor the manager's reply
+                me_at = max(me_at, when)  # the manager wrote from the phone: they are around (hub.presence)
                 if key not in opened:
                     continue  # nothing in that chat was waiting on the manager
                 opened.pop(key, None)
@@ -906,7 +1054,10 @@ class WhatsApp(Adapter):
             lines.append(hub.make_line("whatsapp", "update", key, when, title=title[:80], who=who, link=url,
                                        summary=hub.plain(text), also=hub.extract_also(text), uid=stanza))
         keep = sorted(opened.items(), key=lambda kv: kv[1])[-WA_OPEN:]
-        return _result(lines, {"pk": pk, "open": dict(keep)}, partial)
+        out = {"pk": pk, "open": dict(keep)}
+        if me_at:
+            out["me_at"] = me_at
+        return _result(lines, out, partial)
 
 
 ADAPTERS = {

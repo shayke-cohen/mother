@@ -6,10 +6,11 @@ the watcher can only ever call read tools; adapters only receive a `ReadOnlyClie
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 import health
 
@@ -17,10 +18,20 @@ PROTOCOL = "2025-06-18"
 
 
 class McpError(Exception):
-    def __init__(self, kind: str, message: str):
+    def __init__(self, kind: str, message: str, retry_after: Optional[int] = None):
         super().__init__("%s: %s" % (kind, message))
         self.kind = kind
         self.message = message
+        self.retry_after = retry_after  # seconds, when a rate-limited reply said (Retry-After)
+
+
+_RETRY_AFTER = re.compile(r"retry[-_ ]?after\W{0,4}(\d{1,5})", re.I)
+
+
+def retry_after(text: str) -> Optional[int]:
+    """The Retry-After seconds in an error text (a header echoed into it, `retry_after: 30`, ...), else None."""
+    m = _RETRY_AFTER.search(text or "")
+    return int(m.group(1)) if m else None
 
 
 class ForbiddenTool(Exception):
@@ -91,7 +102,7 @@ class Client:
             if r.get("id") == want:
                 if "error" in r:
                     m = r["error"].get("message", "") if isinstance(r["error"], dict) else str(r["error"])
-                    raise McpError(_kind(m), m)
+                    raise McpError(_kind(m), m, retry_after(m))
                 return r.get("result")
 
     def _handshake(self) -> None:
@@ -130,7 +141,7 @@ class Client:
                 text = c.get("text", "")
                 break
         if res.get("isError"):
-            raise McpError(_kind(text), text[:300])
+            raise McpError(_kind(text), text[:300], retry_after(text))  # read before the text is cut
         try:
             return json.loads(text)
         except ValueError:

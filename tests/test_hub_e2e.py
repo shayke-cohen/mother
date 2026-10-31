@@ -49,6 +49,12 @@ def conn(fixture, log):
             "env": {"FAKE_MCP_FIXTURE": fixture, "FAKE_MCP_LOG": log}}
 
 
+def setUpModule():  # the watcher's away check reads this Mac (ioreg, transcripts): present, in every test here
+    patch = mock.patch.object(hub, "presence", lambda *a, **k: {"away": False, "why": "test"})
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
+
+
 class E2E(unittest.TestCase):
     AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
 
@@ -68,6 +74,8 @@ class E2E(unittest.TestCase):
                                 "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"]},
                     "connectors": {"chat": "slack", "tracker": "jira"},
                     "hub": {"enabled": True, "every_seconds": 120, "sweep_minutes": 240,
+                            # every conversation on the 2-minute tier: these scenarios test routing, not pacing
+                            "pacing": {"warm_seconds": 120, "cold_seconds": 120, "dm_max_seconds": 120},
                             "connections": {"chat": conn(self.fx, self.log),
                                             "tracker": {"command": "example-server", "args": [], "env": {}}},
                             "watch": {"chat": {"channels": [CH]}, "tracker": {"projects": ["PLAT"]}}}}
