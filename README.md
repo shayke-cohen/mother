@@ -100,15 +100,25 @@ It symlinks `mother` into `~/.local/bin`. Pass another directory if that one isn
 (a hooks module beside the guard), so there is nothing more to install. Open it with `/now-panel` (`/now` is
 MOTHER's chat skill, which prints the same list in the conversation). It reads `.mother/now.json` on the machine
 the tick runs on and makes no network calls.
-Open an item and it shows a chip for each of its sources (thread, channel, mail, ticket, PR, build) and up to three
-quick actions picked by what the item is: Draft a reply and Summarize the thread for chat and mail, Review brief and
-Why is CI red? for a PR, Find related PRs and Find the owner for a ticket. Each one only fills the prompt; you press
-Enter, and anything that reaches another person comes back as a draft. **Focus** (`f`) opens a second pane with the
-selected item in full: its sources and timeline, every action grouped as Respond, Investigate, Delegate and Triage,
-Run in a session (the hub), Tell Mother… for your own words, and related items from the same team.
-Mail rows also get **Archive** and **Mark read**, done straight through the hub's mail connection with no model
-(`mother inbox`, still checked by the guard); a section with several rows gets **Done all**, and **Archive N mail**
-when two or more are mail.
+It is two panes. **Home** ranks and routes: Top 3 today, the suggested asks, then one line per item grouped by
+what it asks of you (**Decide**, folded into one row that opens the decision queue; **Reply**; **Review**; **On
+you**), **From the hub** (hub updates), **Sessions** (the hub-fed sessions, news first, proposed ones dashed, View
+all), **Suggestions**, and **Neglected by teams** (one row per team with what kind of work is stuck). A group of
+several rows gets **Done all**, and **Archive N mail** when two or more are mail. The foot of Home opens the Mother
+page.
+Click any row and the **Inspector** pane shows that one thing with everything about it and every action. An item:
+why it is on the list and its timeline, one primary next move (the tick's action, else the best quick action for
+its kind: Draft a reply for chat and mail, Review brief for a PR, Find the owner for a ticket) plus three more and
+the rest behind a toggle, Open session or Ask Mother, a chip for each source, links to its session and team, related
+items, and Done (`d`), Snooze (`s`), Ignore…, Make top 3 (`t`) and Tell Mother… at the foot; mail also gets
+**Archive** and **Mark read**, done straight through the hub's mail connection with no model (`mother inbox`, still
+checked by the guard). The other pages: a hub update; a session (where it stands, what was routed into it, what it
+watches, Open, Send a note, Follow, Ignore, Stop routing); all sessions; a proposed session (what Mother read, what
+it would do, Dismiss); the decision queue (one card at a time, options on `1`–`9`, Skip on `n`, filter by team); a
+team (what needs you and its neglected work by kind: stuck work only, no per-person counts); and Mother (sources,
+routines, the hub's health with Refresh and Restart hub, the last routed lines, and what you ignored). A link inside
+a page pushes the next page and **← Back** returns. Every action only fills the prompt; you press Enter, and anything
+that reaches another person comes back as a draft.
 Its one setting, `mother_bin` (userConfig), is the path to the `mother` script it calls for `mother path` and
 the `mother now` edits. Left empty (the default) it runs this plugin's own `bin/mother`, the same version the
 hooks run; set it only to point the panel at another copy (a leading `~` is your home folder).
@@ -226,7 +236,7 @@ Here chat and WhatsApp stay on the default. `mother hub status` shows each sourc
 
 WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
 
-You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel: **Send to hub** on any item with a link, **Follow** on a hub session or hub update, and **Ignore…** on those and on any Now item with a link: just this, this for a week, a chat thread's whole channel, everything from the sender, or messages like it (the tick proposes a few words such messages always contain, you see them before choosing, and from then on they are matched without a model). Ignored things drop out of the hub and the Now list; the **Ignored** list at the foot of the panel shows them and undoes each one. It can't fetch the web or edit files; for those it proposes a session.
+You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel's Inspector: **Run in a session** on any item with a link, **Follow** on a hub session or hub update, and **Ignore…** on those and on any Now item with a link: just this, this for a week, a chat thread's whole channel, everything from the sender, or messages like it (the tick proposes a few words such messages always contain, you see them before choosing, and from then on they are matched without a model). Ignored things drop out of the hub and the Now list; the **Ignored** list at the foot of the panel shows them and undoes each one. It can't fetch the web or edit files; for those it proposes a session.
 
 ### Replying in team channels
 

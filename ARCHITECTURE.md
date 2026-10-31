@@ -31,7 +31,7 @@ holds code a later session would run.
 |---|---|---|
 | `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
 | `hooks/hooks.json` | Wires the hooks | `modules` → `hooks/register.tsx` (the Now panel); PreToolUse → guard (every tool it has a rule for; tests/test_packaging.py checks); Stop and SessionEnd → `mother sync --quiet`. The command hooks run even if the panel module fails to load |
-| `hooks/register.tsx`, `types/index.d.ts` | The Now panel, a hooks module (mod API, early access) in the same plugin: `/now-panel`, status line, toasts | Reads `.mother/now.json` and the hub's files; writes only through `mother now …` / `mother hub …`. `mother_bin` userConfig, empty = `${plugin root}/bin/mother`. Tests: `claude plugin test .` (`hooks/register.test.tsx`) |
+| `hooks/register.tsx`, `types/index.d.ts` | The Now panel, a hooks module (mod API, early access) in the same plugin: `/now-panel` opens Home, a row opens the Inspector pane (one page per item, update, session, proposal, decision queue, team, Mother), status line, toasts | Reads `.mother/now.json` and the hub's files; writes only through `mother now …` / `mother hub …`. `mother_bin` userConfig, empty = `${plugin root}/bin/mother`. Tests: `claude plugin test .` (`hooks/register.test.tsx`) |
 | `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. `hooks/guard_fast.py` takes every tool the main matcher doesn't and escalates to the guard for channel roles, MOTHER's sub-agents, hub and hub-fed sessions and the grant key; otherwise it passes without loading the guard. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
 | `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval`, `health` to `lib/` |
 | `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
@@ -113,7 +113,7 @@ pinned desktop session (/mother:hub): Monitor on `tail --follow` wakes it on eac
   ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
   ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`); pending and unseen expire after update_ttl_hours working hours
   └─ in-app session tools pass the guard only inside what the hub manages (messages into live sessions.json sessions, own_initiative cards); anything else asks; sub-agents and channel sessions are denied
-Now panel: Hub section (status, sessions, updates); the Open button fills the prompt to open the session and marks it seen; the manager sends it (desktop draws only https links)
+Now panel: Home's Sessions group (news first, proposals, View all) and an Inspector page per session (routed lines, what it watches); Open session fills the prompt to open it and marks it seen; the manager sends it (desktop draws only https links)
 ```
 
 Accepted gaps (also in CONTRACT §5e):
