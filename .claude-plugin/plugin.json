@@ -1,6 +1,6 @@
 {
   "name": "mother",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "MOTHER — Manager's Operations, Tasks, Handoffs, Execution & Reporting. A chief of staff for people managers, built on Claude Code: a named agent with a setup interview, a live connector doctor, and scheduled routines (daily brief, team digest, weekly meeting deck, recap, connect-the-dots), and the Now panel beside the chat (`/now-panel`). Pre-alpha.",
   "author": { "name": "Shay Cohen", "url": "https://github.com/shayke-cohen" },
   "homepage": "https://github.com/shayke-cohen/mother",
