@@ -3068,6 +3068,38 @@ class ApproveShell(GuardCase):
         self.ws_call("none", "Bash", {"command": "mother hub status; mother hub show"}, mode=BY, session="admin")
         self.ws_call("ask", "Bash", {"command": "echo $X"}, mode=BY, session="admin")       # show printed hub text
 
+    def test_a_write_only_to_a_temp_folder_does_not_guard_the_files_it_names(self):
+        cfg = config()
+        cfg["policy"]["shell_unasked"] = True
+        self.write_config(cfg)
+        for cmd in ("mkdir -p /tmp/qa && head -5 memory/MEMORY.md; cat AGENTS.md",
+                    "cp teams/TEAMS.md /tmp/qa/; diff -q ~/.claude/plugins/cache/mother/mother/0.10.2/hooks/guard.py x",
+                    "cat memory/MEMORY.md > /tmp/qa/m.txt", "grep -n x CLAUDE.md | tee /tmp/qa/out.txt",
+                    "cp memory/MEMORY.md config.json $TMPDIR/qa/"):
+            self.ws_call("allow", "Bash", {"command": cmd})
+        for cmd in ("mkdir -p /tmp/qa; echo x >> memory/MEMORY.md",
+                    "cp /tmp/qa/x /tmp/link/MEMORY.md", "cp x /tmp/../" + self.ws.lstrip("/") + "/AGENTS.md",
+                    "mkdir -p /tmp/qa memory && echo x > AGENTS.md", "mv memory/MEMORY.md /tmp/qa/",
+                    "cp x.md /tmp/qa/ && cp y CLAUDE.md"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+
+    def test_mentioning_a_hub_verb_does_not_make_a_session_hub_fed(self):
+        BY = "bypassPermissions"
+        cfg = config()
+        cfg["policy"]["shell_in_bypass"] = True
+        self.write_config(cfg)
+        for cmd in ("printf '%s' 'run `mother hub status`, then `mother hub check`' > qa.txt",
+                    "grep -n 'mother hub show' README.md", "echo the mother hub is up",
+                    "mother hub status 2>&1 | head -15", "git commit -m 'docs: mother hub tail'"):
+            self.ws_call("none", "Bash", {"command": cmd}, mode=BY, session="admin")
+            self.ws_call("none", "Bash", {"command": "echo $X"}, mode=BY, session="admin")   # still trusted
+        for i, cmd in enumerate(("mother hub show", "true && mother hub tail -n 5",
+                                 "X=1 mother hub show | head", "echo $(mother hub show)", "env mother hub",
+                                 "true; command mother hub show")):
+            sid = "fed-%d" % i
+            self.run_guard("Bash", {"command": cmd}, mode=BY, session=sid, cwd=self.ws)  # asked or not, it ran
+            self.ws_call("ask", "Bash", {"command": "echo $X"}, mode=BY, session=sid)
+
     def test_another_installed_versions_bin_mother_runs_by_path(self):
         market = os.path.join(self.home, ".claude", "plugins", "marketplaces", "mother", "bin")
         os.makedirs(market)
