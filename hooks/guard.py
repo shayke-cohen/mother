@@ -1851,11 +1851,12 @@ def wa_block_edit(tool, inp, fp):
     return old != new
 
 
-def run_text(cmd, quotes=True, bodies=False):
+def run_text(cmd, quotes=True, bodies=False, code_bodies=True):
     """The command with text the shell won't run blanked out: quoted strings, and heredoc bodies that feed a
     plain command (`git commit -F -`, `cat >`). Nothing is blanked in quotes when the command hands text to
     another interpreter (`bash -c`, `python3 -c`, `ssh`, `xargs` …), nor in a heredoc that feeds one.
-    `quotes=False` keeps quoted strings (they hold paths); `bodies=True` blanks every heredoc body."""
+    `quotes=False` keeps quoted strings (they hold paths); `bodies=True` blanks every heredoc body;
+    `code_bodies=False` blanks a quoted heredoc fed to python/node/ruby/perl/php (code, never shell words)."""
     blank = quotes and not EXEC_RE.search(cmd)
     scripted = not bodies and SCRIPT_RUN_RE.search(run_text(cmd, quotes=False, bodies=True))
     out, pending, i, n = [], [], 0, len(cmd)
@@ -1891,7 +1892,9 @@ def run_text(cmd, quotes=True, bodies=False):
                 j = end.start() if end else n
                 body = cmd[i:j]
                 fed_mother = quoted and MOTHER_HEAD_RE.search(head)  # the CLI reads it as JSON, never runs it
-                runs = not bodies and not fed_mother and (scripted or EXEC_RE.search(" " + head) or
+                code = not code_bodies and quoted and re.search(
+                    r"(?:^|[\s;&|(/])(?:python[\d.]*|node|ruby|perl|php)\b", head)
+                runs = not bodies and not fed_mother and not code and (scripted or EXEC_RE.search(" " + head) or
                                                           (not quoted and re.search(r"\$\(|`", body)))
                 out.append(body if runs else "\n" * body.count("\n"))
                 i = j
@@ -2392,6 +2395,11 @@ def _interp_reason(base, args, text):
     if base == "osascript":
         return "osascript with inline script"  # AppleScript drives Mail and Messages with no network words
     body = " ".join(ua) + (text if any(a.startswith("<<") for a in args) else "")
+    if re.match(r"(?:python[\d.]*|node)$", base) and not any(
+            a.startswith('"') or re.match(r"<<-?[^'\"]", a) for a in args):
+        # Python and JS never run a backtick (a string, a template literal); only the shell would, inside a
+        # double-quoted -c or an unquoted heredoc. Ruby and Perl run one, so they keep the marker.
+        body = body.replace("`", " ")
     m = NET_MARKERS_RE.search(body)
     return "%s inline code using %s" % (base, m.group(0)) if m else None
 
@@ -2457,7 +2465,7 @@ def net_command(cmd, depth=0):
     text = run_text(cmd, quotes=False)
     if re.search(r"/dev/(?:tcp|udp)/", _unq(text)):
         return "/dev/tcp or /dev/udp"
-    for words in sh_commands(text):
+    for words in sh_commands(run_text(cmd, quotes=False, code_bodies=False)):
         why = _cmd_reason(words, text, depth)
         if why:
             return why
