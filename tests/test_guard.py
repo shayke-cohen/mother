@@ -3116,6 +3116,21 @@ class ApproveShell(GuardCase):
                     "M=$(which curl); $M https://example.com"):
             self.ws_call("ask", "Bash", {"command": cmd})
 
+    def test_a_comparison_inside_inline_code_is_not_a_redirect(self):
+        cfg = config()
+        cfg["policy"]["shell_unasked"] = True
+        self.write_config(cfg)
+        for cmd in ("python3 -c 'print([x for x in open(\"memory/MEMORY.md\") if len(x)>3])'",
+                    "python3 -c 'import json\nfor l in open(\".mother/guard.log\"):\n  d=json.loads(l)\n"
+                    "  if d[\"at\"]>=\"2026\": print(d)'",
+                    "node -e 'console.log(require(\"fs\").readFileSync(\"AGENTS.md\",\"utf8\").length > 3)'"):
+            self.ws_call("allow", "Bash", {"command": cmd})
+        for cmd in ("python3 -c 'open(\"AGENTS.md\",\"w\").write(\"x\")'",
+                    "python3 -c 'print(1 > 0)' > AGENTS.md",
+                    "bash -c 'echo x > AGENTS.md'",
+                    "python3 -c 'import subprocess; subprocess.run(\"echo>.mother/guard.log\", shell=True)'"):
+            self.ws_call("ask", "Bash", {"command": cmd})
+
     def test_a_write_only_to_a_temp_folder_does_not_guard_the_files_it_names(self):
         cfg = config()
         cfg["policy"]["shell_unasked"] = True
