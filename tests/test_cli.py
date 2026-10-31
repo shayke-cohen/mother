@@ -1021,6 +1021,16 @@ class HubConfig(unittest.TestCase):
             self.assertEqual(r.returncode, 1, key)
             self.assertIn("hub." + key, r.stdout)
 
+    def test_hub_pacing_is_validated(self):
+        r = self.status_with(lambda b: b.update(pacing={"hot_seconds": 120, "cold_seconds": 3600, "away_seconds": 900,
+                                                        "away_idle_minutes": 15, "backoff_seconds": 120}))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for pace, where in (({"cold_seconds": 10}, "hub.pacing.cold_seconds"), ({"hot_seconds": "2m"}, "hub.pacing.hot"),
+                            ({"bogus": 1}, "hub.pacing.bogus"), ([], "hub.pacing")):
+            r = self.status_with(lambda b: b.update(pacing=pace))
+            self.assertEqual(r.returncode, 1, pace)
+            self.assertIn(where, r.stdout)
+
     def test_hub_per_source_intervals_are_valid(self):
         watch = {"chat": {"every_seconds": 30}, "mail": {"every_seconds": 3600, "idle_every_seconds": 0},
                  "tracker": {"projects": ["PLAT"], "every_seconds": 600, "idle_every_seconds": 86400},

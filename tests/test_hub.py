@@ -2492,5 +2492,118 @@ class WhatsAppWatcher(unittest.TestCase):
         self.assertEqual((found, missing), ({}, []))
 
 
+class Presence(unittest.TestCase):
+    """Away mode: the Mac idle or locked, and no post or typed session turn of the manager's (hub.presence)."""
+    AT = datetime(2026, 10, 29, 10, 0, tzinfo=UTC)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.cfg = {"hub": {"enabled": True}}
+
+    def pres(self, idle=1200.0, locked=False, turn=None, at=None):
+        return REAL_PRESENCE(self.ws, self.cfg, at or self.AT, idle=lambda: idle, is_locked=lambda: locked,
+                             turn=lambda since: turn)
+
+    def cursors(self, **kw):
+        hub.save_json(self.ws, "cursors.json", kw)
+
+    def test_idle_with_no_other_sign_is_away(self):
+        self.assertTrue(self.pres(idle=16 * 60)["away"])
+        self.assertFalse(self.pres(idle=14 * 60)["away"])
+
+    def test_unreadable_idle_is_present(self):
+        self.assertFalse(self.pres(idle=None)["away"])
+
+    def test_a_recent_chat_or_whatsapp_post_is_present(self):
+        self.cursors(chat={"me_at": "%.6f" % (self.AT.timestamp() - 600)})
+        self.assertFalse(self.pres()["away"])
+        self.cursors(chat={"me_at": "%.6f" % (self.AT.timestamp() - 3600)})
+        self.assertTrue(self.pres()["away"])
+        self.cursors(whatsapp={"me_at": "2026-10-29T09:45:00Z"})
+        self.assertFalse(self.pres()["away"])
+
+    def test_a_typed_session_turn_is_present(self):
+        self.assertFalse(self.pres(turn=self.AT - timedelta(minutes=5))["away"])
+
+    def test_locked_counts_from_when_it_was_first_seen(self):
+        self.assertFalse(self.pres(idle=0.0, locked=True)["away"])  # just locked (idle unreadable while locked)
+        later = self.AT + timedelta(minutes=16)
+        self.assertTrue(self.pres(idle=0.0, locked=True, at=later)["away"])
+        self.assertFalse(self.pres(idle=0.0, locked=False, at=later)["away"])  # unlocked: back at once
+        self.assertEqual(hub.load_json(self.ws, "cursors.json", {}).get("_presence"), {})
+
+    def test_thresholds_come_from_config(self):
+        self.cfg["hub"]["pacing"] = {"away_idle_minutes": 5}
+        self.assertTrue(self.pres(idle=6 * 60)["away"])
+
+    def test_idle_and_lock_are_read_from_ioreg(self):
+        out = {("-c", "IOHIDSystem", "-d", "4"): '    | |   "HIDIdleTime" = 905000000000\n',
+               ("-n", "Root", "-d", "1"): '"IOConsoleUsers" = ({"CGSSessionScreenIsLocked"=Yes,"kCGSSessionOnConsoleKey"=Yes})'}
+        self.assertEqual(hub.mac_idle_seconds(lambda *a: out[a]), 905.0)
+        self.assertTrue(hub.screen_locked(lambda *a: out[a]))
+        self.assertIsNone(hub.mac_idle_seconds(lambda *a: None))
+        self.assertFalse(hub.screen_locked(lambda *a: '"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes})'))
+
+    def test_last_human_turn_reads_only_typed_turns(self):
+        root = self.ws / "projects"
+        (root / "p").mkdir(parents=True)
+        f = root / "p" / "s.jsonl"
+        rows = [{"type": "user", "origin": {"kind": "human"}, "timestamp": "2026-10-29T09:50:00Z",
+                 "message": {"content": "hi"}},
+                {"type": "user", "origin": {"kind": "task-notification"}, "timestamp": "2026-10-29T09:58:00Z",
+                 "message": {"content": "<task-notification>"}},
+                {"type": "assistant", "timestamp": "2026-10-29T09:59:00Z", "message": {"content": "human"}}]
+        f.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        os.utime(str(f), (self.AT.timestamp(), self.AT.timestamp()))
+        self.assertEqual(hub.last_human_turn(self.AT - timedelta(minutes=30), root), self.AT - timedelta(minutes=10))
+        self.assertIsNone(hub.last_human_turn(self.AT - timedelta(minutes=5), root))
+        os.utime(str(f), (0, 0))  # not changed in the window: not even opened
+        self.assertIsNone(hub.last_human_turn(self.AT - timedelta(minutes=30), root))
+
+    def test_poll_once_hands_presence_and_live_sessions_to_chat(self):
+        seen = []
+
+        class Chat:
+            @classmethod
+            def poll(cls, client, cursor, cfg, me, at):
+                seen.append(dict(cfg))
+                return {"lines": [], "cursor": {"ts": "1"}, "partial": [], "pacing": {"away": cfg["_away"],
+                                                                                      "every": {"900": 2}}}
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["chat:slack"] = Chat
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        cfg = {"version": 1, "manager": {"email": "dana@example.com", "timezone": "UTC", "chat_dm": "U00000000",
+                                         "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"]},
+               "connectors": {"chat": "slack"},
+               "hub": {"enabled": True, "pacing": {"cold_seconds": 3600},
+                       "connections": {"chat": {"command": "x", "args": [], "env": {}}}}}
+        hub.save_json(self.ws, "sessions.json", {"version": 1, "sessions": {
+            "C00000001/1.000100": {"state": "live", "also": ["PLAT-1"]}, "C00000002/2.000200": {"state": "done"}}})
+        beat = hub.poll_once(self.ws, cfg, self.AT, {"chat": object()},
+                             presence_fn=lambda ws, c, at: {"away": True, "why": "test"})
+        self.assertEqual((seen[0]["_away"], seen[0]["_force"], seen[0]["_pacing"]), (True, False, {"cold_seconds": 3600}))
+        self.assertEqual(sorted(seen[0]["_hot"]), ["C00000001/1.000100", "PLAT-1"])
+        self.assertEqual(beat["presence"], {"away": True, "why": "test"})
+        self.assertEqual(beat["sources"]["chat"]["pacing"], {"away": True, "every": {"900": 2}})
+        import io
+        out = io.StringIO()
+        hub.status(self.ws, self.AT, out=out)
+        self.assertIn("    pacing: 2 every 900s", out.getvalue())
+        self.assertIn("presence: away (test)", out.getvalue())
+
+
+REAL_PRESENCE = hub.presence
+
+
+def setUpModule():  # the watcher's away check reads this Mac (ioreg, transcripts): present, unless a test says so
+    hub.presence = lambda *a, **k: {"away": False, "why": "test"}
+
+
+def tearDownModule():
+    hub.presence = REAL_PRESENCE
+
+
 if __name__ == "__main__":
     unittest.main()

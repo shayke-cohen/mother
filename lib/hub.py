@@ -603,6 +603,8 @@ def _watch_cfg(cfg: dict, h: dict, cap: str) -> dict:
             if p:
                 keys.append(p)
         w["projects"] = list(dict.fromkeys(k for k in keys if isinstance(k, str) and k))
+    if cap == "chat" and isinstance(h.get("pacing"), dict):
+        w["_pacing"] = h["pacing"]
     if cap == "whatsapp":  # the adapter has no client config of its own: it needs the `whatsapp` block
         wa = (cfg or {}).get("whatsapp")
         wa = wa if isinstance(wa, dict) else {}
@@ -642,7 +644,135 @@ def due_caps(ws: Path, cfg: dict, at: datetime, active: bool) -> List[str]:
     return out
 
 
-def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = True, force: bool = False) -> dict:
+# ------------------------------------------------------------------------------------------------ presence
+# Away = the Mac idle (no keyboard or mouse) or locked for `hub.pacing.away_idle_minutes`, AND no chat or WhatsApp
+# post of the manager's and no turn they typed in a Claude Code session (Remote Control included: it is recorded on
+# this Mac) in `away_quiet_minutes`. Away, the chat source reads every conversation less often (hub_sources
+# PACING); any of those signals ends it on the next pass. Anything that cannot be read counts as present.
+_HID_IDLE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
+_LOCKED = re.compile(r'"(?:CGSSessionScreenIsLocked|IOConsoleLocked)"\s*=\s*Yes')
+TURN_FILES = 30  # transcripts read for a human turn, newest first
+TURN_TAIL = 512 * 1024
+
+
+def _ioreg(*args) -> Optional[str]:
+    import subprocess
+    try:
+        r = subprocess.run(["/usr/sbin/ioreg"] + list(args), capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def mac_idle_seconds(run=_ioreg) -> Optional[float]:
+    """Seconds since the last keyboard or mouse input (IOHIDSystem HIDIdleTime), or None when it cannot be read."""
+    m = _HID_IDLE.search(run("-c", "IOHIDSystem", "-d", "4") or "")
+    return int(m.group(1)) / 1e9 if m else None
+
+
+def screen_locked(run=_ioreg) -> bool:
+    return bool(_LOCKED.search(run("-n", "Root", "-d", "1") or ""))
+
+
+def last_human_turn(since: datetime, root: Optional[Path] = None) -> Optional[datetime]:
+    """The newest turn the manager typed (a transcript `user` entry whose origin is `human`) after `since`, in any
+    Claude Code transcript under ~/.claude/projects changed since then; None when there is none."""
+    root = root or Path.home() / ".claude" / "projects"
+    cutoff = since.timestamp()
+    try:
+        files = [f for f in root.glob("*/*.jsonl") if f.stat().st_mtime >= cutoff]
+    except OSError:
+        return None
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    best = None
+    for f in files[:TURN_FILES]:
+        try:
+            with open(str(f), "rb") as fh:
+                fh.seek(max(0, f.stat().st_size - TURN_TAIL))
+                tail = fh.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        for raw in reversed(tail):
+            if '"human"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            origin = d.get("origin") if isinstance(d.get("origin"), dict) else {}
+            if d.get("type") != "user" or "human" not in (origin.get("kind"), d.get("turnOrigin")):
+                continue
+            t = _parse_at(d.get("timestamp"))
+            if t and t > since and (best is None or t > best):
+                best = t
+            break  # the newest human turn in this file
+    return best
+
+
+def _own_post_at(cursors: dict) -> Optional[datetime]:
+    """The manager's newest chat or WhatsApp post the sources have seen (their cursors' `me_at`)."""
+    out = []
+    chat = (cursors.get("chat") or {}).get("me_at") if isinstance(cursors.get("chat"), dict) else None
+    try:
+        if chat:
+            out.append(datetime.fromtimestamp(float(chat), timezone.utc))
+    except (TypeError, ValueError):
+        pass
+    wa = (cursors.get("whatsapp") or {}).get("me_at") if isinstance(cursors.get("whatsapp"), dict) else None
+    if _parse_at(wa):
+        out.append(_parse_at(wa))
+    return max(out) if out else None
+
+
+def presence(ws: Path, cfg: dict, at: datetime, idle=mac_idle_seconds, is_locked=screen_locked,
+             turn=last_human_turn) -> dict:
+    """`{"away": bool, "why": str}` for this pass. Remembers when the screen was first seen locked
+    (`cursors.json` `_presence.locked_since`), since ioreg says only whether it is locked now."""
+    import hub_sources
+    p = hub_sources.pacing({"_pacing": _hub_cfg(cfg).get("pacing")})
+    gone, quiet = p["away_idle_minutes"] * 60, timedelta(minutes=p["away_quiet_minutes"])
+    with locked(ws):
+        cursors = load_json(ws, "cursors.json", {})
+        cursors = cursors if isinstance(cursors, dict) else {}
+        pres = cursors.get("_presence") if isinstance(cursors.get("_presence"), dict) else {}
+        since = _parse_at(pres.get("locked_since"))
+        now_locked = is_locked()
+        if now_locked and since is None:
+            since = at
+        if not now_locked:
+            since = None
+        want = {"locked_since": _iso(since)} if since else {}
+        if want != pres:
+            cursors["_presence"] = want
+            save_json(ws, "cursors.json", cursors)
+    secs = idle()
+    if secs is None and not now_locked:
+        return {"away": False, "why": "idle time unreadable"}
+    lock_secs = (at - since).total_seconds() if since else 0
+    if (secs or 0) < gone and lock_secs < gone:
+        return {"away": False, "why": "at the Mac"}
+    post = _own_post_at(cursors)
+    if post and at - post < quiet:
+        return {"away": False, "why": "posted %s" % _iso(post)}
+    typed = turn(at - quiet)
+    if typed:
+        return {"away": False, "why": "typed in a session %s" % _iso(typed)}
+    return {"away": True, "why": "Mac idle %dm, no post or session turn in %dm" % (
+        max(secs or 0, lock_secs) // 60, p["away_quiet_minutes"])}
+
+
+def live_session_keys(ws: Path) -> List[str]:
+    """Every key (and `also`) of a live hub session: the chat source keeps those conversations hot."""
+    out = []
+    for k, s in (_sessions_doc(ws).get("sessions") or {}).items():
+        if isinstance(s, dict) and s.get("state") == "live":
+            out.append(k)
+            out.extend(a for a in s.get("also") or [] if isinstance(a, str))
+    return out
+
+
+def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = True, force: bool = False,
+              presence_fn=None) -> dict:
     """One pass over the sources; returns the heartbeat it wrote to watcher.json.
 
     For each capability in `connectors` that has an adapter: poll, coalesce, append to the inbox, and only then
@@ -652,6 +782,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     due (its own interval since its last attempt, `cursors.json` `_due`); `force` polls every source (`smoke`)."""
     import hub_sources
     from hub_mcp import ForbiddenTool
+    presence_fn = presence_fn or presence
     h = _hub_cfg(cfg)
     stamp = _iso(at)
     old = load_json(ws, "watcher.json", {})
@@ -671,6 +802,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     mute = live_mute(h["watch"].get("mute") or {}, at)
     passed = []  # every line of this pass, for auto-follow
     known = None  # the tracker's real project keys, when its adapter could read them this pass
+    pres = None  # presence, worked out once and only when the chat source is polled
     due_now = set(due_caps(ws, cfg, at, active)) if poll else set()
     for cap in CAPS if poll else ():
         connector = connector_of(cfg, cap)
@@ -713,6 +845,10 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             sources[cap] = {"status": "couldnt_check", "reason": gap, "since": since}
             errors.append("%s: %s" % (cap, gap))
             continue
+        if cap == "chat":
+            if pres is None:
+                pres = presence_fn(ws, cfg, at)
+            wcfg.update(_away=pres["away"], _hot=live_session_keys(ws), _force=force)
         try:
             res = adapter.poll(client, cursors.get(cap), wcfg, me, at)
         except ForbiddenTool:
@@ -742,6 +878,8 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             errors.append("%s: %s" % (cap, sources[cap]["reason"]))
         else:
             sources[cap] = {"status": "ok"}
+        if isinstance(res.get("pacing"), dict):
+            sources[cap]["pacing"] = res["pacing"]
         notes = [str(n)[:200] for n in res.get("notes") or []][:20]
         if notes:  # expected limits (a busy channel), not failures: the status is unchanged
             sources[cap]["notes"] = notes
@@ -766,6 +904,10 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
     if poll:
         woke = _maybe_sweep(ws, cfg, at, stamp) or woke
     beat = {"at": stamp, "every_seconds": every, "active": active, "sources": sources, "errors": errors}
+    if pres is not None:
+        beat["presence"] = pres
+    elif isinstance(old, dict) and isinstance(old.get("presence"), dict):
+        beat["presence"] = old["presence"]
     last = stamp if woke else (old.get("last_append_at") if isinstance(old, dict) else None)
     if last:
         beat["last_append_at"] = last
@@ -1479,6 +1621,13 @@ def status(ws: Path, at: datetime, out=None, cfg=None) -> int:
         print("  %s: %s%s%s" % (cap, ent.get("status"), " (%s)" % why if why else "", extra), file=out)
         for n in ent.get("notes") or []:
             print("    note: %s" % n, file=out)
+        pace = ent.get("pacing") if isinstance(ent.get("pacing"), dict) else None
+        if pace and isinstance(pace.get("every"), dict) and pace["every"]:
+            print("    pacing: %s" % ", ".join("%s every %ss" % (n, e) for e, n in
+                                             sorted(pace["every"].items(), key=lambda kv: int(kv[0]))), file=out)
+    pres = w.get("presence") if isinstance(w.get("presence"), dict) else None
+    if pres:
+        print("presence: %s (%s)" % ("away" if pres.get("away") else "present", pres.get("why") or "-"), file=out)
     warn = calendar_warning(cfg) if cfg is not None else None
     if warn:
         print("warning: %s" % warn, file=out)
