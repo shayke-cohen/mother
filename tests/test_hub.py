@@ -1041,17 +1041,36 @@ class Install(unittest.TestCase):
                          plist_path=self.plist, out=out, installer=lambda: self.calls.append(("install",)) or 0, **kw)
         return rc, out.getvalue()
 
-    def test_refresh_restarts_a_loaded_job_and_reports_each_source(self):
-        self.plist.parent.mkdir(parents=True)
-        self.plist.write_text("x")
+    def write_plist(self, mother):
+        import plistlib
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        self.plist.write_bytes(plistlib.dumps({"Label": "com.mother.hub",
+                                               "ProgramArguments": ["/usr/bin/python3", mother, "hub", "watch"]}))
+
+    def test_refresh_asks_a_current_job_without_restarting_it(self):
+        self.write_plist("/plug/bin/mother")
         beat = {"at": "2026-10-30T19:00:04Z", "sources": {"tracker": {"status": "ok"},
                                                           "code": {"status": "couldnt_check", "reason": "gh down"}}}
-        rc, out = self.refresh(beat)
+        rc, out = self.refresh(beat, mother="/plug/bin/mother")
         self.assertEqual(rc, 2)
-        self.assertEqual(self.calls[0][:2], ("kickstart", "-k"))
-        self.assertNotIn(("install",), self.calls)
+        self.assertEqual([c[0] for c in self.calls], ["print"])  # loaded? yes: no kickstart, no install
         self.assertIn("tracker | ok | -", out)
         self.assertIn("code | couldnt_check | gh down", out)
+
+    def test_refresh_reinstalls_a_job_on_an_older_plugin_path(self):
+        self.write_plist("/plug-old/bin/mother")
+        rc, _ = self.refresh({"at": "2026-10-30T19:00:04Z", "sources": {"tracker": {"status": "ok"}}},
+                             mother="/plug/bin/mother")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls, [("install",)])
+
+    def test_refresh_reinstalls_when_the_job_is_not_loaded(self):
+        self.write_plist("/plug/bin/mother")
+        self.ctl = lambda *a: (self.calls.append(a), (113, "Could not find service"))[1]
+        rc, _ = self.refresh({"at": "2026-10-30T19:00:04Z", "sources": {"tracker": {"status": "ok"}}},
+                             mother="/plug/bin/mother")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls[-1], ("install",))
 
     def test_refresh_installs_when_the_plist_is_missing(self):
         rc, out = self.refresh({"at": "2026-10-30T19:00:04Z", "sources": {"tracker": {"status": "ok"}}})
