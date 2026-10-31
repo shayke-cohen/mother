@@ -279,7 +279,8 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `spawn`, `exec`, a backtick; osascript inline always counts), never when the script is the `mother` CLI;
   `git push` with a URL or `user@host:` argument, `git remote add|set-url`; `open` with a URL; `nslookup`,
   `dig`, `host` or `drill` with `$(` or a backtick; `gh`/`glab api` with `--hostname` or a `://` endpoint;
-  `WebFetch`; `WebSearch` whose query holds a URL (`://`, `www.`, or `host.tld/…`); an MCP tool whose name has a
+  `WebFetch` of a URL not already shown whole (typed by the manager, in a web search or fetch result, an MCP
+  read, or `mother whatsapp read|hub show|hub tail|inbox` output); `WebSearch` whose query holds a URL (`://`, `www.`, or `host.tld/…`); an MCP tool whose name has a
   `navigate` part, or a `…batch` tool whose input names one; an MCP tool whose name has a `javascript`,
   `evaluate`, `eval` or `js` part; an MCP tool whose name has a `fetch` part and whose input has a url-like field
   or a `://` value; a `Monitor` with a `ws` target; and an MCP call the domain rules give no decision whose operation is not a read

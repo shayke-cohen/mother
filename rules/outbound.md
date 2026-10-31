@@ -241,7 +241,8 @@ to `.mother/grants.json` (or anything under `.mother/`), `mother grant add`, and
   add|set-url`; `open <url>`; `nslookup|dig|host` with a computed name; python, node, perl, ruby, php or
   osascript with inline code that names the network or a process (`socket`, `urllib`, `http`, `requests`,
   `fetch`, `subprocess`, `system`, `popen`, `curl` …; osascript always), a network module (`-m http.server`)
-  or a URL argument (the `mother` CLI fed a heredoc never counts); `WebFetch`; a `WebSearch` whose query names a
+  or a URL argument (the `mother` CLI fed a heredoc never counts); `WebFetch` of a URL
+  nobody outside showed it (a link the manager typed, a search result or a WhatsApp line passes); a `WebSearch` whose query names a
   URL; a browser navigation tool or a tool that runs script in a page (`javascript`, `evaluate`); an MCP
   `fetch` tool given a URL; a Monitor `ws` target; and an MCP call whose operation writes but that the hook can't
   place in a domain. Outside the workspace these are unchanged (normal permissions).
