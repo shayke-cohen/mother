@@ -2459,11 +2459,36 @@ def net_command(cmd, depth=0):
     return None
 
 
+# `NAME=value` as a statement of its own (optionally `export`ed), the value a literal: no `$`, backtick, backslash.
+LITERAL_ASSIGN_RE = re.compile(r"(?:^|[;&|\n(]\s*)(?:export\s+)?([A-Za-z_]\w*)=(\"[^\"$`\\]*\"|'[^']*'"
+                               r"|[^\s;&|$`\"'\\()<>]+)(?=\s*(?:$|[;&|\n]))")
+
+
+def inline_literal_vars(cmd):
+    """`M=/path/bin/mother; $M health` reads as `/path/bin/mother health`, so the rules see the program a routine
+    runs. Only for a name set exactly once, to a literal, and never bound any other way (`for M in`, `read M`,
+    `M+=`, `M=$(…)`): anything else stays a variable and keeps its question."""
+    found = {}
+    for m in LITERAL_ASSIGN_RE.finditer(cmd):
+        found.setdefault(m.group(1), []).append(m.group(2))
+    out = cmd
+    for name, vals in found.items():
+        n = re.escape(name)
+        if len(vals) != 1 or len(re.findall(r"(?<![\w$])" + n + r"\+?=", cmd)) != 1 \
+                or re.search(r"\b(?:for|select)\s+" + n + r"\b|\bread\b[^;&|\n]*\b" + n + r"\b|\b(?:declare|typeset"
+                             r"|local|readonly|let|unset|getopts)\b[^;&|\n]*\b" + n + r"\b", cmd):
+            continue
+        val = vals[0][1:-1] if vals[0][:1] in "\"'" else vals[0]
+        out = re.sub(r"\$(?:\{" + n + r"\}|" + n + r"(?!\w))", lambda _: val, out)
+    return out
+
+
 def classify_shell(cmd, cwd, ctx):
     """A shell command (Bash, a Monitor command, a terminal-panel command). Outside the workspace: the Bash rules.
     In a workspace session: WhatsApp and `mother grant add` first; a command every stage of which is on the
     allow-list then gets no decision; anything else gets the Bash rules, then outbound_unknown for a program that
     can reach the network, else the protected-path kind or shell_unlisted (CONTRACT §5)."""
+    cmd = inline_literal_vars(cmd)
     norm = re.sub(r"[\"'\\]", "", cmd).casefold()
     if CHANNELS_MGR_RE.search(norm):
         return act("manager_only", "manager_only", "`mother channels resume|start` turns the channel reply loop "
@@ -3319,7 +3344,7 @@ def classify(tool, inp, cwd, ctx):
             a = act("outbound_unknown", "outbound_unknown", "a Monitor websocket to %s" % str(url)[:120])
         return a
     if tool == "WebFetch":
-        if in_workspace(cwd, ctx):
+        if in_workspace(cwd, ctx) and not url_shown(str(inp.get("url") or ""), ctx.transcript):
             return act("outbound_unknown", "outbound_unknown", "a web fetch of %s" % str(inp.get("url") or "?")[:160])
         return None
     if tool == "WebSearch":
@@ -3398,6 +3423,58 @@ APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|
 APPROVE_ANY_RE = re.compile(r"^\s*mother\s*approve\b", re.I | re.M)
 LINE_BREAKS_RE = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 SESSION_APPROVAL_MAX_HOURS = 12
+
+
+# Bash output that is other people's text, printed by a fixed command: a WhatsApp chat, a hub line, a mail.
+SHOWN_CMD_RE = re.compile(r"\bmother\s+(?:whatsapp\s+read|hub\s+(?:show|tail)|inbox)\b")
+SHOWN_TOOLS = {"WebSearch", "WebFetch"}
+
+
+def url_shown(url, transcript):
+    """The URL (fragment and a trailing slash aside) already stands, whole, in text that came from outside: a
+    message the manager typed, a web search or fetch result (a redirect included), an MCP read, or what
+    `mother whatsapp read|hub show|hub tail|inbox` printed. Fetching it sends nothing its author did not already
+    have. A URL the agent put together (`?k=` plus something it read, a prefix of a shown one) is not shown."""
+    u = url.split("#", 1)[0].rstrip("/")
+    if not re.match(r"https?://[^/\s]+", u) or not isinstance(transcript, str) or not os.path.isfile(transcript):
+        return False
+    whole = re.compile(r"(?<![\w.~%/-])" + re.escape(u) + r"/?(?=$|[\s\"'<>)\]},;#*`|]|\.(?:\s|$))")
+    uses, hits = {}, []
+    with open(transcript, errors="replace") as f:
+        for line in f:
+            if u not in line and '"tool_use"' not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(e, dict) or e.get("isSidechain"):
+                continue
+            msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+            c = msg.get("content")
+            for b in c if isinstance(c, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    uses[b.get("id")] = (str(b.get("name") or ""), b.get("input") or {})
+            if u not in line:
+                continue
+            typed = user_text(e)
+            if typed and whole.search(typed):
+                return True
+            for b in c if isinstance(c, list) else []:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    rc = b.get("content")
+                    text = rc if isinstance(rc, str) else "\n".join(
+                        str(x.get("text") or "") for x in rc if isinstance(x, dict)) if isinstance(rc, list) else ""
+                    if whole.search(text):
+                        hits.append(b.get("tool_use_id"))
+    for i in hits:
+        name, inp = uses.get(i, ("", {}))
+        if name in SHOWN_TOOLS or name.startswith("mcp__"):
+            return True
+        cmd = re.sub(r"[\"'\\]", "", str(inp.get("command") or "")) if isinstance(inp, dict) else ""
+        if name == "Bash" and SHOWN_CMD_RE.search(cmd) and not re.search(r"\$\(|`|\b(?:echo|printf|cat)\b", cmd):
+            return True
+    return False
 
 
 def user_text(entry):
