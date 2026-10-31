@@ -345,6 +345,8 @@ def validate(cfg: dict) -> list:
         errs.append('policy.autonomy must be "functional" or "strict"')
     if isinstance(pol, dict) and "shell_in_bypass" in pol and not isinstance(pol["shell_in_bypass"], bool):
         errs.append("policy.shell_in_bypass must be true or false")
+    if isinstance(pol, dict) and "shell_unasked" in pol and not isinstance(pol["shell_unasked"], bool):
+        errs.append("policy.shell_unasked must be true or false")
     if "whatsapp" in cfg:
         errs.extend(validate_whatsapp(cfg["whatsapp"]))
     if "hub" in cfg:

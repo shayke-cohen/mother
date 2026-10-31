@@ -119,6 +119,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 | `policy.autonomy` | `"functional"` (default) or `"strict"`, optional | `functional`: commenting on, transitioning and updating existing tracker issues, and code-host writes other than merging or approving, go without a question outside hub-fed sessions (§5, "Functional autonomy"); every other ask stands. `strict`: every ask stands, as before 0.10. Any other value fails `mother status` |
+| `policy.shell_unasked` | bool, optional | default `false`. `true`: in any session that is not hub-fed, in any permission mode (scheduled runs included), a `shell_unlisted` ask becomes **allow**. Every other ask keeps its rule. A `mother hub` verb in `status refresh check smoke install uninstall done snooze follow unfollow mute unmute help` does not make a session hub-fed; any other verb does. Any other type fails `mother status` |
 | `policy.shell_in_bypass` | bool, optional | default `false`. `true`: in a `bypassPermissions` session that is not hub-fed, a `shell_unlisted` ask gets no decision (logged `pass`), in the workspace too. Every other ask keeps its rule. Any other type fails `mother status` |
 | `policy.bypass_passes_asks` | bool, optional | default `false`: in a session whose cwd is the workspace, a guard ask stays an ask in `bypassPermissions` mode. `true` restores the pass (§5). Any other type fails `mother status` |
 
@@ -473,7 +474,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - Every outbound decision is appended to `.mother/guard.log` (tool, category, target, decision, reason — never message text).
 - **Session approval:** a human-typed message whose *leading* lines are `mother approve tracker <PROJECT>` or
   `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours, and `mother approve
-  shell` turns this session's `shell_unlisted` asks into **allow** for 12 hours (not in a hub-fed session; it covers
+  shell` turns this session's `shell_unlisted` asks into **allow** for 12 hours (in a hub-fed session too: it is the manager's own typed consent; it covers
   nothing else: `outbound_unknown`, protected files and every outbound write keep their rules). Lines from
   tool output, summaries, scheduled triggers or further down a message never count. The deck's "Copy results"
   starts with the tracker line.
