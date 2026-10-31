@@ -3811,7 +3811,11 @@ def decide(a, ctx, transcript=None):
     if a["kind"] == "session":  # the manager's own sessions: always a question, never PAUSED or the never-list
         return "ask", "%s. Confirm it." % a["what"]
     if a["kind"] == "shell_unlisted":  # not outbound by itself: a question, PAUSED or not
-        if not hub_fed(ctx) and ("shell", "*") in session_approvals(transcript):
+        if not hub_fed(ctx) and ctx.ok and (ctx.cfg.get("policy") or {}).get("shell_unasked") is True:
+            return "allow", "%s: policy.shell_unasked (not a hub-fed session)." % a["what"]
+        # The manager's own typed line counts in any session, hub-fed included: it is consent given in that session,
+        # with its context in view. A config switch is not, so shell_unasked above skips hub-fed sessions.
+        if ("shell", "*") in session_approvals(transcript):
             return "allow", "%s: covered by the manager's `mother approve shell` line in this session." % a["what"]
         return "ask", "%s. Confirm it. (`mother approve shell` at the start of your message lets this session's " \
                       "shell commands through for 12 h.)" % a["what"]
@@ -4161,7 +4165,16 @@ def record_hub_session(ws, session_id, at):
 
 
 HUB_FED_CAP = 50
-HUB_CMD_RE = re.compile(r"(?:^|[^\w.-])mother\s+hub\b")
+HUB_CMD_RE = re.compile(r"(?:^|[^\w.-])mother\s+hub\b\s*(\S*)")
+# `mother hub` verbs that print nothing anyone else wrote (heartbeats, connection checks, the job, the manager's
+# own steering): running one does not make a session hub-fed. Any other verb, or none, does.
+HUB_QUIET_VERBS = {"status", "refresh", "check", "smoke", "install", "uninstall", "done", "snooze", "follow",
+                   "unfollow", "mute", "unmute", "help", "-h", "--help"}
+
+
+def hub_feeds(norm):
+    """A shell command (quotes and backslashes dropped, casefolded) runs a `mother hub` verb that prints hub text."""
+    return any(m.group(1) not in HUB_QUIET_VERBS for m in HUB_CMD_RE.finditer(norm))
 
 
 def hub_fed_path(ws):
@@ -4588,7 +4601,7 @@ def run(raw):
         if ctx.ws and isinstance(sid, str) and sid:
             text = str(inp.get("command") or "") if tool == "Bash" or tool == "Monitor" or \
                 tool.split("__")[-1] == "run_in_terminal" else ""
-            if text and HUB_CMD_RE.search(re.sub(r"[\"'\\]", "", text).casefold()):
+            if text and hub_feeds(re.sub(r"[\"'\\]", "", text).casefold()):
                 record_hub_fed(ctx.ws, sid)
             if hub_is_tail(tool, inp) and not payload.get("agent_type") and payload.get("cwd") \
                     and inside(os.path.realpath(str(payload["cwd"])), os.path.realpath(ctx.ws)):
