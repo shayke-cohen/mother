@@ -125,6 +125,14 @@ export type HubSessions = { version: 1; sessions: Record<string, HubSession> }
 // watch.json (`mother hub follow|mute`); the panel reads only `mute`. `until`: muted value -> ISO end of a `--for` mute.
 export type HubWatch = { version: 1; mute?: { keys?: string[]; people?: string[]; channels?: string[]; topics?: string[]; until?: Record<string, string> } }
 
+// One page of the Inspector pane: what it shows (`id`: an item id, a U-id, a session or pending key, a team; `filter`: the
+// decision queue's team). The pane draws the last ref of the stack in `inspect`; Back pops it.
+export type InspectRef = {
+  kind: 'item' | 'update' | 'session' | 'sessions' | 'proposal' | 'decisions' | 'team' | 'system'
+  id?: string
+  filter?: string
+}
+
 // What the panel holds of the hub files; null = the file is missing (or never read).
 export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null; watch: HubWatch | null }
 
@@ -134,10 +142,11 @@ declare module 'claude-code' {
       doc: NowDoc | null
       error: string | null
       workspace: string | null
-      selected: string | null   // row holding the d/s/t/x hotkeys: an item id or top:<rank>
-      snoozing: string | null   // the row whose snooze Select is open (an item id, hub:<U-id>), or ignore:<row> for its Ignore picker
-      expanded: string[] | null // sections drawn in full (`on_you`, `neglected`, `suggestion`) and `health`; `hub` flips the Hub section's default, `routed` opens Recently routed, `ignored` opens Ignored
+      selected: string | null   // the Top 3 entry holding the d/x/a hotkeys: top:<rank>
+      snoozing: string | null   // the Inspector picker open: fp-snooze / fp-ignore (an item), hub:<U-id> / ignore:hub:<U-id>, ignore:sess:<key>; hub:refresh while a refresh runs
+      expanded: string[] | null // Home groups drawn in full (`g-reply`, `g-review`, `g-other`, `g-suggestion`); `ignored` opens Ignored, `insp-more` the item page's extra moves, `insp-dropped` archived sessions
       hub: HubBundle | null     // watcher.json, hub.json, sessions.json and watch.json as last read
+      inspect: InspectRef[] | null // the Inspector's back stack; the last ref is the page shown
     }
   }
 }
