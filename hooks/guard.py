@@ -1902,7 +1902,26 @@ def run_text(cmd, quotes=True, bodies=False):
     return "".join(out)
 
 
+# A write whose every target is in a temp folder (/tmp, /private/tmp, /var/folders, $TMPDIR): a redirect, `tee`,
+# `mkdir`, or `cp`'s last argument. It cannot change a protected file, so the files the rest of the command names
+# (`mkdir -p /tmp/qa && cat MEMORY.md`) are only read. A target that climbs (`..`) or itself names a guarded file
+# (`/tmp/link/MEMORY.md`, through a link made earlier) still counts.
+_TEMP = r"(?:(?:/private)?/tmp|/var/folders|\$\{?tmpdir\}?)/[^\s;&|<>()`]*"
+_END = r"(?=\s*(?:$|[;&|)\n]))"
+TEMP_WRITE_RE = re.compile(r"(?:\d*|&)>>?\|?\s*(" + _TEMP + r")"
+                           r"|\b(?:mkdir|tee)(?:\s+-[a-z]+)*((?:\s+" + _TEMP + r")+)" + _END +
+                           r"|\bcp(?:\s+-[a-z]+)*(?:\s+[^\s;&|<>()`]+)+?\s+(" + _TEMP + r")" + _END, re.I)
+TEMP_GUARDED_RE = re.compile(r"\.\.|agents\.md|claude\.md|memory\.md|\.mcp\.json|\.claude|\.mother|grants\.json"
+                             r"|config\.json|guard|ledger|paused|hooks\.json", re.I)
+
+
+def drop_temp_writes(run):
+    return TEMP_WRITE_RE.sub(lambda m: m.group(0) if TEMP_GUARDED_RE.search("".join(g or "" for g in m.groups()))
+                             else " ", run)
+
+
 def shell_writes(cmd, run):
+    run = drop_temp_writes(run)
     if SHELL_WRITE_RE.search(SAFE_REDIRECT_RE.sub(" ", run)):
         return True
     return bool(SCRIPT_RE.search(run) and SCRIPT_WRITE_RE.search(cmd))
@@ -1970,7 +1989,7 @@ def shell_protected(cmd, run, cwd, ctx):
     `.mother/`, `memory/` or `.claude/`. A `cd` into those followed by a write, and `git checkout|restore|reset …
     -- <them>`, count. `~/.claude` (home, not the workspace) does not. The command must reach the workspace: run
     from inside it (unless it first cds to an absolute path), or name it, `$W/` or `$MOTHER_WORKSPACE`."""
-    if not ctx.ws or not (shell_writes(cmd, run) or EXTRA_WRITE_RE.search(run)):
+    if not ctx.ws or not (shell_writes(cmd, run) or EXTRA_WRITE_RE.search(drop_temp_writes(run))):
         return None
     t = re.sub(r"[\"'\\]", "", run_text(cmd, quotes=False)).casefold()
     ws = os.path.realpath(ctx.ws).casefold()
@@ -4165,7 +4184,12 @@ def record_hub_session(ws, session_id, at):
 
 
 HUB_FED_CAP = 50
-HUB_CMD_RE = re.compile(r"(?:^|[^\w.-])mother\s+hub\b\s*(\S*)")
+# `mother hub <verb>` where it runs: at the start of a command stage (after ; & | ( ` a newline, then/do, env
+# assignments and env/command/exec/nohup/time), by name or by path. A mention inside an argument (a grep pattern,
+# an echo, a commit message, a heredoc sentence) runs nothing and marks nothing. The verb is its word characters,
+# so `status`, (a backtick and a comma glued on by prose) is still `status`.
+HUB_CMD_RE = re.compile(r"(?:^|[;&|(`\n]|\b(?:then|do|else)\s)\s*(?:\w+=\S*\s+)*"
+                        r"(?:(?:env|command|exec|nohup|time)\s+)*(?:\S*/)?mother\s+hub\b\s*([\w-]*)")
 # `mother hub` verbs that print nothing anyone else wrote (heartbeats, connection checks, the job, the manager's
 # own steering): running one does not make a session hub-fed. Any other verb, or none, does.
 HUB_QUIET_VERBS = {"status", "refresh", "check", "smoke", "install", "uninstall", "done", "snooze", "follow",
