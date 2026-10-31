@@ -1920,9 +1920,14 @@ def drop_temp_writes(run):
                              else " ", run)
 
 
+# The program text of `python3 -c '…'`, `node -e "…"` (ruby, perl): a `>` in it compares, a `cp` in it is a name.
+# What that code writes is SCRIPT_WRITE_RE's to find (subprocess and os.system included), not the redirect test's.
+INLINE_CODE_RE = re.compile(r"(\b(?:python3?|node|ruby|perl)(?:\s+-[a-zA-Z]+)*\s+-[ce]\s+)('[^']*'|\"(?:[^\"\\]|\\.)*\")")
+
+
 def shell_writes(cmd, run):
     run = drop_temp_writes(run)
-    if SHELL_WRITE_RE.search(SAFE_REDIRECT_RE.sub(" ", run)):
+    if SHELL_WRITE_RE.search(SAFE_REDIRECT_RE.sub(" ", INLINE_CODE_RE.sub(r"\1''", run))):
         return True
     return bool(SCRIPT_RE.search(run) and SCRIPT_WRITE_RE.search(cmd))
 
