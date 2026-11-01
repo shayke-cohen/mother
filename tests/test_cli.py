@@ -527,6 +527,18 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("teams[0].people[0].one_on_one must be", r.stdout)
 
+    def test_team_issue_repos_validated(self):
+        self.init()
+        cfg = self.write_config()
+        cfg["teams"][0]["issue_repos"] = ["not a repo"]
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        r = run(["status"], self.env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("teams[0].issue_repos must be", r.stdout)
+        cfg["teams"][0]["issue_repos"] = ["acme/tools"]
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        self.assertEqual(run(["status"], self.env).returncode, 0)
+
     def test_monthly_routine_and_bad_days(self):
         self.init()
         cfg = self.write_config()

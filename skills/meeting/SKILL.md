@@ -38,6 +38,7 @@ Fill it from:
 | `last` | the sprint that just ended: shipped work **grouped by stream, never by person**, unfinished items with a state; `leadtime` = median and 85th-percentile days created → done, and tickets done, last 30 days vs the 30 before (exclude epics, tickets closed within an hour of creation, and clean-ups older than 120 days; say so in the note) |
 | `next.goals` | 3–6 goals, each with a done-test. Under each: issues already in the sprint (`in` / `done`), existing issues to pull in (`add`, or `assign` with `from` when the owner changes), and new issues (`create`, `key: null`). Every open issue in the sprint appears once — under a goal or in `next.other` |
 | `decisions` | what the team must settle; always include load when someone holds more than ~8 open issues |
+| GitHub issues | only when the team has `issue_repos`: each repo's open issues (`gh issue list -R <repo> --state open --limit 200 --json number,title,assignees,labels,createdAt`) and those closed since the last sprint started. Keys are `owner/repo#N`. Closed ones go in `last` under a stream named after the repo; open ones that serve a goal go under it as `add` / `assign` (owner matched by `people[].code`), the rest stay off the page except a count in `context` or `next.other` when assigned to a teammate. Name the repo in `meta.sources`; if `gh` fails, say so in `meta.banner` |
 
 Read the tracker live, not from last week's files: the team may have started the sprint or moved issues since.
 Trackers cap page sizes; read in slices (e.g. by date) until each slice is complete.
@@ -101,6 +102,10 @@ else. Read the tracker gotchas in the doctor's notes in `capabilities.json` firs
 5. **Post** to the team channel (`role: team`), signed: the plan link, the goals, and what to do — open the
    board filtered by the label, reassign if the owner is wrong, comment if the scope is off, remove the label
    to confirm.
+   An `owner/repo#N` item is a GitHub issue, not a tracker item: skip steps 2–4 for it and instead, for
+   `assign` / `add`, set its assignee (`gh issue edit <N> -R <owner/repo> --add-assignee <code login>`) and
+   add the plan label (`--add-label`, creating it once with `gh label create` if missing). It is never moved
+   into the sprint; the plan page is where it shows as sprint work.
 6. **Re-read and report**: every key changed, every write that failed. Put the real keys into the plan JSON,
    set the banner to what was applied, rebuild, and republish to the same place.
 

@@ -9,6 +9,7 @@ fails loudly instead of rendering an empty section.
 """
 import html
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -63,6 +64,9 @@ def render(d):
     def key(k):
         if not k:
             return '<span class="key new">NEW</span>'
+        gh = re.fullmatch(r"([\w.-]+/[\w.-]+)#(\d+)", k)
+        if gh:
+            return f'<a class="key" href="{e(f"https://github.com/{gh[1]}/issues/{gh[2]}")}" target="_blank" rel="noopener">{e(k)}</a>'
         return f'<a class="key" href="{e(browse + k)}" target="_blank" rel="noopener">{e(k)}</a>' if browse else f'<span class="key">{e(k)}</span>'
 
     def link(url, text):

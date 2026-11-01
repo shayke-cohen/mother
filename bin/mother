@@ -245,6 +245,9 @@ def validate(cfg: dict) -> list:
         where = f"teams[{i}]"
         need(t, "slug", str, where)
         need(t, "name", str, where)
+        ir = t.get("issue_repos")
+        if ir is not None and not (isinstance(ir, list) and all(isinstance(x, str) and re.fullmatch(r"[\w.-]+/[\w.-]+", x) for x in ir)):
+            errs.append(f"{where}.issue_repos must be a list of owner/repo strings")
         for j, pp in enumerate(t.get("people") or []):
             oo = pp.get("one_on_one") if isinstance(pp, dict) else None
             if oo is None:
