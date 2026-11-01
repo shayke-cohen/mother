@@ -4,7 +4,7 @@ team_scoped: false                # loops over config.teams itself
 description: After each team's sprint rolls over — snapshot the new sprint, review the one that closed, append a metrics row. Silent.
 config: routines.weekly-snapshot  # at, days; absent = off
 default: { at: "16:00", days: workdays }   # runs daily, acts only on teams whose sprint just rolled over
-needs: [tracker.read, tracker.sprint]
+needs: [tracker.read, tracker.sprint]   # + code.read for teams with issue_repos
 writes: [teams/<slug>/sprints/, teams/<slug>/metrics.md, teams/<slug>/runs.md]
 sends: nothing
 ---
@@ -47,9 +47,20 @@ For each team in scope (read `rules/teams.md`, `teams/<slug>/TEAM.md`, the newes
 3. **Close out the previous sprint.** Fill its `## Review` if empty: done during the sprint (keys), slipped
    (still open, carried), added after the start (in the sprint, not in `## Committed`). Leave
    `## Decisions` alone — it's the manager's.
+3b. **GitHub issues** — only for a team with `issue_repos`, needing `code.read`. For each repo, over the
+   sprint that closed (start date to end date): issues opened, issues closed as completed
+   (`gh issue list -R <repo> --state closed --search "closed:<start>..<end>" --limit 500 --json number,stateReason,assignees`,
+   count `stateReason: COMPLETED`), open now, and open now with no assignee. Read with `--limit` above the
+   expected count and treat a result equal to the limit as truncated. In the closed sprint's file add
+   `## GitHub issues`: one line per repo with those four counts, and the `owner/repo#N` keys that were on the
+   sprint plan (`meetings/<meeting date>-plan.json`) marked done or still open. In the new sprint's file, list
+   the plan's `owner/repo#N` keys under `## Committed` like tracker items. `code.read` not `ok` → leave the
+   section out and say so in the runs note.
 4. **Metrics.** Append one row to `metrics.md` for the sprint that closed: sprint | dates | committed | done
    | carried | bugs done | added mid-sprint | unassigned in sprint. **Never edit past rows.** A cell you
-   couldn't compute is `?`, with the reason in the runs note.
+   couldn't compute is `?`, with the reason in the runs note. A team with `issue_repos` also gets one row per
+   repo in a separate `## GitHub issues` table under the main one (create it the first time):
+   sprint | repo | opened | closed | open at end | unassigned at end. Same rules: append only, `?` over a guess.
 5. Append to `teams/<slug>/runs.md`: `- <UTC ISO> weekly-snapshot <ok|partial|failed> — <note>`.
 
 **Runs note:** `<slug>: new sprint <name>|no rollover, row appended|—; …`.

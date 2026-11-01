@@ -1,5 +1,6 @@
 """Tests for assets/deck/build.py. python3 -m unittest tests.test_deck -v"""
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,17 @@ class DeckTest(unittest.TestCase):
         r = build(self.data, self.out)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("from tracker hygiene", self.out.read_text())
+
+    @unittest.skipUnless(shutil.which("node"), "needs node")
+    def test_github_issue_key_links_to_github(self):
+        lines = (DECK / "template.html").read_text().splitlines()
+        fns = [l for l in lines if l.strip().startswith(("function esc(", "function key("))]
+        self.assertEqual(len(fns), 2)
+        js = "var JIRA='https://tracker.example.com/browse/';\n" + "\n".join(fns) + \
+            "\nconsole.log(key('acme/tools#42'));console.log(key('PLAT-7'));"
+        out = subprocess.run(["node", "-e", js], capture_output=True, text=True).stdout.splitlines()
+        self.assertIn('href="https://github.com/acme/tools/issues/42"', out[0])
+        self.assertIn('href="https://tracker.example.com/browse/PLAT-7"', out[1])
 
     def test_missing_section_fails(self):
         del self.data["carryover"]

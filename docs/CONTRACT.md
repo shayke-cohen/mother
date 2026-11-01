@@ -105,7 +105,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `workspace.home_machine` | str or null | hostname allowed to run routines; null = routines refuse to run until set |
 | `connectors.{chat,tracker,mail,calendar,code}` | str | `slack`/`teams`, `jira`/`linear`/`monday`/`none`, … |
 | `connectors.whatsapp` | str, optional | `whatsapp`. Not needed: the hub watcher's local WhatsApp source (§5e) is enabled by `hub.connections.whatsapp` alone, and no MCP connector is involved, so the doctor never lists it |
-| `teams[]` | list | `slug, name, tracker{project,board}, repos[], meetings{}, sprint{length,starts}, channels[], people[]`; optional `issue_repos[]` (`owner/repo`: GitHub repos whose issues are part of the team's backlog next to the tracker; the meeting plan reads them, keyed `owner/repo#N`) |
+| `teams[]` | list | `slug, name, tracker{project,board}, repos[], meetings{}, sprint{length,starts}, channels[], people[]`; optional `issue_repos[]` (`owner/repo`: GitHub repos whose issues are part of the team's backlog next to the tracker; the meeting plan, the deck's Unowned intake and `weekly-snapshot` read them, keyed `owner/repo#N`) |
 | `people[]` (per team) | | `name, email, chat, code`, optional `one_on_one {cadence_days (3-90, default 14), title}` for 1:1 prep and drift |
 | `channels[]` (per team) | | `id, name, mode: off|watch|mention|draft|auto, trigger: manager|team|anyone, external: bool, role: standup|team|product|support|announcements, quiet_hours ("HH:MM-HH:MM", default manager.quiet_hours), max_replies_per_hour (default 6), auto_topics: [slug] (auto mode)` |
 | `agent.aliases` | list, optional | other names that address the agent in a channel (e.g. `["mother"]`) |

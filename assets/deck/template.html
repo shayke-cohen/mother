@@ -142,7 +142,7 @@ select:focus,input:focus,textarea:focus{outline:2px solid var(--accent);outline-
   function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
   // Text fields may contain ABC-123 ticket keys; they become links when tracker_url is set. Everything else is escaped.
   function rich(s){return JIRA?esc(s).replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g,'<a class="key" href="'+JIRA+'$1" target="_blank" rel="noopener">$1</a>'):esc(s)}
-  function key(k){return JIRA?'<a class="key" href="'+JIRA+esc(k)+'" target="_blank" rel="noopener">'+esc(k)+'</a>':'<span class="key">'+esc(k)+'</span>'}
+  function key(k){var g=String(k).match(/^([\w.-]+\/[\w.-]+)#(\d+)$/);if(g)return '<a class="key" href="https://github.com/'+esc(g[1])+'/issues/'+g[2]+'" target="_blank" rel="noopener">'+esc(k)+'</a>';return JIRA?'<a class="key" href="'+JIRA+esc(k)+'" target="_blank" rel="noopener">'+esc(k)+'</a>':'<span class="key">'+esc(k)+'</span>'}
   function pill(t,tone){return t?'<span class="pill p-'+(tone||'accent')+'">'+esc(t)+'</span>':''}
   // Change vs an earlier value: +12% red when up, green when down (flip with higherIsBetter). "~" marks an estimated baseline.
   function delta(c){
