@@ -1,14 +1,18 @@
 """Tests for lib/chief.py — worker registry, say queue, spend.
 Run: python3 -m unittest tests.test_chief -v
 """
+import fcntl
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
@@ -191,16 +195,7 @@ class TestPausedSettings(Base):
         self.assertNotIn("bogus", s)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ---- the worker runner ------------------------------------------------------------------------------
-import fcntl  # noqa: E402
-import subprocess  # noqa: E402
-import threading  # noqa: E402
-from unittest import mock  # noqa: E402
-
 FAKE = os.path.join(ROOT, "tests", "fixtures", "fake_claude.py")
 
 
@@ -361,6 +356,57 @@ class TestRun(Base):
         self.assertEqual(self.run_(prompt=""), 2)
         self.assertEqual(self.calls(), [])
 
+    def test_detach_flag_like_text_is_one_token(self):
+        with mock.patch.object(subprocess, "Popen") as popen:
+            self.run_(title="--x", prompt="-- --prompt=y", detach=True)
+        self.assertEqual(popen.call_args[0][0][-2:], ["--title=--x", "--prompt=-- --prompt=y"])
+
+    def test_detach_popen_oserror_is_exit_1(self):
+        with mock.patch.object(subprocess, "Popen", side_effect=OSError("nope")):
+            self.assertEqual(self.run_(detach=True), 1)
+
+    def test_status_is_working_during_run(self):
+        os.environ["FAKE_CLAUDE_SLEEP"] = "1"
+        seen = []
+        t = threading.Timer(0.5, lambda: seen.append(chief.workers(self.ws)["PLAT-1"]["status"]))
+        t.start()
+        self.addCleanup(t.join)
+        self.assertEqual(self.run_(), 0)
+        t.join()
+        self.assertEqual(seen, ["working"])
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
+
+    def test_hold_between_check_and_lock_does_not_start_a_turn(self):
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        real, state = chief._try_lock, {"n": 0}
+
+        def lock_after_hold(path):
+            state["n"] += 1
+            if state["n"] == 1:
+                chief.hold(self.ws, "PLAT-1")
+            return real(path)
+        with mock.patch.object(chief, "_try_lock", side_effect=lock_after_hold):
+            self.assertEqual(self.run_(prompt="later"), 4)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(chief.queued(self.ws), {"PLAT-1": 1})
+
+    def test_drain_stops_at_budget_and_keeps_queue(self):
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        chief.enqueue(self.ws, AT, "PLAT-1", "note", "say")
+        self.assertEqual(self.run_(cfg={"chief": {"daily_budget_usd": 0.01}}), 0)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(chief.queued(self.ws), {"PLAT-1": 1})
+
+    def test_worker_dropped_mid_run_is_exit_1(self):
+        os.environ["FAKE_CLAUDE_SLEEP"] = "1"
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        drop = lambda: self.seed_sessions({})  # noqa: E731
+        t = threading.Timer(0.4, drop)
+        t.start()
+        self.addCleanup(t.join)
+        self.assertEqual(self.run_(), 1)
+        self.assertEqual(chief.running(self.ws), [])
+
     def test_detach_reexecs_and_returns(self):
         with mock.patch.object(subprocess, "Popen") as popen:
             self.assertEqual(self.run_(title="T", prompt="go", detach=True), 0)
@@ -368,7 +414,7 @@ class TestRun(Base):
         kw = popen.call_args[1]
         self.assertEqual(argv[0], sys.executable)
         self.assertEqual(argv[1], os.path.join(ROOT, "bin", "mother"))
-        self.assertEqual(argv[2:], ["chief", "run", "PLAT-1", "--title", "T", "--prompt", "go"])
+        self.assertEqual(argv[2:], ["chief", "run", "PLAT-1", "--title=T", "--prompt=go"])
         self.assertIs(kw["start_new_session"], True)
         self.assertTrue(kw["stdout"].name.endswith(os.path.join("logs", "plat-1.log")))
         self.assertEqual(self.calls(), [])
@@ -389,3 +435,7 @@ class TestParse(unittest.TestCase):
         self.assertEqual((r, c), ("", 0.2))
         self.assertTrue(e)
         self.assertTrue(chief.parse_stream("")[2])
+
+
+if __name__ == "__main__":
+    unittest.main()

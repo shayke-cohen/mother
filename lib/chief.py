@@ -353,13 +353,19 @@ def _detach(ws: Path, key: str, title: str, prompt: str, name: str) -> int:
     mother = Path(__file__).resolve().parent.parent / "bin" / "mother"
     cmd = [sys.executable, str(mother), "chief", "run", key]
     if title:
-        cmd += ["--title", title]
+        cmd.append("--title=" + title)  # one token each, so flag-like or "--" text survives
     if prompt:
-        cmd += ["--prompt", prompt]
-    log = open(str(log_dir / (name + ".log")), "a")
-    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(ws), start_new_session=True,
-                     env=dict(os.environ, MOTHER_WORKSPACE=str(ws)))
-    log.close()
+        cmd.append("--prompt=" + prompt)
+    try:
+        log = open(str(log_dir / (name + ".log")), "a")
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(ws),
+                             start_new_session=True, env=dict(os.environ, MOTHER_WORKSPACE=str(ws)))
+        finally:
+            log.close()
+    except OSError as e:
+        print("could not start a detached run for %s: %s" % (key, e))
+        return EXIT_FAILED
     return EXIT_OK
 
 
@@ -405,13 +411,13 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
         if len(others) >= cfgs["max_workers"]:
             return busy("at the max_workers cap (%d)" % cfgs["max_workers"])
         deadline = clock() + cfgs["run_minutes"] * 60
-        pending = prompt
+        claim = _claim(ws, key, prompt)
+        if claim is None:
+            return busy("held")
+        w, pending = claim
         if not pending:
-            pending = _join(take_queue(ws, key))
-            if not pending:
-                print("nothing to run for %s" % key)
-                return EXIT_USAGE
-        w = workers(ws).get(key, w)
+            print("nothing to run for %s" % key)
+            return EXIT_USAGE
         first = w.get("runs", 0) == 0
         while pending:
             text = (HEADER % (key, w.get("title") or key) + pending) if first else pending
@@ -431,10 +437,39 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
             first = False
             if w.get("held") or paused(ws) or clock() >= deadline:
                 break
-            pending = _join(take_queue(ws, key))
+            if _spend_unreadable(ws) or spent_today(ws, at, tz) >= cap:
+                break  # the queue stays for a later run
+            claim = _claim(ws, key, "")
+            if claim is None:
+                break
+            w, pending = claim
         return EXIT_OK
+    except KeyError:
+        print("%s was dropped while running" % key)
+        return EXIT_FAILED
     finally:
         lock.close()
+
+
+def _claim(ws: Path, key: str, prompt: str):
+    """One atomic step before a turn: None if the worker is held, else (worker, text). The text is `prompt`, or
+    the queued entries (taken) when there is none. status becomes "working" only when there is text to run."""
+    with hub.locked(ws):
+        doc = hub._sessions_doc(ws)
+        w = _live_cli(doc, key)
+        if w.get("held"):
+            return None
+        text = prompt
+        if not text:
+            q = _read_queue(ws)
+            mine = [e for e in q if e.get("key") == key]
+            if mine:
+                _write_queue(ws, [e for e in q if e.get("key") != key])
+                text = _join(mine)
+        if text:
+            w["status"] = "working"
+            hub.save_json(ws, "sessions.json", doc)
+        return w, text
 
 
 def _join(entries: List[dict]) -> str:
