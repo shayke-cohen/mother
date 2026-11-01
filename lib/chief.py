@@ -535,6 +535,17 @@ def _read_obj(path: Path) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+def _landing(raw: List[dict], order: dict, start: int, l: dict) -> int:
+    """Where hub.decide would leave the cursor for `l`: an update stands for every same-key update after the
+    cursor with no later `at`, so it lands on the furthest of them."""
+    far = order[l["id"]]
+    if l.get("kind") == "update":
+        for x in raw[start:]:
+            if x["key"] == l["key"] and x.get("kind") == "update" and x["at"] <= l["at"]:
+                far = max(far, order[x["id"]])
+    return far
+
+
 def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     """One chief pass. Not atomic as a whole (hub.locked is not re-entrant); every step is safe to re-run."""
     ws = Path(ws)
@@ -550,16 +561,26 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     mute = hub.live_mute(hub.merged_watch(cfg, hub.load_watch(ws))["mute"] or {}, at)
     sessions = hub._sessions_doc(ws)
     pending = _pending_lines(ws)
+    raw = hub.read_inbox(ws)
+    order = {l["id"]: i for i, l in enumerate(raw)}
+    cursor = hub._hub_doc(ws).get("inbox_cursor")
+    start = order[cursor] + 1 if cursor in order else 0
+
+    def decidable(l):
+        return (l.get("kind") != "manual" and hub.is_muted(l, mute)) or _session_kind(sessions, l) == "cli"
+
+    first = next((l for l in pending if not decidable(l)), None)
+    limit = order[first["id"]] if first is not None else None
     items, routed = [], []
     for l in pending:
+        if l is first or (limit is not None and _landing(raw, order, start, l) > limit):
+            break
         if l.get("kind") != "manual" and hub.is_muted(l, mute):
             items.append({"line_id": l["id"], "key": l["key"], "decision": "log"})
-        elif _session_kind(sessions, l) == "cli":
+        else:
             hit = hub.find_session(sessions, [l["key"]] + list(l.get("also") or []))
             routed.append((hit[0], l))
             items.append({"line_id": l["id"], "key": l["key"], "decision": "route"})
-        else:
-            break
     for key, l in routed:  # queued before decide: a crash in between repeats a note, never loses one
         text = "%s: %s — %s %s" % (l.get("who"), l.get("title"), l.get("summary"), l.get("link"))
         enqueue(ws, at, key, text, "route")
@@ -583,7 +604,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
         if room <= 0:
             break
         if q.get(key) and not w.get("held") and key not in live and w.get("status") != "failed":
-            run(ws, cfg, at, key, detach=True)
-            out["dispatched"].append(key)
-            room -= 1
+            if run(ws, cfg, at, key, detach=True) == EXIT_OK:
+                out["dispatched"].append(key)
+                room -= 1
     return out

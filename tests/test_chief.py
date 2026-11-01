@@ -520,6 +520,24 @@ class TestTick(Base):
         self.assertEqual(self.cursor(), a["id"])
         self.assertEqual(chief._read_queue(self.ws), [])
 
+    def test_tick_never_moves_cursor_past_judge_line(self):
+        self.mute("PLAT-1")
+        a = line(key="PLAT-1", at="2026-10-29T09:00:00Z")
+        j = line(key="PLAT-7")
+        c = line(key="PLAT-1", at="2026-10-29T08:00:00Z")
+        self.inbox(a, j, c)
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r["decided"], [])
+        self.assertEqual(r["judge"][0], a["id"])
+        self.assertIn(j["id"], [l["id"] for l in chief.lines(self.ws)])
+        self.assertIn(j["id"], r["judge"])
+
+    def test_tick_dispatched_only_when_run_succeeds(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.enqueue(self.ws, AT, "PLAT-2", "x", "say")
+        with mock.patch.object(chief, "run", return_value=1):
+            self.assertEqual(chief.tick(self.ws, {}, AT)["dispatched"], [])
+
     def test_tick_wake_dedup(self):
         a = line(key="PLAT-7")
         self.inbox(a)
@@ -567,10 +585,9 @@ class TestTick(Base):
         chief.register_worker(self.ws, AT, "PLAT-4", "t")
         chief.register_worker(self.ws, AT, "PLAT-5", "t")
         chief.update_worker(self.ws, "PLAT-4", held=True)
-        chief.update_worker(self.ws, "PLAT-5", status="failed")
         for k in ("PLAT-2", "PLAT-3", "PLAT-4", "PLAT-5"):
             chief.enqueue(self.ws, AT, k, "x", "say")
-        chief.update_worker(self.ws, "PLAT-5", status="failed")
+        chief.update_worker(self.ws, "PLAT-5", status="failed")  # after enqueue: a "say" resets failed
         with mock.patch.object(chief, "run", return_value=0) as run:
             r = chief.tick(self.ws, {}, AT)
         self.assertEqual(r["dispatched"], ["PLAT-2", "PLAT-3"])
