@@ -53,6 +53,12 @@ Trackers cap page sizes; read in slices (e.g. by date) until each slice is compl
    owner left or is away, in-progress tickets with no owner. Each becomes one item with `key`, `issue`, the
    file's proposed owner as `proposed`, its reason as `why`, and `source: "hygiene"`. Re-read each ticket live
    first and drop it if it now has an owner, is done, or was closed — the file was written days before.
+3. **If the team has `issue_repos`,** open GitHub issues with no assignee, read live. Show at most 5: newest
+   bugs first (a `bug` label, else the title says broken / fails / crash), then the rest by age. Each becomes one
+   item with `key` = `owner/repo#N`, `issue` = the title, `proposed` = the teammate (matched by `people[].code`)
+   who closed or merged the most work in that repo in the last 30 days, else empty, `why` = "unassigned
+   GitHub issue, opened <date>", and `source: "github"`. Put the total unassigned count per repo, with the
+   repo's issues link, in `intake.note`, so the room sees what the 5 were picked from.
 
 Dedupe by ticket key: a key already in an `intake.md` item keeps that item and its owner proposal; the hygiene
 line is dropped. Every owner in the hygiene file is a **proposal for the room, never an assignment** — it goes in
@@ -141,6 +147,9 @@ Read the tracker gotchas in the doctor's notes in `capabilities.json` first. App
    `deferred: true` → leave it `proposed` in `intake.md` for next week. Update each applied item in `intake.md`.
    A hygiene item (`source: "hygiene"` in the deck JSON) has no `intake.md` line: assign the owner the room chose, add no line, and
    leave a deferred one alone (the next hygiene pass proposes it again).
+   A GitHub item (`source: "github"`, key `owner/repo#N`) has no `intake.md` line either: set the assignee with
+   `gh issue edit <N> -R <owner/repo> --add-assignee <the owner's people[].code>`, never move it into a tracker
+   sprint, and leave a deferred one alone.
 2. **`added[]`** with a `key` → by `action`: `assign` (owner, plus the new sprint if `nextSprint`), `done`
    (transition to the done state found via available transitions), `comment` (comment only). A `comment`
    text is added in every case. Without a key → create, assigned, with its priority and the comment as description.

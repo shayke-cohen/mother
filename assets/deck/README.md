@@ -27,7 +27,7 @@ Required top-level keys: `meta`, `pipeline`, `sprint`, `experts`, `intake`, `car
 (e.g. `vs 09-25`), `estimate` (true = the baseline is reconstructed; shown with `~`) and `higherIsBetter`. With
 `prev` the card shows the change as +/-% — red when it got worse, green when better (lower is better by default).
 
-`intake.items[]` take `id`, `issue`, `proposed`, `why`, `priority`, optional `key`, and optional `source`
+`intake.items[]` take `id`, `issue`, `proposed`, `why`, `priority`, optional `key` (a tracker key, or `owner/repo#N` for a GitHub issue, linked to GitHub), and optional `source`
 (`"hygiene"` = from `meetings/<date>-hygiene.md`; the slide marks it, and its owner is still only a proposal).
 
 Text fields turn `ABC-123` keys into links when `tracker_url` is set. Outcome fields filled after the meeting:
