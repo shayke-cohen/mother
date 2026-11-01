@@ -193,3 +193,199 @@ class TestPausedSettings(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- the worker runner ------------------------------------------------------------------------------
+import fcntl  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+from unittest import mock  # noqa: E402
+
+FAKE = os.path.join(ROOT, "tests", "fixtures", "fake_claude.py")
+
+
+class TestRun(Base):
+    def setUp(self):
+        super().setUp()
+        self.log = self.ws / "claude.log"
+        p = mock.patch.dict(os.environ, {"MOTHER_CLAUDE_BIN": FAKE, "FAKE_CLAUDE_LOG": str(self.log)})
+        p.start()
+        self.addCleanup(p.stop)
+        for k in ("FAKE_CLAUDE_RESULT", "FAKE_CLAUDE_SLEEP", "FAKE_CLAUDE_EXIT"):
+            os.environ.pop(k, None)
+        self.cfg = {}
+        self.locks = []
+        self.addCleanup(lambda: [f.close() for f in self.locks])
+
+    def calls(self):
+        if not self.log.exists():
+            return []
+        return [json.loads(ln) for ln in self.log.read_text().splitlines()]
+
+    def run_(self, key="PLAT-1", prompt="do it", cfg=None, **kw):
+        return chief.run(self.ws, self.cfg if cfg is None else cfg, AT, key, prompt=prompt, **kw)
+
+    def hold_lock(self, key):
+        name = chief._slug(key)
+        d = chief.chief_dir(self.ws) / "run"
+        d.mkdir(parents=True, exist_ok=True)
+        f = open(str(d / (name + ".lock")), "a")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.locks.append(f)
+
+    def test_first_run_uses_session_id_then_resume(self):
+        self.assertEqual(self.run_(title="T"), 0)
+        sid = hub._sessions_doc(self.ws)["sessions"]["PLAT-1"]["session_id"]
+        self.assertEqual(self.run_(), 0)
+        a, b = [c["argv"] for c in self.calls()]
+        self.assertEqual(a[a.index("--session-id") + 1], sid)
+        self.assertNotIn("--resume", a)
+        self.assertEqual(b[b.index("--resume") + 1], sid)
+        self.assertNotIn("--session-id", b)
+        for flag in ("-p", "--verbose", "bypassPermissions"):
+            self.assertIn(flag, a)
+        self.assertIn("MOTHER worker for PLAT-1 (T)", self.calls()[0]["stdin"])
+
+    def test_run_records_progress_cost_status(self):
+        os.environ["FAKE_CLAUDE_RESULT"] = "did x\nPROGRESS: drafted reply"
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        chief.update_worker(self.ws, "PLAT-1", unseen=3)
+        self.assertEqual(self.run_(), 0)
+        w = chief.workers(self.ws)["PLAT-1"]
+        self.assertEqual(w["progress"], "drafted reply")
+        self.assertEqual(w["cost"], 0.01)
+        self.assertEqual(w["status"], "idle")
+        self.assertEqual(w["runs"], 1)
+        self.assertEqual(w["unseen"], 0)
+        self.assertEqual(w["last_run_at"], hub._iso(AT))
+        tz = nowmod.Schedule.from_config(self.cfg).tz
+        self.assertEqual(chief.spent_today(self.ws, AT, tz), 0.01)
+        self.assertEqual(chief.running(self.ws), [])
+
+    def test_failed_run_marks_failed(self):
+        os.environ["FAKE_CLAUDE_EXIT"] = "1"
+        os.environ["FAKE_CLAUDE_RESULT"] = ""
+        self.assertEqual(self.run_(), 1)
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+
+    def test_run_refuses_desktop_key(self):
+        self.seed_sessions({"PLAT-1": {"session_id": "s", "state": "live", "name": "plat-1"}})
+        self.assertEqual(self.run_(), 2)
+        self.assertEqual(self.calls(), [])
+
+    def test_held_run_queues_instead(self):
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        chief.hold(self.ws, "PLAT-1")
+        self.assertEqual(self.run_(prompt="please"), 4)
+        self.assertEqual(self.calls(), [])
+        q = chief.take_queue(self.ws, "PLAT-1")
+        self.assertEqual([(e["text"], e["source"]) for e in q], [("please", "say")])
+
+    def test_second_concurrent_run_queues(self):
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        self.hold_lock("PLAT-1")
+        self.assertEqual(self.run_(prompt="later"), 4)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(chief.queued(self.ws), {"PLAT-1": 1})
+        self.assertEqual(chief.running(self.ws), ["PLAT-1"])
+
+    def test_max_workers_cap(self):
+        for k in ("A-1", "A-2", "A-3"):
+            chief.register_worker(self.ws, AT, k, "t")
+            self.hold_lock(k)
+        self.assertEqual(self.run_(key="A-4", prompt="x"), 4)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(chief.queued(self.ws), {"A-4": 1})
+        self.assertEqual(sorted(chief.running(self.ws)), ["A-1", "A-2", "A-3"])
+
+    def test_drain_runs_queued_text_as_next_turn(self):
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        chief.enqueue(self.ws, AT, "PLAT-1", "first note", "say")
+        chief.enqueue(self.ws, AT, "PLAT-1", "second note", "route")
+        self.assertEqual(self.run_(), 0)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("[say at %s] first note" % hub._iso(AT), calls[1]["stdin"])
+        self.assertIn("[route at %s] second note" % hub._iso(AT), calls[1]["stdin"])
+        self.assertIn("--resume", calls[1]["argv"])
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["runs"], 2)
+        self.assertEqual(chief.queued(self.ws), {})
+
+    def test_hold_during_run_stops_drain(self):
+        os.environ["FAKE_CLAUDE_SLEEP"] = "1"
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        chief.enqueue(self.ws, AT, "PLAT-1", "note", "say")
+        t = threading.Timer(0.4, chief.hold, args=(self.ws, "PLAT-1"))
+        t.start()
+        self.addCleanup(t.join)
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(chief.queued(self.ws), {"PLAT-1": 1})
+
+    def test_timeout_marks_failed(self):
+        os.environ["FAKE_CLAUDE_SLEEP"] = "5"
+        self.assertEqual(self.run_(cfg={"chief": {"run_minutes": 1 / 60}}), 1)
+        w = chief.workers(self.ws)["PLAT-1"]
+        self.assertEqual(w["status"], "failed")
+        self.assertTrue(w["progress"].startswith("timed out"), w["progress"])
+
+    def test_paused_and_budget_refuse(self):
+        chief.pause(self.ws)
+        self.assertEqual(self.run_(), 3)
+        chief.resume(self.ws)
+        tz = nowmod.Schedule.from_config(self.cfg).tz
+        chief.add_spend(self.ws, AT, tz, 5)
+        self.assertEqual(self.run_(cfg={"chief": {"daily_budget_usd": 5}}), 3)
+        self.assertEqual(self.calls(), [])
+
+    def test_corrupt_spend_refuses(self):
+        d = chief.chief_dir(self.ws)
+        d.mkdir(parents=True)
+        (d / "spend.json").write_text("{not json")
+        self.assertEqual(self.run_(), 3)
+        self.assertEqual(self.calls(), [])
+
+    def test_missing_spend_is_zero(self):
+        self.assertEqual(self.run_(), 0)
+
+    def test_worker_env_drops_chief_role(self):
+        os.environ["MOTHER_CHIEF_ROLE"] = "chief"
+        self.assertEqual(self.run_(), 0)
+        env = self.calls()[0]["env"]
+        self.assertNotIn("MOTHER_CHIEF_ROLE", env)
+        self.assertEqual(env["MOTHER_CHIEF_WORKER"], "PLAT-1")
+        self.assertEqual(env["MOTHER_NO_SYNC"], "1")
+        self.assertEqual(env["MOTHER_WORKSPACE"], str(self.ws))
+
+    def test_empty_prompt_and_queue_is_usage(self):
+        self.assertEqual(self.run_(prompt=""), 2)
+        self.assertEqual(self.calls(), [])
+
+    def test_detach_reexecs_and_returns(self):
+        with mock.patch.object(subprocess, "Popen") as popen:
+            self.assertEqual(self.run_(title="T", prompt="go", detach=True), 0)
+        argv = popen.call_args[0][0]
+        kw = popen.call_args[1]
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[1], os.path.join(ROOT, "bin", "mother"))
+        self.assertEqual(argv[2:], ["chief", "run", "PLAT-1", "--title", "T", "--prompt", "go"])
+        self.assertIs(kw["start_new_session"], True)
+        self.assertTrue(kw["stdout"].name.endswith(os.path.join("logs", "plat-1.log")))
+        self.assertEqual(self.calls(), [])
+
+
+class TestParse(unittest.TestCase):
+    def test_progress_of(self):
+        self.assertEqual(chief.progress_of("a\nPROGRESS: one\nmore\nPROGRESS: two"), "two")
+        self.assertEqual(chief.progress_of("\n  first line\nsecond"), "first line")
+        self.assertEqual(len(chief.progress_of("x" * 500)), 200)
+        self.assertEqual(chief.progress_of(""), "")
+
+    def test_parse_stream(self):
+        ok = json.dumps({"type": "result", "subtype": "success", "result": "hi", "total_cost_usd": 0.5})
+        self.assertEqual(chief.parse_stream("noise\n" + ok + "\n"), ("hi", 0.5, None))
+        bad = json.dumps({"type": "result", "subtype": "error_max_turns", "total_cost_usd": 0.2})
+        r, c, e = chief.parse_stream(bad)
+        self.assertEqual((r, c), ("", 0.2))
+        self.assertTrue(e)
+        self.assertTrue(chief.parse_stream("")[2])
