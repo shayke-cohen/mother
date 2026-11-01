@@ -34,6 +34,12 @@ class PlanTest(unittest.TestCase):
         self.assertNotIn("<!--BODY-->", html)
         self.assertIn('href="https://tracker.example.com/browse/PLAT-110"', html)
 
+    def test_github_issue_key_links_to_github(self):
+        self.data["next"]["goals"][0]["items"][0]["key"] = "acme/tools#42"
+        r = build(self.data, self.out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('href="https://github.com/acme/tools/issues/42"', self.out.read_text())
+
     def test_missing_section_fails(self):
         del self.data["next"]
         r = build(self.data, self.out)
