@@ -474,3 +474,116 @@ def _claim(ws: Path, key: str, prompt: str):
 
 def _join(entries: List[dict]) -> str:
     return "\n\n".join("[%s at %s] %s" % (e.get("source"), e.get("at"), e.get("text")) for e in entries)
+
+
+# ---- tick: route what needs no judgment, wake the chief for the rest --------------------------------------
+
+JUDGE_MAX = 20
+WAKE_MINUTES = 10
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+WAKE_TEXT = ("Chief wake: %d inbox lines need a decision. Follow %s. "
+             "Read them with `mother chief lines --json`.")
+
+
+def _pending_lines(ws: Path) -> List[dict]:
+    """The digest of the inbox lines after hub.json's cursor (what the hub tail would print)."""
+    cursor = hub._hub_doc(ws).get("inbox_cursor")
+    batch, _missing = hub.after_cursor(hub.read_inbox(ws), cursor)
+    return hub.digest(ws, batch)
+
+
+def _session_kind(sessions: dict, line: dict) -> Optional[str]:
+    hit = hub.find_session(sessions, [line["key"]] + list(line.get("also") or []))
+    if hit is None:
+        return None
+    return "cli" if _is_cli(hit[1]) else "desktop"
+
+
+def lines(ws: Path) -> List[dict]:
+    """The lines the chief reads: the digest after the cursor, trimmed to the fields it needs, plus `session`
+    ("cli" for a chief worker, "desktop" for a hub session, None for neither)."""
+    ws = Path(ws)
+    sessions = hub._sessions_doc(ws)
+    out = []
+    for l in _pending_lines(ws):
+        d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
+        d["also"] = list(l.get("also") or [])
+        d["session"] = _session_kind(sessions, l)
+        out.append(d)
+    return out
+
+
+def _reconcile(ws: Path) -> List[str]:
+    """A worker marked working whose run lock is free died without a result: mark it failed."""
+    alive = set(running(ws))
+    done = []
+    for key, w in workers(ws).items():
+        if w.get("status") == "working" and key not in alive:
+            try:
+                update_worker(ws, key, status="failed", progress="run ended without a result")
+            except KeyError:
+                continue
+            done.append(key)
+    return done
+
+
+def _read_obj(path: Path) -> dict:
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def tick(ws: Path, cfg: dict, at: datetime) -> dict:
+    """One chief pass. Not atomic as a whole (hub.locked is not re-entrant); every step is safe to re-run."""
+    ws = Path(ws)
+    cfgs = settings(cfg)
+    cdir = chief_dir(ws)
+    _write_atomic(cdir / "heartbeat.json", json.dumps({"at": hub._iso(at), "pid": os.getpid()}) + "\n")
+    out = {"paused": False, "decided": [], "wake": None, "judge": [], "dispatched": [], "reconciled": []}
+    if paused(ws):
+        out["paused"] = True
+        return out
+    out["reconciled"] = _reconcile(ws)
+
+    mute = hub.live_mute(hub.merged_watch(cfg, hub.load_watch(ws))["mute"] or {}, at)
+    sessions = hub._sessions_doc(ws)
+    pending = _pending_lines(ws)
+    items, routed = [], []
+    for l in pending:
+        if l.get("kind") != "manual" and hub.is_muted(l, mute):
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "log"})
+        elif _session_kind(sessions, l) == "cli":
+            hit = hub.find_session(sessions, [l["key"]] + list(l.get("also") or []))
+            routed.append((hit[0], l))
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "route"})
+        else:
+            break
+    for key, l in routed:  # queued before decide: a crash in between repeats a note, never loses one
+        text = "%s: %s — %s %s" % (l.get("who"), l.get("title"), l.get("summary"), l.get("link"))
+        enqueue(ws, at, key, text, "route")
+    if items:
+        out["decided"] = hub.decide(ws, cfg, at, items)
+
+    judge = [l["id"] for l in pending[len(items):]][:JUDGE_MAX]
+    out["judge"] = judge
+    if judge:
+        last = _read_obj(cdir / "wake.json")
+        woke = hub._parse_at(last.get("at"))
+        fresh = woke is not None and (at - woke).total_seconds() < WAKE_MINUTES * 60
+        if not (last.get("line_ids") == judge and fresh):
+            out["wake"] = WAKE_TEXT % (len(judge), PLUGIN_ROOT / "routines" / "chief.md")
+            _write_atomic(cdir / "wake.json", json.dumps({"line_ids": judge, "at": hub._iso(at)}) + "\n")
+
+    live = set(running(ws))
+    room = cfgs["max_workers"] - len(live)
+    q = queued(ws)
+    for key, w in workers(ws).items():
+        if room <= 0:
+            break
+        if q.get(key) and not w.get("held") and key not in live and w.get("status") != "failed":
+            run(ws, cfg, at, key, detach=True)
+            out["dispatched"].append(key)
+            room -= 1
+    return out

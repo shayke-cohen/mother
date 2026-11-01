@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -435,6 +435,168 @@ class TestParse(unittest.TestCase):
         self.assertEqual((r, c), ("", 0.2))
         self.assertTrue(e)
         self.assertTrue(chief.parse_stream("")[2])
+
+
+def line(**kw):
+    d = {"source": "tracker", "kind": "update", "key": "PLAT-1", "at": "2026-10-29T09:00:00Z",
+         "also": [], "title": "t", "who": "Agnes", "link": "https://example.com/PLAT-1", "summary": "s"}
+    d.update(kw)
+    return hub.make_line(**d)
+
+
+class TestTick(Base):
+    def inbox(self, *ls):
+        hub.append_inbox(self.ws, list(ls))
+
+    def mute(self, key):
+        with hub.locked(self.ws):
+            w = hub.load_watch(self.ws)
+            w["mute"]["keys"].append(key)
+            hub.save_watch(self.ws, w)
+
+    def cursor(self):
+        return hub._hub_doc(self.ws).get("inbox_cursor")
+
+    def test_tick_logs_muted_and_routes_live(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        self.mute("PLAT-1")
+        a, b = line(key="PLAT-1"), line(key="PLAT-2", title="Ping", summary="please look")
+        self.inbox(a, b)
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual([(d["line_id"], d["decision"]) for d in r["decided"]],
+                         [(a["id"], "log"), (b["id"], "route")])
+        self.assertEqual(r["judge"], [])
+        self.assertIsNone(r["wake"])
+        self.assertEqual(self.cursor(), b["id"])
+
+    def test_tick_queues_for_cli_worker(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        self.inbox(line(key="PLAT-2", title="Ping", summary="please look", who="Dana"))
+        with mock.patch.object(chief, "_detach", return_value=0):
+            r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r["dispatched"], ["PLAT-2"])
+        q = chief._read_queue(self.ws)
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["source"], "route")
+        self.assertEqual(q[0]["text"], "Dana: Ping \u2014 please look https://example.com/PLAT-1")
+
+    def test_tick_sends_desktop_key_to_judge(self):
+        self.seed_sessions({"PLAT-3": {"session_id": "local_x", "state": "live", "unseen": 0}})
+        a = line(key="PLAT-3")
+        self.inbox(a)
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r["decided"], [])
+        self.assertEqual(r["judge"], [a["id"]])
+        self.assertIsNone(self.cursor())
+        self.assertEqual(hub._sessions_doc(self.ws)["sessions"]["PLAT-3"]["unseen"], 0)
+
+    def test_tick_never_logs_manual(self):
+        self.mute("PLAT-1")
+        a = line(kind="manual")
+        self.inbox(a)
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r["decided"], [])
+        self.assertEqual(r["judge"], [a["id"]])
+
+    def test_lines_marks_session_kind(self):
+        self.seed_sessions({"PLAT-3": {"session_id": "local_x", "state": "live"},
+                            "PLAT-4": {"session_id": "u", "state": "live", "kind": "cli", "also": ["PLAT-9"]}})
+        self.inbox(line(key="PLAT-3"), line(key="PLAT-4"), line(key="PLAT-9"), line(key="PLAT-5"))
+        got = {l["key"]: l["session"] for l in chief.lines(self.ws)}
+        self.assertEqual(got, {"PLAT-3": "desktop", "PLAT-4": "cli", "PLAT-9": "cli", "PLAT-5": None})
+        first = chief.lines(self.ws)[0]
+        self.assertEqual(sorted(first), sorted(["id", "key", "kind", "title", "who", "link", "summary", "also",
+                                                "session"]))
+
+    def test_tick_stops_at_first_judgment_line(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        self.mute("PLAT-1")
+        a, b, c = line(key="PLAT-1"), line(key="PLAT-7"), line(key="PLAT-2")
+        self.inbox(a, b, c)
+        with mock.patch.object(chief, "_detach", return_value=0):
+            r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(len(r["decided"]), 1)
+        self.assertEqual(r["judge"], [b["id"], c["id"]])
+        self.assertEqual(self.cursor(), a["id"])
+        self.assertEqual(chief._read_queue(self.ws), [])
+
+    def test_tick_wake_dedup(self):
+        a = line(key="PLAT-7")
+        self.inbox(a)
+        r1 = chief.tick(self.ws, {}, AT)
+        r2 = chief.tick(self.ws, {}, AT + timedelta(minutes=1))
+        self.assertIn("1 inbox lines", r1["wake"])
+        self.assertIn(str(chief.PLUGIN_ROOT / "routines" / "chief.md"), r1["wake"])
+        self.assertIsNone(r2["wake"])
+        self.assertEqual(r2["judge"], [a["id"]])
+
+    def test_tick_rewakes_after_10_min(self):
+        self.inbox(line(key="PLAT-7"))
+        chief.tick(self.ws, {}, AT)
+        r = chief.tick(self.ws, {}, AT + timedelta(minutes=10, seconds=1))
+        self.assertIsNotNone(r["wake"])
+
+    def test_tick_wakes_again_when_batch_changes(self):
+        self.inbox(line(key="PLAT-7"))
+        chief.tick(self.ws, {}, AT)
+        self.inbox(line(key="PLAT-8"))
+        self.assertIsNotNone(chief.tick(self.ws, {}, AT + timedelta(minutes=1))["wake"])
+
+    def test_tick_judge_capped_at_20(self):
+        self.inbox(*[line(key="PLAT-%d" % (100 + i)) for i in range(25)])
+        self.assertEqual(len(chief.tick(self.ws, {}, AT)["judge"]), 20)
+
+    def test_tick_reconciles_dead_run(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.update_worker(self.ws, "PLAT-2", status="working")
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r["reconciled"], ["PLAT-2"])
+        w = hub._sessions_doc(self.ws)["sessions"]["PLAT-2"]
+        self.assertEqual((w["status"], w["progress"]), ("failed", "run ended without a result"))
+
+    def test_tick_leaves_a_running_worker_alone(self):
+        w = chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.update_worker(self.ws, "PLAT-2", status="working")
+        lock = chief._try_lock(chief._lock_path(self.ws, w["name"]))
+        self.addCleanup(lock.close)
+        self.assertEqual(chief.tick(self.ws, {}, AT)["reconciled"], [])
+
+    def test_tick_dispatches_queued_idle_worker(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.register_worker(self.ws, AT, "PLAT-3", "t")
+        chief.register_worker(self.ws, AT, "PLAT-4", "t")
+        chief.register_worker(self.ws, AT, "PLAT-5", "t")
+        chief.update_worker(self.ws, "PLAT-4", held=True)
+        chief.update_worker(self.ws, "PLAT-5", status="failed")
+        for k in ("PLAT-2", "PLAT-3", "PLAT-4", "PLAT-5"):
+            chief.enqueue(self.ws, AT, k, "x", "say")
+        chief.update_worker(self.ws, "PLAT-5", status="failed")
+        with mock.patch.object(chief, "run", return_value=0) as run:
+            r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r["dispatched"], ["PLAT-2", "PLAT-3"])
+        self.assertEqual([c.args[3] for c in run.call_args_list], ["PLAT-2", "PLAT-3"])
+        self.assertTrue(all(c.kwargs == {"detach": True} for c in run.call_args_list))
+
+    def test_tick_dispatch_respects_max_workers(self):
+        for k in ("PLAT-2", "PLAT-3"):
+            chief.register_worker(self.ws, AT, k, "t")
+            chief.enqueue(self.ws, AT, k, "x", "say")
+        with mock.patch.object(chief, "run", return_value=0):
+            r = chief.tick(self.ws, {"chief": {"max_workers": 1}}, AT)
+        self.assertEqual(r["dispatched"], ["PLAT-2"])
+
+    def test_tick_paused_only_heartbeats(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.update_worker(self.ws, "PLAT-2", status="working")
+        self.inbox(line(key="PLAT-7"))
+        chief.pause(self.ws)
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r, {"paused": True, "decided": [], "wake": None, "judge": [], "dispatched": [],
+                             "reconciled": []})
+        hb = json.loads((chief.chief_dir(self.ws) / "heartbeat.json").read_text())
+        self.assertEqual(hb, {"at": hub._iso(AT), "pid": os.getpid()})
+        self.assertFalse((chief.chief_dir(self.ws) / "wake.json").exists())
+        self.assertEqual(hub._sessions_doc(self.ws)["sessions"]["PLAT-2"]["status"], "working")
 
 
 if __name__ == "__main__":
