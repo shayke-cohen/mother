@@ -338,7 +338,7 @@ def _exec(ws: Path, w: dict, key: str, prompt: str, first: bool, model: str, tim
         except OSError:
             pass
         p.communicate()
-        return "", 0.0, "timed out after %g min" % (timeout / 60.0)
+        return "", 0.0, "timed out after %g min" % round(timeout / 60.0, 2)
     result, cost, error = parse_stream(out)
     if p.returncode != 0 and error is None:
         error = (err or "").strip()[-300:] or "claude exited %d" % p.returncode
