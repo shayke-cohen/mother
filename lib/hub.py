@@ -2029,6 +2029,10 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
                 return 2
             also = [a for a in str(o.get("also") or "").split(",") if a]
             prev = items.get(key) or {}
+            if prev.get("kind") == "cli":
+                # a worker `mother chief` runs headless: the hub never repoints or refreshes it
+                print("mother hub session add: %s is a chief worker; use mother chief" % key, file=sys.stderr)
+                return 1
             was = next((p for p in h["pending"] if p.get("key") == key), None)
             raised = bool(was and was.get("raised_at"))
             if prev.get("state") == "live" and str(prev.get("session_id")) != str(o["id"]) and not raised:

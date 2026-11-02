@@ -118,6 +118,7 @@ export type HubSession = {
   opened_at?: string; last_routed_at?: string | null
   unseen?: number
   state: 'live' | 'dropped'
+  kind?: 'cli'            // a chief worker (`mother chief`); the hub and its panel leave it alone
 }
 
 export type HubSessions = { version: 1; sessions: Record<string, HubSession> }

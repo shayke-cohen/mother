@@ -51,8 +51,9 @@ const NO_HUB: HubBundle = { hub: null, sessions: null, watcher: null, watch: nul
 const WATCHER_DOWN_MS = 10 * 60_000
 const ROUTED_SHOWN = 10
 
+// A chief worker (kind 'cli') is the Chief pane's, not a hub session: it is never listed or counted here.
 export const liveSessions = (s: HubSessions | null | undefined): [string, HubSession][] =>
-  Object.entries(s?.sessions ?? {}).filter(([, v]) => v && v.state === 'live')
+  Object.entries(s?.sessions ?? {}).filter(([, v]) => v && v.state === 'live' && v.kind !== 'cli')
 
 // The sessions with an update the manager has not looked at, plus the cards waiting to be started.
 export const waitingCount = (h: HubBundle): number =>

@@ -4585,6 +4585,69 @@ def hub_gh_ok(prog, args):
     return True
 
 
+CHIEF_ROLE_ENV = "MOTHER_CHIEF_ROLE"
+CHIEF_RUN_VALUES = ("--title=", "--prompt=")
+
+
+def chief_session(ctx, payload):
+    """The call comes from the chief: MOTHER_CHIEF_ROLE is exactly `chief` in the hook's environment, the session
+    id is `session_id` in .mother/chief/chief.json (missing or unreadable: not the chief), the call is not a
+    sub-agent's (one carries its parent's session id), and neither .mother/PAUSED nor a dry run is on (both keep
+    today's rules). The role alone is not enough: a worker could set it."""
+    if os.environ.get(CHIEF_ROLE_ENV) != "chief" or not (ctx.ws and ctx.sid) or payload.get("agent_type") \
+            or paused(ctx) or os.environ.get(DRY_RUN_ENV, "").strip():
+        return False
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
+    want = doc.get("session_id") if ok and isinstance(doc, dict) else None
+    return isinstance(want, str) and bool(want) and want == ctx.sid
+
+
+def chief_command(cmd):
+    """True for exactly one `mother chief lines|status|run|say …` the chief may run: `mother`, this plugin's
+    bin/mother by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` of it. Read by the shell allow-list's lexer
+    (sl_lex): one stage, no newline, redirection or heredoc, and no `$` expansion, backtick, backslash, glob or
+    comment outside quotes, so a value may hold any other text quoted. The shapes:
+    `lines [--json]`, `status [--json]`, `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a value
+    in the same token) and `say <key> -- <text…>`."""
+    if "\n" in cmd or "\r" in cmd or hub_odd_chars(cmd):
+        return False
+    plugin = os.path.dirname(HERE)
+    try:
+        stages = sl_lex(cmd, plugin)
+    except Exception:
+        return False
+    if len(stages) != 1 or stages[0]["redirs"] or stages[0]["heredocs"] or stages[0].get("sep"):
+        return False
+    words = stages[0]["words"]
+    mine = os.path.realpath(os.path.join(plugin, "bin", "mother"))
+    if words[:1] in (["python3"], ["python"]):
+        words = words[1:]
+        if not (words and os.path.isabs(words[0]) and os.path.realpath(words[0]) == mine):
+            return False
+    elif not words or not (words[0] == "mother" or (os.path.isabs(words[0]) and os.path.realpath(words[0]) == mine)):
+        return False
+    args = words[1:]
+    if len(args) < 2 or args[0] != "chief":
+        return False
+    verb, rest = args[1], args[2:]
+    if verb in ("lines", "status"):
+        return rest in ([], ["--json"])
+    if not rest or not rest[0] or rest[0].startswith("-"):
+        return False
+    key, rest = rest[0], rest[1:]
+    if verb == "say":
+        return len(rest) >= 2 and rest[0] == "--"
+    if verb != "run":
+        return False
+    seen = set()
+    for a in rest:
+        flag = a if a == "--detach" else next((f for f in CHIEF_RUN_VALUES if a.startswith(f)), None)
+        if flag is None or flag in seen:
+            return False
+        seen.add(flag)
+    return True
+
+
 def hub_bad_field(v):
     """True when a nested input names a field that is, or ends in, url/uri/href/path/file/dest/destination."""
     if isinstance(v, dict):
@@ -4727,6 +4790,10 @@ def run(raw):
                 if r != "normal":
                     log(ctx, tool, {"kind": "hub-session", "category": "hub"}, r[0], r[1])
                     return r
+        # The chief (MOTHER_CHIEF_ROLE=chief and its id in .mother/chief/chief.json) runs its own `mother chief`
+        # verbs unasked, hub-fed or not; every other session, a hub-fed worker included, gets the rules below.
+        if tool == "Bash" and chief_session(ctx, payload) and chief_command(str(inp.get("command") or "")):
+            return None
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             # The channels loop's session: a plain `mother channels plan` that gets no decision, run as itself in the
