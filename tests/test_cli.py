@@ -875,6 +875,22 @@ class HubHelp(unittest.TestCase):
         self.assertIn("install", r.stdout)
 
 
+class ChiefCli(unittest.TestCase):
+    def test_chief_dispatch(self):
+        ws = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(ws), True)
+        shutil.copy(str(ROOT / "templates/workspace/config.example.json"), str(ws / "config.json"))
+        env = dict(os.environ, MOTHER_WORKSPACE=str(ws), MOTHER_NOW="2026-11-01T09:00:00Z")
+        env.pop("MOTHER_CHIEF_ROLE", None)
+        r = run(["chief", "status", "--json"], env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = json.loads(r.stdout)
+        self.assertEqual((doc["version"], doc["at"], doc["workers"]), (1, "2026-11-01T09:00:00Z", []))
+        r = run(["chief", "role"], dict(env, MOTHER_WORKSPACE=str(ws / "missing")))
+        self.assertEqual((r.returncode, r.stdout), (0, "console\n"), r.stderr)
+        self.assertEqual(run(["chief", "bogus"], env).returncode, 2)
+
+
 class TestWhatsappConfig(unittest.TestCase):
     # Reuse CliTest's fixtures without inheriting (and re-running) its tests.
     setUp, tearDown, init, write_config = CliTest.setUp, CliTest.tearDown, CliTest.init, CliTest.write_config
