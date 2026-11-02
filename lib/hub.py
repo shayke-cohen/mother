@@ -1625,6 +1625,9 @@ def status(ws: Path, at: datetime, out=None, cfg=None) -> int:
         if pace and isinstance(pace.get("every"), dict) and pace["every"]:
             print("    pacing: %s" % ", ".join("%s every %ss" % (n, e) for e, n in
                                              sorted(pace["every"].items(), key=lambda kv: int(kv[0]))), file=out)
+        if pace and pace.get("discovery"):
+            print("    discovery: %s%s" % ("search-first" if pace["discovery"] == "search" else "polling",
+                                         ", %s calls last pass" % pace["calls"] if "calls" in pace else ""), file=out)
     pres = w.get("presence") if isinstance(w.get("presence"), dict) else None
     if pres:
         print("presence: %s (%s)" % ("away" if pres.get("away") else "present", pres.get("why") or "-"), file=out)

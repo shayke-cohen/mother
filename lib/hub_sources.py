@@ -25,6 +25,7 @@ MAX_NEW_THREADS = 10  # unfollowed threads read per watched channel per pass
 MAIL_LINK = "https://mail.google.com/mail/u/0/#all/%s"
 THREAD_DAYS = 7
 SEARCH_OVERLAP = 600
+DM_BURST = 1800  # DM messages closer than this (and not in a thread) are one burst: one inbox line
 
 
 def iso(dt: datetime) -> str:
@@ -86,11 +87,16 @@ def _first(*vals):
 # hot: the manager posted or was mentioned there in the last `hot_mine_minutes`, anyone posted in the last
 # `hot_any_minutes`, or a live hub session follows it. warm: anyone posted in the last `warm_hours`. cold: the rest.
 # Away (see hub.presence), every tier is at least `away_seconds`. A DM is never slower than `dm_max_seconds`. The
-# self-DM inbox is read every pass. The mentions search runs on the hot tier (away: `away_seconds`) and catches
-# what a cold channel has not been read for yet.
+# self-DM inbox is read every pass. The mentions and DM search runs on the hot tier (away: `away_seconds`).
+# Discovery is search-first (`chat.discovery`, default "search"): while search works, mentions and DMs come only from
+# it, and history is read only for followed threads, `chat.poll` conversations (on the tiers above) and `chat.read_all`
+# ones (every `slow_seconds`). When the server refuses search (missing scope), every watched conversation is polled as
+# before, and search is retried every `search_retry_seconds`. A pass makes at most `max_calls` calls; what is left
+# waits for the next pass, most overdue first. A channel's 7-day lookback runs at most every `lookback_seconds`.
 PACING = {"hot_seconds": 120, "warm_seconds": 600, "cold_seconds": 2700, "dm_max_seconds": 600,
           "away_seconds": 900, "hot_mine_minutes": 120, "hot_any_minutes": 30, "warm_hours": 24,
-          "away_idle_minutes": 15, "away_quiet_minutes": 30, "backoff_seconds": 120, "outage_minutes": 30}
+          "away_idle_minutes": 15, "away_quiet_minutes": 30, "backoff_seconds": 120, "outage_minutes": 30,
+          "slow_seconds": 1800, "max_calls": 20, "lookback_seconds": 1800, "search_retry_seconds": 21600}
 MAX_BACKOFF = 1800
 _RATE = re.compile(r"\b429\b|ratelimited|rate[ _-]?limit", re.I)
 
@@ -129,8 +135,20 @@ class RateLimited(Exception):
         self.retry_after = retry_after
 
 
+class OutOfCalls(Exception):
+    """This pass has made `max_calls` calls: the rest waits for the next pass."""
+
+
 def is_rate_limited(e: Exception) -> bool:
     return bool(_RATE.search(str(getattr(e, "message", None) or e)))
+
+
+def refused(res) -> str:
+    """The `error` of a result the server answered with `ok: false` (Slack's own refusal, e.g. `missing_scope`,
+    returned as a successful tool call), else ""."""
+    if isinstance(res, dict) and res.get("ok") is False:
+        return str(res.get("error") or "error")
+    return ""
 
 
 class ChatSlack(Adapter):
@@ -172,13 +190,21 @@ class ChatSlack(Adapter):
         names = me.get("people") or {}
         tiers = {}  # type: Dict[str, int]
 
+        left = [p["max_calls"]]
+
         def call(name, args):
+            if left[0] <= 0:
+                raise OutOfCalls()
+            left[0] -= 1
             try:
-                return client.call(name, args)
+                res = client.call(name, args)
             except McpError as e:
                 if is_rate_limited(e):
                     raise RateLimited(getattr(e, "retry_after", None))
                 raise
+            if _RATE.search(refused(res)):
+                raise RateLimited(None)
+            return res
 
         def touch(conv, msg):
             """Record a message's time as the conversation's activity, and as the manager's when it is theirs or
@@ -196,15 +222,19 @@ class ChatSlack(Adapter):
             if mine and sender(msg) == mine:
                 me_at = max(me_at, ts)
 
-        def due(conv, dm=False):
-            """True when this conversation's tier says it is time to read it again."""
+        def overdue(conv, dm=False, slow=False):
+            """Seconds past this conversation's next read (>= 0: read it now), from its tier; `slow`: a `read_all`
+            conversation in search-first mode, read every `slow_seconds`."""
             c = convs.get(conv) or {}
             hot = conv in hot_keys or (conv in hot_chans if "/" not in conv else False)
-            every = tier_every(tier(c, now, p, hot), p, dm=dm, away=away)
+            if slow:
+                every = max(p["slow_seconds"], p["away_seconds"]) if away else p["slow_seconds"]
+            else:
+                every = tier_every(tier(c, now, p, hot), p, dm=dm, away=away)
             tiers[conv] = every
             if force or not c.get("read"):
-                return True  # never read on a tier (new, or the cursor predates tiers): read it now
-            return now - float(c["read"]) >= every - 5  # a pass that runs a few seconds early counts
+                return 1e9  # never read on a tier (new, or the cursor predates tiers): read it now
+            return now - float(c["read"]) - (every - 5)  # a pass that runs a few seconds early counts
 
         def named(raw):  # `Name <U…>` for a person in config, else the raw id
             return "%s <%s>" % (names[raw], raw) if names.get(raw) else raw
@@ -230,9 +260,12 @@ class ChatSlack(Adapter):
             # a DM conversation is one thing: the manager's reply resolves it
             key = hub.thing_key("chat", {"channel": ch, "ts": "dm" if dm else ts, "thread_ts": None if dm else tts})
             text = msg.get("text") or ""
+            if dm:  # grouped into bursts at the end of the pass
+                bursts.setdefault(key, []).append({"ts": ts, "mine": bool(mine and raw == mine), "who": who,
+                                                   "text": text, "link": link})
+                return
             if mine and raw == mine:
-                if not dm:
-                    threads.setdefault(key, float(ts))
+                threads.setdefault(key, float(ts))
                 lines.append(hub.make_line("chat", "resolved", key, ts_iso(ts), title=text[:80], who=who,
                                            link=link, summary=text, uid=ts))
                 return
@@ -274,35 +307,42 @@ class ChatSlack(Adapter):
                 add(ch, m, floor=mark, dm=dm)
             # Replies in threads nobody follows: a parent with replies newer than the last read (less the search
             # overlap). History lists parents by their own time, so an older parent needs a lookback read.
-            heads = {m["ts"]: m for m in got if m.get("ts")}
-            back = []
-            try:
-                back = (call("get_channel_history", {
-                    "channel_id": ch, "oldest": "%.6f" % (now - THREAD_DAYS * 86400),
-                    "latest": "%.6f" % mark, "limit": MAX_HISTORY + 1}) or {}).get("messages") or []
-            except McpError as e:
-                partial.append("%s: lookback %s" % (ch, e.kind))
-            if len(back) > MAX_HISTORY:  # a busy channel fills it every pass: a note, not a failure
-                notes.append("%s: lookback truncated" % ch)
-                back = back[:MAX_HISTORY]
-            for m in back:
-                if m.get("ts"):
-                    touch(ch, m)  # older history seeds the tier of a conversation read for the first time
-                    heads.setdefault(m["ts"], m)
+            heads = {m["ts"]: (m, mark) for m in got if m.get("ts")}
+            # The lookback finds replies in older threads; it runs at most every `lookback_seconds` and covers
+            # replies since its own last run (`back`), so skipping it delays a reply, never drops it.
+            c = convs.setdefault(ch, {})
+            back_mark = float(c.get("back") or mark)
+            if force or not c.get("back") or now - back_mark >= p["lookback_seconds"] - 5:
+                back = None
+                try:
+                    back = (call("get_channel_history", {
+                        "channel_id": ch, "oldest": "%.6f" % (now - THREAD_DAYS * 86400),
+                        "latest": "%.6f" % mark, "limit": MAX_HISTORY + 1}) or {}).get("messages") or []
+                except McpError as e:
+                    partial.append("%s: lookback %s" % (ch, e.kind))
+                if back is not None:
+                    if len(back) > MAX_HISTORY:  # a busy channel fills it every pass: a note, not a failure
+                        notes.append("%s: lookback truncated" % ch)
+                        back = back[:MAX_HISTORY]
+                    for m in back:
+                        if m.get("ts"):
+                            touch(ch, m)  # older history seeds the tier of a conversation read for the first time
+                            heads.setdefault(m["ts"], (m, back_mark))
+                    c["back_next"] = now
             active = []
-            for tts, m in heads.items():
+            for tts, (m, floor) in heads.items():
                 try:
                     newest, n = float(m.get("latest_reply") or 0), int(m.get("reply_count") or 0)
                 except (TypeError, ValueError):
                     continue
                 if newest:
                     touch(ch, {"ts": newest})  # a reply in a thread is activity in the channel
-                if n > 0 and newest > mark - SEARCH_OVERLAP and "%s/%s" % (ch, tts) not in threads:
-                    active.append((newest, tts))
+                if n > 0 and newest > floor - SEARCH_OVERLAP and "%s/%s" % (ch, tts) not in threads:
+                    active.append((newest, tts, floor))
             active.sort(reverse=True)
             if len(active) > MAX_NEW_THREADS:
                 partial.append("more than %d active threads in %s" % (MAX_NEW_THREADS, ch))
-            for _, tts in active[:MAX_NEW_THREADS]:
+            for _, tts, floor in active[:MAX_NEW_THREADS]:
                 try:
                     res = call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
                 except McpError:
@@ -310,11 +350,21 @@ class ChatSlack(Adapter):
                     continue
                 for m in (res or {}).get("messages") or []:
                     if m.get("ts") != tts:
-                        add(ch, dict(m, thread_ts=tts), floor=mark - SEARCH_OVERLAP, dm=dm)
-            convs.setdefault(ch, {})["read"] = now
+                        add(ch, dict(m, thread_ts=tts), floor=floor - SEARCH_OVERLAP, dm=dm)
+            if c.pop("back_next", None):
+                c["back"] = now
+            c["read"] = now
 
         search_ts = float(cursor.get("search_ts") or since)
         searched = False
+        off = dict(cursor.get("search_off") or {})  # the server refused search for good (missing scope)
+        if off and now - float(off.get("at") or 0) >= p["search_retry_seconds"] - 5:
+            off = {}  # time to try again: the scope may have been granted
+        discovery = "poll" if cfg.get("discovery") == "poll" else "search"
+        poll_all = set(cfg.get("poll") or [])
+        slow_all = set(cfg.get("read_all") or [])
+        deferred = []
+        bursts = {}  # type: Dict[str, List[dict]]
         try:
             if inbox:  # the manager's self-DM, first and every pass: each note of theirs is a `manual` line
                 try:
@@ -327,15 +377,42 @@ class ChatSlack(Adapter):
                         note(inbox, m)
                 except McpError as e:
                     partial.append("inbox %s: history %s" % (inbox, e.kind))
-            for ch in dms:  # DMs with people in config (`mother hub dms set`); a DM that fails is partial
-                if due(ch, dm=True):
+
+            # Search indexes late and `after` is exclusive by day: look back a day, overlap 10 minutes, dedupe by
+            # ts. It runs on the hot tier and reaches back to the last search that fully worked, so a failed or
+            # skipped search delays a mention, never drops it.
+            if mine and not off and (force or now - search_ts >= tier_every("hot", p, away=away) - 5):
+                floor = search_ts - SEARCH_OVERLAP
+                day = (datetime.fromtimestamp(search_ts, UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+                ok = True
+                for label, text in (("mentions", "<@%s>" % mine), ("DMs", "is:dm")):
+                    res = None
                     try:
-                        read(ch, dm=True)
+                        res = call("search-messages", {"searchText": text, "after": day}) or {}
+                        why = refused(res)
                     except McpError as e:
-                        partial.append("%s: history %s" % (ch, e.kind))
-            for ch in cfg.get("channels") or []:
-                if due(ch):
-                    read(ch)
+                        low = str(getattr(e, "message", e)).lower()
+                        scope = e.kind == "missing_scope" or re.search(r"missing[_ ]scope|insufficient scope", low)
+                        why = "missing_scope" if scope else e.kind
+                    if why:
+                        ok = False
+                        if why == "missing_scope":
+                            needed = res.get("needed") if isinstance(res, dict) else ""
+                            off = {"at": now, "why": "missing scope%s" % (" (%s)" % needed if needed else "")}
+                            partial.append("%s: %s" % (label, off["why"]))
+                            break  # the other query has the same token: don't spend a call on it
+                        partial.append("%s: %s" % (label, why))
+                        continue
+                    box = res.get("messages", res)
+                    for m in (box.get("matches") if isinstance(box, dict) else None) or []:
+                        ch = (m.get("channel") or {}).get("id") or m.get("channel_id") or ""
+                        if not ch:
+                            continue
+                        add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs" or ch in dms))
+                searched = ok
+            elif off:
+                partial.append("search off: %s, polling every watched conversation" % off.get("why", "refused"))
+            search_first = discovery == "search" and bool(mine) and not off
 
             for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
                 if "/" not in key:
@@ -346,9 +423,13 @@ class ChatSlack(Adapter):
                     continue
                 c = convs.setdefault(key, {})
                 c["act"] = max(float(c.get("act") or 0), float(tseen))
-                if not due(key):
+                if overdue(key) < 0:
                     continue
-                res = call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                try:
+                    res = call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+                except OutOfCalls:
+                    deferred.append(key)
+                    continue
                 for m in (res or {}).get("messages") or []:
                     if m.get("ts") == tts:
                         continue
@@ -358,29 +439,29 @@ class ChatSlack(Adapter):
                         threads[key] = max(float(threads[key]), float(m["ts"]))
                 c["read"] = now
 
-            # Search indexes late and `after` is exclusive by day: look back a day, overlap 10 minutes, dedupe by
-            # ts. It runs on the hot tier and reaches back to the last search, so a cold channel's mention is not
-            # left for its next read.
-            if force or now - search_ts >= tier_every("hot", p, away=away) - 5:
-                floor = search_ts - SEARCH_OVERLAP
-                day = (datetime.fromtimestamp(search_ts, UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
-                for label, text in (("mentions", "<@%s>" % mine), ("DMs", "is:dm")):
-                    if label == "mentions" and not mine:
-                        continue
-                    try:
-                        res = call("search-messages", {"searchText": text, "after": day}) or {}
-                    except McpError as e:
-                        low = str(getattr(e, "message", e)).lower()
-                        scope = e.kind == "missing_scope" or re.search(r"missing[_ ]scope|insufficient scope", low)
-                        partial.append("%s: %s" % (label, "missing scope" if scope else e.kind))
-                        continue
-                    box = res.get("messages", res)
-                    for m in (box.get("matches") if isinstance(box, dict) else None) or []:
-                        ch = (m.get("channel") or {}).get("id") or m.get("channel_id") or ""
-                        if not ch:
-                            continue
-                        add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs"))
-                searched = True
+            # DMs with people in config (`mother hub dms set`) and watched channels. Search-first, only `poll`
+            # and `read_all` ones are read; most overdue first, while the pass has calls left.
+            todo = []
+            for ch in list(dms) + [c for c in cfg.get("channels") or [] if c not in dms]:
+                if search_first and ch not in poll_all and ch not in slow_all:
+                    tiers.pop(ch, None)
+                    continue
+                late = overdue(ch, dm=ch in dms, slow=search_first and ch in slow_all and ch not in poll_all)
+                if late >= 0:
+                    todo.append((-late, ch))
+            todo.sort()
+            for _, ch in todo:
+                if left[0] < 2:  # history and maybe a lookback: don't start a read that cannot finish
+                    deferred.append(ch)
+                    continue
+                try:
+                    read(ch, dm=ch in dms)
+                except OutOfCalls:
+                    deferred.append(ch)
+                except McpError as e:
+                    if ch not in dms:
+                        raise
+                    partial.append("%s: history %s" % (ch, e.kind))  # a DM that fails is partial
             limited = {}  # a whole pass without a 429
         except RateLimited as e:
             # Skip the rest of the pass. What was read keeps its read time; the rest is read next pass. One
@@ -393,6 +474,12 @@ class ChatSlack(Adapter):
                                                    "%ds and reading less often until it stops" % wait))
             limited = {"first": limited.get("first", now), "last": now, "until": now + wait, "n": n}
             partial.append("rate limited (429): backing off %ds" % wait)
+        except OutOfCalls:
+            pass  # a search or the inbox ran out of calls: the rest is read next pass
+        lines.extend(dm_lines(bursts))
+        if deferred:  # expected under the budget, not a failure
+            notes.append("call budget (%d) reached: %d conversation(s) wait for the next pass"
+                         % (p["max_calls"], len(deferred)))
         keep = dict(list(threads.items())[-MAX_THREADS:])
         live = set(cfg.get("channels") or []) | set(dms) | set(keep)
         out = {"ts": "%.6f" % now, "threads": keep, "seen": seen[-300:], "followed": followed,
@@ -402,15 +489,53 @@ class ChatSlack(Adapter):
             out["me_at"] = "%.6f" % me_at
         if limited:
             out["limited"] = limited
+        if off:
+            out["search_off"] = off
         res = _result(lines, out, partial, notes)
         counts = {}  # type: Dict[str, int]
         for every in tiers.values():
             counts[str(every)] = counts.get(str(every), 0) + 1
-        res["pacing"] = {"away": away, "every": counts}  # conversations per interval, for `mother hub status`
+        res["pacing"] = {"away": away, "every": counts,  # conversations per interval, for `mother hub status`
+                         "discovery": "search" if discovery == "search" and mine and not off else "poll",
+                         "calls": p["max_calls"] - left[0]}
         return res
 
 
 # --------------------------------------------------------------------------------------------------- mail
+def dm_lines(bursts: Dict[str, List[dict]]) -> List[dict]:
+    """One line per DM burst: messages in one DM less than `DM_BURST` apart. The summary keeps the newest texts
+    (oldest first), the title the first one; the burst is `resolved` (`who`: the manager) when the manager wrote
+    last, else an `update` from the first other person in it."""
+    out = []
+    for key, msgs in bursts.items():
+        msgs = sorted(msgs, key=lambda m: float(m["ts"]))
+        groups = [[msgs[0]]]
+        for m in msgs[1:]:
+            if float(m["ts"]) - float(groups[-1][-1]["ts"]) < DM_BURST:
+                groups[-1].append(m)
+            else:
+                groups.append([m])
+        for g in groups:
+            last = g[-1]
+            texts, size = [], 0
+            for m in reversed(g):  # newest first until the summary is full
+                if texts and size + len(m["text"]) + 1 > hub.SUMMARY_MAX:
+                    break
+                texts.insert(0, m["text"])
+                size += len(m["text"]) + 1
+            summary = "\n".join(texts)
+            others = [m for m in g if not m["mine"]]
+            who = (last if last["mine"] or not others else others[0])["who"]  # resolved: the manager answered
+            also = []
+            for m in g:
+                also += [a for a in hub.extract_also(m["text"]) if a not in also]
+            kind = "resolved" if last["mine"] else "update"
+            out.append(hub.make_line("chat", kind, key, ts_iso(last["ts"]), title=g[0]["text"][:80], who=who,
+                                     link=last["link"], summary=summary, also=[] if last["mine"] else also,
+                                     uid=last["ts"]))
+    return out
+
+
 def _header(msg: dict, name: str) -> str:
     for h in (msg.get("payload") or {}).get("headers") or []:
         if (h.get("name") or "").lower() == name.lower():

@@ -179,7 +179,7 @@ class TestPacing(unittest.TestCase):
 
     def poll(self, cursor, at, **cfg):
         client, f = self.client()
-        base = {"channels": [self.CH], "dms": {"U00000002": self.DM}, "inbox": self.INBOX}
+        base = {"channels": [self.CH], "dms": {"U00000002": self.DM}, "inbox": self.INBOX, "discovery": "poll"}
         base.update(cfg)
         return hs.ChatSlack.poll(client, cursor, base, ME, at), f
 
@@ -219,7 +219,8 @@ class TestPacing(unittest.TestCase):
         out, f = self.poll(out["cursor"], AT + timedelta(minutes=2))  # quiet channel: cold; quiet DM: 10 min
         self.assertEqual(self.read(f), [self.INBOX])
         self.assertTrue(self.searched(f))  # the mentions search is the catch-all, on the hot tier
-        self.assertEqual(out["pacing"], {"away": False, "every": {"600": 1, "2700": 1}})
+        self.assertEqual(out["pacing"], {"away": False, "every": {"600": 1, "2700": 1},
+                                         "discovery": "poll", "calls": 3})
         out, f = self.poll(out["cursor"], AT + timedelta(minutes=10))
         self.assertEqual(sorted(self.read(f)), sorted([self.DM, self.INBOX]))
         out, f = self.poll(out["cursor"], AT + timedelta(minutes=46))
@@ -334,6 +335,204 @@ class TestPacing(unittest.TestCase):
         self.assertEqual(cm.exception.retry_after, 33)
 
 
+# Recorded from the chat gateway (2026-11-01): Slack refuses search with `ok: false` inside a successful tool result.
+NO_SEARCH = {"ok": False, "error": "missing_scope", "needed": "search:read",
+             "provided": "identify,channels:history,im:history,mpim:history,channels:read,groups:read,im:read,"
+                         "mpim:read,reactions:read,users:read,users.profile:read,chat:write"}
+# Recorded shape of a `search-messages` hit (ids and text invented).
+def hit(ts, ch, user="U00000005", text="ping <@U00000000>", **kw):
+    d = {"type": "message", "ts": "%.6f" % ts, "user": user, "text": text,
+         "channel": {"id": ch, "is_im": ch.startswith("D")},
+         "permalink": "https://example.slack.com/archives/%s/p%d" % (ch, int(ts * 1e6))}
+    d.update(kw)
+    return d
+
+
+class TestSearchFirst(unittest.TestCase):
+    """Search-first discovery, the per-pass call budget, the lookback cadence and DM bursts."""
+    CH, CH2, DM = "C00000001", "C00000002", "D00000002"
+
+    def setUp(self):
+        self.history = {}
+        self.search = {}  # searchText -> matches, or a whole result (e.g. NO_SEARCH)
+        self.replies = {}
+
+    def client(self):
+        def hist(a):
+            got = [m for m in self.history.get(a["channel_id"], [])
+                   if float(m["ts"]) > float(a.get("oldest", 0)) and float(m["ts"]) <= float(a.get("latest", 1e18))]
+            return {"ok": True, "messages": sorted(got, key=lambda m: float(m["ts"]))}
+
+        def srch(a):
+            got = self.search.get(a["searchText"], [])
+            return got if isinstance(got, dict) else {"ok": True, "messages": {"matches": got}}
+        return ro({"get_channel_history": hist, "get_thread_replies": lambda a: {
+            "ok": True, "messages": self.replies.get(a["thread_ts"], [])}, "search-messages": srch},
+            hs.ChatSlack.READ_TOOLS)
+
+    def poll(self, cursor=None, at=AT, **cfg):
+        client, f = self.client()
+        base = {"channels": [self.CH, self.CH2], "dms": {"U00000002": self.DM}}
+        base.update(cfg)
+        cur = cursor or {"ts": "%.6f" % (at.timestamp() - 600), "threads": {}}
+        return hs.ChatSlack.poll(client, cur, base, ME, at), f
+
+    @staticmethod
+    def calls(f, tool):
+        return [a for n, a in f.calls if n.endswith(tool)]
+
+    def read(self, f):
+        return sorted(a["channel_id"] for a in self.calls(f, "get_channel_history") if "latest" not in a)
+
+    def test_search_works_so_channels_and_dms_are_not_read(self):
+        self.history = {self.CH: [msg(NOW - 100, text="chatter")], self.DM: [msg(NOW - 90, user="U00000002")]}
+        self.search = {"<@U00000000>": [hit(NOW - 60, "C00000077")],
+                       "is:dm": [hit(NOW - 50, self.DM, user="U00000002", text="can we talk?")]}
+        out, f = self.poll()
+        self.assertEqual(self.read(f), [])  # no history read at all
+        self.assertEqual(sorted(l["key"] for l in out["lines"]),
+                         ["C00000077/%.6f" % (NOW - 60), self.DM + "/dm"])
+        self.assertEqual(out["pacing"]["discovery"], "search")
+        self.assertEqual(out["pacing"]["calls"], 2)
+        self.assertEqual(out["partial"], [])
+
+    def test_refused_search_is_partial_turns_off_and_falls_back_to_polling_in_the_same_pass(self):
+        self.history = {self.CH: [msg(NOW - 100, text="chatter")]}
+        self.search = {"<@U00000000>": NO_SEARCH, "is:dm": NO_SEARCH}
+        out, f = self.poll()
+        self.assertEqual(out["partial"], ["mentions: missing scope (search:read)"])
+        self.assertEqual(len(self.calls(f, "search-messages")), 1)  # the DM query would be refused the same way
+        self.assertEqual(self.read(f), [self.CH, self.CH2, self.DM])  # polled like before
+        self.assertEqual([l["key"] for l in out["lines"]], ["%s/%.6f" % (self.CH, NOW - 100)])
+        self.assertEqual(out["pacing"]["discovery"], "poll")
+        self.assertEqual(out["cursor"]["search_off"]["at"], NOW)
+        self.assertEqual(out["cursor"]["search_ts"], "%.6f" % (NOW - 600))  # not searched: not advanced
+
+    def test_search_off_is_retried_after_search_retry_seconds(self):
+        self.search = {"<@U00000000>": NO_SEARCH}
+        out, _ = self.poll()
+        later = AT + timedelta(hours=1)
+        again, f = self.poll(cursor=out["cursor"], at=later)
+        self.assertEqual(self.calls(f, "search-messages"), [])  # still off: no call spent on it
+        self.assertIn("search off: missing scope (search:read), polling every watched conversation",
+                      again["partial"])
+        self.search = {}  # the scope was granted
+        much_later = AT + timedelta(hours=6)
+        back, f = self.poll(cursor=again["cursor"], at=much_later)
+        self.assertEqual(len(self.calls(f, "search-messages")), 2)
+        self.assertNotIn("search_off", back["cursor"])
+        self.assertEqual(back["pacing"]["discovery"], "search")
+
+    def test_failed_search_does_not_advance_search_ts(self):
+        self.search = {"is:dm": {"ok": False, "error": "internal_error"}}
+        out, _ = self.poll()
+        self.assertIn("DMs: internal_error", out["partial"])
+        self.assertEqual(out["cursor"]["search_ts"], "%.6f" % (NOW - 600))
+        self.assertNotIn("search_off", out["cursor"])  # a passing failure, not a refusal
+
+    def test_refused_with_ratelimited_is_a_429(self):
+        self.search = {"<@U00000000>": {"ok": False, "error": "ratelimited"}}
+        out, _ = self.poll()
+        self.assertEqual([l["title"] for l in out["lines"]], ["chat source rate limited"])
+        self.assertIn("limited", out["cursor"])
+
+    def test_read_all_channel_is_read_on_the_slow_tier_and_poll_on_the_old_tiers(self):
+        self.history = {self.CH: [msg(NOW - 100, text="busy")], self.CH2: [msg(NOW - 100, text="busy too")]}
+        out, f = self.poll(read_all=[self.CH], poll=[self.CH2])
+        self.assertEqual(self.read(f), [self.CH, self.CH2])  # first read of both
+        self.assertEqual(out["pacing"]["every"], {"1800": 1, "2700": 1})  # CH on the slow tier; CH2 not read yet
+        cur = out["cursor"]
+        for mins, want in ((10, [self.CH2]), (31, [self.CH, self.CH2])):
+            nxt, f = self.poll(cursor=cur, at=AT + timedelta(minutes=mins), read_all=[self.CH], poll=[self.CH2])
+            self.assertEqual(self.read(f), want, mins)
+
+    def test_discovery_poll_reads_everything_even_when_search_works(self):
+        out, f = self.poll(discovery="poll")
+        self.assertEqual(self.read(f), [self.CH, self.CH2, self.DM])
+        self.assertEqual(len(self.calls(f, "search-messages")), 2)
+        self.assertEqual(out["pacing"]["discovery"], "poll")
+
+    def test_call_budget_defers_the_rest_most_overdue_first(self):
+        self.search = {"<@U00000000>": NO_SEARCH}
+        chans = ["C%08d" % i for i in range(1, 9)]
+        convs = {c: {"read": NOW - 3600 - 60 * i, "act": NOW - 3 * 86400} for i, c in enumerate(chans)}
+        convs[self.DM] = {"read": NOW - 60, "act": NOW - 60}  # read a minute ago: not due
+        cur = {"ts": "%.6f" % (NOW - 600), "threads": {}, "convs": convs}
+        out, f = self.poll(cursor=cur, channels=chans, _pacing={"max_calls": 7})
+        self.assertEqual(len(f.calls), 7)  # one refused search + three reads of history and lookback
+        self.assertEqual(self.read(f), sorted(chans[-3:]))  # the three read longest ago
+        self.assertIn("call budget (7) reached: 5 conversation(s) wait for the next pass", out["notes"])
+        self.assertEqual(out["partial"], ["mentions: missing scope (search:read)"])  # deferral is not a failure
+        nxt, f = self.poll(cursor=out["cursor"], at=AT + timedelta(minutes=2), channels=chans,
+                           _pacing={"max_calls": 7})
+        self.assertEqual(self.read(f), sorted(chans[2:5]))  # the next three, no call spent on search
+
+    def test_a_read_that_runs_out_of_calls_is_retried_whole_next_pass(self):
+        heads = [msg(NOW - 200 - i, reply_count=1, latest_reply="%.6f" % (NOW - 50)) for i in range(3)]
+        self.history = {self.CH: heads}
+        out, f = self.poll(discovery="poll", channels=[self.CH], dms={}, _pacing={"max_calls": 5})
+        # 2 searches, history, lookback, then one of three thread reads: the budget is spent mid-read
+        self.assertEqual(len(f.calls), 5)
+        self.assertNotIn("read", out["cursor"]["convs"].get(self.CH, {}))  # not marked read: read again next pass
+        self.assertIn("call budget (5) reached: 1 conversation(s) wait for the next pass", out["notes"])
+
+    def test_lookback_runs_on_its_own_cadence_and_its_replies_are_not_lost(self):
+        parent = NOW - 3600  # older than the first read's floor: only the lookback sees it; warm (600 s)
+        self.history = {self.CH: [msg(parent, reply_count=1, latest_reply="%.6f" % parent)]}
+        out, f = self.poll(discovery="poll", channels=[self.CH], dms={})
+        self.assertEqual(len([a for a in self.calls(f, "get_channel_history") if "latest" in a]), 1)
+        cur = out["cursor"]
+        # a reply lands 5 minutes later in the old thread; the lookback is not due for 30 minutes
+        reply_at = NOW + 300
+        self.history[self.CH] = [msg(parent, reply_count=2, latest_reply="%.6f" % reply_at)]
+        self.replies = {"%.6f" % parent: [msg(parent), msg(reply_at, text="late reply", thread_ts="%.6f" % parent)]}
+        at = AT
+        for mins in (10, 20):
+            at = AT + timedelta(minutes=mins)
+            nxt, f = self.poll(cursor=cur, at=at, discovery="poll", channels=[self.CH], dms={})
+            self.assertEqual(self.read(f), [self.CH], mins)  # read on its tier...
+            self.assertEqual([a for a in self.calls(f, "get_channel_history") if "latest" in a], [], mins)  # no lookback
+            self.assertEqual(nxt["lines"], [])
+            cur = nxt["cursor"]
+        nxt, f = self.poll(cursor=cur, at=AT + timedelta(minutes=31), discovery="poll", channels=[self.CH], dms={})
+        self.assertEqual(len([a for a in self.calls(f, "get_channel_history") if "latest" in a]), 1)
+        self.assertEqual([l["summary"] for l in nxt["lines"]], ["late reply"])
+
+    def test_dm_burst_is_one_line_with_every_message(self):
+        self.search = {"is:dm": [hit(NOW - 400, self.DM, user="U00000002", text="hey"),
+                                 hit(NOW - 300, self.DM, user="U00000002", text="are you around?"),
+                                 hit(NOW - 100, self.DM, user="U00000002", text="it is about PLAT-9")]}
+        out, _ = self.poll()
+        (line,) = out["lines"]
+        self.assertEqual((line["key"], line["kind"], line["who"]), (self.DM + "/dm", "update", "U00000002"))
+        self.assertEqual(line["summary"], "hey\nare you around?\nit is about PLAT-9")
+        self.assertEqual(line["title"], "hey")
+        self.assertEqual(line["also"], ["PLAT-9"])
+        self.assertEqual(line["id"], "chat:%s/dm:%.6f" % (self.DM, NOW - 100))  # the newest message's ts
+
+    def test_dm_burst_split_by_a_gap_and_answered_by_the_manager(self):
+        # 40 minutes apart: two bursts; one key, so the newer one is the line the pass keeps
+        self.search = {"is:dm": [hit(NOW - 3000, self.DM, user="U00000002", text="old question"),
+                                 hit(NOW - 500, self.DM, user="U00000002", text="new question"),
+                                 hit(NOW - 400, self.DM, user="U00000000", text="answered")]}
+        cur = {"ts": "%.6f" % (NOW - 600), "threads": {}, "search_ts": "%.6f" % (NOW - 3600)}
+        out, _ = self.poll(cursor=cur)
+        self.assertEqual([(l["kind"], l["summary"], l["who"]) for l in out["lines"]],
+                         [("resolved", "new question\nanswered", "U00000000")])
+        bursts = hs.dm_lines({"D1/dm": [{"ts": "%.6f" % t, "mine": False, "who": "U2", "text": x, "link": ""}
+                                        for t, x in ((NOW - 3000, "a"), (NOW - 500, "b"))]})
+        self.assertEqual([l["summary"] for l in bursts], ["a", "b"])
+
+    def test_dm_burst_summary_keeps_the_newest_text(self):
+        long = ["%d %s" % (i, "x" * 120) for i in range(4)]
+        self.search = {"is:dm": [hit(NOW - 500 + i, self.DM, user="U00000002", text=t) for i, t in enumerate(long)]}
+        out, _ = self.poll()
+        (line,) = out["lines"]
+        self.assertTrue(line["summary"].endswith(long[-1]))
+        self.assertTrue(line["summary"].startswith(long[-2]))
+        self.assertEqual(line["title"], long[0][:80])
+
+
 class TestAdapterShape(unittest.TestCase):
     def test_every_adapter_read_tools_are_reads(self):
         self.assertEqual(set(hs.ADAPTERS), {"chat:slack", "mail:gmail", "tracker:jira", "calendar:google",
@@ -389,7 +588,9 @@ class TestChat(unittest.TestCase):
 
         client, f = ro({"get_channel_history": hist, "get_thread_replies": rep, "search-messages": srch},
                        hs.ChatSlack.READ_TOOLS)
-        return hs.ChatSlack.poll(client, cur, cfg or {"channels": ["C00000001"]}, ME, AT), f
+        cfg = dict(cfg or {"channels": ["C00000001"]})
+        cfg.setdefault("discovery", "poll")  # these tests read history; search-first has its own class
+        return hs.ChatSlack.poll(client, cur, cfg, ME, AT), f
 
     def test_chat_prefilter(self):
         search = {"<@U00000000>": [{"ts": "%.6f" % (NOW - 60), "user": "U00000005", "text": "ping PLAT-12 pls",
@@ -527,7 +728,7 @@ class TestChat(unittest.TestCase):
         out, _ = self.poll(history={"C00000001": [msg(NOW - 100)]},
                            search=hub_mcp.McpError("missing_scope", "search:read"))
         self.assertEqual(len(out["lines"]), 1)
-        self.assertEqual(len(out["partial"]), 2)
+        self.assertEqual(out["partial"], ["mentions: missing scope"])  # the DM query has the same token: not sent
 
     def test_two_messages_in_one_second_keep_distinct_ids(self):
         out, _ = self.poll(history={"C00000001": [msg(NOW - 100.5, text="a", thread_ts="%.6f" % (NOW - 900)),
@@ -552,8 +753,8 @@ class TestChat(unittest.TestCase):
         client, _ = ro({"get_channel_history": lambda a: {"messages": [signed, bot, human]},
                         "get_thread_replies": lambda a: {"messages": []},
                         "search-messages": lambda a: {"messages": {"matches": []}}}, hs.ChatSlack.READ_TOOLS)
-        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, {"channels": ["C00000001"]},
-                                me, AT)
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}},
+                                {"channels": ["C00000001"], "discovery": "poll"}, me, AT)
         self.assertEqual([(l["kind"], l["summary"]) for l in out["lines"]], [("update", "what did Agnes (AI) mean?")])
 
     def test_summary_is_trimmed(self):
@@ -597,7 +798,8 @@ class TestChat(unittest.TestCase):
         self.assertEqual([(l["key"], l["summary"]) for l in out["lines"]], [("D00000001/dm", "and?")])
 
     def test_mapped_dm_cap_and_failure_are_partial(self):
-        cfg = {"channels": ["C00000001"], "dms": {"U00000001": "D00000001", "U00000002": "D00000002"}}
+        cfg = {"channels": ["C00000001"], "dms": {"U00000001": "D00000001", "U00000002": "D00000002"},
+               "discovery": "poll"}
         page = [msg(NOW - 500 + i, user="U00000001") for i in range(101)]
         out, _ = self.poll(history={"D00000001": page}, cfg=cfg)
         self.assertTrue(any("D00000001: more than 100" in p for p in out["partial"]), out["partial"])
@@ -662,7 +864,7 @@ class TestChat(unittest.TestCase):
 
     def test_who_names_people_from_config_and_keeps_raw_ids_for_checks(self):
         me = dict(ME, people={"U00000001": "Agnes", "U00000000": "Dana"})
-        cfg = {"channels": ["C00000001"], "dms": {"U00000001": "D00000001"}}
+        cfg = {"channels": ["C00000001"], "dms": {"U00000001": "D00000001"}, "discovery": "poll"}
         hist = {"C00000001": [msg(NOW - 100, user="U00000001", text="hi"),
                               msg(NOW - 95, user="", user_id="U00000005", text="via user_id"),
                               msg(NOW - 90, user="", username="deploybot", text="deployed"),
@@ -1009,7 +1211,7 @@ class TestTracker(unittest.TestCase):
         client, _ = ro({"get_channel_history": lambda a: {"messages": []}, "get_thread_replies": lambda a: {},
                         "search-messages": search}, hs.ChatSlack.READ_TOOLS)
         out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, {"channels": []}, ME, AT)
-        self.assertEqual(out["partial"], ["mentions: missing scope", "DMs: missing scope"])
+        self.assertEqual(out["partial"], ["mentions: missing scope"])
 
     BASE = {"status": "To Do", "assignee": "acc1", "priority": "Medium", "comments": 0}
 
