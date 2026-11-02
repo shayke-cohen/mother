@@ -494,6 +494,15 @@ def grants_path(ctx):
     return _cf(os.path.join(ctx.ws, ".mother", "grants.json")) if ctx.ws else None
 
 
+def chief_dir_path(fp, ctx):
+    """A real path inside <ws>/.mother/chief/ (casefolded): chief.json is half of the chief's identity
+    (chief_session), so only `mother chief` writes there, never a tool call unasked."""
+    if not ctx.ws:
+        return False
+    d = os.path.realpath(os.path.join(ctx.ws, ".mother", "chief")).casefold()
+    return inside(fp.casefold(), d)
+
+
 def home_settings_path(fp):
     """~/.claude/settings.json, ~/.claude/settings.local.json, ~/.claude.json, or anything under ~/.claude/plugins/."""
     home = os.path.realpath(os.path.expanduser("~")).casefold()
@@ -3347,6 +3356,9 @@ def classify(tool, inp, cwd, ctx):
                 return act("home_settings", "home_settings", "an edit to a session transcript: " + fp)
             if fp.casefold() == grants_path(ctx):
                 return act("grants", "grants_file", "an edit to .mother/grants.json")
+            if chief_dir_path(fp, ctx):
+                return act("grants", "grants_file", "an edit to .mother/chief/ (chief.json names the chief; only "
+                                                    "`mother chief` writes there): " + fp)
             if persona_path(fp, ctx):
                 return act("persona", "persona_files", "an edit to the workspace's standing instructions: " + fp)
         return None
@@ -4604,11 +4616,11 @@ def chief_session(ctx, payload):
 
 def chief_command(cmd):
     """True for exactly one `mother chief lines|status|run|say …` the chief may run: `mother`, this plugin's
-    bin/mother by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` of it. Read by the shell allow-list's lexer
+    bin/mother by its own path (not a symlink to it) or `${CLAUDE_PLUGIN_ROOT}`, or `python3` of it. Read by the shell allow-list's lexer
     (sl_lex): one stage, no newline, redirection or heredoc, and no `$` expansion, backtick, backslash, glob or
     comment outside quotes, so a value may hold any other text quoted. The shapes:
-    `lines [--json]`, `status [--json]`, `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a value
-    in the same token) and `say <key> -- <text…>`."""
+    `lines [--json]`, `status [--json]`, `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a
+    non-empty value in the same token) and `say <key> -- <text…>`."""
     if "\n" in cmd or "\r" in cmd or hub_odd_chars(cmd):
         return False
     plugin = os.path.dirname(HERE)
@@ -4619,12 +4631,16 @@ def chief_command(cmd):
     if len(stages) != 1 or stages[0]["redirs"] or stages[0]["heredocs"] or stages[0].get("sep"):
         return False
     words = stages[0]["words"]
-    mine = os.path.realpath(os.path.join(plugin, "bin", "mother"))
-    if words[:1] in (["python3"], ["python"]):
+    mine = os.path.join(plugin, "bin", "mother")
+
+    def is_mine(p):  # the path as written, not through a symlink a session could repoint after this check
+        return os.path.isabs(p) and os.path.abspath(p) == mine and os.path.realpath(p) == os.path.realpath(mine)
+
+    if words[:1] == ["python3"]:
         words = words[1:]
-        if not (words and os.path.isabs(words[0]) and os.path.realpath(words[0]) == mine):
+        if not (words and is_mine(words[0])):
             return False
-    elif not words or not (words[0] == "mother" or (os.path.isabs(words[0]) and os.path.realpath(words[0]) == mine)):
+    elif not words or not (words[0] == "mother" or is_mine(words[0])):
         return False
     args = words[1:]
     if len(args) < 2 or args[0] != "chief":
@@ -4641,7 +4657,7 @@ def chief_command(cmd):
         return False
     seen = set()
     for a in rest:
-        flag = a if a == "--detach" else next((f for f in CHIEF_RUN_VALUES if a.startswith(f)), None)
+        flag = a if a == "--detach" else next((f for f in CHIEF_RUN_VALUES if a.startswith(f) and a != f), None)
         if flag is None or flag in seen:
             return False
         seen.add(flag)

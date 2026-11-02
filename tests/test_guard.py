@@ -3363,8 +3363,41 @@ class ChiefAllowance(GuardCase):
                     "mother chief status --all", "mother chief lines --json --json",
                     "mother chief say PLAT-1 hello", "mother chief say PLAT-1 --", "mother chief say -- hi",
                     "X=1 mother chief status", "env mother chief status", "command mother chief status",
-                    "/tmp/bin/mother chief status", "python3 /tmp/mother chief status", "nohup mother chief status"):
+                    "/tmp/bin/mother chief status", "python3 /tmp/mother chief status", "nohup mother chief status",
+                    # fix round 1: Python 2 `python`, and an empty value, are not forms the routine spells
+                    "python %s chief status" % os.path.join(ROOT, "bin", "mother"),
+                    "mother chief run PLAT-1 --title= --prompt=x", "mother chief run PLAT-1 --prompt="):
             self.call("ask", cmd)
+
+    def test_chief_bin_by_symlink_asks(self):
+        """Fix round 1: a symlink to bin/mother resolves to it, but the session could repoint it after the check."""
+        link = os.path.join(self.tmp, "lnk")
+        os.symlink(os.path.join(ROOT, "bin", "mother"), link)
+        os.makedirs(os.path.join(self.tmp, "d"))
+        for prog in (link, os.path.join(self.tmp, "d", "..", "lnk"), "python3 " + link):
+            self.call("ask", prog + " chief status")
+
+    def test_tool_writes_to_the_chief_dir_ask(self):
+        """Fix round 1: chief.json is half of the chief's identity, so no tool call may rewrite it unasked: only
+        `mother chief` (Python, not a tool call) writes .mother/chief/. Bypass included, and the chief itself too."""
+        d = os.path.join(self.ws, ".mother", "chief")
+        forged = json.dumps({"session_id": self.WORKER})
+        calls = [("Write", {"file_path": os.path.join(d, "chief.json"), "content": forged}),
+                 ("Edit", {"file_path": os.path.join(d, "chief.json"), "old_string": self.CHIEF,
+                           "new_string": self.WORKER}),
+                 ("MultiEdit", {"file_path": os.path.join(d, "chief.json"),
+                                "edits": [{"old_string": self.CHIEF, "new_string": self.WORKER}]}),
+                 ("NotebookEdit", {"notebook_path": os.path.join(d, "x.ipynb"), "new_source": "x"}),
+                 ("Write", {"file_path": os.path.join(d, "heartbeat.json"), "content": "{}"}),
+                 ("Write", {"file_path": os.path.join(d, "PAUSED"), "content": ""}),
+                 ("Write", {"file_path": os.path.join(self.ws, ".mother", "Chief", "chief.json"), "content": forged}),
+                 ("Write", {"file_path": os.path.join(self.ws, "notes", "..", ".mother", "chief", "chief.json"),
+                            "content": forged})]
+        for tool, inp in calls:
+            for session, env in ((self.WORKER, {}), (self.WORKER, self.ENV), ("fresh-2222", {}), (self.CHIEF, self.ENV)):
+                for mode in ("default", self.BY):
+                    self.expect("ask", tool, inp, session=session, env=env, mode=mode, cwd=self.ws)
+        self.call("ask", "echo '%s' > .mother/chief/chief.json" % forged, session=self.WORKER, env={})
 
 
 if __name__ == "__main__":
