@@ -133,11 +133,13 @@ HUB_KEYS = {"enabled", "every_seconds", "idle_every_seconds", "model", "max_card
 HUB_PACING = {"hot_seconds": (30, 3600), "warm_seconds": (60, 7200), "cold_seconds": (300, 14400),
               "dm_max_seconds": (60, 3600), "away_seconds": (120, 7200), "hot_mine_minutes": (1, 1440),
               "hot_any_minutes": (1, 1440), "warm_hours": (1, 168), "away_idle_minutes": (1, 240),
-              "away_quiet_minutes": (1, 240), "backoff_seconds": (10, 1800), "outage_minutes": (1, 240)}
+              "away_quiet_minutes": (1, 240), "backoff_seconds": (10, 1800), "outage_minutes": (1, 240),
+              "slow_seconds": (300, 14400), "max_calls": (4, 200), "lookback_seconds": (120, 14400),
+              "search_retry_seconds": (600, 86400)}
 HUB_CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
 HUB_CONN_KEYS = {"command", "args", "env", "cli", "local"}
 HUB_WATCH_INTERVALS = {"every_seconds", "idle_every_seconds"}
-HUB_WATCH_KEYS = {"chat": {"channels"} | HUB_WATCH_INTERVALS,
+HUB_WATCH_KEYS = {"chat": {"channels", "discovery", "read_all", "poll"} | HUB_WATCH_INTERVALS,
                   "mail": {"ignore_senders", "ignore_labels"} | HUB_WATCH_INTERVALS,
                   "tracker": {"projects", "extra_jql"} | HUB_WATCH_INTERVALS,
                   "calendar": {"lead_minutes"} | HUB_WATCH_INTERVALS, "code": {"repos"} | HUB_WATCH_INTERVALS,
@@ -447,6 +449,9 @@ def validate_hub(h) -> list:
             elif k == "extra_jql":
                 if v is not None and not isinstance(v, str):
                     errs.append(f"{where}.{k} must be a string or null")
+            elif k == "discovery":
+                if v not in ("search", "poll"):
+                    errs.append(f'{where}.{k} must be "search" or "poll"')
             elif not str_list(v):
                 errs.append(f"{where}.{k} must be a list of strings")
     return errs
