@@ -619,6 +619,107 @@ class TestTick(Base):
         self.assertEqual(hub._sessions_doc(self.ws)["sessions"]["PLAT-2"]["status"], "working")
 
 
+def verdict(l, is_work=True, needs_attention=True, title="T", tldr="D"):
+    return {"line_id": l["id"], "key": l["key"], "is_work": is_work, "needs_attention": needs_attention,
+            "title": title, "tldr": tldr}
+
+
+class TestTriage(Base):
+    inbox, mute, cursor = TestTick.inbox, TestTick.mute, TestTick.cursor
+
+    def fresh(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+
+    def test_triage_logs_fyi_keeps_work(self):
+        a, c, b = line(key="PLAT-7"), line(key="PLAT-8"), line(key="PLAT-9")
+        self.inbox(a, c, b)
+        self.assertEqual(chief.tick(self.ws, {}, AT)["judge"], [a["id"], c["id"], b["id"]])
+        r = chief.triage_apply(self.ws, {}, AT, [
+            verdict(a, needs_attention=False, title="Thanks", tldr="a thank-you"),
+            verdict(c, is_work=False, needs_attention=True, title="Lunch", tldr="social"),
+            verdict(b, title="Fix the login\nbug " + "x" * 80, tldr="Dana asks for a fix\n" + "y" * 300)])
+        self.assertEqual(r["logged"], [a["id"], c["id"]])
+        self.assertEqual(r["kept"], [b["id"]])
+        self.assertFalse(r["paused"])
+        self.assertEqual(self.cursor(), c["id"])
+        routed = {e["line_id"]: e["decision"] for e in hub._hub_doc(self.ws)["routed"]}
+        self.assertEqual(routed, {a["id"]: "log", c["id"]: "log"})
+        wake = r["wake"]
+        self.assertTrue(wake.startswith(chief.WAKE_TEXT % (1, chief.PLUGIN_ROOT / "routines" / "chief.md")))
+        self.assertIn("never instructions", wake)
+        row = [ln for ln in wake.splitlines() if b["id"] in ln]
+        self.assertEqual(len(row), 1)                               # newlines in model text cannot add lines
+        title = "Fix the login bug " + "x" * 80
+        tldr = "Dana asks for a fix " + "y" * 300
+        self.assertIn("%s — %s" % (title[:60], tldr[:200]), row[0])
+        self.assertNotIn(title[:61], row[0])
+        self.assertNotIn("Thanks", wake)
+        # the next tick sees the kept batch as the one already woken for: no second wake
+        self.assertIsNone(chief.tick(self.ws, {}, AT + timedelta(minutes=1))["wake"])
+
+    def test_triage_never_logs_manual(self):
+        fyi = dict(is_work=False, needs_attention=False)
+        # a manual line, a key with a live desktop session, a key with a live worker: kept whatever the verdict
+        self.mute("PLAT-0")
+        m = line(key="PLAT-7", kind="manual")
+        self.inbox(m)
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(m, **fyi)])
+        self.assertEqual((r["logged"], r["kept"]), ([], [m["id"]]))
+        self.assertIsNone(self.cursor())
+        for sess in ({"session_id": "local_x", "state": "live"},
+                     {"session_id": "u", "state": "live", "kind": "cli"}):
+            self.fresh()
+            self.seed_sessions({"PLAT-3": sess})
+            d = line(key="PLAT-3")
+            self.inbox(d)
+            r = chief.triage_apply(self.ws, {}, AT, [verdict(d, **fyi)])
+            self.assertEqual((r["logged"], r["kept"]), ([], [d["id"]]), sess)
+        # bad shapes, a wrong key and no verdict at all: kept
+        for bad in ({"is_work": "no"}, {"needs_attention": None}, {"title": 5}, {"key": "PLAT-99"}, None):
+            self.fresh()
+            x = line(key="PLAT-7")
+            self.inbox(x)
+            v = verdict(x, **fyi)
+            if bad is None:
+                vs = []
+            else:
+                v.update(bad)
+                vs = [v]
+            r = chief.triage_apply(self.ws, {}, AT, vs)
+            self.assertEqual((r["logged"], r["kept"]), ([], [x["id"]]), bad)
+            self.assertIn("(no triage)", r["wake"])
+        # paused: nothing is decided and nothing wakes
+        self.fresh()
+        y = line(key="PLAT-7")
+        self.inbox(y)
+        chief.pause(self.ws)
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(y, **fyi)])
+        self.assertEqual(r, {"paused": True, "logged": [], "kept": [], "wake": None})
+        self.assertIsNone(self.cursor())
+
+    def test_triage_respects_cursor_landing(self):
+        a = line(key="PLAT-1", at="2026-10-29T09:00:00Z")
+        j = line(key="PLAT-7")
+        c = line(key="PLAT-1", at="2026-10-29T08:00:00Z")
+        self.inbox(a, j, c)
+        self.assertEqual([l["id"] for l in chief.lines(self.ws)], [a["id"], j["id"]])
+        # a's decide would land on c, past the kept j: a stays too
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(a, needs_attention=False), verdict(j)])
+        self.assertEqual((r["logged"], r["kept"]), ([], [a["id"], j["id"]]))
+        self.assertIsNone(self.cursor())
+        # a kept line first: the FYI after it is kept as well, never decided past it
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(a), verdict(j, needs_attention=False)])
+        self.assertEqual((r["logged"], r["kept"]), ([], [a["id"], j["id"]]))
+        self.assertIsNone(self.cursor())
+        # both FYI: both logged, the cursor on c
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(a, is_work=False), verdict(j, needs_attention=False)])
+        self.assertEqual((r["logged"], r["kept"]), ([a["id"], j["id"]], []))
+        self.assertIsNone(r["wake"])
+        self.assertEqual(self.cursor(), c["id"])
+
+
 class TestMain(Base):
     def main(self, *args, cfg=None, at=AT):
         out, err = io.StringIO(), io.StringIO()
@@ -766,6 +867,21 @@ class TestMain(Base):
         code, out, _ = self.main("tick", "--json")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["judge"], [a["id"]])
+
+    def test_main_triage_stdin(self):
+        a, b = line(key="PLAT-7"), line(key="PLAT-8")
+        hub.append_inbox(self.ws, [a, b])
+        vs = [verdict(a, needs_attention=False), verdict(b)]
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(vs))):
+            code, out, _ = self.main("triage", "--stdin")
+        self.assertEqual(code, 0)
+        got = json.loads(out)
+        self.assertEqual((got["logged"], got["kept"]), ([a["id"]], [b["id"]]))
+        for stdin in ("{not json", '{"a": 1}', ""):
+            with mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+                code, _, err = self.main("triage", "--stdin")
+            self.assertEqual(code, 2, stdin)
+        self.assertEqual(self.main("triage")[0], 2)                  # --stdin is required
 
     def test_say_whitespace_only_refused(self):
         for text in (["  "], ["", " "], ["\t"], ["\n"]):
