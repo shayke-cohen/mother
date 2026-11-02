@@ -2597,6 +2597,24 @@ class Presence(unittest.TestCase):
 REAL_PRESENCE = hub.presence
 
 
+class TestPump(unittest.TestCase):
+    def test_closed_stdout_ends_like_eof(self):
+        import queue
+        import hub_mcp
+
+        class Closed:
+            def __iter__(self):
+                yield '{"id": 1}\n'
+                raise ValueError("I/O operation on closed file.")
+
+        class P:
+            stdout = Closed()
+        q = queue.Queue()
+        hub_mcp.Client._pump(P(), q)  # raised before: a traceback per close() in watcher.log
+        self.assertEqual(q.get_nowait(), {"id": 1})
+        self.assertIsNone(q.get_nowait())
+
+
 def setUpModule():  # the watcher's away check reads this Mac (ioreg, transcripts): present, unless a test says so
     hub.presence = lambda *a, **k: {"away": False, "why": "test"}
 
