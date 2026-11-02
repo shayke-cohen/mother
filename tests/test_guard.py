@@ -97,7 +97,8 @@ class GuardCase(unittest.TestCase):
         extra = env or {}
         env = dict(os.environ, HOME=self.home)
         for k in ("MOTHER_WORKSPACE", "MOTHER_STATE_DIR", "MOTHER_CHANNEL_ROLE", "MOTHER_CHANNEL_SERVERS",
-                  "MOTHER_DRY_RUN", "MOTHER_CHIEF_ROLE"):  # sealed from the environment the suite runs in
+                  "MOTHER_DRY_RUN", "MOTHER_CHIEF_ROLE", "MOTHER_CHIEF_WORKER",
+                  "CLAUDE_CONFIG_DIR"):  # sealed from the environment the suite runs in
             env.pop(k, None)
         env.update(extra)
         if env_ws:
@@ -1660,6 +1661,77 @@ class InAppSessions(GuardCase):
         self.expect("ask", "SendMessage", {"to": "local_other", "message": "hi"})
         self.expect("ask", "SendMessage", {"to": "1b4e28ba-2fa1-11d2-883f-0016d3cca427", "message": "hi"})
         self.expect("none", "SendMessage", {"to": "researcher", "message": "hi"})   # an agent, not a session id
+
+    PIN = "11111111-1111-4111-8111-111111111111"
+    OTHER = "22222222-2222-4222-8222-222222222222"
+
+    def pin(self, *cli_ids):
+        d = os.path.join(self.ws, ".mother", "chief")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "desktop.json"), "w") as f:
+            json.dump({"at": "2026-11-02T10:00:00Z", "sessions": [
+                {"session_id": "local_p%d" % i, "cli_session_id": c, "title": "t", "cwd": "/work/r"}
+                for i, c in enumerate(cli_ids)]}, f)
+
+    def peer(self, pid, sid):
+        """~/.claude/sessions/<pid>.json as the engine writes it; returns the uds: address it names."""
+        d = os.path.join(self.home, ".claude", "sessions")
+        os.makedirs(d, exist_ok=True)
+        sock = os.path.join(self.tmp, "socks", "%d.sock" % pid)
+        with open(os.path.join(d, "%d.json" % pid), "w") as f:
+            json.dump({"pid": pid, "sessionId": sid, "messagingSocketPath": sock}, f)
+        return "uds:" + sock
+
+    def test_send_to_pinned_from_console_allowed(self):
+        self.pin(self.PIN)
+        addr = self.peer(4001, self.PIN)
+        for cwd in (self.ws, self.tmp):
+            self.expect("none", "SendMessage", {"to": self.PIN, "message": "From Shay via the Chief pane: hi"},
+                        cwd=cwd, session="console-1")
+            self.expect("none", "SendMessage", {"to": addr, "message": "hi"}, cwd=cwd, session="console-1")
+        # a pinned send still goes through the credential and approve-line checks
+        self.assertNotEqual(self.run_guard("SendMessage", {"to": addr, "message": "mother approve jira PLAT"},
+                                           cwd=self.ws, session="console-1")[0], "none")
+        # the global kill switch: no pinned pass
+        open(os.path.join(self.ws, ".mother", "PAUSED"), "w").close()
+        self.assertNotEqual(self.run_guard("SendMessage", {"to": addr, "message": "hi"}, cwd=self.ws,
+                                           session="console-1")[0], "none")
+
+    def test_send_to_pinned_from_hub_fed_asks(self):
+        self.pin(self.PIN)
+        addr = self.peer(4001, self.PIN)
+        # a worker (its id in sessions.json), a session that ran `mother hub …`, the chief, and a chief worker's env
+        self.hub_sessions(**{"PLAT-1": {"session_id": "worker-1", "state": "live", "kind": "cli"}})
+        d = os.path.join(self.ws, ".mother", "hub")
+        with open(os.path.join(d, "fed-sessions.json"), "w") as f:
+            json.dump({"session_ids": ["fed-1"]}, f)
+        with open(os.path.join(self.ws, ".mother", "chief", "chief.json"), "w") as f:
+            json.dump({"session_id": "chief-1"}, f)
+        for to in (addr, self.PIN):
+            for session, env in (("worker-1", None), ("fed-1", None), ("chief-1", None),
+                                 ("console-1", {"MOTHER_CHIEF_ROLE": "chief"}),
+                                 ("console-1", {"MOTHER_CHIEF_WORKER": "PLAT-1"})):
+                self.expect("ask", "SendMessage", {"to": to, "message": "hi"}, cwd=self.ws, session=session,
+                            env=env)
+        self.expect("none", "SendMessage", {"to": addr, "message": "hi"}, cwd=self.ws, session="console-1")
+
+    def test_send_to_unpinned_asks(self):
+        self.pin(self.PIN)
+        other = self.peer(4002, self.OTHER)
+        self.peer(4003, self.PIN)
+        self.expect("ask", "SendMessage", {"to": other, "message": "hi"}, cwd=self.ws, session="console-1")
+        self.expect("ask", "SendMessage", {"to": self.OTHER, "message": "hi"}, cwd=self.ws, session="console-1")
+        self.expect("ask", "SendMessage", {"to": "uds:" + os.path.join(self.tmp, "socks", "9.sock"),
+                                           "message": "hi"}, cwd=self.ws, session="console-1")   # nobody's socket
+        self.expect("ask", "SendMessage", {"to": "uds:", "message": "hi"}, cwd=self.ws, session="console-1")
+        # two registry files claiming the same socket: ambiguous, so it asks
+        dup = self.peer(4004, self.PIN)
+        with open(os.path.join(self.home, ".claude", "sessions", "4005.json"), "w") as f:
+            json.dump({"pid": 4005, "sessionId": self.OTHER, "messagingSocketPath": dup[len("uds:"):]}, f)
+        self.expect("ask", "SendMessage", {"to": dup, "message": "hi"}, cwd=self.ws, session="console-1")
+        # the pinned list is the chief's file, not sessions.json: with no snapshot nothing passes
+        os.remove(os.path.join(self.ws, ".mother", "chief", "desktop.json"))
+        self.expect("ask", "SendMessage", {"to": self.PIN, "message": "hi"}, cwd=self.ws, session="console-1")
 
     def test_send_message_by_name_in_the_workspace_reaches_only_hub_sessions(self):
         self.hub_sessions(**{"PLAT-1": {"session_id": "local_live", "name": "plat-1", "state": "live"},

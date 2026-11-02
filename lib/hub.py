@@ -1666,6 +1666,7 @@ def hub_lagging(w: dict, h: dict, at: datetime) -> bool:
 # ------------------------------------------------------------------------------------------- hub verbs
 ROUTED_MAX = 50
 ALSO_MAX = 50
+WHY_MAX = 200
 DECISIONS = ("log", "now", "route", "propose", "error")
 
 
@@ -1898,6 +1899,8 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
             res = {"line_id": it["line_id"], "key": key, "decision": dec}
             also = list(it.get("also") or line.get("also") or [])
             entry = {"line_id": it["line_id"], "key": key, "decision": dec, "at": stamp}
+            if isinstance(it.get("why"), str) and it["why"].strip():
+                entry["why"] = " ".join(it["why"].split())[:WHY_MAX]  # the audit trail of why it was decided so
             if dec in ("route", "now"):
                 hit = find_session(sess, [key] + also)
                 if hit and dec == "now":

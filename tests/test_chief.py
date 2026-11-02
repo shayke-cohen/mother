@@ -713,11 +713,140 @@ class TestTriage(Base):
         r = chief.triage_apply(self.ws, {}, AT, [verdict(a), verdict(j, needs_attention=False)])
         self.assertEqual((r["logged"], r["kept"]), ([], [a["id"], j["id"]]))
         self.assertIsNone(self.cursor())
-        # both FYI: both logged, the cursor on c
+        # both FYI: a is still kept, because its decide would also fold c (a line its verdict never saw)
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(a, is_work=False), verdict(j, needs_attention=False)])
+        self.assertEqual((r["logged"], r["kept"]), ([], [a["id"], j["id"]]))
+        self.assertIsNone(self.cursor())
+
+    def test_triage_logs_fyi_updates_that_fold_nothing(self):
+        a, j = line(key="PLAT-1"), line(key="PLAT-7")
+        self.inbox(a, j)
         r = chief.triage_apply(self.ws, {}, AT, [verdict(a, is_work=False), verdict(j, needs_attention=False)])
         self.assertEqual((r["logged"], r["kept"]), ([a["id"], j["id"]], []))
         self.assertIsNone(r["wake"])
-        self.assertEqual(self.cursor(), c["id"])
+        self.assertEqual(self.cursor(), j["id"])
+
+    def test_triage_keeps_update_that_folds_older_same_key(self):
+        old = line(key="PLAT-1", at="2026-10-29T08:00:00Z", summary="real work: fix the build")
+        new = line(key="PLAT-1", at="2026-10-29T09:00:00Z", summary="thanks!")
+        self.inbox(old, new)
+        self.assertEqual([l["id"] for l in chief.lines(self.ws)], [new["id"]])   # the digest shows only new
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(new, needs_attention=False)])
+        self.assertEqual((r["logged"], r["kept"]), ([], [new["id"]]))
+        self.assertIsNone(self.cursor())
+
+    def test_triage_never_logs_error_lines(self):
+        e = line(key="PLAT-7", kind="error", title="source failed")
+        self.inbox(e)
+        r = chief.triage_apply(self.ws, {}, AT, [verdict(e, is_work=False, needs_attention=False)])
+        self.assertEqual((r["logged"], r["kept"]), ([], [e["id"]]))
+        self.assertIsNone(self.cursor())
+
+    def test_triage_log_records_the_title_as_why(self):
+        a = line(key="PLAT-7")
+        self.inbox(a)
+        chief.triage_apply(self.ws, {}, AT, [verdict(a, needs_attention=False, title="Thanks\nfrom Dana " + "x" * 90)])
+        entry = hub._hub_doc(self.ws)["routed"][-1]
+        self.assertEqual((entry["line_id"], entry["decision"]), (a["id"], "log"))
+        self.assertEqual(entry["why"], "triage: " + ("Thanks from Dana " + "x" * 90)[:60])
+
+
+CLI_A, CLI_B, CLI_C = ("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222",
+                       "33333333-3333-4333-8333-333333333333")
+
+
+def row(sid, pinned=True, **kw):
+    d = {"sessionId": sid, "title": "Title " + sid[-1], "cwd": "/work/repo-" + sid[-1], "isArchived": False,
+         "link": "claude://example/" + sid}
+    if pinned is not None:
+        d["pinned"] = pinned
+    d.update(kw)
+    return d
+
+
+class TestPinned(Base):
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app = Path(tmp.name)
+
+    def session_file(self, sid, cli, nested=True, **kw):
+        d = self.app / "acct-0" / "org-0" if nested else self.app
+        d.mkdir(parents=True, exist_ok=True)
+        doc = {"sessionId": sid, "cliSessionId": cli, "cwd": "/work/repo", "isArchived": False,
+               "lastActivityAt": 1793620800000, "title": "file title"}
+        doc.update(kw)
+        (d / (sid + ".json")).write_text(json.dumps(doc))
+
+    def snapshot(self):
+        return json.loads((chief.chief_dir(self.ws) / "desktop.json").read_text())
+
+    def test_pinned_snapshot_keeps_pinned_only(self):
+        for sid, cli in (("local_a", CLI_A), ("local_b", CLI_B), ("local_c", CLI_C)):
+            self.session_file(sid, cli)
+        n = chief.pinned_snapshot(self.ws, AT, [row("local_a"), row("local_b", pinned=False),
+                                                row("local_c", pinned=None), "junk", {"pinned": True}],
+                                  app_dir=self.app)
+        self.assertEqual(n, 1)
+        doc = self.snapshot()
+        self.assertEqual(doc["at"], hub._iso(AT))
+        self.assertEqual(doc["sessions"], [{"session_id": "local_a", "cli_session_id": CLI_A, "title": "Title a",
+                                            "cwd": "/work/repo-a", "link": "claude://example/local_a"}])
+        # a later snapshot replaces the earlier one whole
+        self.assertEqual(chief.pinned_snapshot(self.ws, AT, [], app_dir=self.app), 0)
+        self.assertEqual(self.snapshot()["sessions"], [])
+
+    def test_pinned_snapshot_reads_cli_id_and_drops_archived(self):
+        self.session_file("local_a", CLI_A)
+        self.session_file("local_b", CLI_B, nested=False)
+        self.session_file("local_c", CLI_C, isArchived=True)
+        self.session_file("local_d", "not a uuid")
+        self.session_file("local_e", CLI_A)            # the row says archived
+        rows = [row("local_a"), row("local_b"), row("local_c"), row("local_d"), row("local_e", isArchived=True),
+                row("local_missing"), row("../local_a"), row("local_a/../x")]
+        self.assertEqual(chief.pinned_snapshot(self.ws, AT, rows, app_dir=self.app), 2)
+        self.assertEqual([(s["session_id"], s["cli_session_id"]) for s in self.snapshot()["sessions"]],
+                         [("local_a", CLI_A), ("local_b", CLI_B)])
+        # a row's own cli id field is never trusted: the id comes from the app's file
+        self.assertEqual(chief.pinned_snapshot(self.ws, AT, [row("local_a", cliSessionId=CLI_C)], app_dir=self.app), 1)
+        self.assertEqual(self.snapshot()["sessions"][0]["cli_session_id"], CLI_A)
+
+    def test_desktop_status_fields(self):
+        self.session_file("local_a", CLI_A, lastTurnReport="Merged the fix. " + "r" * 300,
+                          lastActivityAt=1793620800000)
+        self.session_file("local_b", CLI_B)
+        chief.pinned_snapshot(self.ws, AT, [row("local_a", cwd="/work/example-api", title="Fix the login bug"),
+                                            row("local_b", link=None)], app_dir=self.app)
+        got = chief.desktop_status(self.ws, self.app)
+        self.assertEqual(got[0], {
+            "session_id": "local_a", "cli_session_id": CLI_A, "title": "Fix the login bug", "cwd": "/work/example-api",
+            "repo": "example-api", "last_activity_at": "2026-11-02T12:00:00Z",
+            "last_report": ("Merged the fix. " + "r" * 300)[:200], "open_link": "claude://example/local_a"})
+        self.assertEqual((got[1]["last_report"], got[1]["open_link"]), ("", None))
+        # a session archived since the snapshot drops out
+        self.session_file("local_b", CLI_B, isArchived=True)
+        self.assertEqual([d["session_id"] for d in chief.desktop_status(self.ws, self.app)], ["local_a"])
+        # no snapshot, no rows; and status_doc carries them
+        self.assertEqual(chief.desktop_status(Path(self._tmp.name) / "nope", self.app), [])
+        with mock.patch.object(chief, "default_app_dir", return_value=self.app):
+            self.assertEqual([d["session_id"] for d in chief.status_doc(self.ws, {}, AT)["desktop"]], ["local_a"])
+
+    def test_cli_pinned_reads_rows_on_stdin(self):
+        self.session_file("local_a", CLI_A)
+        for stdin, code in ((json.dumps([row("local_a"), row("local_b", pinned=False)]), 0), ("{bad", 2),
+                            (json.dumps({"rows": []}), 2)):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(chief, "default_app_dir", return_value=self.app), \
+                    mock.patch("sys.stdin", io.StringIO(stdin)), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                got = chief.main(["pinned", "--stdin"], self.ws, {}, AT)
+            self.assertEqual(got, code, (stdin, err.getvalue()))
+            if code == 0:
+                self.assertEqual(json.loads(out.getvalue()), {"pinned": 1})
+        self.assertEqual(len(self.snapshot()["sessions"]), 1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(chief.main(["pinned"], self.ws, {}, AT), 2)          # --stdin is required
 
 
 class TestMain(Base):
@@ -731,7 +860,8 @@ class TestMain(Base):
         code, out, _ = self.main("status", "--json")
         self.assertEqual(code, 0)
         doc = json.loads(out)
-        self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "workers"})
+        self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "workers", "desktop"})
+        self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
         self.assertEqual(doc["at"], hub._iso(AT))
         self.assertIs(doc["paused"], False)

@@ -2117,6 +2117,63 @@ def in_workspace(cwd, ctx):
     return inside(here, os.path.realpath(ctx.ws))
 
 
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def pinned_cli_ids(ctx):
+    """The CLI session ids of the pinned desktop sessions the console snapshotted (.mother/chief/desktop.json)."""
+    if not ctx.ws:
+        return set()
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "desktop.json"))
+    rows = doc.get("sessions") if ok and isinstance(doc, dict) else None
+    return {str(r["cli_session_id"]) for r in (rows if isinstance(rows, list) else [])
+            if isinstance(r, dict) and isinstance(r.get("cli_session_id"), str) and UUID_RE.match(r["cli_session_id"])}
+
+
+def socket_session_id(sock):
+    """The session id behind a peer socket: the ~/.claude/sessions/<pid>.json whose messagingSocketPath is `sock`
+    (compared on real paths); None when none matches or it is ambiguous."""
+    root = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"),
+                        "sessions")
+    if not sock.startswith("/"):
+        return None
+    want = os.path.realpath(sock)
+    found = set()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        doc, ok = read_json(os.path.join(root, n))
+        if not (ok and isinstance(doc, dict)):
+            continue
+        path, sid = doc.get("messagingSocketPath"), doc.get("sessionId")
+        if isinstance(path, str) and path and isinstance(sid, str) and os.path.realpath(path) == want:
+            found.add(sid)
+    return found.pop() if len(found) == 1 else None
+
+
+def pinned_send_ok(target, ctx):
+    """A SendMessage to a pinned desktop session (its CLI id, or the `uds:<socket>` the engine spells it as) from a
+    session that is not hub-fed and not the chief: the Chief pane's chat, typed by the manager. The chief, its
+    workers and every hub-fed session still ask, and so does everything while .mother/PAUSED is on."""
+    if not (target and ctx.ws and ctx.sid) or hub_fed(ctx) or paused(ctx):
+        return False
+    if os.environ.get(CHIEF_ROLE_ENV) == "chief" or os.environ.get("MOTHER_CHIEF_WORKER"):
+        return False
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
+    if ok and isinstance(doc, dict) and doc.get("session_id") == ctx.sid:
+        return False
+    pinned = pinned_cli_ids(ctx)
+    if not pinned:
+        return False
+    if target.startswith("uds:"):
+        target = socket_session_id(target[len("uds:"):]) or ""
+    return target in pinned
+
+
 def session_target(tool, inp, ctx, cwd=None):
     """A message into a session passes only when that session is one the hub routes to (a `live` entry in
     sessions.json); anything else could carry untrusted source text into an unrelated session, so it asks. In the
@@ -2130,6 +2187,8 @@ def session_target(tool, inp, ctx, cwd=None):
             what = "a message into session %s, which is not a live hub session" % (target or "(none named)")
     elif tool == "SendMessage":
         target = str(inp.get("to") or "").strip()
+        if pinned_send_ok(target, ctx):
+            return None
         if SESSION_ID_RE.match(target):
             if target not in live_hub_sessions(ctx):
                 what = "a message into session %s, which is not a live hub session" % target

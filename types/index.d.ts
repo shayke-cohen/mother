@@ -153,6 +153,18 @@ export type ChiefWorker = {
   resume: string          // `claude --resume <session_id>`
 }
 
+// A pinned desktop session (lib/chief.py desktop_status), from the snapshot the desktop console writes.
+export type ChiefDesktop = {
+  session_id: string                 // local_…
+  cli_session_id: string             // what $.session.send reaches it by
+  title: string
+  cwd: string
+  repo: string                       // the cwd's basename
+  last_activity_at: string | null
+  last_report: string                // the first 200 characters of its last turn report
+  open_link: string | null
+}
+
 export type ChiefStatus = {
   version: 1
   at: string
@@ -160,6 +172,7 @@ export type ChiefStatus = {
   chief: { alive: boolean; heartbeat_at: string | null; session_id: string | null }
   budget: { spent: number; limit: number }   // spent reads 0.0 when spend.json is unreadable
   workers: ChiefWorker[]
+  desktop?: ChiefDesktop[]           // pinned desktop sessions; absent from an older CLI
 }
 
 declare module 'claude-code' {
@@ -176,6 +189,7 @@ declare module 'claude-code' {
       chief: ChiefStatus | null    // `mother chief status --json` as last read; null until it answers
       chiefRole: 'chief' | 'console' | null   // `mother chief role` at session start: only `chief` ticks and wakes
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
+      chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
     }
   }
 }
