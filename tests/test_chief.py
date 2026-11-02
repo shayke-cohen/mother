@@ -767,6 +767,13 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["judge"], [a["id"]])
 
+    def test_say_whitespace_only_refused(self):
+        for text in (["  "], ["", " "], ["\t"], ["\n"]):
+            code, _, err = self.main("say", "PLAT-1", "--", *text)
+            self.assertEqual(code, 2, text)
+        self.assertEqual(chief.queued(self.ws), {})
+        self.assertEqual(chief.workers(self.ws), {})
+
     def test_role_env(self):
         with mock.patch.dict(os.environ, {"MOTHER_CHIEF_ROLE": "chief"}):
             self.assertEqual(self.main("role")[:2], (0, "chief\n"))
@@ -776,6 +783,188 @@ class TestMain(Base):
         with mock.patch.dict(os.environ, {}):
             os.environ.pop("MOTHER_CHIEF_ROLE", None)
             self.assertEqual(self.main("role")[1], "console\n")
+
+
+class FakeRun:
+    """subprocess.run stand-in: records argv, answers has-session from a script of return codes."""
+    def __init__(self, codes):
+        self.codes, self.calls = list(codes), []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(list(argv))
+        rc = self.codes.pop(0) if "has-session" in argv and self.codes else 0
+        return subprocess.CompletedProcess(argv, rc, "", "")
+
+
+class TestKeeper(Base):
+    TMUX, CLAUDE = "/opt/bin/tmux", "/opt/claude/claude"
+
+    def which(self, name):
+        return {"tmux": self.TMUX, "claude": self.CLAUDE}.get(name)
+
+    def test_tmux_command_resume_then_session_id(self):
+        sid = chief.chief_session_id(self.ws)
+        cmd = chief.tmux_command(self.ws, {}, self.TMUX, self.CLAUDE)
+        env = "env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 %s --permission-mode bypassPermissions --model sonnet" % self.CLAUDE
+        self.assertEqual(cmd, [self.TMUX, "new-session", "-d", "-s", "mother-chief", "-c", str(self.ws),
+                               "%s --resume %s || %s --session-id %s" % (env, sid, env, sid)])
+
+    def test_tmux_command_uses_configured_model(self):
+        cmd = chief.tmux_command(self.ws, {"chief": {"chief_model": "opus"}}, self.TMUX, self.CLAUDE)
+        self.assertEqual(cmd[-1].count("--model opus"), 2)
+
+    def test_chief_session_id_stable(self):
+        a = chief.chief_session_id(self.ws)
+        self.assertRegex(a, UUID4)
+        self.assertEqual(chief.chief_session_id(self.ws), a)
+        self.assertEqual(json.loads((self.ws / ".mother" / "chief" / "chief.json").read_text())["session_id"], a)
+
+    def test_keep_starts_when_missing_only(self):
+        run = FakeRun([1, 0])
+        ticks = []
+        chief.keep(self.ws, {}, sleep=lambda s: ticks.append(s), run=run, stop=lambda: len(ticks) >= 2,
+                   which=self.which)
+        self.assertEqual(ticks, [30, 30])
+        starts = [c for c in run.calls if "new-session" in c]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(len([c for c in run.calls if "has-session" in c]), 2)
+        self.assertEqual(run.calls[0], [self.TMUX, "has-session", "-t", "mother-chief"])
+        self.assertIn("started", (self.ws / ".mother" / "chief" / "keeper.log").read_text())
+
+    def test_keep_logs_and_waits_when_tmux_missing(self):
+        run = FakeRun([1])
+        ticks = []
+        chief.keep(self.ws, {}, sleep=lambda s: ticks.append(s), run=run, stop=lambda: len(ticks) >= 1,
+                   which=lambda n: None)
+        self.assertEqual(run.calls, [])
+        self.assertIn("tmux", (self.ws / ".mother" / "chief" / "keeper.log").read_text())
+
+
+class TestInstall(Base):
+    def setUp(self):
+        super().setUp()
+        self.plist_path = self.ws / "LaunchAgents" / "com.mother.chief.plist"
+        self.ctl_calls = []
+        self.cfg = {"workspace": {"home_machine": "laptop"}}
+        os.environ["MOTHER_HOSTNAME"] = "laptop"
+        self.addCleanup(os.environ.pop, "MOTHER_HOSTNAME", None)
+
+    def ctl(self, *args):
+        self.ctl_calls.append(args)
+        return 0, ""
+
+    def which(self, name):
+        return {"tmux": "/opt/tmux/bin/tmux", "claude": "/opt/cl/bin/claude"}.get(name)
+
+    def install(self, which=None, force=False, at=AT, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env or {}), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            os.environ.pop("MOTHER_CLAUDE_BIN", None)
+            code = chief.install(self.ws, self.cfg, at, plist_path=self.plist_path, ctl=self.ctl,
+                                 which=which or self.which, python="/usr/bin/python3", mother="/plug/bin/mother",
+                                 force=force, sleep=lambda s: None)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_plist_label_and_program(self):
+        import plistlib
+        doc = plistlib.loads(chief.plist(self.ws, self.cfg, "/usr/bin/python3", "/plug/bin/mother",
+                                         {"tmux": "/opt/tmux/bin/tmux"}).encode())
+        self.assertEqual(doc["Label"], "com.mother.chief")
+        self.assertEqual(doc["ProgramArguments"], ["/usr/bin/python3", "/plug/bin/mother", "chief", "keep"])
+        self.assertIs(doc["KeepAlive"], True)
+        self.assertIs(doc["RunAtLoad"], True)
+        self.assertEqual(doc["EnvironmentVariables"]["MOTHER_WORKSPACE"], str(self.ws))
+        self.assertIn("/opt/tmux/bin", doc["EnvironmentVariables"]["PATH"].split(":"))
+
+    def test_install_prints_bypass_note(self):
+        code, out, _ = self.install()
+        self.assertEqual(code, 0)
+        self.assertIn('First start: run "tmux attach -t mother-chief" once and accept the bypass-permissions '
+                      'warning yourself.', out.splitlines())
+        self.assertTrue(self.plist_path.exists())
+        self.assertEqual(self.ctl_calls[-1][0], "bootstrap")
+
+    def test_install_refuses_without_tmux(self):
+        code, _, err = self.install(which=lambda n: None if n == "tmux" else "/opt/cl/bin/claude")
+        self.assertEqual(code, 2)
+        self.assertIn("tmux", err)
+        self.assertFalse(self.plist_path.exists())
+        self.assertEqual(self.ctl_calls, [])
+
+    def test_install_refuses_without_claude(self):
+        code, _, err = self.install(which=lambda n: None if n == "claude" else "/opt/tmux/bin/tmux")
+        self.assertEqual(code, 2)
+        self.assertIn("claude", err)
+
+    def test_install_uses_absolute_paths(self):
+        import plistlib
+        self.install()
+        doc = plistlib.loads(self.plist_path.read_bytes())
+        path = doc["EnvironmentVariables"]["PATH"].split(":")
+        self.assertIn("/opt/tmux/bin", path)
+        self.assertIn("/opt/cl/bin", path)
+        self.assertTrue(all(p.startswith("/") for p in path))
+        self.assertEqual(doc["ProgramArguments"][:2], ["/usr/bin/python3", "/plug/bin/mother"])
+        cmd = chief.tmux_command(self.ws, self.cfg, *chief.resolve_bins(self.which)[:2])
+        self.assertEqual(cmd[0], "/opt/tmux/bin/tmux")
+        self.assertIn("/opt/cl/bin/claude --permission-mode", cmd[-1])
+
+    def test_install_claude_bin_env_wins(self):
+        self.assertEqual(chief.resolve_bins(self.which, env={"MOTHER_CLAUDE_BIN": "/x/fake-claude"})[1],
+                         "/x/fake-claude")
+
+    def test_install_refuses_off_home_machine(self):
+        self.cfg["workspace"]["home_machine"] = "elsewhere"
+        code, _, _ = self.install()
+        self.assertEqual(code, 2)
+        self.assertFalse(self.plist_path.exists())
+
+    def test_install_refuses_while_desktop_hub_active(self):
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "hub.json", {"version": 1, "last_wake": hub._iso(AT - timedelta(minutes=3))})
+        code, _, err = self.install()
+        self.assertEqual(code, 1)
+        self.assertIn("desktop hub", err)
+        self.assertFalse(self.plist_path.exists())
+        self.assertEqual(self.ctl_calls, [])
+        self.assertEqual(self.install(force=True)[0], 0)
+
+    def test_install_ok_when_hub_wake_is_old(self):
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "hub.json", {"version": 1, "last_wake": hub._iso(AT - timedelta(minutes=30))})
+        self.assertEqual(self.install()[0], 0)
+
+    def test_uninstall_removes_plist(self):
+        self.install()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(chief.uninstall(plist_path=self.plist_path, ctl=self.ctl), 0)
+        self.assertFalse(self.plist_path.exists())
+        self.assertEqual(self.ctl_calls[-1][0], "bootout")
+
+
+class TestRoutineFile(unittest.TestCase):
+    TEXT = (Path(ROOT) / "routines" / "chief.md").read_text() if (Path(ROOT) / "routines" / "chief.md").exists() else ""
+
+    def test_routine_chief_mentions_rules(self):
+        t = self.TEXT
+        for needle in ("mother chief lines", "mother hub decide", "mother chief run", "mother chief say"):
+            self.assertIn(needle, t)
+        self.assertIn("never resume a worker directly", t.lower())
+        for m in re.finditer(r"mother hub tail", t):
+            self.assertIn("never", t[max(0, m.start() - 40):m.start()].lower())
+
+    def test_routine_commands_are_in_guard_shapes(self):
+        sys.path.insert(0, os.path.join(ROOT, "hooks"))
+        import guard
+        mine = os.path.join(ROOT, "bin", "mother")
+        found = 0
+        for m in re.finditer(r"`(<MOTHER> chief [^`]+)`", self.TEXT):
+            cmd = re.sub(r"<(?!MOTHER)[a-z-]+>", "word", m.group(1).replace("<MOTHER>", mine))
+            found += 1
+            self.assertTrue(guard.chief_command(cmd), cmd)
+        self.assertGreaterEqual(found, 4)
 
 
 if __name__ == "__main__":

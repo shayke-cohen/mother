@@ -8,6 +8,8 @@ import fcntl
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -611,6 +613,144 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     return out
 
 
+# ---- keeping the chief's CLI session alive: tmux keeper, launchd job -------------------------------------
+
+LABEL = "com.mother.chief"
+TMUX_SESSION = "mother-chief"
+KEEP_SECONDS = 30
+HUB_ACTIVE_MINUTES = 10
+BYPASS_NOTE = 'First start: run "tmux attach -t mother-chief" once and accept the bypass-permissions warning yourself.'
+
+
+def chief_session_id(ws: Path) -> str:
+    """The chief's own Claude session id: chief/chief.json, a new uuid4 on first use. The guard reads the same
+    file to know which session is the chief."""
+    path = chief_dir(ws) / "chief.json"
+    with hub.locked(ws):
+        sid = _read_obj(path).get("session_id")
+        if not isinstance(sid, str) or not sid:
+            sid = str(uuid.uuid4())
+            _write_atomic(path, json.dumps({"session_id": sid}) + "\n")
+    return sid
+
+
+def tmux_command(ws: Path, cfg: dict, tmux: str, claude: str) -> List[str]:
+    """Start the chief detached in tmux: resume its session, or create it under the same id on the first run."""
+    sid = chief_session_id(ws)
+    start = "env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 %s --permission-mode bypassPermissions --model %s" % (
+        shlex.quote(claude), shlex.quote(str(settings(cfg)["chief_model"])))
+    return [tmux, "new-session", "-d", "-s", TMUX_SESSION, "-c", str(ws),
+            "%s --resume %s || %s --session-id %s" % (start, sid, start, sid)]
+
+
+def resolve_bins(which=None, env=None) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """(tmux, claude, missing): absolute paths. MOTHER_CLAUDE_BIN wins for claude, as in channels.py."""
+    which = which or shutil.which
+    env = os.environ if env is None else env
+    tmux = which("tmux")
+    claude = env.get("MOTHER_CLAUDE_BIN") or which("claude")
+    return tmux, claude, [n for n, p in (("tmux", tmux), ("claude", claude)) if not p]
+
+
+def _keeper_log(ws: Path, msg: str) -> None:
+    try:
+        (chief_dir(ws)).mkdir(parents=True, exist_ok=True)
+        with open(str(chief_dir(ws) / "keeper.log"), "a") as f:
+            f.write("%s %s\n" % (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), msg))
+    except OSError:
+        pass
+
+
+def keep(ws: Path, cfg: dict, sleep=time.sleep, run=subprocess.run, stop=None, which=None) -> None:
+    """Every 30 s: no tmux session `mother-chief` means start it. `stop` ends the loop (tests); the launchd job
+    never stops it."""
+    ws = Path(ws)
+    while not (stop and stop()):
+        tmux, claude, missing = resolve_bins(which)
+        if missing:
+            _keeper_log(ws, "cannot start the chief: %s not found" % ", ".join(missing))
+        else:
+            has = run([tmux, "has-session", "-t", TMUX_SESSION], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if has.returncode != 0:
+                r = run(tmux_command(ws, cfg, tmux, claude), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                _keeper_log(ws, "started %s" % TMUX_SESSION if r.returncode == 0
+                            else "start failed (exit %d)" % r.returncode)
+        sleep(KEEP_SECONDS)
+
+
+def default_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / (LABEL + ".plist")
+
+
+def plist(ws: Path, cfg: dict, python: str, mother: str, found: Optional[Dict[str, str]] = None) -> str:
+    """The launchd job: `mother chief keep`, always running. PATH holds the directories of tmux, claude and
+    bin/mother, so the keeper (and the tmux server it starts) finds them."""
+    import plistlib
+    doc = {"Label": LABEL,
+           "ProgramArguments": [python, mother, "chief", "keep"],
+           "EnvironmentVariables": {"MOTHER_WORKSPACE": str(ws), "PATH": hub.launch_path(dict(found or {}))},
+           "KeepAlive": True,
+           "ThrottleInterval": 60,
+           "RunAtLoad": True,
+           "StandardOutPath": str(chief_dir(ws) / "keeper.out"),
+           "StandardErrorPath": str(chief_dir(ws) / "keeper.out")}
+    return plistlib.dumps(doc).decode("utf-8")
+
+
+def _desktop_hub_active(ws: Path, at: datetime) -> bool:
+    woke = hub._parse_at(hub._hub_doc(ws).get("last_wake"))
+    return woke is not None and (at - woke).total_seconds() < HUB_ACTIVE_MINUTES * 60
+
+
+def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=None, python=None, mother=None,
+            sleep=time.sleep, force: bool = False) -> int:
+    ctl = ctl or hub.launchctl
+    plist_path = Path(plist_path or default_plist_path())
+    code = hub.home_status(cfg)
+    if code:
+        print("mother chief install: not the home machine (see `mother home check`)", file=sys.stderr)
+        return code
+    tmux, claude, missing = resolve_bins(which)
+    if missing:
+        print("mother chief install: not found: %s (put it on PATH%s)" % (
+            ", ".join(missing), "; MOTHER_CLAUDE_BIN names claude" if "claude" in missing else ""), file=sys.stderr)
+        return EXIT_USAGE
+    if not force and _desktop_hub_active(ws, at):
+        print("mother chief install: a desktop hub session woke in the last %d minutes; the chief replaces it "
+              "and there is one inbox cursor. Stop the hub, or pass --force." % HUB_ACTIVE_MINUTES, file=sys.stderr)
+        return EXIT_FAILED
+    python = python or os.path.abspath(sys.executable)
+    mother = mother or str(PLUGIN_ROOT / "bin" / "mother")
+    chief_dir(ws).mkdir(parents=True, exist_ok=True)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(plist(ws, cfg, python, mother, {"tmux": tmux, "claude": claude, "mother": mother}))
+    domain = "gui/%d" % os.getuid()
+    ctl("bootout", "%s/%s" % (domain, LABEL))  # a reinstall replaces the loaded job; not loaded is fine
+    for attempt in range(hub.BOOTSTRAP_TRIES):
+        rc, out = ctl("bootstrap", domain, str(plist_path))
+        if not rc:
+            break
+        if attempt + 1 < hub.BOOTSTRAP_TRIES:
+            sleep(1)
+    if rc:
+        print("mother chief install: launchctl bootstrap failed: %s" % out, file=sys.stderr)
+        return EXIT_FAILED
+    print("installed %s (logs: %s)" % (plist_path, chief_dir(ws) / "keeper.log"))
+    print(BYPASS_NOTE)
+    return EXIT_OK
+
+
+def uninstall(plist_path=None, ctl=None) -> int:
+    ctl = ctl or hub.launchctl
+    plist_path = Path(plist_path or default_plist_path())
+    ctl("bootout", "gui/%d/%s" % (os.getuid(), LABEL))
+    existed = plist_path.exists()
+    if existed:
+        plist_path.unlink()
+    print("removed %s" % plist_path if existed else "not installed")
+    return EXIT_OK
+
+
 # ---- status and the `mother chief` CLI ----------------------------------------------------------------
 
 ALIVE_SECONDS = 120
@@ -625,6 +765,10 @@ USAGE = """usage: mother chief <verb> ...
   release <key>         hand it back, with a note to read the latest turns first
   lines [--json]        the inbox lines waiting for the chief
   status [--json]       paused, the chief's heartbeat, today's budget and the workers
+  keep                  keep the tmux session `mother-chief` alive (what the launchd job runs)
+  install [--force]     write ~/Library/LaunchAgents/com.mother.chief.plist and load it (home machine only;
+                        refuses while a desktop hub session is active unless --force)
+  uninstall             unload the job and remove the plist
   tick [--json]         one chief pass: route, wake the chief, dispatch queued workers
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
   role                  chief when MOTHER_CHIEF_ROLE=chief, else console
@@ -636,6 +780,7 @@ VERBS = {
     "run": (1, ("--detach",), ("--title", "--prompt")),
     "say": (1, (), ()), "hold": (1, (), ()), "release": (1, (), ()),
     "lines": (0, ("--json",), ()), "status": (0, ("--json",), ()), "tick": (0, ("--json",), ()),
+    "keep": (0, (), ()), "install": (0, ("--force",), ()), "uninstall": (0, (), ()),
     "pause": (0, (), ()), "resume": (0, (), ()), "role": (0, (), ()),
 }
 
@@ -761,12 +906,19 @@ def main(args, ws, cfg, at) -> int:
         return EXIT_OK
     ws = Path(ws)
     as_json = bool(opts.get("json"))
+    if verb == "keep":
+        keep(ws, cfg)
+        return EXIT_OK
+    if verb == "install":
+        return install(ws, cfg, at, force=bool(opts.get("force")))
+    if verb == "uninstall":
+        return uninstall()
     if verb == "run":
         return run(ws, cfg, at, key, prompt=opts.get("prompt", ""), title=opts.get("title", ""),
                    detach=bool(opts.get("detach")))
     if verb == "say":
         words = " ".join(text or [])
-        if not words:
+        if not words.strip():
             return _usage("say needs `-- <text>`")
         return _say(ws, cfg, at, key, words)
     if verb in ("hold", "release"):

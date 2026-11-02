@@ -45,7 +45,7 @@ holds code a later session would run.
 | `lib/hub_mcp.py` | Minimal MCP stdio client plus the read-only wrapper the watcher uses | Allow-list enforced before send. CONTRACT §5e |
 | `lib/inbox.py` | `mother inbox archive\|read`: the Now panel's mail triage over the hub's mail connection, no model | Asks `guard.classify_mcp` before each write, stops while PAUSED, logs to guard.log; the triage tools live in `hub_sources.MailGmail.TRIAGE`. CONTRACT §5f |
 | `lib/hub_sources.py` | Per-capability poll adapters and the deterministic prefilter | Product-specific tool names live only here. The `whatsapp` adapter reads through `LocalWhatsApp` (the reader functions of `lib/whatsapp.py` only: no bridge, no send). CONTRACT §5e |
-| `lib/chief.py` | Chief workers: headless Claude sessions registered in the hub's `sessions.json`, the say queue, daily spend, pause, and `run` | One writer per worker (flock); every state write under `hub.locked`. Python 3.9 stdlib only |
+| `lib/chief.py` | Chief workers: headless Claude sessions registered in the hub's `sessions.json`, the say queue, daily spend, pause, `run`, and the tmux keeper + launchd job that keep the chief's own session alive | One writer per worker (flock); every state write under `hub.locked`. Python 3.9 stdlib only |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
 | `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |
@@ -61,7 +61,8 @@ Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `d
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
-`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
+`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`, `chief` (not scheduled: the chief's
+standing instructions, read by its own CLI session).
 
 ## How a scheduled run flows
 
