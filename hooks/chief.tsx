@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Register, Timer } from 'claude-code'
+import type { Register } from 'claude-code'
 
 import { ago, motherBin } from './shared'
 import type { Dollar } from './shared'
@@ -20,10 +20,12 @@ const MIN_TICK_SECONDS = 5
 type On = Parameters<Register>[0]
 type Role = 'chief' | 'console'
 
-// ` · chief ● N working · M queued` for the status line; ○ while the chief's heartbeat is old; '' with no status.
+// ` · chief ● N working · M queued` for the status line; ○ while the chief's heartbeat is old; '' with no status,
+// and '' when no chief is installed here (it never wrote a heartbeat and there are no workers).
 export function chiefStatusText(s: ChiefStatus | null, _role: Role | null): string {
   if (!s) return ''
   const workers = s.workers ?? []
+  if (!s.chief?.heartbeat_at && workers.length === 0) return ''
   const working = workers.filter(w => w.status === 'working').length
   const queued = workers.reduce((n, w) => n + (w.queued ?? 0), 0)
   return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working · ${queued} queued`
@@ -38,9 +40,14 @@ export const byAttention = (ws: ChiefWorker[]): ChiefWorker[] =>
 
 type Ran = { ok: boolean; stdout: string; stderr: string }
 
+// process.run's own timeout (30 s by default) rejects a hung command, which `cli` turns into a failure, so a hung
+// `tick` can never hold the busy flag for good. A tick decides and dispatches, so it gets longer.
+const TIMEOUT_MS: Record<string, number> = { tick: 120_000 }
+const DEFAULT_TIMEOUT_MS = 30_000
+
 async function cli($: Dollar, bin: string, args: string[]): Promise<Ran> {
   try {
-    const ran = await $.process.run(['python3', bin, 'chief', ...args])
+    const ran = await $.process.run(['python3', bin, 'chief', ...args], { timeoutMs: TIMEOUT_MS[args[0] ?? ''] ?? DEFAULT_TIMEOUT_MS })
     return { ok: ran.exitCode === 0, stdout: String(ran.stdout ?? ''), stderr: String(ran.stderr ?? '') }
   } catch (err) {
     return { ok: false, stdout: '', stderr: (err as Error).message ?? String(err) }
@@ -48,6 +55,10 @@ async function cli($: Dollar, bin: string, args: string[]): Promise<Ran> {
 }
 
 const firstLine = (text: string): string => text.split('\n').find(l => l.trim())?.trim() ?? ''
+
+// The last timer pass's own failure (a tick, or reading the role), kept until that step next succeeds, so the status
+// reload that follows a failed tick cannot clear it. It wins over a status error in chiefError.
+let passError: string | null = null
 
 // `mother chief status --json`. A failure keeps the last good status and sets chiefError.
 async function reloadStatus($: Dollar, bin: string): Promise<void> {
@@ -66,14 +77,20 @@ async function reloadStatus($: Dollar, bin: string): Promise<void> {
     }
   }
   if (parsed) await update($, chiefAtom, () => parsed)
-  await update($, chiefErrorAtom, () => error)
+  const shown = passError ?? error
+  await update($, chiefErrorAtom, () => shown)
 }
 
-// `chief` only when the CLI says so exactly (MOTHER_CHIEF_ROLE=chief in the keeper's session); anything else,
-// a failure included, is a console that never ticks.
-async function readRole($: Dollar, bin: string): Promise<Role> {
+// `chief` only when the CLI says so exactly (MOTHER_CHIEF_ROLE=chief in the keeper's session); `console` for any
+// other answer. null when the call itself failed: the caller retries it and never ticks meanwhile.
+async function readRole($: Dollar, bin: string): Promise<Role | null> {
   const ran = await cli($, bin, ['role'])
-  return ran.ok && ran.stdout.trim() === 'chief' ? 'chief' : 'console'
+  if (!ran.ok) {
+    passError = `couldn't read the chief role (retrying): ${firstLine(ran.stderr) || 'mother chief role failed'}`
+    return null
+  }
+  passError = null
+  return ran.stdout.trim() === 'chief' ? 'chief' : 'console'
 }
 
 // config.json -> chief.tick_seconds, through `mother path`; the default when anything is missing.
@@ -89,15 +106,31 @@ async function tickSeconds($: Dollar, bin: string): Promise<number> {
   }
 }
 
-// One chief pass: `tick --json`, a wake prompt when it names one, then the status again.
+// The main loop's turn in flight, from turn.start / turn.complete (a subagent's turns carry agentId and don't count).
+// tick re-wakes whenever its judge list changes and again after 10 minutes, so it can return a wake while the chief is
+// still working through the last one: that wake waits here and goes out on the first idle tick, newest text winning.
+// A turn older than STUCK_TURN_MS is treated as over, in case its turn.complete never came.
+const STUCK_TURN_MS = 30 * 60_000
+let turnStartedAt: number | null = null
+let pendingWake: string | null = null
+
+// One chief pass: `tick --json`, a wake prompt when it names one and no turn is running, then the status again.
 async function tickOnce($: Dollar, bin: string): Promise<void> {
   const ran = await cli($, bin, ['tick', '--json'])
   if (ran.ok) {
+    passError = null
     let wake: unknown = null
     try { wake = JSON.parse(ran.stdout)?.wake } catch { wake = null }
-    if (typeof wake === 'string' && wake.trim()) void $.prompt.submit({ text: wake }).catch(() => undefined)
+    if (typeof wake === 'string' && wake.trim()) pendingWake = wake
+    const nowMs = await $.clock.now()
+    const busyTurn = turnStartedAt !== null && nowMs - turnStartedAt < STUCK_TURN_MS
+    if (pendingWake && !busyTurn) {
+      const text = pendingWake
+      pendingWake = null
+      void $.prompt.submit({ text }).catch(() => undefined)
+    }
   } else {
-    await update($, chiefErrorAtom, () => firstLine(ran.stderr) || 'mother chief tick failed')
+    passError = `mother chief tick failed: ${firstLine(ran.stderr) || 'non-zero exit'}`
   }
   await reloadStatus($, bin)
 }
@@ -165,39 +198,73 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   )
 }
 
-// The module's own timer; a reload of the mod starts it over, a repeated session.start replaces it.
-let timer: Timer | undefined
+// The pass state; a reload of the mod starts it over. register.tsx owns the timer: the engine's scan lets `$` reach
+// only functions declared at a file's top level, so a timer callback here could not call back into register's
+// status-line draw.
+let role: Role | null = null
 let busy = false
 
-// The chief's part of session.start. The engine takes one unmatched session.start hook per module, so register.tsx's
-// hook calls this after its own poll. Role `chief` ticks every tick_seconds and submits the wake text; role `console`
-// only reloads the status every minute, and never ticks or submits.
-export async function startChief($: Dollar, configured: string): Promise<void> {
+// The chief's part of session.start (the engine takes one unmatched session.start hook per module, so register.tsx's
+// hook calls this). Returns the period register should run chiefPass at: tick_seconds for the chief, a minute for a
+// console, and a minute while the role read keeps failing.
+export async function startChief($: Dollar, configured: string): Promise<number> {
   const bin = await motherBin($, configured)
   try {
     await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: headless workers, chat, take-over' })
   } catch {
     // carry on without the command
   }
-  const role = await readRole($, bin)
+  passError = null
+  pendingWake = null
+  turnStartedAt = null
+  role = await readRole($, bin)
   await update($, chiefRoleAtom, () => role)
   await reloadStatus($, bin)
-  // One pass at a time: a slow tick never overlaps the next one.
-  const pass = async (work: () => Promise<void>) => {
-    if (busy) return
-    busy = true
-    try { await work() } catch { /* the next period retries */ } finally { busy = false }
-  }
-  timer?.cancel()          // a repeated session.start must not stack a second timer
-  if (role === 'chief') {
-    const every = (await tickSeconds($, bin)) * 1000
-    timer = $.clock.every(every, () => pass(() => tickOnce($, bin)))
-  } else {
-    timer = $.clock.every(CONSOLE_POLL_MS, () => pass(() => reloadStatus($, bin)))
+  return periodFor($, bin, role)
+}
+
+async function periodFor($: Dollar, bin: string, r: Role | null): Promise<number> {
+  return r === 'chief' ? (await tickSeconds($, bin)) * 1000 : CONSOLE_POLL_MS
+}
+
+// One timer pass, never two at once (a slow tick makes the next period a no-op). Role `chief`: tick, maybe wake,
+// reload. Role `console`: reload only, never tick or submit. Role unknown (its read failed): read it again and
+// reload; nothing ticks until it answers `chief`. Returns the new period when the role just settled, else null.
+export async function chiefPass($: Dollar, configured: string): Promise<number | null> {
+  if (busy) return null
+  busy = true
+  try {
+    const bin = await motherBin($, configured)
+    if (role === 'chief') {
+      await tickOnce($, bin)
+      return null
+    }
+    if (role === 'console') {
+      await reloadStatus($, bin)
+      return null
+    }
+    const again = await readRole($, bin)
+    await reloadStatus($, bin)
+    if (!again) return null
+    role = again
+    await update($, chiefRoleAtom, () => again)
+    return periodFor($, bin, again)
+  } finally {
+    busy = false
   }
 }
 
 export function registerChief(on: On, configured: string): void {
+  // The main loop's turns only: a wake waits while one runs (see tickOnce).
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId) turnStartedAt = await $.clock.now()
+    return next(e)
+  })
+  on('turn.complete', async (_$, e, next) => {
+    if (!e.agentId) turnStartedAt = null
+    return next(e)
+  })
+
   // /chief [open] opens the pane; /chief status says `mother chief status`; /chief pause|resume run the chief-only
   // pause (.mother/chief/PAUSED, which the CLI writes and removes; the guard's .mother/PAUSED is never touched).
   on('command.run', { command: CHIEF_COMMAND }, async ($, e) => {

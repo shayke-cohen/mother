@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, Timer } from 'claude-code'
 
-import { chiefStatusText, registerChief, startChief } from './chief'
+import { chiefPass, chiefStatusText, registerChief, startChief } from './chief'
 import { ago, clock, motherBin } from './shared'
 import type { Dollar } from './shared'
 import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, HubWatch, InspectRef, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
@@ -1332,6 +1332,7 @@ export const register: Register = (on, options) => {
   const configured = String(options.mother_bin ?? '').trim()
   const loader = newLoader()
   let timer: Timer | undefined
+  let chiefTimer: Timer | undefined
 
   on('session.start', async ($, e, next) => {
     const bin = await motherBin($, configured)
@@ -1346,7 +1347,18 @@ export const register: Register = (on, options) => {
     await poll()
     timer?.cancel()          // a repeated session.start must not stack a second poll
     timer = $.clock.every(POLL_MS, poll)
-    await startChief($, configured).catch(() => undefined)   // the Chief pane never stops the Now panel
+    // The Chief pane's timer lives here, so each pass can redraw the status line (chief.tsx cannot call drawStatus).
+    // A failure never stops the Now panel.
+    const armChief = (ms: number) => {
+      chiefTimer?.cancel()   // a repeated session.start, or a role that just settled, must not stack a second timer
+      chiefTimer = $.clock.every(ms, async () => {
+        const changed = await chiefPass($, configured).catch(() => null)
+        await drawStatus($).catch(() => undefined)
+        if (changed) armChief(changed)
+      })
+    }
+    const chiefMs = await startChief($, configured).catch(() => null)
+    if (chiefMs) armChief(chiefMs); else chiefTimer?.cancel()
     await drawStatus($).catch(() => undefined)               // now with the chief's state, without re-reading files
     return next(e)
   })

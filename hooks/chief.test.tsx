@@ -25,7 +25,7 @@ function status(over: Record<string, unknown> = {}) {
 type Cli = { exitCode: number; stdout?: string; stderr?: string }
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
-async function boot($: any, on: any, role: string, chief: (argv: string[]) => Cli | undefined = () => undefined) {
+async function boot($: any, on: any, role: string, chief: (argv: string[]) => Cli | undefined | Promise<Cli | undefined> = () => undefined) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m' })
   const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
@@ -37,15 +37,17 @@ async function boot($: any, on: any, role: string, chief: (argv: string[]) => Cl
   on('ui.open', (_: any, e: any) => { out.opened.push(e.id); return { value: { isPlaced: true } } })
   on('command.register', (_: any, e: any) => ({ value: { command: e.name } }))
   on('prompt.submit', (_: any, e: any, next: any) => { out.submits.push(e.text); return next(e) })
+  on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
   on('fs.stat', () => ({ deny: 'ENOENT' }))
   on('fs.read', () => ({ deny: 'ENOENT' }))
-  on('process.run', (_: any, e: any) => {
+  on('process.run', async (_: any, e: any) => {
     const argv = [...e.argv] as string[]
     out.argv.push(argv)
     const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[2] === 'path') return ok(WS + '\n')
     if (argv[2] === 'chief') {
-      const r = chief(argv.slice(3))
+      const r = await chief(argv.slice(3))
       if (r) return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       if (argv[3] === 'role') return ok(role + '\n')
       if (argv[3] === 'status') return ok(JSON.stringify(status()))
@@ -164,11 +166,137 @@ test('test_status_text_alive_and_down', async () => {
   const down: any = { ...s, chief: { ...s.chief, alive: false } }
   expect(chiefStatusText(down, 'console')).toBe(' · chief ○ 1 working · 3 queued')
   expect(chiefStatusText(null, null)).toBe('')
+  // no chief installed: no heartbeat ever, no workers
+  const none: any = status({ chief: { alive: false, heartbeat_at: null, session_id: null }, workers: [] })
+  expect(chiefStatusText(none, 'console')).toBe('')
+  // a chief that has beaten but has no workers yet still shows
+  expect(chiefStatusText(status({ workers: [] }) as any, 'chief')).toBe(' · chief ● 0 working · 0 queued')
 })
 
 test('test_status_line_carries_the_chief', async ($, on) => {
   const { out } = await boot($, on, 'console')
   expect(out.status.at(-1)).toBe('◆ no tick here · chief ● 0 working · 0 queued')
+})
+
+test('test_status_line_without_a_chief', async ($, on) => {
+  const { out } = await boot($, on, 'console', argv => argv[0] === 'status'
+    ? { exitCode: 0, stdout: JSON.stringify(status({ chief: { alive: false, heartbeat_at: null, session_id: null }, workers: [] })) }
+    : undefined)
+  expect(out.status.at(-1)).toBe('◆ no tick here')
+})
+
+test('test_status_line_follows_the_chief_tick', async ($, on) => {
+  let working = false
+  const { clock, out } = await boot($, on, 'chief', argv => {
+    if (argv[0] === 'tick') { working = true; return undefined }
+    if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ workers: [worker({ status: working ? 'working' : 'idle' })] })) }
+    return undefined
+  })
+  expect(out.status.at(-1)).toMatch(/chief ● 0 working/)
+  await clock.advance(30_000)                         // the chief's tick, before register's 60 s poll
+  expect(out.status.at(-1)).toMatch(/chief ● 1 working/)
+})
+
+test('test_tick_error_stays_visible', async ($, on) => {
+  let fail = true
+  const { clock } = await boot($, on, 'chief', argv =>
+    argv[0] === 'tick' && fail ? { exitCode: 1, stderr: 'Traceback: boom\n  more\n' } : undefined)
+  await clock.advance(30_000)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /^mother chief tick failed: Traceback: boom$/)).toBe(true)
+    expect(await hasText(ui, /Fix the login bug/)).toBe(true)   // the status reload after it still drew
+    await ui.unmount()
+  }
+  fail = false
+  await clock.advance(30_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /tick failed/)).toBe(false)        // the next good tick clears it
+  await ui.unmount()
+})
+
+test('test_slow_tick_never_overlaps', async ($, on) => {
+  let release: (() => void) | undefined
+  const { clock, out } = await boot($, on, 'chief', argv => argv[0] === 'tick'
+    ? new Promise<Cli | undefined>(res => { release = () => res(undefined) })
+    : undefined)
+  await clock.advance(30_000)                           // the first tick starts and hangs
+  await clock.advance(30_000)                           // its next period finds the pass still busy
+  await clock.advance(30_000)
+  expect(chiefCalls(out, 'tick').length).toBe(1)
+  release?.()
+  await clock.settle()
+  await clock.advance(30_000)                           // free again: the next period ticks
+  expect(chiefCalls(out, 'tick').length).toBe(2)
+})
+
+test('test_role_failure_retries_and_never_ticks_meanwhile', async ($, on) => {
+  let roleFails = true
+  const { clock, out } = await boot($, on, 'chief', argv =>
+    argv[0] === 'role' && roleFails ? { exitCode: 1, stderr: 'mother: no python\n' } : undefined)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /couldn't read the chief role \(retrying\): mother: no python/)).toBe(true)
+  await ui.unmount()
+  await clock.advance(60_000)                           // retried, still failing
+  expect(chiefCalls(out, 'role').length).toBe(2)
+  expect(chiefCalls(out, 'tick')).toEqual([])
+  roleFails = false
+  await clock.advance(60_000)                           // the role answers chief: the tick timer starts
+  expect(chiefCalls(out, 'tick')).toEqual([])
+  await clock.advance(30_000)
+  expect(chiefCalls(out, 'tick').length).toBe(1)
+  const after = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(after, /chief role/)).toBe(false)
+  await after.unmount()
+})
+
+test('test_failing_status_keeps_the_last_status_and_shows_why', async ($, on) => {
+  let mode: 'ok' | 'fail' | 'junk' = 'ok'
+  const { clock } = await boot($, on, 'console', argv => {
+    if (argv[0] !== 'status') return undefined
+    if (mode === 'fail') return { exitCode: 1, stderr: 'mother: workspace missing\n' }
+    if (mode === 'junk') return { exitCode: 0, stdout: '{not json' }
+    return { exitCode: 0, stdout: JSON.stringify(status()) }
+  })
+  for (const [m, re] of [['fail', /^mother: workspace missing$/], ['junk', /^mother chief status unreadable: /]] as const) {
+    mode = m
+    await clock.advance(60_000)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await hasText(ui, re)).toBe(true)
+    expect(await hasText(ui, /Fix the login bug/)).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('test_failing_say_toasts_its_first_stderr_line', async ($, on) => {
+  const { out } = await boot($, on, 'console', argv =>
+    argv[0] === 'say' ? { exitCode: 2, stderr: 'PLAT-1 is a live desktop session\nusage…\n' } : undefined)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.input({ key: 'say:PLAT-1', text: 'ship it' })
+  expect(out.toasts).toContain('PLAT-1 is a live desktop session')
+  await ui.input({ key: 'say:PLAT-1', text: '   ' })          // whitespace only: nothing is sent
+  expect(chiefCalls(out, 'say').length).toBe(1)
+  await ui.unmount()
+})
+
+test('test_wake_waits_while_a_turn_runs', async ($, on) => {
+  const wake = 'Chief wake: 1 inbox lines need a decision.'
+  let next: string | null = wake
+  const { clock, out } = await boot($, on, 'chief', argv => {
+    if (argv[0] !== 'tick') return undefined
+    const w = next
+    next = null                                          // tick names a batch once; it does not repeat it
+    return { exitCode: 0, stdout: JSON.stringify({ wake: w }) }
+  })
+  await $.turn.start({ text: 'Chief wake: earlier batch', turnId: 't1' })
+  await clock.advance(30_000)
+  expect(out.submits).toEqual([])                        // mid-turn: held back
+  await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await $.turn.start({ text: '', turnId: 's1', agentId: 'a1' })   // a subagent's turn still running does not count
+  await clock.advance(30_000)                            // the main loop is idle: the held wake goes out once
+  expect(out.submits).toEqual([wake])
+  await clock.advance(30_000)
+  expect(out.submits).toEqual([wake])
 })
 
 test('test_cards_sorted_by_attention', async ($, on) => {
