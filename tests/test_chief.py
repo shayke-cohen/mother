@@ -804,8 +804,10 @@ class TestKeeper(Base):
 
     def test_tmux_command_resume_then_session_id(self):
         sid = chief.chief_session_id(self.ws)
-        cmd = chief.tmux_command(self.ws, {}, self.TMUX, self.CLAUDE)
-        env = "env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 %s --permission-mode bypassPermissions --model sonnet" % self.CLAUDE
+        cmd = chief.tmux_command(self.ws, {}, self.TMUX, self.CLAUDE, mother="/stable/bin/mother")
+        path = "/opt/bin:/opt/claude:/stable/bin:/usr/bin:/bin"
+        env = ("env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 PATH=%s %s --permission-mode bypassPermissions "
+               "--model sonnet" % (path, self.CLAUDE))
         self.assertEqual(cmd, [self.TMUX, "new-session", "-d", "-s", "mother-chief", "-c", str(self.ws),
                                "%s --resume %s || %s --session-id %s" % (env, sid, env, sid)])
 
@@ -830,6 +832,22 @@ class TestKeeper(Base):
         self.assertEqual(len([c for c in run.calls if "has-session" in c]), 2)
         self.assertEqual(run.calls[0], [self.TMUX, "has-session", "-t", "mother-chief"])
         self.assertIn("started", (self.ws / ".mother" / "chief" / "keeper.log").read_text())
+
+    def test_tmux_command_puts_stable_mother_on_path(self):
+        home = self.ws / "home"
+        stable = home / ".claude" / "plugins" / "marketplaces" / "mother" / "bin"
+        stable.mkdir(parents=True)
+        (stable / "mother").write_text("#!/bin/sh\n")
+        self.assertEqual(chief.stable_mother(home), str(stable / "mother"))
+        self.assertEqual(chief.stable_mother(self.ws / "nohome"), str(chief.PLUGIN_ROOT / "bin" / "mother"))
+
+    def test_keep_survives_oserror_from_run(self):
+        def boom(argv, **kw):
+            raise OSError("tmux vanished")
+        ticks = []
+        chief.keep(self.ws, {}, sleep=lambda s: ticks.append(s), run=boom, stop=lambda: len(ticks) >= 1,
+                   which=self.which)
+        self.assertIn("tmux failed: tmux vanished", (self.ws / ".mother" / "chief" / "keeper.log").read_text())
 
     def test_keep_logs_and_waits_when_tmux_missing(self):
         run = FakeRun([1])
@@ -860,7 +878,8 @@ class TestInstall(Base):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, env or {}), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
-            os.environ.pop("MOTHER_CLAUDE_BIN", None)
+            if env is None:
+                os.environ.pop("MOTHER_CLAUDE_BIN", None)
             code = chief.install(self.ws, self.cfg, at, plist_path=self.plist_path, ctl=self.ctl,
                                  which=which or self.which, python="/usr/bin/python3", mother="/plug/bin/mother",
                                  force=force, sleep=lambda s: None)
@@ -910,6 +929,23 @@ class TestInstall(Base):
         self.assertEqual(cmd[0], "/opt/tmux/bin/tmux")
         self.assertIn("/opt/cl/bin/claude --permission-mode", cmd[-1])
 
+    def test_install_plist_carries_claude_bin_override(self):
+        import plistlib
+        self.install(env={"MOTHER_CLAUDE_BIN": "/x/fake-claude"})
+        doc = plistlib.loads(self.plist_path.read_bytes())
+        self.assertEqual(doc["EnvironmentVariables"]["MOTHER_CLAUDE_BIN"], "/x/fake-claude")
+        self.install()
+        self.assertNotIn("MOTHER_CLAUDE_BIN", plistlib.loads(self.plist_path.read_bytes())["EnvironmentVariables"])
+
+    def test_install_default_mother_is_not_versioned_cache_path(self):
+        import plistlib
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            chief.install(self.ws, self.cfg, AT, plist_path=self.plist_path, ctl=self.ctl, which=self.which,
+                          python="/usr/bin/python3", sleep=lambda s: None)
+        self.assertEqual(plistlib.loads(self.plist_path.read_bytes())["ProgramArguments"][1], chief.stable_mother())
+        self.assertNotIn("/cache/", chief.stable_mother())
+
     def test_install_claude_bin_env_wins(self):
         self.assertEqual(chief.resolve_bins(self.which, env={"MOTHER_CLAUDE_BIN": "/x/fake-claude"})[1],
                          "/x/fake-claude")
@@ -937,11 +973,13 @@ class TestInstall(Base):
 
     def test_uninstall_removes_plist(self):
         self.install()
+        run = FakeRun([])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(chief.uninstall(plist_path=self.plist_path, ctl=self.ctl), 0)
+            self.assertEqual(chief.uninstall(plist_path=self.plist_path, ctl=self.ctl, run=run, which=self.which), 0)
         self.assertFalse(self.plist_path.exists())
         self.assertEqual(self.ctl_calls[-1][0], "bootout")
+        self.assertEqual(run.calls, [["/opt/tmux/bin/tmux", "kill-session", "-t", "mother-chief"]])
 
 
 class TestRoutineFile(unittest.TestCase):
@@ -956,15 +994,18 @@ class TestRoutineFile(unittest.TestCase):
             self.assertIn("never", t[max(0, m.start() - 40):m.start()].lower())
 
     def test_routine_commands_are_in_guard_shapes(self):
+        """Every `mother …` command the routine spells, taken literally (placeholders swapped for a word)."""
         sys.path.insert(0, os.path.join(ROOT, "hooks"))
         import guard
-        mine = os.path.join(ROOT, "bin", "mother")
-        found = 0
-        for m in re.finditer(r"`(<MOTHER> chief [^`]+)`", self.TEXT):
-            cmd = re.sub(r"<(?!MOTHER)[a-z-]+>", "word", m.group(1).replace("<MOTHER>", mine))
-            found += 1
-            self.assertTrue(guard.chief_command(cmd), cmd)
-        self.assertGreaterEqual(found, 4)
+        found = []
+        for m in re.finditer(r"`(mother chief [^`]+)`", self.TEXT):
+            cmd = re.sub(r"<[a-z-]+>", "word", m.group(1))
+            if " -- '" in cmd or " run " in cmd or "lines" in cmd or "status" in cmd:
+                found.append(cmd)
+                self.assertTrue(guard.chief_command(cmd), cmd)
+        self.assertGreaterEqual(len(found), 4)
+        self.assertNotIn("<MOTHER>", self.TEXT)
+        self.assertIn("mother hub decide <<'HUBEOF'", self.TEXT)
 
 
 if __name__ == "__main__":

@@ -634,11 +634,21 @@ def chief_session_id(ws: Path) -> str:
     return sid
 
 
-def tmux_command(ws: Path, cfg: dict, tmux: str, claude: str) -> List[str]:
-    """Start the chief detached in tmux: resume its session, or create it under the same id on the first run."""
+def stable_mother(home: Optional[Path] = None) -> str:
+    """bin/mother by a path that survives plugin updates: the marketplace clone, as `mother link` uses; the
+    running plugin's own copy when there is none."""
+    stable = Path(home or Path.home()) / ".claude" / "plugins" / "marketplaces" / "mother" / "bin" / "mother"
+    return str(stable if stable.is_file() else PLUGIN_ROOT / "bin" / "mother")
+
+
+def tmux_command(ws: Path, cfg: dict, tmux: str, claude: str, mother: Optional[str] = None) -> List[str]:
+    """Start the chief detached in tmux: resume its session, or create it under the same id on the first run.
+    PATH is set in the command itself (tmux into a running server inherits the server's environment, not the
+    keeper's), so the chief's bare `mother` resolves to the stable bin/mother."""
     sid = chief_session_id(ws)
-    start = "env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 %s --permission-mode bypassPermissions --model %s" % (
-        shlex.quote(claude), shlex.quote(str(settings(cfg)["chief_model"])))
+    path = hub.launch_path({"tmux": tmux, "claude": claude, "mother": mother or stable_mother()})
+    start = "env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 PATH=%s %s --permission-mode bypassPermissions --model %s" % (
+        shlex.quote(path), shlex.quote(claude), shlex.quote(str(settings(cfg)["chief_model"])))
     return [tmux, "new-session", "-d", "-s", TMUX_SESSION, "-c", str(ws),
             "%s --resume %s || %s --session-id %s" % (start, sid, start, sid)]
 
@@ -662,7 +672,8 @@ def _keeper_log(ws: Path, msg: str) -> None:
 
 
 def keep(ws: Path, cfg: dict, sleep=time.sleep, run=subprocess.run, stop=None, which=None) -> None:
-    """Every 30 s: no tmux session `mother-chief` means start it. `stop` ends the loop (tests); the launchd job
+    """Every 30 s: no tmux session `mother-chief` means start it. PAUSED is not read here: `tick` stops waking the
+    chief and the guard stops its tools, so an idle session costs nothing. `stop` ends the loop (tests); the launchd job
     never stops it."""
     ws = Path(ws)
     while not (stop and stop()):
@@ -670,11 +681,14 @@ def keep(ws: Path, cfg: dict, sleep=time.sleep, run=subprocess.run, stop=None, w
         if missing:
             _keeper_log(ws, "cannot start the chief: %s not found" % ", ".join(missing))
         else:
-            has = run([tmux, "has-session", "-t", TMUX_SESSION], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if has.returncode != 0:
-                r = run(tmux_command(ws, cfg, tmux, claude), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                _keeper_log(ws, "started %s" % TMUX_SESSION if r.returncode == 0
-                            else "start failed (exit %d)" % r.returncode)
+            try:
+                has = run([tmux, "has-session", "-t", TMUX_SESSION], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if has.returncode != 0:
+                    r = run(tmux_command(ws, cfg, tmux, claude), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    _keeper_log(ws, "started %s" % TMUX_SESSION if r.returncode == 0
+                                else "start failed (exit %d)" % r.returncode)
+            except OSError as e:
+                _keeper_log(ws, "tmux failed: %s" % e)
         sleep(KEEP_SECONDS)
 
 
@@ -682,13 +696,17 @@ def default_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / (LABEL + ".plist")
 
 
-def plist(ws: Path, cfg: dict, python: str, mother: str, found: Optional[Dict[str, str]] = None) -> str:
+def plist(ws: Path, cfg: dict, python: str, mother: str, found: Optional[Dict[str, str]] = None,
+          claude_bin: Optional[str] = None) -> str:
     """The launchd job: `mother chief keep`, always running. PATH holds the directories of tmux, claude and
     bin/mother, so the keeper (and the tmux server it starts) finds them."""
     import plistlib
+    env = {"MOTHER_WORKSPACE": str(ws), "PATH": hub.launch_path(dict(found or {}))}
+    if claude_bin:  # the keeper resolves claude again under launchd; the override must travel with it
+        env["MOTHER_CLAUDE_BIN"] = claude_bin
     doc = {"Label": LABEL,
            "ProgramArguments": [python, mother, "chief", "keep"],
-           "EnvironmentVariables": {"MOTHER_WORKSPACE": str(ws), "PATH": hub.launch_path(dict(found or {}))},
+           "EnvironmentVariables": env,
            "KeepAlive": True,
            "ThrottleInterval": 60,
            "RunAtLoad": True,
@@ -720,10 +738,11 @@ def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=
               "and there is one inbox cursor. Stop the hub, or pass --force." % HUB_ACTIVE_MINUTES, file=sys.stderr)
         return EXIT_FAILED
     python = python or os.path.abspath(sys.executable)
-    mother = mother or str(PLUGIN_ROOT / "bin" / "mother")
+    mother = mother or stable_mother()  # not the versioned cache copy: a plugin update would orphan the job
     chief_dir(ws).mkdir(parents=True, exist_ok=True)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text(plist(ws, cfg, python, mother, {"tmux": tmux, "claude": claude, "mother": mother}))
+    plist_path.write_text(plist(ws, cfg, python, mother, {"tmux": tmux, "claude": claude, "mother": mother},
+                                  claude_bin=os.environ.get("MOTHER_CLAUDE_BIN") or None))
     domain = "gui/%d" % os.getuid()
     ctl("bootout", "%s/%s" % (domain, LABEL))  # a reinstall replaces the loaded job; not loaded is fine
     for attempt in range(hub.BOOTSTRAP_TRIES):
@@ -736,14 +755,21 @@ def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=
         print("mother chief install: launchctl bootstrap failed: %s" % out, file=sys.stderr)
         return EXIT_FAILED
     print("installed %s (logs: %s)" % (plist_path, chief_dir(ws) / "keeper.log"))
+    print("After a plugin update, run `mother chief install` again.")
     print(BYPASS_NOTE)
     return EXIT_OK
 
 
-def uninstall(plist_path=None, ctl=None) -> int:
+def uninstall(plist_path=None, ctl=None, run=subprocess.run, which=None) -> int:
     ctl = ctl or hub.launchctl
     plist_path = Path(plist_path or default_plist_path())
     ctl("bootout", "gui/%d/%s" % (os.getuid(), LABEL))
+    tmux = resolve_bins(which)[0]
+    if tmux:  # the session is the bypass-mode claude: take it down with the job
+        try:
+            run([tmux, "kill-session", "-t", TMUX_SESSION], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError:
+            pass
     existed = plist_path.exists()
     if existed:
         plist_path.unlink()

@@ -3299,6 +3299,16 @@ class ChiefAllowance(GuardCase):
                 "python3 %s chief lines --json" % bin_mother,
                 'python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" chief run PLAT-1 --detach \'--prompt=x; y\'']
 
+    def test_chief_may_run_the_routines_hub_decide_unasked(self):
+        """The exact heredoc routines/chief.md tells the chief to run, placeholders filled in."""
+        text = open(os.path.join(ROOT, "routines", "chief.md")).read()
+        m = re.search(r"```\n(mother hub decide <<'HUBEOF'\n.*?\nHUBEOF)\n```", text, re.S)
+        self.assertIsNotNone(m)
+        cmd = re.sub(r"<[a-z ]+>", "x", m.group(1))
+        self.call("none", cmd)
+        os.remove(os.path.join(self.ws, ".mother", "hub", "fed-sessions.json"))
+        self.call("none", cmd)
+
     def test_chief_may_run_chief_verbs(self):
         for cmd in self.verbs():
             self.call("none", cmd)
