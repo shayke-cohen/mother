@@ -1262,6 +1262,78 @@ model in the loop: the Now panel's Archive, Mark read and "Archive N mail" butto
   exit 0 when every thread was done, 1 when any failed or was refused, 2 for usage, config or PAUSED.
 - **Chat.** The chat connectors have no mark-read tool, so chat rows get Done and Ignore only.
 
+## 5g. Chief (`lib/chief.py`, `mother chief`, `routines/chief.md`, `hooks/chief.tsx`)
+
+An optional layer over the hub. The **chief** is one long-lived Claude Code CLI session, kept alive in tmux by a
+launchd job (`mother chief install`), that decides the hub's inbox lines and starts **workers**: headless
+`claude -p` sessions, one per followed thing. Config: the optional `chief` block (§3), keys `max_workers` (3),
+`run_minutes` (20), `daily_budget_usd` (20), `chief_model` (`sonnet`), `worker_model` (empty: claude's default) and
+`tick_seconds` (30); unknown keys are dropped. Home machine only. The chief replaces a desktop `/mother:hub`
+session: there is one `inbox_cursor`, so `install` refuses while a hub wake is under 10 minutes old unless `--force`.
+
+- **Files, all under `.mother/chief/` (machine-local, gitignored).** `chief.json` (`{session_id}`: the chief's own
+  session id, a uuid4 made on first use; the guard reads it to know which session is the chief). `heartbeat.json`
+  (`{at, pid}`, written first on every tick, paused or not; the status calls the chief alive for 120 s). `wake.json`
+  (`{line_ids, at}`: the batch last woken for; the same batch is not woken again within 10 minutes). `queue.jsonl`
+  (one `{key, text, source, at}` per line, `source` `say` | `route` | `release`; text stored byte for byte; taken
+  atomically per key). `spend.json` (`{"YYYY-MM-DD": usd}` in the configured timezone, the last 14 days). `run/`
+  (`<worker name>.lock`: the flock a worker's turn holds, dropped by the OS on exit). `logs/` (`<worker name>.log`:
+  stdout and stderr of a detached run). `desktop.json` (`{at, sessions: [{session_id, cli_session_id, title, cwd,
+  link}]}`: the pinned desktop sessions, written only by `mother chief pinned --stdin`, below). Also `PAUSED` (the
+  chief-only switch), `desktop-cache.json` (fields read from the app's session files, keyed by mtime and size),
+  `keeper.log` and `keeper.out`. Every write is a temp-file rename; queue, spend, `chief.json` and `desktop.json`
+  take `hub.locked`.
+- **Worker fields in `sessions.json`** (§5e). A worker is a `sessions.json` entry with `kind: "cli"` and the hub
+  fields, plus `status` (`idle` | `working` | `failed`), `held` (bool), `progress` (the last non-empty line of the
+  result, at most 200 characters, or the error), `cost` (USD, all runs), `runs` (int) and `last_run_at`. An entry
+  with no `kind` is a desktop session: `run` and `say` refuse it (exit 2) because a CLI process cannot write to it.
+  `tick` finds a `working` worker with no held run lock and marks it `failed` ("run ended without a result").
+- **`run <key> [--detach] [--title=T] [--prompt=P]`.** One turn plus the queued text. Exit 0 ok, 1 failed, 2 usage,
+  3 paused or over budget (including an unreadable `spend.json`), 4 busy (held, already running, or at
+  `max_workers`; the prompt is queued as a `say`). `--detach` starts the same run in its own process group.
+  `say <key> -- <text>` queues the text and starts the worker when it is idle; `hold` / `release` take the worker
+  over and hand it back (release queues a note to re-read the latest turns). `pause` / `resume` touch only
+  `.mother/chief/PAUSED`, never `.mother/PAUSED`; either one pauses `tick`, `run` and the chief's tools.
+- **`tick [--json]`.** Writes the heartbeat; while paused stops there. Otherwise reconciles dead workers, logs lines
+  muted by the watch rules, routes lines whose key has a worker into that worker's queue, records those with
+  `hub decide`, and returns `wake` (text for the chief) with the `judge` line ids (at most 20) for the rest. It then
+  starts queued, unheld, non-failed workers within `max_workers`. The mod (`hooks/chief.tsx`) calls it every
+  `tick_seconds` and sends the wake into the chief session when no turn is running.
+- **Triage.** Before a wake, the mod asks Haiku (`$.model.complete`, 20 s timeout, 300 tokens) for a verdict
+  `{is_work, needs_attention, title, tldr}` per judge line (never for a `manual` line or one whose key has a live
+  session) and passes them to `mother chief triage --stdin`, which logs the leading lines that need no judgment
+  (`why: "triage: <title>"`; never `manual` or `error` lines, nor an update whose decide would also settle older
+  same-key updates) and rebuilds the wake with each kept line's title and tldr, marked as a model's summary of
+  untrusted text. Triage **fails toward waking**: a model error, a timeout, an unreadable reply or a failing CLI step
+  keeps the line and sends the original wake. Triage cost is **not** counted in `daily_budget_usd` (that covers
+  workers only; the mod's model call is not metered by the CLI).
+- **Pinned desktop sessions.** `mother chief pinned --stdin` takes `list_sessions` rows (JSON array) and writes
+  `desktop.json` from those with `pinned: true`; the CLI session id is read from the app's own `local_<id>.json`,
+  never from the row, and archived or unreadable sessions are dropped. A pinned session is shown, never driven by
+  the chief.
+- **`ChiefStatus`** (`status --json`, version 1, `types/index.d.ts`): `{version, at, paused, chief: {alive,
+  heartbeat_at, session_id}, budget: {spent, limit}, workers: [{key, title, status, held, running, progress, cost,
+  runs, last_run_at, session_id, queued, resume}], desktop: [{session_id, cli_session_id, title, cwd, repo,
+  last_activity_at, last_report, open_link}]}`. Workers: running first, then newest run. `desktop` is the snapshot
+  rows still live in the app (`last_report` is the first 200 characters of the last turn report); an older CLI omits
+  it. `spent` reads 0 when `spend.json` is unreadable.
+- **Keeper.** `install` writes `~/Library/LaunchAgents/com.mother.chief.plist` (`mother chief keep`, KeepAlive) and
+  loads it; every 30 s the keeper starts `tmux new-session -s mother-chief` when none exists, running
+  `claude --resume <id> || claude --session-id <id>` with `MOTHER_CHIEF_ROLE=chief`, `MOTHER_NO_SYNC=1` and
+  `--permission-mode bypassPermissions`. The user accepts the bypass warning once in `tmux attach -t mother-chief`.
+  The job points at the marketplace copy of `bin/mother`, so after a plugin update run `install` again. `uninstall`
+  unloads the job, kills the tmux session and removes the plist.
+- **Guard** (§5). The chief is the session whose id is in `chief.json` and whose environment has
+  `MOTHER_CHIEF_ROLE=chief`. It may run only one plain `mother chief` command per call, as
+  `mother` or this plugin's `bin/mother`: `lines [--json]`, `status [--json]`, `run <key> [--detach] [--title=T]
+  [--prompt=P]` (each flag at most once, value in the same token) and `say <key> -- <text>`; plus the
+  `mother hub decide` heredoc the hub rules already allow. No pipe, redirect, `$`, backtick, backslash or glob. A tool
+  write under `.mother/chief/` asks (`chief.json` is half of the chief's identity), and so does a write under
+  `~/.claude/sessions/` (the peer-socket registry). **Every message into a pinned desktop session asks**, naming the
+  session, whoever sends it (the pane's chat, a model's `SendMessage`, any session): nothing a session can write can
+  vouch for the pane. Workers run with `MOTHER_CHIEF_WORKER=<key>` and never the chief role.
+- **Phase 1 sends nothing.** A worker that needs a send reports it in `progress` and the chief records a `now` line.
+
 ## 6. Sync (`bin/mother sync`)
 
 - `--quiet` (the hook path) with nothing changed but appended `tick` lines in `runs.md` → no commit, no push,
