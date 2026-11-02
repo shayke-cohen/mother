@@ -137,6 +137,31 @@ export type InspectRef = {
 // What the panel holds of the hub files; null = the file is missing (or never read).
 export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null; watch: HubWatch | null }
 
+// `mother chief status --json` (lib/chief.py status_doc, version 1). Workers: running first, then newest last run.
+export type ChiefWorker = {
+  key: string
+  title: string
+  status: 'working' | 'idle' | 'done' | 'failed' | string
+  held: boolean
+  running: boolean        // holds the run lock now: a turn is in flight
+  progress: string
+  cost: number
+  runs: number
+  last_run_at: string | null
+  session_id: string | null
+  queued: number          // say/route lines waiting for this worker
+  resume: string          // `claude --resume <session_id>`
+}
+
+export type ChiefStatus = {
+  version: 1
+  at: string
+  paused: boolean
+  chief: { alive: boolean; heartbeat_at: string | null; session_id: string | null }
+  budget: { spent: number; limit: number }   // spent reads 0.0 when spend.json is unreadable
+  workers: ChiefWorker[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     mother: {
@@ -148,6 +173,9 @@ declare module 'claude-code' {
       expanded: string[] | null // Home groups drawn in full (`g-reply`, `g-review`, `g-other`, `g-suggestion`); `ignored` opens Ignored, `insp-more` the item page's extra moves, `insp-dropped` archived sessions
       hub: HubBundle | null     // watcher.json, hub.json, sessions.json and watch.json as last read
       inspect: InspectRef[] | null // the Inspector's back stack; the last ref is the page shown
+      chief: ChiefStatus | null    // `mother chief status --json` as last read; null until it answers
+      chiefRole: 'chief' | 'console' | null   // `mother chief role` at session start: only `chief` ticks and wakes
+      chiefError: string | null    // the last chief CLI failure the Chief pane shows
     }
   }
 }
