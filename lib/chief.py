@@ -706,8 +706,10 @@ def triage_apply(ws: Path, cfg: dict, at: datetime, verdicts: List[dict]) -> dic
 # ---- pinned desktop sessions: a snapshot the console writes from list_sessions, read back for the pane ----------
 
 REPORT_MAX = 200
-LOCAL_ID_RE = re.compile(r"^local_[0-9A-Za-z-]{1,80}$")
-CLI_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+APP_FILE_MAX = 2 * 1024 * 1024    # an app session file past this is skipped, never parsed
+APP_FIELDS = ("cliSessionId", "isArchived", "cwd", "lastActivityAt", "lastTurnReport")
+LOCAL_ID_RE = re.compile(r"local_[0-9A-Za-z-]{1,80}")
+CLI_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def default_app_dir() -> Path:
@@ -715,16 +717,41 @@ def default_app_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
 
 
-def _session_file(app_dir: Path, sid: str) -> Optional[dict]:
-    """The app's own record for `sid` (local_…): app_dir/, app_dir/*/ or app_dir/*/*/local_<id>.json; None when the
-    id is malformed, no file is found, or it cannot be read as an object."""
-    if not (isinstance(sid, str) and LOCAL_ID_RE.match(sid)):
+def _app_fields(path: Path, cache: Optional[dict] = None) -> Optional[dict]:
+    """The few fields the pane needs from one app session file (APP_FIELDS), or None when it is missing, over 2 MB
+    or not a JSON object. `cache` maps str(path) -> {mtime_ns, size, fields}: an unchanged file is not re-read."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if st.st_size > APP_FILE_MAX:
+        return None
+    key = str(path)
+    hit = (cache or {}).get(key)
+    if isinstance(hit, dict) and hit.get("mtime_ns") == st.st_mtime_ns and hit.get("size") == st.st_size \
+            and isinstance(hit.get("fields"), dict):
+        return hit["fields"]
+    doc = _read_obj(path)
+    if not doc:
+        return None
+    fields = {k: doc[k] for k in APP_FIELDS if k in doc}
+    if isinstance(fields.get("lastTurnReport"), str):
+        fields["lastTurnReport"] = fields["lastTurnReport"][:REPORT_MAX]
+    if cache is not None:
+        cache[key] = {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "fields": fields}
+    return fields
+
+
+def _session_file(app_dir: Path, sid: str, cache: Optional[dict] = None) -> Optional[dict]:
+    """The app's own record for `sid` (local_…): app_dir/, app_dir/*/ or app_dir/*/*/local_<id>.json, as its
+    APP_FIELDS; None when the id is malformed, no file is found, or it cannot be read (see _app_fields)."""
+    if not (isinstance(sid, str) and LOCAL_ID_RE.fullmatch(sid)):
         return None
     name = sid + ".json"
     base = Path(app_dir)
     for pattern in (name, "*/" + name, "*/*/" + name):
         for path in sorted(base.glob(pattern)):
-            doc = _read_obj(path)
+            doc = _app_fields(path, cache)
             if doc:
                 return doc
     return None
@@ -735,7 +762,7 @@ def _cli_id(doc: Optional[dict]) -> Optional[str]:
     if not doc or doc.get("isArchived") is True:
         return None
     cli = doc.get("cliSessionId")
-    return cli if isinstance(cli, str) and CLI_ID_RE.match(cli) else None
+    return cli if isinstance(cli, str) and CLI_ID_RE.fullmatch(cli) else None
 
 
 def pinned_snapshot(ws: Path, at: datetime, rows: List[dict], app_dir: Optional[Path] = None) -> int:
@@ -771,14 +798,20 @@ def _iso_ms(ms) -> Optional[str]:
 
 def desktop_status(ws: Path, app_dir: Optional[Path] = None) -> List[dict]:
     """The pane's Pinned rows: each snapshot row still live in the app, with its repo (cwd basename), last activity
-    (iso) and the first 200 characters of its last turn report."""
+    (iso) and the first 200 characters of its last turn report. The fields read from each app file are cached in
+    chief/desktop-cache.json by mtime and size, so an unchanged file (often hundreds of KB) is not parsed again."""
     app_dir = Path(app_dir or default_app_dir())
     snap = _read_obj(chief_dir(ws) / "desktop.json").get("sessions")
+    if not isinstance(snap, list) or not snap:
+        return []
+    cache_path = chief_dir(ws) / "desktop-cache.json"
+    before = _read_obj(cache_path)
+    cache = dict(before)
     out = []
-    for s in snap if isinstance(snap, list) else []:
+    for s in snap:
         if not isinstance(s, dict):
             continue
-        doc = _session_file(app_dir, s.get("session_id"))
+        doc = _session_file(app_dir, s.get("session_id"), cache)
         cli = _cli_id(doc)
         if cli is None or cli != s.get("cli_session_id"):
             continue
@@ -789,6 +822,13 @@ def desktop_status(ws: Path, app_dir: Optional[Path] = None) -> List[dict]:
                     "last_activity_at": _iso_ms(doc.get("lastActivityAt")),
                     "last_report": report[:REPORT_MAX] if isinstance(report, str) else "",
                     "open_link": s.get("link") if isinstance(s.get("link"), str) else None})
+    names = {"%s.json" % s.get("session_id") for s in snap if isinstance(s, dict)}
+    cache = {k: v for k, v in cache.items() if os.path.basename(k) in names}  # only the pinned sessions' files
+    if cache != before:
+        try:
+            _write_atomic(cache_path, json.dumps(cache) + "\n")
+        except OSError:
+            pass  # a cache that cannot be written only costs a re-read
     return out
 
 

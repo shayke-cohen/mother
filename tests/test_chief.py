@@ -832,6 +832,29 @@ class TestPinned(Base):
         with mock.patch.object(chief, "default_app_dir", return_value=self.app):
             self.assertEqual([d["session_id"] for d in chief.status_doc(self.ws, {}, AT)["desktop"]], ["local_a"])
 
+    def test_desktop_status_caps_and_caches_app_files(self):
+        self.session_file("local_a", CLI_A, lastTurnReport="first")
+        self.session_file("local_b", CLI_B)
+        chief.pinned_snapshot(self.ws, AT, [row("local_a"), row("local_b")], app_dir=self.app)
+        self.assertEqual(len(chief.desktop_status(self.ws, self.app)), 2)
+        cache = json.loads((chief.chief_dir(self.ws) / "desktop-cache.json").read_text())
+        self.assertEqual(sorted(os.path.basename(k) for k in cache), ["local_a.json", "local_b.json"])
+        # an unchanged file is not parsed again
+        with mock.patch.object(chief, "_read_obj", wraps=chief._read_obj) as reads:
+            chief.desktop_status(self.ws, self.app)
+        self.assertFalse(any(str(c.args[0]).endswith(("local_a.json", "local_b.json")) for c in reads.call_args_list))
+        # a changed file is (mtime or size moves)
+        self.session_file("local_a", CLI_A, lastTurnReport="second, longer")
+        self.assertEqual(chief.desktop_status(self.ws, self.app)[0]["last_report"], "second, longer")
+        # a file past the 2 MB cap is skipped, never parsed: the session drops out
+        self.session_file("local_b", CLI_B, padding="x" * (chief.APP_FILE_MAX + 1))
+        self.assertEqual([d["session_id"] for d in chief.desktop_status(self.ws, self.app)], ["local_a"])
+        self.assertEqual(chief.pinned_snapshot(self.ws, AT, [row("local_b")], app_dir=self.app), 0)
+
+    def test_ids_must_match_whole(self):
+        self.session_file("local_a", CLI_A + "\n")
+        self.assertEqual(chief.pinned_snapshot(self.ws, AT, [row("local_a"), row("local_a\n")], app_dir=self.app), 0)
+
     def test_cli_pinned_reads_rows_on_stdin(self):
         self.session_file("local_a", CLI_A)
         for stdin, code in ((json.dumps([row("local_a"), row("local_b", pinned=False)]), 0), ("{bad", 2),

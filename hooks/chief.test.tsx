@@ -398,16 +398,17 @@ const ROWS = [
 const PINNED = { session_id: 'local_a', cli_session_id: CLI_A, title: 'Fix the login bug', cwd: '/work/example-api',
   repo: 'example-api', last_activity_at: '2026-11-02T09:50:00Z', last_report: 'Merged the fix, CI green', open_link: null }
 
-type Pin = { mcp: any[]; pinnedStdins: string[]; sends: any[]; fills: string[] }
+type Pin = { mcp: any[]; pinnedStdins: string[]; sends: any[]; fills: string[]; writes: any[]; order: string[] }
 
 // mcp.call answers `mcp` (a value, or a deny for "not connected"); session.send answers `send`.
 async function bootPinned($: any, on: any, role: string, surface: 'terminal' | 'desktop',
                           mcp: () => any = () => ({ value: { content: [{ type: 'text', text: JSON.stringify(ROWS) }], isError: false } }),
                           send: (e: any) => any = () => ({ isDelivered: true })) {
-  const p: Pin = { mcp: [], pinnedStdins: [], sends: [], fills: [] }
+  const p: Pin = { mcp: [], pinnedStdins: [], sends: [], fills: [], writes: [], order: [] }
   on('session.surfaces', () => ({ value: [surface] }))
   on('mcp.call', (_: any, e: any) => { p.mcp.push(e); return mcp() })
-  on('session.send', (_: any, e: any) => { p.sends.push(e); return send(e) })
+  on('fs.write', (_: any, e: any) => { p.writes.push(e); p.order.push('write'); return { value: undefined } })
+  on('session.send', (_: any, e: any) => { p.sends.push(e); p.order.push('send'); return send(e) })
   on('prompt.fill', (_: any, e: any) => { p.fills.push(e.text); return { isFilled: true } })
   const booted = await boot($, on, role, (argv, stdin) => {
     if (argv[0] === 'pinned') { p.pinnedStdins.push(String(stdin ?? '')); return { exitCode: 0, stdout: '{"pinned": 1}\n' } }
@@ -454,6 +455,17 @@ test('test_pinned_snapshot_fails_soft_when_not_connected', async ($, on) => {
   await ui.unmount()
 })
 
+test('test_pinned_snapshot_hang_times_out', async ($, on) => {
+  const { clock, out, p } = await bootPinned($, on, 'console', 'desktop', () => new Promise(() => undefined))
+  const before = chiefCalls(out, 'status').length
+  await clock.advance(10_000)                                                // the start's call loses to the timer
+  await clock.advance(60_000)                                                // the next pass runs: not stuck busy
+  expect(p.mcp.length).toBe(2)
+  await clock.advance(10_000)
+  expect(chiefCalls(out, 'status').length).toBeGreaterThan(before)
+  expect(chiefCalls(out, 'pinned')).toEqual([])
+})
+
 test('test_pinned_chat_sends_to_cli_id', async ($, on) => {
   let deliver = true
   const { out, p } = await bootPinned($, on, 'console', 'desktop', undefined,
@@ -472,6 +484,16 @@ test('test_pinned_chat_sends_to_cli_id', async ($, on) => {
     expect(JSON.stringify(p.sends[0].to)).toContain(CLI_A)
     expect(JSON.stringify(p.sends[0].to)).not.toContain('local_a')
     expect(chiefCalls(out, 'say')).toEqual([])                               // never through the worker queue
+    // a one-shot ticket for exactly this send, written with $.fs just before it
+    expect(p.order.slice(-2)).toEqual(['write', 'send'])
+    const w = p.writes.at(-1)
+    expect(String(w.path)).toMatch(/^\/work\/ws\/\.mother\/chief\/send-tickets\/[0-9a-f-]{36}\.json$/)
+    const ticket = JSON.parse(String(w.text))
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(p.sends[0].text)))
+    expect(ticket.sha256).toBe(Array.from(digest, b => b.toString(16).padStart(2, '0')).join(''))
+    expect(ticket.to).toBe(CLI_A)
+    expect(Date.parse(ticket.expires) - Date.parse(ticket.at)).toBe(60_000)
+    expect(chiefCalls(out, 'ticket')).toEqual([])                            // no CLI verb writes a ticket
     expect(await hasText(ui, /^Sent: delivered$/)).toBe(true)
     deliver = false
     await ui.input({ key: 'say:' + CLI_A, text: 'again' })

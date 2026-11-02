@@ -504,12 +504,14 @@ def chief_dir_path(fp, ctx):
 
 
 def home_settings_path(fp):
-    """~/.claude/settings.json, ~/.claude/settings.local.json, ~/.claude.json, or anything under ~/.claude/plugins/."""
+    """~/.claude/settings.json, ~/.claude/settings.local.json, ~/.claude.json, or anything under ~/.claude/plugins/
+    or ~/.claude/sessions/ (the peer registry the guard maps a `uds:` send target through)."""
     home = os.path.realpath(os.path.expanduser("~")).casefold()
     f = fp.casefold()
     c = os.path.join(home, ".claude")
     return f in (os.path.join(c, "settings.json"), os.path.join(c, "settings.local.json"),
-                 os.path.join(home, ".claude.json")) or inside(f, os.path.join(c, "plugins"))
+                 os.path.join(home, ".claude.json")) or inside(f, os.path.join(c, "plugins")) \
+        or inside(f, os.path.join(c, "sessions"))
 
 
 def transcript_file(fp, ctx):
@@ -1966,8 +1968,10 @@ def shell_self_edit(cmd, run, cwd, ctx):
         t = os.path.realpath(os.path.expanduser(ctx.transcript)).lower()
         tforms = [t, ctx.transcript.lower(), os.path.basename(t)] + ([t[len("/private"):]] if t.startswith("/private/")
                                                                      else [])
-    if re.search(r"\.claude/+projects\b", re.sub(r"[\"'\\]", "", low)) or here == projects \
-            or here.startswith(projects + os.sep) or any(f and f in low for f in tforms):
+    sessions = os.path.realpath(os.path.join(home, ".claude", "sessions")).lower()
+    if re.search(r"\.claude/+(?:projects|sessions)\b", re.sub(r"[\"'\\]", "", low)) or here == projects \
+            or here.startswith(projects + os.sep) or here == sessions or here.startswith(sessions + os.sep) \
+            or any(f and f in low for f in tforms):
         return "home_settings"
     homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "guard_fast.py", "hooks.json"],
               "config")]
@@ -2049,7 +2053,8 @@ def classify_bash(cmd, cwd, ctx):
     touched = shell_self_edit(cmd, run, cwd, ctx)
     if touched == "home_settings":
         return act("home_settings", "home_settings", "a shell command that could change a session transcript "
-                                                     "(~/.claude/projects): " + cmd.strip()[:160])
+                                                     "(~/.claude/projects) or the session registry "
+                                                     "(~/.claude/sessions): " + cmd.strip()[:160])
     if not touched:
         prot = shell_protected(cmd, run, cwd, ctx)
         if prot == "grants":
@@ -2117,7 +2122,11 @@ def in_workspace(cwd, ctx):
     return inside(here, os.path.realpath(ctx.ws))
 
 
-UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+PID_FILE_RE = re.compile(r"([1-9][0-9]{0,9})\.json")
+TICKET_NAME_RE = re.compile(r"[0-9A-Za-z-]{8,80}\.json")
+TICKET_MAX_SECONDS = 120   # the mod writes at+60s; anything claiming longer is not the mod's
+TICKET_SKEW_SECONDS = 5
 
 
 def pinned_cli_ids(ctx):
@@ -2127,16 +2136,29 @@ def pinned_cli_ids(ctx):
     doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "desktop.json"))
     rows = doc.get("sessions") if ok and isinstance(doc, dict) else None
     return {str(r["cli_session_id"]) for r in (rows if isinstance(rows, list) else [])
-            if isinstance(r, dict) and isinstance(r.get("cli_session_id"), str) and UUID_RE.match(r["cli_session_id"])}
+            if isinstance(r, dict) and isinstance(r.get("cli_session_id"), str)
+            and UUID_RE.fullmatch(r["cli_session_id"])}
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
 
 
 def socket_session_id(sock):
-    """The session id behind a peer socket: the ~/.claude/sessions/<pid>.json whose messagingSocketPath is `sock`
-    (compared on real paths); None when none matches or it is ambiguous."""
-    root = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"),
-                        "sessions")
+    """The session id behind a peer socket: the ~/.claude/sessions/<pid>.json (named for a live pid, its `pid`
+    field the same) whose messagingSocketPath is `sock` on real paths; None when none matches or it is ambiguous.
+    That directory is home_settings: a tool or shell write to it asks."""
     if not sock.startswith("/"):
         return None
+    root = os.path.join(os.path.expanduser("~"), ".claude", "sessions")
     want = os.path.realpath(sock)
     found = set()
     try:
@@ -2144,21 +2166,81 @@ def socket_session_id(sock):
     except OSError:
         return None
     for n in names:
-        if not n.endswith(".json"):
+        m = PID_FILE_RE.fullmatch(n)
+        if not m:
             continue
         doc, ok = read_json(os.path.join(root, n))
         if not (ok and isinstance(doc, dict)):
             continue
-        path, sid = doc.get("messagingSocketPath"), doc.get("sessionId")
-        if isinstance(path, str) and path and isinstance(sid, str) and os.path.realpath(path) == want:
+        pid, path, sid = doc.get("pid"), doc.get("messagingSocketPath"), doc.get("sessionId")
+        if not (isinstance(pid, int) and not isinstance(pid, bool) and str(pid) == m.group(1)):
+            continue
+        if isinstance(path, str) and path and isinstance(sid, str) and os.path.realpath(path) == want \
+                and pid_alive(pid):
             found.add(sid)
     return found.pop() if len(found) == 1 else None
 
 
-def pinned_send_ok(target, ctx):
-    """A SendMessage to a pinned desktop session (its CLI id, or the `uds:<socket>` the engine spells it as) from a
-    session that is not hub-fed and not the chief: the Chief pane's chat, typed by the manager. The chief, its
-    workers and every hub-fed session still ask, and so does everything while .mother/PAUSED is on."""
+def send_text(inp):
+    v = inp.get("message")
+    if not isinstance(v, str):
+        v = inp.get("text")
+    return v if isinstance(v, str) else None
+
+
+def take_send_ticket(ctx, cli_id, text, now=None):
+    """Consume the Chief pane's one-shot ticket for this send: .mother/chief/send-tickets/<id>.json
+    {to, sha256, at, expires}, written by the mod (never a tool call: .mother/chief/ writes ask) just before its
+    $.session.send. It must name `cli_id` and the sha256 of the exact text, and be unexpired (at most 120 s long).
+    A match is claimed by an atomic rename, then removed, so it covers one send. Expired or malformed tickets are
+    swept. True only for a claimed match."""
+    import hashlib
+    if not (ctx.ws and isinstance(text, str)):
+        return False
+    d = os.path.join(ctx.ws, ".mother", "chief", "send-tickets")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return False
+    now = time.time() if now is None else now
+    want = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    hit = False
+    for n in names:
+        if not TICKET_NAME_RE.fullmatch(n):
+            continue
+        path = os.path.join(d, n)
+        doc, ok = read_json(path)
+        at = parse_time(doc.get("at")) if ok and isinstance(doc, dict) else None
+        exp = parse_time(doc.get("expires")) if ok and isinstance(doc, dict) else None
+        sane = at is not None and exp is not None and at <= now + TICKET_SKEW_SECONDS and \
+            0 < exp - at <= TICKET_MAX_SECONDS
+        if not sane or exp < now:
+            if ok:  # an unreadable file may be one the mod is still writing: leave it
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            continue
+        if hit or doc.get("to") != cli_id or doc.get("sha256") != want:
+            continue
+        claimed = path + ".taken.%d" % os.getpid()
+        try:
+            os.rename(path, claimed)
+        except OSError:
+            continue  # another send claimed it first
+        try:
+            os.remove(claimed)
+        except OSError:
+            pass
+        hit = True
+    return hit
+
+
+def pinned_send_ok(target, inp, ctx):
+    """A SendMessage to a pinned desktop session (its CLI id, or the `uds:<socket>` the engine spells it as) that the
+    Chief pane sent: a one-shot ticket for that session and that exact text exists (take_send_ticket), and the
+    session is not hub-fed and not the chief. The chief, its workers, every hub-fed session, a model's own
+    SendMessage (no ticket) and everything while .mother/PAUSED is on still ask."""
     if not (target and ctx.ws and ctx.sid) or hub_fed(ctx) or paused(ctx):
         return False
     if os.environ.get(CHIEF_ROLE_ENV) == "chief" or os.environ.get("MOTHER_CHIEF_WORKER"):
@@ -2171,7 +2253,9 @@ def pinned_send_ok(target, ctx):
         return False
     if target.startswith("uds:"):
         target = socket_session_id(target[len("uds:"):]) or ""
-    return target in pinned
+    if target not in pinned:
+        return False
+    return take_send_ticket(ctx, target, send_text(inp))
 
 
 def session_target(tool, inp, ctx, cwd=None):
@@ -2187,7 +2271,7 @@ def session_target(tool, inp, ctx, cwd=None):
             what = "a message into session %s, which is not a live hub session" % (target or "(none named)")
     elif tool == "SendMessage":
         target = str(inp.get("to") or "").strip()
-        if pinned_send_ok(target, ctx):
+        if pinned_send_ok(target, inp, ctx):
             return None
         if SESSION_ID_RE.match(target):
             if target not in live_hub_sessions(ctx):
