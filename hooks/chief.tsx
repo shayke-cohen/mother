@@ -234,30 +234,6 @@ export const PINNED_PREFIX = 'From Shay via the Chief pane: '
 const PINNED_SERVER = 'ccd_session_mgmt'
 const PINNED_LIMIT = 40
 const MCP_TIMEOUT_MS = 10_000
-const TICKET_MS = 60_000
-
-async function sha256Hex(text: string): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
-  return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('')
-}
-
-// The guard passes a pinned send only with a one-shot ticket for that session and that exact text, which the mod
-// writes here just before sending: .mother/chief/send-tickets/<uuid>.json = {to, sha256, at, expires (at+60s)}.
-// $.fs, not a tool call (a tool's or shell's write under .mother/chief/ asks), and no CLI verb writes one. No
-// ticket written means the guard asks, which is still a safe send.
-async function writeTicket($: Dollar, bin: string, cliId: string, text: string): Promise<void> {
-  try {
-    const ran = await $.process.run(['python3', bin, 'path'])
-    const ws = String(ran.stdout ?? '').trim()
-    if (ran.exitCode !== 0 || !ws) return
-    const nowMs = await $.clock.now()
-    const ticket = { to: cliId, sha256: await sha256Hex(text), at: new Date(nowMs).toISOString(),
-                     expires: new Date(nowMs + TICKET_MS).toISOString() }
-    await $.fs.write(`${ws}/.mother/chief/send-tickets/${crypto.randomUUID()}.json`, JSON.stringify(ticket))
-  } catch {
-    // the guard will ask instead
-  }
-}
 
 // list_sessions rows from an MCP result: its structuredContent when that is the array, else the first text block
 // that parses as one. null for anything else.
@@ -300,11 +276,11 @@ async function snapshotPinned($: Dollar, bin: string): Promise<void> {
 }
 
 // The pane's chat into a pinned session: straight to it by its CLI id, prefixed so the session knows where it came
-// from, after a ticket that lets the guard pass exactly this send. The card says whether it was delivered.
-async function sendPinned($: Dollar, bin: string, cliId: string, value: string): Promise<void> {
+// from. The guard asks the manager to confirm every such send; a declined one comes back undelivered, and the card
+// says so (never a toast or a pane error).
+async function sendPinned($: Dollar, cliId: string, value: string): Promise<void> {
   let said: string
   const text = PINNED_PREFIX + value
-  await writeTicket($, bin, cliId, text)
   try {
     const r = await $.session.send({ to: { sessionId: cliId }, text })
     said = r.isDelivered ? 'delivered' : `not delivered: ${r.reason}`
@@ -369,7 +345,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
         {said ? <Text color={said === 'delivered' ? undefined : 'warning'}>{said === 'delivered' ? 'Sent: delivered' : `Sent: ${said}`}</Text> : null}
         <Box flexWrap="wrap" gap="xs">
           <Input key={'say:' + d.cli_session_id} placeholder="Tell this session…" submitLabel="send"
-            onSubmit={(value: string) => { if (value.trim()) void sendPinned($, bin, d.cli_session_id, value) }} />
+            onSubmit={(value: string) => { if (value.trim()) void sendPinned($, d.cli_session_id, value) }} />
           <Button key={'open:' + d.cli_session_id}
             onPress={() => { void $.prompt.fill({ text: `Open my "${d.title}" session`, mode: 'replace' }) }}>Open</Button>
         </Box>

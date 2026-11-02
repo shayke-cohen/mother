@@ -484,16 +484,7 @@ test('test_pinned_chat_sends_to_cli_id', async ($, on) => {
     expect(JSON.stringify(p.sends[0].to)).toContain(CLI_A)
     expect(JSON.stringify(p.sends[0].to)).not.toContain('local_a')
     expect(chiefCalls(out, 'say')).toEqual([])                               // never through the worker queue
-    // a one-shot ticket for exactly this send, written with $.fs just before it
-    expect(p.order.slice(-2)).toEqual(['write', 'send'])
-    const w = p.writes.at(-1)
-    expect(String(w.path)).toMatch(/^\/work\/ws\/\.mother\/chief\/send-tickets\/[0-9a-f-]{36}\.json$/)
-    const ticket = JSON.parse(String(w.text))
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(p.sends[0].text)))
-    expect(ticket.sha256).toBe(Array.from(digest, b => b.toString(16).padStart(2, '0')).join(''))
-    expect(ticket.to).toBe(CLI_A)
-    expect(Date.parse(ticket.expires) - Date.parse(ticket.at)).toBe(60_000)
-    expect(chiefCalls(out, 'ticket')).toEqual([])                            // no CLI verb writes a ticket
+    expect(p.writes).toEqual([])                                             // no file vouches for the send
     expect(await hasText(ui, /^Sent: delivered$/)).toBe(true)
     deliver = false
     await ui.input({ key: 'say:' + CLI_A, text: 'again' })
@@ -504,6 +495,25 @@ test('test_pinned_chat_sends_to_cli_id', async ($, on) => {
     expect(p.fills.at(-1)).toBe('Open my "Fix the login bug" session')
     await ui.unmount()
   }
+})
+
+test('test_pinned_send_declined_shows_not_delivered', async ($, on) => {
+  // the guard's question, answered no: the send resolves undelivered, or the call rejects; either way the card
+  // says "not delivered", with no toast and no pane error
+  let mode: 'declined' | 'throws' = 'declined'
+  const { out } = await bootPinned($, on, 'console', 'desktop', undefined, () => {
+    if (mode === 'throws') throw new Error('the person declined the message')
+    return { isDelivered: false, reason: 'declined by the person' }
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.input({ key: 'say:' + CLI_A, text: 'ship it' })
+  expect(await hasText(ui, /^Sent: not delivered: declined by the person$/)).toBe(true)
+  mode = 'throws'
+  await ui.input({ key: 'say:' + CLI_A, text: 'ship it' })
+  expect(await hasText(ui, /^Sent: not delivered: /)).toBe(true)
+  expect(await hasText(ui, /^Sent: delivered$/)).toBe(false)
+  expect(out.toasts).toEqual([])
+  await ui.unmount()
 })
 
 test('test_pinned_cards_have_no_takeover', async ($, on) => {
