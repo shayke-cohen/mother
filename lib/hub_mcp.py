@@ -64,13 +64,16 @@ class Client:
 
     @staticmethod
     def _pump(proc, q) -> None:
-        for line in proc.stdout:
-            line = line.strip()
-            if line:
-                try:
-                    q.put(json.loads(line))
-                except ValueError:
-                    pass
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    try:
+                        q.put(json.loads(line))
+                    except ValueError:
+                        pass
+        except (ValueError, OSError):
+            pass  # close() shut stdout under us: the same end as EOF, not a traceback in the log
         q.put(None)  # EOF
 
     def _send(self, method: str, params=None, notify: bool = False):
