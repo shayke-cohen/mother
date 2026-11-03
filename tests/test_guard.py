@@ -3485,6 +3485,29 @@ class ChiefAllowance(GuardCase):
         self.assertNotEqual(self.run_guard("Bash", {"command": decide}, session=self.WORKER, env={}, mode=self.BY,
                                            cwd=self.ws)[0], "deny")
 
+    def test_worker_file_writes_to_the_hub_deny(self):
+        """Re-review I5: the file tools reach the same hub state as `mother hub` writes, so a worker is denied
+        Write/Edit/MultiEdit/NotebookEdit under .mother/hub/ in every mode; a non-worker keeps today's answer."""
+        hub_dir = os.path.join(self.ws, ".mother", "hub")
+        worker = {"MOTHER_CHIEF_WORKER": "PLAT-1"}
+        calls = [("Write", {"file_path": os.path.join(hub_dir, "hub.json"), "content": "{}"}),
+                 ("Edit", {"file_path": os.path.join(hub_dir, "sessions.json"), "old_string": "live",
+                           "new_string": "dropped"}),
+                 ("Write", {"file_path": os.path.join(hub_dir, "watch.json"), "content": "{}"}),
+                 ("Write", {"file_path": ".mother/hub/hub.json", "content": "{}"}),
+                 ("MultiEdit", {"file_path": os.path.join(self.ws, "notes", "..", ".mother", "hub", "hub.json"),
+                                "edits": [{"old_string": "a", "new_string": "b"}]}),
+                 ("NotebookEdit", {"notebook_path": os.path.join(hub_dir, "x.ipynb"), "new_source": "x"})]
+        for tool, inp in calls:
+            for mode in ("default", "acceptEdits", self.BY):
+                why = self.expect("deny", tool, inp, session=self.WORKER, env=worker, mode=mode, cwd=self.ws)
+                self.assertIn("chief worker", why)
+        self.assertNotEqual(self.run_guard("Write", {"file_path": os.path.join(hub_dir, "hub.json"), "content": "{}"},
+                                           session="fresh-2222", env={}, mode=self.BY, cwd=self.ws)[0], "deny")
+        # a worker's ordinary workspace edit is untouched
+        self.expect("none", "Write", {"file_path": os.path.join(self.ws, "notes", "a.md"), "content": "x"},
+                    session=self.WORKER, env=worker, mode=self.BY, cwd=self.ws)
+
     def test_chief_ask_becomes_deny(self):
         """Final review I2: the chief runs unattended, so a question would stall it unseen. Any ask from the chief's
         own session (or a sub-agent of it), PAUSED or not, is a deny that says to propose it instead. Other

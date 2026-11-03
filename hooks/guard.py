@@ -4897,6 +4897,21 @@ WORKER_HUB_READS = {"", "status", "check", "show", "watching", "tail", "help", "
 WORKER_HUB_READ_SUBS = {("session", "for"), ("dms", "show")}
 
 
+WORKER_FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def worker_hub_path(inp, cwd, ctx):
+    """True when a file tool's target is, on real paths (casefolded), inside <ws>/.mother/hub/."""
+    if not ctx.ws:
+        return False
+    raw = inp.get("file_path") or inp.get("notebook_path") or ""
+    if not raw:
+        return False
+    fp = os.path.realpath(os.path.join(cwd or ctx.ws, os.path.expanduser(str(raw))))
+    d = os.path.realpath(os.path.join(ctx.ws, ".mother", "hub"))
+    return inside(fp.casefold(), d.casefold())
+
+
 def worker_hub_write(text):
     """The `mother hub` write a command runs (decide, mute, follow, session add|drop|seen, pending, add, done, ...),
     or None. Quotes and backslashes are dropped first, so a quoted verb still reads as one."""
@@ -4967,6 +4982,12 @@ def _run(raw):
                              "PROGRESS line what should be decided, and the chief decides it." % w)
                 log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
                 return r
+        if tool in WORKER_FILE_TOOLS and os.environ.get(CHIEF_WORKER_ENV, "").strip() \
+                and worker_hub_path(inp, payload.get("cwd"), ctx):
+            r = "deny", ("%s under .mother/hub/ from a chief worker: the hub's state (cursor, sessions, mutes) is the "
+                         "chief's; say in your PROGRESS line what should change, and the chief decides it." % tool)
+            log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
+            return r
         role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
         if role:
             r = channel_session(tool, inp, payload.get("cwd"), ctx, role)
