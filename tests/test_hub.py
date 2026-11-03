@@ -1717,6 +1717,28 @@ class Verbs(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]["session_id"], "S2")
 
+    # ---- chief Task 3b: a chief worker (kind "cli") belongs to `mother chief`, never to `hub session add`
+    def test_session_add_refuses_cli_worker(self):
+        import contextlib
+        import io
+        doc = {"version": 1, "sessions": {"PLAT-1": {"session_id": "W1", "name": "plat-1", "title": "t", "also": [],
+                                                    "state": "live", "kind": "cli", "status": "idle", "held": False}}}
+        hub.save_json(self.ws, "sessions.json", doc)
+        for sid in ("W1", "S-OTHER"):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc, _ = self.session("add", "PLAT-1", "--id", sid, "--name", "n", "--title", "t2", raw=True)
+            self.assertEqual(rc, 1)
+            self.assertIn("a chief worker; use mother chief", err.getvalue())
+        self.assertEqual(hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"], doc["sessions"]["PLAT-1"])
+        # dropped, it is still the chief's
+        rc, _ = self.session("drop", "PLAT-1")
+        self.assertEqual(rc, 0)
+        s = hub.load_json(self.ws, "sessions.json", {})["sessions"]["PLAT-1"]
+        self.assertEqual((s["state"], s["kind"], s["status"], s["held"]), ("dropped", "cli", "idle", False))
+        rc, _ = self.session("add", "PLAT-1", "--id", "W1", "--name", "n", "--title", "t", raw=True)
+        self.assertEqual(rc, 1)
+
     # ---- red-team smaller item: decide refuses a line id whose line has another key
     def test_decide_refuses_a_line_id_with_another_key(self):
         l = line(key="PLAT-1")

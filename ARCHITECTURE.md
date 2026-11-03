@@ -45,6 +45,7 @@ holds code a later session would run.
 | `lib/hub_mcp.py` | Minimal MCP stdio client plus the read-only wrapper the watcher uses | Allow-list enforced before send. CONTRACT §5e |
 | `lib/inbox.py` | `mother inbox archive\|read`: the Now panel's mail triage over the hub's mail connection, no model | Asks `guard.classify_mcp` before each write, stops while PAUSED, logs to guard.log; the triage tools live in `hub_sources.MailGmail.TRIAGE`. CONTRACT §5f |
 | `lib/hub_sources.py` | Per-capability poll adapters and the deterministic prefilter | Product-specific tool names live only here. The `whatsapp` adapter reads through `LocalWhatsApp` (the reader functions of `lib/whatsapp.py` only: no bridge, no send). CONTRACT §5e |
+| `lib/chief.py` | Chief workers: headless Claude sessions registered in the hub's `sessions.json`, the say queue, daily spend, pause, `run`, and the tmux keeper + launchd job that keep the chief's own session alive | One writer per worker (flock); every state write under `hub.locked`. Python 3.9 stdlib only |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
 | `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |
@@ -60,7 +61,8 @@ Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `d
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
-`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
+`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`, `chief` (not scheduled: the chief's
+standing instructions, read by its own CLI session).
 
 ## How a scheduled run flows
 
@@ -113,6 +115,7 @@ pinned desktop session (/mother:hub): Monitor on `tail --follow` wakes it on eac
   ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
   ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`); pending and unseen expire after update_ttl_hours working hours
   └─ in-app session tools pass the guard only inside what the hub manages (messages into live sessions.json sessions, own_initiative cards); anything else asks; sub-agents and channel sessions are denied
+chief (optional, replaces the pinned hub session): launchd keeper → tmux `mother-chief` → the chief's own CLI session, woken by `mother chief tick` (heartbeat, route what needs no judgment, Haiku triage in the mod, wake); decides with `mother hub decide`, starts headless workers with `mother chief run` (flock per worker, state in sessions.json `kind: "cli"`, spend and queue under `.mother/chief/`); the Chief pane shows it and the pinned desktop sessions. CONTRACT §5g
 Now panel: Home's Sessions group (news first, proposals, View all) and an Inspector page per session (routed lines, what it watches); Open session fills the prompt to open it and marks it seen; the manager sends it (desktop draws only https links)
 ```
 

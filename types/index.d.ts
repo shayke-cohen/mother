@@ -118,6 +118,7 @@ export type HubSession = {
   opened_at?: string; last_routed_at?: string | null
   unseen?: number
   state: 'live' | 'dropped'
+  kind?: 'cli'            // a chief worker (`mother chief`); the hub and its panel leave it alone
 }
 
 export type HubSessions = { version: 1; sessions: Record<string, HubSession> }
@@ -136,6 +137,46 @@ export type InspectRef = {
 // What the panel holds of the hub files; null = the file is missing (or never read).
 export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null; watch: HubWatch | null }
 
+// `mother chief status --json` (lib/chief.py status_doc, version 1). Workers: running first, then newest last run.
+export type ChiefWorker = {
+  key: string
+  title: string
+  status: 'working' | 'idle' | 'done' | 'failed' | string
+  held: boolean
+  running: boolean        // holds the run lock now: a turn is in flight
+  progress: string
+  cost: number
+  runs: number
+  last_run_at: string | null
+  session_id: string | null
+  queued: number          // say/route lines waiting for this worker
+  resume: string          // `claude --resume <session_id>`
+}
+
+// A pinned desktop session (lib/chief.py desktop_status), from the snapshot the desktop console writes.
+export type ChiefDesktop = {
+  session_id: string                 // local_…
+  cli_session_id: string             // what $.session.send reaches it by
+  title: string
+  cwd: string
+  repo: string                       // the cwd's basename
+  last_activity_at: string | null
+  last_report: string                // the first 200 characters of its last turn report
+  open_link: string | null
+}
+
+export type ChiefStatus = {
+  version: 1
+  at: string
+  paused: boolean
+  chief: { alive: boolean; heartbeat_at: string | null; session_id: string | null }
+  // spent reads 0.0 when spend.json is unreadable; unreadable and over (spent >= limit, or unreadable) mean no run
+  // starts; both are absent from an older CLI
+  budget: { spent: number; limit: number; unreadable?: boolean; over?: boolean }
+  workers: ChiefWorker[]
+  desktop?: ChiefDesktop[]           // pinned desktop sessions; absent from an older CLI
+}
+
 declare module 'claude-code' {
   interface PluginState {
     mother: {
@@ -147,6 +188,10 @@ declare module 'claude-code' {
       expanded: string[] | null // Home groups drawn in full (`g-reply`, `g-review`, `g-other`, `g-suggestion`); `ignored` opens Ignored, `insp-more` the item page's extra moves, `insp-dropped` archived sessions
       hub: HubBundle | null     // watcher.json, hub.json, sessions.json and watch.json as last read
       inspect: InspectRef[] | null // the Inspector's back stack; the last ref is the page shown
+      chief: ChiefStatus | null    // `mother chief status --json` as last read; null until it answers
+      chiefRole: 'chief' | 'console' | null   // `mother chief role` at session start: only `chief` ticks and wakes
+      chiefError: string | null    // the last chief CLI failure the Chief pane shows
+      chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
     }
   }
 }

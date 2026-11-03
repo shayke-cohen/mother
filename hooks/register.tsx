@@ -1,6 +1,9 @@
 import { atom, read, update } from 'claude-code'
-import type { Hook, Register, Timer } from 'claude-code'
+import type { Register, Timer } from 'claude-code'
 
+import { chiefPass, chiefStatusText, registerChief, startChief } from './chief'
+import { ago, clock, motherBin } from './shared'
+import type { Dollar } from './shared'
 import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, HubWatch, InspectRef, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
 
 // State the Now panel (Task 9) draws from. Keys are declared in types/index.d.ts.
@@ -12,6 +15,10 @@ export const selectedAtom = atom({ plugin: 'mother', key: 'selected' } as const,
 export const expandedAtom = atom({ plugin: 'mother', key: 'expanded' } as const, null)
 export const hubAtom = atom({ plugin: 'mother', key: 'hub' } as const, null)
 export const inspectAtom = atom({ plugin: 'mother', key: 'inspect' } as const, null)
+// The Chief pane's (hooks/chief.tsx writes them); the status line reads them. The state scan wants each read's atom
+// declared in the reading file, so these repeat chief.tsx's refs.
+const chiefAtom = atom({ plugin: 'mother', key: 'chief' } as const, null)
+const chiefRoleAtom = atom({ plugin: 'mother', key: 'chiefRole' } as const, null)
 
 const PANE = 'mother-now'
 const FOCUS = 'mother-focus'
@@ -21,8 +28,9 @@ const TOP_MAX = 3
 export const POLL_MS = 60_000
 export const TOASTED_CAP = 500
 
-// The engine interface a hook receives; the helpers below take it so Task 9 can pass its own `$`.
-export type Dollar = Parameters<Hook<'session.start'>>[0]
+// Moved to ./shared (the Chief pane uses them too); re-exported so existing imports keep working.
+export { ago, clock, motherBin }
+export type { Dollar }
 
 // What `load` remembers between polls: the mtime it last read, so an unchanged file is not re-read.
 export type FileLoader = { mtimeMs: number | null; statFailed: boolean }
@@ -51,8 +59,9 @@ const NO_HUB: HubBundle = { hub: null, sessions: null, watcher: null, watch: nul
 const WATCHER_DOWN_MS = 10 * 60_000
 const ROUTED_SHOWN = 10
 
+// A chief worker (kind 'cli') is the Chief pane's, not a hub session: it is never listed or counted here.
 export const liveSessions = (s: HubSessions | null | undefined): [string, HubSession][] =>
-  Object.entries(s?.sessions ?? {}).filter(([, v]) => v && v.state === 'live')
+  Object.entries(s?.sessions ?? {}).filter(([, v]) => v && v.state === 'live' && v.kind !== 'cli')
 
 // The sessions with an update the manager has not looked at, plus the cards waiting to be started.
 export const waitingCount = (h: HubBundle): number =>
@@ -103,14 +112,6 @@ export function hubStatus(h: HubBundle, nowMs: number): string {
   return (health === 'alive' ? ' · hub ●' : health === 'stale' ? ' · hub ◌ stale' : ' · hub ✗') + (n > 0 ? ` · ${n} waiting` : '')
 }
 
-// Empty (the default) means this plugin's own bin/mother: the panel ships inside the mother plugin.
-export async function motherBin($: Dollar, configured: string): Promise<string> {
-  if (!configured) return $.plugin.root + '/bin/mother'
-  if (configured !== '~' && !configured.startsWith('~/')) return configured
-  const home = (await $.env.get('HOME')) ?? ''
-  return home + configured.slice(1)
-}
-
 async function workspace($: Dollar, bin: string): Promise<string | null> {
   const known = await read($, workspaceAtom)
   if (known) return known
@@ -149,8 +150,14 @@ export async function load($: Dollar, bin: string, loader: Loader): Promise<void
     await readDoc($, `${ws}/.mother/now.json`, loader)
     await readHub($, `${ws}/.mother/hub`, loader).catch(() => undefined)   // the hub never un-reads the list
   }
+  await drawStatus($)
+}
+
+// The status line from what is held: now.json, the hub files and the Chief pane's last status.
+async function drawStatus($: Dollar): Promise<void> {
   const nowMs = await $.clock.now()
-  $.ui.status(statusText(await read($, docAtom), nowMs) + hubStatus((await read($, hubAtom)) ?? NO_HUB, nowMs))
+  $.ui.status(statusText(await read($, docAtom), nowMs) + hubStatus((await read($, hubAtom)) ?? NO_HUB, nowMs)
+    + chiefStatusText(await read($, chiefAtom), await read($, chiefRoleAtom)))
 }
 
 // Only a missing file means "no tick here"; any other failure keeps the previous doc and sets `error`.
@@ -252,24 +259,6 @@ const pendingKey = (p: HubPending): string => `${p.key}@${p.proposed_at}`
 
 // ---- time ------------------------------------------------------------------------------------------
 
-// HH:MM of an ISO instant in the doc's timezone. Falls back to the HH:MM written in the ISO string
-// (the instant's own clock, which is UTC for what lib/now.py writes) when Intl or the zone is missing.
-export function clock(iso: string | undefined | null, tz: string | null | undefined): string {
-  if (!iso) return '--:--'
-  const ms = Date.parse(iso)
-  if (tz && !Number.isNaN(ms)) {
-    try {
-      const parts = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(ms)
-      const part = (t: string) => parts.find(p => p.type === t)?.value
-      const h = part('hour'), m = part('minute')
-      if (h && m) return `${h === '24' ? '00' : h}:${m}`
-    } catch {
-      // fall through to the ISO text
-    }
-  }
-  return /T(\d\d:\d\d)/.exec(iso)?.[1] ?? '--:--'
-}
-
 // YYYY-MM-DD of an instant in the doc's timezone (the manager's local date); UTC when the zone is unknown.
 export function localDate(nowMs: number, tz: string | null | undefined): string {
   if (tz) {
@@ -289,14 +278,6 @@ export function localDate(nowMs: number, tz: string | null | undefined): string 
 export function age(since: string, nowMs: number): string {
   const hours = Math.max(0, Math.floor((nowMs - Date.parse(since)) / 3_600_000))
   return Number.isNaN(hours) ? '' : hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`
-}
-
-// A coarse age for the hub rows: minutes matter there.
-export function ago(iso: string | undefined | null, nowMs: number): string {
-  const ms = iso ? Date.parse(iso) : NaN
-  if (Number.isNaN(ms)) return ''
-  const mins = Math.max(0, Math.floor((nowMs - ms) / 60_000))
-  return mins < 1 ? 'now' : mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins / 60)}h` : `${Math.floor(mins / 1440)}d`
 }
 
 // ---- writes ----------------------------------------------------------------------------------------
@@ -1351,6 +1332,7 @@ export const register: Register = (on, options) => {
   const configured = String(options.mother_bin ?? '').trim()
   const loader = newLoader()
   let timer: Timer | undefined
+  let chiefTimer: Timer | undefined
 
   on('session.start', async ($, e, next) => {
     const bin = await motherBin($, configured)
@@ -1365,6 +1347,19 @@ export const register: Register = (on, options) => {
     await poll()
     timer?.cancel()          // a repeated session.start must not stack a second poll
     timer = $.clock.every(POLL_MS, poll)
+    // The Chief pane's timer lives here, so each pass can redraw the status line (chief.tsx cannot call drawStatus).
+    // A failure never stops the Now panel.
+    const armChief = (ms: number) => {
+      chiefTimer?.cancel()   // a repeated session.start, or a role that just settled, must not stack a second timer
+      chiefTimer = $.clock.every(ms, async () => {
+        const changed = await chiefPass($, configured).catch(() => null)
+        await drawStatus($).catch(() => undefined)
+        if (changed) armChief(changed)
+      })
+    }
+    const chiefMs = await startChief($, configured).catch(() => null)
+    if (chiefMs) armChief(chiefMs); else chiefTimer?.cancel()
+    await drawStatus($).catch(() => undefined)               // now with the chief's state, without re-reading files
     return next(e)
   })
 
@@ -1397,4 +1392,6 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) =>
     homeTree($, $.ui.resolve(e), await makeCtx($, e.surface, configured, loader), await read($, errorAtom), await read($, selectedAtom)))
+
+  registerChief(on, configured)
 }

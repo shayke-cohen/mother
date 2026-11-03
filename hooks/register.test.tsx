@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { hubStatus, quickActions, sourceMark, sourceStale } from './register'
+import { hubStatus, liveSessions, quickActions, sourceMark, sourceStale, waitingCount } from './register'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-10-26T10:00:00Z')
@@ -1049,6 +1049,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await hasText(ui, /hub ●/)).toBe(true)
     await ip.unmount()
     await ui.unmount()
+  })
+
+  test(`a chief worker is not listed as a hub session, on ${surface}`, () => {
+    // kind "cli": a worker the Chief pane owns, kept in sessions.json by `mother chief`
+    const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 2 }), 'PLAT-5': session({ session_id: 'w-1', unseen: 3, kind: 'cli' }) })
+    expect(liveSessions(ss as any).map(([k]) => k)).toEqual(['PLAT-2'])
+    expect(waitingCount(bundle(watcher(), hubDoc(), ss) as any)).toBe(1)
+    expect(hubStatus(bundle(watcher(), hubDoc(), ss), NOW)).toBe(' · hub ● · 1 waiting')
   })
 
   test(`sourceStale: own interval, active hours only, ${surface}`, () => {

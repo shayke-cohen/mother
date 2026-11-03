@@ -173,6 +173,16 @@ Without it the Now panel shows `whatsapp ✗` and `mother hub status` says the s
 Finally run `/mother:hub` once in a pinned session, in normal permission mode (not bypass), and leave it open: it
 wakes on each update and routes it. `mother hub status` shows whether the watcher and hub are keeping up.
 
+**Turn on the chief (optional).** The chief is a long-lived Claude Code session that decides the hub's inbox lines
+and starts headless workers for the ones that need work; the Chief pane in the desktop app shows it, its workers and
+your pinned desktop sessions. On the home machine run `mother chief install`: it writes a launchd job whose keeper
+keeps a tmux session named `mother-chief` alive. The chief runs in bypass-permissions mode, so the first time run
+`tmux attach -t mother-chief` and accept that warning yourself; nothing accepts it for you. The chief replaces a
+desktop `/mother:hub` session (there is one inbox cursor), and the install refuses while one is active unless you
+pass `--force`. Caps (`max_workers`, `run_minutes`, `daily_budget_usd`, models) live in an optional `chief` block of
+`config.json`. After a plugin update run `mother chief install` again. `mother chief status` shows the state, and
+`mother chief pause` / `resume` is its own switch (it never touches `.mother/PAUSED`).
+
 **Another computer, same workspace:** install the plugin, run `mother link` as above, then
 `mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines
 (`mother home show`), so don't register them on the second one.

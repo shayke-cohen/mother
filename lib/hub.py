@@ -1666,6 +1666,7 @@ def hub_lagging(w: dict, h: dict, at: datetime) -> bool:
 # ------------------------------------------------------------------------------------------- hub verbs
 ROUTED_MAX = 50
 ALSO_MAX = 50
+WHY_MAX = 200
 DECISIONS = ("log", "now", "route", "propose", "error")
 
 
@@ -1898,6 +1899,8 @@ def decide(ws: Path, cfg: dict, at: datetime, items: List[dict]) -> List[dict]:
             res = {"line_id": it["line_id"], "key": key, "decision": dec}
             also = list(it.get("also") or line.get("also") or [])
             entry = {"line_id": it["line_id"], "key": key, "decision": dec, "at": stamp}
+            if isinstance(it.get("why"), str) and it["why"].strip():
+                entry["why"] = " ".join(it["why"].split())[:WHY_MAX]  # the audit trail of why it was decided so
             if dec in ("route", "now"):
                 hit = find_session(sess, [key] + also)
                 if hit and dec == "now":
@@ -2029,6 +2032,10 @@ def session_cmd(ws: Path, cfg: dict, at: datetime, args, as_json: bool, out) -> 
                 return 2
             also = [a for a in str(o.get("also") or "").split(",") if a]
             prev = items.get(key) or {}
+            if prev.get("kind") == "cli":
+                # a worker `mother chief` runs headless: the hub never repoints or refreshes it
+                print("mother hub session add: %s is a chief worker; use mother chief" % key, file=sys.stderr)
+                return 1
             was = next((p for p in h["pending"] if p.get("key") == key), None)
             raised = bool(was and was.get("raised_at"))
             if prev.get("state") == "live" and str(prev.get("session_id")) != str(o["id"]) and not raised:

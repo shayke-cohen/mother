@@ -494,13 +494,24 @@ def grants_path(ctx):
     return _cf(os.path.join(ctx.ws, ".mother", "grants.json")) if ctx.ws else None
 
 
+def chief_dir_path(fp, ctx):
+    """A real path inside <ws>/.mother/chief/ (casefolded): chief.json is half of the chief's identity
+    (chief_session), so only `mother chief` writes there, never a tool call unasked."""
+    if not ctx.ws:
+        return False
+    d = os.path.realpath(os.path.join(ctx.ws, ".mother", "chief")).casefold()
+    return inside(fp.casefold(), d)
+
+
 def home_settings_path(fp):
-    """~/.claude/settings.json, ~/.claude/settings.local.json, ~/.claude.json, or anything under ~/.claude/plugins/."""
+    """~/.claude/settings.json, ~/.claude/settings.local.json, ~/.claude.json, or anything under ~/.claude/plugins/
+    or ~/.claude/sessions/ (the peer registry the guard maps a `uds:` send target through)."""
     home = os.path.realpath(os.path.expanduser("~")).casefold()
     f = fp.casefold()
     c = os.path.join(home, ".claude")
     return f in (os.path.join(c, "settings.json"), os.path.join(c, "settings.local.json"),
-                 os.path.join(home, ".claude.json")) or inside(f, os.path.join(c, "plugins"))
+                 os.path.join(home, ".claude.json")) or inside(f, os.path.join(c, "plugins")) \
+        or inside(f, os.path.join(c, "sessions"))
 
 
 def transcript_file(fp, ctx):
@@ -1957,8 +1968,10 @@ def shell_self_edit(cmd, run, cwd, ctx):
         t = os.path.realpath(os.path.expanduser(ctx.transcript)).lower()
         tforms = [t, ctx.transcript.lower(), os.path.basename(t)] + ([t[len("/private"):]] if t.startswith("/private/")
                                                                      else [])
-    if re.search(r"\.claude/+projects\b", re.sub(r"[\"'\\]", "", low)) or here == projects \
-            or here.startswith(projects + os.sep) or any(f and f in low for f in tforms):
+    sessions = os.path.realpath(os.path.join(home, ".claude", "sessions")).lower()
+    if re.search(r"\.claude/+(?:projects|sessions)\b", re.sub(r"[\"'\\]", "", low)) or here == projects \
+            or here.startswith(projects + os.sep) or here == sessions or here.startswith(sessions + os.sep) \
+            or any(f and f in low for f in tforms):
         return "home_settings"
     homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "guard_fast.py", "hooks.json"],
               "config")]
@@ -2040,7 +2053,8 @@ def classify_bash(cmd, cwd, ctx):
     touched = shell_self_edit(cmd, run, cwd, ctx)
     if touched == "home_settings":
         return act("home_settings", "home_settings", "a shell command that could change a session transcript "
-                                                     "(~/.claude/projects): " + cmd.strip()[:160])
+                                                     "(~/.claude/projects) or the session registry "
+                                                     "(~/.claude/sessions): " + cmd.strip()[:160])
     if not touched:
         prot = shell_protected(cmd, run, cwd, ctx)
         if prot == "grants":
@@ -2108,20 +2122,137 @@ def in_workspace(cwd, ctx):
     return inside(here, os.path.realpath(ctx.ws))
 
 
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+PID_FILE_RE = re.compile(r"([1-9][0-9]{0,9})\.json")
+
+
+def pinned_sessions(ctx):
+    """{cli_session_id: title} of the pinned desktop sessions the console snapshotted (.mother/chief/desktop.json)."""
+    if not ctx.ws:
+        return {}
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "desktop.json"))
+    rows = doc.get("sessions") if ok and isinstance(doc, dict) else None
+    return {r["cli_session_id"]: " ".join(str(r.get("title") or "").split())[:80]
+            for r in (rows if isinstance(rows, list) else [])
+            if isinstance(r, dict) and isinstance(r.get("cli_session_id"), str)
+            and UUID_RE.fullmatch(r["cli_session_id"])}
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def socket_session_id(sock):
+    """The session id behind a peer socket: the ~/.claude/sessions/<pid>.json (named for a live pid, its `pid`
+    field the same) whose messagingSocketPath is `sock` on real paths; None when none matches or it is ambiguous.
+    That directory is home_settings: a tool or shell write to it asks."""
+    if not sock.startswith("/"):
+        return None
+    root = os.path.join(os.path.expanduser("~"), ".claude", "sessions")
+    want = os.path.realpath(sock)
+    found = set()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    for n in names:
+        m = PID_FILE_RE.fullmatch(n)
+        if not m:
+            continue
+        doc, ok = read_json(os.path.join(root, n))
+        if not (ok and isinstance(doc, dict)):
+            continue
+        pid, path, sid = doc.get("pid"), doc.get("messagingSocketPath"), doc.get("sessionId")
+        if not (isinstance(pid, int) and not isinstance(pid, bool) and str(pid) == m.group(1)):
+            continue
+        if isinstance(path, str) and path and isinstance(sid, str) and os.path.realpath(path) == want \
+                and pid_alive(pid):
+            found.add(sid)
+    return found.pop() if len(found) == 1 else None
+
+
+def pinned_target(target, ctx):
+    """The title of the pinned desktop session `target` reaches (its CLI id, or the `uds:<socket>` the engine spells
+    a plugin's send as), else None. Every message into one asks, wherever it comes from: the Chief pane's chat, a
+    model's SendMessage, any session. Nothing a session can write (a file, a ticket) can vouch for the pane, since
+    a shell can write it too."""
+    pinned = pinned_sessions(ctx) if target else {}
+    if not pinned:
+        return None
+    sid = socket_session_id(target[len("uds:"):]) if target.startswith("uds:") else target
+    return pinned.get(sid) if sid in pinned else None
+
+
+CHIEF_ALIVE_SECONDS = 120
+
+
+def chief_peer_ids(ctx):
+    """The chief's session id (.mother/chief/chief.json) and every chief worker's (sessions.json kind "cli"), or an
+    empty set when no chief is installed here."""
+    if not ctx.ws:
+        return set()
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
+    sid = doc.get("session_id") if ok and isinstance(doc, dict) else None
+    if not (isinstance(sid, str) and sid):
+        return set()
+    ids = {sid}
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "hub", "sessions.json"))
+    items = doc.get("sessions") if ok and isinstance(doc, dict) else None
+    for e in (items.values() if isinstance(items, dict) else []):
+        if isinstance(e, dict) and e.get("kind") == "cli" and isinstance(e.get("session_id"), str) and e["session_id"]:
+            ids.add(e["session_id"])
+    return ids
+
+
+def chief_alive(ctx):
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "heartbeat.json")) if ctx.ws else ({}, False)
+    at = parse_time(doc.get("at")) if ok and isinstance(doc, dict) else None
+    return at is not None and abs(time.time() - at) < CHIEF_ALIVE_SECONDS
+
+
+def chief_peer_socket(target, ctx):
+    """A `uds:<socket>` send that reaches the chief or a chief worker: both act on what they are told with no one
+    watching, and the chief holds an unasked allowance. The socket maps to a session id through the live-pid
+    ~/.claude/sessions registry; a socket that maps to nothing asks too while the chief is alive (fail toward
+    asking). No chief installed: False, today's rules."""
+    if not target.startswith("uds:"):
+        return False
+    ids = chief_peer_ids(ctx)
+    if not ids:
+        return False
+    sid = socket_session_id(target[len("uds:"):])
+    return sid in ids if sid is not None else chief_alive(ctx)
+
+
 def session_target(tool, inp, ctx, cwd=None):
     """A message into a session passes only when that session is one the hub routes to (a `live` entry in
     sessions.json); anything else could carry untrusted source text into an unrelated session, so it asks. In the
     workspace (where the hub runs) `SendMessage` by name passes only for `main` or a live hub session's name,
     with or without a ` [ref]` suffix. A card passes only as `own_initiative` (it waits for the manager) or as
-    the start of an existing proposal."""
-    what = None
+    the start of an existing proposal. A `SendMessage` into a pinned desktop session (pinned_target) always asks,
+    naming the session, whoever sends it."""
+    what, keep = None, False
     if tool == "mcp__ccd_session_mgmt__send_message":
         target = str(inp.get("session_id") or "")
         if target not in live_hub_sessions(ctx):
             what = "a message into session %s, which is not a live hub session" % (target or "(none named)")
     elif tool == "SendMessage":
         target = str(inp.get("to") or "").strip()
-        if SESSION_ID_RE.match(target):
+        title = pinned_target(target, ctx)
+        if title is not None:
+            what = "Chief pane: message to pinned session '%s' \u2014 confirm" % (title or target)
+        elif chief_peer_socket(target, ctx) or target in chief_peer_ids(ctx):
+            what = "a message into the chief or a chief worker (%s): they act on it unattended" % target
+            keep = True  # bypass mode outside the workspace does not pass it: the sender's mode is not the chief's
+        elif SESSION_ID_RE.match(target):
             if target not in live_hub_sessions(ctx):
                 what = "a message into session %s, which is not a live hub session" % target
         elif in_workspace(cwd, ctx) and target != "main":
@@ -2135,7 +2266,7 @@ def session_target(tool, inp, ctx, cwd=None):
         if not (inp.get("initiation") == "own_initiative" or (keys == {"proposal_id"} and inp.get("proposal_id"))):
             what = "starting a session now (initiation %s), not a card the manager starts" % (
                 inp.get("initiation") or "none")
-    return act("session", "session_messages", what) if what else None
+    return act("session", "session_messages", what, keep_ask=keep) if what else None
 
 
 def classify_mcp(tool, inp):
@@ -3347,6 +3478,9 @@ def classify(tool, inp, cwd, ctx):
                 return act("home_settings", "home_settings", "an edit to a session transcript: " + fp)
             if fp.casefold() == grants_path(ctx):
                 return act("grants", "grants_file", "an edit to .mother/grants.json")
+            if chief_dir_path(fp, ctx):
+                return act("grants", "grants_file", "an edit to .mother/chief/ (chief.json names the chief; only "
+                                                    "`mother chief` writes there): " + fp)
             if persona_path(fp, ctx):
                 return act("persona", "persona_files", "an edit to the workspace's standing instructions: " + fp)
         return None
@@ -3432,7 +3566,10 @@ def green(a, ctx, auto):
 
 # ------------------------------------------------------------------ session approvals (attended runs)
 
-APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))\s*$", re.I)
+# A leading approve line; after the scope or target comes the end of the line, whitespace or `. , ; : !`, so
+# "mother approve shell. I keep getting prompts" counts and "mother approve shellfish" does not. Never `?`: a
+# question ("mother approve shell? what does it do") is not a yes.
+APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))(?=$|[\s.,;:!])", re.I)
 APPROVE_ANY_RE = re.compile(r"^\s*mother\s*approve\b", re.I | re.M)
 LINE_BREAKS_RE = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 SESSION_APPROVAL_MAX_HOURS = 12
@@ -3540,9 +3677,11 @@ def session_approvals(transcript, max_hours=SESSION_APPROVAL_MAX_HOURS, now=None
                     break
                 if m.group(3):  # `mother approve shell`: the workspace allow-list's questions, this session
                     found.add(("shell", "*"))
-                    continue
-                scope = m.group(1).lower()
-                found.add((scope, m.group(2).upper() if scope == "tracker" else m.group(2)))
+                else:
+                    scope = m.group(1).lower()
+                    found.add((scope, m.group(2).upper() if scope == "tracker" else m.group(2)))
+                if ln[m.end():].strip():
+                    break  # prose follows on this line: the approve block ends here
     return found
 
 
@@ -4585,6 +4724,73 @@ def hub_gh_ok(prog, args):
     return True
 
 
+CHIEF_ROLE_ENV = "MOTHER_CHIEF_ROLE"
+CHIEF_RUN_VALUES = ("--title=", "--prompt=")
+
+
+def chief_session(ctx, payload):
+    """The call comes from the chief: MOTHER_CHIEF_ROLE is exactly `chief` in the hook's environment, the session
+    id is `session_id` in .mother/chief/chief.json (missing or unreadable: not the chief), the call is not a
+    sub-agent's (one carries its parent's session id), and neither .mother/PAUSED nor a dry run is on (both keep
+    today's rules). The role alone is not enough: a worker could set it."""
+    if os.environ.get(CHIEF_ROLE_ENV) != "chief" or not (ctx.ws and ctx.sid) or payload.get("agent_type") \
+            or paused(ctx) or os.environ.get(DRY_RUN_ENV, "").strip():
+        return False
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
+    want = doc.get("session_id") if ok and isinstance(doc, dict) else None
+    return isinstance(want, str) and bool(want) and want == ctx.sid
+
+
+def chief_command(cmd):
+    """True for exactly one `mother chief lines|status|run|say …` the chief may run: `mother`, this plugin's
+    bin/mother by its own path (not a symlink to it), or `python3` of it; never `${CLAUDE_PLUGIN_ROOT}`. Read by the shell allow-list's lexer
+    (sl_lex): one stage, no newline, redirection or heredoc, and no `$` expansion, backtick, backslash, glob or
+    comment outside quotes, so a value may hold any other text quoted. The shapes:
+    `lines [--json]`, `status [--json]`, `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a
+    non-empty value in the same token) and `say <key> -- <text…>`."""
+    if "\n" in cmd or "\r" in cmd or hub_odd_chars(cmd) or "CLAUDE_PLUGIN_ROOT" in cmd:
+        return False  # the guard would read ${CLAUDE_PLUGIN_ROOT} as this plugin; the chief's shell has it unset
+    plugin = os.path.dirname(HERE)
+    try:
+        stages = sl_lex(cmd, plugin)
+    except Exception:
+        return False
+    if len(stages) != 1 or stages[0]["redirs"] or stages[0]["heredocs"] or stages[0].get("sep"):
+        return False
+    words = stages[0]["words"]
+    mine = os.path.join(plugin, "bin", "mother")
+
+    def is_mine(p):  # the path as written, not through a symlink a session could repoint after this check
+        return os.path.isabs(p) and os.path.abspath(p) == mine and os.path.realpath(p) == os.path.realpath(mine)
+
+    if words[:1] == ["python3"]:
+        words = words[1:]
+        if not (words and is_mine(words[0])):
+            return False
+    elif not words or not (words[0] == "mother" or is_mine(words[0])):
+        return False
+    args = words[1:]
+    if len(args) < 2 or args[0] != "chief":
+        return False
+    verb, rest = args[1], args[2:]
+    if verb in ("lines", "status"):
+        return rest in ([], ["--json"])
+    if not rest or not rest[0] or rest[0].startswith("-"):
+        return False
+    key, rest = rest[0], rest[1:]
+    if verb == "say":
+        return len(rest) >= 2 and rest[0] == "--"
+    if verb != "run":
+        return False
+    seen = set()
+    for a in rest:
+        flag = a if a == "--detach" else next((f for f in CHIEF_RUN_VALUES if a.startswith(f) and a != f), None)
+        if flag is None or flag in seen:
+            return False
+        seen.add(flag)
+    return True
+
+
 def hub_bad_field(v):
     """True when a nested input names a field that is, or ends in, url/uri/href/path/file/dest/destination."""
     if isinstance(v, dict):
@@ -4669,7 +4875,77 @@ def key_touch(tool, inp, cwd):
     return fp.casefold() == key.casefold()
 
 
+def chief_identity(ctx, payload):
+    """The chief's own session, or a sub-agent of it: MOTHER_CHIEF_ROLE=chief and the call's session id is
+    chief.json's, whatever PAUSED or a dry run says. Nobody watches it, so a question it raises is never seen."""
+    sid = payload.get("session_id")
+    if os.environ.get(CHIEF_ROLE_ENV) != "chief" or not ctx.ws or not (isinstance(sid, str) and sid):
+        return False
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
+    want = doc.get("session_id") if ok and isinstance(doc, dict) else None
+    return isinstance(want, str) and bool(want) and want == sid
+
+
+CHIEF_NO_ASK = ("The chief runs unattended, so nobody would see this question: denied (%s). Do not retry it or try "
+                "another way; propose it as a decision for the manager instead (record the line as `now` with a "
+                "one-sentence why) and carry on.")
+
+CHIEF_WORKER_ENV = "MOTHER_CHIEF_WORKER"
+# `mother hub <verb> [<sub>]` anywhere in a command (by name or path, python3 or not)
+WORKER_HUB_RE = re.compile(r"(?:^|[^\w.-])mother\s+hub\b\s*([\w-]*)\s*([\w-]*)")
+# what a worker may still run: reads that change no hub state
+WORKER_HUB_READS = {"", "status", "check", "show", "watching", "tail", "help", "-h", "--help"}
+WORKER_HUB_READ_SUBS = {("session", "for"), ("dms", "show")}
+
+
+WORKER_FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def worker_hub_path(inp, cwd, ctx):
+    """True when a file tool's target is, on real paths (casefolded), inside <ws>/.mother/hub/."""
+    if not ctx.ws:
+        return False
+    raw = inp.get("file_path") or inp.get("notebook_path") or ""
+    if not raw:
+        return False
+    fp = os.path.realpath(os.path.join(cwd or ctx.ws, os.path.expanduser(str(raw))))
+    d = os.path.realpath(os.path.join(ctx.ws, ".mother", "hub"))
+    return inside(fp.casefold(), d.casefold())
+
+
+def worker_hub_write(text):
+    """The `mother hub` write a command runs (decide, mute, follow, session add|drop|seen, pending, add, done, ...),
+    or None. Quotes and backslashes are dropped first, so a quoted verb still reads as one."""
+    norm = re.sub(r"[\"'\\]", "", text).casefold()
+    for m in WORKER_HUB_RE.finditer(norm):
+        verb, sub = m.group(1), m.group(2)
+        if verb in WORKER_HUB_READS or (verb, sub) in WORKER_HUB_READ_SUBS:
+            continue
+        return ("mother hub %s %s" % (verb, sub)).strip()
+    return None
+
+
 def run(raw):
+    """Returns (decision, reason) or None. Never raises. A question the chief's own session would raise is a deny
+    instead (chief_identity): it runs unattended and an ask would stall it unseen."""
+    r = _run(raw)
+    if not (r and r[0] == "ask"):
+        return r
+    try:
+        payload = json.loads(raw or "")
+        if not isinstance(payload, dict):
+            return r
+        ctx = load_ctx()
+        if not chief_identity(ctx, payload):
+            return r
+        reason = CHIEF_NO_ASK % r[1]
+        log(ctx, str(payload.get("tool_name")), {"kind": "chief", "category": "chief"}, "deny", reason)
+        return "deny", reason
+    except Exception:
+        return r
+
+
+def _run(raw):
     """Returns (decision, reason) or None. Never raises."""
     try:
         payload = json.loads(raw or "")
@@ -4695,6 +4971,23 @@ def run(raw):
         if key_touch(tool, inp, payload.get("cwd")):
             r = "deny", "%s on the grant key (%s): only `mother grant` reads it." % (tool, grant_key_path())
             log(ctx, tool, {"kind": "grant-key", "category": "grant_key"}, r[0], r[1])
+            return r
+        # A chief worker (MOTHER_CHIEF_WORKER, set by `mother chief run` in the worker's own process env) reads
+        # untrusted text headless: it may read the hub but never change it (log lines, mute, drop sessions).
+        text = str(inp.get("command") or "") if tool in ("Bash", "Monitor") or \
+            tool.split("__")[-1] == "run_in_terminal" else ""
+        if text and os.environ.get(CHIEF_WORKER_ENV, "").strip():
+            w = worker_hub_write(text)
+            if w:
+                r = "deny", ("`%s` from a chief worker: a worker may read the hub but never change it; say in your "
+                             "PROGRESS line what should be decided, and the chief decides it." % w)
+                log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
+                return r
+        if tool in WORKER_FILE_TOOLS and os.environ.get(CHIEF_WORKER_ENV, "").strip() \
+                and worker_hub_path(inp, payload.get("cwd"), ctx):
+            r = "deny", ("%s under .mother/hub/ from a chief worker: the hub's state (cursor, sessions, mutes) is the "
+                         "chief's; say in your PROGRESS line what should change, and the chief decides it." % tool)
+            log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
             return r
         role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
         if role:
@@ -4727,6 +5020,10 @@ def run(raw):
                 if r != "normal":
                     log(ctx, tool, {"kind": "hub-session", "category": "hub"}, r[0], r[1])
                     return r
+        # The chief (MOTHER_CHIEF_ROLE=chief and its id in .mother/chief/chief.json) runs its own `mother chief`
+        # verbs unasked, hub-fed or not; every other session, a hub-fed worker included, gets the rules below.
+        if tool == "Bash" and chief_session(ctx, payload) and chief_command(str(inp.get("command") or "")):
+            return None
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             # The channels loop's session: a plain `mother channels plan` that gets no decision, run as itself in the
@@ -4753,6 +5050,7 @@ def run(raw):
         # In the workspace an ask stays an ask unless the manager set policy.bypass_passes_asks; the guard's own
         # files, grants.json and the persona files always ask.
         if r[0] == "ask" and a["kind"] not in ("config", "grants", "persona", "home_settings", "manager_only") \
+                and not a.get("keep_ask") \
                 and payload.get("permission_mode") == "bypassPermissions" \
                 and (bypass_passes(ctx) or shell_in_bypass(ctx, a) or not in_workspace(payload.get("cwd"), ctx)):
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])
