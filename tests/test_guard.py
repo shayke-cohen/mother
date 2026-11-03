@@ -3560,6 +3560,24 @@ class ChiefAllowance(GuardCase):
         os.remove(os.path.join(self.ws, ".mother", "chief", "chief.json"))
         self.expect("none", "SendMessage", send, session="other-3333", cwd=out)
 
+    def test_raw_id_send_to_chief_or_worker_keeps_its_ask(self):
+        """Re-review N1: a SendMessage by the chief's or a worker's raw session id asks like the uds: form, bypass
+        outside the workspace included (a worker id is a live hub session, which used to pass)."""
+        chief_id, worker_id = "11111111-2222-3333-4444-555555555555", "66666666-7777-4888-8999-aaaaaaaaaaaa"
+        self.write_chief({"session_id": chief_id})
+        with open(os.path.join(self.ws, ".mother", "hub", "sessions.json"), "w") as f:
+            json.dump({"version": 1, "sessions": {"PLAT-1": {
+                "session_id": worker_id, "name": "plat-1", "title": "t", "also": [], "state": "live",
+                "kind": "cli", "status": "idle", "held": False}}}, f)
+        out = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(out)
+        for target in (chief_id, worker_id):
+            for cwd in (out, self.ws):
+                for mode in ("default", self.BY):
+                    why = self.expect("ask", "SendMessage", {"to": target, "message": "x"}, session="other-3333",
+                                      mode=mode, cwd=cwd)
+                    self.assertIn("chief or a chief worker", why)
+
     def test_other_hub_fed_session_still_asks_for_chief_run(self):
         for cmd in self.verbs():
             self.call("ask", cmd, session=self.WORKER, env={})  # a worker: hub-fed, no chief role

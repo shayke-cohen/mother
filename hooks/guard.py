@@ -2249,7 +2249,7 @@ def session_target(tool, inp, ctx, cwd=None):
         title = pinned_target(target, ctx)
         if title is not None:
             what = "Chief pane: message to pinned session '%s' \u2014 confirm" % (title or target)
-        elif chief_peer_socket(target, ctx):
+        elif chief_peer_socket(target, ctx) or target in chief_peer_ids(ctx):
             what = "a message into the chief or a chief worker (%s): they act on it unattended" % target
             keep = True  # bypass mode outside the workspace does not pass it: the sender's mode is not the chief's
         elif SESSION_ID_RE.match(target):
