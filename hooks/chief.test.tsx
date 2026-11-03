@@ -26,7 +26,7 @@ type Cli = { exitCode: number; stdout?: string; stderr?: string }
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, role: string, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
-                    surface: 'terminal' | 'desktop' = 'terminal') {
+                    surface: 'terminal' | 'desktop' = 'terminal', sessionId = 'chief-1') {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m' })
   const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
@@ -40,6 +40,7 @@ async function boot($: any, on: any, role: string, chief: (argv: string[], stdin
   on('prompt.submit', (_: any, e: any, next: any) => { out.submits.push(e.text); return next(e) })
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
+  on('session.id', () => ({ value: sessionId }))
   on('fs.stat', () => ({ deny: 'ENOENT' }))
   on('fs.read', () => ({ deny: 'ENOENT' }))
   on('process.run', async (_: any, e: any) => {
@@ -480,7 +481,7 @@ test('test_pinned_chat_sends_to_cli_id', async ($, on) => {
     expect(await hasText(ui, /Merged the fix, CI green/)).toBe(true)
     await ui.input({ key: 'say:' + CLI_A, text: '--help "x"\ny' })
     expect(p.sends.length).toBe(1)
-    expect(p.sends[0].text).toBe('From Shay via the Chief pane: --help "x"\ny')
+    expect(p.sends[0].text).toBe('From the manager via the Chief pane: --help "x"\ny')
     expect(JSON.stringify(p.sends[0].to)).toContain(CLI_A)
     expect(JSON.stringify(p.sends[0].to)).not.toContain('local_a')
     expect(chiefCalls(out, 'say')).toEqual([])                               // never through the worker queue
@@ -583,4 +584,51 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
+})
+
+test('test_stuck_turn_expires_after_30_minutes', async ($, on) => {
+  const wake = 'Chief wake: 1 inbox lines need a decision.'
+  let next: string | null = wake
+  const { clock, out } = await boot($, on, 'chief', argv => {
+    if (argv[0] !== 'tick') return undefined
+    const w = next
+    next = null
+    return { exitCode: 0, stdout: JSON.stringify({ wake: w }) }
+  })
+  await $.turn.start({ text: 'Chief wake: earlier batch', turnId: 't1' })   // its turn.complete never comes
+  await clock.advance(30_000)
+  expect(out.submits).toEqual([])                                          // held while the turn runs
+  await clock.advance(29 * 60_000 - 60_000)                                // 29 minutes after the turn began
+  expect(out.submits).toEqual([])
+  await clock.advance(2 * 60_000)                                          // 31 minutes: treated as over
+  expect(out.submits).toEqual([wake])
+})
+
+test('test_chief_session_id_mismatch_stops_ticking', async ($, on) => {
+  const wake = 'Chief wake: 1 inbox lines need a decision.'
+  const { clock, out } = await boot($, on, 'chief', argv =>
+    argv[0] === 'tick' ? { exitCode: 0, stdout: JSON.stringify({ wake }) } : undefined, 'terminal', 'after-clear-2')
+  await clock.advance(30_000)
+  await clock.advance(30_000)
+  expect(chiefCalls(out, 'tick')).toEqual([])
+  expect(out.submits).toEqual([])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await hasText(ui, /chief session id changed — run `mother chief install` again/)).toBe(true)
+  await ui.unmount()
+})
+
+test('test_pane_shows_unreadable_and_spent_budget', async ($, on) => {
+  let budget: Record<string, unknown> = { spent: 0, limit: 20, unreadable: true, over: true }
+  await boot($, on, 'console', argv =>
+    argv[0] === 'status' ? { exitCode: 0, stdout: JSON.stringify(status({ budget })) } : undefined)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await hasText(ui, /spend file unreadable/)).toBe(true)
+    await ui.unmount()
+  }
+  budget = { spent: 21, limit: 20, unreadable: false, over: true }
+  await $.command.run({ command: 'chief', args: 'pause' } as any)        // any verb reloads the status
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await hasText(ui, /Budget \$21\.00 of \$20\.00 today · spent: no run starts/)).toBe(true)
+  await ui.unmount()
 })

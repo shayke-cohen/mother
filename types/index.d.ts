@@ -170,7 +170,9 @@ export type ChiefStatus = {
   at: string
   paused: boolean
   chief: { alive: boolean; heartbeat_at: string | null; session_id: string | null }
-  budget: { spent: number; limit: number }   // spent reads 0.0 when spend.json is unreadable
+  // spent reads 0.0 when spend.json is unreadable; unreadable and over (spent >= limit, or unreadable) mean no run
+  // starts; both are absent from an older CLI
+  budget: { spent: number; limit: number; unreadable?: boolean; over?: boolean }
   workers: ChiefWorker[]
   desktop?: ChiefDesktop[]           // pinned desktop sessions; absent from an older CLI
 }

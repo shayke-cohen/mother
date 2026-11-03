@@ -61,6 +61,9 @@ const firstLine = (text: string): string => text.split('\n').find(l => l.trim())
 // The last timer pass's own failure (a tick, or reading the role), kept until that step next succeeds, so the status
 // reload that follows a failed tick cannot clear it. It wins over a status error in chiefError.
 let passError: string | null = null
+// The last status read, for the chief's own session id (chief.json), which every tick checks against this session.
+let lastStatus: ChiefStatus | null = null
+export const ID_CHANGED = 'chief session id changed — run `mother chief install` again (and never /clear the chief)'
 
 // `mother chief status --json`. A failure keeps the last good status and sets chiefError.
 async function reloadStatus($: Dollar, bin: string): Promise<void> {
@@ -78,7 +81,10 @@ async function reloadStatus($: Dollar, bin: string): Promise<void> {
       error = `mother chief status unreadable: ${(err as Error).message}`
     }
   }
-  if (parsed) await update($, chiefAtom, () => parsed)
+  if (parsed) {
+    lastStatus = parsed
+    await update($, chiefAtom, () => parsed)
+  }
   const shown = passError ?? error
   await update($, chiefErrorAtom, () => shown)
 }
@@ -196,6 +202,19 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 // One chief pass: `tick --json`; when it names a wake, triage its judge lines first; the wake prompt (if anything is
 // kept) when no turn is running; then the status again.
 async function tickOnce($: Dollar, bin: string): Promise<void> {
+  // After a /clear this process runs under a new session id, which the guard no longer knows as the chief: every
+  // verb would be refused. Stop ticking and say so; `mother chief install` restarts the session under its own id.
+  const want = lastStatus?.chief?.session_id
+  if (want) {
+    let sid: string | null = null
+    try { sid = String(await $.session.id()) } catch { sid = null }
+    if (sid && sid !== want) {
+      passError = ID_CHANGED
+      pendingWake = null
+      await reloadStatus($, bin)
+      return
+    }
+  }
   const ran = await cli($, bin, ['tick', '--json'])
   if (ran.ok) {
     passError = null
@@ -230,7 +249,7 @@ async function act($: Dollar, bin: string, args: string[]): Promise<void> {
 }
 
 // ---- pinned desktop sessions: the desktop console snapshots them; the pane chats with them directly ----
-export const PINNED_PREFIX = 'From Shay via the Chief pane: '
+export const PINNED_PREFIX = 'From the manager via the Chief pane: '
 const PINNED_SERVER = 'ccd_session_mgmt'
 const PINNED_LIMIT = 40
 const MCP_TIMEOUT_MS = 10_000
@@ -358,7 +377,9 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     <Box flexDirection="column">
       {heading('Health')}
       <Text color={s.chief?.alive ? undefined : 'warning'}>{`Chief ${s.chief?.alive ? '● alive' : '○ down'} · ${beat}`}</Text>
-      <Text>{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today`}</Text>
+      {s.budget?.unreadable
+        ? <Text color="warning">Budget: spend file unreadable — no worker run starts until it reads again.</Text>
+        : <Text color={s.budget?.over ? 'warning' : undefined}>{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today${s.budget?.over ? ' · spent: no run starts' : ''}`}</Text>}
       {s.paused ? <Text color="warning">PAUSED: tick only writes the heartbeat; no run starts.</Text> : null}
       {error ? <Text color="warning">{error}</Text> : null}
       {heading(`Workers ${workers.length}`)}
@@ -389,6 +410,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   passError = null
   pendingWake = null
   turnStartedAt = null
+  lastStatus = null
   role = await readRole($, bin)
   await update($, chiefRoleAtom, () => role)
   await reloadStatus($, bin)
