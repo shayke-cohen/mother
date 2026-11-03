@@ -78,7 +78,9 @@ class E2E(unittest.TestCase):
                             "pacing": {"warm_seconds": 120, "cold_seconds": 120, "dm_max_seconds": 120},
                             "connections": {"chat": conn(self.fx, self.log),
                                             "tracker": {"command": "example-server", "args": [], "env": {}}},
-                            "watch": {"chat": {"channels": [CH]}, "tracker": {"projects": ["PLAT"]}}}}
+                            # polling discovery: these scenarios feed history; search-first has its own below
+                            "watch": {"chat": {"channels": [CH], "discovery": "poll"},
+                                      "tracker": {"projects": ["PLAT"]}}}}
         (self.ws / "config.json").write_text(json.dumps(self.cfg))
         FakeTracker.items, FakeTracker.cfgs = [], []
         saved = dict(hub_sources.ADAPTERS)
@@ -389,7 +391,8 @@ class Smoke(unittest.TestCase):
             "tools": [GW + t for t in tools], "errors": {GW + k: v for k, v in (errors or {}).items()},
             "results": {GW + "get_channel_history": {"ok": True, "messages": [news]},
                         GW + "get_thread_replies": {"ok": True, "messages": []},
-                        GW + "search-messages": {"ok": True, "messages": {"matches": []}}}}))
+                        # search-first (the default): the news arrives by search, not by reading the channel
+                        GW + "search-messages": {"ok": True, "messages": {"matches": [dict(news, channel={"id": CH})]}}}}))
 
     def run_smoke(self):
         out, naps = io.StringIO(), []
@@ -433,7 +436,8 @@ class Smoke(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertEqual(naps, [])  # no polling pass after a failed check
 
-        self.write(tools=CHAT_TOOLS, errors={"get_channel_history": "connect ECONNREFUSED"})  # passes can't read
+        self.write(tools=CHAT_TOOLS, errors={"get_channel_history": "connect ECONNREFUSED",
+                                             "search-messages": "connect ECONNREFUSED"})  # passes can't read
         rc, out, _ = self.run_smoke()
         self.assertEqual(rc, 2, out)
         self.assertIn("chat | couldnt_check |", out)

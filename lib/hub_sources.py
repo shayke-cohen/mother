@@ -385,6 +385,7 @@ class ChatSlack(Adapter):
                 floor = search_ts - SEARCH_OVERLAP
                 day = (datetime.fromtimestamp(search_ts, UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
                 ok = True
+                failed = []  # type: List[McpError]
                 for label, text in (("mentions", "<@%s>" % mine), ("DMs", "is:dm")):
                     res = None
                     try:
@@ -394,6 +395,8 @@ class ChatSlack(Adapter):
                         low = str(getattr(e, "message", e)).lower()
                         scope = e.kind == "missing_scope" or re.search(r"missing[_ ]scope|insufficient scope", low)
                         why = "missing_scope" if scope else e.kind
+                        if not scope:
+                            failed.append(e)
                     if why:
                         ok = False
                         if why == "missing_scope":
@@ -410,6 +413,11 @@ class ChatSlack(Adapter):
                             continue
                         add(ch, m, link=m.get("permalink") or "", floor=floor, dm=(label == "DMs" or ch in dms))
                 searched = ok
+                # Search is how a search-first pass finds anything: both queries unreachable is a source down, not
+                # a partial (a channel whose history fails raises the same way).
+                down = [e for e in failed if e.kind in ("unreachable", "dropped", "invalidated", "denied")]
+                if len(down) == 2 and discovery == "search" and not off:
+                    raise down[-1]
             elif off:
                 partial.append("search off: %s, polling every watched conversation" % off.get("why", "refused"))
             search_first = discovery == "search" and bool(mine) and not off

@@ -396,6 +396,28 @@ class TestSearchFirst(unittest.TestCase):
         self.assertEqual(out["pacing"]["calls"], 2)
         self.assertEqual(out["partial"], [])
 
+    def test_search_unreachable_is_a_source_down_not_a_partial(self):
+        def down(a):
+            raise hub_mcp.McpError("unreachable", "connect ECONNREFUSED")
+        self.search = {}
+        client, f = self.client()
+        f.handlers["search-messages"] = down
+        cur = {"ts": "%.6f" % (NOW - 600), "threads": {}}
+        with self.assertRaises(hub_mcp.McpError):  # poll_once reports it couldnt_check
+            hs.ChatSlack.poll(client, cur, {"channels": [self.CH]}, ME, AT)
+
+        once = []
+
+        def flaky(a):  # one query unreachable, the other answers: partial, the pass goes on
+            if not once:
+                once.append(1)
+                raise hub_mcp.McpError("unreachable", "connect ECONNREFUSED")
+            return {"ok": True, "messages": {"matches": []}}
+        client, f = self.client()
+        f.handlers["search-messages"] = flaky
+        out = hs.ChatSlack.poll(client, {"ts": "%.6f" % (NOW - 600), "threads": {}}, {"channels": [self.CH]}, ME, AT)
+        self.assertEqual(out["partial"], ["mentions: unreachable"])
+
     def test_refused_search_is_partial_turns_off_and_falls_back_to_polling_in_the_same_pass(self):
         self.history = {self.CH: [msg(NOW - 100, text="chatter")]}
         self.search = {"<@U00000000>": NO_SEARCH, "is:dm": NO_SEARCH}
