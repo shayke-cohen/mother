@@ -24,7 +24,8 @@ import hub
 import now as nowmod
 
 DEFAULTS = {"max_workers": 3, "run_minutes": 20, "daily_budget_usd": 20,
-            "chief_model": "sonnet", "worker_model": "", "tick_seconds": 30, "tldr_model": "sonnet"}
+            "chief_model": "sonnet", "worker_model": "", "tick_seconds": 30, "tldr_model": "sonnet",
+            "batch_minutes": 30, "decision_hours": 48, "triage_model": "sonnet"}
 TLDR_MODELS = ("sonnet", "opus")   # the Chief pane's TL;DR model; anything else reads as the default
 SOURCES = ("say", "route", "release")
 NAME_MAX = 24
@@ -40,7 +41,10 @@ def settings(cfg: dict) -> dict:
     """The chief caps from config.json -> chief, defaults merged in. Unknown keys are dropped."""
     given = (cfg or {}).get("chief")
     given = given if isinstance(given, dict) else {}
-    return {k: given.get(k, v) for k, v in DEFAULTS.items()}
+    out = {k: given.get(k, v) for k, v in DEFAULTS.items()}
+    if out["triage_model"] not in TLDR_MODELS:
+        out["triage_model"] = DEFAULTS["triage_model"]
+    return out
 
 
 # ---- pause ------------------------------------------------------------------------------------------

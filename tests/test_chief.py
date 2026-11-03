@@ -191,7 +191,10 @@ class TestPausedSettings(Base):
         s = chief.settings({})
         self.assertEqual(s, {"max_workers": 3, "run_minutes": 20, "daily_budget_usd": 20,
                              "chief_model": "sonnet", "worker_model": "", "tick_seconds": 30,
-                             "tldr_model": "sonnet"})
+                             "tldr_model": "sonnet", "batch_minutes": 30, "decision_hours": 48,
+                             "triage_model": "sonnet"})
+        self.assertEqual(chief.settings({"chief": {"triage_model": "gpt"}})["triage_model"], "sonnet")
+        self.assertEqual(chief.settings({"chief": {"triage_model": "opus"}})["triage_model"], "opus")
         s = chief.settings({"chief": {"max_workers": 5, "bogus": 1}})
         self.assertEqual(s["max_workers"], 5)
         self.assertEqual(s["run_minutes"], 20)

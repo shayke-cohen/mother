@@ -3715,5 +3715,18 @@ class ApproveLineProse(GuardCase):
         self.assertIn("mother approve shell", why)
 
 
+class DraftShaTest(unittest.TestCase):
+    def test_draft_sha_canonical(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mother_guard_sha", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        a = g.draft_sha("t", {"channel": "C00000001", "text": "hello"})
+        self.assertEqual(a, g.draft_sha("t", {"text": "hello", "channel": "C00000001"}))
+        self.assertRegex(a, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(a, g.draft_sha("t", {"channel": "C00000001", "text": "hellp"}))
+        self.assertNotEqual(a, g.draft_sha("u", {"channel": "C00000001", "text": "hello"}))
+
+
 if __name__ == "__main__":
     unittest.main()

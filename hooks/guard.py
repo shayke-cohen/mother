@@ -450,6 +450,13 @@ def text_of(inp):
     return v if isinstance(v, str) else json.dumps(v)
 
 
+def draft_sha(tool, inp):
+    """sha256 hex of the canonical JSON of one exact tool call: what a decision grant is bound to."""
+    import hashlib
+    blob = json.dumps({"tool": tool, "input": inp}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def attendees_of(inp):
     found = []
     for key in ("attendees", "attendeeEmails", "guests", "invitees"):
