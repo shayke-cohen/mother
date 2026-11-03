@@ -5,6 +5,7 @@ Every sessions.json write runs inside hub.locked(ws). queue.jsonl and spend.json
 take_queue cannot race enqueue. Stdlib only.
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -27,7 +28,7 @@ DEFAULTS = {"max_workers": 3, "run_minutes": 20, "daily_budget_usd": 20,
 SOURCES = ("say", "route", "release")
 NAME_MAX = 24
 SPEND_KEEP_DAYS = 14
-RELEASE_NOTE = "Shay worked in this session directly; read the latest turns before continuing."
+RELEASE_NOTE = "The manager worked in this session directly; read the latest turns before continuing."
 
 
 def chief_dir(ws: Path) -> Path:
@@ -96,13 +97,27 @@ def _slug(key: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")[:NAME_MAX].strip("-") or "worker"
 
 
+def run_name(key: str) -> str:
+    """The worker's run lock and log name: its slug plus a short hash of the exact key, so two keys with the same
+    slug never share a lock or a log."""
+    return "%s-%s" % (_slug(key), hashlib.sha1(key.encode("utf-8")).hexdigest()[:6])
+
+
+def _last_inbox_id(ws: Path) -> Optional[str]:
+    lines_ = hub.read_inbox(ws)
+    return lines_[-1]["id"] if lines_ else None
+
+
 def _is_cli(s) -> bool:
     return isinstance(s, dict) and s.get("kind") == "cli"
 
 
 def register_worker(ws: Path, at: datetime, key: str, title: str, also: List[str] = ()) -> dict:
     """Create the worker for `key`, or return the existing live CLI one. A live entry without kind is a
-    desktop session, which a CLI process cannot write to: ValueError("desktop session")."""
+    desktop session, which a CLI process cannot write to: ValueError("desktop session"). `inbox_mark` is the newest
+    inbox line id when the worker was made: `tick` never auto-routes a line at or before it (the chief saw those
+    lines when it started the worker, and decides them itself), so a line is not delivered twice."""
+    mark = _last_inbox_id(ws)
     with hub.locked(ws):
         doc = hub._sessions_doc(ws)
         cur = doc["sessions"].get(key)
@@ -114,7 +129,7 @@ def register_worker(ws: Path, at: datetime, key: str, title: str, also: List[str
             "session_id": str(uuid.uuid4()), "name": _slug(key), "title": title, "also": list(also),
             "link": None, "opened_at": hub._iso(at), "last_routed_at": None, "unseen": 0,
             "state": "live", "kind": "cli", "status": "idle", "held": False, "progress": "",
-            "cost": 0.0, "runs": 0, "last_run_at": None,
+            "cost": 0.0, "runs": 0, "last_run_at": None, "inbox_mark": mark,
         }
         doc["sessions"][key] = entry
         hub.save_json(ws, "sessions.json", doc)
@@ -148,7 +163,8 @@ def hold(ws: Path, key: str) -> dict:
 
 
 def release(ws: Path, key: str, at: Optional[datetime] = None) -> dict:
-    """Hand the worker back: clear held, reset failed to idle, queue a note to re-read the transcript."""
+    """Hand the worker back: clear held, reset failed to idle, queue a note to re-read the transcript. The note
+    does not start a turn by itself (tick skips it); it goes in ahead of the next text the worker gets."""
     at = at or datetime.now(timezone.utc)
     with hub.locked(ws):
         doc = hub._sessions_doc(ws)
@@ -191,10 +207,13 @@ def take_queue(ws: Path, key: str) -> List[dict]:
         return mine
 
 
-def queued(ws: Path) -> Dict[str, int]:
+def queued(ws: Path, skip_release: bool = False) -> Dict[str, int]:
+    """{key: entries waiting}. `skip_release` leaves out hand-back notes (what tick dispatches on)."""
     out = {}  # type: Dict[str, int]
     with hub.locked(ws):
         for e in _read_queue(ws):
+            if skip_release and e.get("source") == "release":
+                continue
             k = e.get("key")
             if isinstance(k, str):
                 out[k] = out.get(k, 0) + 1
@@ -310,7 +329,7 @@ def running(ws: Path) -> List[str]:
     """Keys of live workers whose run lock is currently held."""
     out = []
     for key, w in workers(ws).items():
-        f = _try_lock(_lock_path(ws, w.get("name") or _slug(key)))
+        f = _try_lock(_lock_path(ws, run_name(key)))
         if f is None:
             out.append(key)
         else:
@@ -318,8 +337,21 @@ def running(ws: Path) -> List[str]:
     return out
 
 
+def session_seen(stdout: str) -> bool:
+    """True when claude's stream-json carries a session id (its init or result event): the session exists."""
+    for line in (stdout or "").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and isinstance(e.get("session_id"), str) and e["session_id"]:
+            return True
+    return False
+
+
 def _exec(ws: Path, w: dict, key: str, prompt: str, first: bool, model: str, timeout: float):
-    """One claude turn. Returns (result_text, cost, error). Kills the whole process group on timeout."""
+    """One claude turn. Returns (result_text, cost, error, started): `started` when the stream showed the session.
+    Kills the whole process group on timeout."""
     exe = os.environ.get("MOTHER_CLAUDE_BIN", "claude")
     cmd = [exe, "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]
     cmd += ["--session-id" if first else "--resume", w["session_id"]]
@@ -331,7 +363,7 @@ def _exec(ws: Path, w: dict, key: str, prompt: str, first: bool, model: str, tim
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, cwd=str(ws), env=env, start_new_session=True)
     except OSError as e:
-        return "", 0.0, "could not start claude: %s" % e
+        return "", 0.0, "could not start claude: %s" % e, False
     try:
         out, err = p.communicate(prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -339,14 +371,14 @@ def _exec(ws: Path, w: dict, key: str, prompt: str, first: bool, model: str, tim
             os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
-        p.communicate()
-        return "", 0.0, "timed out after %g min" % round(timeout / 60.0, 2)
+        out, _err = p.communicate()
+        return "", 0.0, "timed out after %g min" % round(timeout / 60.0, 2), session_seen(out)
     result, cost, error = parse_stream(out)
     if p.returncode != 0 and error is None:
         error = (err or "").strip()[-300:] or "claude exited %d" % p.returncode
     elif error and p.returncode != 0 and (err or "").strip():
         error = (err or "").strip()[-300:]
-    return result, cost, error
+    return result, cost, error, session_seen(out)
 
 
 def _detach(ws: Path, key: str, title: str, prompt: str, name: str) -> int:
@@ -371,6 +403,19 @@ def _detach(ws: Path, key: str, title: str, prompt: str, name: str) -> int:
     return EXIT_OK
 
 
+def refusal(ws: Path, cfg: dict, at: datetime) -> Optional[str]:
+    """Why no run may start now (paused, an unreadable spend file, today's budget spent), or None."""
+    if paused(ws):
+        return "chief is paused"
+    if _spend_unreadable(ws):
+        return "spend file is unreadable (%s); refusing to run" % (chief_dir(ws) / "spend.json")
+    tz = nowmod.Schedule.from_config(cfg or {}).tz
+    spent, cap = spent_today(ws, at, tz), settings(cfg)["daily_budget_usd"]
+    if spent >= cap:
+        return "over today's budget ($%.2f of $%.2f)" % (spent, cap)
+    return None
+
+
 def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: str = "", detach: bool = False,
         now=None) -> int:
     """Run `key`'s worker for one turn plus any queued text. Exit codes: 0 ok, 1 failed, 2 usage, 3 paused or
@@ -379,23 +424,20 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
     ws = Path(ws)
     cfgs = settings(cfg)
     tz = nowmod.Schedule.from_config(cfg or {}).tz
-    if paused(ws):
-        print("chief is paused")
-        return EXIT_REFUSED
     try:
         w = register_worker(ws, at, key, title or key)
     except ValueError:
         print("%s is a live desktop session; a headless worker cannot write to it" % key)
         return EXIT_USAGE
+    cap = cfgs["daily_budget_usd"]
+    why = refusal(ws, cfg, at)
+    if why:  # checked before detaching, so the caller sees exit 3; the prompt waits in the queue, never dropped
+        if prompt:
+            enqueue(ws, at, key, prompt, "say")
+        print("%s; %s" % (why, "prompt queued for %s" % key if prompt else "nothing started"))
+        return EXIT_REFUSED
     if detach:
-        return _detach(ws, key, title, prompt, w["name"])
-    if _spend_unreadable(ws):
-        print("spend file is unreadable (%s); refusing to run" % (chief_dir(ws) / "spend.json"))
-        return EXIT_REFUSED
-    spent, cap = spent_today(ws, at, tz), cfgs["daily_budget_usd"]
-    if spent >= cap:
-        print("over today's budget ($%.2f of $%.2f)" % (spent, cap))
-        return EXIT_REFUSED
+        return _detach(ws, key, title, prompt, run_name(key))
 
     def busy(why):
         if prompt:
@@ -405,7 +447,7 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
 
     if w.get("held"):
         return busy("held")
-    lock = _try_lock(_lock_path(ws, w["name"]))
+    lock = _try_lock(_lock_path(ws, run_name(key)))
     if lock is None:
         return busy("already running")
     try:
@@ -423,8 +465,11 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
         first = w.get("runs", 0) == 0
         while pending:
             text = (HEADER % (key, w.get("title") or key) + pending) if first else pending
-            result, cost, error = _exec(ws, w, key, text, first, cfgs["worker_model"], max(deadline - clock(), 1))
-            fields = {"cost": round(w.get("cost", 0.0) + cost, 6), "runs": w.get("runs", 0) + 1,
+            result, cost, error, started = _exec(ws, w, key, text, first, cfgs["worker_model"],
+                                                 max(deadline - clock(), 1))
+            # a turn counts only when claude's stream showed the session: a first turn that never started must stay
+            # a first turn (--session-id and the header), or every later run would --resume a session never made
+            fields = {"cost": round(w.get("cost", 0.0) + cost, 6), "runs": w.get("runs", 0) + (1 if started else 0),
                       "last_run_at": hub._iso(at), "unseen": 0}
             if error:
                 fields.update(status="failed", progress=error[:PROGRESS_MAX])
@@ -568,8 +613,17 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     cursor = hub._hub_doc(ws).get("inbox_cursor")
     start = order[cursor] + 1 if cursor in order else 0
 
+    def routable(l):
+        """A live chief worker that existed before this line reached the inbox: a line at or before the worker's
+        inbox_mark was pending when the chief started that worker, so the chief decides it (it was the prompt)."""
+        hit = hub.find_session(sessions, [l["key"]] + list(l.get("also") or []))
+        if hit is None or not _is_cli(hit[1]):
+            return False
+        mark = hit[1].get("inbox_mark")
+        return not (mark in order and order[l["id"]] <= order[mark])
+
     def decidable(l):
-        return (l.get("kind") != "manual" and hub.is_muted(l, mute)) or _session_kind(sessions, l) == "cli"
+        return (l.get("kind") != "manual" and hub.is_muted(l, mute)) or routable(l)
 
     first = next((l for l in pending if not decidable(l)), None)
     limit = order[first["id"]] if first is not None else None
@@ -600,9 +654,11 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
             out["wake"] = WAKE_TEXT % (len(judge), PLUGIN_ROOT / "routines" / "chief.md")
             _write_atomic(cdir / "wake.json", json.dumps({"line_ids": judge, "at": hub._iso(at)}) + "\n")
 
+    if refusal(ws, cfg, at):
+        return out  # over budget or an unreadable spend file: nothing is dispatched until that clears
     live = set(running(ws))
     room = cfgs["max_workers"] - len(live)
-    q = queued(ws)
+    q = queued(ws, skip_release=True)  # a hand-back note alone is not worth a turn: it rides with the next text
     for key, w in workers(ws).items():
         if room <= 0:
             break
@@ -860,12 +916,25 @@ def stable_mother(home: Optional[Path] = None) -> str:
     return str(stable if stable.is_file() else PLUGIN_ROOT / "bin" / "mother")
 
 
+def chief_path(found: Dict[str, str], base: Optional[str]) -> str:
+    """PATH for the keeper, the chief and its workers: the directories of `found` (tmux, claude, bin/mother) first,
+    then `base` (the installer's own PATH, which the plist carries to the keeper), absolute entries only, then
+    /usr/bin and /bin; each directory once."""
+    dirs = []  # type: List[str]
+    for d in [os.path.dirname(p) for p in found.values() if p] + (base or "").split(":") + ["/usr/bin", "/bin"]:
+        d = d.rstrip("/") or d
+        if os.path.isabs(d) and d not in dirs:
+            dirs.append(d)
+    return ":".join(dirs)
+
+
 def tmux_command(ws: Path, cfg: dict, tmux: str, claude: str, mother: Optional[str] = None) -> List[str]:
     """Start the chief detached in tmux: resume its session, or create it under the same id on the first run.
     PATH is set in the command itself (tmux into a running server inherits the server's environment, not the
-    keeper's), so the chief's bare `mother` resolves to the stable bin/mother."""
+    keeper's): the stable bin/mother, tmux and claude first, so the chief's bare `mother` resolves to it, then the
+    keeper's PATH (the installer's, from the plist), so Homebrew tools and npx MCP servers are found."""
     sid = chief_session_id(ws)
-    path = hub.launch_path({"tmux": tmux, "claude": claude, "mother": mother or stable_mother()})
+    path = chief_path({"tmux": tmux, "claude": claude, "mother": mother or stable_mother()}, os.environ.get("PATH"))
     start = "env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 PATH=%s %s --permission-mode bypassPermissions --model %s" % (
         shlex.quote(path), shlex.quote(claude), shlex.quote(str(settings(cfg)["chief_model"])))
     return [tmux, "new-session", "-d", "-s", TMUX_SESSION, "-c", str(ws),
@@ -916,11 +985,12 @@ def default_plist_path() -> Path:
 
 
 def plist(ws: Path, cfg: dict, python: str, mother: str, found: Optional[Dict[str, str]] = None,
-          claude_bin: Optional[str] = None) -> str:
+          claude_bin: Optional[str] = None, base_path: Optional[str] = None) -> str:
     """The launchd job: `mother chief keep`, always running. PATH holds the directories of tmux, claude and
-    bin/mother, so the keeper (and the tmux server it starts) finds them."""
+    bin/mother first, so the keeper (and the tmux server it starts) finds them, then `base_path` (the installer's
+    PATH), so the chief and its workers find what the manager's shell does."""
     import plistlib
-    env = {"MOTHER_WORKSPACE": str(ws), "PATH": hub.launch_path(dict(found or {}))}
+    env = {"MOTHER_WORKSPACE": str(ws), "PATH": chief_path(dict(found or {}), base_path)}
     if claude_bin:  # the keeper resolves claude again under launchd; the override must travel with it
         env["MOTHER_CLAUDE_BIN"] = claude_bin
     doc = {"Label": LABEL,
@@ -935,12 +1005,21 @@ def plist(ws: Path, cfg: dict, python: str, mother: str, found: Optional[Dict[st
 
 
 def _desktop_hub_active(ws: Path, at: datetime) -> bool:
+    """A desktop hub session decided in the last 10 minutes. hub.json `last_wake` is the one per-decide signal
+    lib/hub.py writes, but every `hub.decide` sets it, the chief's own included. The hub skill refuses to start
+    under a fresh chief heartbeat, so a wake no later than one heartbeat window after the chief's last heartbeat
+    came from the chief, not from a desktop hub."""
     woke = hub._parse_at(hub._hub_doc(ws).get("last_wake"))
-    return woke is not None and (at - woke).total_seconds() < HUB_ACTIVE_MINUTES * 60
+    if woke is None or (at - woke).total_seconds() >= HUB_ACTIVE_MINUTES * 60:
+        return False
+    beat = hub._parse_at(_read_obj(chief_dir(ws) / "heartbeat.json").get("at"))
+    return beat is None or (woke - beat).total_seconds() > ALIVE_SECONDS
 
 
 def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=None, python=None, mother=None,
-            sleep=time.sleep, force: bool = False) -> int:
+            sleep=time.sleep, force: bool = False, run=subprocess.run) -> int:
+    """Write and load the launchd job, then end any running `mother-chief` tmux session so the keeper starts it
+    again: under the current plugin and PATH, and under chief.json's session id (after a /clear it had another)."""
     ctl = ctl or hub.launchctl
     plist_path = Path(plist_path or default_plist_path())
     code = hub.home_status(cfg)
@@ -961,7 +1040,8 @@ def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=
     chief_dir(ws).mkdir(parents=True, exist_ok=True)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(plist(ws, cfg, python, mother, {"tmux": tmux, "claude": claude, "mother": mother},
-                                  claude_bin=os.environ.get("MOTHER_CLAUDE_BIN") or None))
+                                  claude_bin=os.environ.get("MOTHER_CLAUDE_BIN") or None,
+                                  base_path=os.environ.get("PATH")))
     domain = "gui/%d" % os.getuid()
     ctl("bootout", "%s/%s" % (domain, LABEL))  # a reinstall replaces the loaded job; not loaded is fine
     for attempt in range(hub.BOOTSTRAP_TRIES):
@@ -973,6 +1053,10 @@ def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=
     if rc:
         print("mother chief install: launchctl bootstrap failed: %s" % out, file=sys.stderr)
         return EXIT_FAILED
+    try:  # the keeper starts it again within 30 s; a lost turn comes back in the next wake
+        run([tmux, "kill-session", "-t", TMUX_SESSION], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        pass
     print("installed %s (logs: %s)" % (plist_path, chief_dir(ws) / "keeper.log"))
     print("After a plugin update, run `mother chief install` again.")
     print(BYPASS_NOTE)
@@ -1044,13 +1128,17 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     sid = _read_obj(cdir / "chief.json").get("session_id")
     tz = nowmod.Schedule.from_config(cfg or {}).tz
     live, q = set(running(ws)), queued(ws)
+    spent, limit = round(spent_today(ws, at, tz), 6), float(settings(cfg)["daily_budget_usd"])
+    unreadable = _spend_unreadable(ws)
+    budget = {"spent": spent, "limit": limit, "unreadable": unreadable, "over": unreadable or spent >= limit}
     rows = []
     for key, w in workers(ws).items():
         rows.append({
             "key": key, "title": w.get("title") or key, "status": w.get("status"), "held": bool(w.get("held")),
             "running": key in live, "progress": w.get("progress") or "", "cost": w.get("cost", 0.0),
             "runs": w.get("runs", 0), "last_run_at": w.get("last_run_at"), "session_id": w.get("session_id"),
-            "queued": q.get(key, 0), "resume": "claude --resume %s" % w.get("session_id"),
+            "queued": q.get(key, 0),
+            "resume": "claude --resume %s" % w["session_id"] if w.get("session_id") else "",
         })
     rows.sort(key=lambda r: r["last_run_at"] or "", reverse=True)
     rows.sort(key=lambda r: not r["running"])
@@ -1059,7 +1147,7 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "chief": {"alive": beat_at is not None and (at - beat_at).total_seconds() < ALIVE_SECONDS,
                   "heartbeat_at": beat if beat_at is not None else None,
                   "session_id": sid if isinstance(sid, str) and sid else None},
-        "budget": {"spent": round(spent_today(ws, at, tz), 6), "limit": float(settings(cfg)["daily_budget_usd"])},
+        "budget": budget,
         "workers": rows,
         "desktop": desktop_status(ws, default_app_dir()),
     }
@@ -1120,11 +1208,14 @@ def _print_status(doc: dict) -> None:
     c = doc["chief"]
     print("chief: %s%s (heartbeat %s)" % ("alive" if c["alive"] else "not running",
                                           ", paused" if doc["paused"] else "", c["heartbeat_at"] or "never"))
-    print("budget: $%.2f of $%.2f today" % (doc["budget"]["spent"], doc["budget"]["limit"]))
+    b = doc["budget"]
+    print("budget: %s" % ("spend file unreadable: no run starts" if b.get("unreadable") else
+                          "$%.2f of $%.2f today%s" % (b["spent"] or 0, b["limit"] or 0,
+                                                       ", spent: no run starts" if b.get("over") else "")))
     for w in doc["workers"]:
-        state = w["status"] + (", held" if w["held"] else "") + (", running" if w["running"] else "")
-        print("%s  [%s]  runs %d  $%.2f  queued %d  %s" % (w["key"], state, w["runs"], w["cost"], w["queued"],
-                                                           w["progress"]))
+        state = str(w["status"] or "?") + (", held" if w["held"] else "") + (", running" if w["running"] else "")
+        print("%s  [%s]  runs %d  $%.2f  queued %d  %s" % (w["key"], state, w["runs"] or 0, w["cost"] or 0,
+                                                           w["queued"] or 0, w["progress"]))
 
 
 def main(args, ws, cfg, at) -> int:

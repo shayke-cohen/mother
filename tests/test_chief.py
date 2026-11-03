@@ -103,7 +103,7 @@ class TestHoldQueue(Base):
         q = chief.take_queue(self.ws, "PLAT-1")
         self.assertEqual(len(q), 1)
         self.assertEqual(q[0]["source"], "release")
-        self.assertEqual(q[0]["text"], "Shay worked in this session directly; read the latest turns before continuing.")
+        self.assertEqual(q[0]["text"], chief.RELEASE_NOTE)
 
     def test_say_text_verbatim(self):
         chief.register_worker(self.ws, AT, "PLAT-1", "t")
@@ -220,10 +220,12 @@ class TestRun(Base):
         return [json.loads(ln) for ln in self.log.read_text().splitlines()]
 
     def run_(self, key="PLAT-1", prompt="do it", cfg=None, **kw):
-        return chief.run(self.ws, self.cfg if cfg is None else cfg, AT, key, prompt=prompt, **kw)
+        self.out = io.StringIO()
+        with contextlib.redirect_stdout(self.out):
+            return chief.run(self.ws, self.cfg if cfg is None else cfg, AT, key, prompt=prompt, **kw)
 
     def hold_lock(self, key):
-        name = chief._slug(key)
+        name = chief.run_name(key)
         d = chief.chief_dir(self.ws) / "run"
         d.mkdir(parents=True, exist_ok=True)
         f = open(str(d / (name + ".lock")), "a")
@@ -418,7 +420,7 @@ class TestRun(Base):
         self.assertEqual(argv[1], os.path.join(ROOT, "bin", "mother"))
         self.assertEqual(argv[2:], ["chief", "run", "PLAT-1", "--title=T", "--prompt=go"])
         self.assertIs(kw["start_new_session"], True)
-        self.assertTrue(kw["stdout"].name.endswith(os.path.join("logs", "plat-1.log")))
+        self.assertTrue(kw["stdout"].name.endswith(os.path.join("logs", chief.run_name("PLAT-1") + ".log")))
         self.assertEqual(self.calls(), [])
 
 
@@ -578,7 +580,7 @@ class TestTick(Base):
     def test_tick_leaves_a_running_worker_alone(self):
         w = chief.register_worker(self.ws, AT, "PLAT-2", "t")
         chief.update_worker(self.ws, "PLAT-2", status="working")
-        lock = chief._try_lock(chief._lock_path(self.ws, w["name"]))
+        lock = chief._try_lock(chief._lock_path(self.ws, chief.run_name("PLAT-2")))
         self.addCleanup(lock.close)
         self.assertEqual(chief.tick(self.ws, {}, AT)["reconciled"], [])
 
@@ -889,7 +891,7 @@ class TestMain(Base):
         self.assertEqual(doc["at"], hub._iso(AT))
         self.assertIs(doc["paused"], False)
         self.assertEqual(doc["chief"], {"alive": False, "heartbeat_at": None, "session_id": None})
-        self.assertEqual(doc["budget"], {"spent": 0.0, "limit": 20.0})
+        self.assertEqual(doc["budget"], {"spent": 0.0, "limit": 20.0, "unreadable": False, "over": False})
         self.assertEqual(doc["workers"], [])
 
     def test_main_status_workers_heartbeat_and_order(self):
@@ -904,12 +906,12 @@ class TestMain(Base):
         chief.enqueue(self.ws, AT, "PLAT-1", "a", "say")
         chief.enqueue(self.ws, AT, "PLAT-1", "b", "route")
         chief.add_spend(self.ws, AT, nowmod.Schedule.from_config({}).tz, 1.5)
-        lock = chief._try_lock(chief._lock_path(self.ws, "plat-3"))
+        lock = chief._try_lock(chief._lock_path(self.ws, chief.run_name("PLAT-3")))
         self.addCleanup(lock.close)
         doc = json.loads(self.main("status", "--json")[1])
         self.assertEqual(doc["chief"], {"alive": True, "heartbeat_at": hub._iso(AT - timedelta(seconds=60)),
                                         "session_id": "chief-sid"})
-        self.assertEqual(doc["budget"], {"spent": 1.5, "limit": 20.0})
+        self.assertEqual(doc["budget"], {"spent": 1.5, "limit": 20.0, "unreadable": False, "over": False})
         self.assertEqual([w["key"] for w in doc["workers"]], ["PLAT-3", "PLAT-2", "PLAT-1"])
         w3, _, w1 = doc["workers"]
         self.assertEqual(set(w1), {"key", "title", "status", "held", "running", "progress", "cost", "runs",
@@ -1073,7 +1075,8 @@ class TestKeeper(Base):
 
     def test_tmux_command_resume_then_session_id(self):
         sid = chief.chief_session_id(self.ws)
-        cmd = chief.tmux_command(self.ws, {}, self.TMUX, self.CLAUDE, mother="/stable/bin/mother")
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            cmd = chief.tmux_command(self.ws, {}, self.TMUX, self.CLAUDE, mother="/stable/bin/mother")
         path = "/opt/bin:/opt/claude:/stable/bin:/usr/bin:/bin"
         env = ("env MOTHER_CHIEF_ROLE=chief MOTHER_NO_SYNC=1 PATH=%s %s --permission-mode bypassPermissions "
                "--model sonnet" % (path, self.CLAUDE))
@@ -1145,13 +1148,14 @@ class TestInstall(Base):
 
     def install(self, which=None, force=False, at=AT, env=None):
         out, err = io.StringIO(), io.StringIO()
+        self.tmux_run = FakeRun([])
         with mock.patch.dict(os.environ, env or {}), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
             if env is None:
                 os.environ.pop("MOTHER_CLAUDE_BIN", None)
             code = chief.install(self.ws, self.cfg, at, plist_path=self.plist_path, ctl=self.ctl,
                                  which=which or self.which, python="/usr/bin/python3", mother="/plug/bin/mother",
-                                 force=force, sleep=lambda s: None)
+                                 force=force, sleep=lambda s: None, run=self.tmux_run)
         return code, out.getvalue(), err.getvalue()
 
     def test_plist_label_and_program(self):
@@ -1211,7 +1215,7 @@ class TestInstall(Base):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             chief.install(self.ws, self.cfg, AT, plist_path=self.plist_path, ctl=self.ctl, which=self.which,
-                          python="/usr/bin/python3", sleep=lambda s: None)
+                          python="/usr/bin/python3", sleep=lambda s: None, run=FakeRun([]))
         self.assertEqual(plistlib.loads(self.plist_path.read_bytes())["ProgramArguments"][1], chief.stable_mother())
         self.assertNotIn("/cache/", chief.stable_mother())
 
@@ -1249,6 +1253,208 @@ class TestInstall(Base):
         self.assertFalse(self.plist_path.exists())
         self.assertEqual(self.ctl_calls[-1][0], "bootout")
         self.assertEqual(run.calls, [["/opt/tmux/bin/tmux", "kill-session", "-t", "mother-chief"]])
+
+
+class TestFinalReviewFixes(Base):
+    """The final whole-branch review's fixes (I1, I6, I7, I8 and the cheap minors)."""
+
+    def setUp(self):
+        super().setUp()
+        self.log = self.ws / "claude.log"
+        p = mock.patch.dict(os.environ, {"MOTHER_CLAUDE_BIN": FAKE, "FAKE_CLAUDE_LOG": str(self.log)})
+        p.start()
+        self.addCleanup(p.stop)
+        for k in ("FAKE_CLAUDE_RESULT", "FAKE_CLAUDE_SLEEP", "FAKE_CLAUDE_EXIT"):
+            os.environ.pop(k, None)
+        self.tz = nowmod.Schedule.from_config({}).tz
+
+    def quiet(self, fn, *a, **kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return fn(*a, **kw)
+
+    def calls(self):
+        return [json.loads(ln) for ln in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    # I1: a refusal is seen by the caller, keeps the prompt, and tick does not respawn it
+    def test_detach_over_budget_is_exit_3_and_queues_the_prompt(self):
+        chief.add_spend(self.ws, AT, self.tz, 50)
+        with mock.patch.object(subprocess, "Popen") as popen:
+            rc = self.quiet(chief.run, self.ws, {}, AT, "PLAT-1", prompt="do the thing", detach=True)
+        self.assertEqual(rc, 3)
+        popen.assert_not_called()
+        self.assertEqual([e["text"] for e in chief.take_queue(self.ws, "PLAT-1")], ["do the thing"])
+
+    def test_detach_unreadable_spend_and_paused_are_exit_3_and_queue(self):
+        d = chief.chief_dir(self.ws)
+        d.mkdir(parents=True)
+        (d / "spend.json").write_text("{not json")
+        with mock.patch.object(subprocess, "Popen") as popen:
+            self.assertEqual(self.quiet(chief.run, self.ws, {}, AT, "PLAT-1", prompt="a", detach=True), 3)
+            (d / "spend.json").unlink()
+            chief.pause(self.ws)
+            self.assertEqual(self.quiet(chief.run, self.ws, {}, AT, "PLAT-1", prompt="b", detach=True), 3)
+        popen.assert_not_called()
+        self.assertEqual([e["text"] for e in chief.take_queue(self.ws, "PLAT-1")], ["a", "b"])
+
+    def test_tick_over_budget_or_unreadable_dispatches_nothing(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.enqueue(self.ws, AT, "PLAT-2", "x", "say")
+        chief.add_spend(self.ws, AT, self.tz, 50)
+        with mock.patch.object(chief, "run", return_value=0) as run:
+            self.assertEqual(chief.tick(self.ws, {}, AT)["dispatched"], [])
+            (chief.chief_dir(self.ws) / "spend.json").write_text("[]")
+            self.assertEqual(chief.tick(self.ws, {}, AT)["dispatched"], [])
+            run.assert_not_called()
+            (chief.chief_dir(self.ws) / "spend.json").unlink()  # spend readable again: it goes out
+            self.assertEqual(chief.tick(self.ws, {}, AT)["dispatched"], ["PLAT-2"])
+        chief.add_spend(self.ws, AT, self.tz, 50)
+        with mock.patch.object(chief, "run", return_value=0):  # the budget day rolls
+            self.assertEqual(chief.tick(self.ws, {}, AT + timedelta(days=1))["dispatched"], ["PLAT-2"])
+
+    def test_status_budget_flags(self):
+        b = chief.status_doc(self.ws, {}, AT)["budget"]
+        self.assertEqual((b["unreadable"], b["over"]), (False, False))
+        chief.add_spend(self.ws, AT, self.tz, 20)
+        self.assertIs(chief.status_doc(self.ws, {}, AT)["budget"]["over"], True)
+        (chief.chief_dir(self.ws) / "spend.json").write_text("{bad")
+        b = chief.status_doc(self.ws, {}, AT)["budget"]
+        self.assertEqual((b["unreadable"], b["over"], b["spent"]), (True, True, 0.0))
+
+    # I8: the routine's order, run --detach then decide `route`, delivers the line once
+    def test_routed_then_run_line_is_delivered_once(self):
+        a = line(key="PLAT-6", title="CI is red")
+        hub.append_inbox(self.ws, [a])
+        with mock.patch.object(subprocess, "Popen"):  # the chief: run --detach registers the worker at once
+            self.assertEqual(self.quiet(chief.run, self.ws, {}, AT, "PLAT-6", prompt="fix CI: " + a["link"],
+                                        detach=True), 0)
+        w = chief.workers(self.ws)["PLAT-6"]
+        self.assertEqual(w["inbox_mark"], a["id"])
+        # a tick between the run and the decide leaves the line to the chief: no route note, no decide
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual((r["decided"], r["judge"]), ([], [a["id"]]))
+        self.assertEqual(chief.queued(self.ws), {})
+        res = hub.decide(self.ws, {}, AT, [{"line_id": a["id"], "key": "PLAT-6", "decision": "route"}])
+        self.assertEqual(res[0]["decision"], "route")  # onto the cli worker, not a propose card
+        self.assertEqual(res[0]["session_id"], w["session_id"])
+        self.assertEqual(hub._hub_doc(self.ws)["pending"], [])
+        self.assertEqual(hub._hub_doc(self.ws)["inbox_cursor"], a["id"])
+        r = chief.tick(self.ws, {}, AT)
+        self.assertEqual((r["decided"], r["judge"], r["wake"]), ([], [], None))
+        self.assertEqual(chief.queued(self.ws), {})  # the prompt was the only delivery
+        # a later line for the same key is the worker's: tick routes it as before
+        b = line(key="PLAT-6", title="CI is green", at="2026-11-01T10:00:00Z")
+        hub.append_inbox(self.ws, [b])
+        self.assertEqual([d["decision"] for d in chief.tick(self.ws, {}, AT)["decided"]], ["route"])
+        self.assertEqual(chief.queued(self.ws), {"PLAT-6": 1})
+
+    # minor 8: a `now` for a live desktop key is a route to it (unseen + 1), not a U<n> update
+    def test_desktop_key_now_is_stored_as_route(self):
+        self.seed_sessions({"PLAT-3": {"session_id": "local_x", "state": "live", "unseen": 0}})
+        a = line(key="PLAT-3")
+        hub.append_inbox(self.ws, [a])
+        res = hub.decide(self.ws, {}, AT, [{"line_id": a["id"], "key": "PLAT-3", "decision": "now", "why": "w"}])
+        self.assertEqual(res[0]["decision"], "route")
+        self.assertNotIn("update_id", res[0])
+        self.assertEqual(hub._sessions_doc(self.ws)["sessions"]["PLAT-3"]["unseen"], 1)
+        self.assertEqual(hub._hub_doc(self.ws)["updates"], [])
+
+    # I6: the chief's own decides do not read as a desktop hub
+    def test_install_proceeds_while_the_chief_itself_decides(self):
+        i = TestInstall("test_install_prints_bypass_note")
+        i.ws = self.ws
+        i.setUp = None
+        i.plist_path = self.ws / "LaunchAgents" / "com.mother.chief.plist"
+        i.ctl_calls, i.cfg = [], {"workspace": {"home_machine": "laptop"}}
+        with mock.patch.dict(os.environ, {"MOTHER_HOSTNAME": "laptop"}):
+            chief.tick(self.ws, {}, AT - timedelta(seconds=20))  # the chief's heartbeat
+            with hub.locked(self.ws):
+                hub.save_json(self.ws, "hub.json", {"version": 1, "last_wake": hub._iso(AT - timedelta(seconds=5))})
+            code, _, err = i.install()
+            self.assertEqual(code, 0, err)
+            # the keeper restarts the chief under chief.json's id: install ends the running tmux session
+            self.assertEqual(i.tmux_run.calls, [["/opt/tmux/bin/tmux", "kill-session", "-t", "mother-chief"]])
+            # the chief went down 9 minutes ago and something decided since: that is a desktop hub
+            chief.tick(self.ws, {}, AT - timedelta(minutes=9))
+            self.assertEqual(i.install()[0], 1)
+
+    # I7: the installer's PATH travels into the plist and the chief's tmux command
+    def test_plist_and_tmux_keep_the_installer_path(self):
+        import plistlib
+        found = {"tmux": "/opt/tmux/bin/tmux", "claude": "/opt/cl/bin/claude", "mother": "/stable/bin/mother"}
+        base = "/opt/homebrew/bin:relative/bin:/usr/bin:/opt/homebrew/bin:/opt/tmux/bin:/Users/x/.local/bin/"
+        doc = plistlib.loads(chief.plist(self.ws, {}, "/usr/bin/python3", "/stable/bin/mother", found,
+                                         base_path=base).encode())
+        want = "/opt/tmux/bin:/opt/cl/bin:/stable/bin:/opt/homebrew/bin:/usr/bin:/Users/x/.local/bin:/bin"
+        self.assertEqual(doc["EnvironmentVariables"]["PATH"], want)
+        with mock.patch.dict(os.environ, {"PATH": want}):  # the keeper runs under the plist's PATH
+            cmd = chief.tmux_command(self.ws, {}, found["tmux"], found["claude"], mother=found["mother"])
+        self.assertIn("PATH=%s " % want, cmd[-1])
+        self.assertEqual(chief.chief_path({}, None), "/usr/bin:/bin")
+
+    # minor 3 + 4: a hand-edited entry with no session id, null numbers, and the text output
+    def test_text_output_and_hand_edited_entries(self):
+        self.seed_sessions({"PLAT-1": {"state": "live", "kind": "cli", "status": "idle", "cost": None, "runs": None,
+                                       "title": "t"}})
+        doc = chief.status_doc(self.ws, {}, AT)
+        self.assertEqual(doc["workers"][0]["resume"], "")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            chief._print_status(doc)
+            self.assertEqual(chief.main(["status"], self.ws, {}, AT), 0)
+        self.assertIn("budget: $0.00 of $20.00 today", out.getvalue())
+        self.assertIn("PLAT-1  [idle]  runs 0  $0.00  queued 0", out.getvalue())
+        a = line(key="PLAT-5", title="Ping")
+        hub.append_inbox(self.ws, [a])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(chief.main(["lines"], self.ws, {}, AT), 0)
+            self.assertEqual(chief.main(["tick"], self.ws, {}, AT), 0)
+        text = out.getvalue().splitlines()
+        self.assertEqual(text[0], "%s  PLAT-5  [-]  Agnes: Ping" % a["id"])
+        self.assertEqual(text[1], "decided 0, judge 1, dispatched 0, reconciled 0")
+        self.assertTrue(text[2].startswith("Chief wake: 1 inbox lines need a decision."))
+        chief.pause(self.ws)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            chief.main(["tick"], self.ws, {}, AT)
+        self.assertEqual(out.getvalue(), "paused: heartbeat only\n")
+
+    # minor 11: a first turn whose claude never started stays a first turn
+    def test_run_that_never_started_is_not_counted(self):
+        os.environ["MOTHER_CLAUDE_BIN"] = str(self.ws / "no-such-claude")
+        self.assertEqual(self.quiet(chief.run, self.ws, {}, AT, "PLAT-1", prompt="go"), 1)
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["runs"], 0)
+        os.environ["MOTHER_CLAUDE_BIN"] = FAKE
+        self.assertEqual(self.quiet(chief.run, self.ws, {}, AT, "PLAT-1", prompt="again"), 0)
+        argv = self.calls()[0]["argv"]
+        self.assertIn("--session-id", argv)
+        self.assertTrue(self.calls()[0]["stdin"].startswith("You are a MOTHER worker for PLAT-1"))
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["runs"], 1)
+
+    # minor 12: two keys with one slug never share a run lock or a log
+    def test_run_names_differ_for_keys_with_one_slug(self):
+        a, b = chief.run_name("PLAT 1"), chief.run_name("plat-1")
+        self.assertEqual(chief._slug("PLAT 1"), chief._slug("plat-1"))
+        self.assertNotEqual(a, b)
+        chief.register_worker(self.ws, AT, "PLAT 1", "t")
+        chief.register_worker(self.ws, AT, "plat-1", "t")
+        lock = chief._try_lock(chief._lock_path(self.ws, a))
+        self.addCleanup(lock.close)
+        self.assertEqual(chief.running(self.ws), ["PLAT 1"])
+
+    # minor 13: a hand-back alone costs no turn; it rides with the next text
+    def test_release_note_waits_for_real_text(self):
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.hold(self.ws, "PLAT-2")
+        chief.release(self.ws, "PLAT-2", AT)
+        with mock.patch.object(chief, "run", return_value=0) as run:
+            self.assertEqual(chief.tick(self.ws, {}, AT)["dispatched"], [])
+            run.assert_not_called()
+        self.assertEqual(chief.queued(self.ws), {"PLAT-2": 1})  # still shown, still kept
+        chief.enqueue(self.ws, AT, "PLAT-2", "next thing", "say")
+        self.assertEqual(self.quiet(chief.run, self.ws, {}, AT, "PLAT-2"), 0)
+        stdin = self.calls()[0]["stdin"]
+        self.assertLess(stdin.index(chief.RELEASE_NOTE), stdin.index("next thing"))
 
 
 class TestRoutineFile(unittest.TestCase):
