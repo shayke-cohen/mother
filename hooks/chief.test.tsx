@@ -643,8 +643,9 @@ const TLDR = JSON.stringify({ tldr: 'Handler patched; tests next.\nWaiting on re
 const SHOWN = [{ id: 'mother-chief', title: 'Chief', isShown: true, isFocused: false, isPlaced: true }]
 
 type TlOpts = {
-  reply?: (e: any) => any, tail?: () => any, shown?: () => boolean, mcp?: (e: any) => any,
-  surface?: 'terminal' | 'desktop', workers?: () => any[], role?: string,
+  reply?: (e: any, h: any) => any, tail?: () => any, shown?: () => boolean, mcp?: (e: any, h: any) => any,
+  surface?: 'terminal' | 'desktop', workers?: (held: boolean) => any[], role?: string,
+  cli?: (argv: string[], stdin?: string) => Cli | undefined,   // answers first; undefined falls through
 }
 type Tl = { asks: any[]; mcp: any[]; stdins: string[]; sends: any[]; fills: string[]; order: string[] }
 
@@ -653,19 +654,21 @@ async function bootTldr($: any, on: any, o: TlOpts = {}) {
   let held = false
   const surface = o.surface ?? 'desktop'
   on('ui.panes', () => ({ value: (o.shown ?? (() => true))() ? SHOWN : [] }))
-  on('model.complete', (_: any, e: any) => { t.asks.push(e); return (o.reply ?? (() => answered(TLDR)))(e) })
+  on('model.complete', (h: any, e: any) => { t.asks.push(e); return (o.reply ?? (() => answered(TLDR)))(e, h) })
   on('session.surfaces', () => ({ value: [surface] }))
-  on('mcp.call', (_: any, e: any) => {
+  on('mcp.call', (h: any, e: any) => {
     t.mcp.push(e)
     if (e.tool === 'list_sessions') return { value: { content: [{ type: 'text', text: '[]' }], isError: false } }
     t.order.push(e.tool)
-    return (o.mcp ?? (() => ({ deny: 'no connected MCP tool' })))(e)
+    return (o.mcp ?? (() => ({ deny: 'no connected MCP tool' })))(e, h)
   })
   on('session.send', (_: any, e: any) => { t.sends.push(e); return { isDelivered: true } })
   on('prompt.fill', (_: any, e: any) => { t.fills.push(e.text); return { isFilled: true } })
   const booted = await boot($, on, o.role ?? 'console', (argv, stdin) => {
+    const over = o.cli?.(argv, stdin)
+    if (over) { if (argv[0] === 'hold') t.order.push('hold'); return over }
     if (argv[0] === 'status') {
-      const ws = o.workers ? o.workers() : [worker({ session_id: W_SID, resume: 'claude --resume ' + W_SID, held })]
+      const ws = o.workers ? o.workers(held) : [worker({ session_id: W_SID, resume: 'claude --resume ' + W_SID, held })]
       return { exitCode: 0, stdout: JSON.stringify(status({ workers: ws, desktop: [PINNED] })) }
     }
     if (argv[0] === 'tail') return { exitCode: 0, stdout: JSON.stringify((o.tail ?? (() => ({ version: 1, model: 'sonnet', sessions: [TAIL_W, TAIL_P] })))()) }
@@ -810,13 +813,22 @@ test('test_chips_drop_unknown_malformed_and_inapplicable', async ($, on) => {
   await ui.unmount()
 })
 
-test('test_reply_chip_runs_say_for_a_worker_and_sends_to_a_pinned_session', async ($, on) => {
+test('test_reply_chip_fills_the_chat_input_and_only_send_sends', async ($, on) => {
   const { clock, out, t } = await bootTldr($, on)
   const ui = await shown($, clock)
+  const value = async (key: string) => (await ui.find({ key }))?.props?.value
+  // a model wrote the text from an untrusted transcript: a click puts it in the card's chat box, nothing more
   await ui.press({ key: `chip:${W_SID}:0` })
-  expect(chiefCalls(out, 'say').map(a => a.slice(3))).toEqual([['say', 'PLAT-1', '--', 'Run the full test suite']])
-  expect(t.sends).toEqual([])
+  expect(chiefCalls(out, 'say')).toEqual([])
+  expect(await value('say:PLAT-1')).toBe('Run the full test suite')
   await ui.press({ key: `chip:${CLI_A}:0` })
+  expect(t.sends).toEqual([])
+  expect(await value('say:' + CLI_A)).toBe('Run the full test suite')
+  // the manager presses send on what the box holds
+  await ui.input({ key: 'say:PLAT-1', text: 'Run the full test suite' })
+  expect(chiefCalls(out, 'say').map(a => a.slice(3))).toEqual([['say', 'PLAT-1', '--', 'Run the full test suite']])
+  expect(await value('say:PLAT-1')).toBeUndefined()                               // the draft is cleared once sent
+  await ui.input({ key: 'say:' + CLI_A, text: 'Run the full test suite' })
   expect(t.sends.length).toBe(1)
   expect(t.sends[0].text).toBe('From the manager via the Chief pane: Run the full test suite')
   expect(JSON.stringify(t.sends[0].to)).toContain(CLI_A)
@@ -835,9 +847,9 @@ test('test_open_worker_holds_first_then_opens_a_terminal_tab', async ($, on) => 
   const call = t.mcp.find((e: any) => e.tool === 'run_in_terminal')
   expect([call.server, call.args]).toEqual(['terminal', { command: 'claude --resume ' + W_SID, cwd: WS, title: 'PLAT-1' }])
   expect(out.toasts.at(-1)).toMatch(/terminal tab/)
-  await ui.press({ key: 'open:PLAT-1' })                                           // already held: no second hold
-  expect(chiefCalls(out, 'hold').length).toBe(1)
-  expect(t.order).toEqual(['hold', 'run_in_terminal', 'run_in_terminal'])
+  await ui.press({ key: 'open:PLAT-1' })                                           // held already: hold again, it is idempotent
+  expect(chiefCalls(out, 'hold').length).toBe(2)
+  expect(t.order).toEqual(['hold', 'run_in_terminal', 'hold', 'run_in_terminal'])
   await ui.unmount()
 })
 
@@ -899,4 +911,163 @@ test('test_chief_open_refreshes_the_tldrs_at_once', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await hasText(ui, /^Handler patched; tests next\.$/)).toBe(true)
   await ui.unmount()
+})
+
+// ---- review fixes ----
+const TERM_OK = (e: any) => e.tool === 'run_in_terminal'
+  ? { value: { content: [{ type: 'text', text: 'typed into tab t1' }], isError: false } } : { deny: 'no' }
+
+// Open fails closed: each case gets its own test (a test boots one host).
+{
+  const W = (over: Record<string, unknown> = {}) => worker({ session_id: W_SID, resume: 'claude --resume ' + W_SID, ...over })
+  const cases: [string, () => TlOpts['cli'], TlOpts['workers'], RegExp][] = [
+    ['hold_fails', () => argv => argv[0] === 'hold' ? { exitCode: 2, stderr: 'PLAT-1 has no live worker\n' } : undefined, undefined, /^PLAT-1 has no live worker$/],
+    ['status_read_fails', () => { let n = 0; return (argv: string[]) => argv[0] === 'status' && ++n > 2 ? { exitCode: 1, stderr: 'boom\n' } : undefined }, undefined, /couldn't confirm/],
+    ['hold_did_not_stick', () => undefined, () => [W({ held: false })], /couldn't confirm/],
+    ['worker_gone', () => undefined, held => held ? [] : [W()], /couldn't confirm/],
+    ['still_running', () => undefined, held => [W({ held, running: held, status: held ? 'working' : 'idle' })], /finishing a turn/],
+  ]
+  for (const [name, cli, workers, toast] of cases) {
+    test(`test_open_worker_fails_closed_${name}`, async ($, on) => {
+      const { clock, out, t } = await bootTldr($, on, { cli: cli(), workers, mcp: TERM_OK })
+      const ui = await shown($, clock)
+      await ui.press({ key: 'open:PLAT-1' })
+      expect(t.order.filter(x => x === 'run_in_terminal')).toEqual([])
+      expect(out.toasts.at(-1)).toMatch(toast)
+      await ui.unmount()
+    })
+  }
+}
+
+test('test_open_worker_holds_even_when_the_card_says_held', async ($, on) => {
+  // the card was drawn held; it was handed back elsewhere since: Open must take it over again, from fresh state
+  let drawnHeld = true
+  const { clock, out, t } = await bootTldr($, on, { mcp: TERM_OK,
+    workers: held => [worker({ session_id: W_SID, resume: 'claude --resume ' + W_SID, held: held || drawnHeld })] })
+  const ui = await shown($, clock)
+  drawnHeld = false
+  await ui.press({ key: 'open:PLAT-1' })
+  expect(chiefCalls(out, 'hold').length).toBe(1)
+  expect(t.order).toEqual(['hold', 'run_in_terminal'])
+  await ui.unmount()
+})
+
+test('test_open_twice_while_pending_does_nothing', async ($, on) => {
+  let hang = true                                                                  // waits on the manager's approval
+  const OK = { value: { content: [{ type: 'text', text: 'ok' }], isError: false } }
+  const { clock, t } = await bootTldr($, on, { mcp: (e: any) => e.tool === 'run_in_terminal' || e.tool === 'open_session_in'
+    ? (hang ? new Promise(() => undefined) : OK) : { deny: 'no' } })
+  const ui = await shown($, clock)
+  const presses = [ui.press({ key: 'open:PLAT-1' })]
+  await clock.settle()
+  presses.push(ui.press({ key: 'open:PLAT-1' }))
+  await clock.settle()
+  expect(t.order).toEqual(['hold', 'run_in_terminal'])                            // the second press did nothing
+  presses.push(ui.press({ key: 'open:' + CLI_A }))
+  await clock.settle()
+  presses.push(ui.press({ key: 'open:' + CLI_A }))
+  await clock.settle()
+  expect(t.order.filter(x => x === 'open_session_in').length).toBe(1)
+  hang = false
+  await clock.advance(121_000)                                                    // both give up waiting
+  await Promise.all(presses)
+  await ui.press({ key: 'open:PLAT-1' })                                           // the first one over: a new press opens
+  expect(t.order.filter(x => x === 'run_in_terminal').length).toBe(2)
+  await ui.unmount()
+})
+
+test('test_open_timeout_says_it_may_still_be_opening', async ($, on) => {
+  const { clock, out } = await bootTldr($, on, { mcp: () => new Promise(() => undefined) })
+  const ui = await shown($, clock)
+  const p = ui.press({ key: 'open:PLAT-1' })
+  await clock.settle()
+  await clock.advance(121_000)
+  await p
+  expect(out.toasts.at(-1)).toMatch(/may still be opening/)
+  expect(out.toasts.at(-1)).not.toMatch(/^Couldn't/)
+  await ui.unmount()
+})
+
+for (const [name, text] of [['refusal', 'Only this session or one it started can be shown; ask the user to open it from the sidebar.'], ['empty', '']]) {
+  test(`test_open_pinned_${name}_without_an_error_still_falls_back`, async ($, on) => {
+    const { clock, out, t } = await bootTldr($, on, { mcp: e => e.tool === 'open_session_in'
+      ? { value: { content: [{ type: 'text', text }], isError: false } } : { deny: 'no' } })
+    const ui = await shown($, clock)
+    await ui.press({ key: 'open:' + CLI_A })
+    expect(t.fills).toEqual(['Open my "Fix the login bug" session'])
+    expect(out.toasts.at(-1)).toMatch(/^Couldn't open it directly/)
+    await ui.unmount()
+  })
+}
+
+test('test_tldr_and_chips_lose_control_and_bidi_characters', async ($, on) => {
+  const bad = JSON.stringify({ tldr: 'Done‮ gnihtyreve\u001b[31m red\r', chips: [{ kind: 'reply', text: 'Ship⁦ it\u0007\u009b' }] })
+  const { clock } = await bootTldr($, on, { reply: () => answered(bad) })
+  const ui = await shown($, clock)
+  expect(await hasText(ui, /^Done gnihtyreve\[31m red$/)).toBe(true)
+  expect((await ui.find({ key: `chip:${W_SID}:0` }))?.text).toBe('Ship it')
+  await ui.unmount()
+})
+
+test('test_tldr_model_is_part_of_the_cache_key', async ($, on) => {
+  let model = 'sonnet'
+  let cachedModel = 'sonnet'
+  const cached = () => ({ tldr: 'From the cache.', chips: [], model: cachedModel })
+  const { clock, t } = await bootTldr($, on, { tail: () => ({ version: 1, model, sessions: [{ ...TAIL_W, ...(cachedModel === model ? { cached: cached() } : {}) }] }) })
+  const ui = await shown($, clock)
+  expect(t.asks).toEqual([])
+  model = 'opus'                                                                  // same fingerprint, new model: asked again
+  await clock.advance(60_000)
+  expect(t.asks.map((a: any) => a.model)).toEqual(['opus'])
+  expect(JSON.parse(t.stdins[0])[0].model).toBe('opus')
+  await ui.unmount()
+})
+
+test('test_tldr_memory_is_pruned_for_gone_sessions', async ($, on) => {
+  let rows: any[] = [TAIL_W]
+  const { clock, t } = await bootTldr($, on, { tail: () => ({ version: 1, model: 'sonnet', sessions: rows }) })
+  const ui = await shown($, clock)
+  expect(t.asks.length).toBe(1)
+  rows = []
+  await clock.advance(60_000)
+  rows = [TAIL_W]                                                                 // back, same fingerprint, nothing stored
+  await clock.advance(60_000)
+  expect(t.asks.length).toBe(2)
+  await ui.unmount()
+})
+
+test('test_tldr_failed_store_is_sent_again', async ($, on) => {
+  let fails = true
+  const { clock, t } = await bootTldr($, on, { cli: argv => argv[0] === 'tldr' && fails
+    ? (fails = false, { exitCode: 1, stderr: 'disk full\n' }) : undefined })
+  const ui = await shown($, clock)
+  expect(t.asks.length).toBe(2)
+  await clock.advance(60_000)
+  expect(t.asks.length).toBe(2)                                                   // not asked again
+  expect(t.stdins.length).toBe(1)                                                 // the retry reached the store
+  expect(JSON.parse(t.stdins[0]).map((s: any) => s.id)).toEqual([W_SID, CLI_A])
+  await ui.unmount()
+})
+
+test('test_a_slow_model_batch_does_not_hold_the_tick', async ($, on) => {
+  // tick 1 (t=30) is released at t=40; its TL;DR batch then waits on the model, so tick 2 (t=60) lands mid-batch
+  let releaseTick: (() => void) | undefined
+  const answers: (() => void)[] = []
+  let ticks = 0
+  const { clock, out, t } = await bootTldr($, on, { role: 'chief',
+    cli: ((argv: string[]) => argv[0] === 'tick' && ++ticks === 1
+      ? new Promise<Cli>(res => { releaseTick = () => res({ exitCode: 0, stdout: JSON.stringify({ paused: false, wake: null, judge: [] }) }) })
+      : undefined) as any,
+    reply: () => new Promise(res => { answers.push(() => res(answered(TLDR))) }) })
+  await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(30_000)
+  await clock.advance(10_000)
+  releaseTick?.()
+  await clock.settle()
+  expect([t.asks.length, t.stdins.length]).toEqual([2, 0])                        // the batch is out
+  await clock.advance(20_000)                                                     // t=60
+  expect(chiefCalls(out, 'tick').length).toBe(2)
+  for (const go of answers) go()
+  await clock.settle()
+  expect(t.stdins.length).toBe(1)                                                 // the detached batch finished and stored
 })

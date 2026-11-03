@@ -202,6 +202,7 @@ declare module 'claude-code' {
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
       chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
       chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by session id (a worker's session_id, a pinned cli_session_id)
+      chiefDraft: Record<string, string> | null     // a card's chat-box text a reply chip put there, by Input key (`say:<key>`, `say:<cli id>`)
     }
   }
 }

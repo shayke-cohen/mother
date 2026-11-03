@@ -12,6 +12,7 @@ export const chiefRoleAtom = atom({ plugin: 'mother', key: 'chiefRole' } as cons
 export const chiefErrorAtom = atom({ plugin: 'mother', key: 'chiefError' } as const, null)
 export const chiefSentAtom = atom({ plugin: 'mother', key: 'chiefSent' } as const, null)
 export const chiefTldrAtom = atom({ plugin: 'mother', key: 'chiefTldr' } as const, null)
+export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as const, null)
 
 export const CHIEF_PANE = 'mother-chief'
 export const CHIEF_COMMAND = 'chief'
@@ -66,8 +67,9 @@ let passError: string | null = null
 let lastStatus: ChiefStatus | null = null
 export const ID_CHANGED = 'chief session id changed — run `mother chief install` again (and never /clear the chief)'
 
-// `mother chief status --json`. A failure keeps the last good status and sets chiefError.
-async function reloadStatus($: Dollar, bin: string): Promise<void> {
+// `mother chief status --json`. A failure keeps the last good status and sets chiefError. Returns this read's status,
+// or null when this read failed (the last good one is not returned: a caller deciding from it must read fresh).
+async function reloadStatus($: Dollar, bin: string): Promise<ChiefStatus | null> {
   const ran = await cli($, bin, ['status', '--json'])
   let parsed: ChiefStatus | null = null
   let error: string | null = null
@@ -88,6 +90,7 @@ async function reloadStatus($: Dollar, bin: string): Promise<void> {
   }
   const shown = passError ?? error
   await update($, chiefErrorAtom, () => shown)
+  return parsed
 }
 
 // `chief` only when the CLI says so exactly (MOTHER_CHIEF_ROLE=chief in the keeper's session); `console` for any
@@ -341,9 +344,14 @@ type TailRow = { id: string; kind: 'worker' | 'pinned'; key?: string; fingerprin
 // {tldr, chips} from a stored entry or a model reply's object, or null. tldr: at most 2 non-empty lines of 160
 // characters. chips: CHIP_KINDS only, each kind once (a reply once per text), a reply's text one line of 1..200
 // characters; at most 6 kept, of which a card draws the first 3 that apply to it now. Anything else is dropped.
+// C0 controls but newline, DEL, C1 controls, and the bidi marks, embeddings, overrides and isolates: what a model could
+// copy from a transcript to make a card misread, and what a surface refuses to draw (a whole pane would go blank).
+const UNSAFE_RE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g
+const safe = (text: string): string => text.replace(UNSAFE_RE, '')
+
 export function cleanTldr(v: any): ChiefTldr | null {
   if (!v || typeof v !== 'object' || Array.isArray(v) || typeof v.tldr !== 'string') return null
-  const lines = v.tldr.split('\n').map((l: string) => l.split(/\s+/).filter(Boolean).join(' ').slice(0, TLDR_LINE_MAX))
+  const lines = v.tldr.split('\n').map((l: string) => safe(l).split(/\s+/).filter(Boolean).join(' ').slice(0, TLDR_LINE_MAX))
     .filter(Boolean).slice(0, TLDR_LINES)
   if (!lines.length) return null
   const chips: ChiefChip[] = []
@@ -352,7 +360,7 @@ export function cleanTldr(v: any): ChiefTldr | null {
     if (!c || typeof c !== 'object' || !(CHIP_KINDS as readonly string[]).includes(c.kind)) continue
     let chip: ChiefChip
     if (c.kind === 'reply') {
-      const text = typeof c.text === 'string' ? c.text.trim() : ''
+      const text = typeof c.text === 'string' ? safe(c.text).trim() : ''
       if (!text || text.includes('\n') || text.length > CHIP_TEXT_MAX) continue
       chip = { kind: 'reply', text }
     } else {
@@ -385,8 +393,10 @@ const tldrPrompt = (row: TailRow, s: ChiefStatus | null): string => {
 }
 
 // Per process: what each session's last TL;DR was made from, a failure's back-off, and the calls of the last minute.
-const tldrMade = new Map<string, { fp: string; tldr: ChiefTldr }>()
-const tldrFailed = new Map<string, { fp: string; at: number }>()
+// A TL;DR is keyed by session id, fingerprint and model. `tldrUnstored` holds results `tldr --stdin` has not taken yet.
+const tldrMade = new Map<string, { fp: string; model: string; tldr: ChiefTldr }>()
+const tldrFailed = new Map<string, { fp: string; model: string; at: number }>()
+const tldrUnstored = new Map<string, { id: string; fingerprint: string; model: string; tldr: string; chips: ChiefChip[] }>()
 let tldrCalls: number[] = []
 let tldrBusy = false
 let tldrLastAt = -Infinity
@@ -428,36 +438,45 @@ async function refreshTldrs($: Dollar, bin: string): Promise<void> {
     const model = (TLDR_MODELS as readonly string[]).includes(doc.model) ? doc.model : TLDR_DEFAULT_MODEL
     const rows = doc.sessions.filter((r: any): r is TailRow => !!r && typeof r.id === 'string' && typeof r.fingerprint === 'string' &&
       typeof r.text === 'string' && (r.kind === 'worker' || r.kind === 'pinned'))
+    // forget sessions that are gone, and results to store for a session that moved or went
+    const live = new Map<string, string>(rows.map((r: TailRow) => [r.id, r.fingerprint]))
+    for (const m of [tldrMade, tldrFailed] as Map<string, unknown>[]) for (const id of [...m.keys()]) if (!live.has(id)) m.delete(id)
+    for (const [id, u] of [...tldrUnstored]) if (live.get(id) !== u.fingerprint || u.model !== model) tldrUnstored.delete(id)
+    const hit = (m: { fp: string; model: string } | undefined, r: TailRow) => !!m && m.fp === r.fingerprint && m.model === model
     const todo: TailRow[] = []
     for (const r of rows) {
-      if (tldrMade.get(r.id)?.fp === r.fingerprint) continue
-      const cached = r.cached === undefined ? null : cleanTldr(r.cached)
-      if (cached) { tldrMade.set(r.id, { fp: r.fingerprint, tldr: cached }); continue }
+      if (hit(tldrMade.get(r.id), r)) continue
+      const cached = r.cached === undefined ? null : cleanTldr(r.cached)   // the CLI matched fingerprint and model
+      if (cached) { tldrMade.set(r.id, { fp: r.fingerprint, model, tldr: cached }); continue }
       const f = tldrFailed.get(r.id)
-      if (f && f.fp === r.fingerprint && nowMs - f.at < TLDR_RETRY_MS) continue
+      if (hit(f, r) && nowMs - f!.at < TLDR_RETRY_MS) continue
       todo.push(r)
     }
     tldrCalls = tldrCalls.filter(t => nowMs - t < 60_000)
     const batch = todo.slice(0, Math.max(0, TLDR_CALLS_PER_MINUTE - tldrCalls.length))
     for (const _ of batch) tldrCalls.push(nowMs)
     const got = await Promise.all(batch.map(r => askTldr($, model, r)))
-    const store: unknown[] = []
     batch.forEach((r, i) => {
       const t = got[i]
       if (t) {
-        tldrMade.set(r.id, { fp: r.fingerprint, tldr: t })
+        tldrMade.set(r.id, { fp: r.fingerprint, model, tldr: t })
         tldrFailed.delete(r.id)
-        store.push({ id: r.id, fingerprint: r.fingerprint, tldr: t.tldr, chips: t.chips })
+        tldrUnstored.set(r.id, { id: r.id, fingerprint: r.fingerprint, model, tldr: t.tldr, chips: t.chips })
       } else {
-        tldrFailed.set(r.id, { fp: r.fingerprint, at: nowMs })
+        tldrFailed.set(r.id, { fp: r.fingerprint, model, at: nowMs })
       }
     })
-    if (store.length) await cli($, bin, ['tldr', '--stdin'], JSON.stringify(store))
+    // a store that fails keeps its rows for the next refresh, so another process need not ask the model again
+    if (tldrUnstored.size) {
+      const sent = [...tldrUnstored.values()]
+      const stored = await cli($, bin, ['tldr', '--stdin'], JSON.stringify(sent))
+      if (stored.ok) for (const u of sent) if (tldrUnstored.get(u.id) === u) tldrUnstored.delete(u.id)
+    }
     // only sessions whose TL;DR matches what they are now; a moved one shows its progress line until it is redone
     const shown: Record<string, ChiefTldr> = {}
     for (const r of rows) {
       const m = tldrMade.get(r.id)
-      if (m && m.fp === r.fingerprint) shown[r.id] = m.tldr
+      if (hit(m, r)) shown[r.id] = m!.tldr
     }
     await update($, chiefTldrAtom, () => shown)
   } catch {
@@ -474,21 +493,28 @@ const OPEN_TIMEOUT_MS = 120_000          // run_in_terminal waits on the manager
 const TERMINAL_SERVER = 'terminal'
 const WINDOW_SERVER = 'ccd_window'
 
-type McpOut = { ok: true; text: string } | { ok: false; why: string }
+type McpOut = { ok: true; text: string } | { ok: false; why: string; timedOut?: true }
 
 // One MCP call with a timer: ok with its first text line, or why not (a deny, an error result, a timeout, a throw).
+// The timer is cancelled once the call answers.
 async function mcpTry($: Dollar, server: string, tool: string, args: Record<string, unknown>, ms: number): Promise<McpOut> {
+  const stop = new AbortController()
   try {
-    const timedOut = $.clock.sleep(ms).then(() => 'timeout' as const)
+    const timedOut = $.clock.sleep(ms, { signal: stop.signal }).then(() => 'timeout' as const, () => 'cancelled' as const)
     const r = await Promise.race([$.mcp.call(server, tool, args), timedOut])
-    if (r === 'timeout') return { ok: false, why: `${tool} timed out` }
+    if (r === 'timeout' || r === 'cancelled') return { ok: false, why: `${tool} gave no answer`, timedOut: true }
     const first = (Array.isArray(r?.content) ? r.content : []).find((b: any) => b?.type === 'text')
     const text = firstLine(String((first as any)?.text ?? ''))
     return r?.isError ? { ok: false, why: text || `${tool} failed` } : { ok: true, text }
   } catch (err) {
     return { ok: false, why: firstLine((err as Error)?.message ?? String(err)) || `${tool} is not reachable` }
+  } finally {
+    stop.abort()
   }
 }
+
+// Open in flight, by session id: a second press while the first waits (on an approval, say) does nothing.
+const opening = new Set<string>()
 
 async function onDesktop($: Dollar): Promise<boolean> {
   try { return (await $.session.surfaces()).includes('desktop') } catch { return false }
@@ -506,44 +532,68 @@ async function workspace($: Dollar, bin: string): Promise<string> {
 // A terminal tab's title: the characters run_in_terminal takes, at most 40.
 const tabTitle = (key: string): string => key.replace(/[^A-Za-z0-9 ._,&+:#/'-]/g, ' ').trim().slice(0, 40) || 'worker'
 
-// Open a worker: a worker session has one writer, so take it over first (hold); once it has no turn running, type
-// `claude --resume <id>` from the workspace into a new tab of the desktop app's Terminal panel. Where that route is not
-// there (a terminal surface, no terminal server, a refusal), say why: the held card shows the resume command.
+// Open a worker: a worker session has one writer, so take it over first. It always runs `hold` (idempotent: the card
+// may be stale), then decides from a fresh status read, never from the card: only a read that says this worker is
+// held and has no turn running goes on, to type `claude --resume <id>` from the workspace into a new tab of the desktop
+// app's Terminal panel. Anything else (a failed hold or read, the worker gone, not held) stops with a toast: fail
+// closed. Where the terminal route is not there it says why, and the held card shows the resume command.
 async function openWorker($: Dollar, bin: string, w: ChiefWorker): Promise<void> {
   const sid = w.session_id ?? ''
   if (!UUID_RE.test(sid)) { $.ui.toast(`${w.key} has no session to open yet`); return }
-  if (!w.held) {
+  if (opening.has(sid)) return
+  opening.add(sid)
+  try {
     const ran = await cli($, bin, ['hold', w.key])
     if (!ran.ok) {
-      $.ui.toast(firstLine(ran.stderr) || `mother chief hold failed`)
+      $.ui.toast(firstLine(ran.stderr) || 'mother chief hold failed')
       await reloadStatus($, bin)
       return
     }
+    const fresh = await reloadStatus($, bin)
+    const now = (fresh?.workers ?? []).find(x => x.key === w.key)
+    if (!now || now.held !== true || now.session_id !== sid) {
+      $.ui.toast(`Open stopped: couldn't confirm ${w.key} is taken over`)
+      return
+    }
+    if (now.running) { $.ui.toast(`Took over ${w.key}; it is finishing a turn — press Open again when it stops`); return }
+    if (!(await onDesktop($))) { $.ui.toast("Couldn't open a terminal tab (no desktop app here): run the resume command on the card"); return }
+    const ws = await workspace($, bin)
+    if (!ws) { $.ui.toast("Couldn't open a terminal tab (no workspace): run the resume command on the card"); return }
+    const r = await mcpTry($, TERMINAL_SERVER, 'run_in_terminal', { command: `claude --resume ${sid}`, cwd: ws, title: tabTitle(w.key) }, OPEN_TIMEOUT_MS)
+    if (r.ok) $.ui.toast(`Resuming ${w.key} in a terminal tab${r.text ? ': ' + r.text : ''}`)
+    else if (r.timedOut) $.ui.toast(`No answer from the terminal after 2 minutes: the tab may still be opening once its line is approved. ${w.key} stays taken over.`)
+    else $.ui.toast(`Couldn't open a terminal tab (${r.why}): run the resume command on the card`)
+  } finally {
+    opening.delete(sid)
   }
-  await reloadStatus($, bin)
-  const now = (lastStatus?.workers ?? []).find(x => x.key === w.key)
-  if (now?.running) { $.ui.toast(`Took over ${w.key}; it is finishing a turn — press Open again when it stops`); return }
-  if (!(await onDesktop($))) { $.ui.toast("Couldn't open a terminal tab (no desktop app here): run the resume command on the card"); return }
-  const ws = await workspace($, bin)
-  if (!ws) { $.ui.toast("Couldn't open a terminal tab (no workspace): run the resume command on the card"); return }
-  const r = await mcpTry($, TERMINAL_SERVER, 'run_in_terminal', { command: `claude --resume ${sid}`, cwd: ws, title: tabTitle(w.key) }, OPEN_TIMEOUT_MS)
-  $.ui.toast(r.ok ? `Resuming ${w.key} in a terminal tab${r.text ? ': ' + r.text : ''}`
-                  : `Couldn't open a terminal tab (${r.why}): run the resume command on the card`)
 }
 
-// Open a pinned desktop session: ask the app to show it (ccd_window open_session_in, focus); the toast is the app's
-// own answer, since it can change nothing (another session on screen, a session this one did not start). Where the
-// call fails, fill the prompt as before and say why.
+// What open_session_in says when it did nothing: its description has it refuse a session this one did not start, and
+// change nothing while this session is off screen. "Already" (shown) counts as opened.
+const REFUSED_RE = /refus|denied|not allowed|cannot|can't|couldn't|unable|\bonly\b|not (on screen|started|visible|shown|open)|changes? nothing|nothing changed|no-op|ask the user/i
+const ALREADY_RE = /\balready\b/i
+
+// Open a pinned desktop session: ask the app to show it (ccd_window open_session_in, focus). Only an answer that says
+// it did counts; an error, a timeout, an empty answer or a refusal without an error fills the prompt as before and
+// says why.
 async function openPinned($: Dollar, d: ChiefDesktop): Promise<void> {
   const fallback = async (why: string) => {
     await $.prompt.fill({ text: `Open my "${d.title}" session`, mode: 'replace' }).catch(() => undefined)
     $.ui.toast(`Couldn't open it directly (${why}); the prompt asks for it instead`)
   }
   if (!LOCAL_RE.test(d.session_id)) return fallback('no app session id')
-  if (!(await onDesktop($))) return fallback('no desktop app here')
-  const r = await mcpTry($, WINDOW_SERVER, 'open_session_in', { session_id: d.session_id, target: 'focus' }, MCP_TIMEOUT_MS)
-  if (r.ok) $.ui.toast(r.text || `Asked the app to show "${d.title}"`)
-  else await fallback(r.why)
+  if (opening.has(d.cli_session_id)) return
+  opening.add(d.cli_session_id)
+  try {
+    if (!(await onDesktop($))) return await fallback('no desktop app here')
+    const r = await mcpTry($, WINDOW_SERVER, 'open_session_in', { session_id: d.session_id, target: 'focus' }, MCP_TIMEOUT_MS)
+    if (!r.ok) return await fallback(r.why)
+    if (!r.text) return await fallback('the app gave no answer')
+    if (REFUSED_RE.test(r.text) && !ALREADY_RE.test(r.text)) return await fallback(`the app said: ${r.text}`)
+    $.ui.toast(r.text)
+  } finally {
+    opening.delete(d.cli_session_id)
+  }
 }
 
 // mark_seen: the hub's `session seen <key>`, which zeroes the worker's unseen count.
@@ -557,9 +607,18 @@ async function markSeen($: Dollar, bin: string, key: string): Promise<void> {
   await reloadStatus($, bin)
 }
 
+// Clears a card's chat-box draft once its text was sent.
+async function clearDraft($: Dollar, input: string): Promise<void> {
+  await update($, chiefDraftAtom, prev => {
+    const next = { ...(prev ?? {}) }
+    delete next[input]
+    return next
+  })
+}
+
 // A chip's effect on this card, or null when it does not apply now: take_over/hold only while not held, hand_back/
 // release only while held, mark_seen only with unseen news; a pinned session takes only reply and open.
-type ChipAct = { id: string; label: string; run: () => Promise<void> }
+type ChipAct = { id: string; label: string; run: () => Promise<unknown> }
 function chipActs($: Dollar, bin: string, chips: ChiefChip[], card: { w?: ChiefWorker; d?: ChiefDesktop }): ChipAct[] {
   const out: ChipAct[] = []
   const seen = new Set<string>()
@@ -568,7 +627,9 @@ function chipActs($: Dollar, bin: string, chips: ChiefChip[], card: { w?: ChiefW
     const { w, d } = card
     if (c.kind === 'reply') {
       const text = c.text
-      a = { id: 'reply:' + text, label: text, run: () => (w ? act($, bin, ['say', w.key, '--', text]) : sendPinned($, d!.cli_session_id, text)) }
+      // a model wrote it from an untrusted transcript: it goes into the card's chat box, and the manager sends it
+      const input = 'say:' + (w ? w.key : d!.cli_session_id)
+      a = { id: 'reply:' + text, label: text, run: () => update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [input]: text })) }
     } else if (c.kind === 'open') {
       a = { id: 'open', label: 'Open', run: () => (w ? openWorker($, bin, w) : openPinned($, d!)) }
     } else if (w && (c.kind === 'take_over' || c.kind === 'hold') && !w.held) {
@@ -589,7 +650,8 @@ function chipActs($: Dollar, bin: string, chips: ChiefChip[], card: { w?: ChiefW
 type Ui = ReturnType<Dollar['ui']['resolve']>
 
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
-                  sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null) {
+                  sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
+                  drafts: Record<string, string> | null) {
   const { Box, Text, Button, Input } = ui
   const heading = (text: string) => (
     <Box marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
@@ -635,8 +697,10 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
               : <Text>{w.resume}</Text>)
           : null}
         <Box flexWrap="wrap" gap="xs">
-          <Input key={'say:' + w.key} placeholder="Tell this worker…" submitLabel="send"
-            onSubmit={(value: string) => { if (value.trim()) void act($, bin, ['say', w.key, '--', value]) }} />
+          <Input key={'say:' + w.key} placeholder="Tell this worker…" submitLabel="send" value={drafts?.['say:' + w.key]}
+            onSubmit={(value: string) => {
+              if (value.trim()) void clearDraft($, 'say:' + w.key).then(() => act($, bin, ['say', w.key, '--', value]))
+            }} />
           {w.held
             ? <Button key={'release:' + w.key} onPress={() => act($, bin, ['release', w.key])}>Hand back</Button>
             : <Button key={'hold:' + w.key} onPress={() => act($, bin, ['hold', w.key])}>Take over</Button>}
@@ -659,7 +723,10 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
         {said ? <Text color={said === 'delivered' ? undefined : 'warning'}>{said === 'delivered' ? 'Sent: delivered' : `Sent: ${said}`}</Text> : null}
         <Box flexWrap="wrap" gap="xs">
           <Input key={'say:' + d.cli_session_id} placeholder="Tell this session…" submitLabel="send"
-            onSubmit={(value: string) => { if (value.trim()) void sendPinned($, d.cli_session_id, value) }} />
+            value={drafts?.['say:' + d.cli_session_id]}
+            onSubmit={(value: string) => {
+              if (value.trim()) void clearDraft($, 'say:' + d.cli_session_id).then(() => sendPinned($, d.cli_session_id, value))
+            }} />
           <Button key={'open:' + d.cli_session_id} onPress={() => openPinned($, d)}>Open</Button>
         </Box>
         {chipRow(d.cli_session_id, { d })}
@@ -711,6 +778,8 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   tldrCalls = []
   tldrLastAt = -Infinity
   tldrBusy = false
+  tldrUnstored.clear()
+  opening.clear()
   role = await readRole($, bin)
   await update($, chiefRoleAtom, () => role)
   await reloadStatus($, bin)
@@ -733,13 +802,13 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
     const bin = await motherBin($, configured)
     if (role === 'chief') {
       await tickOnce($, bin)
-      await refreshTldrs($, bin)
+      void refreshTldrs($, bin).catch(() => undefined)   // detached: a slow model batch never holds the tick
       return null
     }
     if (role === 'console') {
       await snapshotPinned($, bin)
       await reloadStatus($, bin)
-      await refreshTldrs($, bin)
+      void refreshTldrs($, bin).catch(() => undefined)   // detached; refreshTldrs runs one batch at a time
       return null
     }
     const again = await readRole($, bin)
@@ -795,5 +864,5 @@ export function registerChief(on: On, configured: string): void {
   // the timer pass and when /chief opens the pane, never from a draw.
   on('ui.render', { component: 'Pane', requestId: CHIEF_PANE }, async ($, e) =>
     paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
-      await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom)))
+      await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom)))
 }
