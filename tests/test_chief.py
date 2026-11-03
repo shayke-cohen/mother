@@ -1616,7 +1616,7 @@ class TestTldr(Base):
         p = self.transcript(self.ws, w["session_id"], [msg("assistant", "Working on it")])
         [s] = self.tails()["sessions"]
         n = chief.tldr_store(self.ws, AT, [
-            {"id": s["id"], "fingerprint": s["fingerprint"], "tldr": "Fixing it.\nTests next.\nThird line",
+            {"id": s["id"], "fingerprint": s["fingerprint"], "model": "sonnet", "tldr": "Fixing it.\nTests next.\nThird line",
              "chips": [{"kind": "reply", "text": "Ship it"}, {"kind": "rm -rf"}, {"kind": "reply"}, "junk",
                        {"kind": "hold"}, {"kind": "open"}, {"kind": "mark_seen"}]},
             {"id": "not-a-live-session", "fingerprint": "x", "tldr": "x", "chips": []},
@@ -1631,6 +1631,36 @@ class TestTldr(Base):
         p.write_text(p.read_text() + msg("assistant", "Done now") + "\n")
         [s] = self.tails()["sessions"]
         self.assertNotIn("cached", s)
+
+    def test_clean_tldr_strips_control_and_bidi(self):
+        got = chief.clean_tldr("Done‮ gnihtyreve\x1b[31m red\r\nnext⁦\x07\x9b",
+                               [{"kind": "reply", "text": "Ship‏ it\x00"}, {"kind": "reply", "text": "‮\x1b"}])
+        self.assertEqual(got, {"tldr": "Done gnihtyreve[31m red\nnext", "chips": [{"kind": "reply", "text": "Ship it"}]})
+
+    def test_cache_is_keyed_by_model_and_store_prunes_gone_sessions(self):
+        w = chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        self.transcript(self.ws, w["session_id"], [msg("assistant", "Working")])
+        [s] = self.tails()["sessions"]
+        entry = {"id": s["id"], "fingerprint": s["fingerprint"], "tldr": "ok", "chips": [], "model": "sonnet"}
+        chief.tldr_store(self.ws, AT, [entry], home=self.home, app_dir=self.app)
+        self.assertIn("cached", self.tails()["sessions"][0])
+        opus = {"chief": {"tldr_model": "opus"}}
+        self.assertNotIn("cached", self.tails(opus)["sessions"][0])          # another model: not a hit
+        # an entry with no model (an older pane) is no hit either
+        chief.tldr_store(self.ws, AT, [dict(entry, model=None)], home=self.home, app_dir=self.app)
+        self.assertNotIn("cached", self.tails()["sessions"][0])
+        # a session that is gone is pruned from the file on the next store, even with nothing new for it
+        chief.tldr_store(self.ws, AT, [entry], home=self.home, app_dir=self.app)
+        with hub.locked(self.ws):
+            doc = hub.load_json(self.ws, "sessions.json", {})
+            doc["sessions"].pop("PLAT-1")
+            hub.save_json(self.ws, "sessions.json", doc)
+        chief.tldr_store(self.ws, AT, [], home=self.home, app_dir=self.app)
+        self.assertEqual(json.loads((chief.chief_dir(self.ws) / "tldr.json").read_text()), {})
+
+    def test_contract_says_tails_go_to_the_model_api(self):
+        text = (Path(ROOT) / "docs" / "CONTRACT.md").read_text()
+        self.assertIn("pinned desktop sessions included, are sent to the model API", text)
 
     def test_cli_tail_and_tldr_verbs(self):
         w = chief.register_worker(self.ws, AT, "PLAT-1", "t")

@@ -1341,26 +1341,38 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   thinking and sidechains left out, each message cut to 1500 and the whole to its last 6000 characters;
   `fingerprint` is `t:<size>:<mtime_ns>`. With no transcript, a worker's `progress` (`p:<sha1>`) or a pinned
   session's `last_report` (`r:<sha1>`). `model` is `chief.tldr_model`. `cached` is `tldr.json`'s entry for that id
-  when its fingerprint matches. `mother chief tldr --stdin` takes `[{id, fingerprint, tldr, chips}]` and merges
-  them into `tldr.json` (`{<id>: {fingerprint, tldr, chips, at}}`, live sessions only; the rest pruned); prints
-  `{stored: N}`. The mod asks the model (`$.model.complete`, `chief.tldr_model`, effort `low`, 1024 tokens, 30 s)
-  only for a row with no match in its memory or `cached`, only while the Chief pane is shown (`$.ui.panes()`), from
-  the timer pass and when `/chief` opens the pane (never from a draw), at most every 15 s and 6 calls a minute; a
-  failed row is asked again after 5 minutes or when it moves. The tail goes in as JSON data under a fixed note; the
+  when its fingerprint and model both match. `mother chief tldr --stdin` takes `[{id, fingerprint, model, tldr, chips}]` and
+  merges them into `tldr.json` (`{<id>: {fingerprint, model, tldr, chips, at}}`, live sessions only; entries for
+  sessions that are gone are pruned on every store); prints `{stored: N}`. **These tails leave the machine:** while
+  the pane is shown, the recent transcript tails of the workers and of every pinned desktop session (any repo),
+  pinned desktop sessions included, are sent to the model API, as the session's own requests are. The mod asks the model (`$.model.complete`, `chief.tldr_model`, effort `low`, 1024 tokens, 30 s)
+  only for a row with no match (id, fingerprint and model) in its memory or `cached`, only while the Chief pane is
+  shown (`$.ui.panes()`), from the timer pass (detached, so a slow batch never holds a tick; one batch at a time)
+  and when `/chief` opens the pane (never from a draw), at most every 15 s and 6 calls a minute; a failed row is
+  asked again after 5 minutes or when it moves. Sessions that are gone are dropped from its memory; results a
+  `tldr --stdin` failed to store are sent again on the next refresh. The tail goes in as JSON data under a fixed note; the
   reply must be one JSON object `{tldr, chips}`, and anything off keeps the card's progress line (`last_report` for
-  a pinned card). Both the CLI and the mod keep `tldr` to 2 non-empty lines of 160 characters and chips to the kinds
+  a pinned card). Both the CLI and the mod drop control characters (C0 but newline, DEL, C1) and bidi marks, embeddings,
+  overrides and isolates from the TL;DR and chip text, and keep `tldr` to 2 non-empty lines of 160 characters and chips to the kinds
   `reply` (a one-line `text` of 1..200 characters, shown whole on the chip), `take_over`, `hand_back`, `hold`,
   `release`, `open` and `mark_seen`, each once, at most 6 stored; the card draws the first 3 that apply now
   (`take_over`/`hold` → `mother chief hold` while not held, `hand_back`/`release` → `release` while held,
   `mark_seen` → `mother hub session seen <key>` while `unseen` > 0, workers only; a pinned card takes `reply` and
-  `open`). A chip acts only on a click: `reply` runs `mother chief say <key> -- <text>` for a worker and the pinned
-  send (prefixed, and asked by the guard as every pinned send is) for a pinned session. **Open** on a worker runs
-  `hold` first (a worker has one writer), waits out a running turn (it says so and stops), then on the desktop app
-  calls the `terminal` server's `run_in_terminal` with `claude --resume <session id>` and `cwd` the workspace (the
-  app's own approval of the line applies); on a pinned card it calls `ccd_window` `open_session_in` with the
-  `local_…` id and `target: "focus"` and toasts the app's answer. Where the route is missing (a terminal surface,
-  the server not connected, an error result, a timeout) the toast says why and the card falls back: the held
-  worker's resume command, or the pinned card's prompt fill.
+  `open`). A chip acts only on a click. A `reply` chip sends nothing: the model wrote its text from an untrusted
+  transcript, so a click puts the text in the card's chat box (`chiefDraft`), and only the manager's Send runs
+  `mother chief say <key> -- <text>` (a worker) or the pinned send (prefixed, and asked by the guard as every pinned
+  send is). **Open** never runs twice at once for one session (a second press while the first waits does nothing).
+  On a worker it always runs `hold` first (a worker has one writer; `hold` is idempotent and the card may be stale),
+  then reads the status fresh and goes on only when that read shows the worker held with no turn running; a failed
+  hold or read, a missing worker or one not held stops it with a toast (fail closed), and a running turn says to
+  press Open again. It then calls, on the desktop app, the `terminal` server's `run_in_terminal` with
+  `claude --resume <session id>` and `cwd` the workspace (not verified from a mod: whether the app's own approval of
+  the line applies there). After 2 minutes with no answer it says the tab may still be opening, and the worker stays
+  held. On a pinned card it calls `ccd_window` `open_session_in` with the `local_…` id and `target: "focus"`, and
+  counts it opened only when the answer says so: an error, a timeout, an empty answer or a refusal without an
+  error ("only…", "cannot…", "changes nothing"; "already" counts as shown) falls back. Where a route is missing
+  (a terminal surface, the server not connected) the toast says why and the card falls back: the held worker's
+  resume command, or the pinned card's prompt fill.
 - **Keeper.** `install` writes `~/Library/LaunchAgents/com.mother.chief.plist` (`mother chief keep`, KeepAlive) and
   loads it; every 30 s the keeper starts `tmux new-session -s mother-chief` when none exists, running
   `claude --resume <id> || claude --session-id <id>` with `MOTHER_CHIEF_ROLE=chief`, `MOTHER_NO_SYNC=1` and

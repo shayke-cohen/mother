@@ -993,13 +993,22 @@ def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path]) -> List[dict]:
     return out
 
 
+# C0 controls but newline, DEL, C1 controls, and the bidi marks, embeddings, overrides and isolates: what a model could
+# copy from a transcript to make a card misread, or that a surface refuses to draw.
+_UNSAFE_RE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _safe(text: str) -> str:
+    return _UNSAFE_RE.sub("", text)
+
+
 def clean_tldr(tldr, chips) -> Optional[dict]:
     """{tldr, chips} as the pane may show them, or None: tldr at most 2 non-empty lines of 160 characters; chips at
     most 6 of CHIP_KINDS, each kind once, a `reply` with a one-line text of 1..200 characters. Anything else is
     dropped."""
     if not isinstance(tldr, str):
         return None
-    lines = [" ".join(l.split())[:TLDR_LINE_MAX] for l in tldr.splitlines()]
+    lines = [" ".join(_safe(l).split())[:TLDR_LINE_MAX] for l in tldr.split("\n")]
     lines = [l for l in lines if l][:TLDR_LINES]
     if not lines:
         return None
@@ -1010,7 +1019,8 @@ def clean_tldr(tldr, chips) -> Optional[dict]:
         kind = c["kind"]
         if kind == "reply":
             text = c.get("text")
-            if not isinstance(text, str) or "\n" in text.strip() or not text.strip() or len(text.strip()) > CHIP_TEXT_MAX:
+            text = _safe(text) if isinstance(text, str) else None
+            if text is None or "\n" in text.strip() or not text.strip() or len(text.strip()) > CHIP_TEXT_MAX:
                 continue
             ident = ("reply", text.strip())
             chip = {"kind": "reply", "text": text.strip()}
@@ -1027,23 +1037,24 @@ def clean_tldr(tldr, chips) -> Optional[dict]:
 
 def session_tails(ws: Path, cfg: dict, home: Optional[Path] = None, app_dir: Optional[Path] = None) -> dict:
     """`tail --json`: {version, model, sessions: [{id, kind, key?, fingerprint, text, cached?}]}. `cached` is the
-    stored {tldr, chips} when tldr.json holds one for the same id and fingerprint."""
+    stored {tldr, chips} when tldr.json holds one for the same id, fingerprint and model."""
     home = Path(home or Path.home())
     model = settings(cfg).get("tldr_model")
+    model = model if model in TLDR_MODELS else DEFAULTS["tldr_model"]
     store = _read_obj(chief_dir(ws) / "tldr.json")
     sessions = _live_sessions(Path(ws), home, app_dir if app_dir is not None else default_app_dir())
     for s in sessions:
         hit = store.get(s["id"])
-        if isinstance(hit, dict) and hit.get("fingerprint") == s["fingerprint"]:
+        if isinstance(hit, dict) and hit.get("fingerprint") == s["fingerprint"] and hit.get("model") == model:
             c = clean_tldr(hit.get("tldr"), hit.get("chips"))
             if c:
                 s["cached"] = c
-    return {"version": 1, "model": model if model in TLDR_MODELS else DEFAULTS["tldr_model"], "sessions": sessions}
+    return {"version": 1, "model": model, "sessions": sessions}
 
 
 def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = None,
                app_dir: Optional[Path] = None) -> int:
-    """`tldr --stdin`: merge [{id, fingerprint, tldr, chips}] into .mother/chief/tldr.json, for live sessions only
+    """`tldr --stdin`: merge [{id, fingerprint, model, tldr, chips}] into .mother/chief/tldr.json, for live sessions only
     and cleaned as clean_tldr; entries for sessions no longer live are pruned. Returns how many were stored."""
     ws = Path(ws)
     live = {s["id"] for s in _live_sessions(ws, Path(home or Path.home()),
@@ -1058,7 +1069,8 @@ def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = 
             c = clean_tldr(r.get("tldr"), r.get("chips"))
             if not c:
                 continue
-            doc[r["id"]] = {"fingerprint": r["fingerprint"], "tldr": c["tldr"], "chips": c["chips"], "at": hub._iso(at)}
+            doc[r["id"]] = {"fingerprint": r["fingerprint"], "model": r.get("model") if r.get("model") in TLDR_MODELS else None,
+                            "tldr": c["tldr"], "chips": c["chips"], "at": hub._iso(at)}
             n += 1
         _write_atomic(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
     return n
