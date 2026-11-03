@@ -168,6 +168,16 @@ class ReplyGrammarTest(unittest.TestCase):
         for t in ("7 edit", "7 edit:", "7 edit: ", "7 edit no colon"):
             self.assertEqual(decisions.parse_reply(t, self.OPEN), [], t)
 
+    def test_reply_edit_colon_must_follow_word(self):
+        self.assertEqual(decisions.parse_reply("7 edit please change: x", self.OPEN), [])
+        self.assertEqual(decisions.parse_reply("7 edit : x", self.OPEN), [(7, "edit", "x")])
+
+    def test_reply_edit_payload_verbatim(self):
+        self.assertEqual(decisions.parse_reply("7 edit:  two spaces\n trailing \n", self.OPEN),
+                         [(7, "edit", " two spaces\n trailing \n")])
+        self.assertEqual(decisions.parse_reply('7 edit: --help "x"\ny', self.OPEN),
+                         [(7, "edit", '--help "x"\ny')])
+
     def test_reply_ok_all(self):
         self.assertEqual(decisions.parse_reply("ok all", self.OPEN), [(7, "ok", ""), (8, "ok", ""), (9, "ok", "")])
         self.assertEqual(decisions.parse_reply("ok all", set()), [])

@@ -188,18 +188,17 @@ def parse_reply(text: str, open_ids: Set[int]) -> Optional[List[Tuple[int, str, 
     """The manager's answer to the decision queue as (n, verb, payload) items, verb ok|no|edit|say.
     None: not a reply at all (the text keeps its normal path). []: it starts like a reply but doesn't parse fully,
     or names an id that isn't open — apply nothing."""
-    t = (text or "").strip()
-    if not t or not _starts_like_reply(t):
+    t = (text or "").lstrip()  # only what precedes the payload: an edit's text is kept byte for byte
+    if not t.strip() or not _starts_like_reply(t):
         return None
     items, rest = [], t
     while rest.strip():
         e = _EDIT.match(rest)
         if e:
-            if ":" not in e.group(2):
+            c = re.match(r"\s*: ?(.*)$", e.group(2), re.S)
+            if not c or not c.group(1).strip():
                 return []
-            payload = e.group(2).split(":", 1)[1].strip()
-            if not payload:
-                return []
+            payload = c.group(1)
             items.append((int(e.group(1)), "edit", payload))
             break
         parts = re.split(r"[,;\n]", rest, maxsplit=1)
