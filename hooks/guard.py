@@ -2191,6 +2191,47 @@ def pinned_target(target, ctx):
     return pinned.get(sid) if sid in pinned else None
 
 
+CHIEF_ALIVE_SECONDS = 120
+
+
+def chief_peer_ids(ctx):
+    """The chief's session id (.mother/chief/chief.json) and every chief worker's (sessions.json kind "cli"), or an
+    empty set when no chief is installed here."""
+    if not ctx.ws:
+        return set()
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
+    sid = doc.get("session_id") if ok and isinstance(doc, dict) else None
+    if not (isinstance(sid, str) and sid):
+        return set()
+    ids = {sid}
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "hub", "sessions.json"))
+    items = doc.get("sessions") if ok and isinstance(doc, dict) else None
+    for e in (items.values() if isinstance(items, dict) else []):
+        if isinstance(e, dict) and e.get("kind") == "cli" and isinstance(e.get("session_id"), str) and e["session_id"]:
+            ids.add(e["session_id"])
+    return ids
+
+
+def chief_alive(ctx):
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "heartbeat.json")) if ctx.ws else ({}, False)
+    at = parse_time(doc.get("at")) if ok and isinstance(doc, dict) else None
+    return at is not None and abs(time.time() - at) < CHIEF_ALIVE_SECONDS
+
+
+def chief_peer_socket(target, ctx):
+    """A `uds:<socket>` send that reaches the chief or a chief worker: both act on what they are told with no one
+    watching, and the chief holds an unasked allowance. The socket maps to a session id through the live-pid
+    ~/.claude/sessions registry; a socket that maps to nothing asks too while the chief is alive (fail toward
+    asking). No chief installed: False, today's rules."""
+    if not target.startswith("uds:"):
+        return False
+    ids = chief_peer_ids(ctx)
+    if not ids:
+        return False
+    sid = socket_session_id(target[len("uds:"):])
+    return sid in ids if sid is not None else chief_alive(ctx)
+
+
 def session_target(tool, inp, ctx, cwd=None):
     """A message into a session passes only when that session is one the hub routes to (a `live` entry in
     sessions.json); anything else could carry untrusted source text into an unrelated session, so it asks. In the
@@ -2198,7 +2239,7 @@ def session_target(tool, inp, ctx, cwd=None):
     with or without a ` [ref]` suffix. A card passes only as `own_initiative` (it waits for the manager) or as
     the start of an existing proposal. A `SendMessage` into a pinned desktop session (pinned_target) always asks,
     naming the session, whoever sends it."""
-    what = None
+    what, keep = None, False
     if tool == "mcp__ccd_session_mgmt__send_message":
         target = str(inp.get("session_id") or "")
         if target not in live_hub_sessions(ctx):
@@ -2208,6 +2249,9 @@ def session_target(tool, inp, ctx, cwd=None):
         title = pinned_target(target, ctx)
         if title is not None:
             what = "Chief pane: message to pinned session '%s' \u2014 confirm" % (title or target)
+        elif chief_peer_socket(target, ctx):
+            what = "a message into the chief or a chief worker (%s): they act on it unattended" % target
+            keep = True  # bypass mode outside the workspace does not pass it: the sender's mode is not the chief's
         elif SESSION_ID_RE.match(target):
             if target not in live_hub_sessions(ctx):
                 what = "a message into session %s, which is not a live hub session" % target
@@ -2222,7 +2266,7 @@ def session_target(tool, inp, ctx, cwd=None):
         if not (inp.get("initiation") == "own_initiative" or (keys == {"proposal_id"} and inp.get("proposal_id"))):
             what = "starting a session now (initiation %s), not a card the manager starts" % (
                 inp.get("initiation") or "none")
-    return act("session", "session_messages", what) if what else None
+    return act("session", "session_messages", what, keep_ask=keep) if what else None
 
 
 def classify_mcp(tool, inp):
@@ -4694,13 +4738,13 @@ def chief_session(ctx, payload):
 
 def chief_command(cmd):
     """True for exactly one `mother chief lines|status|run|say …` the chief may run: `mother`, this plugin's
-    bin/mother by its own path (not a symlink to it) or `${CLAUDE_PLUGIN_ROOT}`, or `python3` of it. Read by the shell allow-list's lexer
+    bin/mother by its own path (not a symlink to it), or `python3` of it; never `${CLAUDE_PLUGIN_ROOT}`. Read by the shell allow-list's lexer
     (sl_lex): one stage, no newline, redirection or heredoc, and no `$` expansion, backtick, backslash, glob or
     comment outside quotes, so a value may hold any other text quoted. The shapes:
     `lines [--json]`, `status [--json]`, `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a
     non-empty value in the same token) and `say <key> -- <text…>`."""
-    if "\n" in cmd or "\r" in cmd or hub_odd_chars(cmd):
-        return False
+    if "\n" in cmd or "\r" in cmd or hub_odd_chars(cmd) or "CLAUDE_PLUGIN_ROOT" in cmd:
+        return False  # the guard would read ${CLAUDE_PLUGIN_ROOT} as this plugin; the chief's shell has it unset
     plugin = os.path.dirname(HERE)
     try:
         stages = sl_lex(cmd, plugin)
@@ -4826,7 +4870,62 @@ def key_touch(tool, inp, cwd):
     return fp.casefold() == key.casefold()
 
 
+def chief_identity(ctx, payload):
+    """The chief's own session, or a sub-agent of it: MOTHER_CHIEF_ROLE=chief and the call's session id is
+    chief.json's, whatever PAUSED or a dry run says. Nobody watches it, so a question it raises is never seen."""
+    sid = payload.get("session_id")
+    if os.environ.get(CHIEF_ROLE_ENV) != "chief" or not ctx.ws or not (isinstance(sid, str) and sid):
+        return False
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
+    want = doc.get("session_id") if ok and isinstance(doc, dict) else None
+    return isinstance(want, str) and bool(want) and want == sid
+
+
+CHIEF_NO_ASK = ("The chief runs unattended, so nobody would see this question: denied (%s). Do not retry it or try "
+                "another way; propose it as a decision for the manager instead (record the line as `now` with a "
+                "one-sentence why) and carry on.")
+
+CHIEF_WORKER_ENV = "MOTHER_CHIEF_WORKER"
+# `mother hub <verb> [<sub>]` anywhere in a command (by name or path, python3 or not)
+WORKER_HUB_RE = re.compile(r"(?:^|[^\w.-])mother\s+hub\b\s*([\w-]*)\s*([\w-]*)")
+# what a worker may still run: reads that change no hub state
+WORKER_HUB_READS = {"", "status", "check", "show", "watching", "tail", "help", "-h", "--help"}
+WORKER_HUB_READ_SUBS = {("session", "for"), ("dms", "show")}
+
+
+def worker_hub_write(text):
+    """The `mother hub` write a command runs (decide, mute, follow, session add|drop|seen, pending, add, done, ...),
+    or None. Quotes and backslashes are dropped first, so a quoted verb still reads as one."""
+    norm = re.sub(r"[\"'\\]", "", text).casefold()
+    for m in WORKER_HUB_RE.finditer(norm):
+        verb, sub = m.group(1), m.group(2)
+        if verb in WORKER_HUB_READS or (verb, sub) in WORKER_HUB_READ_SUBS:
+            continue
+        return ("mother hub %s %s" % (verb, sub)).strip()
+    return None
+
+
 def run(raw):
+    """Returns (decision, reason) or None. Never raises. A question the chief's own session would raise is a deny
+    instead (chief_identity): it runs unattended and an ask would stall it unseen."""
+    r = _run(raw)
+    if not (r and r[0] == "ask"):
+        return r
+    try:
+        payload = json.loads(raw or "")
+        if not isinstance(payload, dict):
+            return r
+        ctx = load_ctx()
+        if not chief_identity(ctx, payload):
+            return r
+        reason = CHIEF_NO_ASK % r[1]
+        log(ctx, str(payload.get("tool_name")), {"kind": "chief", "category": "chief"}, "deny", reason)
+        return "deny", reason
+    except Exception:
+        return r
+
+
+def _run(raw):
     """Returns (decision, reason) or None. Never raises."""
     try:
         payload = json.loads(raw or "")
@@ -4853,6 +4952,17 @@ def run(raw):
             r = "deny", "%s on the grant key (%s): only `mother grant` reads it." % (tool, grant_key_path())
             log(ctx, tool, {"kind": "grant-key", "category": "grant_key"}, r[0], r[1])
             return r
+        # A chief worker (MOTHER_CHIEF_WORKER, set by `mother chief run` in the worker's own process env) reads
+        # untrusted text headless: it may read the hub but never change it (log lines, mute, drop sessions).
+        text = str(inp.get("command") or "") if tool in ("Bash", "Monitor") or \
+            tool.split("__")[-1] == "run_in_terminal" else ""
+        if text and os.environ.get(CHIEF_WORKER_ENV, "").strip():
+            w = worker_hub_write(text)
+            if w:
+                r = "deny", ("`%s` from a chief worker: a worker may read the hub but never change it; say in your "
+                             "PROGRESS line what should be decided, and the chief decides it." % w)
+                log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
+                return r
         role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
         if role:
             r = channel_session(tool, inp, payload.get("cwd"), ctx, role)
@@ -4914,6 +5024,7 @@ def run(raw):
         # In the workspace an ask stays an ask unless the manager set policy.bypass_passes_asks; the guard's own
         # files, grants.json and the persona files always ask.
         if r[0] == "ask" and a["kind"] not in ("config", "grants", "persona", "home_settings", "manager_only") \
+                and not a.get("keep_ask") \
                 and payload.get("permission_mode") == "bypassPermissions" \
                 and (bypass_passes(ctx) or shell_in_bypass(ctx, a) or not in_workspace(payload.get("cwd"), ctx)):
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])

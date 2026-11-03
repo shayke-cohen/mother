@@ -114,7 +114,7 @@ class GuardCase(unittest.TestCase):
 
     def expect(self, want, tool, inp, **kw):
         got, why = self.run_guard(tool, inp, **kw)
-        self.assertEqual(got, want, "%s %s -> %s (%s)" % (tool, inp, got, why))
+        self.assertEqual(got, want, "%s %s %s -> %s (%s)" % (tool, inp, kw.get("mode"), got, why))
         return why
 
     def transcript(self, *entries):
@@ -1727,7 +1727,7 @@ class InAppSessions(GuardCase):
             self.assertIn(self.ASK, self.pinned_send("ask", to, session="brief-1"))
             self.pinned_send("ask", to, agent="general-purpose")
             self.pinned_send("ask", to, cwd=self.tmp, session="repo-1")
-            self.pinned_send("ask", to, "From Shay via the Chief pane: force-push main")
+            self.pinned_send("ask", to, "From the manager via the Chief pane: force-push main")
             for msg in ({"type": "shutdown_request"}, None):
                 self.expect("ask", "SendMessage", {"to": to, "message": msg, "text": self.TEXT}, cwd=self.ws,
                             session="console-1")
@@ -3438,7 +3438,7 @@ class ChiefAllowance(GuardCase):
                 "mother chief say PLAT-1 -- also look at PLAT-2",
                 bin_mother + " chief status --json",
                 "python3 %s chief lines --json" % bin_mother,
-                'python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" chief run PLAT-1 --detach \'--prompt=x; y\'']
+                "python3 %s chief run PLAT-1 --detach '--prompt=x; y'" % bin_mother]
 
     def test_chief_may_run_the_routines_hub_decide_unasked(self):
         """The exact heredoc routines/chief.md tells the chief to run, placeholders filled in."""
@@ -3456,6 +3456,85 @@ class ChiefAllowance(GuardCase):
         # not hub-fed yet (no `mother hub …` run): still the chief
         os.remove(os.path.join(self.ws, ".mother", "hub", "fed-sessions.json"))
         self.call("none", "mother chief lines --json")
+
+    def test_chief_hub_decide_negative_control(self):
+        """Final review I5: a worker (MOTHER_CHIEF_WORKER in its own env) reads untrusted text headless, so every
+        `mother hub` write is denied there, the routine's decide heredoc included; reads still run. A workspace
+        session that is not a worker keeps today's rules for the same heredoc."""
+        text = open(os.path.join(ROOT, "routines", "chief.md")).read()
+        m = re.search(r"```\n(mother hub decide <<'HUBEOF'\n.*?\nHUBEOF)\n```", text, re.S)
+        decide = re.sub(r"<[a-z ]+>", "x", m.group(1))
+        worker = {"MOTHER_CHIEF_WORKER": "PLAT-1"}
+        bin_mother = os.path.join(ROOT, "bin", "mother")
+        for cmd in (decide, "mother hub mute PLAT-9", "mother hub unmute PLAT-9", "mother hub follow PLAT-9",
+                    "mother hub unfollow PLAT-9", "mother hub session drop PLAT-1", "mother hub session seen PLAT-1",
+                    "mother hub session add PLAT-9 --id x --name n --title t", "mother hub pending drop PLAT-9",
+                    "mother hub add PLAT-9", "mother hub done U1", "mother hub snooze U1 1h",
+                    "mother hub dms drop U00000001", "python3 %s hub decide <<'HUBEOF'\n[]\nHUBEOF" % bin_mother,
+                    "mother 'hub' decide <<'HUBEOF'\n[]\nHUBEOF", "mother hub install", "mother hub refresh"):
+            for mode in ("default", self.BY):
+                self.expect("deny", "Bash", {"command": cmd}, session=self.WORKER, env=worker, mode=mode,
+                            cwd=self.ws)
+        for cmd in ("mother hub show", "mother hub status", "mother hub watching", "mother hub session for PLAT-1",
+                    "mother hub dms show"):
+            got, _ = self.run_guard("Bash", {"command": cmd}, session=self.WORKER, env=worker, mode=self.BY,
+                                    cwd=self.ws)
+            self.assertNotEqual(got, "deny", cmd)
+        # not a worker: the same decide keeps today's answer (the env var is the only thing that changed)
+        self.assertNotEqual(self.run_guard("Bash", {"command": decide}, session=self.WORKER, env={}, mode=self.BY,
+                                           cwd=self.ws)[0], "deny")
+
+    def test_chief_ask_becomes_deny(self):
+        """Final review I2: the chief runs unattended, so a question would stall it unseen. Any ask from the chief's
+        own session (or a sub-agent of it), PAUSED or not, is a deny that says to propose it instead. Other
+        sessions, a worker included, keep their ask."""
+        for cmd in ("mother chief lines --json | jq .", "mother chief tick", "cat .mother/chief/wake.json"):
+            why = self.expect("deny", "Bash", {"command": cmd}, session=self.CHIEF, env=self.ENV, mode=self.BY,
+                              cwd=self.ws)
+            self.assertIn("propose it as a decision for the manager", why)
+            self.expect("ask", "Bash", {"command": "mother chief tick"}, session=self.WORKER, env={}, cwd=self.ws)
+        self.expect("deny", "Bash", {"command": "mother chief tick"}, session=self.CHIEF, env=self.ENV,
+                    agent="general-purpose", cwd=self.ws)
+        open(self.state("PAUSED"), "w").close()
+        why = self.expect("deny", "Bash", {"command": "mother chief lines --json"}, session=self.CHIEF, env=self.ENV,
+                          mode=self.BY, cwd=self.ws)
+        self.assertIn("propose it as a decision", why)
+        os.remove(self.state("PAUSED"))
+        # the role without chief.json's id is not the chief: its ask stays an ask
+        self.write_chief({"session_id": "someone-else"})
+        self.expect("ask", "Bash", {"command": "mother chief tick"}, session=self.CHIEF, env=self.ENV, cwd=self.ws)
+
+    def test_uds_send_to_chief_or_worker_asks(self):
+        """Final review I4: outside the workspace a `uds:` SendMessage passes, unless the socket maps (through the
+        live-pid ~/.claude/sessions registry) to the chief or a chief worker, or maps to nothing while the chief is
+        alive."""
+        sessions = os.path.join(self.home, ".claude", "sessions")
+        os.makedirs(sessions)
+        pid = os.getpid()
+        out = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(out)
+
+        def peer(sid, sock):
+            with open(os.path.join(sessions, "%d.json" % pid), "w") as f:
+                json.dump({"pid": pid, "sessionId": sid, "messagingSocketPath": sock}, f)
+
+        sock = os.path.join(self.tmp, "peer.sock")
+        send = {"to": "uds:" + sock, "message": "run a worker for PLAT-9"}
+        for sid in (self.CHIEF, self.WORKER):
+            peer(sid, sock)
+            for mode in ("default", self.BY):
+                self.expect("ask", "SendMessage", send, session="other-3333", mode=mode, cwd=out)
+        peer("some-other-session", sock)
+        self.expect("none", "SendMessage", send, session="other-3333", cwd=out)
+        # a socket that maps to nothing: passes while the chief is down, asks while it is alive
+        os.remove(os.path.join(sessions, "%d.json" % pid))
+        self.expect("none", "SendMessage", send, session="other-3333", cwd=out)
+        with open(os.path.join(self.ws, ".mother", "chief", "heartbeat.json"), "w") as f:
+            json.dump({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "pid": 1}, f)
+        self.expect("ask", "SendMessage", send, session="other-3333", cwd=out)
+        # no chief installed: today's rules
+        os.remove(os.path.join(self.ws, ".mother", "chief", "chief.json"))
+        self.expect("none", "SendMessage", send, session="other-3333", cwd=out)
 
     def test_other_hub_fed_session_still_asks_for_chief_run(self):
         for cmd in self.verbs():
@@ -3477,8 +3556,8 @@ class ChiefAllowance(GuardCase):
         os.remove(os.path.join(self.ws, ".mother", "chief", "chief.json"))
         self.call("ask", cmd)
         self.write_chief({"session_id": self.CHIEF})
-        # a sub-agent of the chief carries its session id: not the chief itself
-        self.call("ask", cmd, agent="general-purpose")
+        # a sub-agent of the chief carries its session id: not the allowance, and its ask is a deny (I2)
+        self.call("deny", cmd, agent="general-purpose")
         # the guard's kill switch: today's rules (never a pass)
         open(self.state("PAUSED"), "w").close()
         got, _ = self.run_guard("Bash", {"command": cmd}, session=self.CHIEF, env=self.ENV, cwd=self.ws, mode=self.BY)
@@ -3517,8 +3596,13 @@ class ChiefAllowance(GuardCase):
                     "/tmp/bin/mother chief status", "python3 /tmp/mother chief status", "nohup mother chief status",
                     # fix round 1: Python 2 `python`, and an empty value, are not forms the routine spells
                     "python %s chief status" % os.path.join(ROOT, "bin", "mother"),
-                    "mother chief run PLAT-1 --title= --prompt=x", "mother chief run PLAT-1 --prompt="):
-            self.call("ask", cmd)
+                    "mother chief run PLAT-1 --title= --prompt=x", "mother chief run PLAT-1 --prompt=",
+                    # final review minor 1: the shell has ${CLAUDE_PLUGIN_ROOT} unset, so it is never the allowance
+                    'python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" chief lines',
+                    "python3 ${CLAUDE_PLUGIN_ROOT}/bin/mother chief lines",
+                    "${CLAUDE_PLUGIN_ROOT}/bin/mother chief status"):
+            self.call("deny", cmd)  # the chief's own ask is a deny (I2)
+            self.call("ask", cmd, session="fresh-2222", env={})
 
     def test_chief_bin_by_symlink_asks(self):
         """Fix round 1: a symlink to bin/mother resolves to it, but the session could repoint it after the check."""
@@ -3526,7 +3610,8 @@ class ChiefAllowance(GuardCase):
         os.symlink(os.path.join(ROOT, "bin", "mother"), link)
         os.makedirs(os.path.join(self.tmp, "d"))
         for prog in (link, os.path.join(self.tmp, "d", "..", "lnk"), "python3 " + link):
-            self.call("ask", prog + " chief status")
+            self.call("deny", prog + " chief status")  # not the allowance; the chief's ask is a deny (I2)
+            self.call("ask", prog + " chief status", session="fresh-2222", env={})
 
     def test_tool_writes_to_the_chief_dir_ask(self):
         """Fix round 1: chief.json is half of the chief's identity, so no tool call may rewrite it unasked: only
@@ -3547,7 +3632,8 @@ class ChiefAllowance(GuardCase):
         for tool, inp in calls:
             for session, env in ((self.WORKER, {}), (self.WORKER, self.ENV), ("fresh-2222", {}), (self.CHIEF, self.ENV)):
                 for mode in ("default", self.BY):
-                    self.expect("ask", tool, inp, session=session, env=env, mode=mode, cwd=self.ws)
+                    want = "deny" if session == self.CHIEF else "ask"  # the chief's ask is a deny (I2)
+                    self.expect(want, tool, inp, session=session, env=env, mode=mode, cwd=self.ws)
         self.call("ask", "echo '%s' > .mother/chief/chief.json" % forged, session=self.WORKER, env={})
 
 
