@@ -1270,8 +1270,9 @@ model in the loop: the Now panel's Archive, Mark read and "Archive N mail" butto
 An optional layer over the hub. The **chief** is one long-lived Claude Code CLI session, kept alive in tmux by a
 launchd job (`mother chief install`), that decides the hub's inbox lines and starts **workers**: headless
 `claude -p` sessions, one per followed thing. Config: the optional `chief` block (§3), keys `max_workers` (3),
-`run_minutes` (20), `daily_budget_usd` (20), `chief_model` (`sonnet`), `worker_model` (empty: claude's default) and
-`tick_seconds` (30); unknown keys are dropped. Home machine only. The chief replaces a desktop `/mother:hub`
+`run_minutes` (20), `daily_budget_usd` (20), `chief_model` (`sonnet`), `worker_model` (empty: claude's default),
+`tick_seconds` (30) and `tldr_model` (`sonnet`; `opus` is the one other value, anything else reads as `sonnet`);
+unknown keys are dropped. Home machine only. The chief replaces a desktop `/mother:hub`
 session: there is one `inbox_cursor`, so `install` refuses while a hub wake (`hub.json` `last_wake`) is under 10
 minutes old unless `--force`. A wake no later than 120 s after the chief's own heartbeat is the chief's own decide
 (the hub skill refuses to start while that heartbeat is fresh), so a re-install while the chief runs proceeds.
@@ -1287,7 +1288,7 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   stdout and stderr of a detached run). `desktop.json` (`{at, sessions: [{session_id, cli_session_id, title, cwd,
   link}]}`: the pinned desktop sessions, written only by `mother chief pinned --stdin`, below). Also `PAUSED` (the
   chief-only switch), `desktop-cache.json` (fields read from the app's session files, keyed by mtime and size),
-  `keeper.log` and `keeper.out`. Every write is a temp-file rename; queue, spend, `chief.json` and `desktop.json`
+  `keeper.log`, `keeper.out` and `tldr.json` (the Chief pane's TL;DRs, below). Every write is a temp-file rename; queue, spend, `chief.json` and `desktop.json`
   take `hub.locked`.
 - **Worker fields in `sessions.json`** (§5e). A worker is a `sessions.json` entry with `kind: "cli"` and the hub
   fields, plus `status` (`idle` | `working` | `failed`; the type also allows `done`), `held` (bool), `progress` (the
@@ -1328,10 +1329,38 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
 - **`ChiefStatus`** (`status --json`, version 1, `types/index.d.ts`): `{version, at, paused, chief: {alive,
   heartbeat_at, session_id}, budget: {spent, limit, unreadable, over}, workers: [{key, title, status, held, running, progress, cost,
   runs, last_run_at, session_id, queued, resume}], desktop: [{session_id, cli_session_id, title, cwd, repo,
-  last_activity_at, last_report, open_link}]}`. Workers: running first, then newest run. `desktop` is the snapshot
+  last_activity_at, last_report, open_link}]}`; a worker row also carries `unseen` (0 when absent). Workers: running first, then newest run. `desktop` is the snapshot
   rows still live in the app (`last_report` is the first 200 characters of the last turn report); an older CLI omits
   it. `spent` reads 0 when `spend.json` is unreadable; `unreadable` is then true, and `over` (spent at the limit, or
   unreadable) says no run starts; the pane shows both. `resume` is `""` for an entry with no session id.
+- **TL;DR, chips and Open on the Chief pane.** `mother chief tail --json` prints `{version: 1, model, sessions:
+  [{id, kind, key?, fingerprint, text, cached?}]}`: one row per worker (`id` its session id, `kind: "worker"`, `key`)
+  and pinned session (`id` its CLI id, `kind: "pinned"`) with something to summarise. `text` is the transcript's last
+  12 main-thread user and assistant messages from `~/.claude/projects/<cwd slug>/<id>.jsonl` (the workspace for a
+  worker, the snapshot's `cwd` for a pinned session; the last 512 KB read), `role: text` per line with tool output,
+  thinking and sidechains left out, each message cut to 1500 and the whole to its last 6000 characters;
+  `fingerprint` is `t:<size>:<mtime_ns>`. With no transcript, a worker's `progress` (`p:<sha1>`) or a pinned
+  session's `last_report` (`r:<sha1>`). `model` is `chief.tldr_model`. `cached` is `tldr.json`'s entry for that id
+  when its fingerprint matches. `mother chief tldr --stdin` takes `[{id, fingerprint, tldr, chips}]` and merges
+  them into `tldr.json` (`{<id>: {fingerprint, tldr, chips, at}}`, live sessions only; the rest pruned); prints
+  `{stored: N}`. The mod asks the model (`$.model.complete`, `chief.tldr_model`, effort `low`, 1024 tokens, 30 s)
+  only for a row with no match in its memory or `cached`, only while the Chief pane is shown (`$.ui.panes()`), from
+  the timer pass and when `/chief` opens the pane (never from a draw), at most every 15 s and 6 calls a minute; a
+  failed row is asked again after 5 minutes or when it moves. The tail goes in as JSON data under a fixed note; the
+  reply must be one JSON object `{tldr, chips}`, and anything off keeps the card's progress line (`last_report` for
+  a pinned card). Both the CLI and the mod keep `tldr` to 2 non-empty lines of 160 characters and chips to the kinds
+  `reply` (a one-line `text` of 1..200 characters, shown whole on the chip), `take_over`, `hand_back`, `hold`,
+  `release`, `open` and `mark_seen`, each once, at most 6 stored; the card draws the first 3 that apply now
+  (`take_over`/`hold` → `mother chief hold` while not held, `hand_back`/`release` → `release` while held,
+  `mark_seen` → `mother hub session seen <key>` while `unseen` > 0, workers only; a pinned card takes `reply` and
+  `open`). A chip acts only on a click: `reply` runs `mother chief say <key> -- <text>` for a worker and the pinned
+  send (prefixed, and asked by the guard as every pinned send is) for a pinned session. **Open** on a worker runs
+  `hold` first (a worker has one writer), waits out a running turn (it says so and stops), then on the desktop app
+  calls the `terminal` server's `run_in_terminal` with `claude --resume <session id>` and `cwd` the workspace (the
+  app's own approval of the line applies); on a pinned card it calls `ccd_window` `open_session_in` with the
+  `local_…` id and `target: "focus"` and toasts the app's answer. Where the route is missing (a terminal surface,
+  the server not connected, an error result, a timeout) the toast says why and the card falls back: the held
+  worker's resume command, or the pinned card's prompt fill.
 - **Keeper.** `install` writes `~/Library/LaunchAgents/com.mother.chief.plist` (`mother chief keep`, KeepAlive) and
   loads it; every 30 s the keeper starts `tmux new-session -s mother-chief` when none exists, running
   `claude --resume <id> || claude --session-id <id>` with `MOTHER_CHIEF_ROLE=chief`, `MOTHER_NO_SYNC=1` and
