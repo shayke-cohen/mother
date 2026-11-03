@@ -9,11 +9,13 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import chief  # noqa: E402
 import decisions  # noqa: E402
+import grants  # noqa: E402
 import hub  # noqa: E402
 
 UTC = timezone.utc
@@ -198,6 +200,216 @@ class ReplyGrammarTest(unittest.TestCase):
         self.assertEqual(decisions.parse_reply("7 ok 8", {7}), [])
         self.assertEqual(decisions.parse_reply("ok 12", {7}), [])
         self.assertEqual(decisions.parse_reply("7 ok, 12 no", {7}), [])
+
+
+CFG = {"manager": {"chat_dm": ["U00000001", "D00000001"]}}
+DM, OWNER = "D00000001", "U00000001"
+SRC_TS = "%.6f" % (AT.timestamp() - 60)
+
+
+def typed_msg(ts=SRC_TS, text="1 ok", **kw):
+    m = {"ts": ts, "user": OWNER, "client_msg_id": "c-1", "text": text}
+    m.update(kw)
+    return m
+
+
+class AnswerTest(Base):
+    def setUp(self):
+        super().setUp()
+        sdir = tempfile.TemporaryDirectory()
+        self.addCleanup(sdir.cleanup)
+        env = mock.patch.dict(os.environ, {"MOTHER_STATE_DIR": sdir.name})
+        env.start()
+        self.addCleanup(env.stop)
+        self.fetched = []
+
+    def fetch_ok(self, msg=None):
+        def f(cfg, channel, ts):
+            self.fetched.append((channel, ts))
+            return typed_msg(ts=ts) if msg is None else msg
+        return f
+
+    def answer(self, verb="ok", payload="", source=None, n=1, fetch=None):
+        return decisions.answer(self.ws, CFG, AT, n, verb, payload, source or {"via": "pane"}, fetch=fetch)
+
+    def grants(self):
+        doc, problem = grants.read(self.ws)
+        self.assertIsNone(problem)
+        return doc["grants"]
+
+    def queue(self):
+        return chief._read_queue(self.ws)
+
+    def test_ok_writes_bound_grant_and_queues(self):
+        d = self.propose()
+        src = {"via": "slack", "channel": DM, "ts": SRC_TS, "text": "1 ok"}
+        msg = self.answer(source=src, fetch=self.fetch_ok())
+        self.assertEqual(self.fetched, [(DM, SRC_TS)])
+        self.assertIn("D1", msg)
+        gs = self.grants()
+        self.assertEqual(len(gs), 1)
+        g = gs[0]
+        self.assertEqual(g["draft_sha"], d["draft_sha"])
+        self.assertEqual((g["uses"], g["run"], g["decision"], g["scope"]), (1, "chief:D1", "D1", "chat-reply"))
+        self.assertEqual((g["target"], g["thread"]), ("C00000001", "1700000000.000100"))
+        self.assertEqual(g["source"], {"channel": DM, "user": OWNER, "ts": SRC_TS})
+        self.assertEqual(g["expires"], grants.iso(AT.timestamp() + 2 * 3600))
+        q = self.queue()
+        self.assertEqual(len(q), 1)
+        canon = json.dumps(REPLY, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        self.assertEqual(q[0]["source"], "decision")
+        self.assertEqual(q[0]["text"], "D1 approved by the manager. Make exactly this one call now, with this input "
+                                       "unchanged, then end the turn.\nTool: %s\nInput: %s" % (POST, canon))
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "approved")
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
+
+    def test_pane_source_and_expiry_caps(self):
+        decisions.propose(self.ws, {"chief": {"decision_hours": 1}}, AT, "PLAT-1", POST, dict(REPLY), "r")
+        self.answer()
+        g = self.grants()[0]
+        self.assertEqual(g["source"], {"channel": "pane", "user": OWNER, "ts": "%.6f" % AT.timestamp()})
+        self.assertEqual(g["expires"], grants.iso(AT.timestamp() + 3600))  # the decision's own expiry is earlier
+
+    def test_edit_text_verbatim(self):
+        self.propose()
+        payload = '--help "x"\ny'
+        self.answer("edit", payload)
+        g = self.grants()[0]
+        want = dict(REPLY, text=payload)
+        self.assertEqual(g["draft_sha"], decisions.guard.draft_sha(POST, want))
+        d = decisions.load(self.ws)["decisions"][0]
+        self.assertEqual((d["input"], d["text"], d["draft_sha"], d["status"]), (want, payload, g["draft_sha"],
+                                                                               "approved"))
+        self.assertIn(json.dumps(want, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+                      self.queue()[0]["text"])
+
+    def test_edit_without_text_field_stays_open(self):
+        self.propose(inp={"channel": "C00000001", "blocks": [{"type": "section"}]})
+        msg = self.answer("edit", "new")
+        self.assertIn("still open", msg)
+        self.assertEqual((self.grants(), self.queue()), ([], []))
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "pending")
+
+    def test_approve_twice_one_grant(self):
+        self.propose()
+        self.answer()
+        msg = self.answer()
+        self.assertEqual(msg, "D1 is already approved.")
+        self.assertEqual(len(self.grants()), 1)
+        self.assertEqual(len(self.queue()), 1)
+
+    def test_forged_manual_line_not_applied(self):
+        self.propose()
+        src = {"via": "slack", "channel": DM, "ts": SRC_TS, "text": "1 ok"}
+        for bad in (typed_msg(app_id="A1"), typed_msg(bot_id="B1"), typed_msg(client_msg_id=None),
+                    typed_msg(user="U00000007"), typed_msg(text="1 no"), typed_msg(ts="1.000000"), None):
+            msg = self.answer(source=src, fetch=self.fetch_ok(bad) if bad is not None else (lambda c, ch, ts: None))
+            self.assertTrue(msg.startswith("D1 is still open: I couldn't confirm that reply came from you ("), msg)
+        self.assertEqual((self.grants(), self.queue()), ([], []))
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "pending")
+
+    def test_slack_source_outside_dm_or_fetch_error(self):
+        self.propose()
+
+        def boom(cfg, channel, ts):
+            raise RuntimeError("down")
+        for src, f in (({"via": "slack", "channel": "C00000001", "ts": SRC_TS, "text": "1 ok"}, self.fetch_ok()),
+                       ({"via": "slack", "channel": OWNER, "ts": SRC_TS, "text": "1 ok"}, self.fetch_ok()),
+                       ({"via": "slack", "channel": DM, "ts": SRC_TS, "text": "1 ok"}, boom)):
+            self.assertIn("still open", self.answer(source=src, fetch=f))
+        self.assertEqual(self.grants(), [])
+
+    def test_verify_typed_plain_text_match(self):
+        f = self.fetch_ok(typed_msg(text="1​ ok"))
+        self.assertIsNone(decisions.verify_typed(self.ws, CFG, DM, SRC_TS, "1 ok", fetch=f))
+
+    def test_default_fetch_reads_one_ts_and_closes(self):
+        calls, closed = [], []
+
+        class FakeClient:
+            def call(self, name, args):
+                calls.append((name, args))
+                return {"messages": [typed_msg()]}
+
+            def close(self):
+                closed.append(1)
+        built = []
+
+        def build(cfg, have):
+            built.append(sorted(cfg["hub"]["connections"]))
+            return {"chat": FakeClient()}
+        cfg = dict(CFG, hub={"connections": {"chat": {"command": "x"}, "mail": {"command": "y"}}})
+        with mock.patch.object(decisions.hub, "build_clients", build):
+            self.assertIsNone(decisions.verify_typed(self.ws, cfg, DM, SRC_TS, "1 ok"))
+        self.assertEqual(built, [["chat"]])  # only the chat server is started
+        self.assertEqual(calls, [("get_channel_history", {"channel_id": DM, "oldest": SRC_TS, "latest": SRC_TS,
+                                                          "inclusive": True, "limit": 1})])
+        self.assertEqual(closed, [1])
+        with mock.patch.object(decisions.hub, "build_clients", lambda c, h: {"chat": RuntimeError("no server")}):
+            self.assertIn("no server", decisions.verify_typed(self.ws, cfg, DM, SRC_TS, "1 ok"))
+        self.assertIn("no hub chat connection", decisions.verify_typed(self.ws, CFG, DM, SRC_TS, "1 ok"))
+
+    def test_expired_or_sent_reports_status(self):
+        self.propose()
+        for status in ("expired", "sent"):
+            with decisions.locked(self.ws):
+                doc = decisions.load(self.ws)
+                doc["decisions"][0]["status"] = status
+                decisions.save(self.ws, doc)
+            self.assertEqual(self.answer(), "D1 is already %s." % status)
+        self.assertEqual((self.grants(), self.queue()), ([], []))
+
+    def test_pending_past_expiry_is_expired(self):
+        self.propose()
+        late = decisions.answer(self.ws, CFG, AT + timedelta(hours=49), 1, "ok", "", {"via": "pane"})
+        self.assertEqual(late, "D1 is already expired.")
+        self.assertEqual(self.grants(), [])
+
+    def test_unknown_decision(self):
+        self.assertIn("D9", self.answer(n=9))
+
+    def test_manual_kind_no_grant(self):
+        self.propose(tool=MAIL, inp={"to": "a@b.c", "body": "x"})
+        msg = self.answer()
+        self.assertEqual(msg, "D1 is yours to do by hand (%s isn't something I can send): x" % MAIL)
+        self.assertEqual(self.grants(), [])
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "manual")
+
+    def test_paused_no_grant(self):
+        self.propose()
+        chief.pause(self.ws)
+        self.assertEqual(self.answer(), "D1 is still open: outbound is paused.")
+        self.assertEqual((self.grants(), self.queue()), ([], []))
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "pending")
+
+    def test_no_and_say_queue_text(self):
+        self.propose()
+        self.propose(inp=dict(REPLY, text="other"))
+        self.answer("no", n=1)
+        self.answer("say", "wait until Monday", n=2)
+        self.assertEqual([(e["source"], e["text"]) for e in self.queue()],
+                         [("decision", "D1 was rejected by the manager. Don't make that call."),
+                          ("decision", "The manager's words about D2, their instruction to you: wait until Monday")])
+        self.assertEqual([d["status"] for d in decisions.load(self.ws)["decisions"]], ["rejected", "redirected"])
+        self.assertEqual(self.grants(), [])
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
+
+    def test_answer_cli(self):
+        self.propose()
+        out, err = io.StringIO(), io.StringIO()
+        code = decisions.main(["answer", "1", "edit", "--via", "pane", "--", "new", "text"], self.ws, CFG, out, err,
+                              at=AT)
+        self.assertEqual(code, 0, err.getvalue())
+        doc = json.loads(out.getvalue())
+        self.assertTrue(doc["ok"])
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["text"], "new text")
+        for args in (["answer", "1", "ok"], ["answer", "x", "ok", "--via", "pane"],
+                     ["answer", "1", "maybe", "--via", "pane"], ["answer", "1", "ok", "--via", "slack"]):
+            self.assertEqual(decisions.main(args, self.ws, CFG, io.StringIO(), io.StringIO(), at=AT), 2, args)
+        out = io.StringIO()
+        self.assertEqual(decisions.main(["answer", "1", "ok", "--via", "typed"], self.ws, CFG, out, io.StringIO(),
+                                        at=AT), 1)
+        self.assertEqual(json.loads(out.getvalue()), {"ok": False, "message": "D1 is already approved."})
 
 
 if __name__ == "__main__":

@@ -32,6 +32,15 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def typed_by(msg: dict, mine: str) -> bool:
+    """The chat message was typed by `mine` (the manager): posted as that user with a `client_msg_id` (the client
+    sets it) and no `app_id`, `bot_id`, `bot_profile` or `subtype`, with some text. A post made through an app (MOTHER
+    via a connector) always carries `app_id`, signed or not, so it never counts."""
+    return bool(mine) and isinstance(msg, dict) and msg.get("user") == mine and bool(msg.get("client_msg_id")) \
+        and not (msg.get("app_id") or msg.get("bot_id") or msg.get("bot_profile") or msg.get("subtype")) \
+        and bool((msg.get("text") or "").strip())
+
+
 def parse_iso(s: str) -> datetime:
     s = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", (s or "").replace("Z", "+00:00"))
     try:
@@ -273,18 +282,15 @@ class ChatSlack(Adapter):
                                        summary=text, also=hub.extract_also(text), uid=ts))
 
         def note(ch, msg):
-            """A message in the self-DM inbox: only a note the manager typed becomes a `manual` line. Typed means
-            posted as the manager with a `client_msg_id` (the client sets it) and no `app_id`, `bot_id`,
-            `bot_profile` or `subtype`: a post made through an app (MOTHER via a connector) always carries
-            `app_id`, signed or not, so it never loops back as a note."""
+            """A message in the self-DM inbox: only a note the manager typed (`typed_by`) becomes a `manual` line,
+            so a post MOTHER made through an app never loops back as a note."""
             nonlocal me_at
             ts = msg.get("ts")
             if not ts or float(ts) <= since or "%s:%s" % (ch, ts) in seen:
                 return
             seen.append("%s:%s" % (ch, ts))
             text = msg.get("text") or ""
-            if not mine or msg.get("user") != mine or not msg.get("client_msg_id") or msg.get("app_id") \
-                    or msg.get("bot_id") or msg.get("bot_profile") or msg.get("subtype") or not text.strip():
+            if not typed_by(msg, mine):
                 return
             me_at = max(me_at, float(ts))  # a note typed from any device: the manager is around
             text = hub.plain(text)

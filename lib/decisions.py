@@ -1,7 +1,8 @@
 """mother decide — the decision queue. A worker files the exact call it wants to make; the manager answers; code
-(never a model) writes a single-use grant bound to that call (approve/answer, added by later tasks).
+(never a model) writes a single-use grant bound to that call (`answer`).
 
   propose <key> --tool T --recommend R [--why W] [--urgent] --stdin     stdin: the tool's input JSON
+  answer <n> <ok|no|edit|say> --via pane|typed [-- <text>]              the Chief pane's answer (mod only)
 
 State is <workspace>/.mother/chief/decisions.json, changed only under `locked(ws)` (flock on decisions.lock) and
 written atomically. Python 3.9 stdlib only.
@@ -17,6 +18,7 @@ from typing import List, Optional, Set, Tuple
 
 import channels
 import chief
+import grants
 import hub
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -212,6 +214,187 @@ def parse_reply(text: str, open_ids: Set[int]) -> Optional[List[Tuple[int, str, 
     return items
 
 
+# ---- answering ---------------------------------------------------------------------------------------
+
+GRANT_HOURS = 2
+VERBS = ("ok", "no", "edit", "say")
+VIAS = ("slack", "pane", "typed")
+
+
+def canonical(inp) -> str:
+    return json.dumps(inp, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _fetch_slack(cfg: dict, channel: str, ts: str) -> Optional[dict]:
+    """The one message at `ts` in `channel`, read through the hub's read-only chat client; None when Slack has no
+    such message. Raises when the chat connection can't be made or read."""
+    from hub_mcp import McpError
+    h = hub._hub_cfg(cfg)
+    conn = (h.get("connections") or {}).get("chat")
+    if not isinstance(conn, dict):
+        raise McpError("other", "no hub chat connection in config")
+    only_chat = dict(cfg, hub=dict(h, connections={"chat": conn}))  # start the chat server only
+    clients = hub.build_clients(only_chat, {})
+    try:
+        c = clients.get("chat")
+        if c is None or isinstance(c, Exception):
+            raise c if isinstance(c, Exception) else McpError("other", "no chat client")
+        res = c.call("get_channel_history", {"channel_id": channel, "oldest": ts, "latest": ts, "inclusive": True,
+                                             "limit": 1})
+        for m in (res or {}).get("messages") or []:
+            if isinstance(m, dict) and m.get("ts") == ts:
+                return m
+        return None
+    finally:
+        for c in clients.values():
+            if not isinstance(c, Exception):
+                hub._close(c)
+
+
+def verify_typed(ws: Path, cfg: dict, channel: str, ts: str, text: str, fetch=None) -> Optional[str]:
+    """None when Slack shows the message at (channel, ts) typed by the manager (`hub_sources.typed_by`) in the
+    manager's own DM, with the same text after `hub.plain`; otherwise the reason it can't be confirmed."""
+    import hub_sources
+    if not isinstance(channel, str) or not channel.startswith("D") or channel not in guard.dm_ids(cfg):
+        return "it isn't in your own DM"
+    mine = guard.owner_id(cfg)
+    if not mine:
+        return "config.json has no manager chat id"
+    if not isinstance(ts, str) or not ts:
+        return "the message has no timestamp"
+    try:
+        msg = (fetch or _fetch_slack)(cfg, channel, ts)
+    except Exception as e:
+        return "Slack couldn't be read: %s" % (str(e) or type(e).__name__)
+    if not isinstance(msg, dict) or msg.get("ts") != ts:
+        return "Slack doesn't show that message"
+    if not hub_sources.typed_by(msg, mine):
+        return "Slack doesn't show it as typed by you"
+    if hub.plain(msg.get("text")).strip() != hub.plain(text).strip():
+        return "the text in Slack is different"
+    return None
+
+
+def _grant(d: dict, cfg: dict, at: datetime, owner: str, source: dict) -> dict:
+    now = at.timestamp()
+    if source.get("via") == "slack":
+        src = {"channel": source["channel"], "user": owner, "ts": source["ts"]}
+    else:
+        src = {"channel": "pane", "user": owner, "ts": "%.6f" % now}
+    _, max_age = guard.grant_limits(cfg)
+    t = guard.parse_time(src["ts"])
+    if t is None:
+        raise ValueError("the reply's timestamp can't be read")
+    ends = [now + GRANT_HOURS * 3600, t + max_age * 3600]
+    exp = guard.parse_time(d.get("expires"))
+    if exp is not None:
+        ends.append(exp)
+    return {"scope": d["kind"], "target": d.get("target"), "thread": d.get("thread"), "uses": 1,
+            "expires": grants.iso(min(ends)), "run": "chief:%s" % d["id"], "decision": d["id"],
+            "draft_sha": d["draft_sha"], "source": src}
+
+
+def answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, source: dict, fetch=None) -> str:
+    """Apply the manager's answer to decision D<n>; the one-line result for the manager. Only a verified yes (a
+    Slack reply re-read by `verify_typed`, or a pane/typed answer) writes a grant, and that grant is bound to the
+    exact call (`draft_sha`), single-use and short-lived. Anything unverifiable changes nothing.
+    Lock order: decisions, then grants, then the hub lock (enqueue, update_worker)."""
+    return _answer(ws, cfg, at, n, verb, payload, source, fetch)[1]
+
+
+def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, source: dict,
+            fetch=None) -> Tuple[bool, str]:
+    ws = Path(ws)
+    did = "D%d" % n
+    if verb not in VERBS:
+        return False, "%s is still open: I don't know the answer %r." % (did, verb)
+    via = (source or {}).get("via")
+    if via not in VIAS:
+        return False, "%s is still open: I couldn't confirm that reply came from you (unknown source)." % did
+    if via == "slack":
+        why = verify_typed(ws, cfg, source.get("channel"), source.get("ts"), source.get("text"), fetch=fetch)
+        if why:
+            return False, "%s is still open: I couldn't confirm that reply came from you (%s)." % (did, why)
+    with locked(ws):
+        doc = load(ws)
+        d = next((x for x in doc["decisions"] if x.get("id") == did), None)
+        if d is None:
+            return False, "%s isn't a decision I know." % did
+        if d.get("status") == "pending":
+            exp = guard.parse_time(d.get("expires"))
+            if exp is not None and at.timestamp() >= exp:
+                d["status"] = "expired"
+                save(ws, doc)
+        if d.get("status") != "pending":
+            return False, "%s is already %s." % (did, d.get("status"))
+        if chief.paused(ws):
+            return False, "%s is still open: outbound is paused." % did
+        key = d.get("key")
+        if key not in chief.workers(ws):
+            return False, "%s is still open: %s is no longer a live worker." % (did, key)
+        rec = {"verb": verb, "via": via, "at": hub._iso(at)}
+        if via == "slack":
+            rec["ts"] = source.get("ts")
+        if verb in ("edit", "say"):
+            rec["payload"] = payload
+        if verb == "edit":
+            try:
+                inp = edited_input(d["input"], payload)
+            except ValueError as e:
+                return False, "%s is still open: %s." % (did, e)
+            kind, target, thread = kind_of(d["tool"], inp)
+            d.update(input=inp, text=guard.text_of(inp), draft_sha=guard.draft_sha(d["tool"], inp), kind=kind,
+                     target=target, thread=thread)
+        if verb in ("ok", "edit"):
+            if d.get("kind") == "manual":
+                d.update(status="manual", answer=rec)
+                save(ws, doc)
+                _resume(ws, key)
+                return True, "%s is yours to do by hand (%s isn't something I can send): %s" % (
+                    did, d["tool"], d.get("text"))
+            owner = guard.owner_id(cfg)
+            if not owner:
+                return False, "%s is still open: config.json has no manager chat id." % did
+            try:
+                g = _grant(d, cfg, at, owner, source)
+            except ValueError as e:
+                return False, "%s is still open: %s." % (did, e)
+            with grants.locked(ws):
+                gdoc, problem = grants.read(ws)
+                if problem:
+                    return False, "%s is still open: %s." % (did, problem)
+                if not any(isinstance(x, dict) and x.get("decision") == did for x in gdoc["grants"]):
+                    gdoc["grants"].append(g)
+                    grants.write(ws, gdoc)
+            d.update(status="approved", answer=rec)
+            save(ws, doc)
+            chief.enqueue(ws, at, key, "%s approved by the manager. Make exactly this one call now, with this input "
+                                       "unchanged, then end the turn.\nTool: %s\nInput: %s"
+                          % (did, d["tool"], canonical(d["input"])), "decision")
+            _resume(ws, key)
+            return True, "%s approved: %s will make that one call." % (did, key)
+        if verb == "no":
+            d.update(status="rejected", answer=rec)
+            text = "%s was rejected by the manager. Don't make that call." % did
+            result = "%s rejected: %s won't make that call." % (did, key)
+        else:
+            d.update(status="redirected", answer=rec)
+            text = "The manager's words about %s, their instruction to you: %s" % (did, payload)
+            result = "%s: your words went to %s." % (did, key)
+        save(ws, doc)
+        chief.enqueue(ws, at, key, text, "decision")
+        _resume(ws, key)
+        return True, result
+
+
+def _resume(ws: Path, key: str) -> None:
+    """The worker leaves waiting_decision; normal dispatch picks up what was queued."""
+    try:
+        chief.update_worker(ws, key, status="idle")
+    except KeyError:
+        pass
+
+
 def _opts(args, valued, flags):
     pos, o, i = [], {}, 0
     while i < len(args):
@@ -237,6 +420,8 @@ def main(args, ws, cfg, out=sys.stdout, err=sys.stderr, at: Optional[datetime] =
     if verb in ("", "help", "-h", "--help"):
         print(USAGE, file=out)
         return 0
+    if verb == "answer":
+        return _main_answer(rest, ws, cfg, out, err, at)
     if verb != "propose":
         print("usage:\n" + USAGE, file=err)
         return 2
@@ -264,3 +449,25 @@ def main(args, ws, cfg, out=sys.stdout, err=sys.stderr, at: Optional[datetime] =
         return 1
     print(json.dumps({"ok": True, "decision": d}), file=out)
     return 0
+
+
+def _main_answer(rest, ws, cfg, out, err, at) -> int:
+    """mother decide answer <n> <ok|no|edit|say> --via pane|typed [-- <text>] — for the Chief pane only."""
+    payload = ""
+    if "--" in rest:
+        i = rest.index("--")
+        rest, payload = rest[:i], " ".join(rest[i + 1:])
+    try:
+        pos, o = _opts(rest, ("via",), ())
+    except ValueError as e:
+        print("mother decide: %s" % e, file=err)
+        return 2
+    m = _NUM.match(pos[0].lower()) if len(pos) == 2 else None
+    if not m or pos[1] not in VERBS or o.get("via") not in ("pane", "typed") \
+            or (pos[1] in ("edit", "say") and not payload.strip()):
+        print("usage: mother decide answer <n> <ok|no|edit|say> --via pane|typed [-- <text>]", file=err)
+        return 2
+    ok, msg = _answer(Path(ws), cfg or {}, at or datetime.now(timezone.utc), int(m.group(1)), pos[1], payload,
+                      {"via": o["via"]})
+    print(json.dumps({"ok": ok, "message": msg}), file=out)
+    return 0 if ok else 1
