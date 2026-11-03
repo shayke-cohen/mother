@@ -1626,7 +1626,7 @@ class TestTldr(Base):
         [s] = self.tails()["sessions"]
         self.assertEqual(s["cached"], {"tldr": "Fixing it.\nTests next.",
                                        "chips": [{"kind": "reply", "text": "Ship it"}, {"kind": "hold"},
-                                                 {"kind": "open"}]})
+                                                 {"kind": "open"}, {"kind": "mark_seen"}]})
         # the session moved: the cached entry no longer applies
         p.write_text(p.read_text() + msg("assistant", "Done now") + "\n")
         [s] = self.tails()["sessions"]

@@ -897,7 +897,7 @@ TAIL_MESSAGES = 12
 TAIL_MESSAGE_MAX = 1500
 TLDR_LINES, TLDR_LINE_MAX = 2, 160
 CHIP_KINDS = ("reply", "take_over", "hand_back", "hold", "release", "open", "mark_seen")
-CHIPS_MAX, CHIP_TEXT_MAX = 3, 200
+CHIPS_MAX, CHIP_TEXT_MAX = 6, 200   # stored; the pane shows at most 3 that apply to the card now
 
 
 def project_slug(path: str) -> str:
@@ -995,7 +995,7 @@ def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path]) -> List[dict]:
 
 def clean_tldr(tldr, chips) -> Optional[dict]:
     """{tldr, chips} as the pane may show them, or None: tldr at most 2 non-empty lines of 160 characters; chips at
-    most 3 of CHIP_KINDS, each kind once, a `reply` with a one-line text of 1..200 characters. Anything else is
+    most 6 of CHIP_KINDS, each kind once, a `reply` with a one-line text of 1..200 characters. Anything else is
     dropped."""
     if not isinstance(tldr, str):
         return None
