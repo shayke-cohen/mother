@@ -24,7 +24,8 @@ import hub
 import now as nowmod
 
 DEFAULTS = {"max_workers": 3, "run_minutes": 20, "daily_budget_usd": 20,
-            "chief_model": "sonnet", "worker_model": "", "tick_seconds": 30}
+            "chief_model": "sonnet", "worker_model": "", "tick_seconds": 30, "tldr_model": "sonnet"}
+TLDR_MODELS = ("sonnet", "opus")   # the Chief pane's TL;DR model; anything else reads as the default
 SOURCES = ("say", "route", "release")
 NAME_MAX = 24
 SPEND_KEEP_DAYS = 14
@@ -888,6 +889,193 @@ def desktop_status(ws: Path, app_dir: Optional[Path] = None) -> List[dict]:
     return out
 
 
+# ---- the Chief pane's TL;DR: each session's recent tail, and a cache of what the model said ----------------
+
+TAIL_MAX = 6000            # characters of tail text per session that the pane hands the model
+TAIL_READ_BYTES = 512 * 1024
+TAIL_MESSAGES = 12
+TAIL_MESSAGE_MAX = 1500
+TLDR_LINES, TLDR_LINE_MAX = 2, 160
+CHIP_KINDS = ("reply", "take_over", "hand_back", "hold", "release", "open", "mark_seen")
+CHIPS_MAX, CHIP_TEXT_MAX = 6, 200   # stored; the pane shows at most 3 that apply to the card now
+
+
+def project_slug(path: str) -> str:
+    """Claude Code's folder name under ~/.claude/projects for a working directory: every non-alphanumeric
+    character becomes `-`."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def _block_text(content) -> str:
+    """One message's text: a string as is; from a block list the text blocks, plus `[ran <tool>]` per tool call.
+    Tool results and thinking are left out (noise, and tool output is the least trusted part)."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for b in content if isinstance(content, list) else []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text" and isinstance(b.get("text"), str):
+            parts.append(b["text"])
+        elif b.get("type") == "tool_use":
+            parts.append("[ran %s]" % str(b.get("name") or "a tool")[:40])
+    return " ".join(p.strip() for p in parts if p.strip())
+
+
+def _transcript_tail(path: Path) -> Optional[Tuple[str, str]]:
+    """(fingerprint, text) from the end of a session transcript: the last TAIL_MESSAGES main-thread user and
+    assistant messages, `role: text` per line, each capped, the whole cut to TAIL_MAX keeping the newest. The
+    fingerprint is `t:<size>:<mtime_ns>`. None when the file is missing or holds no such message."""
+    try:
+        st = path.stat()
+        with open(str(path), "rb") as f:
+            if st.st_size > TAIL_READ_BYTES:
+                f.seek(st.st_size - TAIL_READ_BYTES)
+                f.readline()  # a partial first line
+            raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    msgs = []
+    for line in raw.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get("type") not in ("user", "assistant") or d.get("isSidechain") \
+                or d.get("isMeta"):
+            continue
+        m = d.get("message")
+        text = _block_text(m.get("content")) if isinstance(m, dict) else ""
+        text = " ".join(text.split())
+        if text:
+            msgs.append("%s: %s" % (d["type"], text[:TAIL_MESSAGE_MAX]))
+    if not msgs:
+        return None
+    out = "\n".join(msgs[-TAIL_MESSAGES:])
+    if len(out) > TAIL_MAX:
+        out = out[-TAIL_MAX:]
+    return "t:%d:%d" % (st.st_size, st.st_mtime_ns), out
+
+
+def _short_fp(prefix: str, text: str) -> str:
+    return "%s:%s" % (prefix, hashlib.sha1(text.encode("utf-8")).hexdigest()[:16])
+
+
+def _tail_for(home: Path, cwds: List[str], sid: str) -> Optional[Tuple[str, str]]:
+    for cwd in cwds:
+        if cwd:
+            got = _transcript_tail(home / ".claude" / "projects" / project_slug(cwd) / (sid + ".jsonl"))
+            if got:
+                return got
+    return None
+
+
+def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path]) -> List[dict]:
+    """Every session the pane draws a card for, with its tail: workers (by session id) and pinned desktop
+    sessions (by CLI id). A worker with neither a transcript nor a progress line has nothing to summarise."""
+    out = []
+    ws_cwds = [str(ws), os.path.realpath(str(ws))]
+    for key, w in workers(ws).items():
+        sid = w.get("session_id")
+        if not (isinstance(sid, str) and CLI_ID_RE.fullmatch(sid)):
+            continue
+        got = _tail_for(home, ws_cwds, sid)
+        if not got and (w.get("progress") or "").strip():
+            got = (_short_fp("p", w["progress"]), w["progress"][:TAIL_MAX])
+        if got:
+            out.append({"id": sid, "kind": "worker", "key": key, "fingerprint": got[0], "text": got[1]})
+    for d in desktop_status(ws, app_dir):
+        got = _tail_for(home, [d["cwd"]], d["cli_session_id"])
+        if not got and d["last_report"].strip():
+            got = (_short_fp("r", d["last_report"]), d["last_report"])
+        if got:
+            out.append({"id": d["cli_session_id"], "kind": "pinned", "fingerprint": got[0], "text": got[1]})
+    return out
+
+
+# C0 controls but newline, DEL, C1 controls, and the bidi marks, embeddings, overrides and isolates: what a model could
+# copy from a transcript to make a card misread, or that a surface refuses to draw.
+_UNSAFE_RE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _safe(text: str) -> str:
+    return _UNSAFE_RE.sub("", text)
+
+
+def clean_tldr(tldr, chips) -> Optional[dict]:
+    """{tldr, chips} as the pane may show them, or None: tldr at most 2 non-empty lines of 160 characters; chips at
+    most 6 of CHIP_KINDS, each kind once, a `reply` with a one-line text of 1..200 characters. Anything else is
+    dropped."""
+    if not isinstance(tldr, str):
+        return None
+    lines = [" ".join(_safe(l).split())[:TLDR_LINE_MAX] for l in tldr.split("\n")]
+    lines = [l for l in lines if l][:TLDR_LINES]
+    if not lines:
+        return None
+    out, seen = [], set()
+    for c in chips if isinstance(chips, list) else []:
+        if not isinstance(c, dict) or c.get("kind") not in CHIP_KINDS:
+            continue
+        kind = c["kind"]
+        if kind == "reply":
+            text = c.get("text")
+            text = _safe(text) if isinstance(text, str) else None
+            if text is None or "\n" in text.strip() or not text.strip() or len(text.strip()) > CHIP_TEXT_MAX:
+                continue
+            ident = ("reply", text.strip())
+            chip = {"kind": "reply", "text": text.strip()}
+        else:
+            ident, chip = (kind,), {"kind": kind}
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(chip)
+        if len(out) == CHIPS_MAX:
+            break
+    return {"tldr": "\n".join(lines), "chips": out}
+
+
+def session_tails(ws: Path, cfg: dict, home: Optional[Path] = None, app_dir: Optional[Path] = None) -> dict:
+    """`tail --json`: {version, model, sessions: [{id, kind, key?, fingerprint, text, cached?}]}. `cached` is the
+    stored {tldr, chips} when tldr.json holds one for the same id, fingerprint and model."""
+    home = Path(home or Path.home())
+    model = settings(cfg).get("tldr_model")
+    model = model if model in TLDR_MODELS else DEFAULTS["tldr_model"]
+    store = _read_obj(chief_dir(ws) / "tldr.json")
+    sessions = _live_sessions(Path(ws), home, app_dir if app_dir is not None else default_app_dir())
+    for s in sessions:
+        hit = store.get(s["id"])
+        if isinstance(hit, dict) and hit.get("fingerprint") == s["fingerprint"] and hit.get("model") == model:
+            c = clean_tldr(hit.get("tldr"), hit.get("chips"))
+            if c:
+                s["cached"] = c
+    return {"version": 1, "model": model, "sessions": sessions}
+
+
+def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = None,
+               app_dir: Optional[Path] = None) -> int:
+    """`tldr --stdin`: merge [{id, fingerprint, model, tldr, chips}] into .mother/chief/tldr.json, for live sessions only
+    and cleaned as clean_tldr; entries for sessions no longer live are pruned. Returns how many were stored."""
+    ws = Path(ws)
+    live = {s["id"] for s in _live_sessions(ws, Path(home or Path.home()),
+                                             app_dir if app_dir is not None else default_app_dir())}
+    n = 0
+    with hub.locked(ws):
+        path = chief_dir(ws) / "tldr.json"
+        doc = {k: v for k, v in _read_obj(path).items() if k in live}
+        for r in rows or []:
+            if not isinstance(r, dict) or r.get("id") not in live or not isinstance(r.get("fingerprint"), str):
+                continue
+            c = clean_tldr(r.get("tldr"), r.get("chips"))
+            if not c:
+                continue
+            doc[r["id"]] = {"fingerprint": r["fingerprint"], "model": r.get("model") if r.get("model") in TLDR_MODELS else None,
+                            "tldr": c["tldr"], "chips": c["chips"], "at": hub._iso(at)}
+            n += 1
+        _write_atomic(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    return n
+
+
 # ---- keeping the chief's CLI session alive: tmux keeper, launchd job -------------------------------------
 
 LABEL = "com.mother.chief"
@@ -1105,6 +1293,11 @@ USAGE = """usage: mother chief <verb> ...
                         prints {paused, logged, kept, wake} as JSON
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}
+  tail --json           each worker's and pinned session's recent tail (at most 6000 characters) for the Chief
+                        pane's TL;DR, with the cached TL;DR when the session has not moved; prints
+                        {version, model, sessions}
+  tldr --stdin          store the pane's TL;DRs and chips (JSON array on stdin) in .mother/chief/tldr.json;
+                        prints {stored: N}
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
   role                  chief when MOTHER_CHIEF_ROLE=chief, else console
 
@@ -1118,6 +1311,7 @@ VERBS = {
     "keep": (0, (), ()), "install": (0, ("--force",), ()), "uninstall": (0, (), ()),
     "pause": (0, (), ()), "resume": (0, (), ()), "role": (0, (), ()),
     "triage": (0, ("--stdin",), ()), "pinned": (0, ("--stdin",), ()),
+    "tail": (0, ("--json",), ()), "tldr": (0, ("--stdin",), ()),
 }
 
 
@@ -1141,6 +1335,7 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
             "runs": w.get("runs", 0), "last_run_at": w.get("last_run_at"), "session_id": w.get("session_id"),
             "queued": q.get(key, 0),
             "resume": "claude --resume %s" % w["session_id"] if w.get("session_id") else "",
+            "unseen": max(0, w["unseen"]) if isinstance(w.get("unseen"), int) else 0,
         })
     rows.sort(key=lambda r: r["last_run_at"] or "", reverse=True)
     rows.sort(key=lambda r: not r["running"])
@@ -1309,6 +1504,20 @@ def main(args, ws, cfg, at) -> int:
         if not isinstance(rows, list):
             return _usage("pinned: stdin must be a JSON array of list_sessions rows")
         print(json.dumps({"pinned": pinned_snapshot(ws, at, rows, default_app_dir())}))
+        return EXIT_OK
+    if verb == "tail":
+        print(json.dumps(session_tails(ws, cfg, Path.home(), default_app_dir()), indent=2, ensure_ascii=False))
+        return EXIT_OK
+    if verb == "tldr":
+        if not opts.get("stdin"):
+            return _usage("tldr reads its entries from stdin: pass --stdin")
+        try:
+            rows = json.loads(sys.stdin.read())
+        except ValueError as e:
+            return _usage("tldr: stdin is not JSON (%s)" % e)
+        if not isinstance(rows, list):
+            return _usage("tldr: stdin must be a JSON array of {id, fingerprint, tldr, chips}")
+        print(json.dumps({"stored": tldr_store(ws, at, rows, Path.home(), default_app_dir())}))
         return EXIT_OK
     if verb == "status":
         doc = status_doc(ws, cfg, at)

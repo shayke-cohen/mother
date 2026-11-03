@@ -151,7 +151,16 @@ export type ChiefWorker = {
   session_id: string | null
   queued: number          // say/route lines waiting for this worker
   resume: string          // `claude --resume <session_id>`
+  unseen?: number         // routed updates not yet seen (sessions.json); absent from an older CLI
 }
+
+// One recommended action on a Chief pane card. Only these kinds exist; the pane drops anything else.
+export type ChiefChip =
+  | { kind: 'reply'; text: string }
+  | { kind: 'take_over' | 'hand_back' | 'hold' | 'release' | 'open' | 'mark_seen' }
+
+// A card's TL;DR (at most 2 short lines) and up to 3 chips, from one model call over the session's recent tail.
+export type ChiefTldr = { tldr: string; chips: ChiefChip[] }
 
 // A pinned desktop session (lib/chief.py desktop_status), from the snapshot the desktop console writes.
 export type ChiefDesktop = {
@@ -192,6 +201,8 @@ declare module 'claude-code' {
       chiefRole: 'chief' | 'console' | null   // `mother chief role` at session start: only `chief` ticks and wakes
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
       chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
+      chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by session id (a worker's session_id, a pinned cli_session_id)
+      chiefDraft: Record<string, string> | null     // a card's chat-box text a reply chip put there, by Input key (`say:<key>`, `say:<cli id>`)
     }
   }
 }
