@@ -3697,6 +3697,9 @@ class ApproveLineProse(GuardCase):
                  ("please mother approve shell", set()),
                  ("mother approve shell. mother approve tracker X", {("shell", "*")}),
                  ("mother approve shell; mother approve chat C00000001", {("shell", "*")}),
+                 # a question is not a yes
+                 ("mother approve shell? what does it do", set()),
+                 ("mother approve tracker MOBPUB?", set()),
                  ("mother approve chat C00000001 ok\nmother approve shell", {("chat", "C00000001")}),
                  ("mother approve chat C00000001\nmother approve shell", {("chat", "C00000001"), ("shell", "*")})]
         for text, want in cases:

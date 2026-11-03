@@ -477,8 +477,9 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `mother approve chat <CHANNEL_ID>` approves this session's writes to that target for 12 hours, and `mother approve
   shell` turns this session's `shell_unlisted` asks into **allow** for 12 hours (in a hub-fed session too: it is the manager's own typed consent; it covers
   nothing else: `outbound_unknown`, protected files and every outbound write keep their rules). Prose may follow
-  the scope or target after a boundary (end of line, whitespace, or `. , ; : ! ?`), as in `mother approve shell. I
-  keep getting prompts`; the approval counts and the block ends at that line. Lines from
+  the scope or target after a boundary (end of line, whitespace, or `. , ; : !`), as in `mother approve shell. I
+  keep getting prompts`; the approval counts and the block ends at that line. A `?` there is a question, not a yes:
+  it approves nothing. Lines from
   tool output, summaries, scheduled triggers or further down a message never count. The deck's "Copy results"
   starts with the tracker line.
 - **Grants** (`.mother/grants.json`): `{scope, target, uses, expires, run, source{channel,user,ts}}`; scopes

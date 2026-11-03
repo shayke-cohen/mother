@@ -3566,9 +3566,10 @@ def green(a, ctx, auto):
 
 # ------------------------------------------------------------------ session approvals (attended runs)
 
-# A leading approve line; after the scope or target comes the end of the line, whitespace or `. , ; : ! ?`, so
-# "mother approve shell. I keep getting prompts" counts and "mother approve shellfish" does not.
-APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))(?=$|[\s.,;:!?])", re.I)
+# A leading approve line; after the scope or target comes the end of the line, whitespace or `. , ; : !`, so
+# "mother approve shell. I keep getting prompts" counts and "mother approve shellfish" does not. Never `?`: a
+# question ("mother approve shell? what does it do") is not a yes.
+APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))(?=$|[\s.,;:!])", re.I)
 APPROVE_ANY_RE = re.compile(r"^\s*mother\s*approve\b", re.I | re.M)
 LINE_BREAKS_RE = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 SESSION_APPROVAL_MAX_HOURS = 12
