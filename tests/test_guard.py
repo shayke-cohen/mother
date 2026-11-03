@@ -3637,5 +3637,38 @@ class ChiefAllowance(GuardCase):
         self.call("ask", "echo '%s' > .mother/chief/chief.json" % forged, session=self.WORKER, env={})
 
 
+class ApproveLineProse(GuardCase):
+    """I10: a leading approve line still counts with prose after a boundary on the same line or below; only the
+    genuine human message's leading block counts, and the first line with prose ends it."""
+
+    def approvals(self, text, **extra):
+        sys.path.insert(0, os.path.join(ROOT, "hooks"))
+        import guard
+        return guard.session_approvals(self.transcript(self.user(text, **extra)))
+
+    def test_prose_after_the_scope(self):
+        cases = [("mother approve shell. I keep getting prompts", {("shell", "*")}),
+                 ("mother approve shell\nI keep getting prompts", {("shell", "*")}),
+                 ("mother approve tracker MOBPUB, thanks", {("tracker", "MOBPUB")}),
+                 ("mother approve shellfish", set()),
+                 ("mother approve tracker MOBPUB-1", {("tracker", "MOBPUB-1")}),
+                 ("please mother approve shell", set()),
+                 ("mother approve shell. mother approve tracker X", {("shell", "*")}),
+                 ("mother approve shell; mother approve chat C00000001", {("shell", "*")}),
+                 ("mother approve chat C00000001 ok\nmother approve shell", {("chat", "C00000001")}),
+                 ("mother approve chat C00000001\nmother approve shell", {("chat", "C00000001"), ("shell", "*")})]
+        for text, want in cases:
+            self.assertEqual(self.approvals(text), want, text)
+
+    def test_only_a_human_entry_counts(self):
+        for extra in ({"origin": {"kind": "tool"}}, {"isSidechain": True}, {"origin": None}):
+            self.assertEqual(self.approvals("mother approve shell. I keep getting prompts", **extra), set(), extra)
+
+    def test_shell_ask_passes_with_prose(self):
+        tr = self.transcript(self.user("mother approve shell. I keep getting prompts"))
+        why = self.expect("allow", "Bash", {"command": "python3 scripts/x.py --dry"}, transcript=tr, cwd=self.ws)
+        self.assertIn("mother approve shell", why)
+
+
 if __name__ == "__main__":
     unittest.main()

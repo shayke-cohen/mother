@@ -3566,7 +3566,9 @@ def green(a, ctx, auto):
 
 # ------------------------------------------------------------------ session approvals (attended runs)
 
-APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))\s*$", re.I)
+# A leading approve line; after the scope or target comes the end of the line, whitespace or `. , ; : ! ?`, so
+# "mother approve shell. I keep getting prompts" counts and "mother approve shellfish" does not.
+APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))(?=$|[\s.,;:!?])", re.I)
 APPROVE_ANY_RE = re.compile(r"^\s*mother\s*approve\b", re.I | re.M)
 LINE_BREAKS_RE = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 SESSION_APPROVAL_MAX_HOURS = 12
@@ -3674,9 +3676,11 @@ def session_approvals(transcript, max_hours=SESSION_APPROVAL_MAX_HOURS, now=None
                     break
                 if m.group(3):  # `mother approve shell`: the workspace allow-list's questions, this session
                     found.add(("shell", "*"))
-                    continue
-                scope = m.group(1).lower()
-                found.add((scope, m.group(2).upper() if scope == "tracker" else m.group(2)))
+                else:
+                    scope = m.group(1).lower()
+                    found.add((scope, m.group(2).upper() if scope == "tracker" else m.group(2)))
+                if ln[m.end():].strip():
+                    break  # prose follows on this line: the approve block ends here
     return found
 
 
