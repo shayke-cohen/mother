@@ -1044,6 +1044,12 @@ def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=
                                   base_path=os.environ.get("PATH")))
     domain = "gui/%d" % os.getuid()
     ctl("bootout", "%s/%s" % (domain, LABEL))  # a reinstall replaces the loaded job; not loaded is fine
+    # with no keeper loaded, end the running session; the new keeper (RunAtLoad) then starts it once, under the
+    # current plugin and chief.json's id. A lost turn comes back in the next wake.
+    try:
+        run([tmux, "kill-session", "-t", TMUX_SESSION], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        pass
     for attempt in range(hub.BOOTSTRAP_TRIES):
         rc, out = ctl("bootstrap", domain, str(plist_path))
         if not rc:
@@ -1053,10 +1059,6 @@ def install(ws: Path, cfg: dict, at: datetime, plist_path=None, ctl=None, which=
     if rc:
         print("mother chief install: launchctl bootstrap failed: %s" % out, file=sys.stderr)
         return EXIT_FAILED
-    try:  # the keeper starts it again within 30 s; a lost turn comes back in the next wake
-        run([tmux, "kill-session", "-t", TMUX_SESSION], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError:
-        pass
     print("installed %s (logs: %s)" % (plist_path, chief_dir(ws) / "keeper.log"))
     print("After a plugin update, run `mother chief install` again.")
     print(BYPASS_NOTE)

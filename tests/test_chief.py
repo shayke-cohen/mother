@@ -1377,6 +1377,25 @@ class TestFinalReviewFixes(Base):
             chief.tick(self.ws, {}, AT - timedelta(minutes=9))
             self.assertEqual(i.install()[0], 1)
 
+    # re-review N3: the tmux session ends while no keeper runs (after bootout, before bootstrap)
+    def test_install_kills_tmux_between_bootout_and_bootstrap(self):
+        events = []
+
+        def ctl(*args):
+            events.append(args[0])
+            return 0, ""
+
+        def run(argv, **kw):
+            events.append(argv[1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.dict(os.environ, {"MOTHER_HOSTNAME": "laptop"}), contextlib.redirect_stdout(io.StringIO()):
+            code = chief.install(self.ws, {"workspace": {"home_machine": "laptop"}}, AT,
+                                 plist_path=self.ws / "LA" / "x.plist", ctl=ctl,
+                                 which=lambda n: "/opt/bin/" + n, python="/usr/bin/python3", mother="/m/bin/mother",
+                                 sleep=lambda s: None, run=run)
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["bootout", "kill-session", "bootstrap"])
+
     # I7: the installer's PATH travels into the plist and the chief's tmux command
     def test_plist_and_tmux_keep_the_installer_path(self):
         import plistlib
