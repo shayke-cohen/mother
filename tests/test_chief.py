@@ -190,7 +190,8 @@ class TestPausedSettings(Base):
     def test_settings_defaults_and_overrides(self):
         s = chief.settings({})
         self.assertEqual(s, {"max_workers": 3, "run_minutes": 20, "daily_budget_usd": 20,
-                             "chief_model": "sonnet", "worker_model": "", "tick_seconds": 30})
+                             "chief_model": "sonnet", "worker_model": "", "tick_seconds": 30,
+                             "tldr_model": "sonnet"})
         s = chief.settings({"chief": {"max_workers": 5, "bogus": 1}})
         self.assertEqual(s["max_workers"], 5)
         self.assertEqual(s["run_minutes"], 20)
@@ -915,7 +916,7 @@ class TestMain(Base):
         self.assertEqual([w["key"] for w in doc["workers"]], ["PLAT-3", "PLAT-2", "PLAT-1"])
         w3, _, w1 = doc["workers"]
         self.assertEqual(set(w1), {"key", "title", "status", "held", "running", "progress", "cost", "runs",
-                                   "last_run_at", "session_id", "queued", "resume"})
+                                   "last_run_at", "session_id", "queued", "resume", "unseen"})
         self.assertIs(w3["running"], True)
         self.assertIs(w1["running"], False)
         self.assertEqual(w1["queued"], 2)
@@ -1515,6 +1516,144 @@ class TestRoutineFile(unittest.TestCase):
                 if f.is_file() and f.suffix in (".py", ".ts", ".tsx", ".md", ".json") and "Shay" in f.read_text():
                     bad.append(str(f))
         self.assertEqual(bad, [])
+
+
+# ---- the Chief pane's TL;DR: session tails and the cache ----------------------------------------------
+def msg(role, content, **kw):
+    d = {"type": role, "uuid": kw.pop("uuid", "u-" + role), "message": {"role": role, "content": content}}
+    d.update(kw)
+    return json.dumps(d)
+
+
+class TestTldr(Base):
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name) / "home"
+        self.app = Path(tmp.name) / "app"
+        self.app.mkdir()
+
+    def transcript(self, cwd, sid, lines):
+        d = self.home / ".claude" / "projects" / chief.project_slug(str(cwd))
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / (sid + ".jsonl")
+        p.write_text("".join(l + "\n" for l in lines))
+        return p
+
+    def tails(self, cfg=None):
+        return chief.session_tails(self.ws, cfg or {}, home=self.home, app_dir=self.app)
+
+    def pin(self, report="Merged the fix, CI green"):
+        d = self.app / "acct" / "org"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "local_a.json").write_text(json.dumps({"sessionId": "local_a", "cliSessionId": CLI_A, "cwd": "/work/api",
+                                                    "isArchived": False, "lastTurnReport": report}))
+        chief.pinned_snapshot(self.ws, AT, [row("local_a", cwd="/work/api")], app_dir=self.app)
+
+    def test_project_slug(self):
+        self.assertEqual(chief.project_slug("/Users/m/my.work_space"), "-Users-m-my-work-space")
+
+    def test_tail_reads_a_workers_transcript(self):
+        w = chief.register_worker(self.ws, AT, "PLAT-1", "Fix the login bug")
+        p = self.transcript(self.ws, w["session_id"], [
+            "not json",
+            msg("user", "Fix the login bug in the handler", uuid="u1"),
+            msg("assistant", [{"type": "text", "text": "Patched the handler."},
+                              {"type": "tool_use", "name": "Bash", "input": {"command": "pytest"}}], uuid="u2"),
+            msg("user", [{"type": "tool_result", "content": "secret tool output"}], uuid="u3"),
+            msg("assistant", [{"type": "text", "text": "Side quest"}], uuid="u4", isSidechain=True),
+            msg("assistant", [{"type": "text", "text": "Tests pass; ready for review."}], uuid="u5"),
+        ])
+        doc = self.tails()
+        self.assertEqual((doc["version"], doc["model"]), (1, "sonnet"))
+        [s] = doc["sessions"]
+        st = p.stat()
+        self.assertEqual((s["id"], s["kind"], s["key"]), (w["session_id"], "worker", "PLAT-1"))
+        self.assertEqual(s["fingerprint"], "t:%d:%d" % (st.st_size, st.st_mtime_ns))
+        self.assertEqual(s["text"], "user: Fix the login bug in the handler\n"
+                                    "assistant: Patched the handler. [ran Bash]\n"
+                                    "assistant: Tests pass; ready for review.")
+        self.assertNotIn("secret tool output", s["text"])
+        self.assertNotIn("Side quest", s["text"])
+        self.assertNotIn("cached", s)
+
+    def test_tail_caps_text_and_keeps_the_newest(self):
+        w = chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        self.transcript(self.ws, w["session_id"],
+                        [msg("assistant", "m%d " % i + "x" * 3000, uuid="u%d" % i) for i in range(10)] +
+                        [msg("assistant", "the newest", uuid="last")])
+        [s] = self.tails()["sessions"]
+        self.assertLessEqual(len(s["text"]), chief.TAIL_MAX)
+        self.assertTrue(s["text"].endswith("assistant: the newest"))
+        self.assertNotIn("m0 ", s["text"])
+
+    def test_tail_falls_back_to_progress_and_report(self):
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        chief.update_worker(self.ws, "PLAT-1", progress="patched, tests next")
+        chief.register_worker(self.ws, AT, "PLAT-2", "t2")          # no transcript, no progress: no entry
+        self.pin()
+        got = {s["kind"]: s for s in self.tails()["sessions"]}
+        self.assertEqual(sorted(got), ["pinned", "worker"])
+        self.assertEqual(got["worker"]["text"], "patched, tests next")
+        self.assertTrue(got["worker"]["fingerprint"].startswith("p:"))
+        self.assertEqual((got["pinned"]["id"], got["pinned"]["text"]), (CLI_A, "Merged the fix, CI green"))
+        self.assertTrue(got["pinned"]["fingerprint"].startswith("r:"))
+        # a pinned session's own transcript wins over its report when the file is there
+        self.transcript("/work/api", CLI_A, [msg("assistant", "Opened the PR")])
+        [p] = [s for s in self.tails()["sessions"] if s["kind"] == "pinned"]
+        self.assertEqual(p["text"], "assistant: Opened the PR")
+        self.assertTrue(p["fingerprint"].startswith("t:"))
+
+    def test_tldr_model_setting(self):
+        for given, want in ((None, "sonnet"), ("opus", "opus"), ("sonnet", "sonnet"), ("haiku", "sonnet"),
+                            ("claude-x", "sonnet"), (3, "sonnet")):
+            cfg = {} if given is None else {"chief": {"tldr_model": given}}
+            self.assertEqual(self.tails(cfg)["model"], want, given)
+
+    def test_store_and_cached_round_trip(self):
+        w = chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        p = self.transcript(self.ws, w["session_id"], [msg("assistant", "Working on it")])
+        [s] = self.tails()["sessions"]
+        n = chief.tldr_store(self.ws, AT, [
+            {"id": s["id"], "fingerprint": s["fingerprint"], "tldr": "Fixing it.\nTests next.\nThird line",
+             "chips": [{"kind": "reply", "text": "Ship it"}, {"kind": "rm -rf"}, {"kind": "reply"}, "junk",
+                       {"kind": "hold"}, {"kind": "open"}, {"kind": "mark_seen"}]},
+            {"id": "not-a-live-session", "fingerprint": "x", "tldr": "x", "chips": []},
+            "junk",
+        ], home=self.home, app_dir=self.app)
+        self.assertEqual(n, 1)
+        [s] = self.tails()["sessions"]
+        self.assertEqual(s["cached"], {"tldr": "Fixing it.\nTests next.",
+                                       "chips": [{"kind": "reply", "text": "Ship it"}, {"kind": "hold"},
+                                                 {"kind": "open"}]})
+        # the session moved: the cached entry no longer applies
+        p.write_text(p.read_text() + msg("assistant", "Done now") + "\n")
+        [s] = self.tails()["sessions"]
+        self.assertNotIn("cached", s)
+
+    def test_cli_tail_and_tldr_verbs(self):
+        w = chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        self.transcript(self.ws, w["session_id"], [msg("assistant", "Working")])
+        out = io.StringIO()
+        with mock.patch.object(chief, "default_app_dir", return_value=self.app), \
+                mock.patch.object(Path, "home", return_value=self.home), contextlib.redirect_stdout(out):
+            self.assertEqual(chief.main(["tail", "--json"], self.ws, {}, AT), 0)
+        [s] = json.loads(out.getvalue())["sessions"]
+        for stdin, code in ((json.dumps([{"id": s["id"], "fingerprint": s["fingerprint"], "tldr": "ok", "chips": []}]), 0),
+                            ("{bad", 2), (json.dumps({"x": 1}), 2)):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(chief, "default_app_dir", return_value=self.app), \
+                    mock.patch.object(Path, "home", return_value=self.home), \
+                    mock.patch("sys.stdin", io.StringIO(stdin)), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(chief.main(["tldr", "--stdin"], self.ws, {}, AT), code, stdin)
+            if code == 0:
+                self.assertEqual(json.loads(out.getvalue()), {"stored": 1})
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(chief.main(["tldr"], self.ws, {}, AT), 2)
+        doc = json.loads((chief.chief_dir(self.ws) / "tldr.json").read_text())
+        self.assertEqual(list(doc), [s["id"]])
 
 
 if __name__ == "__main__":
