@@ -145,5 +145,50 @@ class CliTest(Base):
         self.assertIn("NOPE", err)
 
 
+class ReplyGrammarTest(unittest.TestCase):
+    OPEN = {7, 8, 9}
+
+    def test_reply_single_ok(self):
+        self.assertEqual(decisions.parse_reply("7 ok", self.OPEN), [(7, "ok", "")])
+        self.assertEqual(decisions.parse_reply("D7 OK", self.OPEN), [(7, "ok", "")])
+
+    def test_reply_ok_list(self):
+        self.assertEqual(decisions.parse_reply("ok 7 9", self.OPEN), [(7, "ok", ""), (9, "ok", "")])
+
+    def test_reply_design_example(self):
+        self.assertEqual(decisions.parse_reply("ok 7 9, 8 no keep it but move to next sprint", self.OPEN),
+                         [(7, "ok", ""), (9, "ok", ""), (8, "no", ""), (8, "say", "keep it but move to next sprint")])
+
+    def test_reply_edit_rest_of_message(self):
+        self.assertEqual(decisions.parse_reply("7 edit: line1\nline2", self.OPEN), [(7, "edit", "line1\nline2")])
+        self.assertEqual(decisions.parse_reply("8 ok, 7 edit: a, b; c", self.OPEN),
+                         [(8, "ok", ""), (7, "edit", "a, b; c")])
+
+    def test_reply_edit_unreadable(self):
+        for t in ("7 edit", "7 edit:", "7 edit: ", "7 edit no colon"):
+            self.assertEqual(decisions.parse_reply(t, self.OPEN), [], t)
+
+    def test_reply_ok_all(self):
+        self.assertEqual(decisions.parse_reply("ok all", self.OPEN), [(7, "ok", ""), (8, "ok", ""), (9, "ok", "")])
+        self.assertEqual(decisions.parse_reply("ok all", set()), [])
+
+    def test_reply_no_list_and_say(self):
+        self.assertEqual(decisions.parse_reply("no 7 8", self.OPEN), [(7, "no", ""), (8, "no", "")])
+        self.assertEqual(decisions.parse_reply("9 wait until Monday", self.OPEN), [(9, "say", "wait until Monday")])
+
+    def test_reply_duplicates_kept(self):
+        self.assertEqual(decisions.parse_reply("ok 7, 7 no", self.OPEN), [(7, "ok", ""), (7, "no", "")])
+
+    def test_reply_not_a_reply_returns_none(self):
+        for t in ("look at PLAT-1", "", "  ", "7th floor", "ok then", "no problem"):
+            self.assertIsNone(decisions.parse_reply(t, self.OPEN), t)
+
+    def test_reply_partial_parse_applies_nothing(self):
+        self.assertEqual(decisions.parse_reply("ok 7 and also ping Dana", {7}), [])
+        self.assertEqual(decisions.parse_reply("7 ok 8", {7}), [])
+        self.assertEqual(decisions.parse_reply("ok 12", {7}), [])
+        self.assertEqual(decisions.parse_reply("7 ok, 12 no", {7}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,11 +9,13 @@ written atomically. Python 3.9 stdlib only.
 import contextlib
 import importlib.util
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
+import channels
 import chief
 import hub
 
@@ -135,6 +137,80 @@ def edited_input(inp: dict, text: str) -> dict:
                 nested[k] = text
                 return out
     raise ValueError("the call has no text field to edit")
+
+
+_NUM = re.compile(r"^d?(\d+)$")
+_START_NUM = re.compile(r"^d?\d+(?!\w)", re.I)
+_START_WORD = re.compile(r"^(\S+)\s+(?:d?\d+|all)(?!\w)", re.I)
+_EDIT = re.compile(r"^\s*d?(\d+)\s+edit(?!\w)(.*)$", re.I | re.S)
+
+
+def _starts_like_reply(t: str) -> bool:
+    if _START_NUM.match(t):
+        return True
+    m = _START_WORD.match(t)
+    return bool(m) and m.group(1).lower() in (channels.SEND_WORDS | channels.NO_WORDS)
+
+
+def _clause(c: str, open_ids: Set[int]) -> Optional[list]:
+    """Items for one non-edit clause, or None when it doesn't parse."""
+    toks = c.split()
+    if len(toks) < 2:
+        return None
+    w, verb = toks[0].lower(), None
+    if w in channels.SEND_WORDS:
+        verb = "ok"
+    elif w in channels.NO_WORDS:
+        verb = "no"
+    if verb:
+        if verb == "ok" and len(toks) == 2 and toks[1].lower() == "all":
+            return [(n, "ok", "") for n in sorted(open_ids)] or None
+        nums = [_NUM.match(x.lower()) for x in toks[1:]]
+        if all(nums):
+            return [(int(m.group(1)), verb, "") for m in nums]
+        # "no 8 ..." with trailing words falls through to None: that form is "N no <words>"
+        return None
+    m = _NUM.match(w)
+    if not m:
+        return None
+    n, w2, rest = int(m.group(1)), toks[1].lower(), toks[2:]
+    if w2 in channels.SEND_WORDS:
+        return [(n, "ok", "")] if not rest else None
+    if w2 in channels.NO_WORDS:
+        out = [(n, "no", "")]
+        if rest:
+            out.append((n, "say", " ".join(rest)))
+        return out
+    return [(n, "say", " ".join(toks[1:]))]
+
+
+def parse_reply(text: str, open_ids: Set[int]) -> Optional[List[Tuple[int, str, str]]]:
+    """The manager's answer to the decision queue as (n, verb, payload) items, verb ok|no|edit|say.
+    None: not a reply at all (the text keeps its normal path). []: it starts like a reply but doesn't parse fully,
+    or names an id that isn't open — apply nothing."""
+    t = (text or "").strip()
+    if not t or not _starts_like_reply(t):
+        return None
+    items, rest = [], t
+    while rest.strip():
+        e = _EDIT.match(rest)
+        if e:
+            if ":" not in e.group(2):
+                return []
+            payload = e.group(2).split(":", 1)[1].strip()
+            if not payload:
+                return []
+            items.append((int(e.group(1)), "edit", payload))
+            break
+        parts = re.split(r"[,;\n]", rest, maxsplit=1)
+        got = _clause(parts[0].strip(), open_ids)
+        if not got:
+            return []
+        items.extend(got)
+        rest = parts[1] if len(parts) > 1 else ""
+    if not items or any(n not in open_ids for n, _, _ in items):
+        return []
+    return items
 
 
 def _opts(args, valued, flags):
