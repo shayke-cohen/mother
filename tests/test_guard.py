@@ -3461,7 +3461,8 @@ class ChiefAllowance(GuardCase):
         """Final review I5: a worker (MOTHER_CHIEF_WORKER in its own env) reads untrusted text headless, so every
         `mother hub` write is denied there, the routine's decide heredoc included; reads still run. A workspace
         session that is not a worker keeps today's rules for the same heredoc."""
-        text = open(os.path.join(ROOT, "routines", "chief.md")).read()
+        with open(os.path.join(ROOT, "routines", "chief.md")) as f:
+            text = f.read()
         m = re.search(r"```\n(mother hub decide <<'HUBEOF'\n.*?\nHUBEOF)\n```", text, re.S)
         decide = re.sub(r"<[a-z ]+>", "x", m.group(1))
         worker = {"MOTHER_CHIEF_WORKER": "PLAT-1"}
