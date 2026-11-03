@@ -1482,6 +1482,21 @@ class TestRoutineFile(unittest.TestCase):
         self.assertNotIn("<MOTHER>", self.TEXT)
         self.assertIn("mother hub decide <<'HUBEOF'", self.TEXT)
 
+    def test_routine_orders_run_then_route_and_forbids_clear(self):
+        t = self.TEXT
+        self.assertIn("Never run `/clear`", t)
+        run_at = t.index("Run `mother chief run <key> --detach")
+        self.assertLess(run_at, t.index("as `route` in the decide call"))
+
+    def test_runtime_text_names_no_person(self):
+        """Final review I9: the public plugin's runtime text says "the manager", never a person's name."""
+        bad = []
+        for d in ("lib", "hooks", "routines", "skills", "docs", "types"):
+            for f in (Path(ROOT) / d).rglob("*"):
+                if f.is_file() and f.suffix in (".py", ".ts", ".tsx", ".md", ".json") and "Shay" in f.read_text():
+                    bad.append(str(f))
+        self.assertEqual(bad, [])
+
 
 if __name__ == "__main__":
     unittest.main()
