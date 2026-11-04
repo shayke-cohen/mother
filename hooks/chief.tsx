@@ -296,7 +296,9 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 // - may have landed (a timeout, a result with no readable ts, an unexplained throw): no post for batch_minutes, and one
 //   wake line for that batch. A late result that has a ts is still recorded.
 // - did not land (a clear error before or from the call): back off 2, 4, 8 … minutes up to batch_minutes; once at that
-//   cap, one wake line for that batch.
+//   cap, one wake line for that batch. A batch holding an urgent decision gets that line on its first failure.
+// An urgent decision that came after the last attempt ends a hold, once per decision. What was already tried, urgent
+// or not, is never posted sooner than its hold allows.
 // The state is in session state, so a reload of the mod can't cause a second post.
 const BATCH_WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
 const SLACK_TS_RE = /^\d+\.\d+$/
@@ -304,7 +306,9 @@ const DEFAULT_BATCH_MINUTES = 30
 const FIRST_BACKOFF_MINUTES = 2
 const REFUSED_CALL_RE = /no connected|not connected|denied|refus|forbidden|unauthori[sz]ed|not allowed|permission|unknown tool|no such tool|not found|invalid|missing/i
 const TIMED_OUT_RE = /time[d\s-]*out/i
-const IDLE_BATCH: ChiefBatchState = { sentOwed: null, holdUntil: 0, failures: 0, wokenFor: null, lineDue: false, note: null }
+const IDLE_BATCH: ChiefBatchState = { sentOwed: null, holdUntil: 0, failures: 0, wokenFor: null, lineDue: false, note: null, urgentSeen: [] }
+
+const urgentIds = (s: ChiefStatus | null): string[] => pendingDecisions(s).filter(d => d.urgent).map(d => d.id)
 
 async function batchState($: Dollar): Promise<ChiefBatchState> {
   return (await read($, chiefBatchAtom)) ?? IDLE_BATCH
@@ -384,11 +388,12 @@ async function logPost($: Dollar, bin: string, tool: string, target: string, out
   return (await cli($, bin, ['post-log', '--stdin'], JSON.stringify({ tool, target, outcome, reason }))).ok
 }
 
-type Attempt = { end: 'nothing' } | { end: 'posted'; ids: string; ts: string } | { end: 'unsure' | 'failed'; why: string; batch: string }
+const UNREAD_BATCH = '?'   // a batch that couldn't be read: its ids aren't known
+type Attempt = { end: 'nothing' } | { end: 'posted'; ids: string; ts: string } | { end: 'unsure' | 'failed'; why: string; batch: string; ids: string[] }
 
 // One attempt. `batch` names the batch for its one wake line: its ids, or its text when it has none.
 async function postBatch($: Dollar, bin: string): Promise<Attempt> {
-  const unread = { end: 'failed', batch: '?' } as const
+  const unread = { end: 'failed', batch: UNREAD_BATCH, ids: [] as string[] } as const
   const ran = await cli($, bin, ['batch', '--json'], undefined, 'decide')
   if (!ran.ok) return { ...unread, why: firstLine(ran.stderr) || 'mother decide batch failed' }
   if (!ran.stdout.trim()) return { end: 'nothing' }
@@ -403,8 +408,8 @@ async function postBatch($: Dollar, bin: string): Promise<Attempt> {
   const ids = list.join(',')
   const batch = ids || doc.text
   const target = await batchTarget($, bin)
-  if (typeof target === 'string') return { end: 'failed', why: target, batch }
-  if (!(await logPost($, bin, target.tool, target.channel, 'attempt'))) return { end: 'failed', why: "the post log can't be written", batch }
+  if (typeof target === 'string') return { end: 'failed', why: target, batch, ids: list }
+  if (!(await logPost($, bin, target.tool, target.channel, 'attempt'))) return { end: 'failed', why: "the post log can't be written", batch, ids: list }
 
   const stop = new AbortController()
   let out: PostEnd | 'timeout'
@@ -431,7 +436,7 @@ async function postBatch($: Dollar, bin: string): Promise<Attempt> {
     out = { end: 'unsure', why: `no answer from the post in ${MCP_TIMEOUT_MS / 1000} s` }
   }
   await logPost($, bin, target.tool, target.channel, out.end, out.end === 'posted' ? '' : out.why)
-  return out.end === 'posted' ? { end: 'posted', ids, ts: out.ts } : { end: out.end, why: out.why, batch }
+  return out.end === 'posted' ? { end: 'posted', ids, ts: out.ts } : { end: out.end, why: out.why, batch, ids: list }
 }
 
 async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: string }): Promise<void> {
@@ -450,7 +455,8 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     return
   }
   const nowMs = await $.clock.now()
-  if (nowMs < st.holdUntil) {
+  const seen = st.urgentSeen ?? []
+  if (nowMs < st.holdUntil && urgentIds(lastStatus).every(id => seen.includes(id))) {
     if (st.note) passError = st.note
     return
   }
@@ -470,12 +476,15 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     const cap = await batchMinutes($, bin)
     const failures = got.end === 'failed' ? st.failures + 1 : st.failures
     const minutes = got.end === 'failed' ? Math.min(FIRST_BACKOFF_MINUTES * 2 ** (failures - 1), cap) : cap
-    const wake = minutes >= cap && st.wokenFor !== got.batch
+    // read fresh: a decision filed since the last read may be in this batch. An unread batch counts any urgent one.
+    const urgent = urgentIds((await reloadStatus($, bin)) ?? lastStatus)
+    const hasUrgent = got.batch === UNREAD_BATCH ? urgent.length > 0 : got.ids.some(id => urgent.includes(id))
+    const wake = (minutes >= cap || (got.end === 'failed' && hasUrgent)) && st.wokenFor !== got.batch
     const note = safe(`couldn't post the batch: ${got.why}`)
     passError = note
     await update($, chiefBatchAtom, prev => ({
       ...(prev ?? IDLE_BATCH), failures, note, holdUntil: nowMs + minutes * 60_000,
-      wokenFor: wake ? got.batch : st.wokenFor, lineDue: wake || st.lineDue,
+      wokenFor: wake ? got.batch : st.wokenFor, lineDue: wake || st.lineDue, urgentSeen: [...new Set([...urgent, ...got.ids])],
     }))
   }
 }

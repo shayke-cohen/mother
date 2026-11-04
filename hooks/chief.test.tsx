@@ -1277,7 +1277,7 @@ const FILES = {
 const postedOk = () => ({ value: { content: [{ type: 'text', text: JSON.stringify({ ok: true, channel: DM, ts: POST_TS }) }], isError: false } })
 
 // A chief (or `role`) whose tick asks for a batch while `due()`; `mcp` answers the post.
-type BatchOpts = { role?: string; due?: () => boolean; files?: Record<string, string>; sent?: () => Cli; batch?: () => Cli | undefined; tick?: Record<string, unknown>; env?: Record<string, string>; log?: () => Cli | undefined }
+type BatchOpts = { role?: string; due?: () => boolean; files?: Record<string, string>; sent?: () => Cli; batch?: () => Cli | undefined; tick?: Record<string, unknown>; env?: Record<string, string>; log?: () => Cli | undefined; decisions?: () => unknown[] }
 async function bootBatch($: any, on: any, mcp: () => any, opts: BatchOpts = {}) {
   const posts: any[] = []
   const logs: any[] = []
@@ -1287,6 +1287,7 @@ async function bootBatch($: any, on: any, mcp: () => any, opts: BatchOpts = {}) 
     if (argv[0] === 'decide' && argv[1] === 'batch') return opts.batch ? opts.batch() : { exitCode: 0, stdout: JSON.stringify(BATCH) }
     if (argv[0] === 'decide' && argv[1] === 'sent') return opts.sent ? opts.sent() : { exitCode: 0, stdout: '{}' }
     if (argv[0] === 'post-log') { logs.push(JSON.parse(String(stdin))); return opts.log?.() }
+    if (argv[0] === 'status' && opts.decisions) return withDecisions(opts.decisions())
     return undefined
   }, 'terminal', 'chief-1', opts.files ?? FILES, opts.env ?? {})
   return { ...booted, posts, logs }
@@ -1295,6 +1296,8 @@ const lineCount = (out: { submits: string[] }) => out.submits.filter(t => t.incl
 const asText = (text: string, isError = false) => ({ value: { content: [{ type: 'text', text }], isError } })
 const SOON = { ...FILES, [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: ['U00000001', DM] }, connectors: { chat: 'slack' }, chief: { batch_minutes: 2 } }) }
 const WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
+// batch_minutes 8: the long tests walk every tick, and a test has 5 s.
+const EIGHT = { ...FILES, [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: ['U00000001', DM] }, connectors: { chat: 'slack' }, chief: { batch_minutes: 8 } }) }
 
 test('test_console_never_posts_batch', async ($, on) => {
   const { clock, out, posts } = await bootBatch($, on, postedOk, { role: 'console' })
@@ -1350,8 +1353,8 @@ const MAY_HAVE_LANDED: Array<[string, () => any]> = [
 ]
 for (const [name, mcp] of MAY_HAVE_LANDED) {
   test(`test_may_have_landed_never_loops: ${name}`, async ($, on) => {
-    const { clock, out, posts, logs } = await bootBatch($, on, mcp)
-    for (let i = 0; i < 40; i++) await clock.advance(30_000)                  // 20 minutes of ticks
+    const { clock, out, posts, logs } = await bootBatch($, on, mcp, { files: EIGHT })
+    for (let i = 0; i < 16; i++) await clock.advance(30_000)                  // to t = 8 minutes
     expect(posts.length).toBe(1)
     expect(lineCount(out)).toBe(1)
     expect(decideCalls(out, 'sent')).toEqual([])
@@ -1359,7 +1362,7 @@ for (const [name, mcp] of MAY_HAVE_LANDED) {
     const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
     expect(await hasText(ui, /^couldn't post the batch: /)).toBe(true)         // still shown between attempts
     await ui.unmount()
-    for (let i = 0; i < 22; i++) await clock.advance(30_000)                  // past batch_minutes (30)
+    await clock.advance(30_000)                                               // t = 8.5: batch_minutes after the post
     expect(posts.length).toBe(2)
     expect(lineCount(out)).toBe(1)                                             // one wake line per batch
   })
@@ -1382,7 +1385,7 @@ test('test_hang_never_loops_and_a_late_ts_is_recorded', async ($, on) => {
   expect(logs.map(l => l.outcome)).toEqual(['attempt', 'unsure', 'posted'])
 })
 
-// The post surely did not land: 2, 4, 8, 16, then 30 minutes apart; the wake line once the backoff reaches the cap.
+// The post surely did not land: 2, 4, then 8 minutes apart (the cap here); the wake line once the backoff reaches it.
 const DID_NOT_LAND: Array<[string, () => any]> = [
   ['an error result', () => asText('channel_not_found', true)],
   ['ok false', () => asText(JSON.stringify({ ok: false, error: 'channel_not_found', ts: POST_TS }))],
@@ -1390,7 +1393,7 @@ const DID_NOT_LAND: Array<[string, () => any]> = [
 ]
 for (const [name, mcp] of DID_NOT_LAND) {
   test(`test_did_not_land_backs_off: ${name}`, async ($, on) => {
-    const { clock, out, posts } = await bootBatch($, on, mcp)
+    const { clock, out, posts } = await bootBatch($, on, mcp, { files: EIGHT })
     await clock.advance(30_000)
     expect(posts.length).toBe(1)
     expect(decideCalls(out, 'sent')).toEqual([])
@@ -1399,14 +1402,102 @@ for (const [name, mcp] of DID_NOT_LAND) {
     await clock.advance(30_000)                                               // t = 2.5 min
     expect(posts.length).toBe(2)
     expect(lineCount(out)).toBe(0)
-    for (let i = 0; i < 115; i++) await clock.advance(30_000)                 // to t = 60 min
-    expect(posts.length).toBe(5)                                              // 0.5, 2.5, 6.5, 14.5, 30.5; the next at 60.5
-    expect(lineCount(out)).toBe(1)                                            // at 30.5, when the wait reached 30
-    await clock.advance(60_000)
-    expect(posts.length).toBe(6)
+    for (let i = 0; i < 8; i++) await clock.advance(30_000)                   // t = 6.5: the wait reaches the cap
+    expect(posts.length).toBe(3)
+    expect(lineCount(out)).toBe(1)
+    for (let i = 0; i < 15; i++) await clock.advance(30_000)                  // t = 14
+    expect(posts.length).toBe(3)
+    await clock.advance(30_000)                                               // t = 14.5
+    expect(posts.length).toBe(4)
     expect(lineCount(out)).toBe(1)
   })
 }
+
+test('test_backoff_doubles_up_to_batch_minutes_by_default', async ($, on) => {
+  const { clock, out, posts } = await bootBatch($, on, () => asText('channel_not_found', true))
+  await clock.advance(30_000)                                                  // the attempts at 2.5 and 6.5 are walked above
+  await clock.advance(14 * 60_000)                                             // t = 14.5
+  expect(posts.length).toBe(4)
+  expect(lineCount(out)).toBe(0)                                               // 16 minutes next: under the 30 minute cap
+  await clock.advance(16 * 60_000)                                             // t = 30.5: next wait is 30, the cap
+  expect(posts.length).toBe(5)
+  expect(lineCount(out)).toBe(1)
+})
+
+// ---- urgent: the wake line comes on the first clear failure, and a new urgent decision ends a hold ----
+const URGENT_IN_BATCH = () => [decision({ urgent: true }), decision({ id: 'D8' })]
+const NO_TS = () => asText(JSON.stringify({ ok: true }))
+
+for (const [name, mcp] of DID_NOT_LAND) {
+  test(`test_urgent_batch_wakes_on_first_clear_failure: ${name}`, async ($, on) => {
+    const { clock, out, posts } = await bootBatch($, on, mcp, { decisions: URGENT_IN_BATCH })
+    // the default cap of 30: only the urgency can bring this line now
+    await clock.advance(30_000)
+    expect(posts.length).toBe(1)
+    expect(lineCount(out)).toBe(1)                                             // not at the cap: now
+    for (let i = 0; i < 3; i++) await clock.advance(30_000)
+    expect(posts.length).toBe(1)                                               // the backoff is the same: never re-posted faster
+    await clock.advance(30_000)                                               // t = 2.5
+    expect(posts.length).toBe(2)
+    for (let i = 0; i < 8; i++) await clock.advance(30_000)                   // t = 6.5
+    expect(posts.length).toBe(3)
+    expect(lineCount(out)).toBe(1)                                             // one line per batch
+  })
+}
+
+test('test_urgent_batch_with_no_target_wakes_at_once', async ($, on) => {
+  const files = { ...FILES, [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: 'U00000001' }, connectors: { chat: 'slack' } }) }
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { files, decisions: URGENT_IN_BATCH })
+  await clock.advance(30_000)
+  expect(posts).toEqual([])
+  expect(out.submits).toEqual([WAKE_LINE])
+  for (let i = 0; i < 10; i++) await clock.advance(30_000)
+  expect(out.submits).toEqual([WAKE_LINE])
+})
+
+test('test_unreadable_batch_with_an_urgent_decision_wakes_at_once', async ($, on) => {
+  const { clock, out } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 1, stderr: 'boom' }), decisions: URGENT_IN_BATCH })
+  await clock.advance(30_000)
+  expect(out.submits).toEqual([WAKE_LINE])
+})
+
+test('test_urgent_decision_outside_the_batch_changes_nothing', async ($, on) => {
+  // announced earlier, so not in this batch: the line waits for the cap and the hold stands
+  const { clock, out, posts } = await bootBatch($, on, () => asText('channel_not_found', true), { decisions: () => [decision({ id: 'D9', urgent: true })] })
+  for (let i = 0; i < 4; i++) await clock.advance(30_000)
+  expect(posts.length).toBe(1)
+  expect(lineCount(out)).toBe(0)
+})
+
+test('test_non_urgent_batch_waits_for_the_cap', async ($, on) => {
+  const { clock, out } = await bootBatch($, on, () => asText('channel_not_found', true), { decisions: () => [decision(), decision({ id: 'D8' })] })
+  for (let i = 0; i < 16; i++) await clock.advance(30_000)
+  expect(lineCount(out)).toBe(0)
+})
+
+test('test_urgent_in_the_tried_batch_does_not_end_its_hold', async ($, on) => {
+  const { clock, posts } = await bootBatch($, on, NO_TS, { decisions: URGENT_IN_BATCH })
+  for (let i = 0; i < 16; i++) await clock.advance(30_000)
+  expect(posts.length).toBe(1)
+})
+
+test('test_new_urgent_decision_ends_a_hold_once', async ($, on) => {
+  let ds: unknown[] = [decision(), decision({ id: 'D8' })]
+  let current = BATCH
+  const { clock, out, posts } = await bootBatch($, on, NO_TS, { decisions: () => ds, batch: () => ({ exitCode: 0, stdout: JSON.stringify(current) }) })
+  await clock.advance(30_000)
+  for (let i = 0; i < 4; i++) await clock.advance(30_000)
+  expect(posts.length).toBe(1)
+  ds = [...ds, decision({ id: 'D9', urgent: true })]
+  current = { text: 'urgent now', ids: ['D9'] }
+  await clock.advance(30_000)                                                  // the status read that shows it comes after this tick's check
+  await clock.advance(30_000)
+  expect(posts.length).toBe(2)
+  expect(posts[1].args.text).toBe('urgent now')
+  expect(lineCount(out)).toBe(2)                                               // a new batch, its own line
+  for (let i = 0; i < 16; i++) await clock.advance(30_000)
+  expect(posts.length).toBe(2)                                                 // one decision ends one hold: no loop
+})
 
 test('test_a_new_batch_gets_its_own_wake_line', async ($, on) => {
   let current = BATCH

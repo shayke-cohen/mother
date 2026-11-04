@@ -199,6 +199,7 @@ export type ChiefBatchState = {
   wokenFor: string | null  // the batch that already got its one wake line
   lineDue: boolean         // the wake line goes out with the next wake
   note: string | null      // why the last attempt failed, for the pane
+  urgentSeen: string[]     // urgent decisions known at the last attempt; any other ends a hold
 }
 
 export type ChiefStatus = {
