@@ -8,7 +8,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.py\"",
-            "timeout": 10
+            "timeout": 60
           }
         ]
       },
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_fast.py\"",
-            "timeout": 10
+            "timeout": 60
           }
         ]
       }

@@ -1417,8 +1417,8 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   - **The guard is not a sandbox.** A same-uid process that reaches code execution can reach the grant key, and with it
     sign any grant. The guard closes the routes it knows about; a new route is a new fix. Text matching can't see a
     string built at run time (`'ans'+'wer'`, `printf … | sh`) or a script on disk (`python3 /tmp/x.py`). In a worker and
-    the chief those commands are off the allow-list, and the write limits below close the known ways to make an allowed
-    command run planted code. In a normal session they get that session's ordinary shell rules, which outside the
+    the chief those commands are off the positive shell list below, and the write limits close the known ways to make a
+    listed command run planted code; that is a list of routes closed, not a proof there are no others. In a normal session they get that session's ordinary shell rules, which outside the
     workspace or with the policy switches on means they run. A process that unsets `MOTHER_CHIEF_WORKER` gets past the
     CLI's refusal.
   - **Workers and the chief get no passes.** With `MOTHER_CHIEF_WORKER` set or `MOTHER_CHIEF_ROLE=chief`,
@@ -1429,11 +1429,27 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     open: reads, workspace edits, the allow-list, the manager's own DM, a live bound grant, a worker's exact `mother
     decide propose` (checked before the text rule, so quoted third-party text can't stop a filing), and the chief's
     `mother chief …` and `mother decide batch [--json]`, `sent --ids D7,D8 [--ts TS]`.
-  - **Where they write.** With `MOTHER_CHIEF_WORKER` or `MOTHER_CHIEF_ROLE=chief`, Write, Edit, MultiEdit, NotebookEdit and
-    allow-listed shell write only inside the workspace, on real paths, and never to anything dotted at its root
+  - **A positive shell list.** With `MOTHER_CHIEF_WORKER` or `MOTHER_CHIEF_ROLE=chief`, every stage of a shell command must
+    be one of: `cat`, `ls`, `head`, `tail`, `wc`, `grep`, `rg` (no `--pre`, `--hostname-bin`); `git status|log|diff|show`
+    with an exact set of options, no prefixes (no `push`, `fetch`, `pull`, `commit`, `add`, `-c`, `-C`, `--output`,
+    `--ext-diff`, `--textconv`, `--exec-path`); `gh pr|issue|run` reads; `mother path|version|help|status` and `mother hub
+    status|check|show|watching|help|session for|dms show`. A worker also has its exact `mother decide propose`; the chief
+    its `mother chief lines|status|run|say`, `mother decide batch|sent` and `mother hub decide` heredoc. Nothing else runs:
+    no interpreter, `find`, `sed`, `awk`, `xargs`, `sort`, `make`, `tar`, `env`, `nohup`, `less`, `man`, `vim`, `echo`,
+    `cp`, `mv`, `rm`, `cd`, `mother sync`, and no redirect that writes. The list passes through the allow-list's own path and
+    option checks as well. A refusal tells the session to file a decision, say it in PROGRESS or record the line as `now`.
+    In other sessions git's abbreviated long options are read as their full names first, so `git commit --amen` and `git
+    push --exe=` meet the rule of `--amend` and `--exec`.
+  - **The hook's deadline.** A shell command over 64 KB gets an immediate ask (deny in a worker or the chief), before any
+    regex. Each guard entry point (`guard.py`, and `guard_fast.py` before it reads its input) arms an 8 s `SIGALRM` at
+    startup that emits the same answer and exits. Claude Code lets a call run unguarded when it kills a hook at its
+    timeout, so `hooks.json` gives both entries 60 s, a margin a test keeps at 5 times the deadline or more. Where
+    `SIGALRM` isn't available there is no alarm.
+  - **Where they write.** With `MOTHER_CHIEF_WORKER` or `MOTHER_CHIEF_ROLE=chief`, Write, Edit, MultiEdit and NotebookEdit
+    write only inside the workspace, on real paths, and never to anything dotted at its root
     (`.git`, `.claude`, `.githooks`, `.mother`, `.mcp.json`, `.env`), a `.git`, `.githooks` or `.claude` folder at any depth,
     `scripts/` or `skills/`. Otherwise an allowed command runs what lands there: `git status` runs what `core.fsmonitor`
-    in `~/.gitconfig` or `.git/config` names, `zsh -c` sources `~/.zshenv`. `config.json`, `AGENTS.md`, `CLAUDE.md` and
+    in `~/.gitconfig` or `.git/config` names, `zsh -c` sources `~/.zshenv`. The shell list writes nothing. `config.json`, `AGENTS.md`, `CLAUDE.md` and
     `memory/MEMORY.md` keep their ask, which is a deny here. The chief's and workers' own state goes through `mother`
     verbs, which are not file tools. Normal sessions and a `--resume` takeover with no worker env are not limited by this.
   - **Stores.** Write, Edit, MultiEdit, NotebookEdit and shell writes to `.mother/chief/decisions.json` and

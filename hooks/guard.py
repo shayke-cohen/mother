@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sys
 import time
 
@@ -47,6 +48,40 @@ try:  # not on Windows; the ledger then works without a lock
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
+
+DEADLINE_SECONDS = 8  # hooks.json allows 60: a hook killed at its timeout lets the call run unguarded, so this fires first
+MAX_COMMAND_BYTES = 64 * 1024
+
+
+def arm_deadline(seconds=DEADLINE_SECONDS):
+    """Emit a question (a deny for a chief worker or the chief, whom nobody watches) and exit when the guard runs out
+    of time, instead of dying with no decision. False where SIGALRM isn't available: the call then runs as before."""
+    if not (hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")):
+        return False
+
+    def expired(_signum, _frame):
+        alone = os.environ.get("MOTHER_CHIEF_WORKER", "").strip() or os.environ.get("MOTHER_CHIEF_ROLE") == "chief"
+        os.write(1, (json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny" if alone else "ask",
+            "permissionDecisionReason": "[mother guard] The guard ran out of time reading this call, so it can't vouch "
+                                        "for it."}}) + "\n").encode("utf-8"))
+        os._exit(0)
+
+    try:
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+    except (ValueError, OSError):  # not the main thread
+        return False
+    return True
+
+
+def disarm_deadline():
+    if hasattr(signal, "setitimer"):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+if __name__ == "__main__":
+    arm_deadline()  # before the regexes below compile: under load that alone takes a while
 
 TAG = "[mother guard] "
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -3354,6 +3389,35 @@ def _sl_sed(scripts):
                 _sl_fail("a sed script the guard can't read as print/delete/substitute (%s)" % part.strip()[:30])
 
 
+# The long options the rules below name, per subcommand. git takes any unique prefix of a long option, so a prefix of
+# one of these is read as it; if git finds the prefix ambiguous it refuses it anyway.
+GIT_RULED_LONG = {
+    "push": ("--repo", "--exec", "--receive-pack", "--force", "--force-with-lease", "--force-if-includes", "--mirror",
+             "--all", "--branches", "--tags", "--delete", "--prune"),
+    "fetch": ("--upload-pack", "--force", "--prune", "--prune-tags", "--refmap", "--update-head-ok"),
+    "pull": ("--upload-pack", "--force", "--prune", "--prune-tags", "--refmap", "--update-head-ok"),
+    "commit": ("--amend", "--file", "--template"),
+    "blame": ("--contents",),
+    "log": ("--output", "--ext-diff", "--textconv"),
+    "diff": ("--output", "--ext-diff", "--textconv"),
+    "show": ("--output", "--ext-diff", "--textconv"),
+}
+
+
+def git_expand_long(sub, rest):
+    """`rest` with each abbreviated long option that GIT_RULED_LONG names written in full, up to `--`."""
+    names, out = GIT_RULED_LONG.get(sub, ()), []
+    for k, a in enumerate(rest):
+        if a == "--":
+            return out + list(rest[k:])
+        name, eq, value = a.partition("=")
+        if name.startswith("--") and len(name) > 2 and name not in names:
+            hit = next((n for n in names if n.startswith(name)), None)
+            a = hit + eq + value if hit else a
+        out.append(a)
+    return out
+
+
 def _sl_git(args, cwd, ws):
     k, gitdir = 0, os.path.realpath(cwd)
     while k < len(args) and args[k].startswith("-"):
@@ -3368,6 +3432,7 @@ def _sl_git(args, cwd, ws):
     if gitdir != ws:  # a .git below the root brings its own config (fsmonitor, hooks, aliases)
         _sl_fail("git run anywhere but the workspace root (%s)" % gitdir)
     sub, rest = (args[k], args[k + 1:]) if k < len(args) else ("", [])
+    rest = git_expand_long(sub, rest)
     if sub not in SL_GIT:
         _sl_fail("git %s is not on the allow-list" % (sub or "with no subcommand"))
     if sub == "stash" and rest != ["list"]:
@@ -5057,10 +5122,11 @@ DECISION_IMPORT_RE = re.compile(
     r"|\bpython[\d.]*(?:\s+-\S+)*\s+-m\s+(?:lib\.)?" + _ANSWER_MODULE)
 DECISION_LIB_RE = re.compile(r"\blib/+(?:decisions|grants)(?:\.py)?(?![\w./-])")  # .py or no extension: not lib/grants.ts
 DECISION_INTERP_RE = re.compile(r"(?<![\w.-])(?:python[\d.]*|node|ruby|perl)(?=[\s;&|)]|$)")
-# Linters read a file; they don't run it or rewrite it (black, isort and `ruff --fix` do). Any other `python3 -m` (runpy,
+# Linters read a file; they don't run it or rewrite it (black, isort, `ruff format` and `ruff --fix` do). Any other `python3 -m` (runpy,
 # pdb, trace …) may.
 DECISION_STATIC_RE = re.compile(r"(?<![\w.-])python[\d.]*(?:\s+-\S+)*?\s+-m\s+(?:pyflakes|pylint|flake8|mypy"
-                                r"|pycodestyle|py_compile|compileall)\b")
+                                r"|pycodestyle|py_compile|compileall|ruff\s+check(?![^|;&\n]*--(?:fix|unsafe-fixes|add-noqa)))"
+                                r"\b")
 _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
 _ANSI_C_ESC_RE = re.compile(r"\\(?:x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|.)", re.S)
 _ANSI_C_CHARS = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b", "f": "\f", "v": "\v"}
@@ -5223,9 +5289,118 @@ def worker_hub_write(text):
     return None
 
 
+UNATTENDED_READS = ("cat", "ls", "head", "tail", "wc", "grep", "rg")
+_GIT_DIFF_READ = {"--oneline", "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "-p", "--patch",
+                  "--no-color", "--no-ext-diff", "--no-textconv", "--decorate", "--no-decorate"}
+UNATTENDED_GIT = {
+    "status": ({"-s", "--short", "--porcelain", "-b", "--branch"}, ()),
+    "log": (_GIT_DIFF_READ | {"--graph", "--all", "--follow", "--reverse", "--first-parent", "--merges", "--no-merges",
+                              "--abbrev-commit", "-n"},
+            ("--format=", "--pretty=", "--since=", "--until=", "--author=", "--grep=", "--max-count=", "--diff-filter=")),
+    "diff": (_GIT_DIFF_READ | {"--cached", "--staged"}, ("--diff-filter=",)),
+    "show": (_GIT_DIFF_READ | {"--no-patch"}, ("--format=", "--pretty=")),
+}
+UNATTENDED_GH = {"pr": ("view", "list", "diff", "checks", "status"), "issue": ("view", "list", "status"),
+                 "run": ("view", "list")}
+UNATTENDED_MOTHER = {("path",), ("version",), ("help",), ("status",), ("hub", "status"), ("hub", "check"),
+                     ("hub", "show"), ("hub", "watching"), ("hub", "help"), ("hub", "session", "for"),
+                     ("hub", "dms", "show")}
+
+
+def unattended_git_refused(args):
+    """git status|log|diff|show with only the options named above, exact: no prefix of anything, no `-c`, no `-C`."""
+    k = 0
+    while k < len(args) and args[k] in ("--no-pager", "--no-optional-locks"):
+        k += 1
+    sub = args[k] if k < len(args) else ""
+    if sub not in UNATTENDED_GIT:
+        return "git %s" % (sub or "with no subcommand")
+    flags, valued = UNATTENDED_GIT[sub]
+    for a in args[k + 1:]:
+        if a == "--":
+            break
+        if a.startswith("-") and a not in flags and not a.startswith(valued) \
+                and not (sub != "status" and re.fullmatch(r"-(?:\d+|n\d+|U\d+)", a)):
+            return "git %s %s" % (sub, a)
+    return None
+
+
+def unattended_stage_refused(st):
+    words = st["words"]
+    if st["heredocs"]:
+        return "a heredoc"
+    for op, target in st["redirs"]:
+        if ">" in op and target != "/dev/null" and not target.startswith("&"):
+            return "a redirect that writes (%s)" % target
+    prog, args = (words[0], words[1:]) if words else ("", [])
+    mine = os.path.join(os.path.dirname(HERE), "bin", "mother")
+    if prog == "mother" or (os.path.isabs(prog) and os.path.abspath(prog) == mine):
+        ok = any(tuple(args[:len(shape)]) == shape for shape in UNATTENDED_MOTHER)
+        return None if ok else "mother %s" % " ".join(args[:2])
+    if prog in UNATTENDED_READS:
+        return "rg %s" % args if prog == "rg" and any(a.startswith(("--pre", "--hostname-bin")) for a in args) else None
+    if prog == "git":
+        return unattended_git_refused(args)
+    if prog == "gh":
+        ok = args[1:2] and args[1] in UNATTENDED_GH.get(args[0] if args else "", ()) and reader_bash_ok("gh", args) \
+            and not any(a in ("--web", "-w") for a in args)
+        return None if ok else "gh %s" % " ".join(args[:2])
+    return prog or "an empty command"
+
+
+def unattended_shell_refused(cmd):
+    """What a chief worker's or the chief's shell command holds that isn't on their positive list, or None. The list is
+    a set of heads checked not to run code or write: `mother` reads, cat, ls, head, tail, wc, grep, rg, git
+    status|log|diff|show and gh reads, joined freely under the allow-list's strict grammar; for the chief also its
+    `mother chief` and `mother decide batch|sent` shapes and `mother hub decide`. A command passing it still meets the
+    allow-list's own path and option checks. Blocklists lost twice to git's abbreviations, so this is not one."""
+    if not chief_worker():
+        if chief_command(cmd) or plugin_mother_args(cmd, heredoc=True) == ["hub", "decide"]:
+            return None
+    try:
+        stages = sl_lex(cmd, os.path.dirname(HERE))
+    except Exception as e:  # _Unlisted says which part; anything it can't read isn't on a list
+        return str(e) or "a line the guard can't read"
+    if not stages:
+        return "an empty command"
+    for st in stages:
+        why = unattended_stage_refused(st)
+        if why:
+            return why
+    return None
+
+
+def oversized_command(raw):
+    """A shell command too long to read before the hook's time is up: refused here, before any regex. Returns (decision,
+    reason) or None."""
+    try:
+        payload = json.loads(raw or "")
+        tool, inp = payload.get("tool_name"), payload.get("tool_input")
+        if not (isinstance(tool, str) and isinstance(inp, dict) and isinstance(inp.get("command"), str)) \
+                or not (tool in ("Bash", "Monitor") or tool.split("__")[-1] == "run_in_terminal") \
+                or len(inp["command"].encode("utf-8", "replace")) <= MAX_COMMAND_BYTES:
+            return None
+    except Exception:
+        return None
+    if unattended_session():
+        r = "deny", ("A %s command over 64 KB is too long for the guard to read in time, and nobody is watching here: "
+                     "denied. Say what you need in your PROGRESS line." % tool)
+    else:
+        r = "ask", "A %s command over 64 KB is too long for the guard to read in time. Confirm it, or put it in a " \
+                   "file." % tool
+    try:
+        log(load_ctx(), tool, {"kind": "oversized", "category": "shell"}, r[0], r[1])
+    except Exception:
+        pass
+    return r
+
+
 def run(raw):
     """Returns (decision, reason) or None. Never raises. A question the chief's own session would raise is a deny
     instead (chief_identity): it runs unattended and an ask would stall it unseen."""
+    big = oversized_command(raw)
+    if big:
+        return big
     r = _run(raw)
     if not (r and r[0] == "ask"):
         return r
@@ -5306,6 +5481,12 @@ def _run(raw):
                              "could run what lands there. Say what should change in your PROGRESS line."
                              % (tool, str(raw)[:160]))
                 log(ctx, tool, {"kind": "unattended-write", "category": "chief"}, r[0], r[1])
+                return r
+        if text and not filing and unattended_session():
+            why = unattended_shell_refused(text)
+            if why:  # run() makes this question a deny; a session with the role but not the chief's id keeps its ask
+                r = "ask", "`%s` is not on the short list of read commands a chief worker or the chief may run" % why[:160]
+                log(ctx, tool, {"kind": "unattended-shell", "category": "chief"}, r[0], r[1])
                 return r
         role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
         if role:
@@ -5393,6 +5574,7 @@ def main():
     except Exception:
         raw = ""
     r = run(raw)
+    disarm_deadline()
     if r:
         out(*r)
     sys.exit(0)
