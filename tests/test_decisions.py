@@ -204,7 +204,8 @@ class ReplyGrammarTest(unittest.TestCase):
 
 CFG = {"manager": {"chat_dm": ["U00000001", "D00000001"]}}
 DM, OWNER = "D00000001", "U00000001"
-SRC_TS = "%.6f" % (AT.timestamp() - 60)
+SRC_TS = "%.6f" % (AT.timestamp() + 60)  # the manager's reply, a minute after the decision was filed
+LATER = AT + timedelta(seconds=120)
 
 
 def typed_msg(ts=SRC_TS, text="1 ok", **kw):
@@ -229,8 +230,22 @@ class AnswerTest(Base):
             return typed_msg(ts=ts) if msg is None else msg
         return f
 
-    def answer(self, verb="ok", payload="", source=None, n=1, fetch=None):
-        return decisions.answer(self.ws, CFG, AT, n, verb, payload, source or {"via": "pane"}, fetch=fetch)
+    def answer(self, verb="ok", payload="", source=None, n=1):
+        return decisions.answer(self.ws, CFG, AT, n, verb, payload, source or {"via": "pane"})
+
+    def announce(self, *ids):
+        with decisions.locked(self.ws):
+            doc = decisions.load(self.ws)
+            doc["batch"]["announced"] = list(ids)
+            decisions.save(self.ws, doc)
+
+    def reply(self, text="1 ok", ts=SRC_TS, at=LATER, channel=DM, cfg=None, **kw):
+        """The manager types `text`; Slack shows it (with `kw` set on the message)."""
+        return decisions.answer_reply(self.ws, cfg or CFG, at, channel, ts,
+                                      fetch=self.fetch_ok(typed_msg(ts=ts, text=text, **kw)))
+
+    def status(self, i=0):
+        return decisions.load(self.ws)["decisions"][i]["status"]
 
     def grants(self):
         doc, problem = grants.read(self.ws)
@@ -242,10 +257,11 @@ class AnswerTest(Base):
 
     def test_ok_writes_bound_grant_and_queues(self):
         d = self.propose()
-        src = {"via": "slack", "channel": DM, "ts": SRC_TS, "text": "1 ok"}
-        msg = self.answer(source=src, fetch=self.fetch_ok())
-        self.assertEqual(self.fetched, [(DM, SRC_TS)])
-        self.assertIn("D1", msg)
+        self.announce("D1")
+        lines = self.reply()
+        self.assertEqual(self.fetched, [(DM, SRC_TS)])  # one read
+        self.assertEqual(len(lines), 1)
+        self.assertIn("D1", lines[0])
         gs = self.grants()
         self.assertEqual(len(gs), 1)
         g = gs[0]
@@ -253,7 +269,7 @@ class AnswerTest(Base):
         self.assertEqual((g["uses"], g["run"], g["decision"], g["scope"]), (1, "chief:D1", "D1", "chat-reply"))
         self.assertEqual((g["target"], g["thread"]), ("C00000001", "1700000000.000100"))
         self.assertEqual(g["source"], {"channel": DM, "user": OWNER, "ts": SRC_TS})
-        self.assertEqual(g["expires"], grants.iso(AT.timestamp() + 2 * 3600))
+        self.assertEqual(g["expires"], grants.iso(LATER.timestamp() + 2 * 3600))
         q = self.queue()
         self.assertEqual(len(q), 1)
         canon = json.dumps(REPLY, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -300,28 +316,173 @@ class AnswerTest(Base):
 
     def test_forged_manual_line_not_applied(self):
         self.propose()
-        src = {"via": "slack", "channel": DM, "ts": SRC_TS, "text": "1 ok"}
+        self.announce("D1")
         for bad in (typed_msg(app_id="A1"), typed_msg(bot_id="B1"), typed_msg(client_msg_id=None),
-                    typed_msg(user="U00000007"), typed_msg(text="1 no"), typed_msg(ts="1.000000"), None):
-            msg = self.answer(source=src, fetch=self.fetch_ok(bad) if bad is not None else (lambda c, ch, ts: None))
-            self.assertTrue(msg.startswith("D1 is still open: I couldn't confirm that reply came from you ("), msg)
+                    typed_msg(user="U00000007"), typed_msg(ts="1.000000"), None):
+            f = self.fetch_ok(bad) if bad is not None else (lambda c, ch, ts: None)
+            lines = decisions.answer_reply(self.ws, CFG, LATER, DM, SRC_TS, fetch=f)
+            self.assertEqual(len(lines), 1, bad)
+            self.assertIn("I couldn't confirm that reply came from you (", lines[0])
         self.assertEqual((self.grants(), self.queue()), ([], []))
-        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "pending")
+        self.assertEqual(self.status(), "pending")
 
     def test_slack_source_outside_dm_or_fetch_error(self):
         self.propose()
+        self.announce("D1")
 
         def boom(cfg, channel, ts):
             raise RuntimeError("down")
-        for src, f in (({"via": "slack", "channel": "C00000001", "ts": SRC_TS, "text": "1 ok"}, self.fetch_ok()),
-                       ({"via": "slack", "channel": OWNER, "ts": SRC_TS, "text": "1 ok"}, self.fetch_ok()),
-                       ({"via": "slack", "channel": DM, "ts": SRC_TS, "text": "1 ok"}, boom)):
-            self.assertIn("still open", self.answer(source=src, fetch=f))
+        for channel, f in (("C00000001", self.fetch_ok()), (OWNER, self.fetch_ok()), (DM, boom)):
+            lines = decisions.answer_reply(self.ws, CFG, LATER, channel, SRC_TS, fetch=f)
+            self.assertIn("I couldn't confirm", lines[0])
         self.assertEqual(self.grants(), [])
 
-    def test_verify_typed_plain_text_match(self):
-        f = self.fetch_ok(typed_msg(text="1​ ok"))
-        self.assertIsNone(decisions.verify_typed(self.ws, CFG, DM, SRC_TS, "1 ok", fetch=f))
+    def test_answer_refuses_a_slack_source(self):
+        self.propose()
+        msg = self.answer(source={"via": "slack", "channel": DM, "ts": SRC_TS, "text": "1 ok"})
+        self.assertIn("still open", msg)
+        self.assertEqual(self.grants(), [])
+
+    def test_reply_edit_keeps_newlines_from_raw(self):
+        self.propose()
+        self.announce("D1")
+        self.reply("1 edit: line one\nline two\ttabbed\n")
+        d = decisions.load(self.ws)["decisions"][0]
+        self.assertEqual(d["text"], "line one\nline two\ttabbed\n")
+        self.assertEqual(self.grants()[0]["draft_sha"], decisions.guard.draft_sha(POST, d["input"]))
+
+    def test_reply_edit_over_300_chars(self):
+        self.propose()
+        self.announce("D1")
+        body = "x" * 700
+        self.reply("1 edit: " + body)
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["text"], body)
+        self.assertEqual(self.status(), "approved")
+
+    def test_reply_edit_unescapes_and_unwraps_links(self):
+        self.propose()
+        self.announce("D1")
+        self.reply("1 edit: a &amp; b &lt;c&gt; &amp;lt; <https://x.test/a?b=1&amp;c=2|docs> "
+                   "<https://y.test|https://y.test> <https://z.test> <@U00000002> <#C00000002|plat>")
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["text"],
+                         "a & b <c> &lt; docs (https://x.test/a?b=1&c=2) https://y.test https://z.test "
+                         "<@U00000002> <#C00000002|plat>")
+
+    def test_reply_verb_comes_from_verified_message(self):
+        self.propose()
+        self.announce("D1")
+        lines = self.reply("1 no")
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(self.grants(), [])
+        self.assertEqual(self.status(), "rejected")
+
+    def test_reply_not_a_reply_is_none(self):
+        self.propose()
+        self.announce("D1")
+        self.assertIsNone(self.reply("call the venue"))
+        self.assertEqual((self.grants(), self.status()), ([], "pending"))
+
+    def test_reply_no_with_words_tells_the_worker_both(self):
+        self.propose()
+        self.announce("D1")
+        lines = self.reply("1 no move it to next sprint")
+        self.assertEqual(len(lines), 2)
+        self.assertEqual([e["text"] for e in self.queue()],
+                         ["D1 was rejected by the manager. Don't make that call.",
+                          "The manager's words about D1, their instruction to you: move it to next sprint"])
+        self.assertEqual(self.status(), "rejected")
+
+    def test_reply_older_than_decision_not_applied(self):
+        self.propose()
+        self.announce("D1")
+        old = "%.6f" % (AT.timestamp() - 3600)
+        lines = self.reply("1 ok", ts=old)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((self.grants(), self.status()), ([], "pending"))
+        lines = self.reply("ok all", ts=old)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((self.grants(), self.status()), ([], "pending"))
+
+    def test_ok_all_only_announced(self):
+        self.propose()
+        self.propose(inp=dict(REPLY, text="other"))
+        self.announce("D1")
+        self.assertEqual(len(self.reply("ok all")), 1)
+        self.assertEqual([self.status(0), self.status(1)], ["approved", "pending"])
+        self.assertEqual([g["decision"] for g in self.grants()], ["D1"])
+
+    def test_unannounced_id_unreadable(self):
+        self.propose()
+        lines = self.reply("1 ok")
+        self.assertEqual(len(lines), 1)
+        self.assertEqual((self.grants(), self.status()), ([], "pending"))
+        self.assertEqual(lines, self.reply("ok all"))  # the same unreadable line
+
+    def test_pane_answer_not_limited_to_announced(self):
+        self.propose()
+        self.answer()
+        self.assertEqual(self.status(), "approved")
+
+    def crash_leaving_grant(self, n=1):
+        """A first answer whose decision save fails: the grant is on disk, the decision still pending."""
+        with mock.patch.object(decisions, "save", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                self.answer(n=n)
+        self.assertEqual(len(self.grants()), 1)
+        self.assertEqual(self.status(n - 1), "pending")
+
+    def test_retry_edit_replaces_grant(self):
+        d = self.propose()
+        self.crash_leaving_grant()
+        self.assertEqual(self.grants()[0]["draft_sha"], d["draft_sha"])
+        self.answer("edit", "second text")
+        gs = self.grants()
+        self.assertEqual(len(gs), 1)
+        self.assertEqual(gs[0]["draft_sha"], decisions.guard.draft_sha(POST, dict(REPLY, text="second text")))
+
+    def test_no_removes_grant(self):
+        self.propose()
+        self.crash_leaving_grant()
+        self.answer("no")
+        self.assertEqual(self.grants(), [])
+        self.assertEqual(self.status(), "rejected")
+
+    def test_say_and_expiry_remove_grant(self):
+        self.propose()
+        self.crash_leaving_grant()
+        self.answer("say", "wait")
+        self.assertEqual(self.grants(), [])
+        self.propose(inp=dict(REPLY, text="other"))
+        self.crash_leaving_grant(n=2)
+        late = decisions.answer(self.ws, CFG, AT + timedelta(hours=49), 2, "ok", "", {"via": "pane"})
+        self.assertEqual(late, "D2 is already expired.")
+        self.assertEqual(self.grants(), [])
+
+    def test_removing_keeps_other_decisions_grants(self):
+        self.propose()
+        self.propose(inp=dict(REPLY, text="other"))
+        self.answer(n=1)
+        self.answer("no", n=2)
+        self.assertEqual([g["decision"] for g in self.grants()], ["D1"])
+
+    def test_born_dead_grant_not_written(self):
+        self.propose()
+        off = dict(CFG, policy={"grants": {"enabled": False}})
+        msg = decisions.answer(self.ws, off, AT, 1, "ok", "", {"via": "pane"})
+        self.assertTrue(msg.startswith("D1 is still open: "), msg)
+        self.assertTrue(msg.endswith(". Answer again."), msg)
+        one_off = dict(CFG, policy={"grants": {"scopes": {"chat-post": {}}}})  # chat-reply isn't in the list
+        msg = decisions.answer(self.ws, one_off, AT, 1, "ok", "", {"via": "pane"})
+        self.assertTrue(msg.endswith(". Answer again."), msg)
+        self.assertEqual((self.grants(), self.queue(), self.status()), ([], [], "pending"))
+        # a reply older than the policy's max age (96 h), on a decision that hasn't expired
+        decisions.propose(self.ws, {"chief": {"decision_hours": 200}}, AT, "PLAT-1", POST, dict(REPLY, text="b"), "r")
+        self.announce("D2")
+        lines = self.reply("2 ok", at=AT + timedelta(hours=100))
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("D2 is still open: "), lines[0])
+        self.assertTrue(lines[0].endswith(". Answer again."), lines[0])
+        self.assertEqual((self.grants(), self.status(1)), ([], "pending"))
 
     def test_default_fetch_reads_one_ts_and_closes(self):
         calls, closed = [], []
@@ -339,15 +500,17 @@ class AnswerTest(Base):
             built.append(sorted(cfg["hub"]["connections"]))
             return {"chat": FakeClient()}
         cfg = dict(CFG, hub={"connections": {"chat": {"command": "x"}, "mail": {"command": "y"}}})
+        self.propose()
+        self.announce("D1")
         with mock.patch.object(decisions.hub, "build_clients", build):
-            self.assertIsNone(decisions.verify_typed(self.ws, cfg, DM, SRC_TS, "1 ok"))
+            self.assertIn("approved", decisions.answer_reply(self.ws, cfg, LATER, DM, SRC_TS)[0])
         self.assertEqual(built, [["chat"]])  # only the chat server is started
         self.assertEqual(calls, [("get_channel_history", {"channel_id": DM, "oldest": SRC_TS, "latest": SRC_TS,
                                                           "inclusive": True, "limit": 1})])
         self.assertEqual(closed, [1])
         with mock.patch.object(decisions.hub, "build_clients", lambda c, h: {"chat": RuntimeError("no server")}):
-            self.assertIn("no server", decisions.verify_typed(self.ws, cfg, DM, SRC_TS, "1 ok"))
-        self.assertIn("no hub chat connection", decisions.verify_typed(self.ws, CFG, DM, SRC_TS, "1 ok"))
+            self.assertIn("no server", decisions.answer_reply(self.ws, cfg, LATER, DM, SRC_TS)[0])
+        self.assertIn("no hub chat connection", decisions.answer_reply(self.ws, CFG, LATER, DM, SRC_TS)[0])
 
     def test_expired_or_sent_reports_status(self):
         self.propose()
