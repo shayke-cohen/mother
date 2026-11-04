@@ -3863,7 +3863,7 @@ class DecisionGrants(GuardCase):
         self.expect("ask", self.TOOL, other)
 
 
-class DeployedPolicyMatrix(GuardCase):
+class UnattendedBase(GuardCase):
     """Fix round 1, C1 and I2: the switches the home workspace runs with give a worker and the chief nothing. They are
     unattended and read other people's text, so a question nobody sees is a deny, and only a bound grant sends."""
 
@@ -3896,6 +3896,9 @@ class DeployedPolicyMatrix(GuardCase):
                 ("worker, known id", {"session": self.KNOWN, "env": self.WORKER_ENV, "cwd": self.ws}),
                 ("worker, moved out of the workspace", {"session": "worker-new", "env": self.WORKER_ENV, "cwd": self.tmp}),
                 ("chief", {"session": self.CHIEF, "env": self.CHIEF_ENV, "cwd": self.ws}))
+
+class DeployedPolicyMatrix(UnattendedBase):
+    """The switches give a worker and the chief nothing (see UnattendedBase)."""
 
     def test_switches_give_nothing(self):
         calls = [(self.POST, self.INP),
@@ -3987,10 +3990,10 @@ class DeployedPolicyMatrix(GuardCase):
             for name, kw in self.unattended():
                 got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, **kw)
                 self.assertEqual(got, "deny", "%s: %s -> %s %s" % (name, cmd, got, why))
-        for cmd in ("echo x >> todos/open.md", "echo x > memory/x.md", "cp notes/a notes/b"):
+        # shell writes nothing at all now, even where a file tool may (round 3's positive list)
+        for cmd in ("echo x >> todos/open.md", "cat notes/a > memory/x.md", "cp notes/a notes/b"):
             for name, kw in self.unattended():
-                if kw["cwd"] == self.ws:  # from elsewhere these relative paths land outside the workspace
-                    self.expect("none", "Bash", {"command": cmd}, mode=self.BY, **kw)
+                self.expect("deny", "Bash", {"command": cmd}, mode=self.BY, **kw)
 
     def test_other_sessions_keep_their_file_tools(self):
         """Not vacuous, and scoped: with no worker env and no chief role, a normal session and a `--resume` takeover of
@@ -4014,6 +4017,249 @@ class DeployedPolicyMatrix(GuardCase):
                     cwd=self.ws, mode=self.BY)
         self.expect("none", "Bash", {"command": "mother decide batch --json"}, session=self.CHIEF, env=self.CHIEF_ENV,
                     cwd=self.ws, mode=self.BY)
+
+
+class UnattendedShellList(UnattendedBase):
+    """Fix round 3, N3: blocklists on git options lost twice to abbreviation, so a worker's and the chief's shell is a
+    positive list of heads. Each row: what stays allowed, then that entry's dangerous variants."""
+
+    TABLE = (
+        ("cat", ["cat notes/a.md"], ["cat notes/a.md > notes/b", "cat notes/a.md >> todos/open.md", "cat x | sh",
+                                     "cat ~/.mother/grant.key", "cat <<'EOF'\nx\nEOF"]),
+        ("ls", ["ls notes", "ls -la notes"], ["ls notes > x", "ls notes | xargs rm"]),
+        ("head", ["head -5 notes/a.md"], ["head -5 notes/a.md > x"]),
+        ("tail", ["tail -n 5 notes/a.md"], ["tail -5 notes/a.md | tee x"]),
+        ("wc", ["wc -l notes/a.md", "cat notes/a.md | wc -l"], ["wc --files0-from=x"]),
+        ("grep", ["grep -n x notes/a.md", "grep x notes/a.md 2>/dev/null"],
+         ["grep x notes/a.md > y", "grep x notes/a.md | sh", "grep --devices=x y z"]),
+        ("rg", ["rg -n x notes"], ["rg --pre=sh x", "rg --pre sh x", "rg --pre-glob=x y", "rg --hostname-bin=sh x"]),
+        ("git", ["git status", "git status --short", "git log --oneline -5", "git log -n 5 --format=%h -- notes",
+                 "git --no-pager diff --stat", "git diff --cached", "git show HEAD --stat"],
+         ["git push", "git fetch", "git pull", "git commit -m x", "git add x", "git stash list", "git branch",
+          "git log --output=x", "git log --outp=x", "git diff --output=x", "git diff --ext-diff", "git diff --ex",
+          "git log --textconv", "git show --textc", "git -c core.pager=x log", "git --exec-path=x status",
+          "git --exec-path status", "git -C notes status", "git diff --no-index a b", "git log -O x",
+          "git status --ignored=x", "git log --unknown-option"]),
+        ("gh", ["gh pr view 3", "gh issue view 3", "gh pr diff 3", "gh pr checks 3"],
+         ["gh pr create --title x", "gh pr comment 3 --body x", "gh api repos/o/r", "gh pr view 3 --web",
+          "gh extension install x", "gh alias set a b", "gh auth status"]),
+        ("mother", ["mother hub status", "mother hub show", "mother hub check", "mother hub watching", "mother path",
+                    "mother hub session for PLAT-1", "mother hub dms show"],
+         ["mother hub mute x", "mother hub tail", "mother sync", "mother eval", "mother speak x", "mother grant list",
+          "mother grant add x", "mother whatsapp send --to a --text b", "mother register", "mother now show"]),
+    )
+    OFF_LIST = ("find . -name x", "find . -exec sh x {} +", "find . -delete", "xargs sh", "sed -n 1p notes/a.md",
+                "sed -e 1e notes/a.md", "sed 1w\\ x notes/a.md", "awk 'BEGIN{system(\"x\")}'", "awk '{print | \"sh\"}' x",
+                "make", "make x", "tar xf x", "sort notes/a.md", "sort --compress-program=sh x", "less x", "man x", "vim x",
+                "env", "env x", "nohup x", "python3 x.py", "python3 -c 'print(1)'", "python x.py", "node x", "ruby x",
+                "perl x", "bash x", "sh x", "zsh x", "./x.sh", "notes/x.sh", "echo x", "printf x", "cp a b", "mv a b",
+                "rm a", "mkdir a", "touch a", "cd notes && cat a.md", "jq . x", "curl x", "ssh x", "A=1 cat x")
+    CHAINS = ("git push --rep=notes --exe='sh notes/x.sh'", "git push --rep=notes --receive-pa='sh notes/x.sh'",
+              "git fetch --upload-pa='sh notes/x.sh' origin", "git fetch --upl='sh notes/x.sh' origin",
+              "git pull --upl='sh notes/x.sh' origin", "git push --receive-pa='sh notes/x.sh' origin master",
+              "git push --exe='sh notes/x.sh' origin master", "git commit --amen -m x", "git commit --fil=notes/a",
+              "git push --delet origin master", "git push --mirr", "git push --pru", "git commit --templ=x",
+              "git blame --content=x y")
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.ws, "notes"))
+        for name in ("notes.md", os.path.join("notes", "a.md")):
+            with open(os.path.join(self.ws, name), "w") as f:
+                f.write("x")
+
+    def pair(self):
+        return (self.unattended()[0], self.unattended()[3])  # a worker's first turn, and the chief
+
+    def test_table(self):
+        for head, good, bad in self.TABLE:
+            for name, kw in self.pair():
+                if head != "mother" or name != "chief":  # the chief's own verbs have their own test
+                    for cmd in good:
+                        got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, **kw)
+                        self.assertEqual(got, "none", "%s: %s -> %s %s" % (name, cmd, got, why))
+                for cmd in bad:
+                    got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, **kw)
+                    self.assertEqual(got, "deny", "%s: %s -> %s %s" % (name, cmd, got, why))
+
+    def test_off_the_list(self):
+        for cmd in self.OFF_LIST:
+            for name, kw in self.pair():
+                got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, **kw)
+                self.assertEqual(got, "deny", "%s: %s -> %s %s" % (name, cmd, got, why))
+        self.assertIn("PROGRESS", self.expect("deny", "Bash", {"command": "make"}, mode=self.BY, **self.pair()[0][1]))
+        # every shell tool, not only Bash
+        for tool in ("Monitor", "mcp__terminal__run_in_terminal"):
+            self.expect("deny", tool, {"command": "make"}, **self.pair()[0][1])
+
+    def test_the_two_step_chains(self):
+        """Write notes/x.sh, then git runs it through an abbreviated option: that answered the worker's own draft."""
+        for name, kw in self.unattended():
+            self.expect("none", "Write", {"file_path": os.path.join(self.ws, "notes", "x.sh"), "content": "#!/bin/sh"},
+                        mode=self.BY, **kw)
+            for cmd in self.CHAINS:
+                got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, **kw)
+                self.assertEqual(got, "deny", "%s: %s -> %s %s" % (name, cmd, got, why))
+
+    def test_documented_flows_stay(self):
+        """routines/chief.md's four shapes and its decide heredoc, and HEADER's filing."""
+        chief = dict(self.pair()[1][1], mode=self.BY)
+        for cmd in ("mother chief lines --json", "mother chief status --json", "mother decide batch --json",
+                    "mother chief run PLAT-1 --detach '--title=T x' '--prompt=do; it'",
+                    "mother chief say PLAT-1 -- 'more to do'", "mother decide sent --ids D1 --ts 1700000000.000100",
+                    "mother hub decide <<'HUBEOF'\n[{\"line_id\": \"1\", \"key\": \"k\", \"decision\": \"log\"}]\nHUBEOF"):
+            self.expect("none", "Bash", {"command": cmd}, **chief)
+        worker = dict(self.pair()[0][1], mode=self.BY)
+        for cmd in ("mother chief lines --json", "mother decide batch --json", "mother hub decide <<'E'\n[]\nE"):
+            self.expect("deny", "Bash", {"command": cmd}, **worker)
+        self.expect("none", "Bash", {"command": "mother decide propose PLAT-1 --tool T --recommend send --why 'a b' "
+                                                "--stdin <<'EOF'\n{}\nEOF"}, **worker)
+
+    def test_normal_session_unchanged(self):
+        self.expect("none", "Bash", {"command": "sort notes/a.md"}, cwd=self.ws)
+        self.expect("none", "Bash", {"command": "echo x >> notes/a.md"}, cwd=self.ws)
+
+
+class GitAbbreviations(GuardCase):
+    """Fix round 3, every session: git accepts a unique prefix of a long option, so it meets the rule of its full name."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.ws, ".git"))
+        with open(os.path.join(self.ws, ".git", "config"), "w") as f:
+            f.write('[remote "origin"]\n\turl = https://example.com/x.git\n')
+
+    def test_same_rule_as_the_full_name(self):
+        pairs = (("git commit --amend -m x", ("git commit --amen -m x", "git commit --am -m x")),
+                 ("git commit --file=a", ("git commit --fil=a", "git commit --fi=a")),
+                 ("git commit --template=a", ("git commit --templ=a",)),
+                 ("git push --delete origin master", ("git push --delet origin master", "git push --del origin master")),
+                 ("git push --repo=a", ("git push --rep=a", "git push --re=a")),
+                 ("git push --exec=a origin", ("git push --exe=a origin", "git push --ex=a origin")),
+                 ("git push --receive-pack=a origin", ("git push --receive-pa=a origin", "git push --rec=a origin")),
+                 ("git push --mirror", ("git push --mirr",)), ("git push --prune", ("git push --pru",)),
+                 ("git push --all", ("git push --al",)), ("git push --force origin", ("git push --forc origin",)),
+                 ("git fetch --upload-pack=a origin", ("git fetch --upl=a origin", "git fetch --upload-pa=a origin")),
+                 ("git pull --upload-pack=a origin", ("git pull --upl=a origin",)),
+                 ("git blame --contents=a x", ("git blame --content=a x",)),
+                 ("git log --output=a", ("git log --outp=a",)))
+        for full, abbreviated in pairs:
+            want = self.expect("ask", "Bash", {"command": full}, cwd=self.ws)
+            for cmd in abbreviated:
+                self.expect("ask", "Bash", {"command": cmd}, cwd=self.ws)
+            self.assertTrue(want)
+
+    def test_other_options_untouched(self):
+        for cmd in ("git commit --all -m x", "git commit --fixup=abc", "git push --dry-run origin", "git push --verbose origin",
+                    "git log --oneline", "git diff --stat", "git push --recurse-submodules=no origin"):
+            self.expect("none", "Bash", {"command": cmd}, cwd=self.ws)
+
+
+class HookDeadline(GuardCase):
+    """Fix round 3: never die with no decision, whatever Claude Code does when a hook is killed."""
+
+    LONG = "decide answer " + "x " * 100000  # 200 KB
+
+    def driver(self, body, env=None, timeout=60):
+        code = ("import importlib.util, json, signal, sys, time\n"
+                "spec = importlib.util.spec_from_file_location('g', %r)\n"
+                "g = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(g)\n" % GUARD) + body
+        e = dict(os.environ, HOME=self.home, MOTHER_WORKSPACE=self.ws)
+        for k in ("MOTHER_CHIEF_ROLE", "MOTHER_CHIEF_WORKER"):
+            e.pop(k, None)
+        e.update(env or {})
+        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=e, timeout=timeout)
+
+    def test_over_64_kb_asks_before_any_regex(self):
+        import unittest.mock  # noqa: F401
+        for tool in ("Bash", "Monitor", "mcp__terminal__run_in_terminal"):
+            for cwd in (self.ws, self.tmp):
+                self.assertIn("64 KB", self.expect("ask", tool, {"command": self.LONG}, cwd=cwd))
+        self.expect("ask", "Bash", {"command": "cat " + "x " * 33000}, cwd=self.ws, mode="bypassPermissions")
+        self.expect("deny", "Bash", {"command": self.LONG}, cwd=self.ws, env={"MOTHER_CHIEF_WORKER": "PLAT-1"})
+        self.expect("deny", "Bash", {"command": self.LONG}, cwd=self.ws, env={"MOTHER_CHIEF_ROLE": "chief"})
+        # under the cap, the ordinary rules
+        self.expect("none", "Bash", {"command": "cat " + "x " * 1000}, cwd=self.ws)
+        self.expect("none", "Write", {"file_path": os.path.join(self.ws, "a.md"), "content": "x" * 100000}, cwd=self.ws)
+        # no regex ran: a scan of this many bytes would not fit in this budget on a loaded box
+        p = self.driver("g.re = None\ng._run = None\nprint(json.dumps(g.run(json.dumps({'tool_name': 'Bash', "
+                        "'tool_input': {'command': 'x ' * 100000}, 'session_id': 't', 'cwd': '/'}))))")
+        self.assertEqual(json.loads(p.stdout.strip().splitlines()[-1])[0], "ask", p.stderr)
+
+    SLOW = "g.arm_deadline(1)\ng._run = lambda raw: time.sleep(30)\ng.main()\n"
+
+    def slow(self, env=None):
+        sys_in = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "t", "cwd": "/"})
+        started = time.time()
+        p = self.driver("sys.stdin = __import__('io').StringIO(%r)\n%s" % (sys_in, self.SLOW), env=env)
+        return p, time.time() - started
+
+    def test_the_alarm_decides(self):
+        p, took = self.slow()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "ask", p.stdout)
+        self.assertLess(took, 25)
+        for env in ({"MOTHER_CHIEF_WORKER": "PLAT-1"}, {"MOTHER_CHIEF_ROLE": "chief"}):
+            p, _ = self.slow(env)
+            self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "deny", p.stdout)
+
+    def test_a_decision_in_time_disarms(self):
+        sys_in = json.dumps({"tool_name": "Bash", "tool_input": {"command": "curl https://example.com"},
+                             "session_id": "t", "cwd": self.ws})
+        p = self.driver("sys.stdin = __import__('io').StringIO(%r)\ng.arm_deadline(5)\n"
+                        "try:\n    g.main()\nexcept SystemExit:\n    pass\ntime.sleep(6)\nprint('still here')\n" % sys_in)
+        self.assertEqual(p.stdout.count("hookSpecificOutput"), 1, p.stdout)
+        self.assertIn("still here", p.stdout)
+
+    def test_no_sigalrm_falls_back(self):
+        p = self.driver("del signal.SIGALRM\nprint(g.arm_deadline(1))\ng.disarm_deadline()\nprint('ok')\n")
+        self.assertEqual(p.stdout.split(), ["False", "ok"], p.stderr)
+
+    def test_script_arms_itself_and_fast_path_too(self):
+        src = open(GUARD).read()
+        self.assertRegex(src, r'if __name__ == "__main__":\n    arm_deadline\(\)')
+        self.assertLess(src.index("arm_deadline()"), src.index("TAG = "), "armed before the module's regexes compile")
+        fast = open(GUARD_FAST).read()
+        main = fast[fast.index("def main():"):]
+        self.assertLess(main.index("arm_deadline()"), main.index("sys.stdin.read()"), "armed before any work")
+        self.assertLess(main.index("arm_deadline()"), main.index("import guard"))
+
+    def test_hook_timeout_outlasts_the_deadline(self):
+        """A hook Claude Code kills at its timeout lets the call run unguarded: the guard's alarm must decide first."""
+        sys.path.insert(0, os.path.join(ROOT, "hooks"))
+        import guard
+        import guard_fast
+        with open(os.path.join(ROOT, "hooks", "hooks.json")) as f:
+            entries = json.load(f)["hooks"]["PreToolUse"]
+        seen = set()
+        for entry in entries:
+            for h in entry["hooks"]:
+                script = os.path.basename(h["command"].split("/")[-1].strip('"'))
+                deadline = {"guard.py": guard.DEADLINE_SECONDS, "guard_fast.py": guard_fast.DEADLINE_SECONDS}[script]
+                self.assertGreaterEqual(h["timeout"], 5 * deadline, h)
+                seen.add(script)
+        self.assertEqual(seen, {"guard.py", "guard_fast.py"})
+
+    def test_fast_path_alarm_decides(self):
+        """guard_fast.py, slowed past its deadline inside guard.run, still answers."""
+        sys_in = json.dumps({"tool_name": "Read", "tool_input": {"file_path": os.path.join(self.home, ".mother", "grant.key")},
+                             "session_id": "t", "cwd": "/"})
+        code = ("import importlib.util, io, sys, time\n"
+                "sys.path.insert(0, %r)\n"
+                "import guard\nguard.run = lambda raw: time.sleep(30)\n"
+                "spec = importlib.util.spec_from_file_location('f', %r)\n"
+                "f = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(f)\n"
+                "f.DEADLINE_SECONDS = 1\nf.arm_deadline.__defaults__ = (1,)\n"
+                "sys.stdin = io.StringIO(%r)\nf.main()\n" % (os.path.join(ROOT, "hooks"), GUARD_FAST, sys_in))
+        for env, want in (({}, "ask"), ({"MOTHER_CHIEF_WORKER": "PLAT-1"}, "deny")):
+            e = dict(os.environ, HOME=self.home, MOTHER_WORKSPACE=self.ws)
+            for k in ("MOTHER_CHIEF_ROLE", "MOTHER_CHIEF_WORKER"):
+                e.pop(k, None)
+            e.update(env)
+            started = time.time()
+            p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=e, timeout=60)
+            self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], want, p.stdout + p.stderr)
+            self.assertLess(time.time() - started, 25)
 
 
 class DecisionShell(GuardCase):
@@ -4081,7 +4327,8 @@ class DecisionShell(GuardCase):
                 "rg --pre='mother decide answer 1 ok' x", "A=1 git commit -m 'mother decide answer 1 ok'",
                 "gh api -f q='mother decide answer 1 ok'", "npm run test -- --grep 'from grants import'",
                 "python3 -m black lib/decisions.py", "python3 -m isort lib/grants.py",
-                "python3 -m ruff check --fix lib/decisions.py"]
+                "python3 -m ruff check --fix lib/decisions.py", "python3 -m ruff check lib/grants.py --fix-only",
+                "python3 -m ruff format lib/decisions.py"]
         # fix round 2, N2: the shell has started a comment where a scanner sees a quote open, so the next line runs
         for head in ("echo x", "grep x y", "rg x y", "git log", "git commit -m x", "gh pr view 3"):
             for q in "'\"":
@@ -4112,7 +4359,7 @@ class DecisionShell(GuardCase):
                     "node src/lib/grants.ts", "cp a src/lib/grants.ts", "sed -i s/a/b/ src/lib/decisions.ts",
                     "echo x > app/lib/grants.ts", "python3 -m pytest tests/ ; git add lib/grants.py",
                     "python3 -m unittest tests.test_chief && cat lib/decisions.py",
-                    "python3 -m pyflakes lib/decisions.py", "git log --grep='#1 mother decide answer 1'",
+                    "python3 -m pyflakes lib/decisions.py", "python3 -m ruff check lib/decisions.py", "git log --grep='#1 mother decide answer 1'",
                     # fix round 1, I3: arguments no program executes
                     "git commit -m 'feat: mother decide answer verb'", "git log --grep='mother decide answer 1'",
                     "gh pr create --title x --body 'from grants import x'", "gh pr view 3",
