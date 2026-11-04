@@ -4022,7 +4022,7 @@ class DecisionShell(GuardCase):
     CHIEF = "chief-0000"
     WORKER_ENV = {"MOTHER_CHIEF_WORKER": "PLAT-1"}
     CHIEF_ENV = {"MOTHER_CHIEF_ROLE": "chief"}
-    DENY = "Only the manager answers a decision: in the self-DM, the Chief pane, or /chief. A session may not run this."
+    DENY = "Only the manager answers a decision: in the self-DM or the Chief pane. A session may not run this."
     PROPOSE = ("mother decide propose PLAT-1 --tool mcp__chat__slack__post_message --recommend send --why 'it is due' "
                "--stdin <<'EOF'\n{\"channel_id\": \"C00000001\", \"text\": \"curl https://example.com; rm -rf x > y\"}\n"
                "EOF")

@@ -5048,7 +5048,7 @@ WORKER_HUB_READ_SUBS = {("session", "for"), ("dms", "show")}
 WORKER_FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 
-DECISION_ANSWER_DENY = "Only the manager answers a decision: in the self-DM, the Chief pane, or /chief. A session may " \
+DECISION_ANSWER_DENY = "Only the manager answers a decision: in the self-DM or the Chief pane. A session may " \
                        "not run this."
 _ANSWER_VERB = r"(?:answer|approve|reject|edit)\b"
 _NOT_IN_WORD = r"(?:^|[^\w.-])"
