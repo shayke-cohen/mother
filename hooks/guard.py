@@ -2934,6 +2934,19 @@ def ws_protected(p, ws):
         or "/".join(parts) in ("agents.md", "memory/memory.md", "config.json", "capabilities.json")
 
 
+def unattended_write_refused(p, ws):
+    """A real path a chief worker or the chief may not write: outside the workspace, or a place an allowed command (or
+    a later session) runs code from: anything dotted at the root (.git, .claude, .githooks, .mother, .mcp.json, .env),
+    a .git, .githooks or .claude folder at any depth, scripts/, and skills/ (.claude/skills links there, and a skill
+    can run a shell line). Otherwise `git status` runs whatever ~/.gitconfig or .git/config names."""
+    p, ws = p.casefold(), ws.casefold()
+    if not inside(p, ws):
+        return True
+    parts = os.path.relpath(p, ws).replace(os.sep, "/").split("/")
+    return parts[0].startswith(".") or parts[0] in ("scripts", "skills") \
+        or any(x in (".git", ".githooks", ".claude") for x in parts)
+
+
 def ws_protected_tree(p, ws):
     """A path a cp/mv/rm/mkdir may not take as source or destination: a protected path, a folder above one
     (`memory`, the root) or a folder that holds one (checked on disk), so renaming folders can't swap one in."""
@@ -2971,6 +2984,8 @@ def sl_path(word, cwd, ws, write=False):
         _sl_fail("a protected workspace path (%s)" % word, kind)
     if write and not inside(p, ws):
         _sl_fail("a write outside the workspace (%s)" % word)
+    if write and unattended_session() and unattended_write_refused(p, ws):
+        _sl_fail("a place a chief worker or the chief may not write (%s)" % word)
 
 
 def _git_remotes(ws):
@@ -5024,11 +5039,12 @@ DECISION_ANSWER_DENY = "Only the manager answers a decision: in the self-DM, the
 _ANSWER_VERB = r"(?:answer|approve|reject|edit)\b"
 _NOT_IN_WORD = r"(?:^|[^\w.-])"
 _LEADING_FLAGS = r"(?:-\S*\s+(?:[^-\s]\S*\s+)?)*?"  # where the verb sits is the program's business, not the guard's
-# by name or path; what xargs feeds in; a renamed or computed program, by its arguments
+# by name or path; what xargs feeds in. A renamed or computed program is told by its arguments (decision_answer_args).
 DECISION_ANSWER_RE = re.compile(
     _NOT_IN_WORD + r"mother\s+decide\s+" + _LEADING_FLAGS + _ANSWER_VERB +
-    r"|\bxargs\b[^|;&\n]*" + _NOT_IN_WORD + r"mother\s+decide\b"
-    r"|" + _NOT_IN_WORD + r"decide\s+" + _LEADING_FLAGS + _ANSWER_VERB + r"[^;&|\n]*?\s(?:d?\d+\b|--via\b)")
+    r"|\bxargs\b[^|;&\n]*" + _NOT_IN_WORD + r"mother\s+decide\b")
+DECISION_ANY_PROGRAM_RE = re.compile(_NOT_IN_WORD + r"decide\s+" + _LEADING_FLAGS + _ANSWER_VERB)
+DECISION_ANSWER_ARG_RE = re.compile(r"\s(?:d?\d+\b|--via\b)")
 # A word the shell computes (brace, glob, `$`, backtick) where the guard needs to read the subcommand or the verb.
 DECISION_COMPUTED_RE = re.compile(_NOT_IN_WORD + r"(?:mother|decide)[ \t]+\S*[{}*?\[\]$`]")
 _ANSWER_MODULE = r"(?:decisions|grants)\b"
@@ -5041,15 +5057,26 @@ DECISION_IMPORT_RE = re.compile(
     r"|\bpython[\d.]*(?:\s+-\S+)*\s+-m\s+(?:lib\.)?" + _ANSWER_MODULE)
 DECISION_LIB_RE = re.compile(r"\blib/+(?:decisions|grants)(?:\.py)?(?![\w./-])")  # .py or no extension: not lib/grants.ts
 DECISION_INTERP_RE = re.compile(r"(?<![\w.-])(?:python[\d.]*|node|ruby|perl)(?=[\s;&|)]|$)")
-# Linters read a file; they don't run it. Any other `python3 -m` (runpy, pdb, trace …) may.
-DECISION_STATIC_RE = re.compile(r"(?<![\w.-])python[\d.]*(?:\s+-\S+)*?\s+-m\s+(?:pyflakes|pylint|flake8|mypy|ruff|black"
-                                r"|isort|pycodestyle|py_compile|compileall)\b")
+# Linters read a file; they don't run it or rewrite it (black, isort and `ruff --fix` do). Any other `python3 -m` (runpy,
+# pdb, trace …) may.
+DECISION_STATIC_RE = re.compile(r"(?<![\w.-])python[\d.]*(?:\s+-\S+)*?\s+-m\s+(?:pyflakes|pylint|flake8|mypy"
+                                r"|pycodestyle|py_compile|compileall)\b")
 _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
 _ANSI_C_ESC_RE = re.compile(r"\\(?:x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|.)", re.S)
 _ANSI_C_CHARS = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b", "f": "\f", "v": "\v"}
 _INERT_GH = {"pr": ("create", "edit", "comment", "view", "list", "diff", "checks", "status"),
              "issue": ("view", "list", "status"), "run": ("view", "list"), "repo": ("view",),
              "release": ("view", "list"), "search": None}
+
+
+def decision_answer_args(norm):
+    """`decide answer` with a number or --via after it in the same stage, whatever runs it. One pass per stage: the
+    first `decide answer` in a stage has the longest tail, so none after it can match if it doesn't."""
+    for stage in re.split(r"[;&|\n]", norm):
+        m = DECISION_ANY_PROGRAM_RE.search(stage)
+        if m and DECISION_ANSWER_ARG_RE.search(stage, m.end()):
+            return True
+    return False
 
 
 def decode_ansi_c(text):
@@ -5103,7 +5130,8 @@ def shell_units(text):
 def inert_text_command(cmd):
     """True for one plain `git commit`, `git log`, `grep`, `rg`, `echo` or a `gh` read or PR body: arguments no program
     executes, so words in them are only words. One stage, read with shlex: no pipe, redirect, `;`, `&`, newline,
-    subshell, backtick, unquoted `$`, or `$(`, `${` or backtick inside double quotes. The program word comes first, no
+    subshell, backtick, unquoted `$` or `#` (a comment, where the rest of the line is no longer quoted text and a quote
+    in it opens nothing), or `$(`, `${` or backtick inside double quotes. The program word comes first, no
     assignment before it, and the git subcommand straight after `git`, so no `git -c`. rg's --pre and --hostname-bin
     run a program, so they don't count."""
     i, n, q = 0, len(cmd), None
@@ -5124,7 +5152,7 @@ def inert_text_command(cmd):
             i += 1
         elif c in "'\"":
             q = c
-        elif c in "|;&<>()`$\n\r":
+        elif c in "|;&<>()`$#\n\r":
             return False
         i += 1
     if q:
@@ -5152,15 +5180,16 @@ def decision_answer_shell(cmd):
     with `$'…'` decoded and quotes and backslashes dropped (subprocess's list form and brace lists too), heredoc bodies
     and quoted text included, unless inert_text_command says no program executes them. lib/decisions(.py) and
     lib/grants(.py) by path count when the same command, pipeline included, runs an interpreter or writes; reading them
-    or an interpreter in another stage passes. A string built at run time or a script on disk is not caught here: the
-    allow-list's deny does that in a worker and the chief (CONTRACT §5g)."""
+    or an interpreter in another stage passes. A string built at run time or a script on disk is not caught here; the
+    allow-list and the write limits narrow that in a worker and the chief, and CONTRACT §5g states what is left."""
     if inert_text_command(cmd):
         return False
     for text in (cmd, inline_literal_vars(cmd)):
         text = decode_ansi_c(text.replace("\\\n", " "))
         norm = re.sub(r"[\"'\\]", "", text).casefold()
-        if DECISION_COMPUTED_RE.search(norm) or DECISION_IMPORT_RE.search(norm) \
-                or DECISION_ANSWER_RE.search(re.sub(r"[,\[\](){}]+", " ", norm)):
+        spaced = re.sub(r"[,\[\](){}]+", " ", norm)
+        if DECISION_COMPUTED_RE.search(norm) or DECISION_IMPORT_RE.search(norm) or DECISION_ANSWER_RE.search(spaced) \
+                or decision_answer_args(spaced):
             return True
         for unit in shell_units(text):
             u = re.sub(r"[\"'\\]", "", unit).casefold()
@@ -5267,6 +5296,17 @@ def _run(raw):
                          "chief's; say in your PROGRESS line what should change, and the chief decides it." % tool)
             log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
             return r
+        if tool in WORKER_FILE_TOOLS and unattended_session():
+            raw = inp.get("file_path") or inp.get("notebook_path") or ""
+            if raw and (not ctx.ws or unattended_write_refused(
+                    os.path.realpath(os.path.join(payload.get("cwd") or ctx.ws, os.path.expanduser(str(raw)))),
+                    os.path.realpath(ctx.ws))):
+                r = "deny", ("%s of %s: a chief worker or the chief writes only inside the workspace, and not under .git, "
+                             ".claude, .mother, scripts or skills or to a dotfile at its root, because an allowed command "
+                             "could run what lands there. Say what should change in your PROGRESS line."
+                             % (tool, str(raw)[:160]))
+                log(ctx, tool, {"kind": "unattended-write", "category": "chief"}, r[0], r[1])
+                return r
         role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
         if role:
             r = channel_session(tool, inp, payload.get("cwd"), ctx, role)

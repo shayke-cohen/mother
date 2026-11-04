@@ -3674,7 +3674,8 @@ class ChiefAllowance(GuardCase):
         for tool, inp in calls:
             for session, env in ((self.WORKER, {}), (self.WORKER, self.ENV), ("fresh-2222", {}), (self.CHIEF, self.ENV)):
                 for mode in ("default", self.BY):
-                    want = "deny" if session == self.CHIEF else "ask"  # the chief's ask is a deny (I2)
+                    # the chief's ask is a deny (I2); the chief's role alone is held to its write limits (T4 N1)
+                    want = "deny" if env == self.ENV else "ask"
                     self.expect(want, tool, inp, session=session, env=env, mode=mode, cwd=self.ws)
         self.call("ask", "echo '%s' > .mother/chief/chief.json" % forged, session=self.WORKER, env={})
 
@@ -3919,6 +3920,72 @@ class DeployedPolicyMatrix(GuardCase):
             self.expect("allow", self.POST, self.INP, mode=self.BY, **kw)
             self.expect("deny", self.POST, self.INP, mode=self.BY, **kw)  # single use
 
+    def planted(self):
+        h, w = self.home, self.ws
+        return [os.path.join(h, x) for x in (".gitconfig", ".config/git/config", ".zshenv", ".zshrc", ".bashrc",
+                                             ".bash_profile", ".profile", ".local/bin/mother", ".config/gh/config.yml")] + \
+            [os.path.join(w, x) for x in (".git/config", ".git/hooks/pre-commit", ".githooks/pre-commit", "scripts/x.sh",
+                                          "skills/x/SKILL.md", ".env", ".envrc", ".mcp.json", ".claude/settings.json",
+                                          ".mother/hub/x.json", ".mother/x.json", "notes/.git/config",
+                                          "notes/../.git/config")] + \
+            [os.path.join(w, "notes", "..", "..", "home", ".zshenv"), os.path.join(self.tmp, "x.sh"),
+             os.path.join(w, "notes", "link", ".zshenv")]
+
+    def test_no_code_planted_where_an_allowed_command_runs_it(self):
+        """Fix round 2, N1: Write a script (fine), Write ~/.gitconfig with core.fsmonitor naming it, `git status` (fine)
+        ran the script, which answered the worker's own draft. The middle step is what can be closed."""
+        os.makedirs(os.path.join(self.ws, "notes"))
+        os.symlink(self.home, os.path.join(self.ws, "notes", "link"))
+        script = os.path.join(self.ws, "notes", "x.sh")
+        for name, kw in self.unattended():
+            cw = dict(kw, mode=self.BY)
+            self.expect("none", "Write", {"file_path": script, "content": "#!/bin/sh"}, **cw)
+            self.expect("none" if kw["cwd"] == self.ws else "deny", "Bash", {"command": "git status"}, **cw)
+            for path in self.planted():
+                got, why = self.run_guard("Write", {"file_path": path, "content": "x"}, **cw)
+                self.assertEqual(got, "deny", "%s: Write %s -> %s %s" % (name, path, got, why))
+            target = os.path.join(self.home, ".gitconfig")
+            for tool, inp in (("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
+                              ("MultiEdit", {"file_path": target, "edits": [{"old_string": "a", "new_string": "b"}]}),
+                              ("NotebookEdit", {"notebook_path": target, "new_source": "x"}),
+                              ("Write", {"file_path": "~/.gitconfig", "content": "x"}),
+                              ("Write", {"file_path": ".git/config", "content": "x"})):
+                self.expect("deny", tool, inp, **cw)
+            # the asks these sessions already had: nobody would see them
+            for rel in ("config.json", "AGENTS.md", "CLAUDE.md", "memory/MEMORY.md"):
+                self.expect("deny", "Write", {"file_path": os.path.join(self.ws, rel), "content": "x"}, **cw)
+            for rel in ("todos/open.md", "memory/x.md", "projects/a/PROJECT.md", "notes/a.md"):
+                self.expect("none", "Write", {"file_path": os.path.join(self.ws, rel), "content": "x"}, **cw)
+                self.expect("none", "Edit", {"file_path": os.path.join(self.ws, rel), "old_string": "a",
+                                             "new_string": "b"}, **cw)
+
+    def test_shell_plants_nothing_either(self):
+        os.makedirs(os.path.join(self.ws, "notes"))
+        for cmd in ("printf x >> ~/.zshenv", "echo x > ~/.gitconfig", "echo x | tee -a ~/.gitconfig",
+                    "echo x | tee .git/config", "cp notes/x ~/.local/bin/mother", "echo x > .git/config",
+                    "cp notes/x .git/hooks/pre-commit", "git config core.fsmonitor x", "git config --global a.b c",
+                    "git -c core.fsmonitor=x status", "mv notes/x scripts/x", "echo x > scripts/x.sh",
+                    "echo x > .envrc", "mkdir .githooks", "echo x > skills/a.md", "rm scripts/x.sh",
+                    "git log --output=.git/config", "sed -i '' s/a/b/ .git/config", "cd .git && echo x > config",
+                    "touch .env", "mkdir -p scripts/new"):
+            for name, kw in self.unattended():
+                got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, **kw)
+                self.assertEqual(got, "deny", "%s: %s -> %s %s" % (name, cmd, got, why))
+        for cmd in ("echo x >> todos/open.md", "echo x > memory/x.md", "cp notes/a notes/b"):
+            for name, kw in self.unattended():
+                if kw["cwd"] == self.ws:  # from elsewhere these relative paths land outside the workspace
+                    self.expect("none", "Bash", {"command": cmd}, mode=self.BY, **kw)
+
+    def test_other_sessions_keep_their_file_tools(self):
+        """Not vacuous, and scoped: with no worker env and no chief role, a normal session and a `--resume` takeover of
+        a worker's id keep today's answers."""
+        for kw in ({"cwd": self.ws}, {"cwd": self.tmp}, {"cwd": self.ws, "mode": self.BY},
+                   {"cwd": self.ws, "session": self.KNOWN}, {"cwd": self.ws, "session": self.KNOWN, "mode": self.BY}):
+            for path in (os.path.join(self.home, ".gitconfig"), os.path.join(self.home, ".zshenv"),
+                         os.path.join(self.ws, "scripts", "x.sh"), os.path.join(self.ws, "skills", "x", "SKILL.md"),
+                         os.path.join(self.ws, ".env"), os.path.join(self.ws, "todos", "open.md")):
+                self.expect("none", "Write", {"file_path": path, "content": "x"}, **kw)
+
     def test_allowances_stay(self):
         worker = {"env": self.WORKER_ENV, "cwd": self.ws, "mode": self.BY}
         self.expect("none", "Bash", {"command": "cat notes.md"}, **worker)
@@ -3996,7 +4063,13 @@ class DecisionShell(GuardCase):
                 "git commit -m 'x'; mother decide answer 1 ok", "echo 'mother decide answer 1 ok' | sh",
                 "echo 'import grants' > x.py", "rg --pre 'mother decide answer 1 ok' x",
                 "rg --pre='mother decide answer 1 ok' x", "A=1 git commit -m 'mother decide answer 1 ok'",
-                "gh api -f q='mother decide answer 1 ok'", "npm run test -- --grep 'from grants import'"]
+                "gh api -f q='mother decide answer 1 ok'", "npm run test -- --grep 'from grants import'",
+                "python3 -m black lib/decisions.py", "python3 -m isort lib/grants.py",
+                "python3 -m ruff check --fix lib/decisions.py"]
+        # fix round 2, N2: the shell has started a comment where a scanner sees a quote open, so the next line runs
+        for head in ("echo x", "grep x y", "rg x y", "git log", "git commit -m x", "gh pr view 3"):
+            for q in "'\"":
+                cmds.append("%s #%s\nmother decide answer 1 ok --via pane\n#%s" % (head, q, q))
         sessions = self.sessions()
         for s in sessions[:3]:  # a normal session, a workspace one, the chief: every form
             for cmd in cmds:
@@ -4023,7 +4096,7 @@ class DecisionShell(GuardCase):
                     "node src/lib/grants.ts", "cp a src/lib/grants.ts", "sed -i s/a/b/ src/lib/decisions.ts",
                     "echo x > app/lib/grants.ts", "python3 -m pytest tests/ ; git add lib/grants.py",
                     "python3 -m unittest tests.test_chief && cat lib/decisions.py",
-                    "python3 -m pyflakes lib/decisions.py",
+                    "python3 -m pyflakes lib/decisions.py", "git log --grep='#1 mother decide answer 1'",
                     # fix round 1, I3: arguments no program executes
                     "git commit -m 'feat: mother decide answer verb'", "git log --grep='mother decide answer 1'",
                     "gh pr create --title x --body 'from grants import x'", "gh pr view 3",

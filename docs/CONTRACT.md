@@ -1411,14 +1411,16 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     the word after `mother` or `decide`, or imports `decisions`/`grants`. `lib/decisions` and `lib/grants` (`.py` or no
     extension) by path count when that command or pipeline runs an interpreter or writes; a linter under `python3 -m`
     and plain reads pass. Quoted text and heredoc bodies count, except in one plain `git commit`, `git log`, `grep`, `rg`
-    (no `--pre`, `--hostname-bin`), `echo` or `gh` read or PR body with no pipe, redirect, `;`, `&`, `$(`, backtick or
-    unquoted `$`. `mother decide answer` itself also refuses in a process with `MOTHER_CHIEF_WORKER`. It does not refuse
+    (no `--pre`, `--hostname-bin`), `echo` or `gh` read or PR body with no newline, pipe, redirect, `;`, `&`, `$(`, backtick,
+    unquoted `$` or unquoted `#`. `mother decide answer` itself also refuses in a process with `MOTHER_CHIEF_WORKER`. It does not refuse
     on `MOTHER_CHIEF_ROLE`: the Chief pane's mod runs in the chief's session and inherits it.
-  - **Residual.** Text matching can't see a string built at run time (`'ans'+'wer'`, `printf … | sh`) or a script on disk
-    (`python3 /tmp/x.py`). In a worker and the chief the rule below stops those. In a normal session they get that
-    session's ordinary shell rules, which outside the workspace or with the policy switches on means they run; and a
-    script that unsets `MOTHER_CHIEF_WORKER` gets past the CLI's refusal. The guard is not a boundary against code the
-    session already runs.
+  - **The guard is not a sandbox.** A same-uid process that reaches code execution can reach the grant key, and with it
+    sign any grant. The guard closes the routes it knows about; a new route is a new fix. Text matching can't see a
+    string built at run time (`'ans'+'wer'`, `printf … | sh`) or a script on disk (`python3 /tmp/x.py`). In a worker and
+    the chief those commands are off the allow-list, and the write limits below close the known ways to make an allowed
+    command run planted code. In a normal session they get that session's ordinary shell rules, which outside the
+    workspace or with the policy switches on means they run. A process that unsets `MOTHER_CHIEF_WORKER` gets past the
+    CLI's refusal.
   - **Workers and the chief get no passes.** With `MOTHER_CHIEF_WORKER` set or `MOTHER_CHIEF_ROLE=chief`,
     `policy.shell_unasked`, `shell_in_bypass`, `bypass_passes_asks`, functional autonomy and bypass mode outside the
     workspace open nothing, and the shell allow-list applies wherever the command's cwd is. A worker counts as hub-fed
@@ -1427,6 +1429,13 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     open: reads, workspace edits, the allow-list, the manager's own DM, a live bound grant, a worker's exact `mother
     decide propose` (checked before the text rule, so quoted third-party text can't stop a filing), and the chief's
     `mother chief …` and `mother decide batch [--json]`, `sent --ids D7,D8 [--ts TS]`.
+  - **Where they write.** With `MOTHER_CHIEF_WORKER` or `MOTHER_CHIEF_ROLE=chief`, Write, Edit, MultiEdit, NotebookEdit and
+    allow-listed shell write only inside the workspace, on real paths, and never to anything dotted at its root
+    (`.git`, `.claude`, `.githooks`, `.mother`, `.mcp.json`, `.env`), a `.git`, `.githooks` or `.claude` folder at any depth,
+    `scripts/` or `skills/`. Otherwise an allowed command runs what lands there: `git status` runs what `core.fsmonitor`
+    in `~/.gitconfig` or `.git/config` names, `zsh -c` sources `~/.zshenv`. `config.json`, `AGENTS.md`, `CLAUDE.md` and
+    `memory/MEMORY.md` keep their ask, which is a deny here. The chief's and workers' own state goes through `mother`
+    verbs, which are not file tools. Normal sessions and a `--resume` takeover with no worker env are not limited by this.
   - **Stores.** Write, Edit, MultiEdit, NotebookEdit and shell writes to `.mother/chief/decisions.json` and
     `.mother/hub/inbox.jsonl` ask in every session (denied under PAUSED and in the chief and workers), wherever they run
     and through paths the guard can't resolve, since the folder and file are named.
