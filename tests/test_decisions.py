@@ -91,7 +91,7 @@ class ProposeTest(Base):
 
     def test_load_defaults(self):
         self.assertEqual(decisions.load(self.ws), {"version": 1, "next": 1, "decisions": [],
-                                                   "batch": {"last_at": None, "announced": {}}, "confirm": []})
+                                                   "batch": {"last_at": None, "announced": {}}, "confirm": [], "replied": {}})
 
 
 class EditedInputTest(unittest.TestCase):
@@ -687,6 +687,46 @@ class SignatureTest(Base):
         msg = decisions.answer(self.ws, self.cfg(), AT, 1, "edit", "new " + SIG, {"via": "pane"})
         self.assertIn("still open", msg)
         self.assertEqual(decisions.load(self.ws)["decisions"][0]["input"], blocks)
+
+
+class DraftTextTest(Base):
+    def test_one_field_is_byte_for_byte(self):
+        self.assertEqual(decisions.draft_text(REPLY), REPLY["text"])
+        self.assertEqual(decisions.draft_text({"inputs": {"issueIdOrKey": "PLAT-1", "comment": " a\nb "}}), " a\nb ")
+
+    def test_several_fields_are_all_shown_and_labelled(self):
+        inp = {"channel": "C00000001", "text": "short", "blocks": [{"type": "section"}], "reply_broadcast": True}
+        self.assertEqual(decisions.draft_text(inp), 'text: short\n\nblocks: [{"type": "section"}]')
+        inp = {"projectKey": "PLAT", "issueType": "Task", "summary": "s", "description": "d"}
+        self.assertEqual(decisions.draft_text(inp), "summary: s\n\ndescription: d")
+        self.assertEqual(decisions.draft_text({"to": "a@b.c", "subject": "s", "cc": "x@b.c", "body": "b"}),
+                         "subject: s\n\ncc: x@b.c\n\nbody: b")
+
+    def test_edit_refuses_a_call_with_several_fields(self):
+        """New text in one field would send the others unread."""
+        cfg = dict(SIGNED, manager={"chat_dm": ["U00000001", "D00000001"]})
+        inp = dict(REPLY, unfurl_text="more words")
+        self.propose(inp=inp)
+        sdir = tempfile.TemporaryDirectory()
+        self.addCleanup(sdir.cleanup)
+        with mock.patch.dict(os.environ, {"MOTHER_STATE_DIR": sdir.name}):
+            msg = decisions.answer(self.ws, cfg, AT, 1, "edit", "new " + SIG, {"via": "pane"})
+        self.assertIn("still open", msg)
+        self.assertIn("unfurl_text", msg)
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["input"], inp)
+
+    def test_plain_target(self):
+        cases = ((POST, REPLY, "C00000001"),
+                 ("mcp__tracker__jira__comment-on-issue", {"issueIdOrKey": "PLAT-7", "comment": "x"}, "PLAT-7"),
+                 ("mcp__tracker__jira__comment-on-issue", {"inputs": {"issueIdOrKey": "PLAT-8", "comment": "x"}},
+                  "PLAT-8"),
+                 ("mcp__tracker__jira__create-issue", {"projectKey": "PLAT", "summary": "s"}, "PLAT"),
+                 (MAIL, {"to": ["a@b.c", "d@b.c"], "body": "x"}, "a@b.c, d@b.c"),
+                 (MAIL, {"body": "x"}, ""))
+        for tool, inp, want in cases:
+            d = {"tool": tool, "input": inp, "target": decisions.kind_of(tool, inp)[1]}
+            self.assertEqual(decisions.plain_target(d), want, inp)
+        self.assertEqual(decisions.plain_target({"tool": MAIL, "input": {"to": "a\n\u202eb"}}), "a b")
 
 
 class ResumeTest(Base):

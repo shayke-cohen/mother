@@ -573,10 +573,15 @@ def _session_kind(sessions: dict, line: dict) -> Optional[str]:
 def lines(ws: Path) -> List[dict]:
     """The lines the chief reads: the digest after the cursor, trimmed to the fields it needs, plus `session`
     ("cli" for a chief worker, "desktop" for a hub session, None for neither)."""
+    import decisions
     ws = Path(ws)
     sessions = hub._sessions_doc(ws)
     out = []
-    for l in _pending_lines(ws):
+    pending = _pending_lines(ws)
+    replies = decisions.held_replies(ws, pending)  # the tick's: a wake never decides a reply
+    for l in pending:
+        if l["id"] in replies:
+            continue
         d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
         d["also"] = list(l.get("also") or [])
         d["session"] = _session_kind(sessions, l)
@@ -618,16 +623,20 @@ def _landing(raw: List[dict], order: dict, start: int, l: dict) -> int:
 
 
 def tick(ws: Path, cfg: dict, at: datetime) -> dict:
-    """One chief pass. Not atomic as a whole (hub.locked is not re-entrant); every step is safe to re-run."""
+    """One chief pass. Not atomic as a whole (hub.locked is not re-entrant); every step is safe to re-run. `batch` is
+    true when `mother decide batch` has a message for the manager's DM."""
+    import decisions
     ws = Path(ws)
     cfgs = settings(cfg)
     cdir = chief_dir(ws)
     _write_atomic(cdir / "heartbeat.json", json.dumps({"at": hub._iso(at), "pid": os.getpid()}) + "\n")
-    out = {"paused": False, "decided": [], "wake": None, "judge": [], "dispatched": [], "reconciled": []}
+    out = {"paused": False, "decided": [], "wake": None, "judge": [], "dispatched": [], "reconciled": [],
+           "batch": False}
     if paused(ws):
         out["paused"] = True
         return out
     out["reconciled"] = _reconcile(ws)
+    decisions.settle(ws, at)
 
     mute = hub.live_mute(hub.merged_watch(cfg, hub.load_watch(ws))["mute"] or {}, at)
     sessions = hub._sessions_doc(ws)
@@ -636,6 +645,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     order = {l["id"]: i for i, l in enumerate(raw)}
     cursor = hub._hub_doc(ws).get("inbox_cursor")
     start = order[cursor] + 1 if cursor in order else 0
+    replies = decisions.apply_replies(ws, cfg, at, pending)
 
     def routable(l):
         """A live chief worker that existed before this line reached the inbox: a line at or before the worker's
@@ -647,7 +657,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
         return not (mark in order and order[l["id"]] <= order[mark])
 
     def decidable(l):
-        return (l.get("kind") != "manual" and hub.is_muted(l, mute)) or routable(l)
+        return l["id"] in replies or (l.get("kind") != "manual" and hub.is_muted(l, mute)) or routable(l)
 
     first = next((l for l in pending if not decidable(l)), None)
     limit = order[first["id"]] if first is not None else None
@@ -655,7 +665,10 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     for l in pending:
         if l is first or (limit is not None and _landing(raw, order, start, l) > limit):
             break
-        if l.get("kind") != "manual" and hub.is_muted(l, mute):
+        if l["id"] in replies:
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "log",
+                          "why": "a reply to the decision queue"})
+        elif l.get("kind") != "manual" and hub.is_muted(l, mute):
             items.append({"line_id": l["id"], "key": l["key"], "decision": "log"})
         else:
             hit = hub.find_session(sessions, [l["key"]] + list(l.get("also") or []))
@@ -668,7 +681,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     if items:
         out["decided"] = hub.decide(ws, cfg, at, items)
 
-    judge = [l["id"] for l in pending[len(items):]][:JUDGE_MAX]
+    judge = [l["id"] for l in pending[len(items):] if l["id"] not in replies][:JUDGE_MAX]
     out["judge"] = judge
     if judge:
         last = _read_obj(cdir / "wake.json")
@@ -678,6 +691,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
             out["wake"] = WAKE_TEXT % (len(judge), PLUGIN_ROOT / "routines" / "chief.md")
             _write_atomic(cdir / "wake.json", json.dumps({"line_ids": judge, "at": hub._iso(at)}) + "\n")
 
+    out["batch"] = decisions.batch(ws, cfg, at) is not None
     if refusal(ws, cfg, at):
         return out  # over budget or an unreadable spend file: nothing is dispatched until that clears
     live = set(running(ws))
@@ -734,6 +748,7 @@ def triage_apply(ws: Path, cfg: dict, at: datetime, verdicts: List[dict]) -> dic
     decide's cursor landing stays short of that line (the rule `tick` follows). Returns {paused, logged, kept, wake}:
     `kept` is the batch the chief now judges (wake.json is set to it, so the next tick does not wake for it again),
     `wake` its wake text with each kept line's triage title and tldr, None when nothing is kept or chief is paused."""
+    import decisions
     ws = Path(ws)
     out = {"paused": False, "logged": [], "kept": [], "wake": None}
     if paused(ws):
@@ -768,7 +783,8 @@ def triage_apply(ws: Path, cfg: dict, at: datetime, verdicts: List[dict]) -> dic
     if items:
         hub.decide(ws, cfg, at, items)
     out["logged"] = [it["line_id"] for it in items]
-    kept = pending[len(items):][:JUDGE_MAX]
+    replies = decisions.held_replies(ws, pending)  # the tick's: it applies them and logs them
+    kept = [l for l in pending[len(items):] if l["id"] not in replies][:JUDGE_MAX]
     out["kept"] = [l["id"] for l in kept]
 
     cdir = chief_dir(ws)
@@ -1026,6 +1042,11 @@ _UNSAFE_RE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u
 
 def _safe(text: str) -> str:
     return _UNSAFE_RE.sub("", text)
+
+
+def safe_line(text, cap: int) -> str:
+    """Text a worker wrote, as one line a card or a message can show: whitespace flattened, capped, nothing unsafe."""
+    return _safe(_one_line(str(text or ""), cap))
 
 
 def clean_tldr(tldr, chips) -> Optional[dict]:
@@ -1315,7 +1336,8 @@ USAGE = """usage: mother chief <verb> ...
   install [--force]     write ~/Library/LaunchAgents/com.mother.chief.plist and load it (home machine only;
                         refuses while a desktop hub session is active unless --force)
   uninstall             unload the job and remove the plist
-  tick [--json]         one chief pass: route, wake the chief, dispatch queued workers
+  tick [--json]         one chief pass: apply the manager's DM replies, settle decisions, route, wake the chief,
+                        dispatch queued workers; `batch` says a message is due (`mother decide batch`)
   triage --stdin        log the lines a triage verdict list (JSON array on stdin) finds need no judgment;
                         prints {paused, logged, kept, wake} as JSON
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
@@ -1344,7 +1366,8 @@ VERBS = {
 
 def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     """The ChiefStatus document the mod reads (version 1). Workers: running first, then last_run_at newest first.
-    `decisions` is every pending decision, oldest first; `to_decide` how many."""
+    `decisions` is every pending decision, oldest first: `text` capped, `full_text` all the call would send (see
+    decisions.draft_text), `why` and `recommendation` one safe line; `to_decide` how many."""
     import decisions
     ws = Path(ws)
     cdir = chief_dir(ws)
@@ -1368,8 +1391,10 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         })
     rows.sort(key=lambda r: r["last_run_at"] or "", reverse=True)
     rows.sort(key=lambda r: not r["running"])
-    open_ = [{"id": d.get("id"), "key": d.get("key"), "kind": d.get("kind"), "recommendation": d.get("recommendation"),
-              "why": d.get("why") or "", "text": (d.get("text") or "")[:DECISION_TEXT_MAX], "urgent": bool(d.get("urgent")),
+    open_ = [{"id": d.get("id"), "key": d.get("key"), "kind": d.get("kind"), "target": decisions.plain_target(d),
+              "recommendation": safe_line(d.get("recommendation"), PROGRESS_MAX),
+              "why": safe_line(d.get("why"), PROGRESS_MAX), "text": (d.get("text") or "")[:DECISION_TEXT_MAX],
+              "full_text": decisions.draft_text(d.get("input")), "urgent": bool(d.get("urgent")),
               "status": d.get("status"), "created": d.get("created"), "expires": d.get("expires")}
              for d in decisions.pending(ws)]
     return {

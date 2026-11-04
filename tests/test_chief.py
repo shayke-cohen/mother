@@ -513,13 +513,28 @@ class TestWaitsOnDecision(Base):
         self.assertEqual(doc["to_decide"], 1)
         self.assertEqual(len(doc["decisions"]), 1)
         got = doc["decisions"][0]
-        self.assertEqual(sorted(got), sorted(["id", "key", "kind", "recommendation", "why", "text", "urgent", "status",
-                                              "created", "expires"]))
+        self.assertEqual(sorted(got), sorted(["id", "key", "kind", "target", "recommendation", "why", "text",
+                                              "full_text", "urgent", "status", "created", "expires"]))
+        self.assertEqual(got["target"], "a@b.c")
+        self.assertEqual(got["full_text"], "y" * 500)
         self.assertEqual((got["id"], got["key"], got["kind"], got["recommendation"], got["why"], got["urgent"],
                           got["status"], got["created"], got["expires"]),
                          ("D1", "PLAT-1", "manual", "send", "asked", True, "pending", d1["created"], d1["expires"]))
         self.assertLessEqual(len(got["text"]), 400)
         self.assertTrue(got["text"].startswith("y"))
+
+    def test_status_doc_why_and_recommendation_are_one_safe_line(self):
+        decisions.propose(self.ws, {}, AT, "PLAT-1", self.MAIL, {"to": "a@b.c", "body": "x"},
+                          "send\nit\u202e now\x07", why="a\n\tb\u2028c\x1b " + "y" * 300)
+        got = chief.status_doc(self.ws, {}, AT)["decisions"][0]
+        self.assertEqual(got["recommendation"], "send it now")
+        self.assertTrue(got["why"].startswith("a b c y"))
+        self.assertLessEqual(len(got["why"]), 200)
+
+    def test_status_doc_full_text_covers_every_field(self):
+        decisions.propose(self.ws, {}, AT, "PLAT-1", self.MAIL, {"to": "a@b.c", "subject": "s", "body": "b"}, "send")
+        got = chief.status_doc(self.ws, {}, AT)["decisions"][0]
+        self.assertEqual(got["full_text"], "subject: s\n\nbody: b")
 
     def test_status_doc_empty_queue(self):
         doc = chief.status_doc(self.ws, {}, AT)
@@ -534,6 +549,532 @@ class TestWaitsOnDecision(Base):
         form = h[h.index("mother decide propose"):h.index("\nEOF") + 4].replace("<key>", "PLAT-1") \
             .replace("<tool>", "T").replace("<send|skip>", "send").replace("<one line>", "w")
         self.assertTrue(decisions.guard.worker_propose_command(form), form)
+
+
+class TestTickDecisions(Base):
+    """Task 6: the tick applies the manager's DM replies, expires decisions, closes the loop and builds the batch."""
+    POST = "mcp__chat__slack__post_message"
+    MAIL = "mcp__mail__gmail__send-gmail-message"
+    SIG = "Mother (AI)"
+    DM, OWNER = "D00000001", "U00000001"
+    CFG = {"agent": {"name": "Mother"}, "manager": {"chat_dm": ["U00000001", "D00000001"]}}
+    TS = "%.6f" % (AT.timestamp() + 60)
+    LATER = AT + timedelta(seconds=120)
+    HELP = "I couldn't read that reply, so nothing was applied. Use: 7 ok · 7 no · 7 edit: <text> · ok all"
+
+    def setUp(self):
+        super().setUp()
+        sdir = tempfile.TemporaryDirectory()
+        self.addCleanup(sdir.cleanup)
+        env = mock.patch.dict(os.environ, {"MOTHER_STATE_DIR": sdir.name})
+        env.start()
+        self.addCleanup(env.stop)
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+        self.fetched = []
+        self.words = {}
+        p = mock.patch.object(decisions, "_fetch_slack", self.fetch)
+        p.start()
+        self.addCleanup(p.stop)
+        run = mock.patch.object(chief, "run", return_value=0)  # a queued note must never start a real detached worker
+        run.start()
+        self.addCleanup(run.stop)
+
+    def fetch(self, cfg, channel, ts):
+        self.fetched.append((channel, ts))
+        return {"ts": ts, "user": self.OWNER, "client_msg_id": "c-1", "text": self.words[ts]}
+
+    def inp(self, words="hello"):
+        return {"channel": "C00000001", "text": "%s %s" % (words, self.SIG), "thread_ts": "1700000000.000100"}
+
+    def file(self, key="PLAT-1", cfg=None, at=AT, words="hello", recommendation="send", **kw):
+        return decisions.propose(self.ws, cfg or self.CFG, at, key, self.POST, self.inp(words), recommendation, **kw)
+
+    def announce(self, *ids):
+        decisions.sent(self.ws, AT + timedelta(seconds=30), list(ids), "%.6f" % (AT.timestamp() + 30))
+
+    def manual(self, text, ts=None, source="chat"):
+        ts = ts or self.TS
+        self.words[ts] = text
+        return hub.make_line(source, "manual", hub.manual_key(text), hub._iso(self.LATER), title=text[:80], who="me",
+                             summary=text, uid=ts)
+
+    def inbox(self, *ls):
+        hub.append_inbox(self.ws, list(ls))
+
+    def tick(self, at=None, cfg=None):
+        return chief.tick(self.ws, cfg or self.CFG, at or self.LATER)
+
+    def doc(self):
+        return decisions.load(self.ws)
+
+    def status(self, i=0):
+        return self.doc()["decisions"][i]["status"]
+
+    def cursor(self):
+        return hub._hub_doc(self.ws).get("inbox_cursor")
+
+    def ledger(self, *runs):
+        (self.ws / ".mother" / "ledger.json").write_text(json.dumps(
+            {"version": 1, "uses": [{"run": r, "scope": "chat-reply", "source": "x", "n": 1} for r in runs]}))
+
+    def approve(self):
+        decisions.answer(self.ws, self.CFG, AT, 1, "ok", "", {"via": "pane"})
+
+    def delivered(self):
+        return chief.take_queue(self.ws, "PLAT-1")
+
+    # replies ---------------------------------------------------------------------------------------------------
+
+    def test_tick_applies_reply_line_and_logs_it(self):
+        self.file()
+        self.announce("D1")
+        l = self.manual("1 ok")
+        self.inbox(l)
+        r = self.tick()
+        self.assertEqual(self.fetched, [(self.DM, self.TS)])
+        self.assertEqual(self.status(), "approved")
+        self.assertEqual([(x["line_id"], x["decision"]) for x in r["decided"]], [(l["id"], "log")])
+        self.assertEqual(self.cursor(), l["id"])
+        self.assertEqual(self.doc()["confirm"], ["D1 approved: PLAT-1 will make that one call."])
+        self.assertIs(r["batch"], True)
+
+    def test_tick_reply_line_never_wakes(self):
+        self.file()
+        self.announce("D1")
+        self.inbox(self.manual("1 ok"))
+        r = self.tick()
+        self.assertEqual(r["judge"], [])
+        self.assertIsNone(r["wake"])
+
+    def test_tick_unreadable_reply_confirms_help(self):
+        self.file()
+        self.announce("D1")
+        for text, ts in (("1 maybe yes, 2 ok", self.TS), ("9 ok", "%.6f" % (AT.timestamp() + 61))):
+            self.inbox(self.manual(text, ts))
+        r = self.tick()
+        self.assertEqual(self.doc()["confirm"], [self.HELP, self.HELP])
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(len(r["decided"]), 2)
+        self.assertIsNone(r["wake"])
+
+    def test_tick_unverifiable_reply_applies_nothing(self):
+        self.file()
+        self.announce("D1")
+        self.inbox(self.manual("1 ok"))
+        with mock.patch.object(decisions, "_fetch_slack", side_effect=RuntimeError("down")):
+            r = self.tick()
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(len(self.doc()["confirm"]), 1)
+        self.assertIn("I couldn't confirm", self.doc()["confirm"][0])
+        self.assertEqual(len(r["decided"]), 1)
+
+    def test_tick_reply_channel_is_the_d_entry(self):
+        cfg = dict(self.CFG, manager={"chat_dm": ["U00000001", "D00000001"], "chat_user": "U00000001"})
+        self.file()
+        self.announce("D1")
+        self.inbox(self.manual("1 ok"))
+        self.tick(cfg=cfg)
+        self.assertEqual(self.fetched, [(self.DM, self.TS)])
+
+    def test_tick_cli_manual_line_is_never_a_reply(self):
+        """A `source == "manual"` line came from a CLI verb any session could run; it can't be re-read from Slack."""
+        self.file()
+        self.announce("D1")
+        l = self.manual("1 ok", source="manual")
+        self.inbox(l)
+        r = self.tick()
+        self.assertEqual((self.fetched, self.status()), ([], "pending"))
+        self.assertEqual(r["judge"], [l["id"]])
+
+    def test_tick_other_manual_notes_keep_their_path(self):
+        self.file()
+        l = self.manual("remember the milk")
+        self.inbox(l)
+        r = self.tick()
+        self.assertEqual((r["judge"], r["decided"], self.fetched), ([l["id"]], [], []))
+
+    def test_tick_summary_like_a_reply_but_raw_is_not(self):
+        """The raw message decides. A line that isn't a reply keeps its normal path, and Slack is read once for it."""
+        self.file()
+        l = self.manual("1 ok")
+        self.inbox(l)
+        self.words[self.TS] = "remember the milk"
+        r = self.tick()
+        self.assertEqual(r["judge"], [l["id"]])
+        self.assertEqual(self.doc()["confirm"], [])
+        self.assertEqual(chief.lines(self.ws)[0]["id"], l["id"])
+        self.tick()
+        self.assertEqual(len(self.fetched), 1)
+
+    def test_cursor_prefix_with_reply_in_middle(self):
+        self.file()
+        self.announce("D1")
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        a = line(key="PLAT-2", at="2026-10-29T09:00:00Z")
+        rep = self.manual("1 ok")
+        chief.register_worker(self.ws, AT, "PLAT-3", "t")
+        b = line(key="PLAT-3", at="2026-10-29T09:00:01Z")
+        judge = line(key="PLAT-7", at="2026-10-29T09:00:02Z")
+        late = self.manual("2 ok", "%.6f" % (AT.timestamp() + 70))
+        self.inbox(a, rep, b, judge, late)
+        r = self.tick()
+        self.assertEqual([x["line_id"] for x in r["decided"]], [a["id"], rep["id"], b["id"]])
+        self.assertEqual(self.cursor(), b["id"])
+        self.assertEqual(r["judge"], [judge["id"]])  # a reply behind a judge line is not the chief's to decide
+        self.assertEqual(self.status(), "approved")
+        self.assertEqual(len(self.doc()["confirm"]), 2)  # both applied now, the second one unreadable (no D2)
+
+    def test_reply_behind_a_judge_line_applies_once(self):
+        self.file()
+        self.announce("D1")
+        judge = line(key="PLAT-7")
+        rep = self.manual("1 ok")
+        self.inbox(judge, rep)
+        r = self.tick()
+        self.assertEqual((r["judge"], self.status()), ([judge["id"]], "approved"))
+        self.assertEqual(self.cursor(), None)
+        confirm = self.doc()["confirm"]
+        self.tick()
+        self.assertEqual(self.doc()["confirm"], confirm)
+        self.assertEqual(len(self.fetched), 1)
+        self.assertEqual([l["id"] for l in chief.lines(self.ws)], [judge["id"]])  # the chief never sees the reply
+        hub.decide(self.ws, self.CFG, self.LATER, [{"line_id": judge["id"], "key": judge["key"], "decision": "log"}])
+        r = self.tick()
+        self.assertEqual([x["line_id"] for x in r["decided"]], [rep["id"]])
+
+    def test_triage_never_keeps_a_reply(self):
+        self.file()
+        self.announce("D1")
+        judge = line(key="PLAT-7")
+        rep = self.manual("1 ok")
+        self.inbox(judge, rep)
+        self.tick()
+        r = chief.triage_apply(self.ws, self.CFG, self.LATER, [])
+        self.assertEqual(r["kept"], [judge["id"]])
+
+    def test_paused_tick_applies_no_reply(self):
+        self.file()
+        self.announce("D1")
+        self.inbox(self.manual("1 ok"))
+        chief.pause(self.ws)
+        r = self.tick()
+        self.assertTrue(r["paused"])
+        self.assertIs(r["batch"], False)
+        self.assertEqual((self.fetched, self.status()), ([], "pending"))
+
+    # expiry --------------------------------------------------------------------------------------------------
+
+    def test_tick_expires_decision(self):
+        self.file()
+        at = AT + timedelta(hours=48)
+        self.tick(at=at)
+        self.assertEqual(self.status(), "expired")
+        self.assertEqual(self.doc()["confirm"], ["D1 expired unanswered."])
+        q = self.delivered()
+        self.assertEqual([(e["source"], e["text"]) for e in q],
+                         [("decision", "D1 expired unanswered. Don't make that call.")])
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
+
+    def test_tick_keeps_an_unexpired_decision(self):
+        self.file()
+        self.tick(at=AT + timedelta(hours=47))
+        self.assertEqual((self.status(), self.doc()["confirm"]), ("pending", []))
+
+    def test_expiry_of_a_gone_worker_queues_nothing(self):
+        self.file()
+        with hub.locked(self.ws):
+            doc = hub._sessions_doc(self.ws)
+            doc["sessions"]["PLAT-1"]["state"] = "dropped"
+            hub.save_json(self.ws, "sessions.json", doc)
+        self.tick(at=AT + timedelta(hours=48))
+        self.assertEqual((self.status(), self.delivered()), ("expired", []))
+
+    def test_answering_an_expired_decision_still_tells_the_worker(self):
+        self.file()
+        msg = decisions.answer(self.ws, self.CFG, AT + timedelta(hours=48), 1, "ok", "", {"via": "pane"})
+        self.assertEqual(msg, "D1 is already expired.")
+        self.assertEqual(self.doc()["confirm"], ["D1 expired unanswered."])
+        self.assertEqual(len(self.delivered()), 1)
+
+    # closing the loop ----------------------------------------------------------------------------------------
+
+    def test_tick_marks_sent_from_ledger(self):
+        self.file()
+        self.approve()
+        self.delivered()  # the worker took it
+        self.ledger("chief:D1")
+        self.tick()
+        self.assertEqual(self.status(), "sent")
+        self.assertEqual(self.doc()["confirm"], ["✓ D1 done: chat-reply on C00000001"])
+        self.assertEqual(self.delivered(), [])
+
+    def test_tick_flags_unused_grant(self):
+        self.file()
+        self.approve()
+        self.delivered()
+        self.ledger("chief:D9")
+        self.tick()
+        text = "D1 didn't go out: the call didn't match what you approved. It's back with the worker."
+        self.assertEqual(self.status(), "failed")
+        self.assertEqual(self.doc()["confirm"], [text])
+        self.assertEqual([(e["source"], e["text"]) for e in self.delivered()], [("decision", text)])
+        got, problem = decisions.grants.read(self.ws)
+        self.assertEqual((got["grants"], problem), ([], None))  # a closed decision keeps no live grant
+
+    def test_loop_waits_while_the_approval_is_still_queued(self):
+        self.file()
+        self.approve()
+        chief.update_worker(self.ws, "PLAT-1", held=True)  # nothing dispatches: the approval stays queued
+        self.tick()
+        self.assertEqual(self.status(), "approved")
+
+    def test_loop_waits_while_the_worker_runs(self):
+        self.file()
+        self.approve()
+        self.delivered()
+        f = chief._try_lock(chief._lock_path(self.ws, chief.run_name("PLAT-1")))
+        self.addCleanup(f.close)
+        self.tick()
+        self.assertEqual(self.status(), "approved")
+
+    def test_loop_leaves_it_open_when_the_ledger_cannot_be_read(self):
+        self.file()
+        self.approve()
+        self.delivered()
+        (self.ws / ".mother" / "ledger.json").write_text("{not json")
+        self.tick()
+        self.assertEqual((self.status(), self.doc()["confirm"]), ("approved", []))
+
+    def test_loop_failed_for_a_gone_worker_queues_nothing(self):
+        self.file()
+        self.approve()
+        self.delivered()
+        with hub.locked(self.ws):
+            doc = hub._sessions_doc(self.ws)
+            doc["sessions"]["PLAT-1"]["state"] = "dropped"
+            hub.save_json(self.ws, "sessions.json", doc)
+        self.tick()
+        self.assertEqual((self.status(), self.delivered()), ("failed", []))
+
+    # the batch -----------------------------------------------------------------------------------------------
+
+    def test_batch_none_when_nothing_to_say(self):
+        self.assertIsNone(decisions.batch(self.ws, self.CFG, AT))
+        self.assertIs(self.tick()["batch"], False)
+
+    def test_batch_due_after_batch_minutes(self):
+        decisions.sent(self.ws, AT, [], None)
+        self.file(at=AT + timedelta(minutes=1))
+        at = AT + timedelta(minutes=29, seconds=59)
+        self.assertIsNone(decisions.batch(self.ws, self.CFG, at))
+        self.assertIs(self.tick(at=at)["batch"], False)
+        at = AT + timedelta(minutes=30)
+        self.assertEqual(decisions.batch(self.ws, self.CFG, at)["ids"], ["D1"])
+        self.assertIs(self.tick(at=at)["batch"], True)
+        self.assertIsNone(decisions.batch(self.ws, dict(self.CFG, chief={"batch_minutes": 31}), at))
+
+    def test_batch_first_ever_is_due(self):
+        self.file()
+        self.assertEqual(decisions.batch(self.ws, self.CFG, AT)["ids"], ["D1"])
+
+    def test_batch_urgent_now(self):
+        decisions.sent(self.ws, AT, [], None)
+        self.file(urgent=True)
+        self.assertEqual(decisions.batch(self.ws, self.CFG, AT + timedelta(seconds=1))["ids"], ["D1"])
+
+    def test_batch_not_due_for_announced_decisions_alone(self):
+        self.file(urgent=True)
+        decisions.sent(self.ws, AT, ["D1"], None)
+        self.assertIsNone(decisions.batch(self.ws, self.CFG, AT + timedelta(hours=5)))
+
+    def test_batch_for_a_confirm_lists_every_open_decision(self):
+        """`ok all` reaches every announced decision, so every batch shows them all."""
+        self.file()
+        decisions.sent(self.ws, AT, ["D1"], None)
+        self.file(words="other", at=AT + timedelta(minutes=1))
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"].append("a line")
+            decisions.save(self.ws, doc)
+        got = decisions.batch(self.ws, self.CFG, AT + timedelta(minutes=2))
+        self.assertEqual(got["ids"], ["D1", "D2"])
+        self.assertTrue(got["text"].startswith("2 to decide"))
+
+    def test_batch_text_format(self):
+        ran = hub._iso(AT - timedelta(minutes=5))
+        chief.register_worker(self.ws, AT, "PLAT-2", "t")
+        chief.register_worker(self.ws, AT, "PLAT-3", "t")
+        chief.register_worker(self.ws, AT, "PLAT-4", "t")
+        chief.update_worker(self.ws, "PLAT-2", last_run_at=ran)
+        chief.update_worker(self.ws, "PLAT-3", last_run_at=ran, status="done")
+        chief.update_worker(self.ws, "PLAT-4", last_run_at=ran, status="failed")
+        self.file(why="they asked\nfor it " + "y" * 200, recommendation="send")
+        self.file(key="PLAT-2", words="b", recommendation="skip", why="<https://evil.test|click> & go")
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"] = ["✓ D5 done: chat-post on C00000001", "D6 expired unanswered."]
+            doc["batch"]["last_at"] = hub._iso(AT - timedelta(hours=1))
+            decisions.save(self.ws, doc)
+        got = decisions.batch(self.ws, self.CFG, AT)
+        self.assertEqual(got["ids"], ["D1", "D2"])
+        self.assertEqual(got["text"], "\n".join([
+            "2 to decide · 1 done without you",
+            "D1 · PLAT-1: they asked for it " + "y" * 82 + " · recommend: send",
+            "D2 · PLAT-2: &lt;https://evil.test|click&gt; &amp; go · recommend: skip",
+            "✓ D5 done: chat-post on C00000001",
+            "D6 expired unanswered.",
+            "Reply: 7 ok · 7 no · 7 edit: <text> · ok all",
+        ]))
+
+    def test_batch_why_and_recommendation_are_one_safe_line(self):
+        self.file(why="a\n\tb\u202e\x07 c", recommendation="send\nit\u2066")
+        self.assertIn("D1 · PLAT-1: a b c · recommend: send it\n",
+                      decisions.batch(self.ws, self.CFG, AT)["text"] + "\n")
+
+    def test_batch_confirm_only_has_no_footer(self):
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"] = ["✓ D5 done: chat-post on C00000001"]
+            decisions.save(self.ws, doc)
+        got = decisions.batch(self.ws, self.CFG, AT)
+        self.assertEqual(got, {"text": "0 to decide · 0 done without you\n✓ D5 done: chat-post on C00000001", "ids": []})
+
+    def test_batch_counts_only_runs_since_the_last_batch(self):
+        chief.update_worker(self.ws, "PLAT-1", last_run_at=hub._iso(AT - timedelta(hours=2)))
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"] = ["x"]
+            doc["batch"]["last_at"] = hub._iso(AT - timedelta(hours=1))
+            decisions.save(self.ws, doc)
+        self.assertTrue(decisions.batch(self.ws, self.CFG, AT)["text"].startswith("0 to decide · 0 done"))
+
+    def test_batch_silent_while_paused(self):
+        self.file()
+        chief.pause(self.ws)
+        self.assertIsNone(decisions.batch(self.ws, self.CFG, AT))
+
+    def test_sent_clears_confirm(self):
+        self.file()
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"] = ["a", "b"]
+            decisions.save(self.ws, doc)
+        decisions.sent(self.ws, self.LATER, ["D1"], self.TS)
+        doc = self.doc()
+        self.assertEqual(doc["confirm"], [])
+        self.assertEqual(doc["batch"]["last_at"], hub._iso(self.LATER))
+        self.assertEqual(doc["batch"]["announced"], {"D1": self.TS})
+
+    def test_sent_without_ts_stamps_now(self):
+        self.file()
+        decisions.sent(self.ws, self.LATER, ["D1"], None)
+        self.assertEqual(self.doc()["batch"]["announced"], {"D1": hub._iso(self.LATER)})
+
+    def test_sent_keeps_the_first_announce(self):
+        """A reply to the first batch must still be good after a second batch lists the same decision."""
+        self.file()
+        first = "%.6f" % (AT.timestamp() + 30)
+        decisions.sent(self.ws, AT, ["D1"], first)
+        decisions.sent(self.ws, self.LATER, ["D1"], self.TS)
+        self.assertEqual(self.doc()["batch"]["announced"], {"D1": first})
+
+    def test_sent_ignores_what_is_not_pending_and_prunes(self):
+        self.file()
+        self.file(words="b")
+        decisions.sent(self.ws, AT, ["D1", "D2", "D9"], self.TS)
+        decisions.answer(self.ws, self.CFG, AT, 1, "no", "", {"via": "pane"})
+        decisions.sent(self.ws, self.LATER, ["D1"], self.TS)
+        self.assertEqual(sorted(self.doc()["batch"]["announced"]), ["D2"])
+
+    def test_sent_refuses_a_bad_ts(self):
+        self.file()
+        with self.assertRaises(ValueError):
+            decisions.sent(self.ws, AT, ["D1"], "not-a-ts")
+        self.assertEqual(self.doc()["batch"], {"last_at": None, "announced": {}})
+
+    def cli(self, *args, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env or {}):
+            code = decisions.main(list(args), self.ws, self.CFG, out, err, at=self.LATER)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cli_batch_and_sent(self):
+        code, out, _ = self.cli("batch", "--json")
+        self.assertEqual((code, json.loads(out)), (0, None))
+        self.file()
+        code, out, _ = self.cli("batch", "--json")
+        doc = json.loads(out)
+        self.assertEqual((code, sorted(doc), doc["ids"]), (0, ["ids", "text"], ["D1"]))
+        code, out, _ = self.cli("batch")
+        self.assertEqual(out.strip(), doc["text"])
+        code, out, _ = self.cli("sent", "--ids", "D1", "--ts", self.TS)
+        self.assertEqual((code, json.loads(out)), (0, {"ok": True}))
+        self.assertEqual(self.doc()["batch"]["announced"], {"D1": self.TS})
+
+    def test_cli_sent_keeps_a_confirm_that_arrived_during_the_post(self):
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"] = ["shown"]
+            decisions.save(self.ws, doc)
+        self.cli("batch", "--json")
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"].append("came during the post")
+            decisions.save(self.ws, doc)
+        self.assertEqual(self.cli("sent", "--ids", "D0")[0], 0)
+        self.assertEqual(self.doc()["confirm"], ["came during the post"])
+        self.assertIs(self.doc()["batch"].get("offered"), None)
+
+    def test_cli_sent_usage(self):
+        for args in (("sent", "--ids", "D1", "--ts", "x"), ("sent", "--ids", "7"), ("batch", "--all"), ("sent", "x")):
+            self.assertEqual(self.cli(*args)[0], 2, args)
+
+    def test_cli_sent_with_no_ids_for_a_confirm_only_batch(self):
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"] = ["a"]
+            decisions.save(self.ws, doc)
+        self.assertEqual(self.cli("sent")[0], 0)
+        self.assertEqual(self.doc()["confirm"], [])
+
+    def test_cli_sent_with_an_empty_id_list(self):
+        """A batch of confirm lines only: records the time, clears them, announces nothing."""
+        self.file()
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["confirm"] = ["a"]
+            decisions.save(self.ws, doc)
+        code, out, _ = self.cli("sent", "--ids", "", "--ts", self.TS)
+        self.assertEqual((code, json.loads(out)), (0, {"ok": True}))
+        doc = self.doc()
+        self.assertEqual((doc["confirm"], doc["batch"]["announced"]), ([], {}))
+        self.assertEqual(doc["batch"]["last_at"], hub._iso(self.LATER))
+
+    def test_routine_names_commands_the_chief_may_run(self):
+        t = (Path(ROOT) / "routines" / "chief.md").read_text()
+        g = decisions.guard
+        for cmd in ("mother decide batch --json", "mother decide sent --ids D7,D8 --ts 1700000000.000100"):
+            self.assertIn(cmd, t)
+            self.assertTrue(g.chief_command(cmd), cmd)
+        self.assertIn("--ids D0", t)
+        self.assertIn("A wake never decides reply lines", t)
+        self.assertIn("Post `text` to the manager's own DM, verbatim", t)
+        self.assertTrue(g.chief_command("mother decide sent --ids D0 --ts 1700000000.000100"))
+
+    def test_a_worker_cannot_announce(self):
+        self.file()
+        for args in (("sent", "--ids", "D1"), ("batch", "--json")):
+            code, out, _ = self.cli(*args, env={"MOTHER_CHIEF_WORKER": "PLAT-1"})
+            self.assertEqual(code, 1, args)
+            self.assertFalse(json.loads(out)["ok"])
+        self.assertEqual(self.doc()["batch"]["announced"], {})
+
+    def test_tick_json_has_batch(self):
+        self.file()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            chief.main(["tick", "--json"], self.ws, self.CFG, AT)
+        self.assertIs(json.loads(out.getvalue())["batch"], True)
 
 
 class TestParse(unittest.TestCase):
@@ -726,7 +1267,7 @@ class TestTick(Base):
         chief.pause(self.ws)
         r = chief.tick(self.ws, {}, AT)
         self.assertEqual(r, {"paused": True, "decided": [], "wake": None, "judge": [], "dispatched": [],
-                             "reconciled": []})
+                             "reconciled": [], "batch": False})
         hb = json.loads((chief.chief_dir(self.ws) / "heartbeat.json").read_text())
         self.assertEqual(hb, {"at": hub._iso(AT), "pid": os.getpid()})
         self.assertFalse((chief.chief_dir(self.ws) / "wake.json").exists())

@@ -3,6 +3,8 @@
 
   propose <key> --tool T --recommend R [--why W] [--urgent] --stdin     stdin: the tool's input JSON
   answer <n> <ok|no|edit|say> --via pane|typed [-- <text>]              the Chief pane's answer (mod only)
+  batch [--json]                                                        the message due for the manager's DM, if any
+  sent [--ids D7,D8] [--ts TS]                                          that message went out (TS: its Slack ts)
 
 State is <workspace>/.mother/chief/decisions.json, changed only under `locked(ws)` (flock on decisions.lock) and
 written atomically. Python 3.9 stdlib only.
@@ -53,12 +55,15 @@ def locked(ws: Path):
 
 
 def _empty() -> dict:
-    return {"version": 1, "next": 1, "decisions": [], "batch": {"last_at": None, "announced": {}}, "confirm": []}
+    return {"version": 1, "next": 1, "decisions": [], "batch": {"last_at": None, "announced": {}}, "confirm": [],
+            "replied": {}}
 
 
 def load(ws: Path) -> dict:
     """decisions.json with every field present; a missing or unreadable file reads as empty. `batch.announced` maps a
-    decision id to the stamp of the batch that showed it to the manager; any other shape reads as no announcements."""
+    decision id to the stamp of the batch that showed it to the manager; any other shape reads as no announcements.
+    `batch.offered` is how many confirm lines the last `batch` command handed out. `replied` maps an inbox line that
+    looked like a reply to whether its re-read message was one, so a line behind the cursor is applied once."""
     doc = _empty()
     try:
         raw = json.loads(_path(ws).read_text())
@@ -75,8 +80,12 @@ def load(ws: Path) -> dict:
         doc["batch"]["last_at"] = b.get("last_at") if isinstance(b.get("last_at"), str) else None
         if isinstance(b.get("announced"), dict):
             doc["batch"]["announced"] = {k: v for k, v in b["announced"].items() if isinstance(v, str)}
+        if isinstance(b.get("offered"), int) and not isinstance(b["offered"], bool) and b["offered"] >= 0:
+            doc["batch"]["offered"] = b["offered"]
     if isinstance(raw.get("confirm"), list):
         doc["confirm"] = [x for x in raw["confirm"] if isinstance(x, str)]
+    if isinstance(raw.get("replied"), dict):
+        doc["replied"] = {k: v for k, v in raw["replied"].items() if isinstance(v, bool)}
     return doc
 
 
@@ -158,11 +167,55 @@ def edited_input(inp: dict, text: str) -> dict:
     raise ValueError("the call has no text field to edit")
 
 
+# what routes a call rather than what it says: `target` shows these, and an id in a text field would only be noise
+ROUTING_KEYS = {"channel", "channel_id", "channelId", "thread_ts", "threadTs", "ts", "to", "issueKey", "issueIdOrKey",
+                "issue_key", "issueId", "projectKey", "project_key", "project", "issueType", "issueTypeId",
+                "issuetype", "issue_type", "transitionId", "transition", "transition_id", "inputs"}
+
+
+def draft_fields(inp) -> List[Tuple[str, str]]:
+    """(field, what it says) for everything a call would send: every field but ROUTING_KEYS, at the top and under
+    `inputs`, in the input's order. A list or object (blocks) reads as JSON. Booleans and numbers are settings."""
+    out = []
+    for prefix, d in (("", inp), ("inputs.", inp.get("inputs") if isinstance(inp, dict) else None)):
+        for k, v in (d.items() if isinstance(d, dict) else ()):
+            if k in ROUTING_KEYS or v is None or v == "" or isinstance(v, (bool, int, float)):
+                continue
+            out.append((prefix + k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)))
+    return out
+
+
+def draft_text(inp) -> str:
+    """All the call would send, for the manager to read. One field is that field, byte for byte. Several are each
+    labelled, so nothing that would go out is hidden behind the first."""
+    fields = draft_fields(inp)
+    if len(fields) == 1:
+        return fields[0][1]
+    return "\n\n".join("%s: %s" % f for f in fields)
+
+
+def plain_target(d: dict) -> str:
+    """Where the call goes, as one safe line: the tracker issue, the channel, the grant's target, or the recipient."""
+    tool, inp = d.get("tool"), d.get("input")
+    if not isinstance(inp, dict) or not isinstance(tool, str):
+        return ""
+    nested = inp.get("inputs") if isinstance(inp.get("inputs"), dict) else {}
+    a = guard.classify_mcp(tool, inp) or {}
+    found = guard.first(inp, "issueKey", "issueIdOrKey", "issue_key", "issueId") \
+        or guard.first(nested, "issueKey", "issueIdOrKey", "issue_key", "issueId") \
+        or a.get("channel") or d.get("target") or guard.first(inp, "to") or guard.first(nested, "to") or ""
+    return chief.safe_line(", ".join(map(str, found)) if isinstance(found, list) else found, 200)
+
+
 def signed_edit(d: dict, cfg: dict, text: str) -> dict:
     """`d`'s input with the manager's `text`, still carrying the signature the guard wants, or the grant could never
     match. Their words stay as typed; the signature the draft carried goes on a line after them when they left it
     out. ValueError when that isn't possible."""
     tool, inp = d["tool"], edited_input(d["input"], text)
+    fields = [f for f, _ in draft_fields(d["input"])]
+    if len(fields) > 1:  # new text in one would send the others unread: the manager can say what to change instead
+        raise ValueError("this call sends %s, and an edit can only replace one. Tell the worker what to change: "
+                         "%s <your words>" % (" and ".join(fields), str(d.get("id"))[1:]))
     kind = kind_of(tool, inp)[0]
     if _signed(kind, tool, inp, cfg):
         return inp
@@ -254,7 +307,7 @@ def parse_reply(text: str, open_ids: Set[int]) -> Optional[List[Tuple[int, str, 
 GRANT_HOURS = 2
 VERBS = ("ok", "no", "edit", "say")
 VIAS = ("pane", "typed")  # a Slack reply goes through answer_reply, which reads what the manager wrote
-UNREADABLE = "I couldn't read that reply, so nothing changed. Answer like: 7 ok, 8 no, 9 edit: new text."
+UNREADABLE = "I couldn't read that reply, so nothing was applied. Use: 7 ok · 7 no · 7 edit: <text> · ok all"
 UNCONFIRMED = "I couldn't confirm that reply came from you (%s)."
 _SLACK_LINK = re.compile(r"<(https?:[^|>\s]*)(?:\|([^>]*))?>")
 
@@ -434,9 +487,7 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
         if d.get("status") == "pending":
             exp = guard.parse_time(d.get("expires"))
             if exp is not None and at.timestamp() >= exp:
-                _set_grant(ws, did, None)  # a grant never outlives its decision, so a read problem here is harmless
-                d["status"] = "expired"
-                save(ws, doc)
+                _expire(ws, doc, d, at)
         if d.get("status") != "pending":
             return False, "%s is already %s." % (did, d.get("status"))
         if chief.paused(ws):
@@ -497,6 +548,178 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
         return True, result
 
 
+def _expire(ws: Path, doc: dict, d: dict, at: datetime) -> None:
+    """A pending decision ran out of time. The caller holds `locked(ws)`."""
+    did, key = d.get("id"), d.get("key")
+    _set_grant(ws, did, None)  # a grant never outlives its decision, so a read problem here is harmless
+    d["status"] = "expired"
+    doc["confirm"].append("%s expired unanswered." % did)
+    save(ws, doc)
+    if key in chief.workers(ws):
+        chief.enqueue(ws, at, key, "%s expired unanswered. Don't make that call." % did, "decision")
+        _resume(ws, key)
+
+
+def settle(ws: Path, at: datetime) -> None:
+    """The tick's pass over the queue: expire what ran out of time, and close each approved decision whose worker
+    run has ended. A run has ended when the worker is gone, or its run lock is free, it isn't marked working and its
+    approval has left the queue. The guard's ledger then says whether the grant was used; a ledger that can't be read
+    says nothing, so those decisions stay approved until it can."""
+    ws = Path(ws)
+    with locked(ws):
+        doc = load(ws)
+        for d in doc["decisions"]:
+            exp = guard.parse_time(d.get("expires"))
+            if d.get("status") == "pending" and exp is not None and at.timestamp() >= exp:
+                _expire(ws, doc, d, at)
+        approved = [d for d in doc["decisions"] if d.get("status") == "approved"]
+        if not approved:
+            return
+        with guard.Ledger(str(ws)) as led:
+            book = led.read()
+        if book is None:
+            return
+        used = {r.get("run") for r in book["uses"] if isinstance(r, dict)}
+        live, busy, queue = chief.workers(ws), set(chief.running(ws)), chief._read_queue(ws)
+        for d in approved:
+            did, key = d.get("id"), d.get("key")
+            w = live.get(key)
+            waiting = any(e.get("key") == key and e.get("source") == "decision"
+                          and str(e.get("text")).startswith("%s approved by" % did) for e in queue)
+            if w is not None and (key in busy or w.get("status") == "working" or waiting):
+                continue
+            if "chief:%s" % did in used:
+                d["status"] = "sent"
+                doc["confirm"].append("✓ %s done: %s on %s" % (did, d.get("kind"), d.get("target")))
+                save(ws, doc)
+                continue
+            _set_grant(ws, did, None)
+            text = "%s didn't go out: the call didn't match what you approved. It's back with the worker." % did
+            d["status"] = "failed"
+            doc["confirm"].append(text)
+            save(ws, doc)
+            if w is not None:
+                chief.enqueue(ws, at, key, text, "decision")
+
+
+# ---- the tick's replies: a manager's note in the self-DM that answers the queue --------------------------------
+
+REPLIED_KEEP = 200
+
+
+def is_reply_line(l: dict) -> bool:
+    """A self-DM note whose summary starts like a reply. Only a `chat` line can be re-read from Slack: a `manual`
+    source line came from a CLI verb any session can run. This only pre-filters: `answer_reply` reads the message."""
+    return l.get("kind") == "manual" and l.get("source") == "chat" and parse_reply(l.get("summary"), set()) is not None
+
+
+def held_replies(ws: Path, lines: List[dict]) -> Set[str]:
+    """The lines that are the tick's, not the chief's: replies, and any not yet read that may be one."""
+    seen = load(ws)["replied"]
+    return {l["id"] for l in lines if is_reply_line(l) and seen.get(l["id"]) is not False}
+
+
+def apply_replies(ws: Path, cfg: dict, at: datetime, lines: List[dict]) -> Set[str]:
+    """Apply every reply among `lines`, each once, even one the cursor can't reach yet. Result lines go to `confirm`.
+    Returns the ids of the lines that are replies; a line whose re-read message isn't one keeps its normal path."""
+    ws = Path(ws)
+    channel = next((x for x in sorted(guard.dm_ids(cfg), key=str) if str(x).startswith("D")), None)
+    out = set()
+    for l in lines:
+        if not is_reply_line(l):
+            continue
+        lid = l["id"]
+        known = load(ws)["replied"].get(lid)
+        if known is None:
+            got = answer_reply(ws, cfg, at, channel, lid.rsplit(":", 1)[-1])
+            known = got is not None
+            with locked(ws):
+                doc = load(ws)
+                doc["replied"][lid] = known
+                doc["replied"] = dict(list(doc["replied"].items())[-REPLIED_KEEP:])
+                if known:
+                    doc["confirm"].extend(got or [UNREADABLE])
+                save(ws, doc)
+        if known:
+            out.add(lid)
+    return out
+
+
+# ---- the batch: what the manager's DM hears from the queue ------------------------------------------------------
+
+WHY_MAX = 100
+_SLACK_TS = re.compile(r"^\d+(?:\.\d+)?$")
+
+
+def _shown(text, cap: int) -> str:
+    """Worker-written text as one line of a Slack message: capped, and it can't draw a link or a mention."""
+    return chief.safe_line(text, cap).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _done_without_you(ws: Path, doc: dict, last: Optional[datetime]) -> int:
+    """Workers that ran since the last batch and rest done or idle, with no decision open or filed since then."""
+    n = 0
+    for key, w in chief.workers(ws).items():
+        ran = hub._parse_at(w.get("last_run_at"))
+        if ran is None or (last is not None and ran <= last) or w.get("status") not in ("done", "idle"):
+            continue
+        filed = [d for d in doc["decisions"] if d.get("key") == key]
+        if any(d.get("status") in ("pending", "approved") or last is None
+               or (hub._parse_at(d.get("created")) or last) > last for d in filed):
+            continue
+        n += 1
+    return n
+
+
+def batch(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
+    """{"text", "ids"} when a message is due for the manager's DM, else None. Due: an unannounced pending decision
+    once batch_minutes have passed since the last batch, or at once when one is urgent; or any confirm line. It lists
+    every pending decision, already announced or not: `ok all` reaches them all, so the manager sees them all."""
+    ws = Path(ws)
+    if chief.paused(ws):
+        return None
+    doc = load(ws)
+    open_ = [d for d in doc["decisions"] if d.get("status") == "pending"]
+    fresh = [d for d in open_ if d.get("id") not in doc["batch"]["announced"]]
+    last = hub._parse_at(doc["batch"]["last_at"])
+    wait = chief.settings(cfg)["batch_minutes"] * 60
+    due = bool(fresh) and (last is None or (at - last).total_seconds() >= wait or any(d.get("urgent") for d in fresh))
+    if not due and not doc["confirm"]:
+        return None
+    rows = ["%d to decide · %d done without you" % (len(open_), _done_without_you(ws, doc, last))]
+    for d in open_:
+        rows.append("%s · %s: %s · recommend: %s" % (d.get("id"), _shown(d.get("key"), WHY_MAX),
+                                                     _shown(d.get("why"), WHY_MAX),
+                                                     _shown(d.get("recommendation"), WHY_MAX)))
+    rows.extend(doc["confirm"])
+    if open_:
+        rows.append("Reply: 7 ok · 7 no · 7 edit: <text> · ok all")
+    return {"text": "\n".join(rows), "ids": [d.get("id") for d in open_]}
+
+
+def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None) -> None:
+    """The batch was posted. `ids` count as announced at `ts`, the post's own Slack ts (now when none is given). A
+    decision keeps its first stamp, so a reply to an earlier batch stays good. Clears the confirm lines the last
+    `batch` command handed out, or all of them; a line that arrived while the post was going out stays. ValueError on
+    a `ts` that isn't a Slack ts: nothing is written."""
+    if ts is not None and not _SLACK_TS.match(str(ts)):
+        raise ValueError("--ts must be the post's Slack ts")
+    ws = Path(ws)
+    with locked(ws):
+        doc = load(ws)
+        open_ = {d.get("id") for d in doc["decisions"] if d.get("status") == "pending"}
+        b = doc["batch"]
+        announced = {k: v for k, v in b["announced"].items() if k in open_}
+        for i in ids:
+            if i in open_:
+                announced.setdefault(i, str(ts) if ts is not None else hub._iso(at))
+        b["announced"] = announced
+        b["last_at"] = hub._iso(at)
+        offered = b.pop("offered", None)
+        doc["confirm"] = doc["confirm"][offered:] if offered is not None else []
+        save(ws, doc)
+
+
 def _resume(ws: Path, key: str) -> None:
     """The worker leaves waiting_decision unless another decision of its is still open; normal dispatch picks up what
     was queued."""
@@ -533,6 +756,8 @@ def main(args, ws, cfg, out=sys.stdout, err=sys.stderr, at: Optional[datetime] =
         return 0
     if verb == "answer":
         return _main_answer(rest, ws, cfg, out, err, at)
+    if verb in ("batch", "sent"):
+        return _main_batch(verb, rest, ws, cfg, out, err, at)
     if verb != "propose":
         print("usage:\n" + USAGE, file=err)
         return 2
@@ -559,6 +784,47 @@ def main(args, ws, cfg, out=sys.stdout, err=sys.stderr, at: Optional[datetime] =
         print("mother decide: %s" % e, file=err)
         return 1
     print(json.dumps({"ok": True, "decision": d}), file=out)
+    return 0
+
+
+def _main_batch(verb, rest, ws, cfg, out, err, at) -> int:
+    """mother decide batch [--json] | sent [--ids D7,D8] [--ts TS]. Refused in a worker's process: announcing is what
+    lets a reply reach a decision, so a worker must not be able to mark its own draft as seen."""
+    if os.environ.get(guard.CHIEF_WORKER_ENV, "").strip():
+        print(json.dumps({"ok": False, "message": "A chief worker can't announce decisions."}), file=out)
+        return 1
+    at = at or datetime.now(timezone.utc)
+    ws = Path(ws)
+    try:
+        pos, o = _opts(rest, ("ids", "ts") if verb == "sent" else (), ("json",) if verb == "batch" else ())
+    except ValueError as e:
+        print("mother decide: %s" % e, file=err)
+        return 2
+    if pos:
+        print("usage:\n" + USAGE, file=err)
+        return 2
+    if verb == "batch":
+        with locked(ws):
+            got = batch(ws, cfg or {}, at)
+            if got is not None:
+                doc = load(ws)
+                doc["batch"]["offered"] = len(doc["confirm"])
+                save(ws, doc)
+        if o.get("json"):
+            print(json.dumps(got, ensure_ascii=False), file=out)
+        elif got is not None:
+            print(got["text"], file=out)
+        return 0
+    raw = o.get("ids", "")
+    if raw and not re.match(r"^D\d+(?:,D\d+)*$", raw):
+        print("mother decide: --ids takes D7,D8, or nothing for a batch of confirm lines only", file=err)
+        return 2
+    try:
+        sent(ws, at, raw.split(",") if raw else [], o.get("ts"))
+    except ValueError as e:
+        print("mother decide: %s" % e, file=err)
+        return 2
+    print(json.dumps({"ok": True}), file=out)
     return 0
 
 
