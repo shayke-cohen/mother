@@ -3988,20 +3988,31 @@ def answers_last_hour(book, target, now):
     return n
 
 
+def signature_marks(cfg):
+    """The text MOTHER signs with: the agent's name with `(AI)`, and any configured signature."""
+    agent = cfg.get("agent") or {}
+    marks = ["%s (AI)" % agent["name"]] if agent.get("name") else []
+    if isinstance(agent.get("signature"), str) and agent["signature"].strip():
+        marks.append(agent["signature"].strip())
+    return marks
+
+
+def carries_signature(a, cfg):
+    """Unattended writes must carry the disclosure signature, and so must their blocks, which are what the reader
+    actually sees."""
+    marks = signature_marks(cfg)
+    if not any(m in (a.get("text") or "") for m in marks):
+        return False
+    return not a.get("blocks") or any(m in a["blocks"] for m in marks)
+
+
 def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
     scope, target, n = sc
     scopes, max_age = grant_limits(ctx.cfg)
     if scope not in scopes or not target or target not in allowed_targets(scope, ctx.cfg):
         return None
-    if scope in ("chat-post", "chat-reply", "tracker-comment", "answer"):
-        agent = ctx.cfg.get("agent") or {}
-        marks = ["%s (AI)" % agent["name"]] if agent.get("name") else []
-        if isinstance(agent.get("signature"), str) and agent["signature"].strip():
-            marks.append(agent["signature"].strip())
-        if not any(m in (a.get("text") or "") for m in marks):
-            return None  # unattended writes must carry the disclosure signature
-        if a.get("blocks") and not any(m in a["blocks"] for m in marks):
-            return None  # and so must the blocks, which are what the reader actually sees
+    if scope in ("chat-post", "chat-reply", "tracker-comment", "answer") and not carries_signature(a, ctx.cfg):
+        return None
     data, ok = read_json(os.path.join(ctx.ws, ".mother", "grants.json"))
     if not ok or not isinstance(data, dict) or not isinstance(data.get("grants"), list):
         return None
@@ -4854,11 +4865,12 @@ def plugin_mother_args(cmd, heredoc=False):
 
 
 def chief_decide_args(args):
-    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8 [--ts TS]`."""
+    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8|'' [--ts TS]`."""
     verb, rest = (args[0], args[1:]) if args else ("", [])
     if verb == "batch":
         return rest in ([], ["--json"])
-    if verb != "sent" or len(rest) not in (2, 4) or rest[0] != "--ids" or not re.fullmatch(r"D\d+(?:,D\d+)*", rest[1]):
+    if verb != "sent" or len(rest) not in (2, 4) or rest[0] != "--ids" or \
+            not re.fullmatch(r"(?:D\d+(?:,D\d+)*)?", rest[1]):
         return False
     return len(rest) == 2 or (rest[2] == "--ts" and bool(re.fullmatch(r"\d+(?:\.\d+)?", rest[3])))
 

@@ -6,7 +6,7 @@ config: chief                     # max_workers, run_minutes, daily_budget_usd, 
 default: {}
 needs: []
 writes: [.mother/hub.json, .mother/chief/]
-sends: nothing in Phase 1
+sends: the decision batch to the manager's own DM, and only when a wake says the mod couldn't post it
 sync: false
 ---
 
@@ -27,6 +27,8 @@ your PATH): no absolute path, no `python3`, no pipe, no `&&`, no redirect, no `$
 - `mother chief status --json`
 - `mother chief run <key> --detach '--title=<title>' '--prompt=<prompt>'`
 - `mother chief say <key> -- '<text>'`
+- `mother decide batch --json`
+- `mother decide sent --ids D7,D8 --ts 1700000000.000100`
 
 A valued flag is one token, `--flag=value`. Single-quote any value that has spaces or punctuation, with the
 quotes around the whole token, and leave apostrophes and `$` out of it. A separate `--title T` asks a question
@@ -69,13 +71,30 @@ that id and retry the rest.
    If `run` exits 3 (paused or over budget: the prompt is queued for later) or 2, record the line as `now` instead.
 4. Record every line in one `mother hub decide` call, after any `run`.
 
+## Decisions
+
+Workers file what needs the manager's yes as decisions, and the manager answers in the self-DM or the Chief pane.
+`mother chief tick` applies those replies as plain code. A wake never decides reply lines: they aren't in
+`mother chief lines --json`, and you never answer a decision yourself.
+
+If a wake says a batch is due and the mod couldn't post it:
+
+1. Run `mother decide batch --json`. It prints `{"text", "ids"}`, or `null` when nothing is due: then stop.
+2. Post `text` to the manager's own DM, verbatim.
+3. Run `mother decide sent --ids <ids, comma-separated> --ts <the post's ts>`. When `ids` is empty, use `--ids ''`.
+   Without this the next wake posts it again.
+
+If a wake says the batch record is failing, the batch is already posted, and the wake gives its ids and ts. Run
+`mother decide sent --ids <ids> --ts <ts>` with those, once. If that fails too, post one line to the manager's own
+DM saying batch confirmations are failing. Never re-post the batch.
+
 ## Rules
 
 - Never run `claude` yourself, and never resume a worker directly: its session has one writer. Use
   `mother chief say <key> -- <text>` to give a worker more to do; it starts a turn when the worker is idle and
   queues otherwise.
-- Phase 1: do not send anything to anyone. A worker that needs a send reports it in its progress line, and the
-  line becomes a `now` for the manager.
+- Do not send anything to anyone but the batch above. A worker that needs a send files a decision, and the manager
+  answers it.
 - A held worker belongs to the manager. `say` still queues; do not try to start it.
 - Keep your turn short, and end it when every line is decided. Do not wait for workers.
 - When the chief is paused, `mother chief tick` only writes the heartbeat and `run` refuses, so a wake you still see

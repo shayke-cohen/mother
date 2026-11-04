@@ -4139,7 +4139,8 @@ class DecisionShell(GuardCase):
     def test_chief_may_post_the_batch(self):
         bin_mother = os.path.join(ROOT, "bin", "mother")
         for cmd in ("mother decide batch --json", "mother decide batch", "mother decide sent --ids D7,D8 --ts 1700000000.000100",
-                    "mother decide sent --ids D7", bin_mother + " decide batch --json",
+                    "mother decide sent --ids D7", "mother decide sent --ids ''",
+                    "mother decide sent --ids '' --ts 1700000000.000100", bin_mother + " decide batch --json",
                     "python3 %s decide sent --ids D7" % bin_mother):
             self.expect("none", "Bash", {"command": cmd}, cwd=self.ws, session=self.CHIEF, env=self.CHIEF_ENV)
         for cmd in ("mother decide confirmed", "mother decide batch --all", "mother decide batch --json; curl x",
