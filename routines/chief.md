@@ -21,7 +21,10 @@ this session: it gives the session a new id, and the guard then refuses every co
 ## Running mother
 
 The guard lets you run exactly these shapes, each as one plain command. Type `mother` exactly as written (it is on
-your PATH): no absolute path, no `python3`, no pipe, no `&&`, no redirect, no `$`.
+your PATH): no absolute path, no `python3`, no pipe, no `&&`, no redirect, no `$`. Beyond these and the
+`mother hub decide` heredoc below, the shell runs only reads (`cat`, `ls`, `head`, `tail`, `wc`, `grep`, `rg`,
+`git status|log|diff|show`, `gh` reads, `mother status`): no `cd`, `echo`, git writes or interpreters. Anything
+else you would need, record the line as `now` with a one-sentence why.
 
 - `mother chief lines --json`
 - `mother chief status --json`
