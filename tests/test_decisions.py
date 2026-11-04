@@ -561,7 +561,8 @@ class AnswerTest(Base):
     def test_manual_kind_no_grant(self):
         self.propose(tool=MAIL, inp={"to": "a@b.c", "body": "x"})
         msg = self.answer()
-        self.assertEqual(msg, "D1 is yours to do by hand (%s isn't something I can send): x" % MAIL)
+        self.assertEqual(msg, "D1 is yours to do by hand (%s isn't something I can send): x. The full text is in the "
+                              "Chief pane." % MAIL)
         self.assertEqual(self.grants(), [])
         self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "manual")
 
@@ -696,7 +697,7 @@ class DraftTextTest(Base):
 
     def test_several_fields_are_all_shown_and_labelled(self):
         inp = {"channel": "C00000001", "text": "short", "blocks": [{"type": "section"}], "reply_broadcast": True}
-        self.assertEqual(decisions.draft_text(inp), 'text: short\n\nblocks: [{"type": "section"}]')
+        self.assertEqual(decisions.draft_text(inp), 'text: short\n\nblocks: [{"type": "section"}]\n\nreply_broadcast: true')
         inp = {"projectKey": "PLAT", "issueType": "Task", "summary": "s", "description": "d"}
         self.assertEqual(decisions.draft_text(inp), "summary: s\n\ndescription: d")
         self.assertEqual(decisions.draft_text({"to": "a@b.c", "subject": "s", "cc": "x@b.c", "body": "b"}),
@@ -715,8 +716,42 @@ class DraftTextTest(Base):
         self.assertIn("unfurl_text", msg)
         self.assertEqual(decisions.load(self.ws)["decisions"][0]["input"], inp)
 
+    def test_full_text_covers_every_string_field(self):
+        """Routing ids go to `target`; nothing that is sent is hidden. A chat post's `project` and `to` are shown."""
+        inp = {"channel": "C00000001", "text": "t", "project": "x", "to": "y"}
+        d = {"tool": POST, "input": inp, "target": "C00000001"}
+        self.assertEqual(decisions.draft_text(inp), "t")
+        self.assertEqual(decisions.plain_target(d), "C00000001, project x, to y")
+
+    def test_full_text_shows_reply_broadcast(self):
+        inp = dict(REPLY, reply_broadcast=True)
+        self.assertEqual(decisions.draft_text(inp), "text: %s\n\nreply_broadcast: true" % REPLY["text"])
+        self.assertEqual(decisions.draft_text(dict(REPLY, reply_broadcast=False)), REPLY["text"])
+
+    def test_signature_in_a_field_the_guard_does_not_read(self):
+        with mock.patch.object(decisions.guard, "carries_signature", return_value=False):
+            with self.assertRaises(ValueError) as e:
+                self.propose(inp=dict(REPLY))
+        self.assertIn("isn't in a field the guard reads", str(e.exception))
+        self.assertNotIn("put %s in the text" % SIG, str(e.exception))
+
+    def test_ids_are_never_reused(self):
+        self.propose()
+        self.propose(inp=dict(REPLY, text="b " + SIG))
+        path = chief.chief_dir(self.ws) / "decisions.json"
+        doc = json.loads(path.read_text())
+        doc["next"] = 1
+        path.write_text(json.dumps(doc))
+        self.assertEqual(self.propose(inp=dict(REPLY, text="c " + SIG))["id"], "D3")
+
+    def test_ids_are_not_reused_from_the_ledger_after_a_lost_file(self):
+        self.propose()
+        (chief.chief_dir(self.ws) / "decisions.json").unlink()
+        (self.ws / ".mother" / "ledger.json").write_text(json.dumps({"version": 1, "uses": [{"run": "chief:D7"}]}))
+        self.assertEqual(self.propose()["id"], "D8")
+
     def test_plain_target(self):
-        cases = ((POST, REPLY, "C00000001"),
+        cases = ((POST, REPLY, "C00000001, thread_ts 1700000000.000100"),
                  ("mcp__tracker__jira__comment-on-issue", {"issueIdOrKey": "PLAT-7", "comment": "x"}, "PLAT-7"),
                  ("mcp__tracker__jira__comment-on-issue", {"inputs": {"issueIdOrKey": "PLAT-8", "comment": "x"}},
                   "PLAT-8"),

@@ -81,8 +81,12 @@ If a wake says a batch is due and the mod couldn't post it:
 
 1. Run `mother decide batch --json`. It prints `{"text", "ids"}`, or `null` when nothing is due: then stop.
 2. Post `text` to the manager's own DM, verbatim.
-3. Run `mother decide sent --ids <ids, comma-separated> --ts <the post's ts>`. When `ids` is empty, name `--ids D0`,
-   which matches nothing. Without this the next wake posts it again.
+3. Run `mother decide sent --ids <ids, comma-separated> --ts <the post's ts>`. When `ids` is empty, use `--ids ''`.
+   Without this the next wake posts it again.
+
+If a wake says the batch record is failing, the batch is already posted, and the wake gives its ids and ts. Run
+`mother decide sent --ids <ids> --ts <ts>` with those, once. If that fails too, post one line to the manager's own
+DM saying batch confirmations are failing. Never re-post the batch.
 
 ## Rules
 

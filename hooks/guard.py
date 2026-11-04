@@ -4850,11 +4850,12 @@ def plugin_mother_args(cmd, heredoc=False):
 
 
 def chief_decide_args(args):
-    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8 [--ts TS]`."""
+    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8|'' [--ts TS]`."""
     verb, rest = (args[0], args[1:]) if args else ("", [])
     if verb == "batch":
         return rest in ([], ["--json"])
-    if verb != "sent" or len(rest) not in (2, 4) or rest[0] != "--ids" or not re.fullmatch(r"D\d+(?:,D\d+)*", rest[1]):
+    if verb != "sent" or len(rest) not in (2, 4) or rest[0] != "--ids" or \
+            not re.fullmatch(r"(?:D\d+(?:,D\d+)*)?", rest[1]):
         return False
     return len(rest) == 2 or (rest[2] == "--ts" and bool(re.fullmatch(r"\d+(?:\.\d+)?", rest[3])))
 
