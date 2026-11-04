@@ -85,8 +85,9 @@ If a wake says a batch is due and the mod couldn't post it:
    Without this the next wake posts it again.
 
 If a wake says the batch record is failing, the batch is already posted, and the wake gives its ids and ts. Run
-`mother decide sent --ids <ids> --ts <ts>` with those, once. If that fails too, post one line to the manager's own
-DM saying batch confirmations are failing. Never re-post the batch.
+`mother decide sent --ids <ids> --ts <ts>` with those, once. Exit 2 means it's already recorded or no batch is waiting:
+stop there. Any other failure: post one line to the manager's own DM saying batch confirmations are failing.
+Never re-post the batch.
 
 ## Rules
 

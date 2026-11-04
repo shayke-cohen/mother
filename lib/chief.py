@@ -1487,6 +1487,7 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "desktop": desktop_status(ws, default_app_dir()),
         "decisions": open_,
         "to_decide": len(open_),
+        "reply_problem": decisions.reply_channel(ws, cfg or {})[1] if open_ else None,
     }
 
 

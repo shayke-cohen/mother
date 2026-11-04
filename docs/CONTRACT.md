@@ -1334,7 +1334,7 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   last_activity_at, last_report, open_link}]}`; a worker row also carries `unseen` (0 when absent). Workers: running first, then newest run. `desktop` is the snapshot
   rows still live in the app (`last_report` is the first 200 characters of the last turn report); an older CLI omits
   it. `spent` reads 0 when `spend.json` is unreadable; `unreadable` is then true, and `over` (spent at the limit, or
-  unreadable) says no run starts; the pane shows both. `resume` is `""` for an entry with no session id. A worker's `status` can also be `waiting_decision`. Phase 2 adds `to_decide` (the pending count) and `decisions: [{id, key, kind, target, recommendation, why, text, full_text, edit_refusal, edit_text, urgent, status, created, expires}]`, oldest first. `target` is one line and can be composite. `edit_refusal` says why Edit can't take this call, else null; `edit_text` is the one field an edit replaces (Edit's prefill), else null.
+  unreadable) says no run starts; the pane shows both. `resume` is `""` for an entry with no session id. A worker's `status` can also be `waiting_decision`. Phase 2 adds `to_decide` (the pending count) and `decisions: [{id, key, kind, target, recommendation, why, text, full_text, edit_refusal, edit_text, urgent, status, created, expires}]`, oldest first. `target` is one line and can be composite. `edit_refusal` says why Edit can't take this call, else null; `edit_text` is the one field an edit replaces (Edit's prefill), else null. `reply_problem`, while decisions are open, says what stops self-DM replies from working, else null: an inbox line names no channel, so replies are re-read in `follow.inbox` from watch.json, which must be the D id in `manager.chat_dm`, where the batch goes. If it isn't, or is unset, every reply fails closed or never arrives, and the pane says so.
 - **TL;DR, chips and Open on the Chief pane.** `mother chief tail --json` prints `{version: 1, model, sessions:
   [{id, kind, key?, fingerprint, text, cached?}]}`: one row per worker (`id` its session id, `kind: "worker"`, `key`)
   and pinned session (`id` its CLI id, `kind: "pinned"`) with something to summarise. `text` is the transcript's last
@@ -1425,13 +1425,14 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     link or a mention. Replies typed in the batch's thread are ignored.
   - **`sent`.** `mother decide sent --ids D7,D8|'' --ts <the post's ts>` records the batch time, stamps each id as
     announced at that ts (a decision keeps its first stamp) and clears the confirmation lines the batch offered; a line
-    that arrived during the post stays. The ids must be ones the last `batch` offered, and each offer is used once:
-    otherwise it exits 2 and writes nothing, as it does for a bad `--ids` or `--ts`. So the order is `batch`, post,
-    `sent`. A batch of confirmation lines alone uses `--ids ''`.
+    that arrived during the post stays. It needs a live offer from `batch`, each offer is used once, and the ids must
+    be ones that offer named: otherwise it exits 2 and writes nothing, `--ids ''` and a repeat of a successful `sent`
+    included, as it does for a bad `--ids` or `--ts`. So the order is `batch`, post, `sent`. A batch of confirmation
+    lines alone uses `--ids ''`. The stamp is never earlier than the offer.
   - **The post.** The chief's mod posts the batch with `$.mcp.call`, which is not a tool call, so the guard doesn't see
     it. The mod does the guard's checks itself: nothing goes out under `MOTHER_DRY_RUN` or either PAUSED file, only the
     manager's `D…` channel is posted to, and `mother chief post-log --stdin` writes each attempt and its outcome to
-    `guard.log` as `decision: "mod post: attempt|posted|unsure|failed"`, with target and reason, never the text. A
+    `guard.log` as `decision: "mod post: attempt|posted|unsure|failed|record dropped"`, with target and reason, never the text. A
     post that may have landed (a timeout, no readable ts) is never re-posted before `batch_minutes`, and gets one wake
     line per batch. One that surely failed backs off 2, 4, 8 … minutes up to `batch_minutes`, with one wake line at the
     cap, or on its first failure if the batch holds an urgent decision. A new urgent decision ends a hold, at most 3
@@ -1440,9 +1441,10 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     posts the text and runs `sent` (`routines/chief.md`).
   - **A `sent` that fails.** No new batch goes out while one is owed. After 3 failures in a row the chief gets one wake
     line, "The batch record is failing", with the ids and ts to run `sent` with once, and the mod retries once per
-    `batch_minutes`. If `sent` exits 2 the mod drops the debt, because it can never succeed (the offer was used, by a
-    `sent` whose answer got lost or by the chief's, or a later batch replaced it). What it didn't stamp is listed in
-    the next batch, so a second DM is possible there.
+    `batch_minutes`. If `sent` exits 2 the mod drops the debt without counting a failure, because it can never succeed
+    (already recorded, by a `sent` whose answer got lost or by the chief's, or a later batch replaced the offer), and
+    logs `mod post: record dropped`. Nothing is re-posted for `batch_minutes`; after that, what wasn't stamped is listed
+    in the next batch, so a second DM is possible there.
   - **To decide cards.** The Chief pane shows pending decisions with Approve, Edit and Reject. A card shows the first 400
     characters and says so when a draft is cut; `full_text` in the status carries the rest, every field labelled when
     there are several. A call `edit` can't take has no Edit button, and its card shows `edit_refusal` from the status.

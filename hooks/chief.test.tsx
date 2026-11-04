@@ -1981,6 +1981,7 @@ test('test_real_status_draws_the_cards', async ($, on) => {
     const ui = await $.ui.mount({ ...PANE, surface })
     const all = await texts(ui)
     expect(all).toContain('To decide 3')
+    expect(all.some((t: string) => /^DM replies won't work/.test(t))).toBe(false)
     expect(all).toContain('chat-reply → C00000001, thread_ts 1700000000.000100')   // a composite target, whole
     expect(all).toContain('tracker-create → PLAT, issueType Bug')
     expect(all).toContain('summary: s\n\ndescription: d')                           // every field that would go out
@@ -2072,14 +2073,39 @@ test('test_real_null_from_a_due_tick_is_nothing_to_post', async ($, on) => {
   expect(out.submits).toEqual([])
 })
 
+const hasNoError = async ($: any) => {
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const bad = await hasText(ui, /recording it failed|couldn't post/)
+  await ui.unmount()
+  return !bad
+}
+
+test('test_no_reply_problem_no_line', async ($, on) => {
+  await bootCards($, on, () => [decision()])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /^DM replies won't work/)).toBe(false)
+  await ui.unmount()
+})
+
+test('test_reply_problem_is_drawn', async ($, on) => {
+  await boot($, on, 'console', argv => (argv[0] === 'status' ? withDecisions([decision()], { reply_problem: 'the watcher has no self-DM inbox' }) : undefined))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /^DM replies won't work: the watcher has no self-DM inbox$/)).toBe(true)
+  await ui.unmount()
+})
+
 // A `sent` whose answer got lost, or one the chief ran: the offer is used up, so a retry exits 2 for good.
 test('test_sent_refused_for_good_drops_the_debt_and_the_next_batch_can_go', async ($, on) => {
   let n = 0
-  const { clock, out, posts } = await bootBatch($, on, postedOk, { files: EIGHT, sent: () => (n++ === 0 ? real(CLI.sent_again) : real(CLI.sent_ok)) })
-  await clock.advance(30_000)                                                  // posted; `sent` refused
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { files: EIGHT, due: () => n < 2, sent: () => (n++ === 0 ? real(CLI.sent_again) : real(CLI.sent_ok)) })
+  await clock.advance(30_000)                                                  // posted; `sent` refused: no live offer
   expect(decideCalls(out, 'sent').length).toBe(1)
-  expect(recordLines(out)).toBe(0)
-  await clock.advance(30_000)                                                  // no debt, no hold: the still-due batch relists them
+  expect(recordLines(out)).toBe(0)                                             // not a record failure
+  expect(await hasNoError($)).toBe(true)
+  for (let i = 0; i < 15; i++) await clock.advance(30_000)                    // t = 8: no re-post and no retry inside batch_minutes
+  expect(posts.length).toBe(1)
+  expect(decideCalls(out, 'sent').length).toBe(1)
+  for (let i = 0; i < 2; i++) await clock.advance(30_000)                     // past them, a batch still due lists what wasn't stamped
   expect(posts.length).toBe(2)
   expect(decideCalls(out, 'sent').length).toBe(2)
 })

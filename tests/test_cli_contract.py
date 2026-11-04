@@ -54,6 +54,7 @@ def capture() -> dict:
         import chief
         chief.register_worker(Path(ws), datetime.now(timezone.utc), "PLAT-1", "Plat one")
         out = {}
+        subprocess.run([sys.executable, MOTHER, "hub", "dms", "inbox", "D00000001"], capture_output=True, check=True, env=env)
 
         def run(name, *args, stdin=None):
             p = subprocess.run([sys.executable, MOTHER] + list(args), input=stdin, capture_output=True, text=True, env=env)

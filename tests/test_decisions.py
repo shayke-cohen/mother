@@ -725,6 +725,37 @@ class DraftTextTest(Base):
         got = decisions.answer(self.ws, SIGNED, AT, 1, "edit", "new", {"via": "pane"})
         self.assertIn("summary and description", got)
 
+    def set_inbox(self, channel):
+        watch = hub.load_watch(self.ws)
+        watch.setdefault("follow", {})["inbox"] = channel
+        hub.save_watch(self.ws, watch)
+
+    def test_reply_channel_is_the_watchers_when_config_agrees(self):
+        cfg = {"manager": {"chat_dm": ["U00000001", "D00000001"]}}
+        self.set_inbox("D00000001")
+        self.assertEqual(decisions.reply_channel(self.ws, cfg), ("D00000001", None))
+
+    def test_reply_channel_says_when_replies_cannot_work(self):
+        cfg = {"manager": {"chat_dm": ["U00000001", "D00000001"]}}
+        chan, why = decisions.reply_channel(self.ws, cfg)              # no inbox: replies never arrive
+        self.assertEqual(chan, "D00000001")
+        self.assertIn("mother hub dms inbox D00000001", why)
+        self.set_inbox("D00000002")                                    # a different D id: fails closed, and says so
+        chan, why = decisions.reply_channel(self.ws, cfg)
+        self.assertIsNone(chan)
+        self.assertIn("D00000002", why)
+        chan, why = decisions.reply_channel(self.ws, {"manager": {"chat_dm": "U00000001"}})   # only a U id
+        self.assertIsNone(chan)
+        self.assertIn("no D", why)
+
+    def test_a_reply_is_read_in_the_channel_the_watcher_read(self):
+        cfg = {"manager": {"chat_dm": ["U00000001", "D00000002", "D00000009"]}}
+        self.set_inbox("D00000009")
+        line = {"id": "chat:manual:x:1700000000.000100", "kind": "manual", "source": "chat", "summary": "1 ok"}
+        with mock.patch.object(decisions, "_reply", return_value=("not_reply", [])) as got:
+            decisions.apply_replies(self.ws, cfg, AT, [line])
+        self.assertEqual(got.call_args[0][3], "D00000009")
+
     def test_edit_refuses_a_call_with_several_fields(self):
         """New text in one field would send the others unread."""
         cfg = dict(SIGNED, manager={"chat_dm": ["U00000001", "D00000001"]})

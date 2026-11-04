@@ -305,8 +305,9 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 // is never posted sooner than its hold allows.
 // After 3 `sent` failures in a row: one wake line saying so, with the ids and ts routines/chief.md runs `sent` with, and
 // one retry per batch_minutes. The debt stays, and no new post goes out while it's owed.
-// A `sent` refused for good (exit 2: its offer was already used, by a `sent` whose answer got lost or the chief's, or
-// replaced by a later batch) can never succeed, so the debt goes. What it didn't stamp is listed in the next batch.
+// A `sent` that exits 2 has no live offer: it was already recorded (a `sent` whose answer got lost, or the chief's), or a
+// later batch replaced the offer. It can never succeed, so the debt goes, and it isn't a record failure. Nothing is
+// re-posted because of it: batch_minutes pass first, and what it didn't stamp is then listed in the next batch.
 // The state is in session state, so a reload of the mod can't cause a second post: a hold is set before each post, for a
 // reload during one, whose answer is lost with the process.
 const BATCH_WAKE_LINE = "A batch is due and the mod couldn't post it: follow the Decisions part of routines/chief.md."
@@ -473,8 +474,9 @@ async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: strin
     return
   }
   if (sent.code === SENT_REFUSED_EXIT) {
-    passError = safe(`a batch record was refused, so it's dropped: ${firstLine(sent.stderr) || 'mother decide sent refused it'}`)
-    await update($, chiefBatchAtom, prev => idleAfter(prev))
+    await logPost($, bin, 'mother decide sent', '', 'record dropped', firstLine(sent.stderr))
+    const holdUntil = nowMs + (await batchMinutes($, bin)) * 60_000
+    await update($, chiefBatchAtom, prev => ({ ...idleAfter(prev), holdUntil }))
     return
   }
   const note = failing(firstLine(sent.stderr) || 'mother decide sent failed')
@@ -1178,6 +1180,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
         ? <Text color="warning">Budget: spend file unreadable — no worker run starts until it reads again.</Text>
         : <Text color={s.budget?.over ? 'warning' : undefined}>{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today${s.budget?.over ? ' · spent: no run starts' : ''}`}</Text>}
       {s.paused ? <Text color="warning">PAUSED: tick only writes the heartbeat; no run starts.</Text> : null}
+      {typeof s.reply_problem === 'string' && s.reply_problem ? <Text color="warning" wrap="wrap">{`DM replies won't work: ${oneLine(s.reply_problem, 300)}`}</Text> : null}
       {error ? <Text color="warning">{error}</Text> : null}
       {decisions.length || answered.length ? heading(`To decide ${decisions.length}`) : null}
       {decisions.map(decisionCard)}

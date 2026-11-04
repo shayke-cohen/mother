@@ -810,13 +810,31 @@ def _record_reply(ws: Path, lid: str, state, lines: List[str]) -> None:
         save(ws, doc)
 
 
+def reply_channel(ws: Path, cfg: dict) -> Tuple[Optional[str], Optional[str]]:
+    """(the D id a self-DM reply is re-read from, what stops replies from working). An inbox line names no channel, and
+    two settings say which one it is: the watcher reads `follow.inbox` in watch.json, and the batch goes to the D id in
+    manager.chat_dm. When they differ, every reply fails closed, so the Chief pane says so."""
+    ds = sorted(str(x) for x in guard.dm_ids(cfg) if str(x).startswith("D"))
+    inbox = hub.merged_watch(cfg, hub.load_watch(ws))["chat"].get("inbox") or ""
+    if not ds:
+        return None, "config.json has no D… channel in manager.chat_dm, so no batch can be posted and no reply confirmed"
+    if not inbox:
+        return ds[0], "the watcher has no self-DM inbox, so replies in the DM never arrive: run `mother hub dms inbox %s`" % ds[0]
+    if inbox not in ds:
+        return None, "the watcher reads %s but manager.chat_dm says %s, so no reply can be confirmed: make them the same" \
+            % (chief.safe_line(inbox, 40), ds[0])
+    if len(ds) > 1:
+        return inbox, "manager.chat_dm lists several D… channels: the batch goes to the first, and replies are read in %s" % inbox
+    return inbox, None
+
+
 def apply_replies(ws: Path, cfg: dict, at: datetime, lines: List[dict]) -> Set[str]:
     """Apply every reply among `lines`, each once, even one the cursor can't reach yet. Result lines go to `confirm`.
     Returns the ids to log: the replies that reached the queue. A failed Slack read is tried again next tick, and
     `for_chief` stops there until it settles. Anything else keeps its normal path: a note that isn't a reply, and one that only starts like a reply, which gets
     the help line. So does a line after REPLY_TRIES failed reads. One bad line is logged and can't stop the others."""
     ws = Path(ws)
-    channel = next((x for x in sorted(guard.dm_ids(cfg), key=str) if str(x).startswith("D")), None)
+    channel = reply_channel(ws, cfg)[0]
     candidates = [l for l in lines if is_reply_line(l)]
     seen = load(ws)["replied"]
     todo = [l for l in candidates if not isinstance(seen.get(l["id"]), bool)]

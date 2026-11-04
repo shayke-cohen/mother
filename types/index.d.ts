@@ -222,6 +222,7 @@ export type ChiefStatus = {
   desktop?: ChiefDesktop[]           // pinned desktop sessions; absent from an older CLI
   decisions?: ChiefDecision[]        // absent from an older CLI
   to_decide?: number                 // pending decisions; absent from an older CLI
+  reply_problem?: string | null      // what stops self-DM replies from working, while decisions are open
 }
 
 declare module 'claude-code' {

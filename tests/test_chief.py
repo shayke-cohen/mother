@@ -541,7 +541,7 @@ class TestWaitsOnDecision(Base):
         self.assertEqual(len(doc["decisions"]), 1)
         got = doc["decisions"][0]
         self.assertEqual(sorted(got), sorted(["id", "key", "kind", "target", "recommendation", "why", "text",
-                                              "full_text", "urgent", "status", "created", "expires"]))
+                                              "full_text", "edit_refusal", "edit_text", "urgent", "status", "created", "expires"]))
         self.assertEqual(got["target"], "a@b.c")
         self.assertEqual(got["full_text"], "y" * 500)
         self.assertEqual((got["id"], got["key"], got["kind"], got["recommendation"], got["why"], got["urgent"],
@@ -2063,7 +2063,7 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "workers", "desktop", "decisions",
-                                    "to_decide"})
+                                    "to_decide", "reply_problem"})
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
         self.assertEqual(doc["at"], hub._iso(AT))
