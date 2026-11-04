@@ -183,6 +183,13 @@ pass `--force`. Caps (`max_workers`, `run_minutes`, `daily_budget_usd`, models) 
 `config.json`. After a plugin update run `mother chief install` again. `mother chief status` shows the state, and
 `mother chief pause` / `resume` is its own switch (it never touches `.mother/PAUSED`).
 
+A worker never sends anything itself. When it wants to post, reply or comment, it files a decision with the exact
+call; every so often (`batch_minutes`) the chief posts the open ones to your own DM, and the Chief pane shows them as
+cards. Reply `7 ok`, `7 no`, `7 edit: <text>` or `ok all`, or press a button. Only your answer counts, and it
+lets that one call through, once, unchanged; anything else the worker tries is refused. Workers are strict: no shell
+commands beyond a short allow-list (not even `npm test`) and file writes only inside the workspace. This is a guard,
+not a sandbox, and the decision flow needs a live check after you install.
+
 **Another computer, same workspace:** install the plugin, run `mother link` as above, then
 `mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines
 (`mother home show`), so don't register them on the second one.
