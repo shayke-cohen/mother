@@ -256,6 +256,22 @@ def add_spend(ws: Path, at: datetime, tz, usd: float) -> None:
         _write_atomic(chief_dir(ws) / "spend.json", json.dumps({k: doc[k] for k in keep}, indent=2) + "\n")
 
 
+# USD per million input and output tokens, for the pane's own model calls (triage, TL;DR). `spend` estimates from these.
+MODEL_PRICES = {"sonnet": (3, 15), "opus": (15, 75)}
+TLDR_MAX_TOKENS = 1024  # hooks/chief.tsx's cap on a TL;DR call: what a call with no usage counts as
+
+
+def model_cost(model, input_tokens, output_tokens) -> float:
+    """The estimate for one call. Usage that is missing or not a count reads as TLDR_MAX_TOKENS of output, and a model
+    with no price as the dearest: this feeds a cap, so it errs high."""
+    def count(v):
+        return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    if not (count(input_tokens) and count(output_tokens)):
+        input_tokens, output_tokens = 0, TLDR_MAX_TOKENS
+    per_in, per_out = (MODEL_PRICES.get(model) if isinstance(model, str) else None) or max(MODEL_PRICES.values())
+    return (input_tokens * per_in + output_tokens * per_out) / 1e6
+
+
 def _spend_unreadable(ws: Path) -> bool:
     """True when spend.json exists but cannot be read as an object. A missing file is $0, not unreadable."""
     try:
@@ -999,13 +1015,14 @@ def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path]) -> List[dict]:
     return out
 
 
-# C0 controls but newline, DEL, C1 controls, and the bidi marks, embeddings, overrides and isolates: what a model could
-# copy from a transcript to make a card misread, or that a surface refuses to draw.
-_UNSAFE_RE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# C0 controls but newline and tab, DEL, C1 controls, the line and paragraph separators, and the bidi marks, embeddings,
+# overrides and isolates: what a model could copy from a transcript to make a card misread, or that a surface refuses to
+# draw. A tab becomes a space, so it can't join two words.
+_UNSAFE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 
 
 def _safe(text: str) -> str:
-    return _UNSAFE_RE.sub("", text)
+    return _UNSAFE_RE.sub("", text.replace("\t", " "))
 
 
 def clean_tldr(tldr, chips) -> Optional[dict]:
@@ -1304,6 +1321,8 @@ USAGE = """usage: mother chief <verb> ...
                         {version, model, sessions}
   tldr --stdin          store the pane's TL;DRs and chips (JSON array on stdin) in .mother/chief/tldr.json;
                         prints {stored: N}
+  spend --stdin         add one pane model call ({model, input_tokens, output_tokens} on stdin) to today's spend;
+                        prints {added: usd}
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
   role                  chief when MOTHER_CHIEF_ROLE=chief, else console
 
@@ -1317,7 +1336,7 @@ VERBS = {
     "keep": (0, (), ()), "install": (0, ("--force",), ()), "uninstall": (0, (), ()),
     "pause": (0, (), ()), "resume": (0, (), ()), "role": (0, (), ()),
     "triage": (0, ("--stdin",), ()), "pinned": (0, ("--stdin",), ()),
-    "tail": (0, ("--json",), ()), "tldr": (0, ("--stdin",), ()),
+    "tail": (0, ("--json",), ()), "tldr": (0, ("--stdin",), ()), "spend": (0, ("--stdin",), ()),
 }
 
 
@@ -1524,6 +1543,22 @@ def main(args, ws, cfg, at) -> int:
         if not isinstance(rows, list):
             return _usage("tldr: stdin must be a JSON array of {id, fingerprint, tldr, chips}")
         print(json.dumps({"stored": tldr_store(ws, at, rows, Path.home(), default_app_dir())}))
+        return EXIT_OK
+    if verb == "spend":
+        if not opts.get("stdin"):
+            return _usage("spend reads one model call from stdin: pass --stdin")
+        try:
+            call = json.loads(sys.stdin.read())
+        except ValueError as e:
+            return _usage("spend: stdin is not JSON (%s)" % e)
+        if not isinstance(call, dict):
+            return _usage("spend: stdin must be a JSON object {model, input_tokens, output_tokens}")
+        if _spend_unreadable(ws):  # add_spend would read it as $0 and overwrite it, lifting the refusal
+            print("spend file is unreadable (%s); nothing added" % (chief_dir(ws) / "spend.json"), file=sys.stderr)
+            return EXIT_FAILED
+        usd = model_cost(call.get("model"), call.get("input_tokens"), call.get("output_tokens"))
+        add_spend(ws, at, nowmod.Schedule.from_config(cfg or {}).tz, usd)
+        print(json.dumps({"added": round(usd, 6)}))
         return EXIT_OK
     if verb == "status":
         doc = status_doc(ws, cfg, at)

@@ -1689,5 +1689,83 @@ class TestTldr(Base):
         self.assertEqual(list(doc), [s["id"]])
 
 
+class TestModelSpendAndText(Base):
+    inbox = TestTick.inbox
+
+    def spend(self, stdin, cfg=None):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = chief.main(["spend", "--stdin"], self.ws, cfg or {}, AT)
+        return code, out.getvalue()
+
+    def spent(self):
+        return chief.spent_today(self.ws, AT, UTC)
+
+    def test_wake_text_counts_judged_lines(self):
+        lines = [line(key="PLAT-%d" % i) for i in range(chief.JUDGE_MAX + 5)]
+        self.inbox(*lines)
+        ticked = chief.tick(self.ws, {}, AT)
+        self.assertEqual(len(ticked["judge"]), chief.JUDGE_MAX)
+        self.assertTrue(ticked["wake"].startswith("Chief wake: %d inbox lines" % chief.JUDGE_MAX))
+        # triage logs the first 22: 3 lines stay, and the wake says 3, not the 25 that were pending
+        done = chief.triage_apply(self.ws, {}, AT, [verdict(l, needs_attention=False) for l in lines[:22]])
+        self.assertEqual(len(done["kept"]), 3)
+        self.assertTrue(done["wake"].startswith("Chief wake: 3 inbox lines"))
+
+    def test_spend_counts_model_calls(self):
+        self.assertEqual(chief.MODEL_PRICES, {"sonnet": (3, 15), "opus": (15, 75)})
+        code, out = self.spend(json.dumps({"model": "sonnet", "input_tokens": 1000000, "output_tokens": 1000000}))
+        self.assertEqual(code, 0)
+        self.assertAlmostEqual(json.loads(out)["added"], 18.0)
+        self.assertAlmostEqual(self.spent(), 18.0)
+        self.spend(json.dumps({"model": "opus", "input_tokens": 1000, "output_tokens": 1000}))
+        self.assertAlmostEqual(self.spent(), 18.0 + 0.015 + 0.075)
+
+    def test_spend_without_usage_counts_the_tldr_cap(self):
+        for doc in ({"model": "sonnet"}, {"model": "sonnet", "input_tokens": None, "output_tokens": 5},
+                    {"model": "sonnet", "input_tokens": -1, "output_tokens": 5},
+                    {"model": "sonnet", "input_tokens": True, "output_tokens": 5}):
+            before = self.spent()
+            self.assertEqual(self.spend(json.dumps(doc))[0], 0)
+            self.assertAlmostEqual(self.spent() - before, chief.TLDR_MAX_TOKENS * 15 / 1e6, places=5, msg=doc)
+
+    def test_spend_unknown_model_counts_at_the_dearest_price(self):
+        self.spend(json.dumps({"model": "other", "input_tokens": 1000000, "output_tokens": 0}))
+        self.assertAlmostEqual(self.spent(), 15.0)
+        self.assertEqual(self.spend(json.dumps({"model": ["x"], "input_tokens": 1000000, "output_tokens": 0}))[0], 0)
+        self.assertAlmostEqual(self.spent(), 30.0)
+
+    def test_spend_usage_errors(self):
+        for stdin in ("{bad", "[]", json.dumps("x")):
+            self.assertEqual(self.spend(stdin)[0], 2, stdin)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(chief.main(["spend"], self.ws, {}, AT), 2)
+        self.assertEqual(self.spent(), 0.0)
+
+    def test_spend_never_overwrites_an_unreadable_file(self):
+        path = chief.chief_dir(self.ws) / "spend.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{torn")
+        self.assertEqual(self.spend(json.dumps({"model": "sonnet", "input_tokens": 1, "output_tokens": 1}))[0], 1)
+        self.assertEqual(path.read_text(), "{torn")   # still refuses runs, rather than reading $0 from here on
+
+    def test_spend_reaches_the_budget(self):
+        cfg = {"chief": {"daily_budget_usd": 1}}
+        self.assertIsNone(chief.refusal(self.ws, cfg, AT))
+        self.spend(json.dumps({"model": "opus", "input_tokens": 0, "output_tokens": 20000}), cfg)
+        self.assertIn("over today's budget", chief.refusal(self.ws, cfg, AT))
+
+    def test_triage_haiku_config_reads_sonnet(self):
+        self.assertEqual(chief.settings({"chief": {"triage_model": "haiku"}})["triage_model"], "sonnet")
+        self.assertEqual(chief.settings({"chief": {"triage_model": "opus"}})["triage_model"], "opus")
+
+    def test_safe_strips_line_separators(self):
+        self.assertEqual(chief._safe("a\u2028b\u2029c\nd"), "abc\nd")
+
+    def test_safe_tab_to_space(self):
+        self.assertEqual(chief._safe("a\tb"), "a b")
+        self.assertEqual(chief.clean_tldr("a\tb", [])["tldr"], "a b")
+
+
 if __name__ == "__main__":
     unittest.main()
