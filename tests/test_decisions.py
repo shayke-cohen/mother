@@ -750,6 +750,26 @@ class DraftTextTest(Base):
         (self.ws / ".mother" / "ledger.json").write_text(json.dumps({"version": 1, "uses": [{"run": "chief:D7"}]}))
         self.assertEqual(self.propose()["id"], "D8")
 
+    def test_ids_stay_above_a_live_grant_after_a_corrupt_file(self):
+        cfg = dict(SIGNED, manager={"chat_dm": ["U00000001", "D00000001"]})
+        sdir = tempfile.TemporaryDirectory()
+        self.addCleanup(sdir.cleanup)
+        with mock.patch.dict(os.environ, {"MOTHER_STATE_DIR": sdir.name}):
+            self.propose()
+            decisions.answer(self.ws, cfg, AT, 1, "ok", "", {"via": "pane"})
+            (chief.chief_dir(self.ws) / "decisions.json").write_text("{not json")
+            self.assertEqual(self.propose()["id"], "D2")
+
+    def test_ids_read_the_grant_file_as_it_stands(self):
+        (self.ws / ".mother" / "grants.json").write_text(json.dumps(
+            {"grants": [{"decision": "D9", "run": "chief:D4"}, {"run": "chief:D11"}, "odd", {"decision": 7}]}))
+        self.assertEqual(self.propose()["id"], "D12")
+
+    def test_unreadable_grants_and_ledger_do_not_stop_a_filing(self):
+        (self.ws / ".mother" / "grants.json").write_text("{not json")
+        (self.ws / ".mother" / "ledger.json").write_text("{not json")
+        self.assertEqual(self.propose()["id"], "D1")
+
     def test_plain_target(self):
         cases = ((POST, REPLY, "C00000001, thread_ts 1700000000.000100"),
                  ("mcp__tracker__jira__comment-on-issue", {"issueIdOrKey": "PLAT-7", "comment": "x"}, "PLAT-7"),
