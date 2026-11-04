@@ -89,7 +89,7 @@ class ProposeTest(Base):
 
     def test_load_defaults(self):
         self.assertEqual(decisions.load(self.ws), {"version": 1, "next": 1, "decisions": [],
-                                                   "batch": {"last_at": None, "announced": []}, "confirm": []})
+                                                   "batch": {"last_at": None, "announced": {}}, "confirm": []})
 
 
 class EditedInputTest(unittest.TestCase):
@@ -233,10 +233,11 @@ class AnswerTest(Base):
     def answer(self, verb="ok", payload="", source=None, n=1):
         return decisions.answer(self.ws, CFG, AT, n, verb, payload, source or {"via": "pane"})
 
-    def announce(self, *ids):
+    def announce(self, *ids, at=AT + timedelta(seconds=30)):
+        """Mark decisions announced to the manager at `at` (by default after they were filed, before SRC_TS)."""
         with decisions.locked(self.ws):
             doc = decisions.load(self.ws)
-            doc["batch"]["announced"] = list(ids)
+            doc["batch"]["announced"].update({i: hub._iso(at) for i in ids})
             decisions.save(self.ws, doc)
 
     def reply(self, text="1 ok", ts=SRC_TS, at=LATER, channel=DM, cfg=None, **kw):
@@ -401,6 +402,30 @@ class AnswerTest(Base):
         self.assertEqual((self.grants(), self.status()), ([], "pending"))
         lines = self.reply("ok all", ts=old)
         self.assertEqual(len(lines), 1)
+        self.assertEqual((self.grants(), self.status()), ([], "pending"))
+
+    def test_reply_before_announce_not_applied(self):
+        self.propose(inp=dict(REPLY, text="first"))
+        typed = AT + timedelta(seconds=120)  # D2 was filed at AT, the manager types at T, D2 is announced at T+5
+        ts = "%.6f" % typed.timestamp()
+        self.propose(inp=dict(REPLY, text="second"))
+        self.announce("D1", at=AT + timedelta(seconds=30))
+        self.announce("D2", at=typed + timedelta(seconds=5))
+        tick = typed + timedelta(seconds=30)  # the next tick reads the reply after the announcement
+        self.reply("2 ok", ts=ts, at=tick)
+        self.assertEqual((self.grants(), self.status(1)), ([], "pending"))
+        self.reply("ok all", ts=ts, at=tick)
+        self.assertEqual([g["decision"] for g in self.grants()], ["D1"])  # only what the manager had seen
+        self.assertEqual([self.status(0), self.status(1)], ["approved", "pending"])
+
+    def test_announced_list_reads_as_none(self):
+        self.propose()
+        doc = decisions.load(self.ws)
+        doc["batch"]["announced"] = ["D1"]  # the old shape: no stamps, so nothing counts as announced
+        with decisions.locked(self.ws):
+            decisions.save(self.ws, doc)
+        self.assertEqual(decisions.load(self.ws)["batch"]["announced"], {})
+        self.assertEqual(len(self.reply("1 ok")), 1)
         self.assertEqual((self.grants(), self.status()), ([], "pending"))
 
     def test_ok_all_only_announced(self):

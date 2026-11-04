@@ -51,11 +51,12 @@ def locked(ws: Path):
 
 
 def _empty() -> dict:
-    return {"version": 1, "next": 1, "decisions": [], "batch": {"last_at": None, "announced": []}, "confirm": []}
+    return {"version": 1, "next": 1, "decisions": [], "batch": {"last_at": None, "announced": {}}, "confirm": []}
 
 
 def load(ws: Path) -> dict:
-    """decisions.json with every field present; a missing or unreadable file reads as empty."""
+    """decisions.json with every field present; a missing or unreadable file reads as empty. `batch.announced` maps a
+    decision id to the stamp of the batch that showed it to the manager; any other shape reads as no announcements."""
     doc = _empty()
     try:
         raw = json.loads(_path(ws).read_text())
@@ -70,8 +71,8 @@ def load(ws: Path) -> dict:
     b = raw.get("batch")
     if isinstance(b, dict):
         doc["batch"]["last_at"] = b.get("last_at") if isinstance(b.get("last_at"), str) else None
-        if isinstance(b.get("announced"), list):
-            doc["batch"]["announced"] = [x for x in b["announced"] if isinstance(x, str)]
+        if isinstance(b.get("announced"), dict):
+            doc["batch"]["announced"] = {k: v for k, v in b["announced"].items() if isinstance(v, str)}
     if isinstance(raw.get("confirm"), list):
         doc["confirm"] = [x for x in raw["confirm"] if isinstance(x, str)]
     return doc
@@ -286,15 +287,14 @@ def slack_text(raw: str) -> str:
 
 
 def _reply_open_ids(ws: Path, ts: str) -> Set[int]:
-    """What a Slack reply can answer: pending decisions already announced to the manager and filed before the reply.
-    Anything else is a call the manager hadn't seen when typing it."""
+    """What a Slack reply can answer: pending decisions announced to the manager before the reply was typed. Anything
+    else is a call the manager hadn't seen. A decision is filed before it is announced, so this also covers `created`."""
     sent = guard.parse_time(ts)
     doc = load(ws)
     out = set()
     for d in doc["decisions"]:
-        made = guard.parse_time(d.get("created"))
-        if d.get("status") == "pending" and d.get("id") in doc["batch"]["announced"] and made is not None \
-                and made < sent:
+        shown = guard.parse_time(doc["batch"]["announced"].get(d.get("id")))
+        if d.get("status") == "pending" and shown is not None and shown < sent:
             m = _NUM.match(str(d["id"]).lower())
             if m:
                 out.add(int(m.group(1)))
