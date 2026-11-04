@@ -1755,6 +1755,23 @@ class TestModelSpendAndText(Base):
         self.spend(json.dumps({"model": "opus", "input_tokens": 0, "output_tokens": 20000}), cfg)
         self.assertIn("over today's budget", chief.refusal(self.ws, cfg, AT))
 
+    def test_post_log_appends_to_guard_log_without_text(self):
+        row = {"tool": "slack__post_message", "target": "D00000001", "outcome": "unsure", "reason": "no\u202e ts\nat all",
+               "text": "the draft itself"}
+        for _ in range(2):
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(row))):
+                self.assertEqual(chief.main(["post-log", "--stdin"], self.ws, {}, AT), 0)
+        recs = [json.loads(l) for l in (self.ws / ".mother" / "guard.log").read_text().splitlines()]
+        self.assertEqual(len(recs), 2)
+        self.assertEqual((recs[0]["tool"], recs[0]["target"], recs[0]["decision"], recs[0]["reason"]),
+                         ("slack__post_message", "D00000001", "mod post: unsure", "no ts at all"))
+        self.assertNotIn("the draft itself", json.dumps(recs))
+
+    def test_post_log_usage_errors(self):
+        for stdin in ("{bad", "[]"):
+            with mock.patch("sys.stdin", io.StringIO(stdin)), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(chief.main(["post-log", "--stdin"], self.ws, {}, AT), 2)
+
     def test_triage_haiku_config_reads_sonnet(self):
         self.assertEqual(chief.settings({"chief": {"triage_model": "haiku"}})["triage_model"], "sonnet")
         self.assertEqual(chief.settings({"chief": {"triage_model": "opus"}})["triage_model"], "opus")

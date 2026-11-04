@@ -3,7 +3,7 @@ import type { Register } from 'claude-code'
 
 import { ago, motherBin } from './shared'
 import type { Dollar } from './shared'
-import type { ChiefChip, ChiefDecision, ChiefDesktop, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
+import type { ChiefBatchState, ChiefChip, ChiefDecision, ChiefDesktop, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
 
 // The Chief pane: the chief's health, one card per headless worker with a chat box and take-over. Every write goes
 // through `mother chief …`; the pane never edits a chief file itself.
@@ -15,6 +15,7 @@ export const chiefTldrAtom = atom({ plugin: 'mother', key: 'chiefTldr' } as cons
 export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as const, null)
 export const chiefAnswersAtom = atom({ plugin: 'mother', key: 'chiefAnswers' } as const, null)
 export const chiefToastedAtom = atom({ plugin: 'mother', key: 'chiefToasted' } as const, null)
+export const chiefBatchAtom = atom({ plugin: 'mother', key: 'chiefBatch' } as const, null)
 
 export const CHIEF_PANE = 'mother-chief'
 export const CHIEF_COMMAND = 'chief'
@@ -106,7 +107,9 @@ export function pendingDecisions(s: ChiefStatus | null): ChiefDecision[] {
 }
 
 // One line of worker-written text for a toast or a list; the worker's draft is untrusted, the same as a transcript.
-const oneLine = (text: unknown): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ')
+const oneLine = (text: unknown, cap = 200): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ').slice(0, cap)
+const WHY_MAX = 200
+const RECOMMEND_MAX = 60
 
 // A toast once per urgent decision. The ids live in session state, so a reload of the mod doesn't repeat them.
 async function toastUrgent($: Dollar, s: ChiefStatus): Promise<void> {
@@ -116,7 +119,7 @@ async function toastUrgent($: Dollar, s: ChiefStatus): Promise<void> {
   const fresh = urgent.filter(d => !seen.has(d.id))
   if (!fresh.length) return
   await update($, chiefToastedAtom, prev => [...(prev ?? []), ...fresh.map(d => d.id)])
-  for (const d of fresh) $.ui.toast(`${d.id} needs you: ${oneLine(d.why)}`)
+  for (const d of fresh) $.ui.toast(`${d.id} needs you: ${oneLine(d.why, WHY_MAX)}`)
 }
 
 // `chief` only when the CLI says so exactly (MOTHER_CHIEF_ROLE=chief in the keeper's session); `console` for any
@@ -221,10 +224,20 @@ const SPEND_OWED_MAX = 200
 // Rows the CLI hasn't taken yet: a failed write is sent again on the next pass, so the budget isn't undercounted.
 const spendOwed: SpendRow[] = []
 
+let spendFlushing = false
+
+// In order, one flusher at a time, stopping at the first failure: when the CLI is failing, one spawn a pass is enough.
 async function flushSpend($: Dollar, bin: string): Promise<void> {
-  for (const row of spendOwed.splice(0)) {
-    const ran = await cli($, bin, ['spend', '--stdin'], JSON.stringify(row))
-    if (!ran.ok && spendOwed.length < SPEND_OWED_MAX) spendOwed.push(row)
+  if (spendFlushing) return
+  spendFlushing = true
+  try {
+    while (spendOwed.length) {
+      const ran = await cli($, bin, ['spend', '--stdin'], JSON.stringify(spendOwed[0]))
+      if (!ran.ok) return
+      spendOwed.shift()
+    }
+  } finally {
+    spendFlushing = false
   }
 }
 
@@ -232,6 +245,7 @@ async function flushSpend($: Dollar, bin: string): Promise<void> {
 // read too, so it counts at the input price: an estimate that errs high.
 async function recordSpend($: Dollar, bin: string, model: string, u: any): Promise<void> {
   const known = u && typeof u.input_tokens === 'number' && typeof u.output_tokens === 'number'
+  if (spendOwed.length >= SPEND_OWED_MAX) spendOwed.shift()
   spendOwed.push(known
     ? { model, input_tokens: u.input_tokens + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0), output_tokens: u.output_tokens }
     : { model })
@@ -274,108 +288,195 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 }
 
 // ---- the batch: what's waiting on the manager, posted to their own DM (the chief only; tickOnce is its pass) ----
-// `$.mcp.call` first. Any failure leaves the batch unsent (`decide sent` is what marks it) and asks the chief, through
-// the next wake, to post it by routines/chief.md. The post is tried on every tick that says one is due, but that wake
-// line goes out at most every 10 minutes, so a broken connection doesn't cost a turn per tick.
+// `$.mcp.call` is not a tool call, so the guard never sees it: this code honours MOTHER_DRY_RUN and PAUSED itself, posts
+// only to the manager's D… channel, and logs every attempt to guard.log (`mother chief post-log`).
+//
+// A duplicate DM is the failure to avoid, so an attempt has three ends:
+// - posted: the result has a ts, which `decide sent` records. Only `sent` is ever retried, never the post.
+// - may have landed (a timeout, a result with no readable ts, an unexplained throw): no post for batch_minutes, and one
+//   wake line for that batch. A late result that has a ts is still recorded.
+// - did not land (a clear error before or from the call): back off 2, 4, 8 … minutes up to batch_minutes; once at that
+//   cap, one wake line for that batch.
+// The state is in session state, so a reload of the mod can't cause a second post.
 const BATCH_WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
-const BATCH_WAKE_EVERY_MS = 10 * 60_000
 const SLACK_TS_RE = /^\d+\.\d+$/
-let batchLineDue = false
-let batchLineAt = -Infinity
-// A post that landed and `decide sent` hasn't recorded yet: only `sent` is retried, so it is never posted twice.
-let sentOwed: { ids: string; ts: string } | null = null
+const DEFAULT_BATCH_MINUTES = 30
+const FIRST_BACKOFF_MINUTES = 2
+const REFUSED_CALL_RE = /no connected|not connected|denied|refus|forbidden|unauthori[sz]ed|not allowed|permission|unknown tool|no such tool|not found|invalid|missing/i
+const TIMED_OUT_RE = /time[d\s-]*out/i
+const IDLE_BATCH: ChiefBatchState = { sentOwed: null, holdUntil: 0, failures: 0, wokenFor: null, lineDue: false, note: null }
 
-// The post's own Slack ts, from its result: the structured content or the first text block that parses. '' when the
-// call failed, said ok: false, or has no ts that reads as one: then the post doesn't count, and the batch stays unsent.
-function postedTs(r: { content?: unknown; structuredContent?: unknown; isError?: boolean } | null | undefined): string {
-  if (!r || r.isError) return ''
-  const docs: any[] = [r.structuredContent]
-  for (const b of Array.isArray(r.content) ? r.content : []) {
-    if (!b || typeof b !== 'object' || (b as any).type !== 'text') continue
-    try { docs.push(JSON.parse(String((b as any).text ?? ''))) } catch { /* not this block */ }
-  }
-  for (const d of docs) {
-    if (!d || typeof d !== 'object' || d.ok === false) continue
-    for (const ts of [d.ts, d.message?.ts]) if (typeof ts === 'string' && SLACK_TS_RE.test(ts)) return ts
-  }
-  return ''
+async function batchState($: Dollar): Promise<ChiefBatchState> {
+  return (await read($, chiefBatchAtom)) ?? IDLE_BATCH
 }
 
-// Where a batch goes: the manager's D… channel (a reply only counts in one, F5) and the chat connector's post tool, from
-// capabilities.json's `mcp__<server>__<prefix>`. A string says why it can't be posted.
-async function batchTarget($: Dollar, bin: string): Promise<{ server: string; tool: string; channel: string } | string> {
+type PostResult = { content?: unknown; structuredContent?: unknown; isError?: boolean } | null | undefined
+type PostEnd = { end: 'posted'; ts: string } | { end: 'unsure' | 'failed'; why: string }
+
+// What a post's result says. Only a ts that reads as one counts as posted.
+function postEnd(r: PostResult): PostEnd {
+  const blocks = (Array.isArray(r?.content) ? r!.content : []).filter((b: any) => b && typeof b === 'object' && b.type === 'text') as any[]
+  if (r?.isError) {
+    const text = firstLine(String(blocks[0]?.text ?? ''))
+    return { end: TIMED_OUT_RE.test(text) ? 'unsure' : 'failed', why: text || 'the post tool reported an error' }
+  }
+  const docs: any[] = [r?.structuredContent]
+  for (const b of blocks) {
+    try { docs.push(JSON.parse(String(b.text ?? ''))) } catch { /* not this block */ }
+  }
+  for (const d of docs) {
+    if (!d || typeof d !== 'object') continue
+    if (d.ok === false) return { end: 'failed', why: String(d.error ?? 'the post said ok: false') }
+    for (const ts of [d.ts, d.message?.ts]) if (typeof ts === 'string' && SLACK_TS_RE.test(ts)) return { end: 'posted', ts }
+  }
+  return { end: 'unsure', why: 'the post gave no readable message ts' }
+}
+
+async function configDoc($: Dollar, bin: string): Promise<{ ws: string; cfg: any } | null> {
   const ws = await workspace($, bin)
-  if (!ws) return 'no workspace'
-  let cfg: any
+  if (!ws) return null
+  try { return { ws, cfg: JSON.parse(await $.fs.read(`${ws}/config.json`)) } } catch { return null }
+}
+
+// config.json -> chief.batch_minutes, its default when missing or not a positive number.
+async function batchMinutes($: Dollar, bin: string): Promise<number> {
+  const n = (await configDoc($, bin))?.cfg?.chief?.batch_minutes
+  return typeof n === 'number' && n > 0 ? n : DEFAULT_BATCH_MINUTES
+}
+
+// Why nothing may be posted now, or null: a dry run, or either PAUSED file. A check that can't answer holds the post.
+async function postHeld($: Dollar, bin: string): Promise<string | null> {
+  try {
+    if ((await $.env.get('MOTHER_DRY_RUN'))?.trim()) return 'dry run (MOTHER_DRY_RUN is set)'
+    const ws = await workspace($, bin)
+    if (!ws) return 'no workspace'
+    if (await $.fs.exists(`${ws}/.mother/PAUSED`) || await $.fs.exists(`${ws}/.mother/chief/PAUSED`)) return 'paused'
+    return null
+  } catch {
+    return "couldn't check the pause and dry-run switches"
+  }
+}
+
+// Where a batch goes: the manager's D… channel from config (a reply only counts in one, F5; never anything else) and
+// the chat connector's post tool, from capabilities.json's `mcp__<server>__<prefix>`. A string says why it can't be posted.
+async function batchTarget($: Dollar, bin: string): Promise<{ server: string; tool: string; channel: string } | string> {
+  const doc = await configDoc($, bin)
+  if (!doc) return 'config.json is unreadable'
   let caps: any
   try {
-    cfg = JSON.parse(await $.fs.read(`${ws}/config.json`))
-    caps = JSON.parse(await $.fs.read(`${ws}/capabilities.json`))
+    caps = JSON.parse(await $.fs.read(`${doc.ws}/capabilities.json`))
   } catch {
-    return 'config.json or capabilities.json is unreadable'
+    return 'capabilities.json is unreadable'
   }
-  const m = cfg?.manager ?? {}
+  const m = doc.cfg?.manager ?? {}
   const ids = [m.chat_dm, m.chat_user].flat().filter((x: unknown): x is string => typeof x === 'string')
-  const channel = ids.find(x => x.startsWith('D'))
+  const channel = ids.find(x => /^D[A-Z0-9]+$/.test(x))
   if (!channel) return 'config.json has no D… channel for the manager'
-  const conn = caps?.connectors?.[String(cfg?.connectors?.chat ?? '')]
+  const conn = caps?.connectors?.[String(doc.cfg?.connectors?.chat ?? '')]
   const name = Array.isArray(conn?.servers?.post) && typeof conn.servers.post[0] === 'string' ? conn.servers.post[0] : conn?.server
   const parts = typeof name === 'string' ? /^mcp__(.+?)(?:__(.+))?$/.exec(name) : null
   if (!parts) return 'capabilities.json names no chat server to post with'
   return { server: parts[1], tool: parts[2] ? `${parts[2]}__post_message` : 'post_message', channel }
 }
 
-// One post attempt. null: posted, or nothing to post. Otherwise why not.
-async function postBatch($: Dollar, bin: string): Promise<string | null> {
+// One line in guard.log: the target and the outcome, never the text. False when it couldn't be written.
+async function logPost($: Dollar, bin: string, tool: string, target: string, outcome: string, reason = ''): Promise<boolean> {
+  return (await cli($, bin, ['post-log', '--stdin'], JSON.stringify({ tool, target, outcome, reason }))).ok
+}
+
+type Attempt = { end: 'nothing' } | { end: 'posted'; ids: string; ts: string } | { end: 'unsure' | 'failed'; why: string; batch: string }
+
+// One attempt. `batch` names the batch for its one wake line: its ids, or its text when it has none.
+async function postBatch($: Dollar, bin: string): Promise<Attempt> {
+  const unread = { end: 'failed', batch: '?' } as const
   const ran = await cli($, bin, ['batch', '--json'], undefined, 'decide')
-  if (!ran.ok) return firstLine(ran.stderr) || 'mother decide batch failed'
-  if (!ran.stdout.trim()) return null
+  if (!ran.ok) return { ...unread, why: firstLine(ran.stderr) || 'mother decide batch failed' }
+  if (!ran.stdout.trim()) return { end: 'nothing' }
   let doc: any
-  try { doc = JSON.parse(ran.stdout) } catch { return 'mother decide batch is unreadable' }
-  if (doc === null) return null
-  const ids = doc?.ids
-  if (typeof doc?.text !== 'string' || !Array.isArray(ids) || !ids.every((i: unknown) => typeof i === 'string' && DECISION_ID_RE.test(i))) {
-    return 'mother decide batch is unreadable'
+  try { doc = JSON.parse(ran.stdout) } catch { return { ...unread, why: 'mother decide batch is unreadable' } }
+  if (doc === null) return { end: 'nothing' }
+  const list = doc?.ids
+  if (typeof doc?.text !== 'string' || !Array.isArray(list) || !list.every((i: unknown) => typeof i === 'string' && DECISION_ID_RE.test(i))) {
+    return { ...unread, why: 'mother decide batch is unreadable' }
   }
-  if (!doc.text.trim()) return null
+  if (!doc.text.trim()) return { end: 'nothing' }
+  const ids = list.join(',')
+  const batch = ids || doc.text
   const target = await batchTarget($, bin)
-  if (typeof target === 'string') return target
+  if (typeof target === 'string') return { end: 'failed', why: target, batch }
+  if (!(await logPost($, bin, target.tool, target.channel, 'attempt'))) return { end: 'failed', why: "the post log can't be written", batch }
+
   const stop = new AbortController()
-  let ts = ''
+  let out: PostEnd | 'timeout'
+  let call: Promise<PostResult> | null = null
   try {
-    // a hung call must not hold the pass's busy flag; it loses to the timer and counts as not posted
-    const timedOut = $.clock.sleep(MCP_TIMEOUT_MS, { signal: stop.signal }).then(() => null, () => null)
-    ts = postedTs(await Promise.race([$.mcp.call(target.server, target.tool, { channel_id: target.channel, text: doc.text }), timedOut]))
+    call = $.mcp.call(target.server, target.tool, { channel_id: target.channel, text: doc.text })
+    // a hung call must not hold the pass's busy flag: it loses to the timer, and a late answer is dealt with below
+    const timedOut = $.clock.sleep(MCP_TIMEOUT_MS, { signal: stop.signal }).then(() => 'timeout' as const, () => 'timeout' as const)
+    const first = await Promise.race([call, timedOut])
+    out = first === 'timeout' ? 'timeout' : postEnd(first)
   } catch (err) {
-    return firstLine((err as Error)?.message ?? String(err)) || 'the post failed'
+    const why = firstLine((err as Error)?.message ?? String(err)) || 'the post threw'
+    out = { end: REFUSED_CALL_RE.test(why) ? 'failed' : 'unsure', why }
   } finally {
     stop.abort()
   }
-  if (!ts) return 'the post gave no message ts'
-  sentOwed = { ids: ids.join(','), ts }
-  return null
+  if (out === 'timeout') {
+    void call!.then(async r => {
+      const late = postEnd(r)
+      if (late.end !== 'posted') return
+      await logPost($, bin, target.tool, target.channel, 'posted', 'a late answer')
+      await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), sentOwed: { ids, ts: late.ts } }))
+    }).catch(() => undefined)
+    out = { end: 'unsure', why: `no answer from the post in ${MCP_TIMEOUT_MS / 1000} s` }
+  }
+  await logPost($, bin, target.tool, target.channel, out.end, out.end === 'posted' ? '' : out.why)
+  return out.end === 'posted' ? { end: 'posted', ids, ts: out.ts } : { end: out.end, why: out.why, batch }
 }
 
-// The tick's batch step: first a `sent` still owed, else a post when the tick says one is due. Not reached by a console.
-async function settleBatch($: Dollar, bin: string, due: boolean): Promise<void> {
-  if (!sentOwed && due) {
-    const why = await postBatch($, bin)
-    if (why) {
-      passError = `couldn't post the batch: ${why}`
-      const nowMs = await $.clock.now()
-      if (nowMs - batchLineAt >= BATCH_WAKE_EVERY_MS) {
-        batchLineAt = nowMs
-        batchLineDue = true
-      }
-      return
-    }
-    batchLineDue = false
-    batchLineAt = -Infinity
+async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: string }): Promise<void> {
+  const sent = await cli($, bin, ['sent', '--ids', owed.ids, '--ts', owed.ts], undefined, 'decide')
+  if (sent.ok) await update($, chiefBatchAtom, () => IDLE_BATCH)
+  else passError = safe(`the batch went out, but recording it failed: ${firstLine(sent.stderr) || 'mother decide sent failed'}`)
+}
+
+// The tick's batch step: a `sent` still owed first; else a post, when the tick says one is due and nothing holds it.
+// A paused tick leaves the state alone; a tick with nothing due clears it. Not reached by a console.
+async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boolean): Promise<void> {
+  const st = await batchState($)
+  if (st.sentOwed) return recordSent($, bin, st.sentOwed)
+  if (!due) {
+    if (!tickPaused && (st.holdUntil || st.failures || st.wokenFor || st.lineDue || st.note)) await update($, chiefBatchAtom, () => IDLE_BATCH)
+    return
   }
-  if (sentOwed) {
-    const sent = await cli($, bin, ['sent', '--ids', sentOwed.ids, '--ts', sentOwed.ts], undefined, 'decide')
-    if (sent.ok) sentOwed = null
-    else passError = `the batch went out, but recording it failed: ${firstLine(sent.stderr) || 'mother decide sent failed'}`
+  const nowMs = await $.clock.now()
+  if (nowMs < st.holdUntil) {
+    if (st.note) passError = st.note
+    return
+  }
+  const held = await postHeld($, bin)
+  if (held) {
+    passError = `batch not posted: ${held}`
+    return
+  }
+  const got = await postBatch($, bin)
+  if (got.end === 'nothing') {
+    await update($, chiefBatchAtom, () => IDLE_BATCH)
+  } else if (got.end === 'posted') {
+    const owed = { ids: got.ids, ts: got.ts }
+    await update($, chiefBatchAtom, () => ({ ...IDLE_BATCH, sentOwed: owed }))
+    await recordSent($, bin, owed)
+  } else {
+    const cap = await batchMinutes($, bin)
+    const failures = got.end === 'failed' ? st.failures + 1 : st.failures
+    const minutes = got.end === 'failed' ? Math.min(FIRST_BACKOFF_MINUTES * 2 ** (failures - 1), cap) : cap
+    const wake = minutes >= cap && st.wokenFor !== got.batch
+    const note = safe(`couldn't post the batch: ${got.why}`)
+    passError = note
+    await update($, chiefBatchAtom, prev => ({
+      ...(prev ?? IDLE_BATCH), failures, note, holdUntil: nowMs + minutes * 60_000,
+      wokenFor: wake ? got.batch : st.wokenFor, lineDue: wake || st.lineDue,
+    }))
   }
 }
 
@@ -391,7 +492,7 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     if (sid && sid !== want) {
       passError = ID_CHANGED
       pendingWake = null
-      batchLineDue = false
+      await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lineDue: false }))
       await reloadStatus($, bin)
       return
     }
@@ -402,23 +503,26 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     let wake: unknown = null
     let judge: string[] = []
     let batch = false
+    let tickPaused = false
     try {
       const r = JSON.parse(ran.stdout)
       wake = r?.wake
-      batch = r?.batch === true && r?.paused !== true
+      tickPaused = r?.paused === true
+      batch = r?.batch === true && !tickPaused
       if (Array.isArray(r?.judge)) judge = r.judge.filter((j: unknown): j is string => typeof j === 'string')
     } catch { wake = null }
-    await settleBatch($, bin, batch)
+    await settleBatch($, bin, batch, tickPaused)
     if (typeof wake === 'string' && wake.trim()) {
       // newest wins, a held one included
       pendingWake = judge.length && !overBudget(lastStatus) ? await triageWake($, bin, judge, wake) : wake
     }
     const nowMs = await $.clock.now()
     const busyTurn = turnStartedAt !== null && nowMs - turnStartedAt < STUCK_TURN_MS
-    if ((pendingWake || batchLineDue) && !busyTurn) {
-      const text = [pendingWake, batchLineDue ? BATCH_WAKE_LINE : null].filter(Boolean).join('\n')
+    const lineDue = (await batchState($)).lineDue
+    if ((pendingWake || lineDue) && !busyTurn) {
+      const text = [pendingWake, lineDue ? BATCH_WAKE_LINE : null].filter(Boolean).join('\n')
       pendingWake = null
-      batchLineDue = false
+      if (lineDue) await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lineDue: false }))
       void $.prompt.submit({ text }).catch(() => undefined)
     }
   } else {
@@ -819,7 +923,7 @@ async function answerDecision($: Dollar, bin: string, d: ChiefDecision, verb: 'o
     message = message || firstLine(ran.stderr) || (ran.ok ? `${d.id}: answered.` : `${d.id}: the answer failed.`)
     await update($, chiefAnswersAtom, prev => {
       const rows = Object.entries(prev ?? {}).filter(([id]) => id !== d.id)
-      return Object.fromEntries([...rows, [d.id, { key: d.key, message: safe(message) }]].slice(-ANSWERS_KEPT))
+      return Object.fromEntries([...rows, [d.id, { message: safe(message) }]].slice(-ANSWERS_KEPT))
     })
     if (ran.ok) await clearDraft($, 'decide-text:' + d.id)   // a refused edit keeps the manager's words in the box
     await reloadStatus($, bin)
@@ -863,7 +967,7 @@ type Ui = ReturnType<Dollar['ui']['resolve']>
 
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
                   sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
-                  drafts: Record<string, string> | null, answers: Record<string, { key: string; message: string }> | null) {
+                  drafts: Record<string, string> | null, answers: Record<string, { message: string }> | null) {
   const { Box, Text, Button, Input } = ui
   const heading = (text: string) => (
     <Box marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
@@ -947,31 +1051,41 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   }
   // A decision: what the worker wants to do, for the manager to answer. All of it is worker-written, drawn as plain text.
   const decisionCard = (d: ChiefDecision) => {
-    const draft = safe(String(d.text ?? '')).slice(0, DRAFT_SHOWN)
-    const cut = draft.length >= DRAFT_SHOWN                // the status caps it: the rest of the draft isn't here
+    // `full_text` is the whole draft; an older CLI gives only the capped `text`, which at the cap can't be prefilled.
+    const hasFull = typeof d.full_text === 'string'
+    const whole = safe(String(hasFull ? d.full_text : d.text ?? ''))
+    const cut = whole.length > DRAFT_SHOWN || (!hasFull && whole.length === DRAFT_SHOWN)
+    const allKey = 'decide-all:' + d.id
+    const showAll = hasFull && drafts?.[allKey] !== undefined
+    const draft = showAll ? whole : whole.slice(0, DRAFT_SHOWN)
+    const where = [oneLine(d.kind, 40), typeof d.target === 'string' && d.target.trim() ? oneLine(d.target, 120) : ''].filter(Boolean).join(' → ')
     const inputKey = 'decide-text:' + d.id
     const editing = drafts?.[inputKey]
     const message = answers?.[d.id]?.message
     return (
       <Box key={'d-' + d.id} flexDirection="column" marginTop={1}>
         <Text weight="semibold" color={d.urgent ? 'warning' : undefined}>{`${d.id} · ${safe(String(d.key ?? ''))}`}</Text>
-        <Text wrap="wrap">{safe(String(d.why ?? ''))}</Text>
-        <Text dimColor>{`recommend: ${safe(String(d.recommendation ?? ''))}`}</Text>
+        <Text wrap="wrap">{oneLine(d.why, WHY_MAX)}</Text>
+        {where ? <Text dimColor>{where}</Text> : null}
+        <Text dimColor>{`recommend: ${oneLine(d.recommendation, RECOMMEND_MAX)}`}</Text>
         <Text wrap="wrap">{draft}</Text>
-        {cut ? <Text color="warning" wrap="wrap">{`Cut at ${DRAFT_SHOWN} characters: Approve sends the whole draft, including what isn't shown.`}</Text> : null}
+        {cut && !showAll ? <Text color="warning" wrap="wrap">{`Cut at ${DRAFT_SHOWN} characters: Approve sends the whole draft, including what isn't shown.`}</Text> : null}
+        {cut && hasFull
+          ? <Button key={'decide-more:' + d.id} onPress={() => showAll ? clearDraft($, allKey) : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [allKey]: '1' }))}>{showAll ? 'Show less' : 'Show all'}</Button>
+          : null}
         {message ? <Text color="warning" wrap="wrap">{message}</Text> : null}
         {editing === undefined
           ? (
             <Box flexWrap="wrap" gap="xs">
               <Button key={'decide-ok:' + d.id} onPress={() => answerDecision($, bin, d, 'ok')}>Approve</Button>
-              <Button key={'decide-edit:' + d.id} onPress={() => update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [inputKey]: cut ? '' : draft }))}>Edit</Button>
+              <Button key={'decide-edit:' + d.id} onPress={() => update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [inputKey]: hasFull || !cut ? whole : '' }))}>Edit</Button>
               <Button key={'decide-no:' + d.id} onPress={() => answerDecision($, bin, d, 'no')}>Reject</Button>
             </Box>
           )
           : (
             <Box flexDirection="column">
-              {/* A cut draft is never prefilled: one changed word would send the first 400 characters as the whole message. */}
-              {cut ? <Text color="warning" wrap="wrap">This draft is longer than shown. Type the whole new text: it replaces all of it.</Text> : null}
+              {/* A draft whose rest isn't here is never prefilled: one changed word would send the first 400 characters as the whole message. */}
+              {cut && !hasFull ? <Text color="warning" wrap="wrap">This draft is longer than shown. Type the whole new text: it replaces all of it.</Text> : null}
               <Box flexWrap="wrap" gap="xs">
                 <Input key={inputKey} rows={4} value={editing} placeholder="The whole new text…" submitLabel="approve this text"
                   onSubmit={(value: string) => {
@@ -1043,9 +1157,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   opening.clear()
   answering.clear()
   spendOwed.length = 0
-  batchLineDue = false
-  batchLineAt = -Infinity
-  sentOwed = null
+  spendFlushing = false
   role = await readRole($, bin)
   await update($, chiefRoleAtom, () => role)
   await reloadStatus($, bin)
@@ -1129,7 +1241,7 @@ export function registerChief(on: On, configured: string): void {
       const fresh = await reloadStatus($, bin)
       if (!fresh) return { text: "Couldn't read the decisions: `mother chief status` failed." }
       const rows = pendingDecisions(fresh).map(d =>
-        `${d.id} · ${oneLine(d.key)}${d.urgent ? ' · urgent' : ''}: ${oneLine(d.why)} · recommend: ${oneLine(d.recommendation)}`)
+        `${d.id} · ${oneLine(d.key)}${d.urgent ? ' · urgent' : ''}: ${oneLine(d.why, WHY_MAX)} · recommend: ${oneLine(d.recommendation, RECOMMEND_MAX)}`)
       return { text: rows.length ? rows.join('\n') : 'Nothing to decide.' }
     }
     return { text: 'Usage: /chief [open | status | decisions | pause | resume]' }

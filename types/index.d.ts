@@ -174,7 +174,8 @@ export type ChiefDesktop = {
   open_link: string | null
 }
 
-// A decision a worker filed (lib/decisions.py). The pane draws the pending ones; `text` is the draft's first 400 characters.
+// A decision a worker filed (lib/decisions.py). The pane draws the pending ones; `text` is the draft's first 400
+// characters, `full_text` all of it; `target` is where the call goes. The last two are absent from an older CLI.
 export type ChiefDecision = {
   id: string                         // D<n>
   key: string
@@ -182,10 +183,22 @@ export type ChiefDecision = {
   recommendation: string
   why: string
   text: string
+  full_text?: string
+  target?: string | null
   urgent: boolean
   status: 'pending' | 'approved' | 'rejected' | 'redirected' | 'expired' | 'sent' | 'failed' | 'manual' | string
   created: string
   expires: string
+}
+
+// The batch post's state (hooks/chief.tsx settleBatch), in session state so a reload of the mod can't post twice.
+export type ChiefBatchState = {
+  sentOwed: { ids: string; ts: string } | null   // posted; `decide sent` hasn't recorded it yet
+  holdUntil: number        // epoch ms: no post before this
+  failures: number         // posts that surely did not land, in a row
+  wokenFor: string | null  // the batch that already got its one wake line
+  lineDue: boolean         // the wake line goes out with the next wake
+  note: string | null      // why the last attempt failed, for the pane
 }
 
 export type ChiefStatus = {
@@ -218,8 +231,9 @@ declare module 'claude-code' {
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
       chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
       chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by session id (a worker's session_id, a pinned cli_session_id)
-      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<key>`, `say:<cli id>`), a decision being edited (`decide-text:<id>`)
-      chiefAnswers: Record<string, { key: string; message: string }> | null   // the last answers' messages, by decision id
+      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<key>`, `say:<cli id>`), a decision being edited (`decide-text:<id>`); `decide-all:<id>` is set while a card shows its whole draft
+      chiefAnswers: Record<string, { message: string }> | null   // the last answers' messages, by decision id
+      chiefBatch: ChiefBatchState | null            // the batch post's state; null until the first post
       chiefToasted: string[] | null                 // urgent decision ids already toasted this session
     }
   }

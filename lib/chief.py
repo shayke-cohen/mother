@@ -272,6 +272,19 @@ def model_cost(model, input_tokens, output_tokens) -> float:
     return (input_tokens * per_in + output_tokens * per_out) / 1e6
 
 
+def log_post(ws: Path, at: datetime, row: dict) -> None:
+    """One line in .mother/guard.log for the mod's own batch post, which the guard can't see: an attempt or its outcome.
+    The same record shape as the guard's. Target and outcome only, never the message text."""
+    d = Path(ws) / ".mother"
+    d.mkdir(parents=True, exist_ok=True)
+    text = lambda k, cap: " ".join(_safe(str(row.get(k) or "")).split())[:cap]
+    rec = {"at": hub._iso(at), "tool": text("tool", 120), "kind": "chat", "category": "post",
+           "target": text("target", 40) or None, "decision": "mod post: " + text("outcome", 20),
+           "reason": text("reason", 200)}
+    with open(d / "guard.log", "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
 def _spend_unreadable(ws: Path) -> bool:
     """True when spend.json exists but cannot be read as an object. A missing file is $0, not unreadable."""
     try:
@@ -1323,6 +1336,7 @@ USAGE = """usage: mother chief <verb> ...
                         prints {stored: N}
   spend --stdin         add one pane model call ({model, input_tokens, output_tokens} on stdin) to today's spend;
                         prints {added: usd}
+  post-log --stdin      one guard.log line for the pane's batch post ({tool, target, outcome, reason} on stdin)
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
   role                  chief when MOTHER_CHIEF_ROLE=chief, else console
 
@@ -1337,6 +1351,7 @@ VERBS = {
     "pause": (0, (), ()), "resume": (0, (), ()), "role": (0, (), ()),
     "triage": (0, ("--stdin",), ()), "pinned": (0, ("--stdin",), ()),
     "tail": (0, ("--json",), ()), "tldr": (0, ("--stdin",), ()), "spend": (0, ("--stdin",), ()),
+    "post-log": (0, ("--stdin",), ()),
 }
 
 
@@ -1543,6 +1558,21 @@ def main(args, ws, cfg, at) -> int:
         if not isinstance(rows, list):
             return _usage("tldr: stdin must be a JSON array of {id, fingerprint, tldr, chips}")
         print(json.dumps({"stored": tldr_store(ws, at, rows, Path.home(), default_app_dir())}))
+        return EXIT_OK
+    if verb == "post-log":
+        if not opts.get("stdin"):
+            return _usage("post-log reads one record from stdin: pass --stdin")
+        try:
+            row = json.loads(sys.stdin.read())
+        except ValueError as e:
+            return _usage("post-log: stdin is not JSON (%s)" % e)
+        if not isinstance(row, dict):
+            return _usage("post-log: stdin must be a JSON object {tool, target, outcome, reason}")
+        try:
+            log_post(ws, at, row)
+        except OSError as e:
+            print("post-log: %s" % e, file=sys.stderr)
+            return EXIT_FAILED
         return EXIT_OK
     if verb == "spend":
         if not opts.get("stdin"):
