@@ -3,7 +3,7 @@ import type { Register } from 'claude-code'
 
 import { ago, motherBin } from './shared'
 import type { Dollar } from './shared'
-import type { ChiefChip, ChiefDesktop, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
+import type { ChiefChip, ChiefDecision, ChiefDesktop, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
 
 // The Chief pane: the chief's health, one card per headless worker with a chat box and take-over. Every write goes
 // through `mother chief …`; the pane never edits a chief file itself.
@@ -13,6 +13,8 @@ export const chiefErrorAtom = atom({ plugin: 'mother', key: 'chiefError' } as co
 export const chiefSentAtom = atom({ plugin: 'mother', key: 'chiefSent' } as const, null)
 export const chiefTldrAtom = atom({ plugin: 'mother', key: 'chiefTldr' } as const, null)
 export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as const, null)
+export const chiefAnswersAtom = atom({ plugin: 'mother', key: 'chiefAnswers' } as const, null)
+export const chiefToastedAtom = atom({ plugin: 'mother', key: 'chiefToasted' } as const, null)
 
 export const CHIEF_PANE = 'mother-chief'
 export const CHIEF_COMMAND = 'chief'
@@ -23,15 +25,15 @@ const MIN_TICK_SECONDS = 5
 type On = Parameters<Register>[0]
 type Role = 'chief' | 'console'
 
-// ` · chief ● N working · M queued` for the status line; ○ while the chief's heartbeat is old; '' with no status,
-// and '' when no chief is installed here (it never wrote a heartbeat and there are no workers).
+// ` · chief ● N working · M to decide` for the status line, the last part only when M > 0; ○ while the chief's heartbeat
+// is old; '' with no status, and '' when no chief is installed here (no heartbeat ever, no workers, nothing to decide).
 export function chiefStatusText(s: ChiefStatus | null, _role: Role | null): string {
   if (!s) return ''
   const workers = s.workers ?? []
-  if (!s.chief?.heartbeat_at && workers.length === 0) return ''
+  const toDecide = typeof s.to_decide === 'number' ? s.to_decide : 0
+  if (!s.chief?.heartbeat_at && workers.length === 0 && toDecide === 0) return ''
   const working = workers.filter(w => w.status === 'working').length
-  const queued = workers.reduce((n, w) => n + (w.queued ?? 0), 0)
-  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working · ${queued} queued`
+  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working` + (toDecide > 0 ? ` · ${toDecide} to decide` : '')
 }
 
 // Attention order: failed, held, working, idle, then the rest (done); newest last run first within a group.
@@ -48,10 +50,10 @@ type Ran = { ok: boolean; stdout: string; stderr: string }
 const TIMEOUT_MS: Record<string, number> = { tick: 120_000 }
 const DEFAULT_TIMEOUT_MS = 30_000
 
-async function cli($: Dollar, bin: string, args: string[], stdin?: string): Promise<Ran> {
+async function cli($: Dollar, bin: string, args: string[], stdin?: string, noun: 'chief' | 'decide' = 'chief'): Promise<Ran> {
   try {
     const timeoutMs = TIMEOUT_MS[args[0] ?? ''] ?? DEFAULT_TIMEOUT_MS
-    const ran = await $.process.run(['python3', bin, 'chief', ...args], stdin === undefined ? { timeoutMs } : { timeoutMs, stdin })
+    const ran = await $.process.run(['python3', bin, noun, ...args], stdin === undefined ? { timeoutMs } : { timeoutMs, stdin })
     return { ok: ran.exitCode === 0, stdout: String(ran.stdout ?? ''), stderr: String(ran.stderr ?? '') }
   } catch (err) {
     return { ok: false, stdout: '', stderr: (err as Error).message ?? String(err) }
@@ -87,10 +89,34 @@ async function reloadStatus($: Dollar, bin: string): Promise<ChiefStatus | null>
   if (parsed) {
     lastStatus = parsed
     await update($, chiefAtom, () => parsed)
+    await toastUrgent($, parsed)
   }
   const shown = passError ?? error
   await update($, chiefErrorAtom, () => shown)
   return parsed
+}
+
+// The cards to draw: pending, with an id the answer verb can name; urgent first, then the oldest.
+const DECISION_ID_RE = /^D(\d+)$/
+const createdAt = (d: ChiefDecision): number => Date.parse(d.created) || 0
+export function pendingDecisions(s: ChiefStatus | null): ChiefDecision[] {
+  const all = Array.isArray(s?.decisions) ? s!.decisions! : []
+  return all.filter(d => !!d && d.status === 'pending' && DECISION_ID_RE.test(String(d.id)))
+    .sort((a, b) => Number(!!b.urgent) - Number(!!a.urgent) || createdAt(a) - createdAt(b))
+}
+
+// One line of worker-written text for a toast or a list; the worker's draft is untrusted, the same as a transcript.
+const oneLine = (text: unknown): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ')
+
+// A toast once per urgent decision. The ids live in session state, so a reload of the mod doesn't repeat them.
+async function toastUrgent($: Dollar, s: ChiefStatus): Promise<void> {
+  const urgent = pendingDecisions(s).filter(d => d.urgent)
+  if (!urgent.length) return
+  const seen = new Set((await read($, chiefToastedAtom)) ?? [])
+  const fresh = urgent.filter(d => !seen.has(d.id))
+  if (!fresh.length) return
+  await update($, chiefToastedAtom, prev => [...(prev ?? []), ...fresh.map(d => d.id)])
+  for (const d of fresh) $.ui.toast(`${d.id} needs you: ${oneLine(d.why)}`)
 }
 
 // `chief` only when the CLI says so exactly (MOTHER_CHIEF_ROLE=chief in the keeper's session); `console` for any
@@ -203,6 +229,112 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
   }
 }
 
+// ---- the batch: what's waiting on the manager, posted to their own DM (the chief only; tickOnce is its pass) ----
+// `$.mcp.call` first. Any failure leaves the batch unsent (`decide sent` is what marks it) and asks the chief, through
+// the next wake, to post it by routines/chief.md. The post is tried on every tick that says one is due, but that wake
+// line goes out at most every 10 minutes, so a broken connection doesn't cost a turn per tick.
+const BATCH_WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
+const BATCH_WAKE_EVERY_MS = 10 * 60_000
+const SLACK_TS_RE = /^\d+\.\d+$/
+let batchLineDue = false
+let batchLineAt = -Infinity
+// A post that landed and `decide sent` hasn't recorded yet: only `sent` is retried, so it is never posted twice.
+let sentOwed: { ids: string; ts: string } | null = null
+
+// The post's own Slack ts, from its result: the structured content or the first text block that parses. '' when the
+// call failed, said ok: false, or has no ts that reads as one: then the post doesn't count, and the batch stays unsent.
+function postedTs(r: { content?: unknown; structuredContent?: unknown; isError?: boolean } | null | undefined): string {
+  if (!r || r.isError) return ''
+  const docs: any[] = [r.structuredContent]
+  for (const b of Array.isArray(r.content) ? r.content : []) {
+    if (!b || typeof b !== 'object' || (b as any).type !== 'text') continue
+    try { docs.push(JSON.parse(String((b as any).text ?? ''))) } catch { /* not this block */ }
+  }
+  for (const d of docs) {
+    if (!d || typeof d !== 'object' || d.ok === false) continue
+    for (const ts of [d.ts, d.message?.ts]) if (typeof ts === 'string' && SLACK_TS_RE.test(ts)) return ts
+  }
+  return ''
+}
+
+// Where a batch goes: the manager's D… channel (a reply only counts in one, F5) and the chat connector's post tool, from
+// capabilities.json's `mcp__<server>__<prefix>`. A string says why it can't be posted.
+async function batchTarget($: Dollar, bin: string): Promise<{ server: string; tool: string; channel: string } | string> {
+  const ws = await workspace($, bin)
+  if (!ws) return 'no workspace'
+  let cfg: any
+  let caps: any
+  try {
+    cfg = JSON.parse(await $.fs.read(`${ws}/config.json`))
+    caps = JSON.parse(await $.fs.read(`${ws}/capabilities.json`))
+  } catch {
+    return 'config.json or capabilities.json is unreadable'
+  }
+  const m = cfg?.manager ?? {}
+  const ids = [m.chat_dm, m.chat_user].flat().filter((x: unknown): x is string => typeof x === 'string')
+  const channel = ids.find(x => x.startsWith('D'))
+  if (!channel) return 'config.json has no D… channel for the manager'
+  const conn = caps?.connectors?.[String(cfg?.connectors?.chat ?? '')]
+  const name = Array.isArray(conn?.servers?.post) && typeof conn.servers.post[0] === 'string' ? conn.servers.post[0] : conn?.server
+  const parts = typeof name === 'string' ? /^mcp__(.+?)(?:__(.+))?$/.exec(name) : null
+  if (!parts) return 'capabilities.json names no chat server to post with'
+  return { server: parts[1], tool: parts[2] ? `${parts[2]}__post_message` : 'post_message', channel }
+}
+
+// One post attempt. null: posted, or nothing to post. Otherwise why not.
+async function postBatch($: Dollar, bin: string): Promise<string | null> {
+  const ran = await cli($, bin, ['batch', '--json'], undefined, 'decide')
+  if (!ran.ok) return firstLine(ran.stderr) || 'mother decide batch failed'
+  if (!ran.stdout.trim()) return null
+  let doc: any
+  try { doc = JSON.parse(ran.stdout) } catch { return 'mother decide batch is unreadable' }
+  if (doc === null) return null
+  const ids = doc?.ids
+  if (typeof doc?.text !== 'string' || !Array.isArray(ids) || !ids.every((i: unknown) => typeof i === 'string' && DECISION_ID_RE.test(i))) {
+    return 'mother decide batch is unreadable'
+  }
+  if (!doc.text.trim()) return null
+  const target = await batchTarget($, bin)
+  if (typeof target === 'string') return target
+  const stop = new AbortController()
+  let ts = ''
+  try {
+    // a hung call must not hold the pass's busy flag; it loses to the timer and counts as not posted
+    const timedOut = $.clock.sleep(MCP_TIMEOUT_MS, { signal: stop.signal }).then(() => null, () => null)
+    ts = postedTs(await Promise.race([$.mcp.call(target.server, target.tool, { channel_id: target.channel, text: doc.text }), timedOut]))
+  } catch (err) {
+    return firstLine((err as Error)?.message ?? String(err)) || 'the post failed'
+  } finally {
+    stop.abort()
+  }
+  if (!ts) return 'the post gave no message ts'
+  sentOwed = { ids: ids.join(','), ts }
+  return null
+}
+
+// The tick's batch step: first a `sent` still owed, else a post when the tick says one is due. Not reached by a console.
+async function settleBatch($: Dollar, bin: string, due: boolean): Promise<void> {
+  if (!sentOwed && due) {
+    const why = await postBatch($, bin)
+    if (why) {
+      passError = `couldn't post the batch: ${why}`
+      const nowMs = await $.clock.now()
+      if (nowMs - batchLineAt >= BATCH_WAKE_EVERY_MS) {
+        batchLineAt = nowMs
+        batchLineDue = true
+      }
+      return
+    }
+    batchLineDue = false
+    batchLineAt = -Infinity
+  }
+  if (sentOwed) {
+    const sent = await cli($, bin, ['sent', '--ids', sentOwed.ids, '--ts', sentOwed.ts], undefined, 'decide')
+    if (sent.ok) sentOwed = null
+    else passError = `the batch went out, but recording it failed: ${firstLine(sent.stderr) || 'mother decide sent failed'}`
+  }
+}
+
 // One chief pass: `tick --json`; when it names a wake, triage its judge lines first; the wake prompt (if anything is
 // kept) when no turn is running; then the status again.
 async function tickOnce($: Dollar, bin: string): Promise<void> {
@@ -215,6 +347,7 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     if (sid && sid !== want) {
       passError = ID_CHANGED
       pendingWake = null
+      batchLineDue = false
       await reloadStatus($, bin)
       return
     }
@@ -224,19 +357,23 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     passError = null
     let wake: unknown = null
     let judge: string[] = []
+    let batch = false
     try {
       const r = JSON.parse(ran.stdout)
       wake = r?.wake
+      batch = r?.batch === true && r?.paused !== true
       if (Array.isArray(r?.judge)) judge = r.judge.filter((j: unknown): j is string => typeof j === 'string')
     } catch { wake = null }
+    await settleBatch($, bin, batch)
     if (typeof wake === 'string' && wake.trim()) {
       pendingWake = judge.length ? await triageWake($, bin, judge, wake) : wake   // newest wins, a held one included
     }
     const nowMs = await $.clock.now()
     const busyTurn = turnStartedAt !== null && nowMs - turnStartedAt < STUCK_TURN_MS
-    if (pendingWake && !busyTurn) {
-      const text = pendingWake
+    if ((pendingWake || batchLineDue) && !busyTurn) {
+      const text = [pendingWake, batchLineDue ? BATCH_WAKE_LINE : null].filter(Boolean).join('\n')
       pendingWake = null
+      batchLineDue = false
       void $.prompt.submit({ text }).catch(() => undefined)
     }
   } else {
@@ -616,6 +753,33 @@ async function clearDraft($: Dollar, input: string): Promise<void> {
   })
 }
 
+// ---- a card's answer: only from a button press or the edit box's submit, the manager's own hand ----
+const ANSWERS_KEPT = 5
+const DRAFT_SHOWN = 400
+const answering = new Set<string>()
+
+// `mother decide answer <n> <verb> --via pane`, then the status again; the card shows the message it printed. An edit's
+// text goes after `--`, whole. A press while the same card's answer runs does nothing.
+async function answerDecision($: Dollar, bin: string, d: ChiefDecision, verb: 'ok' | 'no' | 'edit', text?: string): Promise<void> {
+  const n = DECISION_ID_RE.exec(d.id)?.[1]
+  if (!n || answering.has(d.id)) return
+  answering.add(d.id)
+  try {
+    const ran = await cli($, bin, ['answer', n, verb, '--via', 'pane', ...(verb === 'edit' ? ['--', text ?? ''] : [])], undefined, 'decide')
+    let message = ''
+    try { message = String(JSON.parse(ran.stdout)?.message ?? '') } catch { /* no message to show */ }
+    message = message || firstLine(ran.stderr) || (ran.ok ? `${d.id}: answered.` : `${d.id}: the answer failed.`)
+    await update($, chiefAnswersAtom, prev => {
+      const rows = Object.entries(prev ?? {}).filter(([id]) => id !== d.id)
+      return Object.fromEntries([...rows, [d.id, { key: d.key, message: safe(message) }]].slice(-ANSWERS_KEPT))
+    })
+    if (ran.ok) await clearDraft($, 'decide-text:' + d.id)   // a refused edit keeps the manager's words in the box
+    await reloadStatus($, bin)
+  } finally {
+    answering.delete(d.id)
+  }
+}
+
 // A chip's effect on this card, or null when it does not apply now: take_over/hold only while not held, hand_back/
 // release only while held, mark_seen only with unseen news; a pinned session takes only reply and open.
 type ChipAct = { id: string; label: string; run: () => Promise<unknown> }
@@ -651,7 +815,7 @@ type Ui = ReturnType<Dollar['ui']['resolve']>
 
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
                   sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
-                  drafts: Record<string, string> | null) {
+                  drafts: Record<string, string> | null, answers: Record<string, { key: string; message: string }> | null) {
   const { Box, Text, Button, Input } = ui
   const heading = (text: string) => (
     <Box marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
@@ -733,6 +897,51 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       </Box>
     )
   }
+  // A decision: what the worker wants to do, for the manager to answer. All of it is worker-written, drawn as plain text.
+  const decisionCard = (d: ChiefDecision) => {
+    const draft = safe(String(d.text ?? '')).slice(0, DRAFT_SHOWN)
+    const cut = draft.length >= DRAFT_SHOWN                // the status caps it: the rest of the draft isn't here
+    const inputKey = 'decide-text:' + d.id
+    const editing = drafts?.[inputKey]
+    const message = answers?.[d.id]?.message
+    return (
+      <Box key={'d-' + d.id} flexDirection="column" marginTop={1}>
+        <Text weight="semibold" color={d.urgent ? 'warning' : undefined}>{`${d.id} · ${safe(String(d.key ?? ''))}`}</Text>
+        <Text wrap="wrap">{safe(String(d.why ?? ''))}</Text>
+        <Text dimColor>{`recommend: ${safe(String(d.recommendation ?? ''))}`}</Text>
+        <Text wrap="wrap">{draft}</Text>
+        {message ? <Text color="warning" wrap="wrap">{message}</Text> : null}
+        {editing === undefined
+          ? (
+            <Box flexWrap="wrap" gap="xs">
+              <Button key={'decide-ok:' + d.id} onPress={() => answerDecision($, bin, d, 'ok')}>Approve</Button>
+              <Button key={'decide-edit:' + d.id} onPress={() => update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [inputKey]: cut ? '' : draft }))}>Edit</Button>
+              <Button key={'decide-no:' + d.id} onPress={() => answerDecision($, bin, d, 'no')}>Reject</Button>
+            </Box>
+          )
+          : (
+            <Box flexDirection="column">
+              {/* A cut draft is never prefilled: one changed word would send the first 400 characters as the whole message. */}
+              {cut ? <Text color="warning" wrap="wrap">This draft is longer than shown. Type the whole new text: it replaces all of it.</Text> : null}
+              <Box flexWrap="wrap" gap="xs">
+                <Input key={inputKey} rows={4} value={editing} placeholder="The whole new text…" submitLabel="approve this text"
+                  onSubmit={(value: string) => {
+                    if (value.trim()) {
+                      void update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [inputKey]: value }))
+                        .then(() => answerDecision($, bin, d, 'edit', value))
+                    }
+                  }} />
+                <Button key={'decide-cancel:' + d.id} onPress={() => clearDraft($, inputKey)}>Cancel</Button>
+              </Box>
+            </Box>
+          )}
+      </Box>
+    )
+  }
+  const decisions = pendingDecisions(s)
+  const open = new Set(decisions.map(d => d.id))
+  // Answers whose card has gone: the message stays until newer answers push it out.
+  const answered = Object.entries(answers ?? {}).filter(([id]) => !open.has(id))
   const workers = byAttention(s.workers ?? [])
   const pinned = Array.isArray(s.desktop) ? s.desktop : []
   return (
@@ -744,6 +953,9 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
         : <Text color={s.budget?.over ? 'warning' : undefined}>{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today${s.budget?.over ? ' · spent: no run starts' : ''}`}</Text>}
       {s.paused ? <Text color="warning">PAUSED: tick only writes the heartbeat; no run starts.</Text> : null}
       {error ? <Text color="warning">{error}</Text> : null}
+      {decisions.length || answered.length ? heading(`To decide ${decisions.length}`) : null}
+      {decisions.map(decisionCard)}
+      {answered.map(([id, a]) => <Text key={'answered:' + id} wrap="wrap">{a.message}</Text>)}
       {heading(`Workers ${workers.length}`)}
       {workers.length === 0 ? <Text dimColor>No workers yet.</Text> : null}
       {workers.map(card)}
@@ -780,6 +992,10 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   tldrBusy = false
   tldrUnstored.clear()
   opening.clear()
+  answering.clear()
+  batchLineDue = false
+  batchLineAt = -Infinity
+  sentOwed = null
   role = await readRole($, bin)
   await update($, chiefRoleAtom, () => role)
   await reloadStatus($, bin)
@@ -833,7 +1049,7 @@ export function registerChief(on: On, configured: string): void {
     return next(e)
   })
 
-  // /chief [open] opens the pane; /chief status says `mother chief status`; /chief pause|resume run the chief-only
+  // /chief [open] opens the pane; /chief status says `mother chief status`; /chief decisions lists the open ones; /chief pause|resume run the chief-only
   // pause (.mother/chief/PAUSED, which the CLI writes and removes; the guard's .mother/PAUSED is never touched).
   on('command.run', { command: CHIEF_COMMAND }, async ($, e) => {
     const bin = await motherBin($, configured)
@@ -857,12 +1073,21 @@ export function registerChief(on: On, configured: string): void {
       await reloadStatus($, bin)
       return { text }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume]' }
+    // Read-only: an answer never comes from a command. A button press or a reply in the self-DM answers a decision.
+    if (verb === 'decisions') {
+      const fresh = await reloadStatus($, bin)
+      if (!fresh) return { text: "Couldn't read the decisions: `mother chief status` failed." }
+      const rows = pendingDecisions(fresh).map(d =>
+        `${d.id} · ${oneLine(d.key)}${d.urgent ? ' · urgent' : ''}: ${oneLine(d.why)} · recommend: ${oneLine(d.recommendation)}`)
+      return { text: rows.length ? rows.join('\n') : 'Nothing to decide.' }
+    }
+    return { text: 'Usage: /chief [open | status | decisions | pause | resume]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
   // the timer pass and when /chief opens the pane, never from a draw.
   on('ui.render', { component: 'Pane', requestId: CHIEF_PANE }, async ($, e) =>
     paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
-      await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom)))
+      await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
+      await read($, chiefAnswersAtom)))
 }

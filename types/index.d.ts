@@ -174,6 +174,20 @@ export type ChiefDesktop = {
   open_link: string | null
 }
 
+// A decision a worker filed (lib/decisions.py). The pane draws the pending ones; `text` is the draft's first 400 characters.
+export type ChiefDecision = {
+  id: string                         // D<n>
+  key: string
+  kind: string
+  recommendation: string
+  why: string
+  text: string
+  urgent: boolean
+  status: 'pending' | 'approved' | 'rejected' | 'redirected' | 'expired' | 'sent' | 'failed' | 'manual' | string
+  created: string
+  expires: string
+}
+
 export type ChiefStatus = {
   version: 1
   at: string
@@ -184,6 +198,8 @@ export type ChiefStatus = {
   budget: { spent: number; limit: number; unreadable?: boolean; over?: boolean }
   workers: ChiefWorker[]
   desktop?: ChiefDesktop[]           // pinned desktop sessions; absent from an older CLI
+  decisions?: ChiefDecision[]        // absent from an older CLI
+  to_decide?: number                 // pending decisions; absent from an older CLI
 }
 
 declare module 'claude-code' {
@@ -202,7 +218,9 @@ declare module 'claude-code' {
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
       chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
       chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by session id (a worker's session_id, a pinned cli_session_id)
-      chiefDraft: Record<string, string> | null     // a card's chat-box text a reply chip put there, by Input key (`say:<key>`, `say:<cli id>`)
+      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<key>`, `say:<cli id>`), a decision being edited (`decide-text:<id>`)
+      chiefAnswers: Record<string, { key: string; message: string }> | null   // the last answers' messages, by decision id
+      chiefToasted: string[] | null                 // urgent decision ids already toasted this session
     }
   }
 }

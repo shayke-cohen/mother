@@ -26,7 +26,7 @@ type Cli = { exitCode: number; stdout?: string; stderr?: string }
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, role: string, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
-                    surface: 'terminal' | 'desktop' = 'terminal', sessionId = 'chief-1') {
+                    surface: 'terminal' | 'desktop' = 'terminal', sessionId = 'chief-1', files: Record<string, string> = {}) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m' })
   const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
@@ -42,12 +42,17 @@ async function boot($: any, on: any, role: string, chief: (argv: string[], stdin
   on('turn.complete', () => ({ text: '' }))
   on('session.id', () => ({ value: sessionId }))
   on('fs.stat', () => ({ deny: 'ENOENT' }))
-  on('fs.read', () => ({ deny: 'ENOENT' }))
+  on('fs.read', (_: any, e: any) => (e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' }))
   on('process.run', async (_: any, e: any) => {
     const argv = [...e.argv] as string[]
     out.argv.push(argv)
     const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[2] === 'path') return ok(WS + '\n')
+    if (argv[2] === 'decide') {   // `mother decide <verb>`: the same callback, as ['decide', <verb>, ...]
+      const r = await chief(['decide', ...argv.slice(3)], e.init?.stdin)
+      if (r) return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+      return ok()
+    }
     if (argv[2] === 'chief') {
       const r = await chief(argv.slice(3), e.init?.stdin)
       if (r) return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -164,20 +169,20 @@ test('test_takeover_hides_resume_while_running', async ($, on) => {
 
 test('test_status_text_alive_and_down', async () => {
   const s: any = status({ workers: [worker({ status: 'working', queued: 1 }), worker({ key: 'PLAT-2', status: 'idle', queued: 2 })] })
-  expect(chiefStatusText(s, 'chief')).toBe(' · chief ● 1 working · 3 queued')
+  expect(chiefStatusText(s, 'chief')).toBe(' · chief ● 1 working')
   const down: any = { ...s, chief: { ...s.chief, alive: false } }
-  expect(chiefStatusText(down, 'console')).toBe(' · chief ○ 1 working · 3 queued')
+  expect(chiefStatusText(down, 'console')).toBe(' · chief ○ 1 working')
   expect(chiefStatusText(null, null)).toBe('')
   // no chief installed: no heartbeat ever, no workers
   const none: any = status({ chief: { alive: false, heartbeat_at: null, session_id: null }, workers: [] })
   expect(chiefStatusText(none, 'console')).toBe('')
   // a chief that has beaten but has no workers yet still shows
-  expect(chiefStatusText(status({ workers: [] }) as any, 'chief')).toBe(' · chief ● 0 working · 0 queued')
+  expect(chiefStatusText(status({ workers: [] }) as any, 'chief')).toBe(' · chief ● 0 working')
 })
 
 test('test_status_line_carries_the_chief', async ($, on) => {
   const { out } = await boot($, on, 'console')
-  expect(out.status.at(-1)).toBe('◆ no tick here · chief ● 0 working · 0 queued')
+  expect(out.status.at(-1)).toBe('◆ no tick here · chief ● 0 working')
 })
 
 test('test_status_line_without_a_chief', async ($, on) => {
@@ -1070,4 +1075,339 @@ test('test_a_slow_model_batch_does_not_hold_the_tick', async ($, on) => {
   for (const go of answers) go()
   await clock.settle()
   expect(t.stdins.length).toBe(1)                                                 // the detached batch finished and stored
+})
+
+// ---- To decide: cards, answer buttons, batch posting ----
+const DM = 'D00000001'
+const decision = (over: Record<string, unknown> = {}) => ({
+  id: 'D7', key: 'PLAT-1', kind: 'chat-post', recommendation: 'send', why: 'The thread asks for a date',
+  text: 'We ship on Tuesday.', urgent: false, status: 'pending', created: '2026-11-02T08:00:00Z', expires: '2026-11-04T08:00:00Z', ...over,
+})
+const withDecisions = (ds: unknown[], over: Record<string, unknown> = {}): Cli =>
+  ({ exitCode: 0, stdout: JSON.stringify(status({ decisions: ds, to_decide: ds.length, ...over })) })
+const decideCalls = (out: { argv: string[][] }, verb: string) => out.argv.filter(a => a[2] === 'decide' && a[3] === verb)
+const answerArgs = (out: { argv: string[][] }) => decideCalls(out, 'answer').map(a => a.slice(3))
+const said = (ok: boolean, message: string): Cli => ({ exitCode: ok ? 0 : 1, stdout: JSON.stringify({ ok, message }) })
+
+// A console with the decisions `ds()` as of now; `answer` says what the answer verb prints.
+async function bootCards($: any, on: any, ds: () => unknown[], answer: (argv: string[]) => Cli = () => said(true, 'D7 approved: PLAT-1 will make that one call.'), role = 'console') {
+  return boot($, on, role, argv => {
+    if (argv[0] === 'status') return withDecisions(ds())
+    if (argv[0] === 'decide' && argv[1] === 'answer') return answer(argv)
+    return undefined
+  })
+}
+
+test('test_decision_card_renders_terminal_and_desktop', async ($, on) => {
+  await bootCards($, on, () => [decision()])
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const all: string[] = await texts(ui)
+    expect(all).toContain('To decide 1')
+    expect(all).toContain('D7 · PLAT-1')
+    expect(all).toContain('The thread asks for a date')
+    expect(all).toContain('recommend: send')
+    expect(all).toContain('We ship on Tuesday.')
+    expect(all.indexOf('To decide 1')).toBeLessThan(all.indexOf('Workers 1'))   // above the worker cards
+    expect((await ui.find({ key: 'decide-ok:D7' }))?.text).toBe('Approve')
+    expect((await ui.find({ key: 'decide-edit:D7' }))?.text).toBe('Edit')
+    expect((await ui.find({ key: 'decide-no:D7' }))?.text).toBe('Reject')
+    await ui.unmount()
+  }
+})
+
+test('test_decision_cards_urgent_first_then_oldest_and_pending_only', async ($, on) => {
+  await bootCards($, on, () => [
+    decision({ id: 'D3', created: '2026-11-02T09:00:00Z' }),
+    decision({ id: 'D4', created: '2026-11-02T07:00:00Z' }),
+    decision({ id: 'D5', created: '2026-11-02T09:30:00Z', urgent: true }),
+    decision({ id: 'D6', status: 'approved' }),
+  ])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const heads = (await texts(ui)).filter((t: string) => /^D\d+ · /.test(t))
+  expect(heads).toEqual(['D5 · PLAT-1', 'D4 · PLAT-1', 'D3 · PLAT-1'])
+  await ui.unmount()
+})
+
+test('test_decision_card_text_cannot_blank_the_pane', async ($, on) => {
+  const long = 'x'.repeat(900)
+  await bootCards($, on, () => [decision({ why: 'a\u202eb\u0007', text: long, key: 'PLAT\u20661' })])
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const all: string[] = await texts(ui)
+    expect(all).toContain('ab')
+    expect(all).toContain('D7 · PLAT1')
+    expect(all).toContain('x'.repeat(400))
+    await ui.unmount()
+  }
+})
+
+test('test_approve_button_runs_answer_via_pane', async ($, on) => {
+  let pending = true
+  const { out } = await bootCards($, on, () => (pending ? [decision()] : [decision({ status: 'approved' })]), () => {
+    pending = false
+    return said(true, 'D7 approved: PLAT-1 will make that one call.')
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(answerArgs(out)).toEqual([])
+  const before = chiefCalls(out, 'status').length
+  await ui.press({ key: 'decide-ok:D7' })
+  expect(answerArgs(out)).toEqual([['answer', '7', 'ok', '--via', 'pane']])
+  expect(chiefCalls(out, 'status').length).toBeGreaterThan(before)            // the pane reloads
+  expect(await hasText(ui, /^D7 approved: PLAT-1 will make that one call\.$/)).toBe(true)
+  expect(await ui.find({ key: 'decide-ok:D7' })).toBeUndefined()              // the card has gone, its message stays
+  await ui.unmount()
+})
+
+test('test_refused_answer_keeps_card_and_says_why', async ($, on) => {
+  const { out } = await bootCards($, on, () => [decision()], () => said(false, 'D7 is still open: outbound is paused.'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'decide-ok:D7' })
+  expect(await hasText(ui, /^D7 is still open: outbound is paused\.$/)).toBe(true)
+  expect((await ui.find({ key: 'decide-ok:D7' }))?.text).toBe('Approve')
+  expect(out.toasts).toEqual([])
+  await ui.unmount()
+})
+
+test('test_edit_button_passes_text_after_dashdash', async ($, on) => {
+  const { out } = await bootCards($, on, () => [decision()], () => said(true, 'D7 approved: PLAT-1 will make that one call.'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'decide-text:D7' })).toBeUndefined()
+  await ui.press({ key: 'decide-edit:D7' })
+  expect((await ui.find({ key: 'decide-text:D7' }))?.props?.value).toBe('We ship on Tuesday.')   // prefilled
+  expect(answerArgs(out)).toEqual([])                                         // opening the editor answers nothing
+  await ui.input({ key: 'decide-text:D7', text: '   ' })                      // whitespace only: nothing is sent
+  expect(answerArgs(out)).toEqual([])
+  await ui.input({ key: 'decide-text:D7', text: '--help  we ship\nWednesday ' })
+  expect(answerArgs(out)).toEqual([['answer', '7', 'edit', '--via', 'pane', '--', '--help  we ship\nWednesday ']])
+  await ui.unmount()
+})
+
+test('test_edit_cancel_answers_nothing', async ($, on) => {
+  const { out } = await bootCards($, on, () => [decision()])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'decide-edit:D7' })
+  await ui.press({ key: 'decide-cancel:D7' })
+  expect(await ui.find({ key: 'decide-text:D7' })).toBeUndefined()
+  expect((await ui.find({ key: 'decide-ok:D7' }))?.text).toBe('Approve')
+  expect(answerArgs(out)).toEqual([])
+  await ui.unmount()
+})
+
+test('test_edit_of_a_cut_draft_starts_empty', async ($, on) => {
+  await bootCards($, on, () => [decision({ text: 'y'.repeat(400) })])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'decide-edit:D7' })
+  expect((await ui.find({ key: 'decide-text:D7' }))?.props?.value ?? '').toBe('')    // a cut prefill would send the cut text
+  expect(await hasText(ui, /longer than shown/)).toBe(true)
+  await ui.unmount()
+})
+
+test('test_failed_edit_keeps_the_text', async ($, on) => {
+  await bootCards($, on, () => [decision()], () => said(false, 'D7 is still open: the signature is gone.'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'decide-edit:D7' })
+  await ui.input({ key: 'decide-text:D7', text: 'my words' })
+  expect(await hasText(ui, /^D7 is still open: the signature is gone\.$/)).toBe(true)
+  expect((await ui.find({ key: 'decide-text:D7' }))?.props?.value).toBe('my words')
+  await ui.unmount()
+})
+
+test('test_reject_button', async ($, on) => {
+  const { out } = await bootCards($, on, () => [decision()], () => said(true, 'D7 rejected.'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'decide-no:D7' })
+  expect(answerArgs(out)).toEqual([['answer', '7', 'no', '--via', 'pane']])
+  await ui.unmount()
+})
+
+test('test_nothing_answers_without_a_press', async ($, on) => {
+  const { clock, out } = await bootCards($, on, () => [decision({ urgent: true })], undefined, 'chief')
+  await clock.advance(30_000)
+  await clock.advance(30_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.unmount()
+  await $.command.run({ command: 'chief', args: 'decisions' } as any)
+  expect(answerArgs(out)).toEqual([])
+})
+
+test('test_status_line_to_decide', async ($, on) => {
+  const s: any = status({ workers: [worker({ status: 'working' })], to_decide: 2 })
+  expect(chiefStatusText(s, 'chief')).toBe(' · chief ● 1 working · 2 to decide')
+  expect(chiefStatusText({ ...s, to_decide: 0 }, 'chief')).toBe(' · chief ● 1 working')
+  const { out } = await boot($, on, 'console', argv => argv[0] === 'status' ? withDecisions([decision()]) : undefined)
+  expect(out.status.at(-1)).toBe('◆ no tick here · chief ● 0 working · 1 to decide')
+})
+
+test('test_urgent_toast_once', async ($, on) => {
+  let ds: unknown[] = [decision({ urgent: true }), decision({ id: 'D8' })]
+  const { clock, out } = await boot($, on, 'console', argv => argv[0] === 'status' ? withDecisions(ds) : undefined)
+  expect(out.toasts).toEqual(['D7 needs you: The thread asks for a date'])
+  await clock.advance(60_000)
+  expect(out.toasts.length).toBe(1)
+  ds = [...ds, decision({ id: 'D9', urgent: true, why: 'Second\nline' })]
+  await clock.advance(60_000)
+  expect(out.toasts).toEqual(['D7 needs you: The thread asks for a date', 'D9 needs you: Second line'])
+})
+
+test('test_chief_decisions_lists_and_never_answers', async ($, on) => {
+  const { out } = await bootCards($, on, () => [decision(), decision({ id: 'D8', urgent: true, status: 'approved' })])
+  const got: any = await $.command.run({ command: 'chief', args: 'decisions' } as any)
+  expect(got.text).toContain('D7 · PLAT-1')
+  expect(got.text).toContain('The thread asks for a date')
+  expect(got.text).not.toContain('D8')
+  for (const args of ['ok 7', 'no 7', 'edit 7 new words']) {
+    const r: any = await $.command.run({ command: 'chief', args } as any)
+    expect(r.text).toMatch(/^Usage:/)
+  }
+  expect(answerArgs(out)).toEqual([])
+})
+
+const BATCH = { text: '2 to decide · 0 done without you\nD7 · PLAT-1: why · recommend: send', ids: ['D7', 'D8'] }
+const POST_TS = '1762077600.000100'
+const FILES = {
+  [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: ['U00000001', DM] }, connectors: { chat: 'slack' } }),
+  [WS + '/capabilities.json']: JSON.stringify({ connectors: { slack: { server: 'mcp__Acme_Slack__slack', servers: { post: ['mcp__Acme_Slack__slack'] } } } }),
+}
+const postedOk = () => ({ value: { content: [{ type: 'text', text: JSON.stringify({ ok: true, channel: DM, ts: POST_TS }) }], isError: false } })
+
+// A chief (or `role`) whose tick asks for a batch while `due()`; `mcp` answers the post.
+async function bootBatch($: any, on: any, mcp: () => any, opts: { role?: string; due?: () => boolean; files?: Record<string, string>; sent?: () => Cli; batch?: () => Cli | undefined; tick?: Record<string, unknown> } = {}) {
+  const posts: any[] = []
+  on('mcp.call', (_: any, e: any) => { posts.push(e); return mcp() })
+  const booted = await boot($, on, opts.role ?? 'chief', argv => {
+    if (argv[0] === 'tick') return { exitCode: 0, stdout: JSON.stringify({ paused: false, wake: null, judge: [], batch: (opts.due ?? (() => true))(), ...opts.tick }) }
+    if (argv[0] === 'decide' && argv[1] === 'batch') return opts.batch ? opts.batch() : { exitCode: 0, stdout: JSON.stringify(BATCH) }
+    if (argv[0] === 'decide' && argv[1] === 'sent') return opts.sent ? opts.sent() : { exitCode: 0, stdout: '{}' }
+    return undefined
+  }, 'terminal', 'chief-1', opts.files ?? FILES)
+  return { ...booted, posts }
+}
+
+test('test_console_never_posts_batch', async ($, on) => {
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { role: 'console' })
+  await clock.advance(60_000)
+  await clock.advance(60_000)
+  expect(posts).toEqual([])
+  expect(decideCalls(out, 'batch')).toEqual([])
+  expect(decideCalls(out, 'sent')).toEqual([])
+  expect(out.submits).toEqual([])
+})
+
+test('test_chief_posts_batch_then_marks_sent', async ($, on) => {
+  let due = true
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { due: () => due, sent: () => { due = false; return { exitCode: 0, stdout: '{}' } } })
+  await clock.advance(30_000)
+  expect(decideCalls(out, 'batch').map(a => a.slice(4))).toEqual([['--json']])
+  expect(posts.map((e: any) => [e.server, e.tool, e.args])).toEqual([['Acme_Slack', 'slack__post_message', { channel_id: DM, text: BATCH.text }]])
+  expect(decideCalls(out, 'sent').map(a => a.slice(4))).toEqual([['--ids', 'D7,D8', '--ts', POST_TS]])
+  expect(out.submits).toEqual([])
+  await clock.advance(30_000)
+  expect(posts.length).toBe(1)                                                // done: not posted again
+})
+
+for (const tick of [{ batch: false }, { batch: 'yes' }, { batch: true, paused: true }]) {
+  test(`test_no_batch_flag_means_no_post ${JSON.stringify(tick)}`, async ($, on) => {
+    const { clock, out, posts } = await bootBatch($, on, postedOk, { tick })
+    await clock.advance(30_000)
+    expect(posts).toEqual([])
+    expect(decideCalls(out, 'batch')).toEqual([])
+  })
+}
+
+test('test_empty_batch_posts_nothing', async ($, on) => {
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 0, stdout: '' }) })
+  await clock.advance(30_000)
+  expect(posts).toEqual([])
+  expect(decideCalls(out, 'sent')).toEqual([])
+  expect(out.submits).toEqual([])
+})
+
+const WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
+
+const POST_FAILURES: Array<[string, () => any]> = [
+  ['an error result', () => ({ value: { content: [{ type: 'text', text: 'channel_not_found' }], isError: true } })],
+  ['a deny', () => ({ deny: 'no connected MCP tool' })],
+  ['no ts', () => ({ value: { content: [{ type: 'text', text: JSON.stringify({ ok: true, channel: DM }) }], isError: false } })],
+  ['ok false', () => ({ value: { content: [{ type: 'text', text: JSON.stringify({ ok: false, ts: POST_TS }) }], isError: false } })],
+  ['a junk ts', () => ({ value: { content: [{ type: 'text', text: JSON.stringify({ ts: 'soon' }) }], isError: false } })],
+]
+for (const [name, mcp] of POST_FAILURES) {
+  test(`test_post_failure_leaves_batch_unsent: ${name}`, async ($, on) => {
+    const { clock, out, posts } = await bootBatch($, on, mcp)
+    await clock.advance(30_000)
+    expect(posts.length).toBe(1)
+    expect(decideCalls(out, 'sent')).toEqual([])
+    expect(out.submits).toEqual([WAKE_LINE])
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    expect(await hasText(ui, /^couldn't post the batch: /)).toBe(true)
+    await ui.unmount()
+  })
+}
+
+test('test_post_hang_is_a_failure', async ($, on) => {
+  const { clock, out } = await bootBatch($, on, () => new Promise(() => undefined))
+  await clock.advance(30_000)
+  await clock.advance(10_000)
+  await clock.settle()
+  expect(decideCalls(out, 'sent')).toEqual([])
+  await clock.advance(20_000)
+  expect(out.submits).toEqual([WAKE_LINE])
+})
+
+const BAD_TARGETS: Array<[string, Record<string, string>]> = [
+  ['only a U id', { ...FILES, [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: 'U00000001' }, connectors: { chat: 'slack' } }) }],
+  ['no capabilities', { [WS + '/config.json']: FILES[WS + '/config.json'] }],
+]
+for (const [name, files] of BAD_TARGETS) {
+  test(`test_batch_without_a_target_wakes: ${name}`, async ($, on) => {
+    const { clock, out, posts } = await bootBatch($, on, postedOk, { files })
+    await clock.advance(30_000)
+    expect(posts).toEqual([])                                                 // never to a U id: replies must land in the D channel
+    expect(out.submits).toEqual([WAKE_LINE])
+  })
+}
+
+const BAD_BATCHES: Array<[string, Cli]> = [
+  ['a failure', { exitCode: 1, stderr: 'boom' }],
+  ['junk', { exitCode: 0, stdout: '{not json' }],
+  ['ids not a list', { exitCode: 0, stdout: JSON.stringify({ text: 'x', ids: 'D7' }) }],
+]
+for (const [name, cliOut] of BAD_BATCHES) {
+  test(`test_unreadable_batch_wakes: ${name}`, async ($, on) => {
+    const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => cliOut })
+    await clock.advance(30_000)
+    expect(posts).toEqual([])
+    expect(out.submits).toEqual([WAKE_LINE])
+  })
+}
+
+test('test_batch_wake_line_rides_the_wake', async ($, on) => {
+  const { clock, out } = await bootBatch($, on, () => ({ deny: 'no connected MCP tool' }), { tick: { wake: 'Chief wake: 1 inbox lines need a decision.' } })
+  await clock.advance(30_000)
+  expect(out.submits).toEqual(['Chief wake: 1 inbox lines need a decision.\n' + WAKE_LINE])
+})
+
+test('test_batch_wake_line_is_not_repeated_every_tick', async ($, on) => {
+  const { clock, out, posts } = await bootBatch($, on, () => ({ deny: 'no connected MCP tool' }))
+  await clock.advance(30_000)
+  await clock.advance(30_000)
+  await clock.advance(30_000)
+  expect(out.submits).toEqual([WAKE_LINE])                                    // a failing post costs one turn per 10 minutes
+  expect(posts.length).toBe(3)                                                // while the post itself is tried each tick
+  await clock.advance(10 * 60_000)
+  expect(out.submits.length).toBe(2)
+})
+
+test('test_failed_sent_is_retried_without_posting_again', async ($, on) => {
+  let fail = true
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { sent: () => (fail ? { exitCode: 1, stderr: 'locked' } : { exitCode: 0, stdout: '{}' }) })
+  await clock.advance(30_000)
+  await clock.advance(30_000)
+  expect(posts.length).toBe(1)                                                // the post landed: never twice
+  expect(decideCalls(out, 'sent').length).toBe(2)
+  fail = false
+  await clock.advance(30_000)
+  expect(decideCalls(out, 'sent').at(-1)?.slice(4)).toEqual(['--ids', 'D7,D8', '--ts', POST_TS])
+  expect(out.submits).toEqual([])
 })
