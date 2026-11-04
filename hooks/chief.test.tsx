@@ -1499,6 +1499,138 @@ test('test_new_urgent_decision_ends_a_hold_once', async ($, on) => {
   expect(posts.length).toBe(2)                                                 // one decision ends one hold: no loop
 })
 
+// ---- N1: a stream of urgent decisions can't become a stream of DMs ----
+const everyMinutes = (tickSeconds: number) => ({ ...FILES, [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: ['U00000001', DM] }, connectors: { chat: 'slack' }, chief: { tick_seconds: tickSeconds } }) })
+
+test('test_urgent_stream_ends_at_most_3_holds_an_hour', async ($, on) => {
+  // a new, different urgent decision on every tick; posts that never confirm, so every attempt starts a 30 minute hold
+  let n = 10
+  let ds: unknown[] = []
+  const MINUTES_PER_TICK = 2
+  const { clock, posts } = await bootBatch($, on, NO_TS, {
+    files: everyMinutes(120),
+    decisions: () => ds,
+    batch: () => ({ exitCode: 0, stdout: JSON.stringify({ text: 'urgent ' + n, ids: ['D' + n] }) }),
+  })
+  const at: number[] = []
+  let seen = 0
+  for (let tick = 1; tick <= 60; tick++) {                                     // two hours
+    n += 1
+    ds = [decision({ id: 'D' + n, urgent: true, why: 'varied ' + n })]
+    await clock.advance(120_000)
+    if (tick === 30) { await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true }); await clock.settle() }   // a reload keeps the count
+    while (seen < posts.length) { at.push(tick * MINUTES_PER_TICK); seen++ }
+  }
+  const holdEnds: number[] = []
+  at.forEach((t, i) => { if (i > 0 && t - at[i - 1] < 30) holdEnds.push(t) })  // sooner than the 30 minute hold: a hold-end
+  expect(holdEnds.length).toBeGreaterThan(0)
+  for (const t of holdEnds) expect(holdEnds.filter(x => x > t - 60 && x <= t).length).toBeLessThanOrEqual(3)
+  expect(holdEnds.filter(t => t <= 60).length).toBe(3)                         // the first hour uses them all
+  at.forEach((t, i) => { if (i > 0) expect(t - at[i - 1]).toBeGreaterThanOrEqual(2) })
+  expect(posts.length).toBeLessThanOrEqual(3 * 2 + 5)                          // 2 hours: hold-ends plus the ordinary retries
+})
+
+test('test_urgent_past_the_cap_waits_and_still_shows', async ($, on) => {
+  let n = 10
+  let ds: unknown[] = [decision({ id: 'D10' })]
+  const { clock, out, posts } = await bootBatch($, on, NO_TS, {
+    files: everyMinutes(120), decisions: () => ds,
+    batch: () => ({ exitCode: 0, stdout: JSON.stringify({ text: 'b' + n, ids: ['D' + n] }) }),
+  })
+  for (let i = 0; i < 10; i++) {                                               // 20 minutes: inside the first 30 minute hold
+    n += 1
+    ds = [decision({ id: 'D' + n, urgent: true, why: 'varied ' + n })]
+    await clock.advance(120_000)
+  }
+  expect(posts.length).toBe(4)                                                 // the first post and 3 hold-ends
+  expect(out.toasts).toContain('D' + n + ' needs you: varied ' + n)            // past the cap the toast still comes
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'decide-ok:D' + n }))?.text).toBe('Approve')    // and the card
+  await ui.unmount()
+})
+
+test('test_urgent_never_ends_a_hold_within_2_minutes_of_an_attempt', async ($, on) => {
+  let ds: unknown[] = [decision()]
+  const { clock, posts } = await bootBatch($, on, NO_TS, { files: everyMinutes(60), decisions: () => ds })
+  await clock.advance(60_000)                                                  // t = 1: the attempt
+  expect(posts.length).toBe(1)
+  ds = [decision(), decision({ id: 'D9', urgent: true })]
+  await $.command.run({ command: 'chief', args: 'decisions' } as any)          // the status read that shows it, right away
+  await clock.advance(60_000)                                                  // t = 2: 1 minute after the attempt
+  expect(posts.length).toBe(1)
+  await clock.advance(60_000)                                                  // t = 3: 2 minutes after it
+  expect(posts.length).toBe(2)
+})
+
+test('test_hold_end_count_survives_a_batch_that_landed', async ($, on) => {
+  // a post that lands clears the batch, not the hourly count
+  let land = false
+  let n = 10
+  let ds: unknown[] = [decision({ id: 'D10' })]
+  const { clock, posts } = await bootBatch($, on, () => (land ? postedOk() : NO_TS()), {
+    files: everyMinutes(120), decisions: () => ds,
+    batch: () => ({ exitCode: 0, stdout: JSON.stringify({ text: 'b' + n, ids: ['D' + n] }) }),
+  })
+  const stream = async (ticks: number) => {
+    for (let i = 0; i < ticks; i++) {
+      n += 1
+      ds = [decision({ id: 'D' + n, urgent: true })]
+      await clock.advance(120_000)
+    }
+  }
+  // a status read trails the tick that checks it, so a new urgent id ends a hold every other tick
+  await stream(8)                                                              // the first post and 3 hold-ends
+  expect(posts.length).toBe(4)
+  land = true
+  await clock.advance(30 * 60_000)                                             // the hold runs out, and that post lands
+  const after = posts.length
+  land = false
+  await stream(3)                                                              // still inside the hour: no fourth hold-end
+  expect(posts.length - after).toBeLessThanOrEqual(1)                          // only the first, which has no hold to end
+})
+
+// ---- N2: a `sent` that keeps failing wakes the chief once and slows down ----
+const RECORD_LINE = 'The batch record is failing: a batch went out, but `mother decide sent` keeps failing, so no new batch goes out until it succeeds.'
+const recordLines = (out: { submits: string[] }) => out.submits.filter(t => t.includes(RECORD_LINE)).length
+
+test('test_sent_failing_wakes_once_slows_and_a_success_clears_it', async ($, on) => {
+  let fail = true
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { files: EIGHT, sent: () => (fail ? { exitCode: 1, stderr: 'locked' } : { exitCode: 0, stdout: '{}' }) })
+  await clock.advance(30_000)                                                  // t = 0.5: the post, and `sent` fails once
+  await clock.advance(30_000)
+  expect(recordLines(out)).toBe(0)
+  await clock.advance(30_000)                                                  // t = 1.5: the third failure
+  expect(decideCalls(out, 'sent').length).toBe(3)
+  expect(recordLines(out)).toBe(1)
+  for (let i = 0; i < 15; i++) await clock.advance(30_000)                    // t = 9: the slow wait, 8 minutes from 1.5
+  expect(decideCalls(out, 'sent').length).toBe(3)
+  await clock.advance(30_000)                                                  // t = 9.5
+  expect(decideCalls(out, 'sent').length).toBe(4)
+  expect(recordLines(out)).toBe(1)                                             // not repeated
+  expect(posts.length).toBe(1)                                                 // no new post while it's owed
+  expect(decideCalls(out, 'batch').length).toBe(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /^the batch went out, but recording it failed: locked$/)).toBe(true)
+  await ui.unmount()
+  fail = false
+  for (let i = 0; i < 16; i++) await clock.advance(30_000)                    // t = 17.5: the next retry succeeds
+  expect(decideCalls(out, 'sent').at(-1)?.slice(4)).toEqual(['--ids', 'D7,D8', '--ts', POST_TS])
+  await clock.advance(30_000)                                                  // the debt is gone: the tick's batch posts
+  expect(posts.length).toBeGreaterThan(1)
+  expect(recordLines(out)).toBe(1)
+})
+
+test('test_sent_debt_and_its_slowdown_survive_a_reload', async ($, on) => {
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { files: EIGHT, sent: () => ({ exitCode: 1, stderr: 'locked' }) })
+  for (let i = 0; i < 3; i++) await clock.advance(30_000)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  for (let i = 0; i < 4; i++) await clock.advance(30_000)
+  expect(decideCalls(out, 'sent').length).toBe(3)
+  expect(posts.length).toBe(1)
+  expect(recordLines(out)).toBe(1)
+})
+
 test('test_a_new_batch_gets_its_own_wake_line', async ($, on) => {
   let current = BATCH
   const { clock, out } = await bootBatch($, on, () => asText(JSON.stringify({ ok: true })), {

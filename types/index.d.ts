@@ -200,6 +200,12 @@ export type ChiefBatchState = {
   lineDue: boolean         // the wake line goes out with the next wake
   note: string | null      // why the last attempt failed, for the pane
   urgentSeen: string[]     // urgent decisions known at the last attempt; any other ends a hold
+  holdEnds: number[]       // epoch ms of holds an urgent decision ended, the last hour's; outlives a batch
+  lastAttemptAt: number | null   // epoch ms of the last post attempt; outlives a batch
+  sentFailures: number     // `decide sent` failures in a row for what's owed
+  sentRetryAt: number      // epoch ms: no `sent` before this, once it has failed 3 times
+  recordLineDue: boolean   // the "batch record is failing" line goes out with the next wake
+  recordWoken: boolean     // that line already went out for this debt
 }
 
 export type ChiefStatus = {

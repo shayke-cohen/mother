@@ -297,16 +297,29 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 //   wake line for that batch. A late result that has a ts is still recorded.
 // - did not land (a clear error before or from the call): back off 2, 4, 8 … minutes up to batch_minutes; once at that
 //   cap, one wake line for that batch. A batch holding an urgent decision gets that line on its first failure.
-// An urgent decision that came after the last attempt ends a hold, once per decision. What was already tried, urgent
-// or not, is never posted sooner than its hold allows.
+// An urgent decision that came after the last attempt ends a hold, once per decision, at most 3 times in a rolling hour
+// and never within 2 minutes of the last attempt (a worker sets `urgent`, so a stream of them must not become a stream of
+// DMs); past that it waits like any batch, and its card and toast still show it. What was already tried, urgent or not,
+// is never posted sooner than its hold allows.
+// After 3 `sent` failures in a row: one wake line saying so, and one retry per batch_minutes. The debt stays, and no new
+// post goes out while it's owed.
 // The state is in session state, so a reload of the mod can't cause a second post.
 const BATCH_WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
+const RECORD_WAKE_LINE = 'The batch record is failing: a batch went out, but `mother decide sent` keeps failing, so no new batch goes out until it succeeds.'
+const SENT_FAILURES_TO_SLOW = 3
+const HOLD_ENDS_PER_HOUR = 3
+const HOUR_MS = 60 * 60_000
+const HOLD_END_GAP_MS = 2 * 60_000
 const SLACK_TS_RE = /^\d+\.\d+$/
 const DEFAULT_BATCH_MINUTES = 30
 const FIRST_BACKOFF_MINUTES = 2
 const REFUSED_CALL_RE = /no connected|not connected|denied|refus|forbidden|unauthori[sz]ed|not allowed|permission|unknown tool|no such tool|not found|invalid|missing/i
 const TIMED_OUT_RE = /time[d\s-]*out/i
-const IDLE_BATCH: ChiefBatchState = { sentOwed: null, holdUntil: 0, failures: 0, wokenFor: null, lineDue: false, note: null, urgentSeen: [] }
+const IDLE_BATCH: ChiefBatchState = { sentOwed: null, holdUntil: 0, failures: 0, wokenFor: null, lineDue: false, note: null, urgentSeen: [],
+  holdEnds: [], lastAttemptAt: null, sentFailures: 0, sentRetryAt: 0, recordLineDue: false, recordWoken: false }
+// Back to idle; the urgent rate limit outlives any one batch, or a landed post would reset it.
+const idleAfter = (prev: ChiefBatchState | null): ChiefBatchState =>
+  ({ ...IDLE_BATCH, holdEnds: prev?.holdEnds ?? [], lastAttemptAt: prev?.lastAttemptAt ?? null })
 
 const urgentIds = (s: ChiefStatus | null): string[] => pendingDecisions(s).filter(d => d.urgent).map(d => d.id)
 
@@ -440,9 +453,28 @@ async function postBatch($: Dollar, bin: string): Promise<Attempt> {
 }
 
 async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: string }): Promise<void> {
+  const st = await batchState($)
+  const nowMs = await $.clock.now()
+  const failing = (why: string) => safe(`the batch went out, but recording it failed: ${why}`)
+  if (nowMs < (st.sentRetryAt ?? 0)) {
+    if (st.note) passError = st.note
+    return
+  }
   const sent = await cli($, bin, ['sent', '--ids', owed.ids, '--ts', owed.ts], undefined, 'decide')
-  if (sent.ok) await update($, chiefBatchAtom, () => IDLE_BATCH)
-  else passError = safe(`the batch went out, but recording it failed: ${firstLine(sent.stderr) || 'mother decide sent failed'}`)
+  if (sent.ok) {
+    await update($, chiefBatchAtom, prev => idleAfter(prev))
+    return
+  }
+  const note = failing(firstLine(sent.stderr) || 'mother decide sent failed')
+  passError = note
+  const failures = (st.sentFailures ?? 0) + 1
+  const slow = failures >= SENT_FAILURES_TO_SLOW
+  const retryAt = slow ? nowMs + (await batchMinutes($, bin)) * 60_000 : 0
+  const wake = slow && !st.recordWoken
+  await update($, chiefBatchAtom, prev => ({
+    ...(prev ?? IDLE_BATCH), note, sentFailures: failures, sentRetryAt: retryAt,
+    recordWoken: st.recordWoken || wake, recordLineDue: wake || st.recordLineDue,
+  }))
 }
 
 // The tick's batch step: a `sent` still owed first; else a post, when the tick says one is due and nothing holds it.
@@ -451,12 +483,16 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
   const st = await batchState($)
   if (st.sentOwed) return recordSent($, bin, st.sentOwed)
   if (!due) {
-    if (!tickPaused && (st.holdUntil || st.failures || st.wokenFor || st.lineDue || st.note)) await update($, chiefBatchAtom, () => IDLE_BATCH)
+    if (!tickPaused && (st.holdUntil || st.failures || st.wokenFor || st.lineDue || st.note)) await update($, chiefBatchAtom, prev => idleAfter(prev))
     return
   }
   const nowMs = await $.clock.now()
   const seen = st.urgentSeen ?? []
-  if (nowMs < st.holdUntil && urgentIds(lastStatus).every(id => seen.includes(id))) {
+  const holdEnds = (st.holdEnds ?? []).filter(t => nowMs - t < HOUR_MS)
+  const holding = nowMs < st.holdUntil
+  const endsHold = holding && urgentIds(lastStatus).some(id => !seen.includes(id)) && holdEnds.length < HOLD_ENDS_PER_HOUR &&
+    (st.lastAttemptAt === null || st.lastAttemptAt === undefined || nowMs - st.lastAttemptAt >= HOLD_END_GAP_MS)
+  if (holding && !endsHold) {
     if (st.note) passError = st.note
     return
   }
@@ -465,12 +501,13 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     passError = `batch not posted: ${held}`
     return
   }
+  await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lastAttemptAt: nowMs, holdEnds: endsHold ? [...holdEnds, nowMs] : holdEnds }))
   const got = await postBatch($, bin)
   if (got.end === 'nothing') {
-    await update($, chiefBatchAtom, () => IDLE_BATCH)
+    await update($, chiefBatchAtom, prev => idleAfter(prev))
   } else if (got.end === 'posted') {
     const owed = { ids: got.ids, ts: got.ts }
-    await update($, chiefBatchAtom, () => ({ ...IDLE_BATCH, sentOwed: owed }))
+    await update($, chiefBatchAtom, prev => ({ ...idleAfter(prev), sentOwed: owed }))
     await recordSent($, bin, owed)
   } else {
     const cap = await batchMinutes($, bin)
@@ -501,7 +538,7 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     if (sid && sid !== want) {
       passError = ID_CHANGED
       pendingWake = null
-      await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lineDue: false }))
+      await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lineDue: false, recordLineDue: false }))
       await reloadStatus($, bin)
       return
     }
@@ -527,11 +564,11 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     }
     const nowMs = await $.clock.now()
     const busyTurn = turnStartedAt !== null && nowMs - turnStartedAt < STUCK_TURN_MS
-    const lineDue = (await batchState($)).lineDue
-    if ((pendingWake || lineDue) && !busyTurn) {
-      const text = [pendingWake, lineDue ? BATCH_WAKE_LINE : null].filter(Boolean).join('\n')
+    const { lineDue, recordLineDue } = await batchState($)
+    if ((pendingWake || lineDue || recordLineDue) && !busyTurn) {
+      const text = [pendingWake, lineDue ? BATCH_WAKE_LINE : null, recordLineDue ? RECORD_WAKE_LINE : null].filter(Boolean).join('\n')
       pendingWake = null
-      if (lineDue) await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lineDue: false }))
+      if (lineDue || recordLineDue) await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lineDue: false, recordLineDue: false }))
       void $.prompt.submit({ text }).catch(() => undefined)
     }
   } else {
