@@ -253,11 +253,14 @@ def signed_edit(d: dict, cfg: dict, text: str) -> dict:
     """`d`'s input with the manager's `text`, still carrying the signature the guard wants, or the grant could never
     match. Their words stay as typed; the signature the draft carried goes on a line after them when they left it
     out. ValueError when that isn't possible."""
-    tool, inp = d["tool"], edited_input(d["input"], text)
+    tell = "Tell the worker what to change: %s <your words>" % str(d.get("id"))[1:]
     fields = [chief.safe_line(f, 60) for f, _ in draft_fields(d["input"], settings=False)]
     if len(fields) > 1:  # new text in one would send the others unread: the manager can say what to change instead
-        raise ValueError("this call sends %s, and an edit can only replace one. Tell the worker what to change: "
-                         "%s <your words>" % (" and ".join(fields), str(d.get("id"))[1:]))
+        raise ValueError("this call sends %s, and an edit can only replace one. %s" % (" and ".join(fields), tell))
+    try:
+        tool, inp = d["tool"], edited_input(d["input"], text)
+    except ValueError as e:
+        raise ValueError("%s. %s" % (e, tell))
     kind = kind_of(tool, inp)[0]
     if _signed(kind, tool, inp, cfg):
         return inp
@@ -269,6 +272,18 @@ def signed_edit(d: dict, cfg: dict, text: str) -> dict:
     if not _signed(kind, tool, inp, cfg):
         raise ValueError("the edited text can't carry the signature")
     return inp
+
+
+def edit_view(d: dict, cfg: dict) -> dict:
+    """What the Chief pane's Edit may do with `d`, known before anyone presses it: `edit_refusal`, why it can't be
+    edited (or None), and `edit_text`, the one field an edit replaces (None when refused). `full_text` won't do for that:
+    it can hold labels and settings an edit must not send."""
+    try:
+        signed_edit(d, cfg, "x")
+    except (ValueError, KeyError, TypeError) as e:
+        return {"edit_refusal": chief.safe_line(str(e), 300) or "this call can't be edited", "edit_text": None}
+    fields = draft_fields(d["input"], settings=False)
+    return {"edit_refusal": None, "edit_text": fields[0][1] if fields else ""}
 
 
 _NUM = re.compile(r"^d?(\d+)$")

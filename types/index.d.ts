@@ -185,6 +185,8 @@ export type ChiefDecision = {
   text: string
   full_text?: string
   target?: string | null
+  edit_refusal?: string | null       // why Edit can't be used on this call; absent from an older CLI
+  edit_text?: string | null          // the one field an edit replaces: Edit's prefill
   urgent: boolean
   status: 'pending' | 'approved' | 'rejected' | 'redirected' | 'expired' | 'sent' | 'failed' | 'manual' | string
   created: string

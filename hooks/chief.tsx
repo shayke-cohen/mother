@@ -44,7 +44,7 @@ const runAt = (w: ChiefWorker): number => (w.last_run_at ? Date.parse(w.last_run
 export const byAttention = (ws: ChiefWorker[]): ChiefWorker[] =>
   [...ws].sort((a, b) => rank(a) - rank(b) || runAt(b) - runAt(a))
 
-type Ran = { ok: boolean; stdout: string; stderr: string }
+type Ran = { ok: boolean; stdout: string; stderr: string; code?: number }
 
 // process.run's own timeout (30 s by default) rejects a hung command, which `cli` turns into a failure, so a hung
 // `tick` can never hold the busy flag for good. A tick decides and dispatches, so it gets longer.
@@ -55,7 +55,7 @@ async function cli($: Dollar, bin: string, args: string[], stdin?: string, noun:
   try {
     const timeoutMs = TIMEOUT_MS[args[0] ?? ''] ?? DEFAULT_TIMEOUT_MS
     const ran = await $.process.run(['python3', bin, noun, ...args], stdin === undefined ? { timeoutMs } : { timeoutMs, stdin })
-    return { ok: ran.exitCode === 0, stdout: String(ran.stdout ?? ''), stderr: String(ran.stderr ?? '') }
+    return { ok: ran.exitCode === 0, stdout: String(ran.stdout ?? ''), stderr: String(ran.stderr ?? ''), code: ran.exitCode ?? undefined }
   } catch (err) {
     return { ok: false, stdout: '', stderr: (err as Error).message ?? String(err) }
   }
@@ -109,6 +109,8 @@ export function pendingDecisions(s: ChiefStatus | null): ChiefDecision[] {
 // One line of worker-written text for a toast or a list; the worker's draft is untrusted, the same as a transcript.
 const oneLine = (text: unknown, cap = 200): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ').slice(0, cap)
 const WHY_MAX = 200
+const TARGET_MAX = 200
+const EDIT_REFUSAL_MAX = 300
 const RECOMMEND_MAX = 60
 
 // A toast once per urgent decision. The ids live in session state, so a reload of the mod doesn't repeat them.
@@ -301,11 +303,16 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 // and never within 2 minutes of the last attempt (a worker sets `urgent`, so a stream of them must not become a stream of
 // DMs); past that it waits like any batch, and its card and toast still show it. What was already tried, urgent or not,
 // is never posted sooner than its hold allows.
-// After 3 `sent` failures in a row: one wake line saying so, and one retry per batch_minutes. The debt stays, and no new
-// post goes out while it's owed.
-// The state is in session state, so a reload of the mod can't cause a second post.
-const BATCH_WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
-const RECORD_WAKE_LINE = 'The batch record is failing: a batch went out, but `mother decide sent` keeps failing, so no new batch goes out until it succeeds.'
+// After 3 `sent` failures in a row: one wake line saying so, with the ids and ts routines/chief.md runs `sent` with, and
+// one retry per batch_minutes. The debt stays, and no new post goes out while it's owed.
+// A `sent` refused for good (exit 2: its offer was already used, by a `sent` whose answer got lost or the chief's, or
+// replaced by a later batch) can never succeed, so the debt goes. What it didn't stamp is listed in the next batch.
+// The state is in session state, so a reload of the mod can't cause a second post: a hold is set before each post, for a
+// reload during one, whose answer is lost with the process.
+const BATCH_WAKE_LINE = "A batch is due and the mod couldn't post it: follow the Decisions part of routines/chief.md."
+const recordWakeLine = (owed: { ids: string; ts: string }): string =>
+  `The batch record is failing: the batch is already posted, but \`mother decide sent\` keeps failing, so no new batch goes out. Its ids are ${owed.ids || 'empty'} and its ts is ${owed.ts}: run \`mother decide sent --ids ${owed.ids || "''"} --ts ${owed.ts}\` once, as routines/chief.md says. Never re-post the batch.`
+const SENT_REFUSED_EXIT = 2
 const SENT_FAILURES_TO_SLOW = 3
 const HOLD_ENDS_PER_HOUR = 3
 const HOUR_MS = 60 * 60_000
@@ -465,6 +472,11 @@ async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: strin
     await update($, chiefBatchAtom, prev => idleAfter(prev))
     return
   }
+  if (sent.code === SENT_REFUSED_EXIT) {
+    passError = safe(`a batch record was refused, so it's dropped: ${firstLine(sent.stderr) || 'mother decide sent refused it'}`)
+    await update($, chiefBatchAtom, prev => idleAfter(prev))
+    return
+  }
   const note = failing(firstLine(sent.stderr) || 'mother decide sent failed')
   passError = note
   const failures = (st.sentFailures ?? 0) + 1
@@ -501,7 +513,8 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     passError = `batch not posted: ${held}`
     return
   }
-  await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lastAttemptAt: nowMs, holdEnds: endsHold ? [...holdEnds, nowMs] : holdEnds }))
+  const inFlightHold = nowMs + (await batchMinutes($, bin)) * 60_000
+  await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lastAttemptAt: nowMs, holdUntil: inFlightHold, holdEnds: endsHold ? [...holdEnds, nowMs] : holdEnds }))
   const got = await postBatch($, bin)
   if (got.end === 'nothing') {
     await update($, chiefBatchAtom, prev => idleAfter(prev))
@@ -564,9 +577,9 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     }
     const nowMs = await $.clock.now()
     const busyTurn = turnStartedAt !== null && nowMs - turnStartedAt < STUCK_TURN_MS
-    const { lineDue, recordLineDue } = await batchState($)
-    if ((pendingWake || lineDue || recordLineDue) && !busyTurn) {
-      const text = [pendingWake, lineDue ? BATCH_WAKE_LINE : null, recordLineDue ? RECORD_WAKE_LINE : null].filter(Boolean).join('\n')
+    const { lineDue, recordLineDue, sentOwed } = await batchState($)
+    if ((pendingWake || lineDue || (recordLineDue && sentOwed)) && !busyTurn) {
+      const text = [pendingWake, lineDue ? BATCH_WAKE_LINE : null, recordLineDue && sentOwed ? recordWakeLine(sentOwed) : null].filter(Boolean).join('\n')
       pendingWake = null
       if (lineDue || recordLineDue) await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lineDue: false, recordLineDue: false }))
       void $.prompt.submit({ text }).catch(() => undefined)
@@ -1104,7 +1117,10 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     const allKey = 'decide-all:' + d.id
     const showAll = hasFull && drafts?.[allKey] !== undefined
     const draft = showAll ? whole : whole.slice(0, DRAFT_SHOWN)
-    const where = [oneLine(d.kind, 40), typeof d.target === 'string' && d.target.trim() ? oneLine(d.target, 120) : ''].filter(Boolean).join(' → ')
+    // the target can be composite ("C00000001, thread_ts 1700000000.000100"): the CLI's cap, so none of it is cut off
+    const where = [oneLine(d.kind, 40), typeof d.target === 'string' && d.target.trim() ? oneLine(d.target, TARGET_MAX) : ''].filter(Boolean).join(' → ')
+    const refusal = typeof d.edit_refusal === 'string' && d.edit_refusal.trim() ? oneLine(d.edit_refusal, EDIT_REFUSAL_MAX) : ''
+    const prefill = typeof d.edit_text === 'string' ? safe(d.edit_text) : whole
     const inputKey = 'decide-text:' + d.id
     const editing = drafts?.[inputKey]
     const message = answers?.[d.id]?.message
@@ -1120,11 +1136,12 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
           ? <Button key={'decide-more:' + d.id} onPress={() => showAll ? clearDraft($, allKey) : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [allKey]: '1' }))}>{showAll ? 'Show less' : 'Show all'}</Button>
           : null}
         {message ? <Text color="warning" wrap="wrap">{message}</Text> : null}
+        {refusal ? <Text dimColor wrap="wrap">{`No Edit here: ${refusal} (a reply in the self-DM).`}</Text> : null}
         {editing === undefined
           ? (
             <Box flexWrap="wrap" gap="xs">
               <Button key={'decide-ok:' + d.id} onPress={() => answerDecision($, bin, d, 'ok')}>Approve</Button>
-              <Button key={'decide-edit:' + d.id} onPress={() => update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [inputKey]: hasFull || !cut ? whole : '' }))}>Edit</Button>
+              {refusal ? null : <Button key={'decide-edit:' + d.id} onPress={() => update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [inputKey]: hasFull || !cut ? prefill : '' }))}>Edit</Button>}
               <Button key={'decide-no:' + d.id} onPress={() => answerDecision($, bin, d, 'no')}>Reject</Button>
             </Box>
           )

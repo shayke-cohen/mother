@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { chiefStatusText, cleanTldr } from './chief'
+import { CLI } from '../tests/fixtures/chief_cli'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-11-02T10:00:00Z')
@@ -8,7 +9,7 @@ function worker(over: Record<string, unknown> = {}) {
   return {
     key: 'PLAT-1', title: 'Fix the login bug', status: 'idle', held: false, running: false,
     progress: 'patched the handler, tests next', cost: 0.42, runs: 2, last_run_at: '2026-11-02T09:55:00Z',
-    session_id: 'sess-1', queued: 0, resume: 'claude --resume sess-1', ...over,
+    session_id: 'sess-1', queued: 0, resume: 'claude --resume sess-1', unseen: 0, ...over,
   }
 }
 
@@ -16,8 +17,11 @@ function status(over: Record<string, unknown> = {}) {
   return {
     version: 1, at: '2026-11-02T10:00:00Z', paused: false,
     chief: { alive: true, heartbeat_at: '2026-11-02T09:59:40Z', session_id: 'chief-1' },
-    budget: { spent: 1.5, limit: 20 },
+    budget: { spent: 1.5, limit: 20, unreadable: false, over: false },
     workers: [worker()],
+    desktop: [],
+    decisions: [],
+    to_decide: 0,
     ...over,
   }
 }
@@ -59,7 +63,7 @@ async function boot($: any, on: any, role: string, chief: (argv: string[], stdin
       if (r) return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
       if (argv[3] === 'role') return ok(role + '\n')
       if (argv[3] === 'status') return ok(JSON.stringify(status()))
-      if (argv[3] === 'tick') return ok(JSON.stringify({ paused: false, decided: [], wake: null, judge: [], dispatched: [], reconciled: [] }))
+      if (argv[3] === 'tick') return ok(JSON.stringify({ paused: false, decided: [], wake: null, judge: [], dispatched: [], reconciled: [], batch: false }))
     }
     return ok()
   })
@@ -1083,10 +1087,15 @@ test('test_a_slow_model_batch_does_not_hold_the_tick', async ($, on) => {
 
 // ---- To decide: cards, answer buttons, batch posting ----
 const DM = 'D00000001'
-const decision = (over: Record<string, unknown> = {}) => ({
-  id: 'D7', key: 'PLAT-1', kind: 'chat-post', recommendation: 'send', why: 'The thread asks for a date',
-  text: 'We ship on Tuesday.', urgent: false, status: 'pending', created: '2026-11-02T08:00:00Z', expires: '2026-11-04T08:00:00Z', ...over,
-})
+// As `mother chief status` prints one. A test of an older CLI passes full_text: undefined.
+const decision = (over: Record<string, any> = {}) => {
+  const text = over.text ?? 'We ship on Tuesday.'
+  const whole = 'full_text' in over ? over.full_text : text
+  return {
+    id: 'D7', key: 'PLAT-1', kind: 'chat-post', target: 'C00000001', recommendation: 'send', why: 'The thread asks for a date',
+    text, full_text: whole, edit_refusal: null, edit_text: whole, urgent: false, status: 'pending', created: '2026-11-02T08:00:00Z', expires: '2026-11-04T08:00:00Z', ...over,
+  }
+}
 const withDecisions = (ds: unknown[], over: Record<string, unknown> = {}): Cli =>
   ({ exitCode: 0, stdout: JSON.stringify(status({ decisions: ds, to_decide: ds.length, ...over })) })
 const decideCalls = (out: { argv: string[][] }, verb: string) => out.argv.filter(a => a[2] === 'decide' && a[3] === verb)
@@ -1200,7 +1209,7 @@ test('test_edit_cancel_answers_nothing', async ($, on) => {
 })
 
 test('test_edit_of_a_cut_draft_starts_empty_without_full_text', async ($, on) => {
-  await bootCards($, on, () => [decision({ text: 'y'.repeat(400) })])
+  await bootCards($, on, () => [decision({ text: 'y'.repeat(400), full_text: undefined, edit_text: undefined })])
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'decide-edit:D7' })
   expect((await ui.find({ key: 'decide-text:D7' }))?.props?.value ?? '').toBe('')    // a cut prefill would send the cut text
@@ -1268,7 +1277,7 @@ test('test_chief_decisions_lists_and_never_answers', async ($, on) => {
   expect(answerArgs(out)).toEqual([])
 })
 
-const BATCH = { text: '2 to decide · 0 done without you\nD7 · PLAT-1: why · recommend: send', ids: ['D7', 'D8'] }
+const BATCH = { text: '2 to decide · 0 done without you\nD7 · PLAT-1 · chat-post on C00000001: "We ship" · why: asked · recommend: send\nD8 · PLAT-1 · chat-post on C00000001: "Later" · recommend: send\nReply in this DM, not in a thread: 7 ok · 7 no · 7 edit: your text · ok all', ids: ['D7', 'D8'] }
 const POST_TS = '1762077600.000100'
 const FILES = {
   [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: ['U00000001', DM] }, connectors: { chat: 'slack' } }),
@@ -1285,7 +1294,7 @@ async function bootBatch($: any, on: any, mcp: () => any, opts: BatchOpts = {}) 
   const booted = await boot($, on, opts.role ?? 'chief', (argv, stdin) => {
     if (argv[0] === 'tick') return { exitCode: 0, stdout: JSON.stringify({ paused: false, wake: null, judge: [], batch: (opts.due ?? (() => true))(), ...opts.tick }) }
     if (argv[0] === 'decide' && argv[1] === 'batch') return opts.batch ? opts.batch() : { exitCode: 0, stdout: JSON.stringify(BATCH) }
-    if (argv[0] === 'decide' && argv[1] === 'sent') return opts.sent ? opts.sent() : { exitCode: 0, stdout: '{}' }
+    if (argv[0] === 'decide' && argv[1] === 'sent') return opts.sent ? opts.sent() : { exitCode: 0, stdout: '{"ok": true}\n' }
     if (argv[0] === 'post-log') { logs.push(JSON.parse(String(stdin))); return opts.log?.() }
     if (argv[0] === 'status' && opts.decisions) return withDecisions(opts.decisions())
     return undefined
@@ -1295,7 +1304,7 @@ async function bootBatch($: any, on: any, mcp: () => any, opts: BatchOpts = {}) 
 const lineCount = (out: { submits: string[] }) => out.submits.filter(t => t.includes(WAKE_LINE)).length
 const asText = (text: string, isError = false) => ({ value: { content: [{ type: 'text', text }], isError } })
 const SOON = { ...FILES, [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: ['U00000001', DM] }, connectors: { chat: 'slack' }, chief: { batch_minutes: 2 } }) }
-const WAKE_LINE = 'A batch is due: post it (routines/chief.md).'
+const WAKE_LINE = "A batch is due and the mod couldn't post it: follow the Decisions part of routines/chief.md."
 // batch_minutes 8: the long tests walk every tick, and a test has 5 s.
 const EIGHT = { ...FILES, [WS + '/config.json']: JSON.stringify({ manager: { chat_dm: ['U00000001', DM] }, connectors: { chat: 'slack' }, chief: { batch_minutes: 8 } }) }
 
@@ -1336,7 +1345,7 @@ for (const tick of [{ batch: false }, { batch: 'yes' }, { batch: true, paused: t
 }
 
 test('test_empty_batch_posts_nothing', async ($, on) => {
-  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 0, stdout: '' }) })
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 0, stdout: 'null\n' }) })
   await clock.advance(30_000)
   expect(posts).toEqual([])
   expect(decideCalls(out, 'sent')).toEqual([])
@@ -1590,12 +1599,12 @@ test('test_hold_end_count_survives_a_batch_that_landed', async ($, on) => {
 })
 
 // ---- N2: a `sent` that keeps failing wakes the chief once and slows down ----
-const RECORD_LINE = 'The batch record is failing: a batch went out, but `mother decide sent` keeps failing, so no new batch goes out until it succeeds.'
+const RECORD_LINE = `The batch record is failing: the batch is already posted, but \`mother decide sent\` keeps failing, so no new batch goes out. Its ids are D7,D8 and its ts is ${POST_TS}: run \`mother decide sent --ids D7,D8 --ts ${POST_TS}\` once, as routines/chief.md says. Never re-post the batch.`
 const recordLines = (out: { submits: string[] }) => out.submits.filter(t => t.includes(RECORD_LINE)).length
 
 test('test_sent_failing_wakes_once_slows_and_a_success_clears_it', async ($, on) => {
   let fail = true
-  const { clock, out, posts } = await bootBatch($, on, postedOk, { files: EIGHT, sent: () => (fail ? { exitCode: 1, stderr: 'locked' } : { exitCode: 0, stdout: '{}' }) })
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { files: EIGHT, sent: () => (fail ? { exitCode: 1, stderr: 'locked' } : { exitCode: 0, stdout: '{"ok": true}\n' }) })
   await clock.advance(30_000)                                                  // t = 0.5: the post, and `sent` fails once
   await clock.advance(30_000)
   expect(recordLines(out)).toBe(0)
@@ -1738,7 +1747,7 @@ test('test_failed_sent_is_retried_without_posting_again', async ($, on) => {
 
 test('test_reload_keeps_what_the_post_owes', async ($, on) => {
   let fail = true
-  const { clock, out, posts } = await bootBatch($, on, postedOk, { sent: () => (fail ? { exitCode: 1, stderr: 'locked' } : { exitCode: 0, stdout: '{}' }) })
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { sent: () => (fail ? { exitCode: 1, stderr: 'locked' } : { exitCode: 0, stdout: '{"ok": true}\n' }) })
   await clock.advance(30_000)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })    // a reload runs session.start again
   await clock.settle()
@@ -1767,7 +1776,7 @@ test('test_failure_reason_cannot_blank_the_pane', async ($, on) => {
 })
 
 test('test_confirm_only_batch_marks_sent_with_no_ids', async ($, on) => {
-  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 0, stdout: JSON.stringify({ text: '✓ D1 done', ids: [] }) }) })
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 0, stdout: JSON.stringify({ text: '0 to decide · 0 done without you\n✓ D1: the call was made (chat-reply on C00000001)', ids: [] }) }) })
   await clock.advance(30_000)
   expect(posts.length).toBe(1)
   expect(decideCalls(out, 'sent')[0].slice(4)).toEqual(['--ids', '', '--ts', POST_TS])
@@ -1822,7 +1831,7 @@ test('test_card_shows_kind_and_target', async ($, on) => {
 })
 
 test('test_card_without_target_shows_kind_only', async ($, on) => {
-  await bootCards($, on, () => [decision(), decision({ id: 'D8', target: null, kind: 'tracker-comment' })])
+  await bootCards($, on, () => [decision({ target: null }), decision({ id: 'D8', target: null, kind: 'tracker-comment' })])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await hasText(ui, /^chat-post$/)).toBe(true)
   expect(await hasText(ui, /^tracker-comment$/)).toBe(true)
@@ -1957,8 +1966,135 @@ test('test_safe_tab_to_space', async () => {
 })
 
 test('test_confirm_only_batch_marks_sent_with_no_ids', async ($, on) => {
-  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 0, stdout: JSON.stringify({ text: '✓ D1 done', ids: [] }) }) })
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => ({ exitCode: 0, stdout: JSON.stringify({ text: '0 to decide · 0 done without you\n✓ D1: the call was made (chat-reply on C00000001)', ids: [] }) }) })
   await clock.advance(30_000)
   expect(posts.length).toBe(1)
   expect(decideCalls(out, 'sent')[0].slice(4)).toEqual(['--ids', '', '--ts', POST_TS])
+})
+
+// ---- the real CLI's output (tests/fixtures/chief_cli.ts, which tests/test_cli_contract.py holds to bin/mother) ----
+const real = (r: { exitCode: number; stdout: string; stderr: string }): Cli => ({ exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr })
+
+test('test_real_status_draws_the_cards', async ($, on) => {
+  await boot($, on, 'console', argv => (argv[0] === 'status' ? real(CLI.status_pending) : undefined))
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const all = await texts(ui)
+    expect(all).toContain('To decide 3')
+    expect(all).toContain('chat-reply → C00000001, thread_ts 1700000000.000100')   // a composite target, whole
+    expect(all).toContain('tracker-create → PLAT, issueType Bug')
+    expect(all).toContain('summary: s\n\ndescription: d')                           // every field that would go out
+    expect(all.some((t: string) => /^We ship Tuesday\./.test(t))).toBe(true)
+    for (const id of ['D1', 'D2', 'D3']) expect((await ui.find({ key: 'decide-ok:' + id }))?.text).toBe('Approve')
+    await ui.unmount()
+  }
+})
+
+test('test_real_several_fields_have_no_edit_and_say_why', async ($, on) => {
+  await boot($, on, 'console', argv => (argv[0] === 'status' ? real(CLI.status_pending) : undefined))
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'decide-edit:D2' })).toBeUndefined()
+    expect(await ui.find({ key: 'decide-edit:D3' })).toBeUndefined()
+    expect(await hasText(ui, /^No Edit here: this call sends summary and description, and an edit can only replace one\. Tell the worker what to change: 2 <your words>/)).toBe(true)
+    await ui.press({ key: 'decide-edit:D1' })                                       // the single-field one still edits
+    expect(String((await ui.find({ key: 'decide-text:D1' }))?.props?.value)).toMatch(/^We ship Tuesday\.\n.*Agnes \(AI\)/)
+    await ui.press({ key: 'decide-cancel:D1' })
+    await ui.unmount()
+  }
+})
+
+test('test_edit_prefill_is_the_field_not_the_labelled_text', async ($, on) => {
+  // reply_broadcast shows in full_text, so the prefill can't be full_text: it would be sent as the words
+  await bootCards($, on, () => [decision({ full_text: 'text: hi\n\nreply_broadcast: true', edit_text: 'hi' })])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'decide-edit:D7' })
+  expect((await ui.find({ key: 'decide-text:D7' }))?.props?.value).toBe('hi')
+  await ui.unmount()
+})
+
+test('test_real_refused_edit_and_answers_show_their_message', async ($, on) => {
+  let answer = real(CLI.answer_again)
+  await bootCards($, on, () => JSON.parse(CLI.status_pending.stdout).decisions, () => answer)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'decide-ok:D1' })
+  expect(await hasText(ui, /^D1 is already approved\.$/)).toBe(true)
+  answer = real(CLI.answer_usage)
+  await ui.press({ key: 'decide-ok:D2' })
+  expect(await hasText(ui, /^usage: mother decide answer/)).toBe(true)
+  answer = real(CLI.answer_ok)
+  await ui.press({ key: 'decide-ok:D3' })
+  expect(await hasText(ui, /approved: PLAT-1 will make that one call\.$/)).toBe(true)
+  await ui.unmount()
+})
+
+test('test_real_batch_posts_the_text_then_records_it', async ($, on) => {
+  let due = true
+  const { clock, out, posts } = await bootBatch($, on, postedOk, {
+    due: () => due, tick: {},
+    batch: () => real(CLI.batch_due),
+    sent: () => { due = false; return real(CLI.sent_ok) },
+  })
+  await clock.advance(30_000)
+  expect(JSON.parse(CLI.tick_due.stdout).batch).toBe(true)
+  expect(posts.length).toBe(1)
+  expect(posts[0].args.text).toBe(JSON.parse(CLI.batch_due.stdout).text)
+  expect(decideCalls(out, 'sent').map(a => a.slice(4))).toEqual([['--ids', 'D1,D2,D3', '--ts', POST_TS]])
+  const order = out.argv.filter(a => a[2] === 'decide').map(a => a[3])
+  expect(order).toEqual(['batch', 'sent'])                                      // `sent` needs its offer first
+  await clock.advance(30_000)
+  expect(posts.length).toBe(1)
+  expect(out.submits).toEqual([])
+})
+
+test('test_real_tick_with_nothing_due_posts_nothing', async ($, on) => {
+  const { clock, out, posts } = await boot2Real($, on)
+  await clock.advance(30_000)
+  expect(posts).toEqual([])
+  expect(decideCalls(out, 'sent')).toEqual([])
+})
+async function boot2Real($: any, on: any) {
+  const posts: any[] = []
+  on('mcp.call', (_: any, e: any) => { posts.push(e); return postedOk() })
+  const booted = await boot($, on, 'chief', argv => {
+    if (argv[0] === 'tick') return real(CLI.tick_nothing)
+    if (argv[0] === 'decide' && argv[1] === 'batch') return real(CLI.batch_nothing)
+    return undefined
+  }, 'terminal', 'chief-1', FILES)
+  return { ...booted, posts }
+}
+
+test('test_real_null_from_a_due_tick_is_nothing_to_post', async ($, on) => {
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { batch: () => real(CLI.batch_nothing) })
+  await clock.advance(30_000)
+  expect(posts).toEqual([])
+  expect(decideCalls(out, 'sent')).toEqual([])
+  expect(out.submits).toEqual([])
+})
+
+// A `sent` whose answer got lost, or one the chief ran: the offer is used up, so a retry exits 2 for good.
+test('test_sent_refused_for_good_drops_the_debt_and_the_next_batch_can_go', async ($, on) => {
+  let n = 0
+  const { clock, out, posts } = await bootBatch($, on, postedOk, { files: EIGHT, sent: () => (n++ === 0 ? real(CLI.sent_again) : real(CLI.sent_ok)) })
+  await clock.advance(30_000)                                                  // posted; `sent` refused
+  expect(decideCalls(out, 'sent').length).toBe(1)
+  expect(recordLines(out)).toBe(0)
+  await clock.advance(30_000)                                                  // no debt, no hold: the still-due batch relists them
+  expect(posts.length).toBe(2)
+  expect(decideCalls(out, 'sent').length).toBe(2)
+})
+
+test('test_chief_recording_it_clears_the_debt_after_the_wake', async ($, on) => {
+  let n = 0
+  const { clock, out, posts } = await bootBatch($, on, postedOk, {
+    files: EIGHT, due: () => n < 4,
+    sent: () => (++n <= 3 ? { exitCode: 1, stderr: 'locked' } : real(CLI.sent_again)),   // the chief ran it after the wake
+  })
+  for (let i = 0; i < 3; i++) await clock.advance(30_000)
+  expect(out.submits.filter(t => t.includes(RECORD_LINE)).length).toBe(1)
+  for (let i = 0; i < 17; i++) await clock.advance(30_000)                    // past the slow wait: the retry is refused
+  expect(decideCalls(out, 'sent').length).toBe(4)
+  for (let i = 0; i < 20; i++) await clock.advance(30_000)                    // and the debt is gone: no more retries
+  expect(decideCalls(out, 'sent').length).toBe(4)
+  expect(posts.length).toBe(1)
 })

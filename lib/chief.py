@@ -1442,10 +1442,15 @@ VERBS = {
 }
 
 
+def _edit_shown(view: dict) -> dict:
+    return dict(view, edit_text=_safe(view["edit_text"]) if isinstance(view["edit_text"], str) else None)
+
+
 def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     """The ChiefStatus document the mod reads (version 1). Workers: running first, then last_run_at newest first.
     `decisions` is every pending decision, oldest first: `text` capped, `full_text` all the call would send (see
-    decisions.draft_text), `why` and `recommendation` one safe line; `to_decide` how many."""
+    decisions.draft_text), `why` and `recommendation` one safe line, `edit_refusal` and `edit_text` what Edit may do
+    (decisions.edit_view); `to_decide` how many."""
     import decisions
     ws = Path(ws)
     cdir = chief_dir(ws)
@@ -1473,7 +1478,8 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
               "recommendation": safe_line(d.get("recommendation"), PROGRESS_MAX),
               "why": safe_line(d.get("why"), PROGRESS_MAX), "text": _safe(d.get("text") or "")[:DECISION_TEXT_MAX],
               "full_text": _safe(decisions.draft_text(d.get("input"))), "urgent": bool(d.get("urgent")),
-              "status": d.get("status"), "created": d.get("created"), "expires": d.get("expires")}
+              "status": d.get("status"), "created": d.get("created"), "expires": d.get("expires"),
+              **_edit_shown(decisions.edit_view(d, cfg or {}))}
              for d in decisions.pending(ws)]
     return {
         "version": 1, "at": hub._iso(at), "paused": paused(ws),

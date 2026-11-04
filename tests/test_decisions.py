@@ -703,6 +703,28 @@ class DraftTextTest(Base):
         self.assertEqual(decisions.draft_text({"to": "a@b.c", "subject": "s", "cc": "x@b.c", "body": "b"}),
                          "subject: s\n\ncc: x@b.c\n\nbody: b")
 
+    def test_edit_view_says_up_front_what_edit_can_do(self):
+        one = self.propose()
+        self.assertEqual(decisions.edit_view(one, SIGNED), {"edit_refusal": None, "edit_text": REPLY["text"]})
+        tool = "mcp__tracker__jira__create-issue"
+        several = self.propose(tool=tool, inp={"projectKey": "PLAT", "summary": "s", "description": "d"})
+        view = decisions.edit_view(several, SIGNED)
+        self.assertIn("summary and description", view["edit_refusal"])
+        self.assertIn("2 <your words>", view["edit_refusal"])
+        self.assertIsNone(view["edit_text"])
+        no_text = self.propose(tool=tool, inp={"projectKey": "PLAT", "summary": "only"})
+        self.assertIn("3 <your words>", decisions.edit_view(no_text, SIGNED)["edit_refusal"])
+
+    def test_edit_view_text_leaves_out_a_shown_setting(self):
+        d = self.propose(inp=dict(REPLY, reply_broadcast=True))
+        self.assertIn("reply_broadcast", decisions.draft_text(d["input"]))
+        self.assertEqual(decisions.edit_view(d, SIGNED)["edit_text"], REPLY["text"])
+
+    def test_edit_of_a_create_says_several_fields_not_no_text(self):
+        self.propose(tool="mcp__tracker__jira__create-issue", inp={"projectKey": "PLAT", "summary": "s", "description": "d"})
+        got = decisions.answer(self.ws, SIGNED, AT, 1, "edit", "new", {"via": "pane"})
+        self.assertIn("summary and description", got)
+
     def test_edit_refuses_a_call_with_several_fields(self):
         """New text in one field would send the others unread."""
         cfg = dict(SIGNED, manager={"chat_dm": ["U00000001", "D00000001"]})
