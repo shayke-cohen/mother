@@ -1402,6 +1402,34 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   `dms set|drop`, the job verbs) is denied, and the reads (`status`, `check`, `show`, `watching`, `tail`,
   `session for`, `dms show`) stay.
 - **Phase 1 sends nothing.** A worker that needs a send reports it in `progress` and the chief records a `now` line.
+- **Decisions in the guard (Phase 2).** A grant carrying `draft_sha` or `decision` covers one exact call: it matches only
+  when `draft_sha(tool, input)` equals its `draft_sha`, checked before the ledger, so a mismatch costs no use. Its
+  ledger key includes the decision, so one reply can answer several. `source.channel: "pane"` counts only on such a
+  grant with both fields; the owner, age and expiry checks still apply.
+  - **Only the manager answers.** In every session, a shell command is denied when it names `mother decide
+    answer|approve|reject|edit` (by name or path, any flag order, `$'…'` decoded), holds `{ } * ? [ ] $` or a backtick in
+    the word after `mother` or `decide`, or imports `decisions`/`grants`. `lib/decisions` and `lib/grants` (`.py` or no
+    extension) by path count when that command or pipeline runs an interpreter or writes; a linter under `python3 -m`
+    and plain reads pass. Quoted text and heredoc bodies count, except in one plain `git commit`, `git log`, `grep`, `rg`
+    (no `--pre`, `--hostname-bin`), `echo` or `gh` read or PR body with no pipe, redirect, `;`, `&`, `$(`, backtick or
+    unquoted `$`. `mother decide answer` itself also refuses in a process with `MOTHER_CHIEF_WORKER`. It does not refuse
+    on `MOTHER_CHIEF_ROLE`: the Chief pane's mod runs in the chief's session and inherits it.
+  - **Residual.** Text matching can't see a string built at run time (`'ans'+'wer'`, `printf … | sh`) or a script on disk
+    (`python3 /tmp/x.py`). In a worker and the chief the rule below stops those. In a normal session they get that
+    session's ordinary shell rules, which outside the workspace or with the policy switches on means they run; and a
+    script that unsets `MOTHER_CHIEF_WORKER` gets past the CLI's refusal. The guard is not a boundary against code the
+    session already runs.
+  - **Workers and the chief get no passes.** With `MOTHER_CHIEF_WORKER` set or `MOTHER_CHIEF_ROLE=chief`,
+    `policy.shell_unasked`, `shell_in_bypass`, `bypass_passes_asks`, functional autonomy and bypass mode outside the
+    workspace open nothing, and the shell allow-list applies wherever the command's cwd is. A worker counts as hub-fed
+    from its first turn, and a typed `mother approve` line doesn't count in it. Every ask from a worker is a deny that
+    tells it to file a decision or say what it needs in its PROGRESS line, as the chief's asks already are. What remains
+    open: reads, workspace edits, the allow-list, the manager's own DM, a live bound grant, a worker's exact `mother
+    decide propose` (checked before the text rule, so quoted third-party text can't stop a filing), and the chief's
+    `mother chief …` and `mother decide batch [--json]`, `sent --ids D7,D8 [--ts TS]`.
+  - **Stores.** Write, Edit, MultiEdit, NotebookEdit and shell writes to `.mother/chief/decisions.json` and
+    `.mother/hub/inbox.jsonl` ask in every session (denied under PAUSED and in the chief and workers), wherever they run
+    and through paths the guard can't resolve, since the folder and file are named.
 
 ## 6. Sync (`bin/mother sync`)
 

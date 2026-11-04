@@ -600,5 +600,32 @@ class AnswerTest(Base):
         self.assertEqual(json.loads(out.getvalue()), {"ok": False, "message": "D1 is already approved."})
 
 
+class AnswerEnvironment(unittest.TestCase):
+    """Fix round 1, C1: behind the guard, a worker's process can't answer; the Chief pane, in the chief's session, can."""
+
+    def setUp(self):
+        import tempfile as _t
+        self._tmp = _t.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ws = Path(self._tmp.name)
+
+    def test_worker_env_is_refused_and_writes_nothing(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"MOTHER_CHIEF_WORKER": "PLAT-1"}), \
+                mock.patch.object(decisions, "_answer", side_effect=AssertionError("must not run")):
+            code = decisions.main(["answer", "1", "ok", "--via", "pane"], self.ws, {}, out, err)
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(out.getvalue())["ok"])
+
+    def test_chief_role_env_still_answers(self):
+        """hooks/chief.tsx's `$.process.run` inherits the keeper's MOTHER_CHIEF_ROLE (it is how the mod reads its role)."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"MOTHER_CHIEF_ROLE": "chief"}), \
+                mock.patch.object(decisions, "_answer", return_value=(True, "D1 approved")) as called:
+            code = decisions.main(["answer", "1", "ok", "--via", "pane"], self.ws, {}, out, err)
+        self.assertEqual(code, 0)
+        called.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

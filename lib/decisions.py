@@ -10,6 +10,7 @@ written atomically. Python 3.9 stdlib only.
 import contextlib
 import importlib.util
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -528,7 +529,13 @@ def main(args, ws, cfg, out=sys.stdout, err=sys.stderr, at: Optional[datetime] =
 
 
 def _main_answer(rest, ws, cfg, out, err, at) -> int:
-    """mother decide answer <n> <ok|no|edit|say> --via pane|typed [-- <text>] — for the Chief pane only."""
+    """mother decide answer <n> <ok|no|edit|say> --via pane|typed [-- <text>] — for the Chief pane only. Refused in a
+    worker's process, behind the guard's deny. Not on MOTHER_CHIEF_ROLE: the pane's mod runs in the chief's session and
+    inherits it (hooks/chief.tsx reads its role the same way)."""
+    if os.environ.get(guard.CHIEF_WORKER_ENV, "").strip():
+        print(json.dumps({"ok": False, "message": "A chief worker can't answer a decision: only the manager does."}),
+              file=out)
+        return 1
     payload = ""
     if "--" in rest:
         i = rest.index("--")
