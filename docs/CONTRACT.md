@@ -1271,8 +1271,8 @@ An optional layer over the hub. The **chief** is one long-lived Claude Code CLI 
 launchd job (`mother chief install`), that decides the hub's inbox lines and starts **workers**: headless
 `claude -p` sessions, one per followed thing. Config: the optional `chief` block (§3), keys `max_workers` (3),
 `run_minutes` (20), `daily_budget_usd` (20), `chief_model` (`sonnet`), `worker_model` (empty: claude's default),
-`tick_seconds` (30) and `tldr_model` (`sonnet`; `opus` is the one other value, anything else reads as `sonnet`);
-unknown keys are dropped. Home machine only. The chief replaces a desktop `/mother:hub`
+`tick_seconds` (30), `tldr_model` and `triage_model` (both `sonnet`; `opus` is the one other value, anything else reads
+as `sonnet`), `batch_minutes` (30) and `decision_hours` (48); unknown keys are dropped. Home machine only. The chief replaces a desktop `/mother:hub`
 session: there is one `inbox_cursor`, so `install` refuses while a hub wake (`hub.json` `last_wake`) is under 10
 minutes old unless `--force`. A wake no later than 120 s after the chief's own heartbeat is the chief's own decide
 (the hub skill refuses to start while that heartbeat is fresh), so a re-install while the chief runs proceeds.
@@ -1314,14 +1314,16 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   then starts queued, unheld, non-failed workers within `max_workers`, unless today's budget is spent or
   `spend.json` is unreadable (then nothing starts until the day rolls or the file reads again). The mod (`hooks/chief.tsx`) calls it every
   `tick_seconds` and sends the wake into the chief session when no turn is running.
-- **Triage.** Before a wake, the mod asks Haiku (`$.model.complete`, 20 s timeout, 300 tokens) for a verdict
+- **Triage.** Before a wake, the mod asks the model (`chief.triage_model`, `$.model.complete`, 20 s timeout, 300 tokens) for a verdict
   `{is_work, needs_attention, title, tldr}` per judge line (never for a `manual` line or one whose key has a live
   session) and passes them to `mother chief triage --stdin`, which logs the leading lines that need no judgment
   (`why: "triage: <title>"`; never `manual` or `error` lines, nor an update whose decide would also settle older
   same-key updates) and rebuilds the wake with each kept line's title and tldr, marked as a model's summary of
   untrusted text. Triage **fails toward waking**: a model error, a timeout, an unreadable reply or a failing CLI step
-  keeps the line and sends the original wake. Triage cost is **not** counted in `daily_budget_usd` (that covers
-  workers only; the mod's model call is not metered by the CLI).
+  keeps the line and sends the original wake. The mod reports the cost of triage and TL;DR calls through
+  `mother chief spend --stdin` (`{model, input_tokens?, output_tokens?}`), so they count in `daily_budget_usd` with the
+  workers. A missing usage counts as 1024 output tokens and an unknown model at the dearest price. Over budget, those
+  model calls are skipped: lines wake the chief untriaged and stored TL;DRs stay on the cards.
 - **Pinned desktop sessions.** `mother chief pinned --stdin` takes `list_sessions` rows (JSON array) and writes
   `desktop.json` from those with `pinned: true`; the CLI session id is read from the app's own `local_<id>.json`,
   never from the row, and archived or unreadable sessions are dropped. A pinned session is shown, never driven by
@@ -1332,7 +1334,7 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   last_activity_at, last_report, open_link}]}`; a worker row also carries `unseen` (0 when absent). Workers: running first, then newest run. `desktop` is the snapshot
   rows still live in the app (`last_report` is the first 200 characters of the last turn report); an older CLI omits
   it. `spent` reads 0 when `spend.json` is unreadable; `unreadable` is then true, and `over` (spent at the limit, or
-  unreadable) says no run starts; the pane shows both. `resume` is `""` for an entry with no session id.
+  unreadable) says no run starts; the pane shows both. `resume` is `""` for an entry with no session id. A worker's `status` can also be `waiting_decision`. Phase 2 adds `to_decide` (the pending count) and `decisions: [{id, key, kind, recommendation, why, text, full_text, urgent, status, created, expires}]`, oldest first.
 - **TL;DR, chips and Open on the Chief pane.** `mother chief tail --json` prints `{version: 1, model, sessions:
   [{id, kind, key?, fingerprint, text, cached?}]}`: one row per worker (`id` its session id, `kind: "worker"`, `key`)
   and pinned session (`id` its CLI id, `kind: "pinned"`) with something to summarise. `text` is the transcript's last
@@ -1401,7 +1403,49 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   (`decide`, `mute`, `unmute`, `follow`, `unfollow`, `session add|drop|seen`, `pending`, `add`, `done`, `snooze`,
   `dms set|drop`, the job verbs) is denied, and the reads (`status`, `check`, `show`, `watching`, `tail`,
   `session for`, `dms show`) stay.
-- **Phase 1 sends nothing.** A worker that needs a send reports it in `progress` and the chief records a `now` line.
+- **Decisions (Phase 2).** A worker never sends. It files the exact call it wants to make, with `mother decide propose
+  <key> --tool T --recommend R [--why W] [--urgent] --stdin` (stdin is the tool's input JSON), and ends its turn. A
+  chat post, reply or tracker comment must carry the agent's signature or the filing is refused. The decision lands in
+  `.mother/chief/decisions.json` (changed under `decisions.lock`, atomically) as `D<n>`: `{id, key, kind, tool, input,
+  target, thread, text, draft_sha, recommendation, why, urgent, status, created, expires, answer}`. `kind` is
+  `chat-post`, `chat-reply`, `tracker-create`, `tracker-comment` or `tracker-transition`; any other call is `manual`
+  (approving it hands the manager the text to do by hand, and no grant is written). `status` is `pending`, `approved`,
+  `rejected`, `redirected`, `expired`, `sent`, `failed` or `manual`. `expires` is `decision_hours` after the filing. The
+  worker's status becomes `waiting_decision` while one of its decisions is pending; `tick` starts it again only when
+  an answer is queued for it (queue source `decision`, or a `say`).
+  - **The batch.** `tick --json` gains `"batch": bool`. A batch is due when there are unannounced pending decisions and
+    `batch_minutes` have passed since the last one, or one is `urgent`, or confirmation lines wait.
+    `mother decide batch --json` prints `{text, ids}`: a header (`<P> to decide · <M> done without you`), one line per
+    decision (`D7 · <key>: <why> · recommend: <recommendation>`), the confirmation lines and the reply footer
+    (`Reply: 7 ok · 7 no · 7 edit: <text> · ok all`). The mod posts it to the manager's own DM and then runs
+    `mother decide sent --ids D7,D8 --ts <the post's ts>`, which records the batch time, the stamp each decision was
+    announced at, and clears the confirmations. If the mod can't post, the chief posts the text and runs `sent`. The
+    same pass shows the decisions as "To decide" cards on the Chief pane, with Approve, Edit and Reject; a card shows
+    the first 400 characters and says so when a draft is cut (`full_text` in the status carries the rest).
+  - **Answering.** Two routes, and only these. A reply in the manager's own DM: a `manual` inbox line whose id, channel
+    and timestamp are re-read from Slack (`get_channel_history`) and the text parsed from the message as fetched, not
+    from the watcher's summary: `7 ok`, `7 no`, `7 edit: <text>`, `ok all`, several on separate lines. A reply counts
+    only for a decision announced before the reply was typed. Or a button in the Chief pane
+    (`mother decide answer <n> ok|no|edit --via pane`). A line that can't be verified or read applies nothing and the
+    decision stays open. There are no typed `/chief` answer commands (`/chief decisions` only lists).
+    Code writes the result: `ok` and `edit` write a grant and queue the approved call for the worker; `no` and a
+    redirect queue the manager's words. `edit` replaces the draft's text (keeping the signature), so the grant binds
+    to the edited call. An answer made while `.mother/PAUSED` or `chief/PAUSED` exists writes no grant and the decision
+    stays pending, as does one the policy would refuse (scope off, a reply older than the grant age limit).
+  - **The bound grant.** One live grant per decision: `uses: 1`, `run: "chief:D<n>"`, `decision: D<n>`, `draft_sha`,
+    scope and target from the decision, expiring at the earliest of two hours, the decision's `expires` and the policy's
+    cited-message age limit. `draft_sha` is the sha256 of the tool name and input as sorted compact JSON, defined once in
+    `hooks/guard.py`. The worker is told to make that one call with the input unchanged; the guard allows it only if the
+    hash matches, and a mismatch costs no use. No other call of the worker is covered.
+  - **Closing the loop.** Once the worker's run ends, an approved decision whose use is in the ledger becomes `sent`
+    and the next batch carries `✓ D<n> done`; one with no use becomes `failed` ("the call didn't match what you
+    approved") and goes back to the worker. A pending decision past `expires` becomes `expired` and its grant is
+    removed.
+  - **What a worker can't do.** No shell command off the guard's allow-list, so no `npm test` and no `python3 -m
+    unittest`: a worker reads, drafts and files decisions. File tools write only inside the workspace and not to the
+    guarded paths below. A worker that can't do something says so in its `PROGRESS:` line. Everything outbound is a
+    decision.
+
 - **Decisions in the guard (Phase 2).** A grant carrying `draft_sha` or `decision` covers one exact call: it matches only
   when `draft_sha(tool, input)` equals its `draft_sha`, checked before the ledger, so a mismatch costs no use. Its
   ledger key includes the decision, so one reply can answer several. `source.channel: "pane"` counts only on such a
