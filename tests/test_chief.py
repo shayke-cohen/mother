@@ -19,6 +19,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import chief  # noqa: E402
+import decisions  # noqa: E402
 import hub  # noqa: E402
 import now as nowmod  # noqa: E402
 
@@ -426,6 +427,113 @@ class TestRun(Base):
         self.assertIs(kw["start_new_session"], True)
         self.assertTrue(kw["stdout"].name.endswith(os.path.join("logs", chief.run_name("PLAT-1") + ".log")))
         self.assertEqual(self.calls(), [])
+
+
+class TestWaitsOnDecision(Base):
+    """Task 5: a worker with a pending decision waits for the answer rather than taking more turns."""
+    MAIL = "mcp__mail__gmail__send-gmail-message"
+
+    def setUp(self):
+        super().setUp()
+        self.log = self.ws / "claude.log"
+        p = mock.patch.dict(os.environ, {"MOTHER_CLAUDE_BIN": FAKE, "FAKE_CLAUDE_LOG": str(self.log)})
+        p.start()
+        self.addCleanup(p.stop)
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+
+    def file(self, key="PLAT-1", **kw):
+        return decisions.propose(self.ws, {}, AT, key, self.MAIL, {"to": "a@b.c", "body": kw.pop("body", "x")}, "send",
+                                 **kw)
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def run_(self, prompt="go"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return chief.run(self.ws, {}, AT, "PLAT-1", prompt=prompt)
+
+    def test_run_with_pending_decision_waits(self):
+        self.file()
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "waiting_decision")
+
+    def test_run_without_a_decision_ends_idle(self):
+        self.assertEqual(self.run_(), 0)
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
+
+    def test_run_failure_stays_failed_with_a_decision(self):
+        self.file()
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_EXIT": "1"}):
+            self.assertEqual(self.run_(), 1)
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+
+    def test_run_loop_stops_at_a_route_while_waiting(self):
+        self.file()
+        chief.enqueue(self.ws, AT, "PLAT-1", "a thread moved", "route")
+        self.run_()
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(chief.queued(self.ws), {"PLAT-1": 1})
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "waiting_decision")
+
+    def test_run_loop_takes_an_answer_while_waiting(self):
+        self.file()
+        chief.enqueue(self.ws, AT, "PLAT-1", "D1 was rejected", "decision")
+        self.run_()
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(chief.queued(self.ws), {})
+
+    def test_tick_skips_waiting_without_answer(self):
+        self.file()
+        chief.enqueue(self.ws, AT, "PLAT-1", "a thread moved", "route")
+        with mock.patch.object(chief, "run", return_value=0) as run:
+            r = chief.tick(self.ws, {}, AT)
+        self.assertEqual(r["dispatched"], [])
+        run.assert_not_called()
+
+    def test_tick_dispatches_waiting_after_answer(self):
+        self.file()
+        for source in ("decision", "say"):
+            chief.enqueue(self.ws, AT, "PLAT-1", "the answer", source)
+            with mock.patch.object(chief, "run", return_value=0) as run:
+                self.assertEqual(chief.tick(self.ws, {}, AT)["dispatched"], ["PLAT-1"], source)
+            run.assert_called_once()
+            chief.take_queue(self.ws, "PLAT-1")
+
+    def test_queued_sources(self):
+        chief.enqueue(self.ws, AT, "PLAT-1", "a", "route")
+        chief.enqueue(self.ws, AT, "PLAT-1", "b", "decision")
+        self.assertEqual(chief.queued(self.ws), {"PLAT-1": 2})
+        self.assertEqual(chief.queued(self.ws, sources=("decision", "say")), {"PLAT-1": 1})
+
+    def test_status_doc_lists_pending_decisions(self):
+        d1 = self.file(why="asked", urgent=True, body="y" * 500)
+        self.file(body="z")
+        decisions.answer(self.ws, {"manager": {"chat_dm": ["U00000001"]}}, AT, 2, "no", "", {"via": "pane"})
+        doc = chief.status_doc(self.ws, {}, AT)
+        self.assertEqual(doc["to_decide"], 1)
+        self.assertEqual(len(doc["decisions"]), 1)
+        got = doc["decisions"][0]
+        self.assertEqual(sorted(got), sorted(["id", "key", "kind", "recommendation", "why", "text", "urgent", "status",
+                                              "created", "expires"]))
+        self.assertEqual((got["id"], got["key"], got["kind"], got["recommendation"], got["why"], got["urgent"],
+                          got["status"], got["created"], got["expires"]),
+                         ("D1", "PLAT-1", "manual", "send", "asked", True, "pending", d1["created"], d1["expires"]))
+        self.assertLessEqual(len(got["text"]), 400)
+        self.assertTrue(got["text"].startswith("y"))
+
+    def test_status_doc_empty_queue(self):
+        doc = chief.status_doc(self.ws, {}, AT)
+        self.assertEqual((doc["decisions"], doc["to_decide"]), ([], 0))
+
+    def test_header_shows_the_heredoc_form(self):
+        h = chief.HEADER % ("PLAT-1", "t")
+        self.assertIn("<<'EOF'", h)
+        self.assertIn("--stdin <<'EOF'\n", h)
+        self.assertIn("\nEOF", h)
+        self.assertIn("sign", h.lower())
+        form = h[h.index("mother decide propose"):h.index("\nEOF") + 4].replace("<key>", "PLAT-1") \
+            .replace("<tool>", "T").replace("<send|skip>", "send").replace("<one line>", "w")
+        self.assertTrue(decisions.guard.worker_propose_command(form), form)
 
 
 class TestParse(unittest.TestCase):
@@ -889,7 +997,8 @@ class TestMain(Base):
         code, out, _ = self.main("status", "--json")
         self.assertEqual(code, 0)
         doc = json.loads(out)
-        self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "workers", "desktop"})
+        self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "workers", "desktop", "decisions",
+                                    "to_decide"})
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
         self.assertEqual(doc["at"], hub._iso(AT))

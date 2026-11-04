@@ -30,6 +30,7 @@ _spec.loader.exec_module(guard)
 USAGE = __doc__.split("\n\n")[1].rstrip()
 KINDS = ("chat-post", "chat-reply", "tracker-create", "tracker-comment", "tracker-transition")
 STATUSES = ("pending", "approved", "rejected", "redirected", "expired", "sent", "failed", "manual")
+SIGNED_KINDS = ("chat-post", "chat-reply", "tracker-comment")  # the kinds run_grant_scope wants a signature on
 TOP_TEXT_KEYS = ("text", "message", "body", "comment", "markdown", "content")
 NESTED_TEXT_KEYS = ("text", "body", "comment", "commentBody", "content")
 
@@ -97,12 +98,24 @@ def kind_of(tool: str, inp: dict) -> tuple:
     return scope[0], scope[1], a.get("thread") if a.get("kind") == "chat" else None
 
 
+def _signed(kind: str, tool: str, inp: dict, cfg: dict) -> bool:
+    """The guard would accept this draft's signature. A kind it wants none on always passes."""
+    return kind not in SIGNED_KINDS or guard.carries_signature(guard.classify_mcp(tool, inp), cfg)
+
+
 def propose(ws: Path, cfg: dict, at: datetime, key: str, tool: str, inp: dict, recommendation: str,
             why: str = "", urgent: bool = False) -> dict:
     if not isinstance(inp, dict):
         raise ValueError("the tool input must be a JSON object")
     sha = guard.draft_sha(tool, inp)
     kind, target, thread = kind_of(tool, inp)
+    if not _signed(kind, tool, inp, cfg):  # the guard refuses it however it's answered: say so now
+        marks = guard.signature_marks(cfg)
+        if not marks:
+            raise ValueError("config.json names no agent to sign this %s with, so it can't be sent" % kind)
+        raise ValueError("this %s isn't signed, so the guard would refuse it even with the manager's yes. Sign it: put "
+                         "%s in the text%s, then file it again" % (
+                             kind, marks[0], " and the blocks" if guard.classify_mcp(tool, inp).get("blocks") else ""))
     hours = chief.settings(cfg)["decision_hours"]
     with locked(ws):
         if key not in chief.workers(ws):
@@ -126,9 +139,11 @@ def edited_input(inp: dict, text: str) -> dict:
     """A copy of `inp` with the text field `guard.text_of` reads replaced. ValueError when there is none, or when
     that field is not a plain string (`blocks`)."""
     out = json.loads(json.dumps(inp))
-    for k in TOP_TEXT_KEYS + ("blocks",):
+    if guard.first(out, "blocks") is not None:  # the reader sees the blocks, so new text alone wouldn't reach them
+        raise ValueError("the text of this call is blocks, which can't be edited as plain text")
+    for k in TOP_TEXT_KEYS:
         if guard.first(out, k) is not None:
-            if k == "blocks" or not isinstance(out[k], str):
+            if not isinstance(out[k], str):
                 raise ValueError("the text of this call is %s, which can't be edited as plain text" % k)
             out[k] = text
             return out
@@ -141,6 +156,24 @@ def edited_input(inp: dict, text: str) -> dict:
                 nested[k] = text
                 return out
     raise ValueError("the call has no text field to edit")
+
+
+def signed_edit(d: dict, cfg: dict, text: str) -> dict:
+    """`d`'s input with the manager's `text`, still carrying the signature the guard wants, or the grant could never
+    match. Their words stay as typed; the signature the draft carried goes on a line after them when they left it
+    out. ValueError when that isn't possible."""
+    tool, inp = d["tool"], edited_input(d["input"], text)
+    kind = kind_of(tool, inp)[0]
+    if _signed(kind, tool, inp, cfg):
+        return inp
+    marks = guard.signature_marks(cfg)
+    if not marks:
+        raise ValueError("config.json names no agent to sign the edited text with")
+    mark = next((m for m in reversed(marks) if m in (d.get("text") or "")), marks[0])
+    inp = edited_input(d["input"], "%s\n\n%s" % (text, mark))
+    if not _signed(kind, tool, inp, cfg):
+        raise ValueError("the edited text can't carry the signature")
+    return inp
 
 
 _NUM = re.compile(r"^d?(\d+)$")
@@ -417,7 +450,7 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
             rec["payload"] = payload
         if verb == "edit":
             try:
-                inp = edited_input(d["input"], payload)
+                inp = signed_edit(d, cfg, payload)
             except ValueError as e:
                 return False, "%s is still open: %s." % (did, e)
             kind, target, thread = kind_of(d["tool"], inp)
@@ -465,9 +498,10 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
 
 
 def _resume(ws: Path, key: str) -> None:
-    """The worker leaves waiting_decision; normal dispatch picks up what was queued."""
+    """The worker leaves waiting_decision unless another decision of its is still open; normal dispatch picks up what
+    was queued."""
     try:
-        chief.update_worker(ws, key, status="idle")
+        chief.update_worker(ws, key, status=chief.rest_status(ws, key))
     except KeyError:
         pass
 

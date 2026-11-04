@@ -22,7 +22,9 @@ UTC = timezone.utc
 AT = datetime(2026, 11, 1, 9, 0, tzinfo=UTC)
 POST = "mcp__chat__slack__post_message"
 MAIL = "mcp__mail__gmail__send-gmail-message"
-REPLY = {"channel": "C00000001", "text": "hello", "thread_ts": "1700000000.000100"}
+SIG = "Mother (AI)"
+SIGNED = {"agent": {"name": "Mother"}}
+REPLY = {"channel": "C00000001", "text": "hello " + SIG, "thread_ts": "1700000000.000100"}
 
 
 class Base(unittest.TestCase):
@@ -33,7 +35,7 @@ class Base(unittest.TestCase):
         chief.register_worker(self.ws, AT, "PLAT-1", "Plat one")
 
     def propose(self, key="PLAT-1", tool=POST, inp=None, **kw):
-        return decisions.propose(self.ws, {}, AT, key, tool, dict(REPLY) if inp is None else inp,
+        return decisions.propose(self.ws, SIGNED, AT, key, tool, dict(REPLY) if inp is None else inp,
                                  kw.pop("recommendation", "send it"), **kw)
 
 
@@ -44,7 +46,7 @@ class ProposeTest(Base):
         self.assertEqual(d["kind"], "chat-reply")
         self.assertEqual(d["target"], "C00000001")
         self.assertEqual(d["thread"], "1700000000.000100")
-        self.assertEqual(d["text"], "hello")
+        self.assertEqual(d["text"], REPLY["text"])
         self.assertEqual(d["draft_sha"], decisions.guard.draft_sha(POST, REPLY))
         self.assertEqual((d["status"], d["urgent"], d["answer"], d["why"]), ("pending", True, None, "asked"))
         self.assertEqual(d["created"], hub._iso(AT))
@@ -54,7 +56,7 @@ class ProposeTest(Base):
 
     def test_propose_tracker_target_is_project(self):
         d = self.propose(tool="mcp__tracker__jira__comment-on-issue",
-                         inp={"issueIdOrKey": "PLAT-1", "comment": "x"})
+                         inp={"issueIdOrKey": "PLAT-1", "comment": "x " + SIG})
         self.assertEqual((d["kind"], d["target"], d["thread"]), ("tracker-comment", "PLAT", None))
 
     def test_propose_email_is_manual(self):
@@ -79,12 +81,12 @@ class ProposeTest(Base):
 
     def test_ids_increase_across_calls(self):
         a = self.propose()
-        b = self.propose(inp=dict(REPLY, text="other"))
+        b = self.propose(inp=dict(REPLY, text="other " + SIG))
         self.assertEqual((a["id"], b["id"]), ("D1", "D2"))
         self.assertEqual(decisions.load(self.ws)["next"], 3)
 
     def test_decision_hours_setting(self):
-        d = decisions.propose(self.ws, {"chief": {"decision_hours": 1}}, AT, "PLAT-1", POST, dict(REPLY), "r")
+        d = decisions.propose(self.ws, dict(SIGNED, chief={"decision_hours": 1}), AT, "PLAT-1", POST, dict(REPLY), "r")
         self.assertEqual(d["expires"], hub._iso(AT + timedelta(hours=1)))
 
     def test_load_defaults(self):
@@ -117,7 +119,7 @@ class CliTest(Base):
         old = sys.stdin
         sys.stdin = io.StringIO(stdin)
         try:
-            code = decisions.main(args, self.ws, {}, out, err)
+            code = decisions.main(args, self.ws, SIGNED, out, err)
         finally:
             sys.stdin = old
         return code, out.getvalue(), err.getvalue()
@@ -202,7 +204,7 @@ class ReplyGrammarTest(unittest.TestCase):
         self.assertEqual(decisions.parse_reply("7 ok, 12 no", {7}), [])
 
 
-CFG = {"manager": {"chat_dm": ["U00000001", "D00000001"]}}
+CFG = dict(SIGNED, manager={"chat_dm": ["U00000001", "D00000001"]})
 DM, OWNER = "D00000001", "U00000001"
 SRC_TS = "%.6f" % (AT.timestamp() + 60)  # the manager's reply, a minute after the decision was filed
 LATER = AT + timedelta(seconds=120)
@@ -281,7 +283,7 @@ class AnswerTest(Base):
         self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
 
     def test_pane_source_and_expiry_caps(self):
-        decisions.propose(self.ws, {"chief": {"decision_hours": 1}}, AT, "PLAT-1", POST, dict(REPLY), "r")
+        decisions.propose(self.ws, dict(SIGNED, chief={"decision_hours": 1}), AT, "PLAT-1", POST, dict(REPLY), "r")
         self.answer()
         g = self.grants()[0]
         self.assertEqual(g["source"], {"channel": "pane", "user": OWNER, "ts": "%.6f" % AT.timestamp()})
@@ -289,7 +291,7 @@ class AnswerTest(Base):
 
     def test_edit_text_verbatim(self):
         self.propose()
-        payload = '--help "x"\ny'
+        payload = '--help "x"\ny ' + SIG
         self.answer("edit", payload)
         g = self.grants()[0]
         want = dict(REPLY, text=payload)
@@ -301,7 +303,7 @@ class AnswerTest(Base):
                       self.queue()[0]["text"])
 
     def test_edit_without_text_field_stays_open(self):
-        self.propose(inp={"channel": "C00000001", "blocks": [{"type": "section"}]})
+        self.propose(inp={"channel": "C00000001", "blocks": [{"type": "section", "text": SIG}]})
         msg = self.answer("edit", "new")
         self.assertIn("still open", msg)
         self.assertEqual((self.grants(), self.queue()), ([], []))
@@ -347,15 +349,15 @@ class AnswerTest(Base):
     def test_reply_edit_keeps_newlines_from_raw(self):
         self.propose()
         self.announce("D1")
-        self.reply("1 edit: line one\nline two\ttabbed\n")
+        self.reply("1 edit: line one " + SIG + "\nline two\ttabbed\n")
         d = decisions.load(self.ws)["decisions"][0]
-        self.assertEqual(d["text"], "line one\nline two\ttabbed\n")
+        self.assertEqual(d["text"], "line one " + SIG + "\nline two\ttabbed\n")
         self.assertEqual(self.grants()[0]["draft_sha"], decisions.guard.draft_sha(POST, d["input"]))
 
     def test_reply_edit_over_300_chars(self):
         self.propose()
         self.announce("D1")
-        body = "x" * 700
+        body = "x" * 700 + " " + SIG
         self.reply("1 edit: " + body)
         self.assertEqual(decisions.load(self.ws)["decisions"][0]["text"], body)
         self.assertEqual(self.status(), "approved")
@@ -364,10 +366,10 @@ class AnswerTest(Base):
         self.propose()
         self.announce("D1")
         self.reply("1 edit: a &amp; b &lt;c&gt; &amp;lt; <https://x.test/a?b=1&amp;c=2|docs> "
-                   "<https://y.test|https://y.test> <https://z.test> <@U00000002> <#C00000002|plat>")
+                   "<https://y.test|https://y.test> <https://z.test> <@U00000002> <#C00000002|plat> " + SIG)
         self.assertEqual(decisions.load(self.ws)["decisions"][0]["text"],
                          "a & b <c> &lt; docs (https://x.test/a?b=1&c=2) https://y.test https://z.test "
-                         "<@U00000002> <#C00000002|plat>")
+                         "<@U00000002> <#C00000002|plat> " + SIG)
 
     def test_reply_verb_comes_from_verified_message(self):
         self.propose()
@@ -405,10 +407,10 @@ class AnswerTest(Base):
         self.assertEqual((self.grants(), self.status()), ([], "pending"))
 
     def test_reply_before_announce_not_applied(self):
-        self.propose(inp=dict(REPLY, text="first"))
+        self.propose(inp=dict(REPLY, text="first " + SIG))
         typed = AT + timedelta(seconds=120)  # D2 was filed at AT, the manager types at T, D2 is announced at T+5
         ts = "%.6f" % typed.timestamp()
-        self.propose(inp=dict(REPLY, text="second"))
+        self.propose(inp=dict(REPLY, text="second " + SIG))
         self.announce("D1", at=AT + timedelta(seconds=30))
         self.announce("D2", at=typed + timedelta(seconds=5))
         tick = typed + timedelta(seconds=30)  # the next tick reads the reply after the announcement
@@ -430,7 +432,7 @@ class AnswerTest(Base):
 
     def test_ok_all_only_announced(self):
         self.propose()
-        self.propose(inp=dict(REPLY, text="other"))
+        self.propose(inp=dict(REPLY, text="other " + SIG))
         self.announce("D1")
         self.assertEqual(len(self.reply("ok all")), 1)
         self.assertEqual([self.status(0), self.status(1)], ["approved", "pending"])
@@ -460,10 +462,10 @@ class AnswerTest(Base):
         d = self.propose()
         self.crash_leaving_grant()
         self.assertEqual(self.grants()[0]["draft_sha"], d["draft_sha"])
-        self.answer("edit", "second text")
+        self.answer("edit", "second text " + SIG)
         gs = self.grants()
         self.assertEqual(len(gs), 1)
-        self.assertEqual(gs[0]["draft_sha"], decisions.guard.draft_sha(POST, dict(REPLY, text="second text")))
+        self.assertEqual(gs[0]["draft_sha"], decisions.guard.draft_sha(POST, dict(REPLY, text="second text " + SIG)))
 
     def test_no_removes_grant(self):
         self.propose()
@@ -477,7 +479,7 @@ class AnswerTest(Base):
         self.crash_leaving_grant()
         self.answer("say", "wait")
         self.assertEqual(self.grants(), [])
-        self.propose(inp=dict(REPLY, text="other"))
+        self.propose(inp=dict(REPLY, text="other " + SIG))
         self.crash_leaving_grant(n=2)
         late = decisions.answer(self.ws, CFG, AT + timedelta(hours=49), 2, "ok", "", {"via": "pane"})
         self.assertEqual(late, "D2 is already expired.")
@@ -485,7 +487,7 @@ class AnswerTest(Base):
 
     def test_removing_keeps_other_decisions_grants(self):
         self.propose()
-        self.propose(inp=dict(REPLY, text="other"))
+        self.propose(inp=dict(REPLY, text="other " + SIG))
         self.answer(n=1)
         self.answer("no", n=2)
         self.assertEqual([g["decision"] for g in self.grants()], ["D1"])
@@ -501,7 +503,7 @@ class AnswerTest(Base):
         self.assertTrue(msg.endswith(". Answer again."), msg)
         self.assertEqual((self.grants(), self.queue(), self.status()), ([], [], "pending"))
         # a reply older than the policy's max age (96 h), on a decision that hasn't expired
-        decisions.propose(self.ws, {"chief": {"decision_hours": 200}}, AT, "PLAT-1", POST, dict(REPLY, text="b"), "r")
+        decisions.propose(self.ws, dict(SIGNED, chief={"decision_hours": 200}), AT, "PLAT-1", POST, dict(REPLY, text="b " + SIG), "r")
         self.announce("D2")
         lines = self.reply("2 ok", at=AT + timedelta(hours=100))
         self.assertEqual(len(lines), 1)
@@ -572,7 +574,7 @@ class AnswerTest(Base):
 
     def test_no_and_say_queue_text(self):
         self.propose()
-        self.propose(inp=dict(REPLY, text="other"))
+        self.propose(inp=dict(REPLY, text="other " + SIG))
         self.answer("no", n=1)
         self.answer("say", "wait until Monday", n=2)
         self.assertEqual([(e["source"], e["text"]) for e in self.queue()],
@@ -585,12 +587,12 @@ class AnswerTest(Base):
     def test_answer_cli(self):
         self.propose()
         out, err = io.StringIO(), io.StringIO()
-        code = decisions.main(["answer", "1", "edit", "--via", "pane", "--", "new", "text"], self.ws, CFG, out, err,
+        code = decisions.main(["answer", "1", "edit", "--via", "pane", "--", "new", "text", SIG], self.ws, CFG, out, err,
                               at=AT)
         self.assertEqual(code, 0, err.getvalue())
         doc = json.loads(out.getvalue())
         self.assertTrue(doc["ok"])
-        self.assertEqual(decisions.load(self.ws)["decisions"][0]["text"], "new text")
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["text"], "new text " + SIG)
         for args in (["answer", "1", "ok"], ["answer", "x", "ok", "--via", "pane"],
                      ["answer", "1", "maybe", "--via", "pane"], ["answer", "1", "ok", "--via", "slack"]):
             self.assertEqual(decisions.main(args, self.ws, CFG, io.StringIO(), io.StringIO(), at=AT), 2, args)
@@ -598,6 +600,104 @@ class AnswerTest(Base):
         self.assertEqual(decisions.main(["answer", "1", "ok", "--via", "typed"], self.ws, CFG, out, io.StringIO(),
                                         at=AT), 1)
         self.assertEqual(json.loads(out.getvalue()), {"ok": False, "message": "D1 is already approved."})
+
+
+class SignatureTest(Base):
+    """A draft the guard would never let out is refused when it is filed, and an edit keeps what the guard reads."""
+    TRACKER = "mcp__tracker__jira__"
+
+    def setUp(self):
+        super().setUp()
+        sdir = tempfile.TemporaryDirectory()
+        self.addCleanup(sdir.cleanup)
+        env = mock.patch.dict(os.environ, {"MOTHER_STATE_DIR": sdir.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_propose_refuses_unsigned_chat_and_tracker_comment(self):
+        for tool, inp in ((POST, dict(REPLY, text="no mark")),
+                          (POST, {"channel": "C00000001", "text": "no mark"}),
+                          (self.TRACKER + "comment-on-issue", {"issueIdOrKey": "PLAT-1", "comment": "no mark"})):
+            with self.assertRaises(ValueError) as e:
+                self.propose(tool=tool, inp=inp)
+            self.assertIn("sign", str(e.exception).lower())
+            self.assertIn(SIG, str(e.exception))
+        self.assertEqual(decisions.load(self.ws)["decisions"], [])
+
+    def test_propose_refuses_when_no_mark_is_configured(self):
+        with self.assertRaises(ValueError) as e:
+            decisions.propose(self.ws, {}, AT, "PLAT-1", POST, dict(REPLY), "r")
+        self.assertIn("agent", str(e.exception))
+
+    def test_propose_accepts_the_configured_signature(self):
+        cfg = {"agent": {"signature": ":sparkles: on behalf"}}
+        d = decisions.propose(self.ws, cfg, AT, "PLAT-1", POST, dict(REPLY, text="hi :sparkles: on behalf"), "r")
+        self.assertEqual(d["kind"], "chat-reply")
+
+    def test_propose_needs_no_signature_where_the_guard_needs_none(self):
+        self.assertEqual(self.propose(tool=MAIL, inp={"to": "a@b.c", "body": "x"})["kind"], "manual")
+        d = self.propose(tool=self.TRACKER + "transition-issue", inp={"issueIdOrKey": "PLAT-1", "transitionId": "1"})
+        self.assertEqual(d["kind"], "tracker-transition")
+
+    def test_propose_refuses_unsigned_blocks(self):
+        with self.assertRaises(ValueError):
+            self.propose(inp=dict(REPLY, blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "unsigned"}}]))
+
+    def test_propose_cli_says_why(self):
+        out, err = io.StringIO(), io.StringIO()
+        old = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(dict(REPLY, text="no mark")))
+        try:
+            code = decisions.main(["propose", "PLAT-1", "--tool", POST, "--recommend", "r", "--stdin"], self.ws, SIGNED,
+                                  out, err)
+        finally:
+            sys.stdin = old
+        self.assertEqual(code, 1)
+        self.assertIn(SIG, err.getvalue())
+
+    def cfg(self):
+        return dict(SIGNED, manager={"chat_dm": ["U00000001", "D00000001"]})
+
+    def test_edit_keeps_the_signature_so_the_grant_can_match(self):
+        self.propose()
+        msg = decisions.answer(self.ws, self.cfg(), AT, 1, "edit", "new words", {"via": "pane"})
+        self.assertIn("approved", msg)
+        d = decisions.load(self.ws)["decisions"][0]
+        self.assertEqual(d["input"]["text"], "new words\n\n" + SIG)
+        g = decisions.guard
+        self.assertTrue(g.carries_signature(g.classify_mcp(POST, d["input"]), self.cfg()))
+        self.assertEqual(d["draft_sha"], g.draft_sha(POST, d["input"]))
+
+    def test_edit_already_signed_stays_as_typed(self):
+        self.propose()
+        decisions.answer(self.ws, self.cfg(), AT, 1, "edit", "mine " + SIG, {"via": "pane"})
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["input"]["text"], "mine " + SIG)
+
+    def test_edit_with_no_mark_to_keep_refuses(self):
+        self.propose()
+        cfg = {"manager": {"chat_dm": ["U00000001", "D00000001"]}}
+        msg = decisions.answer(self.ws, cfg, AT, 1, "edit", "new words", {"via": "pane"})
+        self.assertIn("still open", msg)
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "pending")
+
+    def test_edit_refuses_a_call_with_blocks_beside_its_text(self):
+        """The reader sees the blocks: editing only the text would send something other than what was approved."""
+        blocks = dict(REPLY, blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "old " + SIG}}])
+        self.propose(inp=blocks)
+        msg = decisions.answer(self.ws, self.cfg(), AT, 1, "edit", "new " + SIG, {"via": "pane"})
+        self.assertIn("still open", msg)
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["input"], blocks)
+
+
+class ResumeTest(Base):
+    def test_answering_one_of_two_leaves_the_worker_waiting(self):
+        cfg = dict(SIGNED, manager={"chat_dm": ["U00000001", "D00000001"]})
+        self.propose(tool=MAIL, inp={"to": "a@b.c", "body": "x"})
+        self.propose(tool=MAIL, inp={"to": "a@b.c", "body": "y"})
+        decisions.answer(self.ws, cfg, AT, 1, "no", "", {"via": "pane"})
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "waiting_decision")
+        decisions.answer(self.ws, cfg, AT, 2, "no", "", {"via": "pane"})
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
 
 
 class AnswerEnvironment(unittest.TestCase):
