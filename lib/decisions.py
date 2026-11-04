@@ -64,20 +64,25 @@ def _id_number(d: dict) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def _past_ledger(ws: Path) -> int:
-    """The first id no grant use names: after a lost decisions.json, an old ledger entry must not close a new D1."""
-    data, ok = guard.read_json(os.path.join(str(ws), ".mother", "ledger.json"))
+def _past_used(ws: Path) -> int:
+    """The first id no grant or grant use names: after a lost decisions.json, an old ledger entry or a live grant must
+    not attach to a new decision under the same number."""
     top = 0
-    for r in (data.get("uses") if ok and isinstance(data, dict) and isinstance(data.get("uses"), list) else []):
-        m = re.match(r"^chief:D(\d+)$", str(r.get("run"))) if isinstance(r, dict) else None
-        top = max(top, int(m.group(1))) if m else top
+    for name, key in (("ledger.json", "uses"), ("grants.json", "grants")):
+        data, ok = guard.read_json(os.path.join(str(ws), ".mother", name))
+        rows = data.get(key) if ok and isinstance(data, dict) else None
+        for r in rows if isinstance(rows, list) else []:
+            for v in (r.get("run"), r.get("decision")) if isinstance(r, dict) else ():
+                m = re.match(r"^(?:chief:)?D(\d+)$", str(v))
+                top = max(top, int(m.group(1))) if m else top
     return top + 1
 
 
 def load(ws: Path) -> dict:
     """decisions.json with every field present; a missing or unreadable file reads as empty. `batch.announced` maps a
     decision id to the stamp of the batch that showed it to the manager; any other shape reads as no announcements.
-    `batch.offered` and `batch.offered_ids` are the confirm-line count and the ids the last `batch` command handed out.
+    `batch.offered`, `offered_ids` and `offered_at` are the live offer: the confirm-line count, the ids and the time of
+    the last `batch` command, until `sent` uses it.
     `replied` maps an inbox line that looked like a reply to whether its re-read message was one (a line behind the
     cursor is applied once), or to the failed reads so far. `next` is past every id in the file: an id is never reused."""
     doc = _empty()
@@ -101,6 +106,8 @@ def load(ws: Path) -> dict:
             doc["batch"]["offered"] = b["offered"]
         if isinstance(b.get("offered_ids"), list):
             doc["batch"]["offered_ids"] = [i for i in b["offered_ids"] if isinstance(i, str)]
+        if isinstance(b.get("offered_at"), str):
+            doc["batch"]["offered_at"] = b["offered_at"]
     if isinstance(raw.get("confirm"), list):
         doc["confirm"] = [x for x in raw["confirm"] if isinstance(x, str)]
     if isinstance(raw.get("replied"), dict):
@@ -156,7 +163,7 @@ def propose(ws: Path, cfg: dict, at: datetime, key: str, tool: str, inp: dict, r
         for d in doc["decisions"]:
             if d.get("status") == "pending" and d.get("key") == key and d.get("draft_sha") == sha:
                 raise ValueError("%s already has this call pending as %s" % (key, d.get("id")))
-        doc["next"] = max(doc["next"], _past_ledger(ws))
+        doc["next"] = max(doc["next"], _past_used(ws))
         d = {"id": "D%d" % doc["next"], "key": key, "kind": kind, "tool": tool, "input": inp, "target": target,
              "thread": thread, "text": guard.text_of(inp), "draft_sha": sha, "recommendation": recommendation,
              "why": why, "urgent": bool(urgent), "status": "pending", "created": hub._iso(at),
@@ -511,8 +518,12 @@ def _reply(ws: Path, cfg: dict, at: datetime, channel: str, ts: str, fetch=None)
     for n, verb, payload in items:
         # `8 no <words>` is a no and then the words: they still reach the worker after the no has landed
         after_no = verb == "say" and n in refused
-        ok, line = _answer(ws, cfg, at, n, verb, slack_text(payload) if verb == "edit" else payload, source,
-                           after_no=after_no)
+        try:
+            ok, line = _answer(ws, cfg, at, n, verb, slack_text(payload) if verb == "edit" else payload, source,
+                               after_no=after_no)
+        except Exception as e:  # what the items before it did stands, so the result lines must say so
+            _log(ws, "answer D%d: %r" % (n, e))
+            ok, line = False, "D%d is still open: something went wrong applying your answer. Answer it again." % n
         if ok and verb == "no":
             refused.add(n)
         lines.append(line)
@@ -679,8 +690,12 @@ def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: set, live: dict
     w = live.get(key)
     waiting = any(e.get("key") == key and e.get("source") == "decision"
                   and str(e.get("text")).startswith("%s approved by" % did) for e in queue)
+    made = "chief:%s" % did in used
+    if made and waiting:  # the grant is spent, so "make this call" can only be refused: it mustn't hold this open
+        chief.drop_queued(ws, key, "%s approved by" % did)
+        waiting = False
     ended = w is None or not (key in busy or w.get("status") == "working" or waiting)
-    if "chief:%s" % did in used:
+    if made:
         if ended:
             d["status"] = "sent"
             doc["confirm"].append("✓ %s: the call was made (%s on %s)" % (did, d.get("kind"), plain_target(d)))
@@ -706,7 +721,10 @@ def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: set, live: dict
         return
     _set_grant(ws, did, None)
     d["status"] = "failed"
-    if w is not None and w.get("status") == "failed":
+    if w is None:
+        doc["confirm"].append("%s: the worker is gone and the call wasn't made; nothing went out" % did)
+        note = ""
+    elif w.get("status") == "failed":
         doc["confirm"].append("%s: the worker failed after your yes; it's back with the worker" % did)
         note = "%s: your run failed after the manager's yes, so the call wasn't made. File it again if it's still " \
                "needed." % did
@@ -766,10 +784,21 @@ def is_reply_line(l: dict) -> bool:
     return l.get("kind") == "manual" and l.get("source") == "chat" and parse_reply(l.get("summary"), set()) is not None
 
 
-def held_replies(ws: Path, lines: List[dict]) -> Set[str]:
-    """The lines that are the tick's, not the chief's: replies, and any not yet read that may be one."""
+def for_chief(ws: Path, lines: List[dict]) -> List[dict]:
+    """The lines the chief may judge, in order: replies are the tick's and are left out, and it all stops at a line
+    still waiting on a Slack read. Past that line the chief's decide could move the cursor over it, and a note must
+    never vanish. The hold lasts at most REPLY_TRIES ticks."""
     seen = load(ws)["replied"]
-    return {l["id"] for l in lines if is_reply_line(l) and seen.get(l["id"]) is not False}
+    out = []
+    for l in lines:
+        if is_reply_line(l):
+            v = seen.get(l["id"])
+            if v is True:
+                continue
+            if v is not False:
+                break
+        out.append(l)
+    return out
 
 
 def _record_reply(ws: Path, lid: str, state, lines: List[str]) -> None:
@@ -781,10 +810,10 @@ def _record_reply(ws: Path, lid: str, state, lines: List[str]) -> None:
         save(ws, doc)
 
 
-def apply_replies(ws: Path, cfg: dict, at: datetime, lines: List[dict]) -> Tuple[Set[str], Set[str]]:
+def apply_replies(ws: Path, cfg: dict, at: datetime, lines: List[dict]) -> Set[str]:
     """Apply every reply among `lines`, each once, even one the cursor can't reach yet. Result lines go to `confirm`.
-    Returns (ids to log: the replies that reached the queue, ids held: a failed Slack read, to try again next tick).
-    Anything else keeps its normal path: a note that isn't a reply, and one that only starts like a reply, which gets
+    Returns the ids to log: the replies that reached the queue. A failed Slack read is tried again next tick, and
+    `for_chief` stops there until it settles. Anything else keeps its normal path: a note that isn't a reply, and one that only starts like a reply, which gets
     the help line. So does a line after REPLY_TRIES failed reads. One bad line is logged and can't stop the others."""
     ws = Path(ws)
     channel = next((x for x in sorted(guard.dm_ids(cfg), key=str) if str(x).startswith("D")), None)
@@ -813,9 +842,7 @@ def apply_replies(ws: Path, cfg: dict, at: datetime, lines: List[dict]) -> Tuple
                     except Exception as e2:
                         _log(ws, "reply %s: %r" % (lid, e2))
     seen = load(ws)["replied"]
-    logged = {l["id"] for l in candidates if seen.get(l["id"]) is True}
-    held = {l["id"] for l in candidates if type(seen.get(l["id"])) is int}
-    return logged, held
+    return {l["id"] for l in candidates if seen.get(l["id"]) is True}
 
 
 def waiting_reads(ws: Path) -> Set[str]:
@@ -841,7 +868,8 @@ def forget_replies(ws: Path, ids: Set[str]) -> None:
 # ---- the batch: what the manager's DM hears from the queue ------------------------------------------------------
 
 WHY_MAX = 100
-CONFIRM_MAX = 300
+CONFIRM_MAX = 400  # a manual result line and its pointer to the pane fit
+ALSO_SENDS_MAX = 5
 _SLACK_TS = re.compile(r"^\d+(?:\.\d+)?$")
 
 
@@ -850,6 +878,27 @@ def _shown(text, cap: int) -> str:
     link, a `<!here>` or an @mention."""
     return chief.safe_line(text, cap).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") \
         .replace("@", "@\u200b")
+
+
+def _preview(inp) -> str:
+    """The draft as a row shows it: the main text, saying when it is cut, and naming any other field that goes out. A
+    reply approves what the manager read, so they must know when they read part of it."""
+    fields = draft_fields(inp)
+    if not fields:
+        return '""'
+    names = [p + k for k in TOP_TEXT_KEYS + ("blocks",) + NESTED_TEXT_KEYS for p in ("", "inputs.")]
+    main = next((f for n in names for f in fields if f[0] == n), fields[0])
+    flat = chief.safe_line(main[1], len(main[1]) + 1)
+    out = '"%s"' % _shown(flat, PREVIEW_MAX)
+    if len(flat) > PREVIEW_MAX:
+        out += " … +%d chars, see the pane" % (len(flat) - PREVIEW_MAX)
+    others = [f[0] for f in fields if f is not main]
+    if others:
+        shown = [_shown(n, 60) for n in others[:ALSO_SENDS_MAX]]
+        if len(others) > ALSO_SENDS_MAX:
+            shown.append("+%d more" % (len(others) - ALSO_SENDS_MAX))
+        out += " · also sends: %s" % ", ".join(shown)
+    return out
 
 
 def _done_without_you(ws: Path, doc: dict, last: Optional[datetime]) -> int:
@@ -885,9 +934,9 @@ def batch(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
     rows = ["%d to decide · %d done without you" % (len(open_), _done_without_you(ws, doc, last))]
     for d in open_:
         why = _shown(d.get("why"), WHY_MAX)
-        rows.append('%s · %s · %s on %s: "%s"%s · recommend: %s' % (
+        rows.append("%s · %s · %s on %s: %s%s · recommend: %s" % (
             d.get("id"), _shown(d.get("key"), WHY_MAX), _shown(d.get("kind"), WHY_MAX), _shown(plain_target(d), 200),
-            _shown(draft_text(d.get("input")), PREVIEW_MAX), " · why: %s" % why if why else "",
+            _preview(d.get("input")), " · why: %s" % why if why else "",
             _shown(d.get("recommendation"), WHY_MAX)))
     rows.extend(_shown(c, CONFIRM_MAX) for c in doc["confirm"])
     if open_:
@@ -902,18 +951,22 @@ def offer(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
         got = batch(ws, cfg, at)
         if got is not None:
             doc = load(ws)
-            doc["batch"]["offered"] = len(doc["confirm"])
-            doc["batch"]["offered_ids"] = list(got["ids"])
+            # with an offer still live, its post may be out: a later `sent` clears only what both carried. A line shown
+            # twice beats a line lost.
+            b = doc["batch"]
+            b["offered"] = min(b.get("offered", len(doc["confirm"])), len(doc["confirm"]))
+            b["offered_ids"] = list(got["ids"])
+            b["offered_at"] = hub._iso(at)
             save(ws, doc)
     return got
 
 
 def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None) -> None:
     """The batch was posted. `ids` count as announced at `ts`, the post's own Slack ts (now when none is given). They
-    must be ids the last `offer` handed out: the manager can only answer what they saw. A decision keeps its first
-    stamp, so a reply to an earlier batch stays good. Clears the confirm lines that offer handed out, or all of them; a
-    line that arrived while the post was going out stays. ValueError on a `ts` that isn't a Slack ts or an id that
-    wasn't offered: nothing is written."""
+    must be ids the last `offer` handed out, and the stamp is never earlier than that offer: the manager can only answer
+    what they saw. A decision keeps its first stamp, so a reply to an earlier batch stays good. Clears the confirm lines
+    that offer handed out; a line that arrived while the post was going out stays. Uses the offer up. ValueError with
+    no live offer, on a `ts` that isn't a Slack ts, or on an id that wasn't offered: nothing is written."""
     if ts is not None and not _SLACK_TS.match(str(ts)):
         raise ValueError("--ts must be the post's Slack ts")
     ws = Path(ws)
@@ -921,18 +974,24 @@ def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None) -> No
         doc = load(ws)
         open_ = {d.get("id") for d in doc["decisions"] if d.get("status") == "pending"}
         b = doc["batch"]
+        if "offered" not in b:
+            raise ValueError("no batch is waiting to be recorded: `mother decide batch` makes one")
         extra = [i for i in ids if i not in (b.get("offered_ids") or [])]
         if extra:
             raise ValueError("%s wasn't in the batch `mother decide batch` offered" % ", ".join(extra))
+        stamp = str(ts) if ts is not None else hub._iso(at)
+        offered_at = b.pop("offered_at", None)
+        floor = guard.parse_time(offered_at)
+        if floor is not None and guard.parse_time(stamp) < floor:
+            stamp = offered_at
         b.pop("offered_ids", None)
         announced = {k: v for k, v in b["announced"].items() if k in open_}
         for i in ids:
             if i in open_:
-                announced.setdefault(i, str(ts) if ts is not None else hub._iso(at))
+                announced.setdefault(i, stamp)
         b["announced"] = announced
         b["last_at"] = hub._iso(at)
-        offered = b.pop("offered", None)
-        doc["confirm"] = doc["confirm"][offered:] if offered is not None else []
+        doc["confirm"] = doc["confirm"][b.pop("offered"):]
         save(ws, doc)
 
 

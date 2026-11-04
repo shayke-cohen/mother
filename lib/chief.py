@@ -621,11 +621,7 @@ def lines(ws: Path) -> List[dict]:
     ws = Path(ws)
     sessions = hub._sessions_doc(ws)
     out = []
-    pending = _pending_lines(ws)
-    replies = decisions.held_replies(ws, pending)  # the tick's: a wake never decides a reply
-    for l in pending:
-        if l["id"] in replies:
-            continue
+    for l in decisions.for_chief(ws, _pending_lines(ws)):  # a wake never decides a reply
         d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
         d["also"] = list(l.get("also") or [])
         d["session"] = _session_kind(sessions, l)
@@ -654,8 +650,9 @@ UNSTUCK_NOTE = ("The decision you were waiting on is gone or can't be read, so n
 def _unstick(ws: Path, at: datetime) -> None:
     """A worker waiting on a decision that is no longer there would wait forever: back to idle, and it's told why."""
     import decisions
+    live = workers(ws)  # first: a propose that lands after this read shows in `pending`, or its worker isn't seen waiting
     open_keys = {d.get("key") for d in decisions.pending(ws)}
-    for key, w in workers(ws).items():
+    for key, w in live.items():
         if w.get("status") == "waiting_decision" and key not in open_keys:
             try:
                 update_worker(ws, key, status="idle")
@@ -710,7 +707,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     known = {l["id"] for l in pending}
     retrying = decisions.waiting_reads(ws)  # a line the chief's decide jumped keeps its retries
     jumped = [l for l in raw if l["id"] in retrying and l["id"] not in known]
-    replies, held = decisions.apply_replies(ws, cfg, at, pending + jumped)
+    replies = decisions.apply_replies(ws, cfg, at, pending + jumped)
     behind = {l["id"] for l in raw[:start]}
     stray = decisions.stray_replies(ws, behind | {l["id"] for l in jumped})
 
@@ -754,7 +751,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
         out["decided"] = [d for d in decided if d["line_id"] not in strays]
         decisions.forget_replies(ws, strays)
 
-    judge = [l["id"] for l in pending[len(items):] if l["id"] not in replies and l["id"] not in held][:JUDGE_MAX]
+    judge = [l["id"] for l in decisions.for_chief(ws, pending[len(items):])][:JUDGE_MAX]
     out["judge"] = judge
     if judge:
         last = _read_obj(cdir / "wake.json")
@@ -856,8 +853,7 @@ def triage_apply(ws: Path, cfg: dict, at: datetime, verdicts: List[dict]) -> dic
     if items:
         hub.decide(ws, cfg, at, items)
     out["logged"] = [it["line_id"] for it in items]
-    replies = decisions.held_replies(ws, pending)  # the tick's: it applies them and logs them
-    kept = [l for l in pending[len(items):] if l["id"] not in replies][:JUDGE_MAX]
+    kept = decisions.for_chief(ws, pending[len(items):])[:JUDGE_MAX]  # replies are the tick's: it applies and logs them
     out["kept"] = [l["id"] for l in kept]
 
     cdir = chief_dir(ws)
