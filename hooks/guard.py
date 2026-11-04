@@ -3613,6 +3613,7 @@ def green(a, ctx, auto):
 # question ("mother approve shell? what does it do") is not a yes.
 APPROVE_RE = re.compile(r"^\s*mother approve (?:(tracker|chat) ([A-Za-z0-9_-]+)|(shell))(?=$|[\s.,;:!])", re.I)
 APPROVE_ANY_RE = re.compile(r"^\s*mother\s*approve\b", re.I | re.M)
+APP_NOTES_RE = re.compile(r"\A\s*(?:<system-reminder>.*?</system-reminder>\s*)+", re.S)
 LINE_BREAKS_RE = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 SESSION_APPROVAL_MAX_HOURS = 12
 
@@ -3713,7 +3714,8 @@ def session_approvals(transcript, max_hours=SESSION_APPROVAL_MAX_HOURS, now=None
             ts = parse_time(e.get("timestamp"))
             if ts is None or now - ts > max_hours * 3600 or ts > now + 60:
                 continue
-            for ln in text.strip().splitlines():  # only the leading block of approve lines counts
+            # the app puts its own notes above what the manager typed; only the leading block of approve lines counts
+            for ln in APP_NOTES_RE.sub("", text, count=1).strip().splitlines():
                 m = APPROVE_RE.match(ln)
                 if not m:
                     break
