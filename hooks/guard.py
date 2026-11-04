@@ -2042,6 +2042,20 @@ def shell_protected(cmd, run, cwd, ctx):
     return None
 
 
+def shell_decision_store(cmd, cwd, ctx):
+    """A shell write that names .mother/chief/decisions.json or .mother/hub/inbox.jsonl (on the normalised text of
+    shell_protected), wherever it runs: a `$(...)` or variable the guard can't resolve still counts, since the folder
+    and file are named. Run from inside <ws>/.mother, the bare file name is enough."""
+    run = run_text(cmd)
+    if not (shell_writes(cmd, run) or EXTRA_WRITE_RE.search(drop_temp_writes(run))):
+        return False
+    t = re.sub(r"[\"'\\]", "", run_text(cmd, quotes=False)).casefold()
+    if re.search(r"\.mother/+chief\b.*?decisions\.json|\.mother/+hub\b.*?inbox\.jsonl", t, re.S):
+        return True
+    return bool(ctx.ws and cwd and inside(os.path.realpath(cwd).casefold(), _cf(os.path.join(ctx.ws, ".mother")))
+                and re.search(r"(?<![\w.-])(?:\S*/)?(?:decisions\.json|inbox\.jsonl)(?![\w.-])", t))
+
+
 def wa_shell_names_config(cmd):
     """A shell write that shell_self_edit already matched also names config.json (quoted paths included)."""
     text = run_text(cmd, quotes=False)
@@ -2644,6 +2658,9 @@ def classify_shell(cmd, cwd, ctx):
     if CHANNELS_MGR_RE.search(norm):
         return act("manager_only", "manager_only", "`mother channels resume|start` turns the channel reply loop "
                                                    "back on: %s" % cmd.strip()[:160])
+    if shell_decision_store(cmd, cwd, ctx):
+        return act("grants", "grants_file", "a shell write to .mother/chief/decisions.json or .mother/hub/inbox.jsonl: "
+                   + cmd.strip()[:160], op="decision_store")
     if hub_fed(ctx):
         why = hub_fed_shell(norm)
         if why:
@@ -3485,6 +3502,8 @@ def classify(tool, inp, cwd, ctx):
                 return act("home_settings", "home_settings", "an edit to a session transcript: " + fp)
             if fp.casefold() == grants_path(ctx):
                 return act("grants", "grants_file", "an edit to .mother/grants.json")
+            if ctx.ws and fp.casefold() == _cf(os.path.join(ctx.ws, ".mother", "hub", "inbox.jsonl")):
+                return act("grants", "grants_file", "an edit to .mother/hub/inbox.jsonl", op="decision_store")
             if chief_dir_path(fp, ctx):
                 return act("grants", "grants_file", "an edit to .mother/chief/ (chief.json names the chief; only "
                                                     "`mother chief` writes there): " + fp)
@@ -3899,28 +3918,45 @@ def valid_grant(g, scope, target, cfg, scopes, max_age, now, thread=None):
         return None
     if not isinstance(uses, int) or isinstance(uses, bool) or uses < 1:
         return None
+    pane = str(channel) == "pane"  # a Chief pane press: there is no message, so only a decision's bound grant may cite one
+    if pane and not all(isinstance(g.get(k), str) and g[k] for k in ("draft_sha", "decision")):
+        return None
     if scope == "answer":
         if str(channel) != str(target) or not may_trigger(cfg, target, user):
             return None  # a teammate's message authorises only an answer in that channel, per its mode
     elif str(user) != str(owner_id(cfg)):
         return None  # only the manager's own message can authorise a write
-    if str(channel) not in dm_ids(cfg) | set(team_channels(cfg)):
+    if not pane and str(channel) not in dm_ids(cfg) | set(team_channels(cfg)):
         return None
     if not (now - max_age * 3600 <= ts <= now + 60):
         return None  # the cited message is too old, or in the future
     if not (now < expires <= ts + max_age * 3600):
         return None  # expired, or expiring later than the policy allows
-    return "%s|%s" % (channel, src.get("ts")), min(uses, scopes[scope])
+    key = "%s|%s" % (channel, src.get("ts"))
+    if g.get("decision"):  # one reply can answer several decisions: each one's grant has its own use
+        key += "|%s" % g["decision"]
+    return key, min(uses, scopes[scope])
 
 
-def run_grant(a, ctx, now=None):
-    """Consume one use of a matching grant; return a description, or None."""
+def grant_binds_call(g, tool, inp):
+    """False when `g` is bound to one exact call (it carries `draft_sha` or `decision`) and this isn't that call,
+    or the call isn't known. A grant with neither field covers what its scope and target say."""
+    if "draft_sha" not in g and "decision" not in g:
+        return True
+    want = g.get("draft_sha")
+    return isinstance(want, str) and bool(want) and tool is not None and inp is not None \
+        and want == draft_sha(tool, inp)
+
+
+def run_grant(a, ctx, now=None, tool=None, inp=None):
+    """Consume one use of a matching grant; return a description, or None. `tool` and `inp` are the call itself, what
+    a bound grant (draft_sha) is checked against."""
     sc = grant_scope_of(a)
     if not sc or not ctx.ws:
         return None
     found = None
     for cand in [sc] + ([("answer", sc[1], 1)] if sc[0] == "chat-reply" else []):
-        found = run_grant_scope(a, ctx, cand, now)
+        found = run_grant_scope(a, ctx, cand, now, tool, inp)
         if found:
             break
     return found
@@ -3936,7 +3972,7 @@ def answers_last_hour(book, target, now):
     return n
 
 
-def run_grant_scope(a, ctx, sc, now=None):
+def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
     scope, target, n = sc
     scopes, max_age = grant_limits(ctx.cfg)
     if scope not in scopes or not target or target not in allowed_targets(scope, ctx.cfg):
@@ -3967,7 +4003,7 @@ def run_grant_scope(a, ctx, sc, now=None):
                 return None  # rate limit, enforced here too in case the loop's own check is bypassed
         for g in data["grants"]:
             v = valid_grant(g, scope, target, ctx.cfg, scopes, max_age, now, thread=a.get("thread"))
-            if not v:
+            if not v or not grant_binds_call(g, tool, inp):  # checked before the ledger: a mismatch costs no use
                 continue
             key, cap = v
             used = 0
@@ -4050,7 +4086,7 @@ def decide_whatsapp(a, ctx):
     return "ask", "%s%s. Confirm it." % (shown, note)
 
 
-def decide(a, ctx, transcript=None):
+def decide(a, ctx, transcript=None, tool=None, inp=None):
     if a["kind"] == "whatsapp":
         return decide_whatsapp(a, ctx)
     if a["kind"] == "config":
@@ -4086,6 +4122,9 @@ def decide(a, ctx, transcript=None):
     if a["kind"] == "grants" and a.get("op") == "channels_session":
         return "ask", "%s. The channels loop runs in its own session, which starts with `mother channels plan`; " \
                       "confirm this is you." % a["what"]
+    if a["kind"] == "grants" and a.get("op") == "decision_store":
+        return "ask", "%s. Only `mother decide` and the watcher write it, and a yes is read from it; confirm this is " \
+                      "you." % a["what"]
     if a["kind"] == "grants" and a.get("op") == "cli":
         return "ask", "%s. Confirm the manager asked for this grant." % a["what"]
     if a["kind"] == "grants":
@@ -4109,7 +4148,7 @@ def decide(a, ctx, transcript=None):
         return "allow", "%s: covered by the manager's `mother approve` line in this session." % a["what"]
     if a["kind"] == "outbound_unknown":
         return "ask", "%s: the guard can't tell where this sends data or who sees it. Confirm it." % a["what"]
-    why = run_grant(a, ctx)
+    why = run_grant(a, ctx, tool=tool, inp=inp)
     if why:
         return "allow", "%s: %s." % (a["what"], why)
     return "ask", "%s reaches someone other than the manager (needs a yes: %s). Confirm it." % (
@@ -4748,22 +4787,23 @@ def chief_session(ctx, payload):
     return isinstance(want, str) and bool(want) and want == ctx.sid
 
 
-def chief_command(cmd):
-    """True for exactly one `mother chief lines|status|run|say …` the chief may run: `mother`, this plugin's
-    bin/mother by its own path (not a symlink to it), or `python3` of it; never `${CLAUDE_PLUGIN_ROOT}`. Read by the shell allow-list's lexer
-    (sl_lex): one stage, no newline, redirection or heredoc, and no `$` expansion, backtick, backslash, glob or
-    comment outside quotes, so a value may hold any other text quoted. The shapes:
-    `lines [--json]`, `status [--json]`, `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a
-    non-empty value in the same token) and `say <key> -- <text…>`."""
-    if "\n" in cmd or "\r" in cmd or hub_odd_chars(cmd) or "CLAUDE_PLUGIN_ROOT" in cmd:
-        return False  # the guard would read ${CLAUDE_PLUGIN_ROOT} as this plugin; the chief's shell has it unset
+def plugin_mother_args(cmd, heredoc=False):
+    """The words after `mother` when `cmd` is exactly one run of `mother`, this plugin's bin/mother by its own path
+    (not a symlink to it), or `python3` of it, never `${CLAUDE_PLUGIN_ROOT}`; else None. Read by the shell allow-list's
+    lexer (sl_lex): one stage, no newline, redirection or heredoc, and no `$` expansion, backtick, backslash, glob or
+    comment outside quotes, so a value may hold any other text quoted. `heredoc=True` also takes one <<'WORD' body,
+    which the shell never reads, so only the line that opens it is checked for odd characters."""
+    head = cmd.split("\n", 1)[0] if heredoc else cmd
+    if (not heredoc and "\n" in cmd) or "\r" in head or hub_odd_chars(head) or "CLAUDE_PLUGIN_ROOT" in head:
+        return None  # the guard would read ${CLAUDE_PLUGIN_ROOT} as this plugin; the chief's shell has it unset
     plugin = os.path.dirname(HERE)
     try:
         stages = sl_lex(cmd, plugin)
     except Exception:
-        return False
-    if len(stages) != 1 or stages[0]["redirs"] or stages[0]["heredocs"] or stages[0].get("sep"):
-        return False
+        return None
+    if len(stages) != 1 or stages[0]["redirs"] or stages[0].get("sep") not in (("", "\n") if heredoc else ("",)) \
+            or len(stages[0]["heredocs"]) > (1 if heredoc else 0):
+        return None
     words = stages[0]["words"]
     mine = os.path.join(plugin, "bin", "mother")
 
@@ -4773,10 +4813,32 @@ def chief_command(cmd):
     if words[:1] == ["python3"]:
         words = words[1:]
         if not (words and is_mine(words[0])):
-            return False
+            return None
     elif not words or not (words[0] == "mother" or is_mine(words[0])):
+        return None
+    return words[1:]
+
+
+def chief_decide_args(args):
+    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8 [--ts TS]`."""
+    verb, rest = (args[0], args[1:]) if args else ("", [])
+    if verb == "batch":
+        return rest in ([], ["--json"])
+    if verb != "sent" or len(rest) not in (2, 4) or rest[0] != "--ids" or not re.fullmatch(r"D\d+(?:,D\d+)*", rest[1]):
         return False
-    args = words[1:]
+    return len(rest) == 2 or (rest[2] == "--ts" and bool(re.fullmatch(r"\d+(?:\.\d+)?", rest[3])))
+
+
+def chief_command(cmd):
+    """True for exactly one command the chief may run (plugin_mother_args): `mother chief lines|status|run|say …` or
+    `mother decide batch|sent …`. The chief shapes: `lines [--json]`, `status [--json]`,
+    `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a non-empty value in the same token) and
+    `say <key> -- <text…>`."""
+    args = plugin_mother_args(cmd)
+    if args is None:
+        return False
+    if args[:1] == ["decide"]:
+        return chief_decide_args(args[1:])
     if len(args) < 2 or args[0] != "chief":
         return False
     verb, rest = args[1], args[2:]
@@ -4796,6 +4858,32 @@ def chief_command(cmd):
             return False
         seen.add(flag)
     return True
+
+
+def worker_propose_command(cmd):
+    """True for exactly one `mother decide propose <key> --tool T --recommend R [--why W] [--urgent] --stdin`, with
+    the call's JSON in a <<'WORD' heredoc or not (plugin_mother_args). It only files a pending decision."""
+    args = plugin_mother_args(cmd, heredoc=True)
+    if args is None or args[:2] != ["decide", "propose"]:
+        return False
+    keys, seen, i, rest = [], set(), 0, args[2:]
+    while i < len(rest):
+        a = rest[i]
+        i += 1
+        if a in ("--tool", "--recommend", "--why"):
+            if a in seen or i >= len(rest):
+                return False
+            seen.add(a)
+            i += 1
+        elif a in ("--urgent", "--stdin"):
+            if a in seen:
+                return False
+            seen.add(a)
+        elif a.startswith("-") or not a:
+            return False
+        else:
+            keys.append(a)
+    return len(keys) == 1 and {"--tool", "--recommend", "--stdin"} <= seen
 
 
 def hub_bad_field(v):
@@ -4908,6 +4996,40 @@ WORKER_HUB_READ_SUBS = {("session", "for"), ("dms", "show")}
 WORKER_FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 
+DECISION_ANSWER_DENY = "Only the manager answers a decision: in the self-DM, the Chief pane, or /chief. A session may " \
+                       "not run this."
+_ANSWER_VERB = r"(?:answer|approve|reject|edit)\b"
+_NOT_IN_WORD = r"(?:^|[^\w.-])"
+# by name or path; a verb the shell computes; a verb xargs feeds in; a renamed or computed program, by its arguments
+DECISION_ANSWER_RE = re.compile(
+    _NOT_IN_WORD + r"mother\s+decide\s+" + _ANSWER_VERB + "|" + _NOT_IN_WORD + r"mother\s+decide\s+\S*[$`]"
+    r"|\bxargs\b[^|;&\n]*" + _NOT_IN_WORD + r"mother\s+decide\b|" + _NOT_IN_WORD + r"decide\s+" + _ANSWER_VERB +
+    r"\s+d?\d")
+_ANSWER_MODULE = r"(?:decisions|grants)\b"
+DECISION_IMPORT_RE = re.compile(
+    r"(?:^|[^\w.])import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*(?:lib\.)?" + _ANSWER_MODULE +
+    r"|(?:^|[^\w.])from\s+(?:lib\.)?" + _ANSWER_MODULE + r"\s+import\b"
+    r"|(?:^|[^\w.])from\s+(?:[\w.]+\.)?lib\s+import\s+[^;\n]*\b" + _ANSWER_MODULE +
+    r"|(?:__import__|import_module)\s*\(\s*(?:[\w.]+\.)?" + _ANSWER_MODULE +
+    r"|\bpython[\d.]*(?:\s+-\S+)*\s+(?:\S*/)?(?:decisions|grants)\.py\b"
+    r"|\bpython[\d.]*(?:\s+-\S+)*\s+-m\s+(?:lib\.)?" + _ANSWER_MODULE)
+DECISION_LIB_RE = re.compile(r"\blib/+(?:decisions|grants)(?:\.py)?(?![\w/-])")
+
+
+def decision_answer_shell(cmd):
+    """A shell command that answers a decision or reaches the code that writes its grant: it names `mother decide
+    answer|approve|reject|edit` or imports `decisions`/`grants`, on the text with quotes and backslashes dropped
+    (subprocess's list form too), heredoc bodies and quoted text included, as worker_hub_write reads a command.
+    lib/decisions and lib/grants by path count when the command runs an interpreter or writes; reading them passes."""
+    for text in (cmd, inline_literal_vars(cmd)):
+        norm = re.sub(r"[\"'\\]", "", text).casefold()
+        if DECISION_ANSWER_RE.search(re.sub(r"[,\[\]()]+", " ", norm)) or DECISION_IMPORT_RE.search(norm):
+            return True
+        if DECISION_LIB_RE.search(norm) and (SCRIPT_RE.search(norm) or shell_writes(text, run_text(text))):
+            return True
+    return False
+
+
 def worker_hub_path(inp, cwd, ctx):
     """True when a file tool's target is, on real paths (casefolded), inside <ws>/.mother/hub/."""
     if not ctx.ws:
@@ -4983,6 +5105,9 @@ def _run(raw):
         # untrusted text headless: it may read the hub but never change it (log lines, mute, drop sessions).
         text = str(inp.get("command") or "") if tool in ("Bash", "Monitor") or \
             tool.split("__")[-1] == "run_in_terminal" else ""
+        if text and decision_answer_shell(text):  # every session: a yes comes only from the manager
+            log(ctx, tool, {"kind": "decision-answer", "category": "chief"}, "deny", DECISION_ANSWER_DENY)
+            return "deny", DECISION_ANSWER_DENY
         if text and os.environ.get(CHIEF_WORKER_ENV, "").strip():
             w = worker_hub_write(text)
             if w:
@@ -5031,6 +5156,10 @@ def _run(raw):
         # verbs unasked, hub-fed or not; every other session, a hub-fed worker included, gets the rules below.
         if tool == "Bash" and chief_session(ctx, payload) and chief_command(str(inp.get("command") or "")):
             return None
+        # A chief worker files what needs the manager's yes; that writes a pending decision and nothing else.
+        if tool == "Bash" and os.environ.get(CHIEF_WORKER_ENV, "").strip() and not payload.get("agent_type") \
+                and worker_propose_command(str(inp.get("command") or "")):
+            return None
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             # The channels loop's session: a plain `mother channels plan` that gets no decision, run as itself in the
@@ -5045,7 +5174,7 @@ def _run(raw):
         if os.environ.get(DRY_RUN_ENV, "").strip():
             r = "deny", "%s: dry run (%s is set), nothing leaves the machine." % (a["what"], DRY_RUN_ENV)
         else:
-            r = stamp_block(tool, a, ctx) or decide(a, ctx, payload.get("transcript_path"))
+            r = stamp_block(tool, a, ctx) or decide(a, ctx, payload.get("transcript_path"), tool, inp)
         # Functional autonomy (policy.autonomy, default): only a functional send, a decision someone else sees or
         # the guard's own safety files keep their question. Denies are untouched (PAUSED, never-list, dry run).
         if r[0] == "ask" and functional_pass(tool, a, ctx):

@@ -2529,9 +2529,9 @@ class RoundTwo(GuardCase):
         self.ws_call("none", "Bash", {"command": "awk '{print}' x"}, mode=self.BY)   # the switch passes it
         for cmd in ("mother grant {add,} chat-post C1 --by U1 --cites 1", "cp notes.md .mother/grants.json",
                     "cp notes.md .claude/settings.json", "printf x > AGENTS.md", "cp notes.md teams/CLAUDE.md",
-                    "cat ~/.mother/grant.key", "cp notes.md .git/hooks/pre-commit",
-                    "python3 -c 'import grants; grants.main([\"add\"])'"):
+                    "cat ~/.mother/grant.key", "cp notes.md .git/hooks/pre-commit"):
             self.ws_call("ask", "Bash", {"command": cmd}, mode=self.BY)
+        self.ws_call("deny", "Bash", {"command": "python3 -c 'import grants; grants.main([\"add\"])'"}, mode=self.BY)
         self.expect("none", "Bash", {"command": "awk '{print}' x"}, cwd=self.tmp, mode=self.BY)
 
     def test_heredoc_into_mother_hides_nothing_else(self):
@@ -3726,6 +3726,293 @@ class DraftShaTest(unittest.TestCase):
         self.assertRegex(a, r"^[0-9a-f]{64}$")
         self.assertNotEqual(a, g.draft_sha("t", {"channel": "C00000001", "text": "hellp"}))
         self.assertNotEqual(a, g.draft_sha("u", {"channel": "C00000001", "text": "hello"}))
+
+
+class DecisionGrants(GuardCase):
+    """Phase 2 Task 4: a decision's grant covers one exact tool call, and a Chief pane source counts only on such a
+    grant."""
+
+    TOOL = CHAT + "post_message"
+    INP = {"channel_id": TEAM, "text": "The release is on Sunday. " + SIG}
+
+    @staticmethod
+    def sha(tool, inp):
+        import hashlib
+        blob = json.dumps({"tool": tool, "input": inp}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def bound(self, tool=None, inp=None, scope="chat-post", target=TEAM, channel="pane", n=1, **extra):
+        g = self.grant(scope, target, channel=channel, run="chief:D%d" % n, decision="D%d" % n,
+                       draft_sha=self.sha(tool or self.TOOL, self.INP if inp is None else inp))
+        g.update(extra)
+        return g
+
+    def uses(self):
+        try:
+            with open(self.state("ledger.json")) as f:
+                return json.load(f).get("uses") or []
+        except FileNotFoundError:
+            return []
+
+    def test_draft_sha_covers_exact_call(self):
+        for channel in ("pane", DM):
+            self.grants(self.bound(channel=channel, source={"channel": channel, "user": ME, "ts": "%.6f" % time.time()}))
+            self.expect("allow", self.TOOL, self.INP)
+            self.expect("ask", self.TOOL, self.INP)  # single use
+        # key order is not part of the call
+        self.grants(self.bound(n=2))
+        self.expect("allow", self.TOOL, {"text": self.INP["text"], "channel_id": TEAM})
+
+    def test_draft_sha_mismatch_not_covered(self):
+        self.grants(self.bound())
+        self.expect("ask", self.TOOL, dict(self.INP, text="The release is on Monday. " + SIG))  # one word
+        self.expect("ask", CHAT2 + "slack_send_message", self.INP)  # the same input through another tool
+        self.assertEqual(self.uses(), [], "a mismatch must not consume the use")
+        self.expect("allow", self.TOOL, self.INP)  # the exact call still has its use
+        # another thread, with the thread not pinned by the grant's own `thread` field
+        reply = {"channel_id": TEAM, "thread_ts": "1700000000.000100", "text": "Done. " + SIG}
+        tool = CHAT + "reply_to_thread"
+        self.grants(self.bound(tool, reply, scope="chat-reply", n=2))
+        self.expect("ask", tool, dict(reply, thread_ts="1700000000.000200"))
+        self.assertEqual(len(self.uses()), 1)
+        self.expect("allow", tool, reply)
+
+    def test_bound_answer_grant_mismatch(self):
+        """A chat-reply also tries the `answer` scope: the binding holds there too."""
+        reply = {"channel_id": TEAM, "thread_ts": "1700000000.000100", "text": "Done. " + SIG}
+        tool = CHAT + "reply_to_thread"
+        self.grants(self.bound(tool, reply, scope="answer", channel=TEAM, thread="1700000000.000100"))
+        self.expect("ask", tool, dict(reply, text="Not done. " + SIG))
+        self.assertEqual(self.uses(), [])
+
+    def test_bound_grant_never_reads_as_unbound(self):
+        """Without the call in hand (tool/inp left out), or with a draft_sha that is empty or not a string, a bound
+        grant covers nothing."""
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("mother_guard_bound", GUARD)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        self.grants(self.bound())
+        with mock.patch.dict(os.environ, {"HOME": self.home, "MOTHER_WORKSPACE": self.ws}):
+            ctx = g.load_ctx()
+            a = g.classify(self.TOOL, self.INP, self.tmp, ctx)
+            self.assertIsNone(g.run_grant(a, ctx))
+            self.assertIsNone(g.run_grant(a, ctx, tool=self.TOOL))
+            self.assertEqual(self.uses(), [])
+            self.assertTrue(g.run_grant(a, ctx, tool=self.TOOL, inp=self.INP))
+        for bad in ("", None, 0, ["x"]):
+            self.grants(self.grant("chat-post", TEAM, src_age=700 + len(str(bad)), draft_sha=bad, decision="D3"))
+            self.expect("ask", self.TOOL, self.INP)
+
+    def test_unbound_grant_unchanged(self):
+        self.grants(self.grant("chat-post", TEAM))
+        self.expect("allow", self.TOOL, self.INP)
+        self.expect("ask", self.TOOL, self.INP)
+        self.grants(self.grant("chat-post", TEAM, uses=2, src_age=700))
+        self.expect("allow", self.TOOL, dict(self.INP, text="Anything at all. " + SIG))
+        self.expect("allow", self.TOOL, dict(self.INP, text="Anything else. " + SIG))
+        # an unbound grant beside a bound one still covers what it covers
+        self.grants(self.bound(n=2), self.grant("chat-post", TEAM, src_age=800))
+        self.expect("allow", self.TOOL, dict(self.INP, text="Something else. " + SIG))
+
+    def test_pane_source_needs_draft_sha(self):
+        sha = self.sha(self.TOOL, self.INP)
+        for extra in ({}, {"decision": "D1"}, {"draft_sha": sha}, {"decision": "", "draft_sha": sha},
+                      {"decision": "D1", "draft_sha": ""}, {"decision": 1, "draft_sha": sha}):
+            self.grants(self.grant("chat-post", TEAM, channel="pane", **extra))
+            self.expect("ask", self.TOOL, self.INP)
+        self.assertEqual(self.uses(), [])
+        # the other checks stand: who, how old, when it ends, and a pane press authorises no `answer`
+        for g in (self.bound(source={"channel": "pane", "user": "U00000001", "ts": "%.6f" % (NOW - 60)}),
+                  self.bound(source={"channel": "pane", "user": ME, "ts": "%.6f" % (NOW - 5 * 86400)}),
+                  self.bound(expires=iso(NOW - 60)),
+                  self.bound(expires=iso(NOW + 200 * 3600))):
+            self.grants(g)
+            self.expect("ask", self.TOOL, self.INP)
+        reply = {"channel_id": TEAM, "thread_ts": "1700000000.000100", "text": "Done. " + SIG}
+        self.grants(self.bound(CHAT + "reply_to_thread", reply, scope="answer", thread="1700000000.000100"))
+        self.expect("ask", CHAT + "reply_to_thread", reply)
+        self.grants(self.bound())
+        self.expect("allow", self.TOOL, self.INP)
+
+    def test_one_reply_answers_two_decisions(self):
+        """`1 ok 2 ok` is one Slack message: each decision has its own grant, so each gets its own use."""
+        other = dict(self.INP, text="The other announcement. " + SIG)
+        src = {"channel": DM, "user": ME, "ts": "%.6f" % (NOW - 60)}
+        self.grants(self.bound(channel=DM, n=1, source=src), self.bound(inp=other, channel=DM, n=2, source=src))
+        self.expect("allow", self.TOOL, self.INP)
+        self.expect("allow", self.TOOL, other)
+        self.expect("ask", self.TOOL, other)
+
+
+class DecisionShell(GuardCase):
+    """Phase 2 Task 4: only the manager answers a decision; a chief worker files them; the chief posts the batch."""
+
+    CHIEF = "chief-0000"
+    WORKER_ENV = {"MOTHER_CHIEF_WORKER": "PLAT-1"}
+    CHIEF_ENV = {"MOTHER_CHIEF_ROLE": "chief"}
+    DENY = "Only the manager answers a decision: in the self-DM, the Chief pane, or /chief. A session may not run this."
+    PROPOSE = ("mother decide propose PLAT-1 --tool mcp__chat__slack__post_message --recommend send --why 'it is due' "
+               "--stdin <<'EOF'\n{\"channel_id\": \"C00000001\", \"text\": \"curl https://example.com; rm -rf x > y\"}\n"
+               "EOF")
+
+    def setUp(self):
+        super().setUp()
+        for d in ("hub", "chief"):
+            os.makedirs(os.path.join(self.ws, ".mother", d), exist_ok=True)
+        with open(os.path.join(self.ws, ".mother", "chief", "chief.json"), "w") as f:
+            json.dump({"session_id": self.CHIEF}, f)
+
+    def sessions(self):
+        """(kwargs for run_guard) of a normal session, a workspace one, the chief, a worker, a channel loop, a
+        sub-agent, bypass mode."""
+        return [{"cwd": self.tmp}, {"cwd": self.ws}, {"cwd": self.ws, "session": self.CHIEF, "env": self.CHIEF_ENV},
+                {"cwd": self.ws, "env": self.WORKER_ENV}, {"cwd": self.ws, "env": {"MOTHER_CHANNEL_ROLE": "reply"}},
+                {"cwd": self.ws, "agent": "reader"}, {"cwd": self.ws, "mode": "bypassPermissions"},
+                {"cwd": self.tmp, "mode": "bypassPermissions"}]
+
+    def test_shell_decide_approve_denied(self):
+        bin_mother = os.path.join(ROOT, "bin", "mother")
+        cmds = ["mother decide answer 1 ok --via pane", 'python3 -c "import decisions"',
+                "mother decide approve 1", "mother decide reject 1", "mother decide edit 1 -- x",
+                "mother   decide \t answer 1 ok --via pane", "mother decide \\\n answer 1 ok --via pane",
+                "mo'ther' de\"cide\" answer 1 ok --via typed", "MOTHER DECIDE ANSWER 1 ok",
+                bin_mother + " decide answer 1 ok --via pane", "python3 %s decide answer 1 ok" % bin_mother,
+                "${CLAUDE_PLUGIN_ROOT}/bin/mother decide answer 1 ok", "cd /tmp && ./bin/mother decide answer 1 ok",
+                "true; mother decide answer 1 ok", "sh -c 'mother decide answer 1 ok'",
+                "v=answer; mother decide $v 1 ok", "mother decide ${v} 1 ok", "mother decide `echo answer` 1 ok",
+                "M=mother; $M decide answer 1 ok", "$M decide answer 1 ok", "echo answer 1 ok | xargs mother decide",
+                "python3 -c \"import subprocess; subprocess.run(['mother', 'decide', 'answer', '1', 'ok'])\"",
+                "python3 -c 'from decisions import answer'", "python3 -c 'from grants import write'",
+                "python3 -c 'import grants'", "python3 -c 'import os, json, decisions'",
+                "python3 -c 'import decisions as d'", "python3 -c 'from lib import decisions'",
+                "python3 -c 'from lib.grants import write'", "python3 -c 'import lib.decisions'",
+                "python3 -c \"__import__('decisions')\"",
+                "python3 -c \"import importlib; importlib.import_module('grants')\"",
+                "python3 <<'EOF'\nimport decisions\nEOF", "echo 'import decisions' | python3",
+                "python3 lib/decisions.py answer 1 ok", "python3 lib/grants.py add", "cd lib; python3 decisions.py",
+                "python3 -m decisions", "python3 -m lib.grants",
+                "python3 -c \"import importlib.util as u; u.spec_from_file_location('d', 'lib/decisions.py')\"",
+                "echo x >> lib/decisions.py", "sed -i '' s/a/b/ lib/grants.py", "cp /tmp/x lib/decisions.py"]
+        sessions = self.sessions()
+        for s in sessions[:3]:  # a normal session, a workspace one, the chief: every form
+            for cmd in cmds:
+                self.assertIn(self.DENY, self.expect("deny", "Bash", {"command": cmd}, **s), cmd)
+        for s in sessions[3:]:  # every other kind of session: the two forms the rule has
+            for cmd in cmds[:2]:
+                self.assertIn(self.DENY, self.expect("deny", "Bash", {"command": cmd}, **s), cmd)
+        # every shell tool, and the chief's own allowance cannot carry one in
+        cmd = "mother decide answer 1 ok --via pane"
+        self.assertIn(self.DENY, self.expect("deny", "Monitor", {"command": cmd}, cwd=self.ws))
+        self.assertIn(self.DENY, self.expect("deny", "mcp__terminal__run_in_terminal", {"command": cmd}, cwd=self.ws))
+        self.expect("deny", "Bash", {"command": "mother chief say PLAT-1 -- '%s'" % cmd}, cwd=self.ws,
+                    session=self.CHIEF, env=self.CHIEF_ENV)
+
+    def test_shell_decide_reads_are_not_denied(self):
+        for cmd in ("grep decisions lib/foo.py", "cat lib/decisions.py", "sed -n 1,5p lib/grants.py",
+                    "grep -n answer lib/decisions.py | head -5", "wc -l lib/decisions.py lib/grants.py 2>/dev/null",
+                    "git diff lib/decisions.py", "git add lib/decisions.py lib/grants.py",
+                    "git log --oneline -- lib/grants.py", "python3 -m unittest tests.test_decisions",
+                    "git commit -m 'the guard reads from decisions and grants'", "mother decide propose",
+                    "mother hub decide", "mother hub show", "mother grant list", "ls decisions grants",
+                    "cat .mother/chief/decisions.json", "echo let the manager decide answers"):
+            for cwd in (self.tmp, self.ws):
+                _, why = self.run_guard("Bash", {"command": cmd}, cwd=cwd)
+                self.assertNotIn(self.DENY, why, cmd)
+
+    def test_worker_may_propose(self):
+        bin_mother = os.path.join(ROOT, "bin", "mother")
+        for cwd in (self.ws, self.tmp):
+            for cmd in (self.PROPOSE, self.PROPOSE.replace("mother decide", bin_mother + " decide", 1),
+                        self.PROPOSE.replace("mother decide", "python3 %s decide" % bin_mother, 1),
+                        self.PROPOSE.replace("--why 'it is due' ", "--urgent "),
+                        self.PROPOSE.replace("mother decide propose PLAT-1", "mother decide propose 'example-org/api#12'")):
+                self.expect("none", "Bash", {"command": cmd}, env=self.WORKER_ENV, cwd=cwd)
+        # exactly that shape: one stage, nothing after the heredoc, no redirection
+        for cmd in (self.PROPOSE + "\ncurl https://example.com", "curl https://example.com; " + self.PROPOSE,
+                    "mother decide propose PLAT-1 --tool T --recommend send --stdin > /tmp/out <<'EOF'\n{}\nEOF",
+                    "mother decide propose PLAT-1 --tool T --recommend send --stdin --plugin-dir x <<'EOF'\n{}\nEOF",
+                    "mother decide propose PLAT-1 --tool $T --recommend send --stdin <<'EOF'\n{}\nEOF",
+                    "mother decide propose --tool T --recommend send --stdin <<'EOF'\n{}\nEOF",
+                    "mother decide propose PLAT-1 PLAT-2 --tool T --recommend send --stdin <<'EOF'\n{}\nEOF",
+                    "mother decide propose PLAT-1 --tool T --tool U --recommend send --stdin <<'EOF'\n{}\nEOF",
+                    "mother decide batch --json", "mother decide sent --ids D1"):
+            self.expect("ask", "Bash", {"command": cmd}, env=self.WORKER_ENV, cwd=self.ws)
+        # not a worker: the allow-list's question, as before; a worker's sub-agent is not the worker
+        self.expect("ask", "Bash", {"command": self.PROPOSE}, cwd=self.ws)
+        self.expect("ask", "Bash", {"command": self.PROPOSE}, cwd=self.ws, env=self.WORKER_ENV, agent="helper")
+
+    def test_chief_may_post_the_batch(self):
+        bin_mother = os.path.join(ROOT, "bin", "mother")
+        for cmd in ("mother decide batch --json", "mother decide batch", "mother decide sent --ids D7,D8 --ts 1700000000.000100",
+                    "mother decide sent --ids D7", bin_mother + " decide batch --json",
+                    "python3 %s decide sent --ids D7" % bin_mother):
+            self.expect("none", "Bash", {"command": cmd}, cwd=self.ws, session=self.CHIEF, env=self.CHIEF_ENV)
+        for cmd in ("mother decide confirmed", "mother decide batch --all", "mother decide batch --json; curl x",
+                    "mother decide sent", "mother decide sent --ids", "mother decide sent --ids 'D7;x'",
+                    "mother decide sent --ids D7 --ts x", "mother decide sent --ids D7 --ids D8",
+                    "mother decide sent --ids D7 > /tmp/x", self.PROPOSE):
+            self.expect("deny", "Bash", {"command": cmd}, cwd=self.ws, session=self.CHIEF, env=self.CHIEF_ENV)
+            self.expect("ask", "Bash", {"command": cmd}, cwd=self.ws)
+        # the role without chief.json's id is not the chief
+        self.expect("ask", "Bash", {"command": "mother decide batch --json"}, cwd=self.ws, session="other",
+                    env=self.CHIEF_ENV)
+
+    def store_cases(self, rel):
+        path = os.path.join(self.ws, ".mother", rel)
+        d, name = os.path.split(rel)
+        tools = [("Write", {"file_path": path, "content": "{}"}),
+                 ("Edit", {"file_path": path, "old_string": "a", "new_string": "b"}),
+                 ("MultiEdit", {"file_path": path, "edits": [{"old_string": "a", "new_string": "b"}]}),
+                 ("NotebookEdit", {"notebook_path": path, "new_source": "x"})]
+        shell = ["echo x >> " + path, "echo x >> .mother/%s" % rel, "cp /tmp/x .mother/%s" % rel,
+                 "echo x | tee -a .mother/%s" % rel, "sed -i '' s/a/b/ .mother/%s" % rel,
+                 "cd .mother/%s && echo x >> %s" % (d, name),
+                 "python3 -c \"open('.mother/%s','a').write('x')\"" % rel]
+        return tools, shell
+
+    def expect_store_guarded(self, rel, worker):
+        tools, shell = self.store_cases(rel)
+        d, name = os.path.split(rel)
+        for tool, inp in tools:
+            for kw in ({"cwd": self.ws}, {"cwd": self.tmp}, {"cwd": self.ws, "mode": "bypassPermissions"}):
+                self.expect("ask", tool, inp, **kw)
+            self.expect("deny", tool, inp, cwd=self.ws, session=self.CHIEF, env=self.CHIEF_ENV)
+            self.expect(worker, tool, inp, cwd=self.ws, env=self.WORKER_ENV)
+        for cmd in shell:
+            for kw in ({"cwd": self.ws}, {"cwd": self.ws, "mode": "bypassPermissions"}):
+                self.expect("ask", "Bash", {"command": cmd}, **kw)
+            self.expect("deny", "Bash", {"command": cmd}, cwd=self.ws, session=self.CHIEF, env=self.CHIEF_ENV)
+            self.expect("ask", "Bash", {"command": cmd}, cwd=self.ws, env=self.WORKER_ENV)
+        # from another folder, by a path the guard cannot resolve, and from inside the folder by the bare name
+        for cmd, kw in (("echo x >> $(cat ~/.mother/workspace)/.mother/" + rel, {"cwd": self.tmp}),
+                        ("cd $(cat ~/.mother/workspace)/.mother/%s && echo x >> %s" % (d, name),
+                         {"cwd": self.tmp}),
+                        ("echo x >> $SOMEWHERE/.mother/" + rel, {"cwd": self.tmp, "mode": "bypassPermissions"}),
+                        ("echo x >> " + name, {"cwd": os.path.join(self.ws, ".mother", d)})):
+            self.expect("ask", "Bash", {"command": cmd}, **kw)
+
+    def test_write_decisions_json_asks(self):
+        self.expect_store_guarded(os.path.join("chief", "decisions.json"), "ask")
+
+    def test_write_inbox_asks(self):
+        self.expect_store_guarded(os.path.join("hub", "inbox.jsonl"), "deny")  # a worker's hub-path deny comes first
+
+    def test_decision_store_reads_pass(self):
+        for rel in ("chief/decisions.json", "hub/inbox.jsonl"):
+            for cmd in ("cat .mother/" + rel, "jq . .mother/%s > /tmp/out.json" % rel, "grep x .mother/" + rel):
+                self.expect("none", "Bash", {"command": cmd}, cwd=self.tmp)
+            self.expect("none", "Read", {"file_path": os.path.join(self.ws, ".mother", rel)}, cwd=self.ws)
+        # the same name elsewhere in the workspace is no store
+        self.expect("none", "Write", {"file_path": os.path.join(self.ws, "notes", "inbox.jsonl"), "content": ""},
+                    cwd=self.ws)
+
+    def test_paused_denies_store_writes(self):
+        with open(self.state("PAUSED"), "w") as f:
+            f.write("")
+        self.expect("deny", "Write", {"file_path": self.state(os.path.join("hub", "inbox.jsonl")), "content": ""},
+                    cwd=self.ws)
 
 
 if __name__ == "__main__":
