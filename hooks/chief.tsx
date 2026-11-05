@@ -1086,6 +1086,7 @@ async function openWorker($: Dollar, bin: string, w: ChiefWorker): Promise<void>
 // change nothing while this session is off screen. "Already" (shown) counts as opened.
 const REFUSED_RE = /refus|denied|not allowed|cannot|can't|couldn't|unable|\bonly\b|not (on screen|started|visible|shown|open)|changes? nothing|nothing changed|no-op|ask the user/i
 const ALREADY_RE = /\balready\b/i
+const APP_LINK_RE = /^claude:\/\/claude\.ai\/epitaxy\/local_[A-Za-z0-9-]+$/
 
 // Open a pinned desktop session: ask the app to show it (ccd_window open_session_in, focus). Only an answer that says
 // it did counts; an error, a timeout, an empty answer or a refusal without an error fills the prompt as before and
@@ -1100,6 +1101,13 @@ async function openPinned($: Dollar, d: ChiefDesktop): Promise<void> {
   opening.add(d.cli_session_id)
   try {
     if (!(await onDesktop($))) return await fallback('no desktop app here')
+    // open_session_in refuses any session this one didn't start, which is every pinned one: the app's own link opens it.
+    if (typeof d.open_link === 'string' && APP_LINK_RE.test(d.open_link)) {
+      try {
+        const ran = await $.process.run(['open', d.open_link], { timeoutMs: DEFAULT_TIMEOUT_MS })
+        if (ran.exitCode === 0) { $.ui.toast(`Opened "${d.title}"`); return }
+      } catch { /* fall through to the window tool */ }
+    }
     const r = await mcpTry($, WINDOW_SERVER, 'open_session_in', { session_id: d.session_id, target: 'focus' }, MCP_TIMEOUT_MS)
     if (!r.ok) return await fallback(r.why)
     if (!r.text) return await fallback('the app gave no answer')

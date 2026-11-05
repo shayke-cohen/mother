@@ -900,6 +900,21 @@ test('test_open_falls_back_when_the_tool_is_missing', async ($, on) => {
   await ui.unmount()
 })
 
+test('test_open_pinned_uses_the_app_link_first', async ($, on) => {
+  const link = 'claude://claude.ai/epitaxy/local_a'
+  const { clock, out, t } = await bootTldr($, on, {
+    cli: argv => argv[0] === 'status'
+      ? { exitCode: 0, stdout: JSON.stringify(status({ workers: [worker({ session_id: W_SID })], desktop: [{ ...PINNED, open_link: link }] })) }
+      : undefined })
+  const ui = await shown($, clock)
+  await ui.press({ key: 'open:' + CLI_A })
+  expect(out.argv.some((a: string[]) => a[0] === 'open' && a[1] === link)).toBe(true)
+  expect(t.mcp.some((e: any) => e.tool === 'open_session_in')).toBe(false)
+  expect(t.fills).toEqual([])
+  expect(out.toasts.at(-1)).toBe('Opened "Fix the login bug"')
+  await ui.unmount()
+})
+
 test('test_open_pinned_reports_what_the_app_said', async ($, on) => {
   const { clock, out, t } = await bootTldr($, on, { mcp: e => e.tool === 'open_session_in'
     ? { value: { content: [{ type: 'text', text: 'Showing it in this window.' }], isError: false } } : { deny: 'no' } })
