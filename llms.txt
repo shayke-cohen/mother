@@ -1,0 +1,75 @@
+# MOTHER
+
+> A Claude Code plugin: a chief of staff for people managers. A model-free watcher polls chat, tracker, code,
+> mail, calendar and WhatsApp into a local inbox; one visible desktop session triages it; the Chief pane shows
+> what needs the manager; case sessions own one item each until it is closed; an approval guard hook decides in
+> code what may reach another person. Pre-alpha. Python 3.9 stdlib plus a hooks module in TypeScript.
+
+## Start here
+
+- [README.md](README.md): what it is, a day with it, the pane, how it works, install, skills, routines, safety, FAQ
+- [AGENTS.md](AGENTS.md): rules for coding agents working on this repo; directory map, fast tests, checklists, release steps
+- [ARCHITECTURE.md](ARCHITECTURE.md): code map file by file, process and sequence diagrams, invariants
+- [docs/GUIDE.md](docs/GUIDE.md): operating guide; the watcher, pane commands, cases and relay, every CLI command
+
+## The contract (docs/CONTRACT.md, binding)
+
+- [§1 Two trees](docs/CONTRACT.md#1-two-trees): plugin repo versus workspace; every workspace file, `now.json` included
+- [§2 Finding each other](docs/CONTRACT.md#2-finding-each-other): workspace pointer, home machine, scheduled-task pointers
+- [§3 config.json](docs/CONTRACT.md#3-configjson-schema-v1): every config key and its validation
+- [§4 capabilities.json](docs/CONTRACT.md#4-capabilitiesjson): per-server connector health
+- [§5 Approval guard](docs/CONTRACT.md#5-approval-guard-hooksguardpy): allow, ask, deny; autonomy; grants; guard off and PAUSED
+- [§5b Channel reply loop](docs/CONTRACT.md#5b-channel-reply-loop-libchannelspy-mother-channels-skill-motherchannels): reply modes for team channels
+- [§5c Sub-agents](docs/CONTRACT.md#5c-sub-agents-agents-mother-items-mother-eval): reader, critic, the evidence check
+- [§5d WhatsApp](docs/CONTRACT.md#5d-whatsapp-libwhatsapppy-mother-whatsapp-bridgewhatsapp): local reads, the send bridge
+- [§5e Hub](docs/CONTRACT.md#5e-hub-libhubpy-mother-hub): the watcher, inbox lines, keys, decisions, sessions
+- [§5f Mail triage](docs/CONTRACT.md#5f-mail-triage-libinboxpy-mother-inbox): archive and mark read with no model
+- [§5g Chief](docs/CONTRACT.md#5g-chief-libchiefpy-mother-chief-hookschieftsx): the leading session, triage, the pane, cases, relay, the floor
+- [§6 Sync](docs/CONTRACT.md#6-sync-binmother-sync): commit, secret scan, push
+- [§7 Skills](docs/CONTRACT.md#7-skills-in-v0): the skill list
+- [§8 Writing rules](docs/CONTRACT.md#8-writing-rules-for-everything-in-this-repo): style for everything in the repo
+
+## Design and plan
+
+- [docs/DESIGN.md](docs/DESIGN.md): why it is built this way; principles and safety reasoning
+- [docs/ROADMAP.md](docs/ROADMAP.md): stages, what is built, what is out of scope on purpose
+
+## Skills (skills/<name>/SKILL.md)
+
+- [setup](skills/setup/SKILL.md): discovery interview that writes the workspace config
+- [doctor](skills/doctor/SKILL.md): live connector tests, writes capabilities through `mother health`
+- [routine](skills/routine/SKILL.md): the dispatcher every scheduled run enters through
+- [brief](skills/brief/SKILL.md): the day in one read-only picture
+- [digest](skills/digest/SKILL.md): per-team standup with a decision queue
+- [dots](skills/dots/SKILL.md): cross-source links and two action lists
+- [commitments](skills/commitments/SKILL.md): promises made and owed, asks with no reply
+- [one-on-one](skills/one-on-one/SKILL.md): 1:1 prep, agenda, cadence drift
+- [meeting](skills/meeting/SKILL.md): sprint plan, deck, meeting mode, recap
+- [now](skills/now/SKILL.md): the tick's Now list
+- [cos](skills/cos/SKILL.md): the contract for a session that owns one case
+- [hub](skills/hub/SKILL.md): decide the inbox from a terminal session
+- [channels](skills/channels/SKILL.md): the team-channel reply loop
+- [whatsapp](skills/whatsapp/SKILL.md): read and send WhatsApp
+- [todo](skills/todo/SKILL.md), [remember](skills/remember/SKILL.md), [project](skills/project/SKILL.md), [team](skills/team/SKILL.md), [reflect](skills/reflect/SKILL.md): the workspace's stores
+
+## Routines (routines/<id>.md)
+
+- [brief](routines/brief.md), [brief-ab](routines/brief-ab.md): the morning brief and its A/B test
+- [digest](routines/digest.md): team digest
+- [dots](routines/dots.md): connect the dots
+- [commitments](routines/commitments.md): commitment tracker
+- [one-on-one](routines/one-on-one.md): 1:1 prep
+- [tick](routines/tick.md): the hourly Now list
+- [reflect](routines/reflect.md): nightly reflection
+- [doctor](routines/doctor.md): daily connector check
+- [meeting-prep](routines/meeting-prep.md), [meeting-recap](routines/meeting-recap.md): around each weekly meeting
+- [weekly-snapshot](routines/weekly-snapshot.md), [monthly-refresh](routines/monthly-refresh.md): sprint snapshot, monthly notes refresh
+
+## Code
+
+- [bin/mother](bin/mother): the CLI; its docstring lists every command
+- [hooks/guard.py](hooks/guard.py): the approval guard
+- [hooks/chief.tsx](hooks/chief.tsx): the Chief pane and the leading session's pass
+- [hooks/cos.ts](hooks/cos.ts), [hooks/floor.ts](hooks/floor.ts): cases and relay; the floor
+- [lib/chief.py](lib/chief.py), [lib/hub.py](lib/hub.py), [lib/hub_sources.py](lib/hub_sources.py): tick and triage; hub state; watcher adapters
+- [types/index.d.ts](types/index.d.ts): the JSON shapes the CLI hands the module

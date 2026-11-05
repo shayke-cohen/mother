@@ -1,0 +1,7 @@
+---
+description: Rules for working on the MOTHER plugin repo
+alwaysApply: true
+---
+
+All instructions for working on this repo live in `AGENTS.md` at the repo root. Read it first; this file holds
+no rules of its own.
