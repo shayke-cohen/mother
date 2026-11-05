@@ -2743,8 +2743,14 @@ test('test_inbox_section_draws_and_its_buttons_run_the_hub_verbs', async ($, on)
   await ui.press({ key: 'inbox-open:U1' })                                         // a live session: the Now panel's open
   expect(l.fills).toEqual(['Open my "Fix the build" session'])
   expect(hub().slice(2)).toEqual([['session', 'seen', 'PLAT-8']])
-  await ui.press({ key: 'inbox-open:U2' })                                         // none: the item, filled and never sent
-  expect(l.fills[1]).toContain('"Review due" — needs a look today (https://example.com/9)')
+  await ui.press({ key: 'inbox-open:U2' })                                         // none: a new session with the brief typed, never sent
+  const opened = out.argv.find(a => a[0] === 'open')
+  expect(opened?.[1].startsWith('claude://code/new?q=')).toBe(true)
+  const u = new URL(opened![1])
+  expect(u.searchParams.get('q')).toContain('"Review due" — needs a look today (https://example.com/9)')
+  expect(u.searchParams.get('folder')).toBe(WS)
+  expect(l.fills.length).toBe(1)                                                   // nothing typed into this session
+  expect(out.toasts.at(-1)).toMatch(/^New session opened/)
   expect(out.submits).toEqual([])
   await ui.unmount()
 })
