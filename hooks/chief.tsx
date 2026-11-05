@@ -13,7 +13,9 @@ import type { Dollar } from './shared'
 import { ACTIVE_MINUTES, SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, TAB_IDS, TOP_COLOR, allCards, badge, card, clip, emptyLine, headerStrip,
          humanLabel, isOpen, itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, subHeading, suggestionsFor, tabRow,
          titleRow, toggled, whyText, ACTIONS_SHOWN, ACTION_LABEL_MAX, actButtons, actSays, inboxOrder, kindBadges, suggestionLabels,
-         verdictExtra, verdictLine, CARD_STATES, STATE_RANK, cardState, linkRows, linksOf, sourceLink, statePill } from './pane_ui'
+         verdictExtra, verdictLine, CARD_STATES, STATE_RANK, cardState, headerParts, linkRows, linksOf, sourceBadge, sourceLink, statePill } from './pane_ui'
+import { Panel, Pill, SKIN_MODES, SKIN_STORE_KEY, skinFor, skinOf, skinUi, themeOf } from './skin'
+import type { SkinMode } from './skin'
 import type { CardAct, Extra, Portrait, Tab, TabId, Ui } from './pane_ui'
 import { actionSays, decisionLabel, guardState, healthProblems, healthSection, inboxFollowIgnore, inboxIgnorePick, isWatcherError, itemDetail, loadDetail,
          loadDismissed, suggestedRows, suggestedSection, teamCount, teamSection } from './pane_tabs'
@@ -31,6 +33,7 @@ export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as co
 export const chiefOpenAtom = atom({ plugin: 'mother', key: 'chiefOpen' } as const, null)
 export const chiefSelectedAtom = atom({ plugin: 'mother', key: 'chiefSelected' } as const, null)
 export const chiefTabAtom = atom({ plugin: 'mother', key: 'chiefTab' } as const, null)
+export const chiefSkinAtom = atom({ plugin: 'mother', key: 'chiefSkin' } as const, null)
 const healthAtom = atom({ plugin: 'mother', key: 'chiefHealth' } as const, null)   // written in hooks/pane_tabs.tsx; only read here
 const detailAtom = atom({ plugin: 'mother', key: 'chiefDetail' } as const, null)   // what each dots item does (hooks/pane_tabs.tsx loadDetail); only read here
 const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)   // now.json as register.tsx last read it; only read here
@@ -734,6 +737,7 @@ async function clearDraft($: Dollar, input: string): Promise<void> {
   await update($, chiefDraftAtom, prev => {
     const next = { ...(prev ?? {}) }
     delete next[input]
+    delete next['typed:' + input]   // what was typed there went with it
     return next
   })
 }
@@ -750,7 +754,7 @@ function chipActs($: Dollar, chips: ChiefChip[], d: ChiefDesktop): ChipAct[] {
       const text = c.text
       // a model wrote it from an untrusted transcript: it goes into the card's chat box, and the manager sends it
       const input = 'say:' + d.cli_session_id
-      a = { id: 'reply:' + text, label: text, run: () => update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [input]: text })) }
+      a = { id: 'reply:' + text, label: text, run: () => update($, chiefDraftAtom, prev => { const next = { ...(prev ?? {}), [input]: text }; delete next['typed:' + input]; return next }) }
     } else if (c.kind === 'open') {
       a = { id: 'open', label: 'Open', run: () => openPinned($, d) }
     }
@@ -781,6 +785,7 @@ async function startAsk($: Dollar, bin: string, value: string): Promise<void> {
   const keep = (draft: string | null) => update($, chiefDraftAtom, prev => {
     const next = { ...(prev ?? {}) }
     delete next[ASK_ERROR_KEY]
+    delete next['typed:' + ASK_KEY]
     if (draft === null) delete next[ASK_KEY]; else next[ASK_KEY] = draft
     return next
   })
@@ -834,6 +839,26 @@ async function loadPortrait($: Dollar, bin: string): Promise<void> {
       portrait = { png: d.png, width: d.width, height: d.height, jpeg, svg }
     }
   } catch { /* no picture */ }
+}
+
+// ---- the skin: `/chief skin dark|plain`, and the app's theme ----
+// The mode lives in the plugin's store (machine-local, it outlasts the session); the app's theme is the `theme` row of
+// `$.config.list()`. Both are read at session start and when /chief opens the pane, never in a draw, and kept in an
+// atom: a draw reads nothing else. A store or a list that cannot be read leaves the defaults (dark, a light app).
+async function loadSkin($: Dollar): Promise<void> {
+  let mode: SkinMode | null = null
+  try {
+    const v = await $.store.get(SKIN_STORE_KEY)
+    mode = (SKIN_MODES as readonly unknown[]).includes(v) ? (v as SkinMode) : null
+  } catch { /* the default */ }
+  let rows: unknown = null
+  try { rows = await $.config.list() } catch { rows = null }
+  await update($, chiefSkinAtom, () => ({ mode, theme: themeOf(rows) }))
+}
+
+async function setSkin($: Dollar, mode: SkinMode): Promise<boolean> {
+  await update($, chiefSkinAtom, prev => ({ mode, theme: prev?.theme ?? 'unknown' }))
+  try { await $.store.set(SKIN_STORE_KEY, mode); return true } catch { return false }   // kept for this session only
 }
 
 // What each card's buttons share: a press selects the card first, then runs.
@@ -924,7 +949,7 @@ function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undef
     const ask = <Button key={'today-ask:top:' + e.rank} variant={action ? 'secondary' : 'primary'} onPress={press(() => { note('ask', row); return fill(askPrompt(title, why, e.link)) })}>Ask Mother</Button>
     out.push(card(ui, { id, color: TOP_COLOR, selected: ctx.selected === id }, [
       titleRow(ui, id, `${e.rank}. ${title}`, open, press(() => toggleCard($, id, !open)), null, open ? undefined : (doIt ?? ask)),
-      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
         {badge(ui, 'top', TOP_COLOR, 'badge:' + id)}
         <Text dimColor>{`set by ${e.set_by === 'manager' ? 'you' : 'the agent'} `}</Text>
         {open ? null : sourceLink(ui, id, links)}
@@ -933,7 +958,7 @@ function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undef
       ...(open ? (item ? itemDetail(ui, id, { ...item, link: isUrl(e.link) ? e.link : item.link }, nowMs, ctx.details) : [linkRows(ui, id, links)]) : []),
       ...(open ? actionSays(ui, id, acts, detail, 40) : []),
       open
-        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
             {doIt}
             {ask}
             <Button key={'today-done:top:' + e.rank} onPress={press(() => { note('done', row); return go(['top', 'done', String(e.rank)]) })}>Done</Button>
@@ -959,8 +984,8 @@ function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undef
     const openIt = <Button key={'today-open:' + i.id} variant={acts.length ? 'secondary' : 'primary'} onPress={press(() => openInspector($, { kind: 'item', id: i.id }, 'reset'))}>Open</Button>
     out.push(card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
       titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [...actBtns, openIt]),
-      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
-        {badge(ui, source === 'other' ? 'on you' : source, SOURCE_COLOR[source], 'badge:' + id)}
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
+        {sourceBadge(ui, source, source === 'other' ? 'on you' : source, 'badge:' + id)}
         <Text dimColor>{meta + ' '}</Text>
         {open ? null : sourceLink(ui, id, linksOf(i.link, i.links, source))}
       </Box>,
@@ -968,7 +993,7 @@ function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undef
       ...(open ? itemDetail(ui, id, i, nowMs, ctx.details) : []),
       ...(open ? actionSays(ui, id, acts, detail, ACTION_LABEL_MAX) : []),
       open
-        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
             {actBtns}
             {openIt}
             <Button key={'today-ask:' + i.id} onPress={press(() => { note('ask', i); return fill(askPrompt(title, why, i.link)) })}>Ask Mother</Button>
@@ -1052,8 +1077,8 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
         const doneBtn = <Button key={'inbox-done:' + u.id} onPress={press(() => { note('done'); return goHub(['done', u.id]) })}>Done</Button>
         return card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
           titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [...actBtns, doneBtn]),
-          <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
-            {badge(ui, source, SOURCE_COLOR[source], 'badge:' + id)}
+          <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
+            {sourceBadge(ui, source, source, 'badge:' + id)}
             {kindBadges(ui, extra, id)}
             {u.session?.kind === 'case' ? badge(ui, 'case', SESSION_COLOR, 'badge:case:' + id) : null}
             <Text dimColor>{`${label} · ${ago(u.at, nowMs)} `}</Text>
@@ -1079,7 +1104,7 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
               </Box>
             : null,
           open
-            ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+            ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
                 {openBtn}
                 {doneBtn}
                 {inboxFollowIgnore($, ui, u, goHub, press, note)}
@@ -1123,13 +1148,12 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
                   drafts: Record<string, string> | null, floor: FloorState | null = null, self: string | null = null,
                   ctx: CardCtx = { open: null, selected: null }) {
   const { Box, Text, Button, Input } = ui
-  if (!s) {
-    return (
-      <Box flexDirection="column">
-        {error ? <Text color="warning">{error}</Text> : <Text dimColor>No chief status yet.</Text>}
-      </Box>
-    )
-  }
+  const dark = skinOf(ui).dark
+  if (!s) return Panel(ui, error ? <Text color="warning">{error}</Text> : <Text dimColor>No chief status yet.</Text>)
+  // what a field holds as the manager types it (`typed:<key>`), for the pill beside it: the dark skin draws no native
+  // submit button. The field's own `value` stays the draft, so a redraw never replaces what is being typed.
+  const typing = (key: string) => (value: string) => { void update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), ['typed:' + key]: value })) }
+  const typedOf = (key: string) => drafts?.['typed:' + key] ?? drafts?.[key] ?? ''
   const since = s.chief?.heartbeat_at ? ago(s.chief.heartbeat_at, nowMs) : ''
   const beat = !since ? 'no heartbeat' : since === 'now' ? 'heartbeat now' : `heartbeat ${since} ago`
   const sentLine = (id: string) => {
@@ -1199,7 +1223,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     return card(ui, { id, color: SESSION_COLOR, selected: ctx.selected === id, active, scope: scopeOf(cli) }, [
       titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open)),
                active ? badge(ui, 'this session', SELF_COLOR, 'badge:self:' + cli) : null, open ? undefined : [...quick, openBtn]),
-      <Box key={'meta:' + id} flexWrap={open ? 'wrap' : 'nowrap'} gap="xs">
+      <Box key={'meta:' + id} flexWrap={open ? 'wrap' : 'nowrap'} gap="xs" alignItems="center">
         {badge(ui, state.text, state.color, 'badge:' + id, st === 'idle')}
         {cm ? badge(ui, 'case', SESSION_COLOR, 'badge:case:' + cli) : null}
         {cm && cm.labels.length ? <Text key={'case-label:' + cli} dimColor>{cm.labels.join(', ')}</Text> : null}
@@ -1215,12 +1239,16 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       open && st === 'done' && cm ? <Text key={'archive:' + id} dimColor>Done: close the case, then this session can be archived</Text> : null,
       open ? sentLine(cli) : null,
       open
-        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
             <Input key={'say:' + cli} placeholder="Tell this session…" submitLabel="send"
-              value={drafts?.['say:' + cli]}
+              value={drafts?.['say:' + cli]} {...(dark ? { onInput: typing('say:' + cli) } : {})}
               onSubmit={(value: string) => {
                 if (value.trim()) void select($, id).then(() => clearDraft($, 'say:' + cli)).then(() => sendPinned($, cli, value))
               }} />
+            {dark ? Pill(ui, { key: 'say-send:' + cli, variant: 'primary', label: 'Send', onPress: press(() => {
+              const value = typedOf('say:' + cli)
+              return value.trim() ? clearDraft($, 'say:' + cli).then(() => sendPinned($, cli, value)) : undefined
+            }) }) : null}
             {openBtn}
             {deliverBtn}
             <Button key={'refresh:' + cli} onPress={press(() => refreshNow($, bin, cli))}>Refresh</Button>
@@ -1254,7 +1282,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       return card(ui, { id, color: NEED_COLOR, selected: ctx.selected === sel, scope: scopeOf(cli) }, [
         titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open)), null,
                  shownOptions.length ? shownOptions.map(optionBtn) : openBtn),
-        <Box key={'meta:' + id} gap="xs">
+        <Box key={'meta:' + id} gap="xs" alignItems="center">
           {badge(ui, 'asks', NEED_COLOR, 'badge:' + id)}
           <Text key={'q:' + id} wrap="truncate-end">{clip(oneLine(c.question, 200), PREVIEW_MAX)}</Text>
           {sourceLink(ui, id, caseLinks(cli))}
@@ -1263,7 +1291,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     }
     return card(ui, { id, color: NEED_COLOR, selected: ctx.selected === sel, scope: scopeOf(cli) }, [
       titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open))),
-      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
         {badge(ui, 'asks', NEED_COLOR, 'badge:' + id)}
         <Text dimColor>{meta}</Text>
       </Box>,
@@ -1271,7 +1299,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       caseLinks(cli).length ? linkRows(ui, id, caseLinks(cli)) : null,
       ...(open ? options.map((o, i) => <Text key={`need-says:${cli}:${i}`} dimColor wrap="wrap">{`${o.label}: "${o.message}"`}</Text>) : []),
       open ? sentLine(cli) : null,
-      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+      <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
         {shownOptions.map(optionBtn)}
         <Button key={'need-open:' + cli} onPress={press(() => openPinned($, d))}>Open</Button>
       </Box>,
@@ -1301,27 +1329,46 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   ]
   const shown = shownTab(ctx.tabs?.picked, tabs)
   const drawn = shown === 'all' ? tabs : tabs.filter(t => t.id === shown)
-  return (
-    <Box flexDirection="column">
-      {headerStrip(ui, { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
-                         sessions: pinned.length + caseOnly.length, spent: s.budget?.spent, limit: s.budget?.limit,
-                         overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self), beat,
-                         portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: guardState(s) /* the one read the Health tab's Guard row shows */ })}
-      {s.budget?.unreadable
-        ? <Text color="error">Budget: spend file unreadable — no model call is made until it reads again.</Text>
-        : s.budget?.over
-          ? <Text color="error">{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today · spent: no model call is made`}</Text>
-          : null}
-      {s.paused ? <Text color="error">PAUSED: nothing is triaged or decided until /chief resume.</Text> : null}
-      {error ? <Text color="warning">{error}</Text> : null}
-      <Box key="ask" flexDirection="column" marginTop={1}>
-        <Input key="ask-input" placeholder="Ask Mother…" submitLabel="Start" value={drafts?.[ASK_KEY]}
-          onSubmit={(value: string) => { void startAsk($, bin, value) }} />
-        {drafts?.[ASK_ERROR_KEY] !== undefined ? <Text key="ask-error" color="warning">{ASK_EMPTY}</Text> : null}
+  const strip = { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
+                  sessions: pinned.length + caseOnly.length, spent: s.budget?.spent, limit: s.budget?.limit,
+                  overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self), beat,
+                  portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: guardState(s) /* the one read the Health tab's Guard row shows */ }
+  const body = [
+    s.budget?.unreadable
+      ? <Text color="error">Budget: spend file unreadable — no model call is made until it reads again.</Text>
+      : s.budget?.over
+        ? <Text color="error">{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today · spent: no model call is made`}</Text>
+        : null,
+    s.paused ? <Text color="error">PAUSED: nothing is triaged or decided until /chief resume.</Text> : null,
+    error ? <Text color="warning">{error}</Text> : null,
+    <Box key="ask" flexDirection="column" marginTop={1}>
+      {dark
+        ? <Box key="ask-row" gap={1} alignItems="center">
+            <Box key="ask-field" flexGrow={1}>
+              <Input key="ask-input" placeholder="Ask Mother…" value={drafts?.[ASK_KEY]} onInput={typing(ASK_KEY)}
+                onSubmit={(value: string) => { void startAsk($, bin, value) }} />
+            </Box>
+            {Pill(ui, { key: 'ask-start', variant: 'primary', label: 'Start', onPress: () => startAsk($, bin, typedOf(ASK_KEY)) })}
+          </Box>
+        : <Input key="ask-input" placeholder="Ask Mother…" submitLabel="Start" value={drafts?.[ASK_KEY]}
+            onSubmit={(value: string) => { void startAsk($, bin, value) }} />}
+      {drafts?.[ASK_ERROR_KEY] !== undefined ? <Text key="ask-error" color={dark ? 'error' : 'warning'}>{ASK_EMPTY}</Text> : null}
+    </Box>,
+    tabRow(ui, tabs, shown, ctx.tabs?.seen, id => pickTab($, id, counts, states)),
+    ...drawn.map(t => <Box key={'sec:' + t.id} flexDirection="column">{t.section(shown === 'all') as any}</Box>),
+  ]
+  // Dark skin: the banner above (it is as wide as the pane), then one dark panel around everything else.
+  if (dark) {
+    const parts = headerParts(ui, strip)
+    return (
+      <Box flexDirection="column">
+        {parts.banner as any}
+        {Panel(ui, [parts.strip, ...body])}
       </Box>
-      {tabRow(ui, tabs, shown, ctx.tabs?.seen, id => pickTab($, id, counts, states))}
-      {drawn.map(t => <Box key={'sec:' + t.id} flexDirection="column">{t.section(shown === 'all') as any}</Box>)}
-    </Box>
+    )
+  }
+  return (
+    <Box flexDirection="column">{[headerStrip(ui, strip), ...body] as any}</Box>
   )
 }
 
@@ -1367,7 +1414,7 @@ let busy = false
 export async function startChief($: Dollar, configured: string): Promise<number> {
   const bin = await motherBin($, configured)
   try {
-    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | refresh | status | pause | resume | relay on|off|status | habits on|off|status)' })
+    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | refresh | status | pause | resume | relay on|off|status | habits on|off|status | skin dark|plain|status)' })
   } catch {
     // carry on without the command
   }
@@ -1387,6 +1434,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   resetCos()
   await loadPortrait($, bin)
   await loadDismissed($)
+  await loadSkin($)
   await reloadStatus($, bin)
   // not awaited: a slow list_sessions (up to its 10 s timeout) must not hold up the session's start
   void snapshotPinned($, bin).then(() => reloadStatus($, bin)).catch(() => undefined)
@@ -1444,6 +1492,7 @@ export function registerChief(on: On, configured: string): void {
       return text || fallback
     }
     if (verb === '' || verb === 'open') {
+      await loadSkin($).catch(() => undefined)   // the app's theme may have changed since the session started
       const opened = await $.ui.open({ id: CHIEF_PANE, title: 'Chief' })
       if (opened.isPlaced) {
         void refreshTldrs($, bin).catch(() => undefined)   // not awaited: the command answers at once
@@ -1478,6 +1527,18 @@ export function registerChief(on: On, configured: string): void {
       await update($, chiefOpenAtom, () => allCards(verb === 'expand'))
       return { text: `Chief pane: every card ${verb === 'expand' ? 'expanded' : 'collapsed'}.` }
     }
+    // the pane's look: dark (the default on the desktop app) or plain (the app's own colours and buttons)
+    const skin = /^skin(?:\s+(dark|plain|status))?$/.exec(verb)
+    if (skin) {
+      const want = skin[1] ?? 'status'
+      if (want === 'status') {
+        await loadSkin($).catch(() => undefined)
+        const now = await read($, chiefSkinAtom)
+        return { text: `Chief pane skin: ${now?.mode ?? 'dark'}${now?.mode ? '' : ' (the default)'} on the desktop app, plain in a terminal; app theme: ${now?.theme ?? 'unknown'}.` }
+      }
+      const kept = await setSkin($, want as SkinMode)
+      return { text: `Chief pane skin: ${want}${kept ? '' : ' (for this session only: the store could not be written)'}.` }
+    }
     const tab = /^tab\s+(\S+)$/.exec(verb)?.[1]
     if (tab && (TAB_IDS as readonly string[]).includes(tab)) {
       const floor = await read($, floorAtom)
@@ -1485,7 +1546,7 @@ export function registerChief(on: On, configured: string): void {
                     sessionStates(lastStatus, floor, await read($, chiefTldrAtom)))
       return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | tab needs|inbox|sessions|today|team|health|all]' }
+    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | skin dark|plain|status | tab needs|inbox|sessions|today|team|health|all]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
@@ -1493,7 +1554,9 @@ export function registerChief(on: On, configured: string): void {
   on('ui.render', { component: 'Pane', requestId: CHIEF_PANE }, async ($, e) => {
     let self: string | null = null
     try { self = String((await $.session.id()) ?? '') || null } catch { self = null }
-    return paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
+    const look = await read($, chiefSkinAtom)
+    const skin = skinFor(String(e.surface), look?.mode, look?.theme)
+    return paneTree($, skinUi($.ui.resolve(e), skin), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
       await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
       await read($, floorAtom), self, { open: await read($, chiefOpenAtom), selected: await read($, chiefSelectedAtom), portrait,
         surface: String(e.surface), tabs: await read($, chiefTabAtom), doc: await read($, docAtom), health: await read($, healthAtom),

@@ -5,7 +5,8 @@ import { SNOOZES, age, ago, askPrompt, isUrl, oneLine, safe } from './shared'
 import type { Dollar } from './shared'
 import { THREAD_KEY, followArgs, ignoreArgs, ignoreOptions, nowVerb, openInspector } from './register'
 import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, linkRows, linksOf, money, sectionHeading,
-         sourceLink, subHeading, titleRow, toggled, whyText } from './pane_ui'
+         sourceBadge, sourceLink, subHeading, titleRow, toggled, whyText } from './pane_ui'
+import { SectionHeading, Stat } from './skin'
 import type { Ui } from './pane_ui'
 import { inboxRow, logAct, nowRow, picked, quietedOf } from './habits'
 import type { ActVerb } from './habits'
@@ -162,8 +163,8 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
   const done = <Button key={`${kind}-done:${i.id}`} onPress={press(() => { note('done'); return go(['done', i.id]) })}>Done</Button>
   return card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
     titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [doIt ?? ask, done]),
-    <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
-      {badge(ui, label, SOURCE_COLOR[source], 'badge:' + id)}
+    <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
+      {sourceBadge(ui, source, label, 'badge:' + id)}
       <Text dimColor>{age(i.since, nowMs) + ' '}</Text>
       {open ? null : sourceLink(ui, id, linksOf(i.link, i.links, source))}
     </Box>,
@@ -171,7 +172,7 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
     ...(open ? itemDetail(ui, id, i, nowMs, ctx.details) : []),
     ...(open ? actionSays(ui, id, acts, detail, 40) : []),
     open
-      ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+      ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
           {doIt}
           {ask}
           {done}
@@ -233,9 +234,7 @@ export function teamSection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null |
     const all = drafts?.[moreKey] !== undefined
     out.push(
       <Box key={'team-group:' + t} flexDirection="column">
-        <Box key={'team-name:' + t} marginTop={1}>
-          <Text weight="semibold">{t}<Text dimColor weight="regular">{` ${list.length}`}</Text></Text>
-        </Box>
+        {SectionHeading(ui, { key: 'team-name:' + t, text: t, count: list.length, level: 'group' })}
         {(all ? list : list.slice(0, TEAM_SHOWN)).map(i => nowCard($, ui, bin, i, nowMs, drafts, ctx, 'team'))}
         {list.length > TEAM_SHOWN
           ? <Button key={moreKey} plain dimColor onPress={() => flip($, moreKey)}>{all ? 'Show fewer' : `Show ${list.length - TEAM_SHOWN} more`}</Button>
@@ -383,10 +382,7 @@ async function toggleReport($: Dollar, bin: string, name: string, isLoaded: bool
 }
 
 const kb = (bytes: unknown): string => (typeof bytes === 'number' && bytes >= 0 ? (bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`) : '')
-const sub = (ui: Ui, key: string, text: string, count?: number) => {
-  const { Box, Text } = ui
-  return <Box key={key} marginTop={1}><Text weight="semibold">{text}{count !== undefined ? <Text dimColor weight="regular">{` ${count}`}</Text> : null}</Text></Box>
-}
+const sub = (ui: Ui, key: string, text: string, count?: number) => SectionHeading(ui, { key, text, count, level: 'group' })
 
 export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, doc: NowDoc | null | undefined, nowMs: number,
                               ctx: TabCtx, self: string | null, goHub: GoHub, heading: boolean, goChief?: GoHub) {
@@ -404,7 +400,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
     const since = bad && c.since ? age(c.since, nowMs) : ''
     out.push(
       <Box key={'health-src:' + name} flexDirection="column">
-        <Box flexWrap="wrap" gap="xs">
+        <Box flexWrap="wrap" gap="xs" alignItems="center">
           {badge(ui, statusWord(c.status), statusColor(c.status), 'health-src-badge:' + name)}
           <Text>{name}</Text>
           {since ? <Text dimColor>{`for ${since}`}</Text> : null}
@@ -421,7 +417,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
   } else {
     const polled = ago(w.at, nowMs)
     out.push(
-      <Box key="health-watcher-poll" flexWrap="wrap" gap="xs">
+      <Box key="health-watcher-poll" flexWrap="wrap" gap="xs" alignItems="center">
         <Text color={w.stale ? 'error' : undefined}>{polled ? (polled === 'now' ? 'last poll now' : `last poll ${polled} ago`) : 'last poll unknown'}</Text>
         {w.stale ? badge(ui, 'stale', 'error', 'health-watcher-stale') : null}
         {w.active === false ? <Text dimColor>outside active hours</Text> : null}
@@ -449,7 +445,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       const id = 'health:err:' + u.id
       const why = whyText(u.why)
       out.push(card(ui, { id, color: 'error', selected: ctx.selected === id }, [
-        <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+        <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
           {badge(ui, 'error', 'error', 'badge:' + id)}
           <Text weight="semibold">{oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)}</Text>
           <Text dimColor>{`${oneLine(u.key, 60)} · ${ago(u.at, nowMs)}`}</Text>
@@ -477,7 +473,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       ...(open ? lines.slice(0, REPORT_LINES_MAX).map((line, n) => <Text key={`report:${r.name}:${n}`} wrap="wrap">{line || ' '}</Text>) : []),
       open && lines.length > REPORT_LINES_MAX ? <Text key={'report-more:' + id} dimColor>{`${lines.length - REPORT_LINES_MAX} more lines in .mother/${r.name}`}</Text> : null,
       open
-        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
             <Button key={'health-dismiss:' + r.name} onPress={pressing($, id, () => { logAct($, bin, 'dismiss', { item_id: r.name, source: 'report', title: oneLine(r.routine, 60) }); return dismiss($, r.name) })}>Dismiss</Button>
           </Box>
         : null,
@@ -485,7 +481,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
   }
   if (dismissed.length) {
     out.push(
-      <Box key="health-dismissed" flexWrap="wrap" gap="xs">
+      <Box key="health-dismissed" flexWrap="wrap" gap="xs" alignItems="center">
         <Text dimColor>{`${dismissed.length} dismissed`}</Text>
         <Button key="health-restore" plain dimColor onPress={() => dismiss($, null)}>Show again</Button>
       </Box>)
@@ -497,8 +493,8 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
   const beat = s.chief?.heartbeat_at ? ago(s.chief.heartbeat_at, nowMs) : ''
   out.push(sub(ui, 'health-budget', 'Budget and lead'))
   out.push(
-    <Box key="health-budget-row" flexWrap="wrap" gap="xs">
-      <Text color={b?.over || b?.unreadable ? 'error' : undefined}>{b?.unreadable ? 'spend file unreadable' : `${money(b?.spent)} of ${money(b?.limit)} today`}</Text>
+    <Box key="health-budget-row" flexWrap="wrap" gap="xs" alignItems="center">
+      {Stat(ui, { value: b?.unreadable ? 'spend file unreadable' : `${money(b?.spent)} of ${money(b?.limit)} today`, tone: b?.over || b?.unreadable ? 'error' : undefined })}
       {badge(ui, lead.text, lead.color, 'health-lead')}
       <Text dimColor>{!beat ? 'no heartbeat' : beat === 'now' ? 'heartbeat now' : `heartbeat ${beat} ago`}</Text>
     </Box>)
@@ -507,7 +503,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
   const guard = guardState(s)
   out.push(sub(ui, 'health-guard', 'Guard'))
   out.push(
-    <Box key="health-guard-row" flexWrap="wrap" gap="xs">
+    <Box key="health-guard-row" flexWrap="wrap" gap="xs" alignItems="center">
       {guard ? badge(ui, guard, guard === 'on' ? 'success' : 'error', 'health-guard-badge') : <Text dimColor>not reported</Text>}
       {guard === 'off' ? <Text color="error">every guard rule is off: the model alone decides</Text> : null}
       {guard === 'paused' ? <Text color="error">outbound actions are paused</Text> : null}
@@ -536,7 +532,7 @@ export function quietedSection($: Dollar, ui: Ui, s: ChiefStatus, nowMs: number,
           <Text weight="semibold">{oneLine(r.title, 60) || oneLine(r.key, 60)}</Text>
           <Text dimColor>{`${oneLine(r.label, 40)} · ${ago(r.at, nowMs)}`}</Text>
         </Box>
-        <Box flexWrap="wrap" gap="xs">
+        <Box flexWrap="wrap" gap="xs" alignItems="center">
           <Text key={'quieted-why:' + r.id} dimColor>{oneLine(r.why, 120)}</Text>
           {goChief ? <Button key={'quieted-show:' + r.id} onPress={() => goChief(['habits', 'show', r.id])}>Show</Button> : null}
           {goChief && first ? <Button key={'quieted-stop:' + r.bucket} plain dimColor onPress={() => goChief(['habits', 'except', r.bucket])}>Stop quieting this</Button> : null}

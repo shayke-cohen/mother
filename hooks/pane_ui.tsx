@@ -2,11 +2,14 @@ import type { Color } from 'claude-code'
 
 import { oneLine } from './shared'
 import type { Dollar } from './shared'
+import { Badge, Card, Empty, Icon, Pill, SectionHeading, barSvg, pillCells, pillFills, rawOf, skinOf, BAR_H, BAR_W } from './skin'
+import type { CardFrame } from './skin'
 import type { ChiefCardState, ChiefDesktop, ChiefOpen, ChiefStatus, ChiefTldr } from '../types'
 
 // The Chief pane's drawing kit: the header strip, a card frame with a kind colour, badges, the source colour map and
 // the suggested prompts an Inbox card offers. Nothing here reads state or runs an action: chief.tsx's sections pass
-// what they know and get elements back. Every colour is a theme key, so both themes and both surfaces draw it.
+// what they know and get elements back. Every colour here is a theme key; hooks/skin.tsx holds the palette and the
+// primitives (panel, card, pill, badge) that turn a key into the dark skin's colour on the desktop app.
 
 export type Ui = ReturnType<Dollar['ui']['resolve']>
 
@@ -210,8 +213,24 @@ export const tabIsNew = (t: { id: TabId; count: number }, seen: Record<string, n
 export const tabHover = (id: string) => ({ scope: 'mother-tab:' + id, color: SELF_COLOR, underline: true, dimColor: false })
 
 // The tab row: a Button per tab with its count, the shown one primary; ` •` marks a tab with something new.
+// Dark skin: one row of compact pills, the shown tab coral, the rest quiet; the mark is a coral dot (a red one for
+// Health's alert) after the pill, outside its Button, whose label takes no colour.
 export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<string, number> | null | undefined, onPick: (id: TabId) => unknown) {
   const { Box, Button, Text } = ui
+  if (skinOf(ui).dark) {
+    const rows = [...tabs.map(t => ({ id: t.id, alert: !!t.alert, isNew: t.id !== shown && (tabIsNew(t, seen) || !!t.fresh), text: t.text ?? `${t.label} ${t.count}` })),
+                  { id: 'all' as TabId, alert: false, isNew: false, text: 'All' }]
+    return (
+      <Box key="tabs" flexWrap="wrap" gap={1} marginTop={1} alignItems="center">
+        {rows.map(t => (
+          <Box key={'tab-cell:' + t.id} gap={0} alignItems="center" flexShrink={0}>
+            {Pill(ui, { key: 'tab:' + t.id, variant: t.id === shown ? 'primary' : 'secondary', label: t.text, compact: true, onPress: () => onPick(t.id) })}
+            {t.alert ? <Text key={'tab-alert:' + t.id} color="error">{'●'}</Text> : t.isNew ? <Text key={'tab-dot:' + t.id} color="claude">{'•'}</Text> : null}
+          </Box>
+        ))}
+      </Box>
+    )
+  }
   return (
     <Box key="tabs" flexWrap="wrap" gap="xs" marginTop={1}>
       {[...tabs.map(t => ({ id: t.id, alert: !!t.alert, text: t.text ?? `${t.label} ${t.count}${t.id !== shown && (tabIsNew(t, seen) || t.fresh) ? ' •' : ''}` })), { id: 'all' as TabId, alert: false, text: 'All' }].map(t => (
@@ -330,60 +349,85 @@ export function humanLabel(u: { key?: string | null; label?: string | null; who?
     : source === 'error' ? 'source error' : 'update'
 }
 
-// ---- elements ----
+// ---- elements (the look is hooks/skin.tsx's: these name what a section draws) ----
 // A small filled pill: the source or state of a card, the counts of the header strip.
 export function badge(ui: Ui, text: string, color: Color, key?: string, dim = false) {
-  const { Text } = ui
-  if (dim) return <Text key={key} dimColor>{text}</Text>
-  return <Text key={key} backgroundColor={color} color="inverseText" weight="semibold">{` ${text} `}</Text>
+  return Badge(ui, { tone: color, text, key, dim })
+}
+
+// A card's source badge, with the source's small mark before it where the skin draws one.
+export function sourceBadge(ui: Ui, source: Source, text: string, key: string) {
+  return [Icon(ui, source, 'icon:' + key), badge(ui, text, SOURCE_COLOR[source], key)]
 }
 
 // One dim line where a section has nothing: never a blank.
 export function emptyLine(ui: Ui, key: string, text: string) {
-  const { Box, Text } = ui
-  return <Box key={key} marginTop={1}><Text dimColor>{text}</Text></Box>
+  return Empty(ui, key, text)
 }
 
 export function sectionHeading(ui: Ui, key: string, text: string) {
-  const { Box, Text } = ui
-  return <Box key={key} marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
+  return SectionHeading(ui, { key, text, level: 'section' })
 }
 
 // A small heading inside a tab: `Suggested`, `Top 3`, `On you (12)`.
 export function subHeading(ui: Ui, key: string, text: string) {
-  const { Box, Text } = ui
-  return <Box key={key} marginTop={1}><Text weight="semibold" dimColor>{text}</Text></Box>
+  return SectionHeading(ui, { key, text, level: 'sub' })
 }
 
-export type CardFrame = {
-  id: string            // the card's id: `<kind>:<item>`; the Box is keyed `card:<id>`
-  color: Color          // the kind's border colour
-  selected: boolean     // the last card a button was pressed on: a bold, full-strength border
-  active?: boolean      // this session's own card: the accent colour
-  scope?: string        // a hover group shared with another card of the same session
-}
+export type { CardFrame }
 
-// A bordered card with padding. At rest the border is dim and rounded; selected or hovered it is bold and lit, and a
-// hover anywhere in its `scope` lights every card of that group.
+// A bordered card with padding (hooks/skin.tsx Card): the kind's border colour, bold when selected.
 export function card(ui: Ui, f: CardFrame, children: unknown) {
-  const { Box } = ui
-  const color = f.active ? SELF_COLOR : f.color
-  const lit = f.selected || !!f.active
-  const hover = { borderStyle: 'bold', borderDimColor: false, ...(f.scope ? { scope: f.scope } : {}) }
-  return (
-    <Box key={'card:' + f.id} flexDirection="column" marginTop={1} paddingX={1}
-      borderStyle={f.selected ? 'bold' : 'round'} borderColor={color} borderDimColor={!lit} hover={hover}>
-      {children as any}
-    </Box>
-  )
+  return Card(ui, f, children)
 }
 
 export const COMPACT_TITLE_MAX = 56
 
+export const ROW_CELLS = 48       // the pills a compact card's first row holds beside its title, in cells
+
 // The title row: a plain Button whose press toggles the card; `▾` open, `▸` closed. `actions` (a compact card's
 // primary button, and a small second one) sit at the right end of the same row; the title is then one cut line.
+// Dark skin: a Button's label takes no colour, so the caret alone is the Button (on a small chip) and the title is
+// ink text beside it, cut with `…` before the pills; the recommended pill is pinned right, and when the pills do
+// not all fit the row the others move to a second one, right-aligned.
 export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPress: () => unknown, trailing?: unknown, actions?: unknown) {
   const { Box, Button, Text } = ui
+  if (skinOf(ui).dark) {
+    const { Button: Raw } = rawOf(ui)
+    const chip = pillFills(skinOf(ui)).secondary.fill
+    const caret = (
+      <Box key={'caret:' + id} backgroundColor={chip} paddingX={1} flexShrink={0}>
+        <Raw key={'toggle:' + id} plain onPress={onPress}>{open ? '▾' : '▸'}</Raw>
+      </Box>
+    )
+    const words = <Text key={'title-ink:' + id} weight="semibold" wrap={actions ? 'truncate-end' : 'wrap'}>{actions ? clip(title, COMPACT_TITLE_MAX) : title}</Text>
+    if (!actions) {
+      return (
+        <Box key={'title:' + id} gap={1} alignItems="center">
+          {caret}
+          {words}
+          {trailing as any}
+        </Box>
+      )
+    }
+    const all = (Array.isArray(actions) ? actions.flat(3) : [actions]).filter(Boolean)
+    const fits = all.reduce((n: number, a) => n + pillCells(a), 0) <= ROW_CELLS
+    const first = fits ? all : all.slice(0, 1)
+    const rest = fits ? [] : all.slice(1)
+    return (
+      <Box key={'title:' + id} flexDirection="column">
+        <Box key={'title-row:' + id} gap={1} justifyContent="space-between" alignItems="center">
+          <Box key={'title-text:' + id} gap={1} flexShrink={1} minWidth={0} alignItems="center">
+            {caret}
+            {words}
+            {trailing as any}
+          </Box>
+          <Box key={'title-acts:' + id} gap={1} flexShrink={0} alignItems="center">{first as any}</Box>
+        </Box>
+        {rest.length ? <Box key={'title-more:' + id} gap={1} justifyContent="flex-end" alignItems="center">{rest as any}</Box> : null}
+      </Box>
+    )
+  }
   const toggle = (text: string) => (
     <Button key={'toggle:' + id} plain onPress={onPress}><Text weight="semibold">{`${open ? '▾' : '▸'} ${text}`}</Text></Button>
   )
@@ -488,31 +532,56 @@ export type Strip = {
 // The header: the picture (a slim banner above, which carries the title on a surface with Svg, or a spot at the
 // left), "Mother" and "Chief of Stuff" unless the banner says them, then one line: the budget as `$1.50 / $20` with a
 // mini bar, who leads, the heartbeat's age, and a red pill while the guard is off or paused.
-export function headerStrip(ui: Ui, s: Strip) {
+// `headerParts` hands the banner apart from the strip: the dark skin draws the banner above the panel (it is as wide
+// as the pane) and the strip inside it, the budget's figures then an Svg bar (coral on slate).
+export function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
   const { Box, Text } = ui
+  const dark = skinOf(ui).dark
+  const { Svg } = ui as { Svg?: any }
   const bar = budgetBar(s.spent, s.limit)
   const limit = typeof s.limit === 'number' ? `$${Number.isInteger(s.limit) ? s.limit : s.limit.toFixed(2)}` : '$0'
   const drawn = s.portrait ? portraitOf(ui, s.portrait, s.surface) : null
-  const banner = !!drawn?.banner
-  const titled = banner && !!drawn?.titled
+  const isBanner = !!drawn?.banner
+  const titled = isBanner && !!drawn?.titled
   const picture = (drawn?.el ?? null) as any
-  return (
-    <Box key="strip-all" flexDirection="column">
-    {banner && picture ? <Box key="banner" marginBottom={titled ? 0 : 1}>{picture}</Box> : null}
+  const lim = typeof s.limit === 'number' && s.limit > 0 ? s.limit : 0
+  const ratio = lim ? (s.spent ?? 0) / lim : 1
+  const banner = isBanner && picture ? <Box key="banner" marginBottom={titled ? 0 : 1}>{picture}</Box> : null
+  const strip = (
     <Box key="strip" gap={1}>
-      {banner ? null : picture}
+      {isBanner ? null : picture}
       <Box key="strip-text" flexDirection="column" flexGrow={1}>
       {titled ? null : <Text weight="bold" size="title" color={SELF_COLOR}>Mother</Text>}
       {titled ? null : <Text dimColor size="caption">Chief of Stuff</Text>}
-      <Box key="strip-line" flexWrap="wrap" gap="xs">
-        <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
-        <Text key="pill:bar" color={bar.color}>{bar.text}</Text>
-        {badge(ui, s.lead.text, s.lead.color, 'pill:lead')}
-        {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}
-        <Text key="pill:beat" dimColor>{s.beat}</Text>
-      </Box>
+      {dark
+        ? <Box key="strip-line" flexWrap="wrap" gap={1} alignItems="center">
+            <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
+            {Svg ? <Svg key="pill:bar" source={barSvg(ratio)} alt={`budget ${Math.round(Math.min(1, Math.max(0, ratio)) * 100)}%`} width={BAR_W} height={BAR_H} />
+              : <Text key="pill:bar" color={bar.color}>{bar.text}</Text>}
+            {badge(ui, s.lead.text, s.lead.color, 'pill:lead')}
+            {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}
+            <Text key="pill:beat" dimColor size="footnote">{s.beat}</Text>
+          </Box>
+        : <Box key="strip-line" flexWrap="wrap" gap="xs">
+            <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
+            <Text key="pill:bar" color={bar.color}>{bar.text}</Text>
+            {badge(ui, s.lead.text, s.lead.color, 'pill:lead')}
+            {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}
+            <Text key="pill:beat" dimColor>{s.beat}</Text>
+          </Box>}
       </Box>
     </Box>
+  )
+  return { banner, strip }
+}
+
+export function headerStrip(ui: Ui, s: Strip) {
+  const { Box } = ui
+  const { banner, strip } = headerParts(ui, s)
+  return (
+    <Box key="strip-all" flexDirection="column">
+    {banner as any}
+    {strip as any}
     </Box>
   )
 }
