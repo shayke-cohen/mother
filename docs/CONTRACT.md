@@ -1391,7 +1391,7 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   `open_session_in` with the `local_…` id and `target: "focus"`, and counts it opened only when the answer says so:
   an error, a timeout, an empty answer or a refusal without an error ("only…", "cannot…", "changes nothing";
   "already" counts as shown) fills the prompt with a request to open it instead and says why.
-- **The pane** (`/chief [open | status | pause | resume | expand | collapse | tab <name>]`; the mod polls once a minute; drawn
+- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | expand | collapse | tab <name>]`; the mod polls once a minute; drawn
   by `hooks/chief.tsx` with the frames, badges and strip of `hooks/pane_ui.tsx`). A **header strip**: the picture,
   "Mother" / "Chief of Stuff", the counts as pills (`N need you`, `N inbox`, `N sessions`), the budget (`$1.50 /
   $20` and a bar), who leads (`led here`, `led by another session` or `nobody leading`, from `led_by` and this
@@ -1537,6 +1537,50 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   card: <progress>`, `updated Nm ago`, and on a done case session `Close case` (`close-case` for each of its keys).
   Sessions sort waiting on you, stuck, working, waiting on others, idle, done; a state that differs from the one a
   session had when the Sessions tab was last opened or left marks that tab.
+### Habits: learning from what the manager does (`lib/habits.py`, `hooks/habits.ts`, `mother chief act-log|habits`)
+
+The pane logs what the manager does with each card, code counts it, and triage uses the counts: as a hint to the
+model, and as a rule that stops showing what the manager never engages with. All of it is machine-local
+(`.mother/chief/`, gitignored, never synced).
+
+- **The log** (`actions.jsonl`). One JSON line per action: `{at, verb, item_id, key, source, label, who, kind,
+  urgency, on, title, action_label?, action_index?}`. `verb` is `open_case`, `action` (one of a card's 2-3 buttons;
+  `action_index` 0 is the recommended one), `done`, `snooze`, `ignore`, `follow`, `dismiss`, `answer` (a Needs you
+  option) or `ask`; triage itself writes `shown` when a line becomes an Inbox item. `label` is what the key belongs
+  to: a chat channel or group (never a direct message), a tracker project, a repo; empty for mail and the rest.
+  **It holds labels and the title (60 characters) only: never a message body, a why or a summary.** `mother chief
+  act-log --stdin` keeps the fields above and drops every other key; `source` and `label` come from the key when
+  there is one. Kept 90 days, at most 5000 lines, pruned on each append. The pane calls it from every handler through
+  one helper (`logAct`): detached, never awaited, a failure is silent. `act-log --json [--days N]` prints the log.
+- **Habits** (`mother chief habits --json`: `{version, days: 30, on, buckets, exceptions}`). The last 30 days per
+  bucket: `(source, label)`, `(source, who)`, `(source, kind)`, with the id `<source>|label|<value>` and so on. Rows
+  that share an `item_id` are one item, counted once in `shown` and in at most one of `engaged` (`open_case`,
+  `action`, `answer`, `follow`, `ask`), `ignored`, `closed_unread` (done with no engagement on that item; the log
+  does not time how long a card was open), `snoozed`, in that order; `engage_rate` is engaged / shown. A `(source,
+  kind)` bucket carries `prefers: <action label>` when one non-recommended label was picked at least 3 times and
+  more often than the recommended one. No model is involved.
+- **In the triage prompt.** `mother chief lines --json` gives each line `habits`: counts for its own buckets only
+  (`this_channel` | `this_project` | `this_repo`, `this_person`: `{shown, engaged, ignored, closed_unread}`) and
+  `prefers` (`{<kind>: <label>}` for its source), or null. The prompt carries it beside `context` and `line`; the
+  system note says it is a hint about what deserves attention and which action to put first, never a reason to hide
+  something addressed to the manager, a decision only they can make, or anything urgent. **These per-bucket counts
+  and that one label are the only part of the log that leaves the machine, and only inside a triage call.** The
+  verdict may add `habit_note` (80 characters), kept with the item's extras and shown dim on its open card.
+- **The quiet rule** (`habits.quiet`, in `triage_decide`). A line that would become a `now` item is logged instead,
+  with `why: "habit: <bucket> ignored N of M"`, when all hold: habits are on; its verdict is well-formed and itself
+  says `kind` `fyi` or `act` (never `decide` or `reply`) and `urgency` `today` or `later` (never `now`); the line is
+  not `manual` or `error`; it is not addressed to the manager and does not mention them (`to_manager`), so never a
+  direct message; its key has no live session (a case); deciding it folds no other line; and one of its own `(source,
+  label)` or `(source, who)` buckets, not on the exceptions list, has at least 5 items shown in 30 days, none
+  engaged with, and at least 4 ignored or closed unread. A line with no verdict is never quieted. One engagement with
+  an item of the bucket ends it, and so does the log ageing out.
+- **Quieted lines are kept** (`quieted.json`, 30 days, at most 200). `status --json` carries `habits: {on}` and
+  `quieted: {count_7d, recent: [{id, key, title, label, bucket, at, why}]}` (the last 10). The Health tab draws
+  "Quieted by habit N" with each row's `Show` (`habits show <line id>`: it becomes a normal open Inbox item with its
+  verdict's extras) and, once per bucket, `Stop quieting this` (`habits except <bucket>`: the bucket joins
+  `habits.json` -> `exceptions`, which the rule honours).
+- **The switch.** `mother chief habits on | off | status`, `/chief habits on|off|status`: the flag file
+  `HABITS_OFF`. Off: nothing is quieted and no line carries `habits`; the log is still written. Default on.
 
 ### Cases: a session that owns one Inbox item (`hooks/cos.ts`, `skills/cos`, `mother chief claim|relays|relay`)
 

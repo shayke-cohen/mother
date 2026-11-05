@@ -20,6 +20,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import chief  # noqa: E402
+import habits  # noqa: E402
 import hub  # noqa: E402
 import now as nowmod  # noqa: E402
 
@@ -142,7 +143,7 @@ class TestTick(Base):
         self.assertEqual(got, {"PLAT-3": "desktop", "PLAT-4": None, "PLAT-9": None, "PLAT-5": None})  # a worker row is none
         first = chief.lines(self.ws)[0]
         self.assertEqual(sorted(first), sorted(["id", "key", "kind", "title", "who", "link", "summary", "also",
-                                                "session", "source", "channel", "to_manager"]))
+                                                "session", "source", "channel", "to_manager", "habits"]))
 
     def test_tick_stops_at_first_judgment_line(self):
         self.mute("PLAT-1")
@@ -528,7 +529,8 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "led_by", "inbox",
-                                    "inbox_count", "cases", "relay", "guard", "health"})
+                                    "inbox_count", "cases", "relay", "guard", "health", "habits", "quieted"})
+        self.assertEqual((doc["habits"], doc["quieted"]), ({"on": True}, {"count_7d": 0, "recent": []}))
         self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
@@ -623,7 +625,8 @@ class TestHealth(Base):
         h = doc["health"]
         self.assertEqual(([u["id"] for u in h["watcher_errors"]], h["watcher_error_count"]), (["U2", "U3"], 2))
         self.assertEqual(set(h["watcher_errors"][0]), {"id", "key", "title", "why", "link", "links", "at", "session",
-                                                        "source", "who", "label", "kind", "on", "urgency", "actions"})
+                                                        "source", "who", "label", "kind", "on", "urgency", "actions",
+                                                        "habit_note"})
 
     def test_watcher_heartbeat_and_sources(self):
         with hub.locked(self.ws):
@@ -1547,3 +1550,242 @@ class TestSessionCards(TestTldr):
         self.store([self.card(fp, state="idle")])
         self.assertFalse(floor.list_cards(self.ws, AT)[0]["asks"])
 
+class TestHabits(Base):
+    """The actions log, the habits counted from it, and the quiet rule (lib/habits.py)."""
+    CFG = {"agent": {"manager": "Dana Levi", "manager_short": "Dana"},
+           "teams": [{"slug": "platform", "name": "Platform", "channels": [{"id": "C00000001", "name": "#platform"}]}]}
+    CHAN = "C00000001"
+    QUIET = dict(kind="fyi", on="other", urgency="later", actions=[{"label": "Read it", "prompt": "Read the thread"}])
+
+    def run_cli(self, *args, stdin="", at=AT):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = chief.main(list(args), self.ws, self.CFG, at)
+        return code, out.getvalue(), err.getvalue()
+
+    def log(self, at=AT, **row):
+        return habits.append_actions(self.ws, at, [habits.clean_action(row, at, verbs=habits.VERBS + (habits.SHOWN,))])
+
+    def history(self, key=None, who="Sam", ignored=4, shown=5, verb="ignore", start=0):
+        """`shown` items of one bucket, `ignored` of them ignored (or closed), none engaged with."""
+        for n in range(start, start + shown):
+            k = key or "%s/%d.0" % (self.CHAN, 100 + n)
+            self.log(verb="shown", item_id="U9%d" % n, key=k, who=who, kind="fyi")
+            if n - start < ignored:
+                self.log(verb=verb, item_id="U9%d" % n, key=k, who=who, kind="fyi")
+
+    def decide(self, l, at=AT, cfg=None, **v):
+        hub.append_inbox(self.ws, [l])
+        cfg = self.CFG if cfg is None else cfg
+        judge = chief.tick(self.ws, cfg, at, session="s-1")["judge"]
+        verdicts = [] if v.get("none") else [verdict(l, **dict(self.QUIET, **v))]
+        return chief.triage_decide(self.ws, cfg, at, judge, verdicts)
+
+    def chat(self, n=1, **kw):
+        d = dict(source="chat", key="%s/%d.0" % (self.CHAN, n), who="Sam <U00000009>", title="standup notes", summary="notes")
+        d.update(kw)
+        return line(**d)
+
+    def test_log_shape_drops_unknown_keys_and_bad_verbs(self):
+        code, out, _ = self.run_cli("act-log", "--stdin", stdin=json.dumps({
+            "verb": "action", "item_id": "U4", "key": "%s/12.5" % self.CHAN, "who": "Sam <U00000009>", "kind": "act",
+            "urgency": "today", "on": "team", "title": "x" * 90, "action_label": "Draft a reply", "action_index": 1,
+            "summary": "a body", "why": "a body", "body": "a body", "at": "1999-01-01T00:00:00Z", "source": "mail"}))
+        self.assertEqual((code, json.loads(out)), (0, {"logged": 1}))
+        rows = json.loads(self.run_cli("act-log", "--json")[1])
+        self.assertEqual(rows, [{"at": hub._iso(AT), "verb": "action", "item_id": "U4", "key": "%s/12.5" % self.CHAN,
+                                 "source": "chat", "label": self.CHAN, "who": "Sam", "kind": "act", "urgency": "today",
+                                 "on": "team", "title": "x" * 60, "action_label": "Draft a reply", "action_index": 1}])
+        for bad in ({"verb": "shown"}, {"verb": "delete"}, {}, []):
+            self.assertEqual(self.run_cli("act-log", "--stdin", stdin=json.dumps(bad))[0], 2, bad)
+        self.assertEqual(self.run_cli("act-log", "--stdin", stdin="{no")[0], 2)
+        self.assertEqual(self.run_cli("act-log")[0], 2)
+        # a Today card has no hub key: its source and label are taken as given, cleaned
+        self.log(verb="ask", item_id="tracker:PLAT-1", source="tracker", label="PLAT", title="t")
+        self.assertEqual([(r["source"], r["label"]) for r in habits.actions(self.ws, AT)][-1], ("tracker", "PLAT"))
+        self.assertEqual([habits.bucket_label(k) for k in ("PLAT-12", "acme/api#4", "D00000001/dm", "mail:abc", "wa:123@g.us", "wa:555")],
+                         ["PLAT", "acme/api", "", "", "wa:123@g.us", ""])
+
+    def test_log_prunes_by_age_and_count(self):
+        self.log(at=AT - timedelta(days=91), verb="done", item_id="old")
+        self.log(at=AT - timedelta(days=40), verb="done", item_id="mid")
+        self.log(verb="done", item_id="new")
+        self.assertEqual([r["item_id"] for r in habits.actions(self.ws, AT)], ["mid", "new"])
+        self.assertEqual([r["item_id"] for r in json.loads(self.run_cli("act-log", "--json", "--days", "30")[1])], ["new"])
+        with mock.patch.object(habits, "KEEP_LINES", 3):
+            for n in range(5):
+                self.log(verb="done", item_id="n%d" % n)
+        self.assertEqual([r["item_id"] for r in habits.actions(self.ws, AT)], ["n2", "n3", "n4"])
+        (chief.chief_dir(self.ws) / "actions.jsonl").write_text("{junk\n[1]\n" + json.dumps({"verb": "done", "at": "never"}) + "\n")
+        self.assertEqual(habits.actions(self.ws, AT), [])                       # unreadable rows are skipped
+
+    def test_habits_aggregation(self):
+        k = "%s/1.0" % self.CHAN
+        for iid, verbs in (("U1", ["shown", "ignore"]), ("U2", ["shown", "done"]), ("U3", ["shown", "snooze"]),
+                           ("U4", ["shown", "open_case", "done"]), ("U5", ["shown"]), ("U6", ["shown", "snooze", "done"])):
+            for v in verbs:
+                self.log(verb=v, item_id=iid, key=k, who="Sam", kind="act")
+        self.log(at=AT - timedelta(days=31), verb="ignore", item_id="U0", key=k, who="Sam", kind="act")   # outside 30 days
+        doc = json.loads(self.run_cli("habits", "--json")[1])
+        self.assertEqual((doc["version"], doc["days"], doc["on"], doc["exceptions"]), (1, 30, True, []))
+        want = {"shown": 6, "engaged": 1, "closed_unread": 2, "ignored": 1, "snoozed": 1, "engage_rate": 0.167}
+        got = {b["id"]: b for b in doc["buckets"]}
+        self.assertEqual(sorted(got), ["chat|kind|act", "chat|label|%s" % self.CHAN, "chat|who|Sam"])
+        for b in got.values():
+            self.assertEqual({k2: b[k2] for k2 in want}, want, b["id"])
+        self.assertEqual(habits.for_line(doc, "chat", k, "Sam <U00000009>"), {
+            "this_channel": {"shown": 6, "engaged": 1, "ignored": 1, "closed_unread": 2},
+            "this_person": {"shown": 6, "engaged": 1, "ignored": 1, "closed_unread": 2}})
+        self.assertIsNone(habits.for_line(doc, "tracker", "PLAT-1", "Lee"))        # another bucket: nothing of this one
+        self.assertEqual(json.loads(self.run_cli("habits", "--json")[1]), doc)     # deterministic
+
+    def test_prefers_a_later_action_picked_more_than_the_first(self):
+        for n, (idx, label) in enumerate([(1, "Draft reply"), (1, "draft reply"), (2, "Draft reply"), (0, "Open ticket"), (0, "Open ticket")]):
+            self.log(verb="action", item_id="U%d" % n, key="PLAT-%d" % n, kind="act", action_label=label, action_index=idx)
+        doc = habits.habits(self.ws, AT)
+        self.assertEqual({b["id"]: b.get("prefers") for b in doc["buckets"]}, {"tracker|kind|act": "Draft reply", "tracker|label|PLAT": None})
+        self.assertEqual(habits.for_line(doc, "tracker", "PLAT-50", "")["prefers"], {"act": "Draft reply"})
+        self.log(verb="action", item_id="U8", key="PLAT-8", kind="act", action_label="Open ticket", action_index=0)
+        self.assertIsNone(habits.habits(self.ws, AT)["buckets"][0].get("prefers"))   # 3 against 3: not more
+
+    def test_lines_carry_only_their_own_buckets(self):
+        self.history()
+        self.history(key="PLAT-1", who="Lee", start=20)
+        hub.append_inbox(self.ws, [self.chat(), line(key="OTHER-1", who="Kim")])
+        got = {l["key"]: l["habits"] for l in chief.lines(self.ws, self.CFG)}
+        self.assertEqual(got, {"%s/1.0" % self.CHAN: {"this_channel": {"shown": 5, "engaged": 0, "ignored": 4, "closed_unread": 0},
+                                                      "this_person": {"shown": 5, "engaged": 0, "ignored": 4, "closed_unread": 0}},
+                               "OTHER-1": None})
+        habits.set_on(self.ws, False)
+        self.assertEqual({l["habits"] for l in chief.lines(self.ws, self.CFG)}, {None})
+
+    def test_quiet_rule_logs_the_line_and_lists_it(self):
+        self.history()
+        l = self.chat()
+        r = self.decide(l)
+        self.assertEqual((r["logged"], r["now"]), ([l["id"]], []))
+        entry = hub._hub_doc(self.ws)["routed"][-1]
+        self.assertEqual((entry["decision"], entry["why"]), ("log", "habit: chat #platform ignored 4 of 5"))
+        doc = chief.status_doc(self.ws, self.CFG, AT)
+        self.assertEqual((doc["inbox_count"], doc["quieted"]["count_7d"]), (0, 1))
+        self.assertEqual(doc["quieted"]["recent"], [{"id": l["id"], "key": l["key"], "title": "T", "label": "#platform",
+                                                     "bucket": "chat|label|%s" % self.CHAN, "at": hub._iso(AT),
+                                                     "why": "habit: chat #platform ignored 4 of 5"}])
+        self.assertEqual(chief.status_doc(self.ws, self.CFG, AT + timedelta(days=8))["quieted"]["count_7d"], 0)
+
+    def test_an_ask_box_item_is_never_quieted_and_engages_its_bucket(self):
+        self.history()                                                    # the channel's bucket would be quieted
+        got = chief.ask(self.ws, self.CFG, AT, "look at https://chat.example.com/archives/%s/p1700000000123456" % self.CHAN)
+        self.assertEqual(got["key"], "%s/1700000000.123456" % self.CHAN)
+        [l] = [x for x in hub.read_inbox(self.ws) if x["id"] == got["line_id"]]
+        judge = chief.tick(self.ws, self.CFG, AT, session="s-1")["judge"]
+        r = chief.triage_decide(self.ws, self.CFG, AT, judge, [verdict(l, **self.QUIET)])
+        self.assertEqual((r["logged"], r["now"]), ([], [l["id"]]))       # a `manual` line, whatever its key: shown, held for its case
+        self.assertEqual(chief.status_doc(self.ws, self.CFG, AT)["quieted"]["count_7d"], 0)
+        chief.claim(self.ws, self.CFG, AT, {"key": got["key"], "session_id": CLI_A, "title": "t", "link": None})
+        self.assertEqual(chief.status_doc(self.ws, self.CFG, AT)["inbox"], [])
+        # the pane logs the ask (`ask` is an engaged verb): the bucket has an engaged item, so it is quieted no more
+        self.run_cli("act-log", "--stdin", stdin=json.dumps({"verb": "ask", "item_id": "ask:" + got["key"], "key": got["key"], "title": "look"}))
+        b = [x for x in habits.habits(self.ws, AT)["buckets"] if x["id"] == "chat|label|%s" % self.CHAN]
+        self.assertEqual([x["engaged"] for x in b], [1])
+        other = self.chat(7, who="Kim <U00000010>")                      # the channel bucket alone decides
+        self.assertEqual(habits.quiet(habits.habits(self.ws, AT), other, verdict(other, **self.QUIET), None, None, False), None)
+
+    def test_quiet_rule_by_person_and_closed_unread(self):
+        self.history(key="mail:thread-1", who="Sam", verb="done")       # mail has no label bucket: the person's
+        l = line(source="mail", key="mail:thread-2", who="Sam <sam@example.com>")
+        r = self.decide(l)
+        self.assertEqual(r["logged"], [l["id"]])
+        self.assertEqual(hub._hub_doc(self.ws)["routed"][-1]["why"], "habit: mail Sam ignored 4 of 5")
+
+    def test_quiet_rule_thresholds(self):
+        self.history(ignored=3)                                         # 3 of 5: not enough
+        self.assertEqual(len(self.decide(self.chat(1))["now"]), 1)
+        self.log(verb="ignore", item_id="U93", key="%s/103.0" % self.CHAN, who="Sam")
+        l2 = self.chat(2)
+        # the first chat line was shown too: 6 shown, 4 ignored, none engaged
+        self.assertEqual(self.decide(l2, at=AT + timedelta(seconds=1))["logged"], [l2["id"]])
+        self.log(verb="open_case", item_id="U90", key="%s/100.0" % self.CHAN, who="Sam")   # one engagement ends it
+        self.assertEqual(len(self.decide(self.chat(3), at=AT + timedelta(seconds=2))["now"]), 1)
+
+    def test_quiet_rule_needs_five_shown(self):
+        self.history(ignored=4, shown=4)
+        self.assertEqual(len(self.decide(self.chat())["now"]), 1)
+
+    def test_every_exemption_keeps_the_line(self):
+        cases = {
+            "manual": dict(l=self.chat(kind="manual", source="manual")),
+            "error": dict(l=self.chat(kind="error")),
+            "decide": dict(v=dict(kind="decide")),
+            "reply": dict(v=dict(kind="reply")),
+            "urgent": dict(v=dict(urgency="now")),
+            "no kind said": dict(v=dict(kind=None)),
+            "mentioned": dict(l=self.chat(title="Dana, please look")),
+            "mention by id": dict(l=self.chat(summary="<@U00000001> fyi"), cfg=dict(self.CFG, manager={"chat_dm": ["U00000001", "D00000001"]})),
+            "dm": dict(l=line(source="chat", key="D00000002/dm", who="Sam"), history=dict(key="D00000002/dm")),
+            "no verdict": dict(v=dict(none=True)),
+        }
+        for n, (name, c) in enumerate(sorted(cases.items())):
+            with self.subTest(name):
+                self.setUp()
+                self.history(**c.get("history", {}))
+                l = c.get("l") or self.chat()
+                r = self.decide(l, cfg=c.get("cfg"), **c.get("v", {}))
+                self.assertEqual((r["logged"], r["now"]), ([], [l["id"]]))
+                self.assertEqual(chief.status_doc(self.ws, self.CFG, AT)["quieted"]["count_7d"], 0)
+
+    def test_live_case_exceptions_and_the_switch_keep_the_line(self):
+        self.history()
+        self.seed_sessions({"%s/1.0" % self.CHAN: {"session_id": "s-9", "kind": "case", "state": "live", "unseen": 0}})
+        r = self.decide(self.chat(1))
+        self.assertEqual(r["logged"], [])                                # routed to its case, never quieted
+        self.assertEqual(hub._hub_doc(self.ws)["routed"][-1]["decision"], "route")
+        self.assertEqual(self.run_cli("habits", "off")[1], "habits off: 0 quieted in 7 days\n")
+        self.assertEqual(chief.status_doc(self.ws, self.CFG, AT)["habits"], {"on": False})
+        self.assertEqual(len(self.decide(self.chat(2), at=AT + timedelta(seconds=1))["now"]), 1)
+        self.assertEqual(self.run_cli("habits", "on")[1], "habits on: 0 quieted in 7 days\n")
+        self.assertEqual(self.run_cli("habits", "status")[0], 0)
+        # the exceptions list: both of the line's buckets must be on it for the line to show
+        self.assertEqual(self.run_cli("habits", "except", "chat|label|%s" % self.CHAN)[0], 0)
+        l3 = self.chat(3)
+        self.assertEqual(self.decide(l3, at=AT + timedelta(seconds=2))["logged"], [l3["id"]])
+        self.assertEqual(hub._hub_doc(self.ws)["routed"][-1]["why"], "habit: chat Sam ignored 4 of 6")
+        self.assertEqual(self.run_cli("habits", "except", "chat|who|Sam")[0], 0)
+        self.assertEqual(habits.exceptions(self.ws), ["chat|label|%s" % self.CHAN, "chat|who|Sam"])
+        self.assertEqual(len(self.decide(self.chat(4), at=AT + timedelta(seconds=3))["now"]), 1)
+        self.assertEqual([self.run_cli("habits", "except", "nope")[0], self.run_cli("habits", "bogus")[0],
+                          self.run_cli("habits", "show", "missing")[0]], [1, 2, 1])
+
+    def test_a_folding_update_is_not_quieted(self):
+        self.history()
+        a, b = self.chat(1), self.chat(1, title="second", at="2026-10-29T09:05:00Z")
+        hub.append_inbox(self.ws, [a, b])
+        judge = chief.tick(self.ws, self.CFG, AT, session="s-1")["judge"]
+        r = chief.triage_decide(self.ws, self.CFG, AT, judge, [verdict(x, **self.QUIET) for x in (a, b)])
+        self.assertEqual((r["logged"], len(r["now"])), ([], 1))
+
+    def test_show_puts_a_quieted_line_in_the_inbox(self):
+        self.history()
+        l = self.chat()
+        self.decide(l, habit_note="rarely opened")
+        code, out, _ = self.run_cli("habits", "show", l["id"], at=AT + timedelta(minutes=1))
+        self.assertEqual((code, out), (0, "Shown in the Inbox as U1\n"))
+        doc = chief.status_doc(self.ws, self.CFG, AT + timedelta(minutes=1))
+        self.assertEqual(doc["quieted"], {"count_7d": 0, "recent": []})
+        item = doc["inbox"][0]
+        self.assertEqual((item["id"], item["key"], item["title"], item["why"], item["kind"], item["urgency"], item["label"]),
+                         ("U1", l["key"], "T", "D", "fyi", "later", "#platform"))
+        self.assertEqual(item["actions"], [{"label": "Read it", "prompt": "Read the thread"}])
+        self.assertEqual(habits.actions(self.ws, AT + timedelta(minutes=1))[-1]["verb"], "shown")
+        self.assertEqual(self.run_cli("habits", "show", l["id"])[0], 1)             # once
+
+    def test_now_items_are_logged_as_shown_and_keep_a_habit_note(self):
+        l = self.chat()
+        r = self.decide(l, kind="act", habit_note="  usually\nignored " + "x" * 100)
+        self.assertEqual(r["now"], [l["id"]])
+        rows = habits.actions(self.ws, AT)
+        self.assertEqual([(x["verb"], x["item_id"], x["label"], x["who"], x["kind"], x["title"]) for x in rows],
+                         [("shown", "U1", self.CHAN, "Sam", "act", "T")])
+        self.assertNotIn("summary", rows[0])
+        note = chief.status_doc(self.ws, self.CFG, AT)["inbox"][0]["habit_note"]
+        self.assertEqual((len(note), note.startswith("usually ignored x")), (80, True))

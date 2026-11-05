@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import floor as floormod
+import habits
 import hub
 import now as nowmod
 
@@ -203,6 +204,7 @@ def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
     ws = Path(ws)
     sessions = hub._sessions_doc(ws)
     channels = _channel_names(cfg or {})
+    hab = habits.habits(ws, datetime.now(timezone.utc)) if habits.is_on(ws) else None
     out = []
     for l in _pending_lines(ws):
         d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
@@ -213,6 +215,7 @@ def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
         name = channels.get(key.split("/", 1)[0]) if d["source"] == "chat" and "/" in key else None
         d["channel"] = safe_line(name, LABEL_MAX) if name else None
         d["to_manager"] = _to_manager(cfg or {}, l)
+        d["habits"] = habits.for_line(hab, d["source"], key, l.get("who"))   # the manager's past handling of its own buckets
         out.append(d)
     return out
 
@@ -458,29 +461,46 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
     by_id = {v["line_id"]: v for v in (verdicts or [])
              if _verdict_ok(v) and keys.get(v["line_id"]) == v["key"]}
     wanted = set(judge or [])
-    items = []
+    hab = habits.habits(ws, at) if habits.is_on(ws) else None
+    channels = _channel_names(cfg or {})
+    items, quieted, lines_by_id = [], {}, {l["id"]: l for l in pending}
     for l in pending:
         if l["id"] not in wanted:
             continue
         v = by_id.get(l["id"])
         if l.get("kind") == "sweep":
             items.append({"line_id": l["id"], "key": l["key"], "decision": "log", "why": "sweep: no hub session"})
-        elif (v is not None and l.get("kind") not in TRIAGE_NEVER_LOG and _session_kind(sessions, l) is None
+            continue
+        if (v is not None and l.get("kind") not in TRIAGE_NEVER_LOG and _session_kind(sessions, l) is None
                 and not _folds_others(raw, start, l) and (not v["is_work"] or not v["needs_attention"])):
             items.append({"line_id": l["id"], "key": l["key"], "decision": "log",
                           "why": "triage: " + _one_line(v["title"], TITLE_MAX)})
+            continue
+        # the quiet rule (lib/habits.py `quiet`): the manager never engaged with this line's channel, project, repo or person
+        q = habits.quiet(hab, l, v, _to_manager(cfg or {}, l), _session_kind(sessions, l), _folds_others(raw, start, l), channels)
+        if q:
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "log", "why": q["why"]})
+            quieted[l["id"]] = {"line": l, "verdict": v, "bucket": q["bucket"], "why": q["why"],
+                                "label": item_label(l["key"], habits.who_name(l.get("who")), channels)}
         else:
             title = _one_line(v["title"] if v else str(l.get("title") or ""), TITLE_MAX) or _one_line(str(l["key"]), TITLE_MAX)
             why = _one_line(v["tldr"] if v else str(l.get("summary") or ""), WHY_MAX)
             items.append({"line_id": l["id"], "key": l["key"], "decision": "now", "title": title, "why": why,
                           "link": l.get("link") or ""})
     if items:
-        extras = {}
+        extras, shown, hushed = {}, [], []
         for res in hub.decide(ws, cfg, at, items):
+            v = by_id.get(res["line_id"])
             if res.get("decision") == "now" and res.get("update_id"):
-                extras[res["update_id"]] = verdict_extra(by_id.get(res["line_id"]))
+                extra, note = verdict_extra(v), habits.habit_note(v)
+                extras[res["update_id"]] = dict(extra, habit_note=note) if extra and note else extra
+                shown.append(habits.shown_row(at, res["update_id"], lines_by_id[res["line_id"]], v))
+            elif res.get("decision") == "log" and res["line_id"] in quieted:
+                hushed.append(quieted[res["line_id"]])
         if extras:
             _store_extras(ws, extras)
+        habits.append_actions(ws, at, shown)     # what was shown: the denominator of every habit
+        habits.record_quieted(ws, at, hushed)
         sync_relays(ws)   # a line routed to a case session waits in relays.json for that session to deliver
     out["logged"] = [it["line_id"] for it in items if it["decision"] == "log"]
     out["now"] = [it["line_id"] for it in items if it["decision"] == "now"]
@@ -744,6 +764,7 @@ def inbox_items(ws: Path, cfg: Optional[dict] = None, at: Optional[datetime] = N
         # the triage verdict's extras, cleaned again on the way out (the file is only data); None / [] when none
         x = verdict_extra(extras.get(u["id"])) or {"kind": None, "on": None, "urgency": None, "actions": []}
         rows[-1].update(x)
+        rows[-1]["habit_note"] = habits.habit_note(extras.get(u["id"]))   # set when habits changed the verdict
     rows.sort(key=lambda r: str(r["at"] or ""), reverse=True)
     rows.sort(key=lambda r: URGENCIES.index(r["urgency"] or URGENCY_DEFAULT))   # stable: newest first inside one urgency
     return rows
@@ -1765,17 +1786,26 @@ USAGE = """usage: mother chief <verb> ...
   relay on | off | status | deliver --for <session_id>
                         the machine-local relay switch (.mother/chief/RELAY_OFF); deliver: that session delivers
                         what waits once, on its next pass, though relay is off
+  act-log --stdin | --json [--days N]
+                        --stdin: append one action the manager took on a card ({verb, item_id, key, who, kind,
+                        urgency, on, title, action_label, action_index}; any other field is dropped) to
+                        .mother/chief/actions.jsonl (90 days, at most 5000 lines); --json prints the log
+  habits [--json] | on | off | status | show <line id> | except <bucket>
+                        --json: the log counted per bucket over 30 days; on | off: the machine-local switch
+                        (.mother/chief/HABITS_OFF); show: a line quieted by habit becomes an Inbox item;
+                        except: never quiet that bucket again
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
 
 A valued option takes --opt=V or --opt V."""
 
-# verb: (boolean flags, valued options); only `report`, `relay`, `watch-key`, `close-case` and `dots-detail` take a positional
+# verb: (boolean flags, valued options); only `report`, `relay`, `habits`, `watch-key`, `close-case` and `dots-detail` take a positional
 VERBS = {
     "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
     "portrait": (("--json",), ()), "report": ((), ()),
+    "act-log": (("--stdin", "--json"), ("--days",)), "habits": (("--json",), ()),
     "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
     "watch-key": ((), ("--for",)), "close-case": ((), ()), "ask": (("--stdin",), ()), "dots-detail": (("--json",), ()),
 }
@@ -1895,6 +1925,8 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "relay": {"on": relay_on(ws)},
         "guard": guard_state(ws),
         "health": health_doc(ws, at, errors),
+        "habits": {"on": habits.is_on(ws)},
+        "quieted": habits.quieted_doc(ws, at),
     }
 
 
@@ -1988,6 +2020,51 @@ def _case_verb(ws: Path, cfg: dict, at: datetime, verb: str, opts: dict, pos: Li
     return EXIT_OK
 
 
+def _habit_verb(ws: Path, cfg: dict, at: datetime, verb: str, opts: dict, pos: List[str]) -> int:
+    """`act-log --stdin | --json [--days N]`, `habits [--json] | on | off | status | show <id> | except <bucket>`."""
+    if verb == "act-log":
+        if opts.get("stdin"):
+            try:
+                row = habits.clean_action(json.loads(sys.stdin.read()), at)
+            except ValueError as e:
+                return _usage("act-log: stdin is not JSON (%s)" % e)
+            if row is None:
+                return _usage("act-log: stdin must be a JSON object whose verb is one of %s" % ", ".join(habits.VERBS))
+            print(json.dumps({"logged": habits.append_actions(ws, at, [row])}))
+            return EXIT_OK
+        if not opts.get("json"):
+            return _usage("act-log takes --stdin or --json")
+        try:
+            days = int(opts.get("days", habits.KEEP_DAYS))
+        except ValueError:
+            return _usage("act-log --days needs a number")
+        print(json.dumps(habits.actions(ws, at, max(0, days)), indent=2, ensure_ascii=False))
+        return EXIT_OK
+    sub = pos[0] if pos else ""
+    if sub in ("show", "except") and len(pos) == 2:
+        if sub == "show":
+            uid = habits.show_quieted(ws, cfg, at, pos[1])
+            if uid is None:
+                print("mother chief habits show: no quieted line %s" % pos[1], file=sys.stderr)
+                return EXIT_FAILED
+            print("Shown in the Inbox as %s" % uid)
+        elif not habits.add_exception(ws, pos[1]):
+            print("mother chief habits except: not a bucket (source|label|value or source|who|value)", file=sys.stderr)
+            return EXIT_FAILED
+        else:
+            print("Never quieted again: %s" % safe_line(pos[1].replace("|label|", " ").replace("|who|", " "), 80))
+        return EXIT_OK
+    if len(pos) > 1 or sub not in ("", "on", "off", "status"):
+        return _usage("habits takes --json, on, off, status, show <line id> or except <bucket>")
+    if sub in ("on", "off"):
+        habits.set_on(ws, sub == "on")
+    if opts.get("json") and not sub:
+        print(json.dumps(habits.habits(ws, at), indent=2, ensure_ascii=False))
+        return EXIT_OK
+    print("habits %s: %d quieted in 7 days" % ("on" if habits.is_on(ws) else "off", habits.quieted_doc(ws, at)["count_7d"]))
+    return EXIT_OK
+
+
 def main(args, ws, cfg, at) -> int:
     """`mother chief <verb>`."""
     args = list(args)
@@ -2003,7 +2080,7 @@ def main(args, ws, cfg, at) -> int:
         opts, pos = _parse(rest, flags, valued)
     except ValueError as e:
         return _usage(str(e))
-    if pos and verb not in ("report", "relay", "watch-key", "close-case", "dots-detail"):
+    if pos and verb not in ("report", "relay", "habits", "watch-key", "close-case", "dots-detail"):
         return _usage("%s takes no arguments" % verb)
     ws = Path(ws)
     if verb == "report":
@@ -2045,6 +2122,8 @@ def main(args, ws, cfg, at) -> int:
             return _usage("dots-detail takes one id (A<n> or M<n>)")
         print(json.dumps(dots_detail(ws, pos[0]), ensure_ascii=False))
         return EXIT_OK
+    if verb in ("act-log", "habits"):
+        return _habit_verb(ws, cfg, at, verb, opts, pos)
     if verb in ("pause", "resume"):
         (pause if verb == "pause" else resume)(ws)
         print("chief %s" % ("paused" if verb == "pause" else "resumed"))
