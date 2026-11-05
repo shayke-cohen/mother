@@ -167,6 +167,41 @@ class GuardCase(unittest.TestCase):
         return g
 
 
+class TestGuardOff(GuardCase):
+    SEND = ("mcp__slack__post_message", {"channel": "C999", "text": "hi"})
+
+    def off(self):
+        open(self.state("GUARD_OFF"), "w").close()
+
+    def test_on_by_default_then_off_lets_everything_through(self):
+        self.expect("ask", *self.SEND)
+        self.off()
+        self.expect("none", *self.SEND)
+        self.expect("none", "Bash", {"command": "gh pr merge 1"})
+        self.expect("none", "Write", {"file_path": os.path.join(self.ws, "config.json"), "content": "{}"})
+
+    def test_off_covers_workers_and_the_fast_hook(self):
+        self.off()
+        self.expect("none", *self.SEND, env={"MOTHER_CHIEF_WORKER": "k"})
+        self.expect("none", "Read", {"file_path": "/x"}, env={"MOTHER_CHIEF_WORKER": "k"}, script=GUARD_FAST)
+
+    def test_paused_wins(self):
+        self.off()
+        open(self.state("PAUSED"), "w").close()
+        self.expect("deny", *self.SEND)
+
+    def test_off_is_logged(self):
+        self.off()
+        self.run_guard(*self.SEND)
+        self.assertIn('"decision": "off"', read_file(self.state("guard.log")))
+
+    def test_a_worker_cannot_write_the_flag_while_on(self):
+        self.expect("deny", "Write", {"file_path": self.state("GUARD_OFF"), "content": ""},
+                    env={"MOTHER_CHIEF_WORKER": "k"})
+        self.expect("deny", "Bash", {"command": "touch %s" % self.state("GUARD_OFF")},
+                    env={"MOTHER_CHIEF_WORKER": "k"})
+
+
 class TestGreen(GuardCase):
     def test_chat_to_manager_dm_any_prefix(self):
         self.expect("allow", CHAT + "post_message", {"channel_id": DM, "text": "digest"})

@@ -545,7 +545,8 @@ def protected_paths(ctx):
           os.path.join(HERE, "hooks.json"), os.path.join(os.path.expanduser("~"), ".mother", "workspace")}
     if ctx.ws:
         m = os.path.join(ctx.ws, ".mother")
-        ps |= {os.path.join(ctx.ws, "config.json"), os.path.join(m, "PAUSED"), os.path.join(m, "ledger.json"),
+        ps |= {os.path.join(ctx.ws, "config.json"), os.path.join(m, "PAUSED"), os.path.join(m, "GUARD_OFF"),
+               os.path.join(m, "ledger.json"),
                os.path.join(m, "guard.log")}
     return {_cf(p) for p in ps}  # casefolded: macOS file systems ignore case (Config.json is config.json)
 
@@ -2042,7 +2043,7 @@ def shell_self_edit(cmd, run, cwd, ctx):
         # a command that sets its own MOTHER_WORKSPACE / MOTHER_STATE_DIR is working on a test workspace
         test_ws = re.search(r"\b(?:mother_workspace|mother_state_dir)=", shell)
         marks = [] if test_ws else [r"\$\{?mother_workspace\b", r"\.mother/workspace\b"]
-        homes.append((ctx.ws, marks, ["config.json", "PAUSED", "ledger.json", "guard.log"], "config"))
+        homes.append((ctx.ws, marks, ["config.json", "PAUSED", "GUARD_OFF", "ledger.json", "guard.log"], "config"))
     for base, marks, names, kind in homes:
         # exact case as a bare word (so prose "paused" is not PAUSED), any case after a slash (macOS ignores case)
         if not any(re.search(r"(?<![\w.-])" + re.escape(x) + r"(?![\w.-])", text) or
@@ -5555,9 +5556,32 @@ def oversized_command(raw):
     return r
 
 
+def guard_is_off(raw):
+    """The manager ran `mother guard off`: .mother/GUARD_OFF exists, so no rule runs and the model alone decides, workers
+    and the chief included. PAUSED still wins, so the kill switch works. Each call is still logged. Any doubt means on."""
+    try:
+        ws = resolve_workspace()
+        if not ws or not os.path.isfile(os.path.join(ws, ".mother", "GUARD_OFF")) \
+                or os.path.exists(os.path.join(ws, ".mother", "PAUSED")):
+            return False
+    except Exception:
+        return False
+    try:
+        c = Ctx()
+        c.ws = ws
+        payload = json.loads(raw or "")
+        log(c, str(payload.get("tool_name")) if isinstance(payload, dict) else None,
+            {"kind": "guard_off", "category": "guard"}, "off", "GUARD_OFF exists: no rules ran")
+    except Exception:
+        pass
+    return True
+
+
 def run(raw):
     """Returns (decision, reason) or None. Never raises. A question the chief's own session would raise is a deny
     instead (chief_identity): it runs unattended and an ask would stall it unseen."""
+    if guard_is_off(raw):
+        return None
     big = oversized_command(raw)
     if big:
         return big
