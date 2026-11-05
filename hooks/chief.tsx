@@ -6,9 +6,9 @@ import { askFloor, isPinned, markAnswered, needsYou, reloadFloor, storeCard, FLO
 import { nowVerb, openInspector } from './register'
 import type { FloorState } from './floor'
 import type { Dollar } from './shared'
-import { SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, TAB_IDS, TOP_COLOR, allCards, badge, card, emptyLine, headerStrip, isOpen,
-         itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabRow, titleRow,
-         toggled } from './pane_ui'
+import { ACTIVE_MINUTES, SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, TAB_IDS, TOP_COLOR, allCards, badge, card, clip, emptyLine, headerStrip,
+         humanLabel, isOpen, itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabRow,
+         titleRow, toggled } from './pane_ui'
 import type { Portrait, Tab, TabId, Ui } from './pane_ui'
 import type { ChiefChip, ChiefDesktop, ChiefInboxItem, ChiefOpen, ChiefStatus, ChiefTabs, ChiefTldr, NowDoc, NowItem, NowTop } from '../types'
 
@@ -103,6 +103,16 @@ const TRIAGE_MAX_TOKENS = 300
 const TRIAGE_TIMEOUT_MS = 20_000
 const TITLE_MAX = 60
 const TLDR_MAX = 200
+const WHY_MAX = 300          // what the hub stores of a line's summary; an expanded card shows all of it
+const PREVIEW_MAX = 64       // a compact card's one line of TL;DR or question
+
+// A stored why as an expanded card shows it: whole, on one line. One that reaches a storage cap (300, or the 200 of
+// an older item) without ending a sentence was cut there, mid-word: its last partial word goes and `…` says so.
+export function whyText(raw: unknown): string {
+  const t = oneLine(raw, WHY_MAX)
+  if ((t.length >= WHY_MAX - 1 || t.length === TLDR_MAX) && !/[.!?…)\]"'”]$/.test(t)) return clip(t, t.length - 1)
+  return t
+}
 
 type ChiefLine = { id: string; key: string; kind?: string | null; title?: unknown; who?: unknown; link?: unknown; summary?: unknown; session?: unknown }
 type Verdict = { line_id: string; key: string; is_work: boolean; needs_attention: boolean; title: string; tldr: string }
@@ -127,7 +137,7 @@ export function parseVerdict(text: string): Omit<Verdict, 'line_id' | 'key'> | n
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
   if (typeof v.is_work !== 'boolean' || typeof v.needs_attention !== 'boolean') return null
   if (typeof v.title !== 'string' || typeof v.tldr !== 'string') return null
-  return { is_work: v.is_work, needs_attention: v.needs_attention, title: v.title.slice(0, TITLE_MAX), tldr: v.tldr.slice(0, TLDR_MAX) }
+  return { is_work: v.is_work, needs_attention: v.needs_attention, title: v.title.slice(0, TITLE_MAX), tldr: clip(v.tldr, TLDR_MAX) }
 }
 
 // One line's verdict, or null (kept): a manual line or one whose key has a live session is never asked about; a model
@@ -634,7 +644,8 @@ type CardCtx = { open: ChiefOpen | null; selected: string | null; portrait?: Por
 // Its buttons are the Now panel's own, from register.tsx: `nowVerb` runs `mother now …` and re-reads now.json at once
 // through the panel's loader; `openInspector` opens an item's page. (The two files import each other's functions; each
 // is called only from a hook, never while a module loads.)
-const TODAY_ITEMS_SHOWN = 10
+export const TODAY_GROUP_SHOWN = 7
+const TODAY_MORE = 'today-more:on_you'   // in chiefOpen.cards: true while the On you group is drawn in full
 
 // Today's rows: the open Top 3 entries first, then the on-you items no Top 3 entry names.
 export function todayRows(doc: NowDoc | null | undefined, nowMs: number): { top: NowTop[]; items: NowItem[] } {
@@ -661,6 +672,12 @@ async function pickTab($: Dollar, id: TabId, counts: Record<TabId, number>): Pro
   })
 }
 
+// A small heading inside a tab: `Top 3`, `On you (12)`.
+function subHeading(ui: Ui, key: string, text: string) {
+  const { Box, Text } = ui
+  return <Box key={key} marginTop={1}><Text weight="semibold" dimColor>{text}</Text></Box>
+}
+
 function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undefined, nowMs: number, ctx: CardCtx, heading: boolean) {
   const { Box, Text, Button, Link } = ui
   const { top, items } = todayRows(doc, nowMs)
@@ -673,63 +690,77 @@ function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undef
   const fill = (text: string) => $.prompt.fill({ text, mode: 'replace' }).catch(() => undefined)
   const go = (args: string[]) => nowVerb($, bin, args)
   const byId = new Map((doc.items ?? []).map(i => [i.id, i]))
+  if (top.length) out.push(subHeading(ui, 'today-sub:top', 'Top 3'))
   for (const e of top) {
     const id = 'today:top:' + e.rank
     const open = isOpen(ctx.open, id, 'today', ctx.selected)
     const press = (run: () => unknown) => pressing($, id, run)
     const title = oneLine(e.title, 200)
-    const why = oneLine(e.why, TLDR_MAX)
+    const why = whyText(e.why)
     const action = e.item_id ? byId.get(e.item_id)?.actions?.[0] : undefined
+    const doIt = action
+      ? <Button key={'today-doit:' + e.rank} variant="primary" onPress={press(() => fill(action.prompt || `mother now do ${action.id}`))}>{oneLine(action.label, 40) || 'Do it'}</Button>
+      : null
+    const ask = <Button key={'today-ask:top:' + e.rank} variant={action ? 'secondary' : 'primary'} onPress={press(() => fill(askPrompt(title, why, e.link)))}>Ask Mother</Button>
     out.push(card(ui, { id, color: TOP_COLOR, selected: ctx.selected === id }, [
-      titleRow(ui, id, `${e.rank}. ${title}`, open, press(() => toggleCard($, id, !open))),
+      titleRow(ui, id, `${e.rank}. ${title}`, open, press(() => toggleCard($, id, !open)), null, open ? undefined : (doIt ?? ask)),
       <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
         {badge(ui, 'top', TOP_COLOR, 'badge:' + id)}
         <Text dimColor>{`set by ${e.set_by === 'manager' ? 'you' : 'the agent'} `}</Text>
         {isUrl(e.link) ? <Link href={e.link}>source ↗</Link> : null}
       </Box>,
       open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
-      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
-        {action
-          ? <Button key={'today-doit:' + e.rank} variant="primary" onPress={press(() => fill(action.prompt || `mother now do ${action.id}`))}>{oneLine(action.label, 40) || 'Do it'}</Button>
-          : null}
-        {open || !action
-          ? <Button key={'today-ask:top:' + e.rank} variant={action ? 'secondary' : 'primary'} onPress={press(() => fill(askPrompt(title, why, e.link)))}>Ask Mother</Button>
-          : null}
-        {open ? <Button key={'today-done:top:' + e.rank} onPress={press(() => go(['top', 'done', String(e.rank)]))}>Done</Button> : null}
-      </Box>,
+      open
+        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+            {doIt}
+            {ask}
+            <Button key={'today-done:top:' + e.rank} onPress={press(() => go(['top', 'done', String(e.rank)]))}>Done</Button>
+          </Box>
+        : null,
     ]))
   }
-  for (const i of items.slice(0, TODAY_ITEMS_SHOWN)) {
+  const all = ctx.open?.cards?.[TODAY_MORE] === true
+  const hidden = Math.max(0, items.length - TODAY_GROUP_SHOWN)
+  if (items.length) out.push(subHeading(ui, 'today-sub:on_you', `On you (${items.length})`))
+  for (const i of all ? items : items.slice(0, TODAY_GROUP_SHOWN)) {
     const id = 'today:' + i.id
     const open = isOpen(ctx.open, id, 'today', ctx.selected)
     const press = (run: () => unknown) => pressing($, id, run)
     const source = itemSource(i.id)
     const title = oneLine(i.title, 200)
-    const why = oneLine(i.why, TLDR_MAX)
+    const why = whyText(i.why)
     const meta = [oneLine(i.team, 40), age(i.since, nowMs)].filter(Boolean).join(' · ')
+    const openIt = <Button key={'today-open:' + i.id} variant="primary" onPress={press(() => openInspector($, { kind: 'item', id: i.id }, 'reset'))}>Open</Button>
     out.push(card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
-      titleRow(ui, id, title, open, press(() => toggleCard($, id, !open))),
+      titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : openIt),
       <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
         {badge(ui, source === 'other' ? 'on you' : source, SOURCE_COLOR[source], 'badge:' + id)}
         <Text dimColor>{meta + ' '}</Text>
         {isUrl(i.link) ? <Link href={i.link}>source ↗</Link> : null}
       </Box>,
       open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
-      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
-        <Button key={'today-open:' + i.id} variant="primary" onPress={press(() => openInspector($, { kind: 'item', id: i.id }, 'reset'))}>Open</Button>
-        {open ? <Button key={'today-ask:' + i.id} onPress={press(() => fill(askPrompt(title, why, i.link)))}>Ask Mother</Button> : null}
-        {open ? <Button key={'today-done:' + i.id} onPress={press(() => go(['done', i.id]))}>Done</Button> : null}
-      </Box>,
+      open
+        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+            {openIt}
+            <Button key={'today-ask:' + i.id} onPress={press(() => fill(askPrompt(title, why, i.link)))}>Ask Mother</Button>
+            <Button key={'today-done:' + i.id} onPress={press(() => go(['done', i.id]))}>Done</Button>
+          </Box>
+        : null,
     ]))
   }
-  if (items.length > TODAY_ITEMS_SHOWN) out.push(emptyLine(ui, 'today-more', `${items.length - TODAY_ITEMS_SHOWN} more in the Now panel`))
+  if (hidden) {
+    out.push(
+      <Box key="today-more" marginTop={1}>
+        <Button key={TODAY_MORE} onPress={() => update($, chiefOpenAtom, prev => toggled(prev, TODAY_MORE, !all))}>{all ? 'Show fewer' : `Show ${hidden} more`}</Button>
+      </Box>)
+  }
   return out
 }
 const pressing = ($: Dollar, sel: string, run: () => unknown) => async () => { await select($, sel); await run() }
 
 // The Inbox section: the hub's open `now` items (status `inbox`, newest first, at most INBOX_SHOWN), each a card
-// coloured by its source. Compact: the title row, the source badge, key, age, source link, Open session. Expanded: the
-// why, two suggested prompts (a chosen one becomes the brief Open session types into a new session), Done and Snooze
+// coloured by its source. Compact, two rows: the title with Open session and Done at its right end; the source badge,
+// a human label (never the raw key), age, source link. Expanded: the whole why, the raw key (dim), two suggested prompts (a chosen one becomes the brief Open session types into a new session), Done and Snooze
 // (`mother hub done|snooze`). Open session with no suggestion is the Now panel's: the key's live session, else the
 // item as a prompt to fill, never to submit. The text is line- or model-written: plain text only.
 const INBOX_SHOWN = 10
@@ -753,9 +784,10 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
         const pickKey = 'inbox-snooze:' + u.id
         const sugKey = 'inbox-pick:' + u.id
         const title = oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)
-        const why = oneLine(u.why, TLDR_MAX)
+        const why = whyText(u.why)
         const link = isUrl(u.link) ? u.link : null
         const source = sourceOf(u.key)
+        const label = oneLine(humanLabel(u), 40)
         const open = isOpen(ctx.open, id, 'inbox', ctx.selected)
         const chosen = drafts?.[sugKey]
         const press = (run: () => unknown) => pressing($, id, run)
@@ -764,14 +796,17 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
           if (u.session) return openSession($, goHub, u.session.key, { title: oneLine(u.session.title, TITLE_MAX) })
           return openNew($, bin, askPrompt(title, why, link))
         }
+        const openBtn = <Button key={'inbox-open:' + u.id} variant="primary" onPress={press(openIt)}>Open session</Button>
+        const doneBtn = <Button key={'inbox-done:' + u.id} onPress={press(() => goHub(['done', u.id]))}>Done</Button>
         return card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
-          titleRow(ui, id, title, open, press(() => toggleCard($, id, !open))),
+          titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [openBtn, doneBtn]),
           <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
             {badge(ui, source, SOURCE_COLOR[source], 'badge:' + id)}
-            <Text dimColor>{`${oneLine(u.key, TITLE_MAX)} · ${ago(u.at, nowMs)} `}</Text>
+            <Text dimColor>{`${label} · ${ago(u.at, nowMs)} `}</Text>
             {link ? <Link href={link}>source ↗</Link> : null}
           </Box>,
           open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
+          open ? <Text key={'key:' + id} dimColor size="caption">{oneLine(u.key, TITLE_MAX)}</Text> : null,
           open
             ? <Box key={'sug:' + id} flexWrap="wrap" gap="xs">
                 {suggestionsFor(source).map((text, i) => (
@@ -784,14 +819,14 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
                 ))}
               </Box>
             : null,
-          <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
-            <Button key={'inbox-open:' + u.id} variant="primary" onPress={press(openIt)}>Open session</Button>
-            {open ? <Button key={'inbox-done:' + u.id} onPress={press(() => goHub(['done', u.id]))}>Done</Button> : null}
-            {open
-              ? <Button key={pickKey} onPress={press(() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey)
+          open
+            ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+                {openBtn}
+                {doneBtn}
+                <Button key={pickKey} onPress={press(() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey)
                   : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [pickKey]: '1' })))}>Snooze</Button>
-              : null}
-          </Box>,
+              </Box>
+            : null,
           open && drafts?.[pickKey] !== undefined
             ? <Select key={'inbox-snooze-pick:' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
                 onSelect={(value: string) => clearDraft($, pickKey).then(() => goHub(['snooze', u.id, value]))} />
@@ -800,6 +835,14 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
       })}
     </Box>
   )
+}
+
+// The Sessions tab's order: sessions that ask first, then the active ones (a turn in the last 15 minutes), then the
+// idle; inside each group the most recent first. A session with no readable activity time sorts last in its group.
+export function sessionOrder(pinned: readonly ChiefDesktop[], asking: ReadonlySet<string>, nowMs: number): ChiefDesktop[] {
+  const at = (d: ChiefDesktop) => (d.last_activity_at ? Date.parse(d.last_activity_at) : NaN) || 0
+  const rank = (d: ChiefDesktop) => (asking.has(d.cli_session_id) ? 0 : at(d) && nowMs - at(d) < ACTIVE_MINUTES * 60_000 ? 1 : 2)
+  return pinned.map((d, i) => ({ d, i })).sort((a, b) => rank(a.d) - rank(b.d) || at(b.d) - at(a.d) || a.i - b.i).map(x => x.d)
 }
 
 // Who leads, from the status' `led_by` (the session id behind a fresh heartbeat) and this session's own id.
@@ -845,6 +888,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   }
   const needs = needsYou(s, floor)
   const asking = new Set(needs.map(n => n.d.cli_session_id))
+  const question = new Map(needs.map(n => [n.d.cli_session_id, n.card.question]))
   const scopeOf = (cli: string) => 'mother-sess:' + cli
   // A pinned desktop session: chat goes straight to it; Open asks the app to show it. It has its own person at its
   // own keyboard. The session whose pane this is wears `this session` and the accent colour.
@@ -856,25 +900,29 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     const state = sessionPill(d, asking.has(cli), nowMs, ago)
     const meta = oneLine(d.repo, 80)
     const press = (run: () => unknown) => pressing($, id, run)
+    const openBtn = <Button key={'open:' + cli} variant="primary" onPress={press(() => openPinned($, d))}>Open</Button>
+    // compact: one line of what it asks, else of its TL;DR (its first line), else of its last report
+    const preview = clip(oneLine(question.get(cli) ?? (tldrs?.[cli]?.tldr ?? d.last_report ?? '').split('\n')[0] ?? '', 200), PREVIEW_MAX)
     return card(ui, { id, color: SESSION_COLOR, selected: ctx.selected === id, active, scope: scopeOf(cli) }, [
       titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open)),
-               active ? badge(ui, 'this session', SELF_COLOR, 'badge:self:' + cli) : null),
-      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+               active ? badge(ui, 'this session', SELF_COLOR, 'badge:self:' + cli) : null, open ? undefined : openBtn),
+      <Box key={'meta:' + id} flexWrap={open ? 'wrap' : 'nowrap'} gap="xs">
         {badge(ui, state.text, state.color, 'badge:' + id)}
         {meta ? <Text dimColor>{meta}</Text> : null}
+        {!open && preview ? <Text key={'preview:' + id} wrap="truncate-end">{preview}</Text> : null}
       </Box>,
       ...(open ? summary(cli, d.last_report) : []),
       open ? sentLine(cli) : null,
-      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
-        {open
-          ? <Input key={'say:' + cli} placeholder="Tell this session…" submitLabel="send"
+      open
+        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+            <Input key={'say:' + cli} placeholder="Tell this session…" submitLabel="send"
               value={drafts?.['say:' + cli]}
               onSubmit={(value: string) => {
                 if (value.trim()) void select($, id).then(() => clearDraft($, 'say:' + cli)).then(() => sendPinned($, cli, value))
               }} />
-          : null}
-        <Button key={'open:' + cli} variant="primary" onPress={press(() => openPinned($, d))}>Open</Button>
-      </Box>,
+            {openBtn}
+          </Box>
+        : null,
       open ? chipRow(d) : null,
     ])
   }
@@ -889,6 +937,22 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     const options = c.options.map(o => ({ label: oneLine(o.label, 24), message: oneLine(o.message, 200) })).filter(o => o.label && o.message)
     const press = (run: () => unknown) => pressing($, sel, run)
     const shownOptions = open ? options : options.slice(0, 1)
+    const optionBtn = (o: { label: string; message: string }, i: number) => (
+      <Button key={`need:${cli}:${i}`} variant={i === 0 ? 'primary' : 'secondary'}
+        onPress={press(() => sendPinned($, cli, o.message).then(() => markAnswered($, cli)))}>{o.label}</Button>
+    )
+    const openBtn = <Button key={'need-open:' + cli} variant={options.length ? 'secondary' : 'primary'} onPress={press(() => openPinned($, d))}>Open</Button>
+    if (!open) {
+      // compact, two rows: the title with its first answer (else Open) at the right end; the badge and the question, one line
+      return card(ui, { id, color: NEED_COLOR, selected: ctx.selected === sel, scope: scopeOf(cli) }, [
+        titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open)), null,
+                 shownOptions.length ? shownOptions.map(optionBtn) : openBtn),
+        <Box key={'meta:' + id} gap="xs">
+          {badge(ui, 'asks', NEED_COLOR, 'badge:' + id)}
+          <Text key={'q:' + id} wrap="truncate-end">{clip(oneLine(c.question, 200), PREVIEW_MAX)}</Text>
+        </Box>,
+      ])
+    }
     return card(ui, { id, color: NEED_COLOR, selected: ctx.selected === sel, scope: scopeOf(cli) }, [
       titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open))),
       <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
@@ -899,15 +963,12 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       ...(open ? options.map((o, i) => <Text key={`need-says:${cli}:${i}`} dimColor wrap="wrap">{`${o.label}: "${o.message}"`}</Text>) : []),
       open ? sentLine(cli) : null,
       <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
-        {shownOptions.map((o, i) => (
-          <Button key={`need:${cli}:${i}`} variant={i === 0 ? 'primary' : 'secondary'}
-            onPress={press(() => sendPinned($, cli, o.message).then(() => markAnswered($, cli)))}>{o.label}</Button>
-        ))}
-        {open ? <Button key={'need-open:' + cli} onPress={press(() => openPinned($, d))}>Open</Button> : null}
+        {shownOptions.map(optionBtn)}
+        <Button key={'need-open:' + cli} onPress={press(() => openPinned($, d))}>Open</Button>
       </Box>,
     ])
   }
-  const pinned = Array.isArray(s.desktop) ? s.desktop : []
+  const pinned = sessionOrder(Array.isArray(s.desktop) ? s.desktop : [], asking, nowMs)
   // The tabs, as data: a later group (decisions, dots) is one more row here once it has a source.
   const counts = tabCounts(s, floor, ctx.doc, nowMs)
   const tabs: Tab[] = [
@@ -927,7 +988,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       {headerStrip(ui, { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
                          sessions: pinned.length, spent: s.budget?.spent, limit: s.budget?.limit,
                          overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self), beat,
-                         portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal' })}
+                         portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: s.guard ?? null })}
       {s.budget?.unreadable
         ? <Text color="error">Budget: spend file unreadable — no model call is made until it reads again.</Text>
         : s.budget?.over

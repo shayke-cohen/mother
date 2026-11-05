@@ -183,11 +183,15 @@ export type ChiefStatus = {
   led_by?: string | null             // the session id that wrote the heartbeat while it is fresh (under 120 s), else null
   inbox?: ChiefInboxItem[]           // the hub's open updates (`now` decisions), newest first, at most 10
   inbox_count?: number               // all of them
+  guard?: 'on' | 'off' | 'paused'    // the guard: `paused` while .mother/PAUSED exists (it wins), `off` while .mother/GUARD_OFF does
 }
 
 export type ChiefInboxItem = {
   id: string   // U<n>
   key: string; title: string; why: string; link: string; at: string | null
+  source?: string                    // the key's kind: chat, mail, tracker, code, calendar, manual, error, other
+  who?: string                       // the person its newest inbox line names; '' when none
+  label?: string                     // what a card shows in place of the raw key: a channel's name, a person, `mail thread`…
   session: { key: string; title: string } | null   // the live hub session for the key
 }
 

@@ -1326,7 +1326,7 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   driven.
 - **`ChiefStatus`** (`status --json`, version 1, `types/index.d.ts`): `{version, at, paused, chief: {alive,
   heartbeat_at}, budget: {spent, limit, unreadable, over}, desktop: [{session_id, cli_session_id, title, cwd, repo,
-  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count}`. `alive` is a heartbeat under 120 s old;
+  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard}`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
   `led_by` is that heartbeat's `session_id` while it is alive, else null. `desktop` is the snapshot rows still live in
   the app (`last_report` is the first 200 characters of the last turn report). `spent` reads 0 when `spend.json` is
   unreadable; `unreadable` is then true, and `over` (spent at the limit, or unreadable) says no model call is made.

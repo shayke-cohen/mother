@@ -454,7 +454,7 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "led_by", "inbox",
-                                    "inbox_count"})
+                                    "inbox_count", "guard"})
         self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
@@ -528,6 +528,52 @@ class TestStatusAndText(Base):
         (chief.chief_dir(self.ws) / "spend.json").write_text("{bad")
         b = chief.status_doc(self.ws, {}, AT)["budget"]
         self.assertEqual((b["unreadable"], b["over"], b["spent"]), (True, True, 0.0))
+
+    def now_item(self, key, who="", summary="s", title="t"):
+        a = line(key=key, who=who, summary=summary, title=title)
+        hub.append_inbox(self.ws, [a])
+        hub.decide(self.ws, {}, AT, [{"line_id": a["id"], "key": key, "decision": "now", "title": title, "why": summary}])
+
+    def test_inbox_items_carry_source_who_and_a_human_label(self):
+        cfg = {"teams": [{"channels": [{"id": "C0AAAAAAA", "name": "platform"}]}]}
+        self.now_item("C0AAAAAAA/1700000000.000100", who="Dana <U0DDDDDDD>")
+        self.now_item("C0BBBBBBB/1700000000.000200", who="Sam")
+        self.now_item("C0CCCCCCC/1700000000.000300")
+        self.now_item("D0DDDDDDD/dm", who="Robin")
+        self.now_item("mail:1a2b3c", who="Dana")
+        self.now_item("PLAT-9")
+        self.now_item("example/api#45")
+        self.now_item("cal:evt1")
+        got = {r["key"]: (r["source"], r["who"], r["label"]) for r in chief.status_doc(self.ws, cfg, AT)["inbox"]}
+        self.assertEqual(got, {
+            "C0AAAAAAA/1700000000.000100": ("chat", "Dana", "#platform"),
+            "C0BBBBBBB/1700000000.000200": ("chat", "Sam", "Sam"),
+            "C0CCCCCCC/1700000000.000300": ("chat", "", "chat thread"),
+            "D0DDDDDDD/dm": ("chat", "Robin", "Robin"),
+            "mail:1a2b3c": ("mail", "Dana", "mail thread"),
+            "PLAT-9": ("tracker", "", "PLAT-9"),
+            "example/api#45": ("code", "", "example/api#45"),
+            "cal:evt1": ("calendar", "", "calendar"),
+        })
+        for label in (v[2] for v in got.values()):
+            self.assertNotRegex(label, r"1700000000|1a2b3c|C0[A-Z]{7}")
+
+    def test_inbox_why_keeps_300_characters(self):
+        self.now_item("PLAT-7", summary="word " * 80)
+        why = chief.status_doc(self.ws, {}, AT)["inbox"][0]["why"]
+        self.assertEqual(len(why), 300)
+        self.assertEqual(chief.WHY_MAX, 300)
+
+    def test_status_guard_state(self):
+        m = self.ws / ".mother"
+        m.mkdir(exist_ok=True)
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["guard"], "on")
+        (m / "GUARD_OFF").write_text("")
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["guard"], "off")
+        (m / "PAUSED").write_text("")
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["guard"], "paused")   # PAUSED wins
+        (m / "GUARD_OFF").unlink()
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["guard"], "paused")
 
     # a `now` for a live desktop key is a route to it (unseen + 1), not a U<n> update
     def test_desktop_key_now_is_stored_as_route(self):
