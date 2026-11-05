@@ -51,6 +51,23 @@ except ImportError:  # pragma: no cover
 
 DEADLINE_SECONDS = 8  # hooks.json allows 60: a hook killed at its timeout lets the call run unguarded, so this fires first
 MAX_COMMAND_BYTES = 64 * 1024
+DEADLINE_REASON = "The guard ran out of time reading this call, so it can't vouch for it. If the machine is just busy, " \
+                  "one retry is fine."
+
+
+def log_deadline(decision):
+    """The alarm's line in guard.log. Standing alone: the alarm can fire before the rest of this file has loaded."""
+    try:
+        ws = os.environ.get("MOTHER_WORKSPACE", "").strip()
+        if not ws:
+            with open(os.path.join(os.path.expanduser("~"), ".mother", "workspace")) as f:
+                ws = f.readline().strip()
+        with open(os.path.join(os.path.expanduser(ws), ".mother", "guard.log"), "a") as f:
+            f.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tool": None, "kind": "deadline",
+                                "category": "guard", "target": None, "decision": decision,
+                                "reason": DEADLINE_REASON}) + "\n")
+    except Exception:
+        pass
 
 
 def arm_deadline(seconds=DEADLINE_SECONDS):
@@ -61,10 +78,13 @@ def arm_deadline(seconds=DEADLINE_SECONDS):
 
     def expired(_signum, _frame):
         alone = os.environ.get("MOTHER_CHIEF_WORKER", "").strip() or os.environ.get("MOTHER_CHIEF_ROLE") == "chief"
+        decision = "deny" if alone else "ask"
         os.write(1, (json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse", "permissionDecision": "deny" if alone else "ask",
-            "permissionDecisionReason": "[mother guard] The guard ran out of time reading this call, so it can't vouch "
-                                        "for it."}}) + "\n").encode("utf-8"))
+            "hookEventName": "PreToolUse", "permissionDecision": decision,
+            "permissionDecisionReason": "[mother guard] " + DEADLINE_REASON}}) + "\n").encode("utf-8"))
+        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))  # the answer is out: a stalled disk can't hold the hook
+        signal.setitimer(signal.ITIMER_REAL, 1)
+        log_deadline(decision)
         os._exit(0)
 
     try:
@@ -2773,12 +2793,13 @@ def _sl_fail(why, kind=None):
     raise _Unlisted(why, kind)
 
 
-def sl_lex(cmd, plugin):
+def sl_lex(cmd, plugin, home=None):
     """Stages of a shell line under the strict grammar: a list of {words, redirs, heredocs}; raises _Unlisted with
     the first part it won't read. Words are plain strings with quotes resolved; `${CLAUDE_PLUGIN_ROOT}`,
     `$CLAUDE_PLUGIN_ROOT`, `$HOME` and a leading `~` are expanded; any other `$`, a backtick, a glob or brace
-    character outside quotes, a comment, a subshell, `&`, `<<<` or a line continuation stops it."""
-    home = os.path.expanduser("~")
+    character outside quotes, a comment, a subshell, `&`, `<<<` or a line continuation stops it. `home`, when given,
+    is what `$HOME` and `~` read as instead of the real folder."""
+    home = home or os.path.expanduser("~")
     if re.search(r"\bCLAUDE_PLUGIN_ROOT=|\bHOME=", cmd):
         _sl_fail("sets CLAUDE_PLUGIN_ROOT or HOME")
     stages, cur, i, n = [], {"words": [], "redirs": [], "heredocs": []}, 0, len(cmd)
@@ -5370,6 +5391,89 @@ def unattended_shell_refused(cmd):
     return None
 
 
+SL_HOME_MARK = "\0HOME"  # what `$HOME` and `~` read as below: a word holding it can't be vouched for
+UNATTENDED_CLUSTERS = {"cat": "benstuvAET", "ls": "aAbBcCdfFgGhiklmnopqrRsStTuUvxX1"}  # ls: no -L or -H, they follow links
+UNATTENDED_PATH_DENY = ("`%s`: a chief worker's or the chief's shell reads only inside the workspace, not into its guarded "
+                        "files, not through a link out of it. Use the Read tool for a file, or %s.")
+UNATTENDED_PATH_NEXT = ("say what you need in your PROGRESS line",  # a worker
+                        "propose it as a decision for the manager (record the line as `now`)")  # the chief
+
+
+def unattended_path_refused(word, base, ws):
+    """True unless `word`, from the folder `base`, resolves inside the workspace, outside what's guarded there, and
+    neither in nor above a folder holding the grant key or ~/.claude. base None: only an absolute path can be read."""
+    if base is None and not os.path.isabs(word):
+        return True
+    p = os.path.realpath(os.path.join(base or os.sep, word))
+    if not inside(p, ws) or (p != ws and ws_protected(p, ws)):
+        return True
+    home, state = _home_dirs()
+    fp, root = p.casefold(), ws.casefold()
+    for g in (state, os.path.join(home, ".mother"), os.path.join(home, ".claude")):
+        g = os.path.realpath(g).casefold()
+        if inside(g, fp) or (inside(fp, g) and not inside(root, g)):
+            return True
+    return False
+
+
+def unattended_read_paths(prog, args):
+    """(the path operands of one listed read, True when it reads the cwd with none given). Options come from a positive
+    table, so `grep --dereference-recursive` and its prefixes, `-S`, `-d recurse` and `rg -L` are off with anything else
+    unknown. grep -R follows links where -r doesn't."""
+    if prog in UNATTENDED_CLUSTERS:
+        opts, ops = _sl_args(args)
+        for o in opts:
+            if not re.fullmatch("-[%s]+" % UNATTENDED_CLUSTERS[prog], o):
+                _sl_fail("%s %s" % (prog, o))
+        return ops, prog == "ls" and not ops
+    vals, ops = _sl_opts(prog, args)
+    flags = [f for f, _ in vals]
+    if "-R" in flags:
+        _sl_fail("grep -R, which follows symbolic links (-r doesn't)")
+    if prog not in ("grep", "rg"):
+        return ops, False
+    paths = ops if any(f in ("-e", "--regexp", "-f", "--file", "--files") for f in flags) else ops[1:]
+    return paths + [v for f, v in vals if f == "-f"], not paths
+
+
+def unattended_git_paths(args):
+    """Every word of a listed git read that isn't an option: a pathspec, or a revision that reads as an ordinary name in
+    the workspace. All count, since `git diff` with a path outside the repo reads it, with no `--no-index`. A git read
+    always needs a cwd in the workspace."""
+    words = [a for a in args if a not in ("--no-pager", "--no-optional-locks")][1:]
+    k = words.index("--") if "--" in words else len(words)
+    return [a for a in words[:k] if not a.startswith("-")] + words[k + 1:], True
+
+
+def unattended_paths_refused(cmd, base, ctx):
+    """What a chief worker's or the chief's listed read holds that isn't confined to the workspace, or None. Run after
+    unattended_shell_refused: `mother` and `gh` take no paths; the chief's own shapes carry text, not paths."""
+    if not chief_worker() and (chief_command(cmd) or plugin_mother_args(cmd, heredoc=True) == ["hub", "decide"]):
+        return None
+    ws = os.path.realpath(ctx.ws) if ctx.ws else None
+    try:
+        for st in sl_lex(cmd, os.path.dirname(HERE), home=SL_HOME_MARK):
+            prog, args = st["words"][0], st["words"][1:]
+            if prog != "git" and prog not in UNATTENDED_READS:
+                continue
+            sources = [t for op, t in st["redirs"] if "<" in op and not t.startswith("&")]
+            if any(SL_HOME_MARK in w for w in args + sources):
+                return "a `~` or `$HOME` path"
+            paths, needs_cwd = unattended_git_paths(args) if prog == "git" else unattended_read_paths(prog, args)
+            if not ws:
+                return "%s with no workspace" % prog
+            for w in [x for x in paths if x != "-"] + [x for x in sources if x != "/dev/null"]:
+                if unattended_path_refused(w, base, ws):
+                    return "%s %s" % (prog, w)
+            if needs_cwd and (base is None or unattended_path_refused(".", base, ws)):
+                return "%s from a folder outside the workspace" % prog
+    except _Unlisted as e:
+        return str(e)
+    except Exception:
+        return "a line the guard can't read"
+    return None
+
+
 def oversized_command(raw):
     """A shell command too long to read before the hook's time is up: refused here, before any regex. Returns (decision,
     reason) or None."""
@@ -5486,6 +5590,13 @@ def _run(raw):
             why = unattended_shell_refused(text)
             if why:  # run() makes this question a deny; a session with the role but not the chief's id keeps its ask
                 r = "ask", "`%s` is not on the short list of read commands a chief worker or the chief may run" % why[:160]
+                log(ctx, tool, {"kind": "unattended-shell", "category": "chief"}, r[0], r[1])
+                return r
+            # the terminal tool runs wherever its tab is, which the payload doesn't say
+            why = unattended_paths_refused(text, (payload.get("cwd") or os.getcwd()) if tool in ("Bash", "Monitor")
+                                           else None, ctx)
+            if why:
+                r = "deny", UNATTENDED_PATH_DENY % (why[:160], UNATTENDED_PATH_NEXT[0 if chief_worker() else 1])
                 log(ctx, tool, {"kind": "unattended-shell", "category": "chief"}, r[0], r[1])
                 return r
         role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
