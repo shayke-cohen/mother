@@ -454,7 +454,7 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "led_by", "inbox",
-                                    "inbox_count", "guard", "health"})
+                                    "inbox_count", "cases", "relay", "guard", "health"})
         self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
@@ -998,3 +998,155 @@ class PortraitTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCases(Base):
+    """A case: a session that owns one inbox item (claim), gets its follow-ups (relays) and closes it (hub done)."""
+    A = "11111111-1111-4111-8111-111111111111"
+    B = "22222222-2222-4222-8222-222222222222"
+
+    def now_item(self, key, at=AT, title="t"):
+        a = line(key=key, title=title, at=hub._iso(at))
+        hub.append_inbox(self.ws, [a])
+        return hub.decide(self.ws, {}, at, [{"line_id": a["id"], "key": key, "decision": "now", "title": title, "why": "w"}])[0]
+
+    def follow_up(self, key, n, at=AT, who="Dana <U0DDDDDDD>", summary="any news?"):
+        a = line(key=key, at=hub._iso(at + timedelta(seconds=n)), who=who, summary=summary, title="re")
+        hub.append_inbox(self.ws, [a])
+        chief.triage_decide(self.ws, {}, at + timedelta(seconds=n), [a["id"]], [])
+        return a
+
+    def claim(self, key, cli, at=AT, **kw):
+        return chief.claim(self.ws, {}, at, dict({"key": key, "session_id": cli, "title": "Fix it", "link": "https://example.com/1"}, **kw))
+
+    def rows(self):
+        return hub._sessions_doc(self.ws)["sessions"]
+
+    def test_claim_makes_a_live_case_and_links_the_update(self):
+        uid = self.now_item("PLAT-7")["update_id"]
+        got = self.claim("PLAT-7", self.A)
+        self.assertEqual(got, {"ok": True, "key": "PLAT-7", "session_id": self.A, "update_id": uid})
+        r = self.rows()["PLAT-7"]
+        self.assertEqual((r["state"], r["kind"], r["cli_session_id"], r["session_id"], r["opened_at"], r["unseen"]),
+                         ("live", "case", self.A, self.A, hub._iso(AT), 0))
+        u = hub._hub_doc(self.ws)["updates"][0]
+        self.assertEqual((u["id"], u["state"], u["session_id"]), (uid, "open", self.A))   # kept, and linked
+        item = chief.inbox_items(self.ws)[0]
+        self.assertEqual(item["session"], {"key": "PLAT-7", "title": "Fix it", "kind": "case", "cli_session_id": self.A})
+        self.assertEqual(self.claim("PLAT-7", self.A)["key"], "PLAT-7")                    # again, same session: fine
+
+    def test_claim_refusals(self):
+        for doc, why in (({"key": "PLAT-7", "session_id": self.A}, "no open inbox item"),
+                         ({"key": "bad key", "session_id": self.A}, "not a hub key"),
+                         ({"key": "PLAT-7", "session_id": "nope"}, "not a session id"), ([], "JSON object")):
+            with self.assertRaises(ValueError) as e:
+                chief.claim(self.ws, {}, AT, doc)
+            self.assertIn(why, str(e.exception))
+        self.assertEqual(self.rows(), {})
+
+    def test_claim_repoint_refused_until_the_row_is_stale(self):
+        self.now_item("PLAT-7")
+        self.claim("PLAT-7", self.A)
+        with self.assertRaises(ValueError) as e:
+            self.claim("PLAT-7", self.B, at=AT + timedelta(days=6))
+        self.assertIn("live in another session", str(e.exception))
+        self.assertEqual(self.rows()["PLAT-7"]["cli_session_id"], self.A)
+        self.claim("PLAT-7", self.B, at=AT + timedelta(days=8))                            # older than 7 days: allowed
+        r = self.rows()["PLAT-7"]
+        self.assertEqual((r["cli_session_id"], r["state"], r["opened_at"]), (self.B, "live", hub._iso(AT + timedelta(days=8))))
+
+    def test_relays_take_only_this_sessions_keys_once(self):
+        self.now_item("PLAT-7")
+        self.now_item("PLAT-8")
+        self.claim("PLAT-7", self.A)
+        self.claim("PLAT-8", self.B)
+        a = self.follow_up("PLAT-7", 10)
+        self.follow_up("PLAT-8", 20)
+        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 1)
+        self.assertEqual(len(hub._hub_doc(self.ws)["updates"]), 2)                         # a route, no new item
+        peek = chief.relays(self.ws, AT, self.A)
+        self.assertEqual(peek, [{"key": "PLAT-7", "at": hub._iso(AT + timedelta(seconds=10)), "who": "Dana",
+                                 "title": "re", "summary": "any news?", "link": a["link"]}])
+        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), peek)
+        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), [])                 # taken once
+        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 0)
+        self.assertEqual(self.rows()["PLAT-8"]["unseen"], 1)                               # the other session's still waits
+        self.assertEqual([c["unseen"] for c in chief.cases(self.ws)], [0, 1])
+        for n in range(30, 42):
+            self.follow_up("PLAT-7", n)
+        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True)), chief.RELAY_MAX)
+        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 2)                               # the rest wait
+        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True)), 2)
+
+    def test_relay_lines_survive_the_hubs_routed_cap_and_are_cleaned(self):
+        self.now_item("PLAT-7")
+        self.claim("PLAT-7", self.A)
+        self.follow_up("PLAT-7", 5, who="Da‮na", summary="x" * 500)
+        for n in range(hub.ROUTED_MAX + 5):                                                # push it out of hub.json's routed
+            l = line(key="LOG-%d" % n, at=hub._iso(AT + timedelta(seconds=100 + n)))
+            hub.append_inbox(self.ws, [l])
+            hub.decide(self.ws, {}, AT, [{"line_id": l["id"], "key": l["key"], "decision": "log"}])
+        got = chief.relays(self.ws, AT, self.A, take=True)
+        self.assertEqual([(g["who"], len(g["summary"])) for g in got], [("Dana", 300)])
+
+    def test_relay_flag_holds_lines_until_forced_or_asked(self):
+        self.now_item("PLAT-7")
+        self.claim("PLAT-7", self.A)
+        self.follow_up("PLAT-7", 10)
+        self.assertTrue(chief.relay_on(self.ws))
+        chief.set_relay(self.ws, False)
+        self.assertFalse(chief.status_doc(self.ws, {}, AT)["relay"]["on"])
+        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), [])
+        self.assertEqual(chief.cases(self.ws)[0]["unseen"], 1)                             # still waiting, shown as N new
+        chief.relay_deliver(self.ws, self.A)
+        self.assertIs(chief.cases(self.ws)[0]["deliver_now"], True)
+        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True)), 1)             # once
+        self.assertIs(chief.cases(self.ws)[0]["deliver_now"], False)
+        self.follow_up("PLAT-7", 20)
+        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), [])
+        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True, force=True)), 1)
+        chief.set_relay(self.ws, True)
+        self.assertTrue(chief.relay_on(self.ws))
+
+    def test_done_closes_the_case_and_later_activity_is_a_new_item(self):
+        uid = self.now_item("PLAT-7")["update_id"]
+        self.claim("PLAT-7", self.A)
+        later = AT + timedelta(days=3)                                                     # past the item's TTL: a case's item stays
+        self.follow_up("PLAT-7", 10, at=later)
+        self.assertEqual([u["id"] for u in hub._hub_doc(self.ws)["updates"]], [uid])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(hub.main(["done", uid], self.ws, {}, later), 0)
+        self.assertEqual(self.rows()["PLAT-7"]["state"], "done")
+        self.assertEqual(chief.cases(self.ws), [])
+        a = self.follow_up("PLAT-7", 60, at=later)
+        res = [r for r in hub._hub_doc(self.ws)["routed"] if r["line_id"] == a["id"]][0]
+        self.assertEqual(res["decision"], "now")                                           # a new Inbox card, not a route
+        self.assertEqual(chief.relays(self.ws, later, self.A), [])
+
+    def test_status_cases_and_the_cli_verbs(self):
+        self.now_item("PLAT-7")
+
+        def run(*args, stdin=""):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = chief.main(list(args), self.ws, {}, AT)
+            return code, out.getvalue(), err.getvalue()
+
+        body = json.dumps({"key": "PLAT-7", "session_id": self.A, "title": "Fix it", "link": "https://example.com/1"})
+        self.assertEqual(run("claim", "--stdin", stdin=body)[0], 0)
+        code, _, err = run("claim", "--stdin", stdin=body.replace(self.A, self.B))
+        self.assertEqual((code, "refusing to repoint" in err), (1, True))
+        self.assertEqual(run("claim")[0], 2)
+        self.follow_up("PLAT-7", 10)
+        doc = chief.status_doc(self.ws, {}, AT)
+        self.assertEqual(doc["relay"], {"on": True})
+        self.assertEqual(doc["cases"], [{"key": "PLAT-7", "cli_session_id": self.A, "title": "Fix it", "link": "https://example.com/1",
+                                         "label": "PLAT-7", "unseen": 1, "last_routed_at": hub._iso(AT + timedelta(seconds=10)),
+                                         "opened_at": hub._iso(AT), "deliver_now": False}])
+        self.assertEqual(run("relay", "off")[1], "relay off: 1 line(s) waiting\n")
+        self.assertEqual(json.loads(run("relays", "--for", self.A, "--take")[1]), [])
+        self.assertEqual(run("relay", "deliver", "--for", self.A)[0], 0)
+        self.assertEqual(len(json.loads(run("relays", "--for", self.A, "--take")[1])), 1)
+        self.assertEqual(run("relay", "on")[1], "relay on\n")
+        self.assertEqual(run("relay", "status")[1], "relay on\n")
+        self.assertEqual([run("relay")[0], run("relay", "maybe")[0], run("relays")[0], run("relay", "deliver")[0]], [2, 2, 2, 2])

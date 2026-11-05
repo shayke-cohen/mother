@@ -1837,7 +1837,11 @@ def _prune_updates(h: dict, sessions: dict, cfg: dict, at: datetime) -> None:
     sched = _schedule(cfg)
     keep = []
     for u in h["updates"]:
-        if find_session(sessions, [u.get("key")]):
+        hit = find_session(sessions, [u.get("key")])
+        if hit and hit[1].get("kind") == "case" and u.get("state") != "done":
+            keep.append(u)  # a case session's own item: it stays, linked, until `done` closes the case
+            continue
+        if hit:
             continue
         try:
             ref = hub_sources.parse_iso(u.get("at"))
@@ -2134,6 +2138,11 @@ def update_cmd(ws: Path, cfg: dict, at: datetime, verb: str, args, as_json: bool
         if verb == "done":
             u["state"] = "done"
             u.pop("snooze_until", None)
+            hit = find_session(sess, [u.get("key")])
+            if hit and hit[1].get("kind") == "case":
+                # the case is closed: later activity on the key raises a new item, not a route to a finished session
+                hit[1]["state"] = "done"
+                save_json(ws, "sessions.json", sess)
         else:
             u["state"] = "snoozed"
             u["snooze_until"] = until

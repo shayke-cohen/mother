@@ -1,5 +1,6 @@
 import { atom, update } from 'claude-code'
 
+import { floorRows } from './cos'
 import { oneLine } from './shared'
 import type { Dollar } from './shared'
 import type { ChiefDesktop, ChiefStatus, FloorCard, FloorOption, FloorState } from '../types'
@@ -116,10 +117,10 @@ export async function markAnswered($: Dollar, sessionId: string): Promise<void> 
     (prev ? { ...prev, answered: [...prev.answered.filter(id => id !== sessionId), sessionId] } : prev))
 }
 
-// The cards to draw, oldest first: asking, not this session's own, not just answered, and of a pinned session (a card
-// with no pinned row is not shown).
+// The cards to draw, oldest first: asking, not this session's own, not just answered, and of a pinned session or one
+// that holds a live case (hooks/cos.ts); a card with no such row is not shown.
 export function needsYou(s: ChiefStatus | null, floor: FloorState | null): { card: FloorCard; d: ChiefDesktop }[] {
-  const pinned = Array.isArray(s?.desktop) ? s!.desktop! : []
+  const pinned = floorRows(s)
   if (!floor || !pinned.length) return []
   const out: { card: FloorCard; d: ChiefDesktop }[] = []
   for (const card of floor.cards) {

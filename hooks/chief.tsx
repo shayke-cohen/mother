@@ -3,11 +3,13 @@ import type { Register } from 'claude-code'
 
 import { SNOOZES, age, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe, todaysTop } from './shared'
 import { askFloor, isPinned, markAnswered, needsYou, reloadFloor, storeCard, FLOOR_TAIL_MAX, NO_ASK } from './floor'
+import { askDeliver, caseBrief, caseMeta, caseOnlyRows, claimCase, firstCase, holdsClaim, noteTurn, relayIsOn, relayPass, relaySwitch, resetCos } from './cos'
+import type { CaseItem } from './cos'
 import { nowVerb, openInspector } from './register'
 import type { FloorState } from './floor'
 import type { Dollar } from './shared'
 import { ACTIVE_MINUTES, SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, TAB_IDS, TOP_COLOR, allCards, badge, card, clip, emptyLine, headerStrip,
-         humanLabel, isOpen, itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, subHeading, suggestedBrief, suggestionsFor, tabRow,
+         humanLabel, isOpen, itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, subHeading, suggestionsFor, tabRow,
          titleRow, toggled, whyText } from './pane_ui'
 import type { Portrait, Tab, TabId, Ui } from './pane_ui'
 import { guardState, healthProblems, healthSection, inboxFollowIgnore, inboxIgnorePick, isWatcherError, loadDismissed, suggestedRows, suggestedSection,
@@ -510,7 +512,10 @@ async function onDesktop($: Dollar): Promise<boolean> {
 // this session's prompt instead.
 export const newSessionLink = (text: string, folder: string): string =>
   `claude://code/new?q=${encodeURIComponent(text)}&folder=${encodeURIComponent(folder)}`
-async function openNew($: Dollar, bin: string, text: string): Promise<void> {
+// With `item` (an Inbox item) the text typed is its case brief (hooks/cos.ts), `text` being what to do first; the
+// session that starts from it claims the item's key.
+async function openNew($: Dollar, bin: string, prompt: string, item?: CaseItem | null): Promise<void> {
+  const text = item ? caseBrief(item, prompt) : prompt
   const fill = () => $.prompt.fill({ text, mode: 'replace' }).catch(() => undefined)
   if (!(await onDesktop($))) { await fill(); return }
   const ws = await workspace($, bin)
@@ -655,7 +660,7 @@ export function todayRows(doc: NowDoc | null | undefined, nowMs: number): { top:
 export function tabCounts(s: ChiefStatus | null, floor: FloorState | null, doc: NowDoc | null | undefined, nowMs: number): Record<TabId, number> {
   const today = todayRows(doc, nowMs)
   const inbox = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
-  return { needs: needsYou(s, floor).length, inbox, sessions: Array.isArray(s?.desktop) ? s!.desktop!.length : 0,
+  return { needs: needsYou(s, floor).length, inbox, sessions: (Array.isArray(s?.desktop) ? s!.desktop!.length : 0) + caseOnlyRows(s).length,
            today: today.top.length + today.items.length + suggestedRows(doc).length, all: 0, team: teamCount(doc), health: healthProblems(s, doc) }
 }
 
@@ -783,10 +788,12 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
         const open = isOpen(ctx.open, id, 'inbox', ctx.selected)
         const chosen = drafts?.[sugKey]
         const press = (run: () => unknown) => pressing($, id, run)
+        const caseOf = u.session?.kind === 'case' ? (s.desktop ?? []).find(d => d.cli_session_id === u.session!.cli_session_id) : undefined
         const openIt = () => {
-          if (chosen) return openNew($, bin, suggestedBrief(chosen, title, why, link))
+          if (caseOf) return openPinned($, caseOf)                    // its case session, when the app can show it
+          if (chosen && u.session?.kind !== 'case') return openNew($, bin, chosen, u)   // an item with a case never gets a second one
           if (u.session) return openSession($, goHub, u.session.key, { title: oneLine(u.session.title, TITLE_MAX) })
-          return openNew($, bin, askPrompt(title, why, link))
+          return openNew($, bin, '', u)
         }
         const openBtn = <Button key={'inbox-open:' + u.id} variant="primary" onPress={press(openIt)}>Open session</Button>
         const doneBtn = <Button key={'inbox-done:' + u.id} onPress={press(() => goHub(['done', u.id]))}>Done</Button>
@@ -794,6 +801,7 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
           titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [openBtn, doneBtn]),
           <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
             {badge(ui, source, SOURCE_COLOR[source], 'badge:' + id)}
+            {u.session?.kind === 'case' ? badge(ui, 'has a session', SESSION_COLOR, 'badge:case:' + id) : null}
             <Text dimColor>{`${label} · ${ago(u.at, nowMs)} `}</Text>
             {link ? <Link href={link}>source ↗</Link> : null}
           </Box>,
@@ -895,6 +903,11 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     const meta = oneLine(d.repo, 80)
     const press = (run: () => unknown) => pressing($, id, run)
     const openBtn = <Button key={'open:' + cli} variant="primary" onPress={press(() => openPinned($, d))}>Open</Button>
+    // a session that holds a case: its key's label, how many routed lines wait for it, and (relay off) Deliver now
+    const cm = caseMeta(s, cli)
+    const deliverBtn = cm && cm.unseen > 0 && !relayIsOn(s)
+      ? <Button key={'deliver:' + cli} onPress={press(() => deliverNow($, bin, cli, active))}>Deliver now</Button>
+      : null
     // compact: one line of what it asks, else of its TL;DR (its first line), else of its last report
     const preview = clip(oneLine(question.get(cli) ?? (tldrs?.[cli]?.tldr ?? d.last_report ?? '').split('\n')[0] ?? '', 200), PREVIEW_MAX)
     return card(ui, { id, color: SESSION_COLOR, selected: ctx.selected === id, active, scope: scopeOf(cli) }, [
@@ -902,6 +915,9 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
                active ? badge(ui, 'this session', SELF_COLOR, 'badge:self:' + cli) : null, open ? undefined : openBtn),
       <Box key={'meta:' + id} flexWrap={open ? 'wrap' : 'nowrap'} gap="xs">
         {badge(ui, state.text, state.color, 'badge:' + id)}
+        {cm ? badge(ui, 'case', SESSION_COLOR, 'badge:case:' + cli) : null}
+        {cm && cm.labels.length ? <Text key={'case-label:' + cli} dimColor>{cm.labels.join(', ')}</Text> : null}
+        {cm && cm.unseen > 0 ? <Text key={'case-new:' + cli} color="warning">{`${cm.unseen} new`}</Text> : null}
         {meta ? <Text dimColor>{meta}</Text> : null}
         {!open && preview ? <Text key={'preview:' + id} wrap="truncate-end">{preview}</Text> : null}
       </Box>,
@@ -915,6 +931,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
                 if (value.trim()) void select($, id).then(() => clearDraft($, 'say:' + cli)).then(() => sendPinned($, cli, value))
               }} />
             {openBtn}
+            {deliverBtn}
           </Box>
         : null,
       open ? chipRow(d) : null,
@@ -963,6 +980,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     ])
   }
   const pinned = sessionOrder(Array.isArray(s.desktop) ? s.desktop : [], asking, nowMs)
+  const caseOnly = caseOnlyRows(s)   // case sessions that are not pinned: listed under Cases
   // The tabs, as data: a later group (decisions, dots) is one more row here once it has a source.
   const counts = tabCounts(s, floor, ctx.doc, nowMs)
   const tabs: Tab[] = [
@@ -972,7 +990,9 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     { id: 'inbox', label: 'Inbox', count: counts.inbox, section: h => [inboxSection($, ui, bin, s, nowMs, drafts, ctx, h)] },
     { id: 'sessions', label: 'Sessions', count: counts.sessions, section: h => [
       pinned.length ? (h ? sectionHeading(ui, 'pinned-heading', `Pinned ${pinned.length}`) : null) : emptyLine(ui, 'pinned-empty', 'No pinned sessions'),
-      ...pinned.map(pinnedCard)] },
+      ...pinned.map(pinnedCard),
+      caseOnly.length ? subHeading(ui, 'cases-heading', `Cases ${caseOnly.length}`) : null,
+      ...caseOnly.map(pinnedCard)] },
     { id: 'today', label: 'Today', count: counts.today, section: h => todaySection($, ui, bin, ctx.doc, nowMs, ctx, h, suggestedSection($, ui, bin, ctx.doc, nowMs, drafts, ctx)) },
     { id: 'team', label: 'Team', count: counts.team, section: h => teamSection($, ui, bin, ctx.doc, nowMs, drafts, ctx, h) },
     { id: 'health', label: 'Health', text: 'Health', count: healthProblems(s, ctx.doc, ctx.health?.dismissed), alert: healthProblems(s, ctx.doc, ctx.health?.dismissed) > 0,
@@ -983,7 +1003,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   return (
     <Box flexDirection="column">
       {headerStrip(ui, { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
-                         sessions: pinned.length, spent: s.budget?.spent, limit: s.budget?.limit,
+                         sessions: pinned.length + caseOnly.length, spent: s.budget?.spent, limit: s.budget?.limit,
                          overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self), beat,
                          portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: guardState(s) })}   // the one read the Health tab's Guard row shows
       {s.budget?.unreadable
@@ -1000,10 +1020,11 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
 }
 
 // This session's own card (hooks/floor.ts), written when its turn ends on an answer and cleared (`answer` null) when a
-// prompt is submitted here. Pinned sessions only. Over budget nothing is asked or written.
+// prompt is submitted here. Pinned sessions and those that hold a live case (hooks/cos.ts) only. Over budget nothing
+// is asked or written.
 async function floorCard($: Dollar, configured: string, answer: string | null): Promise<void> {
   const id = await $.session.id()
-  if (!isPinned(lastStatus, id)) return
+  if (!isPinned(lastStatus, id) && !holdsClaim(lastStatus, id)) return
   const bin = await motherBin($, configured)
   if (answer === null) { await storeCard($, bin, id, NO_ASK); return }
   if (overBudget(lastStatus)) return
@@ -1011,6 +1032,23 @@ async function floorCard($: Dollar, configured: string, answer: string | null): 
   const got = await askFloor($, model, String(answer ?? '').slice(-FLOOR_TAIL_MAX))
   await recordSpend($, bin, model, got.usage)
   await storeCard($, bin, id, got.reply)
+}
+
+// The first prompt of a session that starts from a case brief claims the item's key for this session, then re-reads
+// the status so the session is on the floor by the time its turn ends. Errors are swallowed.
+async function claimFirst($: Dollar, configured: string, text: unknown): Promise<void> {
+  const c = firstCase(text)
+  if (!c) return
+  const bin = await motherBin($, configured)
+  if (await claimCase($, bin, c)) await reloadStatus($, bin)
+}
+
+// Deliver now on a session's card (relay off): this session's own lines are submitted here at once; another session
+// is asked to deliver on its next pass (`mother chief relay deliver`).
+async function deliverNow($: Dollar, bin: string, cli: string, own: boolean): Promise<void> {
+  if (own) await relayPass($, bin, lastStatus, true)
+  else $.ui.toast((await askDeliver($, bin, cli)) ? 'That session delivers what waits on its next pass' : 'mother chief relay deliver failed')
+  await reloadStatus($, bin)
 }
 
 // The pass state; a reload of the mod starts it over. register.tsx owns the timer: the engine's scan lets `$` reach
@@ -1023,7 +1061,7 @@ let busy = false
 export async function startChief($: Dollar, configured: string): Promise<number> {
   const bin = await motherBin($, configured)
   try {
-    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | status | pause | resume)' })
+    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | status | pause | resume | relay on|off|status)' })
   } catch {
     // carry on without the command
   }
@@ -1038,6 +1076,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   opening.clear()
   spendOwed.length = 0
   spendFlushing = false
+  resetCos()
   await loadPortrait($, bin)
   await loadDismissed($)
   await reloadStatus($, bin)
@@ -1047,8 +1086,8 @@ export async function startChief($: Dollar, configured: string): Promise<number>
 }
 
 // One timer pass, never two at once (a slow tick makes the next period a no-op): snapshot the pinned sessions, on the
-// desktop surface `tick --as` (leadOnce), which leads only when no other session does, then reload. It never submits
-// a prompt. Always returns null: the period never changes.
+// desktop surface `tick --as` (leadOnce), which leads only when no other session does, then reload. The only prompt
+// it ever submits is a relay into a session that holds a live case. Always returns null: the period never changes.
 export async function chiefPass($: Dollar, configured: string): Promise<number | null> {
   if (busy) return null
   busy = true
@@ -1057,7 +1096,9 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
     await flushSpend($, bin)
     await snapshotPinned($, bin)
     if (await onDesktop($)) await leadOnce($, bin)   // a terminal session only reads
-    await reloadStatus($, bin)
+    const read = await reloadStatus($, bin)
+    // routed lines waiting for a case this session holds: one framed prompt into itself (hooks/cos.ts), within its bounds
+    if (await relayPass($, bin, read)) await reloadStatus($, bin)
     await reloadFloor($, bin)                          // each session's card, for the pane's Needs you
     void refreshTldrs($, bin).catch(() => undefined)   // detached; refreshTldrs runs one batch at a time
     return null
@@ -1067,13 +1108,19 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
 }
 
 export function registerChief(on: On, configured: string): void {
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId) noteTurn(true)   // a relay is never submitted while the main loop's turn runs
+    return next(e)
+  })
   on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) noteTurn(false)
     // the main loop's turns only (a subagent's carry agentId); detached: the card's model call never delays the turn's end
     if (!e.agentId && e.reason === 'answer') void floorCard($, configured, e.answer).catch(() => undefined)
     return next(e)
   })
   // The manager typed here: this session's question, if it had one, is answered. Detached as well.
   on('prompt.submit', async ($, e, next) => {
+    void claimFirst($, configured, e.text).catch(() => undefined)   // a `Mother case:` brief claims its key; detached
     void floorCard($, configured, null).catch(() => undefined)
     return next(e)
   })
@@ -1102,6 +1149,12 @@ export function registerChief(on: On, configured: string): void {
       await reloadStatus($, bin)
       return { text }
     }
+    const relay = /^relay(?:\s+(on|off|status))?$/.exec(verb)
+    if (relay) {
+      const text = await relaySwitch($, bin, (relay[1] ?? 'status') as 'on' | 'off' | 'status')
+      await reloadStatus($, bin)
+      return { text: text ?? '`mother chief relay` failed.' }
+    }
     if (verb === 'expand' || verb === 'collapse') {
       await update($, chiefOpenAtom, () => allCards(verb === 'expand'))
       return { text: `Chief pane: every card ${verb === 'expand' ? 'expanded' : 'collapsed'}.` }
@@ -1111,7 +1164,7 @@ export function registerChief(on: On, configured: string): void {
       await pickTab($, tab as TabId, tabCounts(lastStatus, await read($, floorAtom), await read($, docAtom), await $.clock.now()))
       return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|team|health|all]' }
+    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | expand | collapse | tab needs|inbox|sessions|today|team|health|all]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
