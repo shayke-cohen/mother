@@ -122,7 +122,8 @@ def save_config(ws: Path, cfg: dict) -> None:
     (ws / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
 
 
-TOP_KEYS = {"version", "agent", "manager", "workspace", "connectors", "teams", "routines", "policy", "whatsapp", "hub"}
+TOP_KEYS = {"version", "agent", "manager", "workspace", "connectors", "teams", "routines", "policy", "whatsapp", "hub",
+            "chief"}
 MODES = {"off", "watch", "mention", "draft", "auto"}
 TRIGGERS = {"manager", "team", "anyone"}
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -364,6 +365,8 @@ def validate(cfg: dict) -> list:
         errs.append("policy.shell_unasked must be true or false")
     if "whatsapp" in cfg:
         errs.extend(validate_whatsapp(cfg["whatsapp"]))
+    if "chief" in cfg:
+        errs.extend(validate_chief(cfg["chief"]))
     if "hub" in cfg:
         errs.extend(validate_hub(cfg["hub"]))
     return errs
@@ -459,6 +462,36 @@ def validate_hub(h) -> list:
                     errs.append(f'{where}.{k} must be "search" or "poll"')
             elif not str_list(v):
                 errs.append(f"{where}.{k} must be a list of strings")
+    return errs
+
+
+# config.json -> chief (CONTRACT §5g; lib/chief.py DEFAULTS, which a test holds equal): "count" a whole number from 1,
+# "positive" a number above 0, "money" a number from 0, "text" any string, "model" a TL;DR or triage model.
+CHIEF_FIELDS = {"max_workers": "count", "run_minutes": "positive", "daily_budget_usd": "money", "chief_model": "text",
+                "worker_model": "text", "tick_seconds": "positive", "tldr_model": "model", "triage_model": "model",
+                "batch_minutes": "positive", "decision_hours": "positive"}
+CHIEF_MODELS = ("sonnet", "opus")
+
+
+def validate_chief(c) -> list:
+    if not isinstance(c, dict):
+        return ["chief must be an object"]
+    errs = []
+    for k, v in c.items():
+        kind = CHIEF_FIELDS.get(k)
+        number = isinstance(v, (int, float)) and not isinstance(v, bool)
+        if kind is None:
+            errs.append(f"unknown key chief.{k}")
+        elif kind == "count" and not (isinstance(v, int) and not isinstance(v, bool) and v >= 1):
+            errs.append(f"chief.{k} must be a whole number of 1 or more")
+        elif kind == "positive" and not (number and v > 0):
+            errs.append(f"chief.{k} must be a number above 0")
+        elif kind == "money" and not (number and v >= 0):
+            errs.append(f"chief.{k} must be a number of 0 or more")
+        elif kind == "text" and not isinstance(v, str):
+            errs.append(f"chief.{k} must be a string")
+        elif kind == "model" and v not in CHIEF_MODELS:
+            errs.append(f"chief.{k} must be one of {', '.join(CHIEF_MODELS)}")
     return errs
 
 
