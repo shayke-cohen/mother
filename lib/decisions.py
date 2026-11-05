@@ -214,7 +214,8 @@ def propose(ws: Path, cfg: dict, at: datetime, key: str, tool: str, inp: dict, r
         doc["next"] += 1
         doc["decisions"].append(d)
         save(ws, doc)
-        chief.update_worker(ws, key, status="waiting_decision")
+        if chief.workers(ws)[key].get("status") != "failed":  # a filing is no new start: see `_resume`
+            chief.update_worker(ws, key, status="waiting_decision")
     return d
 
 
@@ -748,7 +749,7 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
             chief.enqueue(ws, at, key, "%s approved by the manager. Make exactly this one call now, with this input "
                                        "unchanged, then end the turn.\nTool: %s\nInput: %s"
                           % (did, d["tool"], canonical(d["input"])), "decision")
-            _resume(ws, key)
+            _resume(ws, key, answered=True)
             return True, _approved_line(ws, cfg, at, did, key)
         problem = _set_grant(ws, did, None)  # no live grant survives an answer that doesn't send
         if problem:
@@ -769,14 +770,21 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
             result = "%s: your words went to %s." % (did, key)
         save(ws, doc)
         chief.enqueue(ws, at, key, text, "decision")
-        _resume(ws, key)
+        _resume(ws, key, answered=verb == "say")
         return True, result
+
+
+def _reason(w: dict) -> str:
+    """Why a failed worker stopped: its `progress`, one line."""
+    return chief.safe_line(w.get("progress"), chief.PROGRESS_MAX)
 
 
 def _approved_line(ws: Path, cfg: dict, at: datetime, did: str, key: str) -> str:
     """An approval's result, which promises the call only when a run can start. Saying so can't undo the approval."""
     try:
-        why = "it's held" if (chief.workers(ws).get(key) or {}).get("held") else chief.refusal(ws, cfg, at)
+        w = chief.workers(ws).get(key) or {}
+        why = "it's held" if w.get("held") else "its last run stopped: %s" % _reason(w) if chief.stopped_by_limit(w) \
+            else chief.refusal(ws, cfg, at)
     except Exception as e:
         _log(ws, "approved %s: %r" % (did, e))
         why = None
@@ -858,7 +866,8 @@ def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: dict, live: dic
     if at.timestamp() >= ends:
         _set_grant(ws, did, None)
         d["status"] = "expired"
-        doc["confirm"].append("%s: approved but not used in time; nothing went out" % did)
+        stopped = " (its last run stopped: %s)" % _reason(w) if w is not None and chief.stopped_by_limit(w) else ""
+        doc["confirm"].append("%s: approved but not used in time; nothing went out%s" % (did, stopped))
         save(ws, doc)
         if w is not None:
             chief.drop_queued(ws, key, "%s approved by" % did)  # a dead instruction: the guard would refuse the call
@@ -876,7 +885,9 @@ def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: dict, live: dic
         doc["confirm"].append("%s: the worker is gone and the call wasn't made; nothing went out" % did)
         note = ""
     elif w.get("status") == "failed":
-        doc["confirm"].append("%s: the worker failed after your yes; it's back with the worker" % did)
+        said = _reason(w)
+        doc["confirm"].append("%s: the worker failed after your yes%s; nothing went out, and it's back with the worker"
+                              % (did, " (%s)" % said if said else ""))
         note = "%s: your run failed after the manager's yes, so the call wasn't made. File it again if it's still " \
                "needed." % did
     elif why:
@@ -1450,10 +1461,15 @@ def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None, poste
         save(ws, doc)
 
 
-def _resume(ws: Path, key: str) -> None:
+def _resume(ws: Path, key: str, answered: bool = False) -> None:
     """The worker leaves waiting_decision unless another decision of its is still open; normal dispatch picks up what
-    was queued."""
+    was queued. A failed worker stays failed, and what's queued waits for its next `say` or `run`: a note about a failure
+    must not start the worker again. `answered`: the manager gave it something to do (a yes, their words), which is
+    input like a `say`, unless its run stopped on a limit and would only stop again."""
     try:
+        w = chief.workers(ws).get(key)
+        if w and w.get("status") == "failed" and (not answered or chief.stopped_by_limit(w)):
+            return
         chief.update_worker(ws, key, status=chief.rest_status(ws, key))
     except KeyError:
         pass

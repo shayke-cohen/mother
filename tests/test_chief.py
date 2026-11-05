@@ -231,6 +231,8 @@ class TestPausedSettings(Base):
 
 # ---- the worker runner ------------------------------------------------------------------------------
 FAKE = os.path.join(ROOT, "tests", "fixtures", "fake_claude.py")
+SPEND_FIXTURE = os.path.join(ROOT, "tests", "fixtures", "spend_limit_result.json")
+SPEND_LIMIT = "You've hit your individual spend limit · run /usage-credits to ask your admin for a higher limit"
 
 
 class TestRun(Base):
@@ -454,6 +456,77 @@ class TestRun(Base):
         self.assertIs(kw["start_new_session"], True)
         self.assertTrue(kw["stdout"].name.endswith(os.path.join("logs", chief.run_name("PLAT-1") + ".log")))
         self.assertEqual(self.calls(), [])
+
+
+class TestRunFailure(Base):
+    """What a run that failed leaves for the manager to read. The event is a live one, its ids scrubbed."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.dict(os.environ, {"MOTHER_CLAUDE_BIN": FAKE, "FAKE_CLAUDE_LOG": str(self.ws / "claude.log"),
+                                         "FAKE_CLAUDE_EVENT_FILE": SPEND_FIXTURE, "FAKE_CLAUDE_EXIT": "1"})
+        p.start()
+        self.addCleanup(p.stop)
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+
+    def run_(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = chief.run(self.ws, {}, AT, "PLAT-1", prompt="go")
+        return code, out.getvalue()
+
+    def test_parse_stream_reads_the_real_message(self):
+        with open(SPEND_FIXTURE) as f:
+            event = json.load(f)
+        self.assertEqual(event["subtype"], "success")  # that is what the live one says
+        self.assertEqual(chief.parse_stream(json.dumps(event))[2], SPEND_LIMIT)
+
+    def test_parse_stream_with_no_message_has_something_to_say(self):
+        for event, want in (({"subtype": "error_max_turns"}, "error_max_turns"),
+                            ({"subtype": "error_during_execution", "errors": ["boom", "bang"]}, "boom; bang"),
+                            ({"subtype": "success", "is_error": True, "api_error": "usage_limit_reached"},
+                             "usage_limit_reached"),
+                            ({"subtype": "success", "is_error": True}, "claude reported an error")):
+            self.assertEqual(chief.parse_stream(json.dumps(dict(event, type="result")))[2], want)
+
+    def test_a_spend_limit_shows_where_the_manager_looks(self):
+        code, out = self.run_()
+        self.assertEqual(code, chief.EXIT_FAILED)
+        self.assertIn("PLAT-1 failed: " + SPEND_LIMIT, out)
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+        row = chief.status_doc(self.ws, {}, AT)["workers"][0]
+        self.assertEqual((row["status"], row["progress"]), ("failed", SPEND_LIMIT))
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            chief._print_status(chief.status_doc(self.ws, {}, AT))
+        self.assertIn(SPEND_LIMIT, printed.getvalue())
+
+    def test_stderr_noise_doesnt_replace_the_real_message(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_STDERR": "a deprecation warning\n"}):
+            self.run_()
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["progress"], SPEND_LIMIT)
+
+    def test_stderr_still_explains_a_run_with_no_message(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_STDERR": "the real reason\n"}):
+            os.environ.pop("FAKE_CLAUDE_EVENT_FILE")
+            self.run_()
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["progress"], "the real reason")
+
+    def test_what_counts_as_a_limit(self):
+        for stopped in (SPEND_LIMIT, "usage_limit_reached", "Claude usage limit reached", "You've hit your session limit",
+                        "Credit balance is too low", "Invalid API key · Please run /login", "Not logged in",
+                        "Failed to authenticate. API Error: 401", "API Error: 403 Forbidden"):
+            self.assertTrue(chief.stopped_by_limit({"status": "failed", "progress": stopped}), stopped)
+        for other in ("claude exited 1", "timed out after 20 min", "run ended without a result", "boom", "",
+                      "the limit of the file was hit"):
+            self.assertFalse(chief.stopped_by_limit({"status": "failed", "progress": other}), other)
+        self.assertFalse(chief.stopped_by_limit({"status": "idle", "progress": SPEND_LIMIT}))
+
+
+class TestHeader(unittest.TestCase):
+    def test_the_header_says_the_grant_binds_the_tool_name_you_have(self):
+        self.assertIn("exact name", chief.HEADER)
+        self.assertIn("binds", chief.HEADER)
 
 
 class TestWaitsOnDecision(Base):
@@ -1070,6 +1143,121 @@ class TestTickDecisions(Base):
                           for e in self.delivered()], [("decision", True, True)])
         self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")  # so it hears it
 
+    def test_a_failed_send_from_a_failed_worker_waits_with_the_worker(self):
+        self.file()
+        self.approve()
+        self.delivered()
+        self.ledger("chief:D1", outcome="failed", error="channel_not_found")
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress="claude exited 1")
+        chief.run.reset_mock()
+        self.tick()
+        self.assertEqual(self.status(), "failed")
+        self.assertIn("channel_not_found", self.doc()["confirm"][0])
+        chief.run.assert_not_called()
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+        self.assertEqual(chief.queued(self.ws).get("PLAT-1"), 1)  # it rides with the next say
+
+    # a failed worker waits -------------------------------------------------------------------------------------
+
+    def failed_after_yes(self, why="claude exited 1"):
+        self.file()
+        self.approve()
+        self.delivered()  # the run took the approval
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress=why)
+        chief.run.reset_mock()
+
+    def test_a_failed_worker_isnt_restarted_by_the_note_about_its_failure(self):
+        self.failed_after_yes()
+        self.tick()
+        self.assertEqual(self.status(), "failed")
+        self.tick(at=self.LATER + timedelta(minutes=1))
+        chief.run.assert_not_called()
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+        self.assertEqual(chief.queued(self.ws).get("PLAT-1"), 1)  # kept for its next run, not dropped
+
+    def test_a_routed_line_doesnt_restart_a_failed_worker(self):
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress="claude exited 1")
+        chief.enqueue(self.ws, AT, "PLAT-1", "a thread moved", "route")
+        chief.run.reset_mock()
+        self.tick()
+        chief.run.assert_not_called()
+
+    def test_a_say_starts_a_failed_worker_again(self):
+        self.failed_after_yes()
+        self.tick()
+        chief.enqueue(self.ws, AT, "PLAT-1", "try again", "say")
+        chief.run.reset_mock()
+        self.tick(at=self.LATER + timedelta(minutes=1))
+        self.assertEqual([c.args[3] for c in chief.run.call_args_list], ["PLAT-1"])
+
+    def test_expiry_doesnt_restart_a_failed_worker(self):
+        self.file()
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress="claude exited 1")
+        chief.run.reset_mock()
+        self.tick(at=AT + timedelta(hours=48))
+        self.assertEqual(self.status(), "expired")
+        chief.run.assert_not_called()
+
+    def test_filing_doesnt_clear_a_failure(self):
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress="claude exited 1")
+        self.file()
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+
+    def test_a_yes_for_a_failed_worker_still_reaches_it(self):
+        """Its run failed with this decision open, for a reason that isn't a limit: the manager's answer is its input."""
+        self.file()
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress="claude exited 1")
+        chief.run.reset_mock()
+        self.approve()
+        self.tick()
+        self.assertEqual([c.args[3] for c in chief.run.call_args_list], ["PLAT-1"])
+        self.assertEqual(self.status(), "approved")
+
+    def test_the_managers_words_reach_a_failed_worker(self):
+        self.file()
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress="claude exited 1")
+        chief.run.reset_mock()
+        decisions.answer(self.ws, self.CFG, AT, 1, "say", "make it shorter", {"via": "pane"})
+        self.tick()
+        self.assertEqual([c.args[3] for c in chief.run.call_args_list], ["PLAT-1"])
+
+    def test_a_no_for_a_failed_worker_doesnt_restart_it(self):
+        self.file()
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress="claude exited 1")
+        chief.run.reset_mock()
+        decisions.answer(self.ws, self.CFG, AT, 1, "no", "", {"via": "pane"})
+        self.tick()
+        chief.run.assert_not_called()
+
+    def test_a_yes_for_a_worker_stopped_by_a_limit_waits_and_says_why(self):
+        self.file()
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress=SPEND_LIMIT)
+        chief.run.reset_mock()
+        msg = decisions.answer(self.ws, self.CFG, AT, 1, "ok", "", {"via": "pane"})
+        self.assertIn("can't run yet", msg)
+        self.assertIn("spend limit", msg)
+        self.tick()
+        chief.run.assert_not_called()
+        self.assertEqual((self.status(), chief.workers(self.ws)["PLAT-1"]["status"]), ("approved", "failed"))
+        # a say starts it, and the approval rides with it, inside the grant's time
+        chief.enqueue(self.ws, AT, "PLAT-1", "the limit is raised", "say")
+        self.tick()
+        self.assertEqual([c.args[3] for c in chief.run.call_args_list], ["PLAT-1"])
+        self.assertEqual(self.status(), "approved")
+
+    def test_a_limit_reaches_the_manager_in_the_failed_rows_line(self):
+        self.failed_after_yes(SPEND_LIMIT)
+        self.tick()
+        self.assertIn("spend limit", self.doc()["confirm"][0])
+
+    def test_a_limit_is_in_the_line_when_the_approval_runs_out(self):
+        self.file()
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress=SPEND_LIMIT)
+        decisions.answer(self.ws, self.CFG, AT, 1, "ok", "", {"via": "pane"})
+        self.tick(at=AT + timedelta(hours=2, seconds=1))
+        self.assertEqual(self.status(), "expired")
+        self.assertIn("spend limit", self.doc()["confirm"][0])
+
     def test_tick_flags_unused_grant(self):
         self.file()
         self.approve()
@@ -1090,9 +1278,10 @@ class TestTickDecisions(Base):
         chief.update_worker(self.ws, "PLAT-1", status="failed", progress="usage limit")
         self.tick()
         self.assertEqual(self.status(), "failed")
-        self.assertEqual(self.doc()["confirm"], ["D1: the worker failed after your yes; it's back with the worker"])
+        self.assertEqual(self.doc()["confirm"], ["D1: the worker failed after your yes (usage limit); nothing went out, "
+                                                 "and it's back with the worker"])
         self.assertEqual([e["source"] for e in self.delivered()], ["decision"])
-        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")  # so the note can run
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")  # the note rides with its next say or run
         self.assertEqual(decisions.grants.read(self.ws)[0]["grants"], [])
 
     def test_tick_approval_whose_grant_expired_unused(self):

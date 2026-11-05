@@ -739,6 +739,14 @@ test('test_tldr_renders_on_worker_and_pinned_cards', async ($, on) => {
   expect(stored.map((s: any) => [s.id, s.fingerprint])).toEqual([[W_SID, 't:10:1'], [CLI_A, 'r:abc']])
 })
 
+test('test_a_failed_workers_card_shows_why_it_stopped_over_its_tldr', async ($, on) => {
+  const why = "You've hit your individual spend limit · run /usage-credits to ask your admin for a higher limit"
+  const { clock } = await bootTldr($, on, { workers: () => [worker({ session_id: W_SID, status: 'failed', progress: why })] })
+  const ui = await shown($, clock)
+  expect(await hasText(ui, /individual spend limit/)).toBe(true)
+  await ui.unmount()
+})
+
 test('test_tldr_cache_stops_a_second_call', async ($, on) => {
   let fp = 't:10:1'
   const { clock, t } = await bootTldr($, on, { tail: () => ({ version: 1, model: 'sonnet', sessions: [{ ...TAIL_W, fingerprint: fp }, TAIL_P] }) })

@@ -1230,7 +1230,8 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       <Box key={'w-' + w.key} flexDirection="column" marginTop={1}>
         <Text weight="semibold">{w.title}</Text>
         <Text dimColor>{`${w.key} · ${state}`}</Text>
-        {summary(w.session_id, w.progress)}
+        {/* a failed worker's progress is why it stopped: no summary of its transcript goes in front of that */}
+        {w.status === 'failed' && w.progress ? <Text color="warning" wrap="wrap">{w.progress}</Text> : summary(w.session_id, w.progress)}
         <Text dimColor>{meta}</Text>
         {w.held
           ? (w.running

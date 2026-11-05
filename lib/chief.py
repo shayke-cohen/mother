@@ -333,7 +333,8 @@ HEADER = (
     "mother decide propose <key> --tool <tool> --recommend <send|skip> --why '<one line, no apostrophes>' --stdin <<'EOF'\n"
     "<the exact tool input as JSON>\n"
     "EOF\n"
-    "<key> is your own key. Sign a chat post or a tracker comment with the agent's signature (\"<agent name> (AI)\") in "
+    "<key> is your own key. <tool> is the exact name of the tool as you have it, its server prefix included: the grant "
+    "binds that name, so the same tool under another prefix is refused even after a yes. Sign a chat post or a tracker comment with the agent's signature (\"<agent name> (AI)\") in "
     "its text, or propose refuses it. It also refuses a target no grant can reach, such as a DM or a channel outside the "
     "teams in config.json: say those in your PROGRESS line for the manager to do by hand. You never post to the manager's "
     "own DM. When a turn "
@@ -349,9 +350,34 @@ def rest_status(ws: Path, key: str) -> str:
     return "waiting_decision" if any(d.get("key") == key for d in decisions.pending(ws)) else "idle"
 
 
+NO_RESULT = "no result from claude"
+# A run these stopped would only stop again: a usage or spend limit, an expired login. Read from a failed worker's
+# `progress`, which then holds the error and nothing a model wrote.
+LIMIT_STOP = re.compile(r"(?:spend|usage|rate|credit|session|weekly|daily|monthly|overage)[ _-]limit"
+                        r"|hit your (?:\w+ ){0,2}limit|credit balance"
+                        r"|/login|not logged in|authenticat|invalid api key|\b40[13]\b", re.I)
+
+
+def stopped_by_limit(w: dict) -> bool:
+    return w.get("status") == "failed" and bool(LIMIT_STOP.search(str(w.get("progress") or "")))
+
+
+def _error_of(e: dict) -> str:
+    """What a failed result event says went wrong. `subtype` comes last: claude writes "success" on a run that stopped
+    on a spend limit (`is_error: true`, the reason in `result`)."""
+    for k in ("result", "api_error"):
+        if isinstance(e.get(k), str) and e[k].strip():
+            return e[k].strip()
+    errs = [x for x in e.get("errors") or [] if isinstance(x, str) and x.strip()] if isinstance(e.get("errors"), list) else []
+    if errs:
+        return "; ".join(errs)
+    sub = e.get("subtype")
+    return sub if isinstance(sub, str) and sub and sub != "success" else "claude reported an error"
+
+
 def parse_stream(stdout: str) -> Tuple[str, float, Optional[str]]:
     """(result_text, cost_usd, error) from claude's stream-json. error is None only for a success result."""
-    result, cost, error, texts = "", 0.0, "no result from claude", []
+    result, cost, error, texts = "", 0.0, NO_RESULT, []
     for line in (stdout or "").splitlines():
         try:
             e = json.loads(line)
@@ -365,7 +391,7 @@ def parse_stream(stdout: str) -> Tuple[str, float, Optional[str]]:
             if e.get("subtype") == "success" and not e.get("is_error"):
                 result, error = e.get("result") or "", None
             else:
-                error = str(e.get("subtype") or e.get("result") or "claude reported an error")
+                error = _error_of(e)
         elif e.get("type") == "assistant":
             for b in (e.get("message") or {}).get("content") or []:
                 if isinstance(b, dict) and b.get("type") == "text":
@@ -449,8 +475,8 @@ def _exec(ws: Path, w: dict, key: str, prompt: str, first: bool, model: str, tim
     result, cost, error = parse_stream(out)
     if p.returncode != 0 and error is None:
         error = (err or "").strip()[-300:] or "claude exited %d" % p.returncode
-    elif error and p.returncode != 0 and (err or "").strip():
-        error = (err or "").strip()[-300:]
+    elif error and p.returncode != 0 and (err or "").strip() and (error == NO_RESULT or error.startswith("error_")):
+        error = (err or "").strip()[-300:]  # the stream had no words for it; a message it had beats stderr's noise
     return result, cost, error, session_seen(out)
 
 
