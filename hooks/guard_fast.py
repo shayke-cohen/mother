@@ -39,9 +39,8 @@ def _log_deadline(decision):
 
 
 def _expired(_signum, _frame):
-    """Out of time, maybe inside guard.py: a question (a deny where nobody watches) rather than no decision."""
-    alone = os.environ.get("MOTHER_CHIEF_WORKER", "").strip() or os.environ.get("MOTHER_CHIEF_ROLE") == "chief"
-    decision = "deny" if alone else "ask"
+    """Out of time, maybe inside guard.py: a question rather than no decision."""
+    decision = "ask"
     os.write(1, (json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": decision,
         "permissionDecisionReason": "[mother guard] " + DEADLINE_REASON}}) + "\n").encode("utf-8"))

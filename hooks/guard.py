@@ -71,14 +71,12 @@ def log_deadline(decision):
 
 
 def arm_deadline(seconds=DEADLINE_SECONDS):
-    """Emit a question (a deny for a chief worker or the chief, whom nobody watches) and exit when the guard runs out
-    of time, instead of dying with no decision. False where SIGALRM isn't available: the call then runs as before."""
+    """Emit a question and exit when the guard runs out of time, instead of dying with no decision. False where SIGALRM isn't available: the call then runs as before."""
     if not (hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")):
         return False
 
     def expired(_signum, _frame):
-        alone = os.environ.get("MOTHER_CHIEF_WORKER", "").strip() or os.environ.get("MOTHER_CHIEF_ROLE") == "chief"
-        decision = "deny" if alone else "ask"
+        decision = "ask"
         os.write(1, (json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": decision,
             "permissionDecisionReason": "[mother guard] " + DEADLINE_REASON}}) + "\n").encode("utf-8"))
@@ -330,7 +328,7 @@ def functional_pass(tool, a, ctx):
     those are what stop a message's injected text from exfiltrating or persisting (tests/test_redteam.py)."""
     if not ctx.ok or autonomy(ctx.cfg) != "functional":  # an invalid config fails closed
         return False
-    if hub_fed(ctx) or unattended_session():  # its context starts with outside text: a write stays a question (red team C03, T01-T02)
+    if hub_fed(ctx):  # its context starts with outside text: a write stays a question (red team C03, T01-T02)
         return False
     if a["category"] == "tracker_writes":  # classify_tracker's op: create, comment, transition, update, sprint
         return a["kind"] == "tracker" and a.get("op") in ("comment", "transition", "update", "sprint")
@@ -506,13 +504,6 @@ def text_of(inp):
     return v if isinstance(v, str) else json.dumps(v)
 
 
-def draft_sha(tool, inp):
-    """sha256 hex of the canonical JSON of one exact tool call: what a decision grant is bound to."""
-    import hashlib
-    blob = json.dumps({"tool": tool, "input": inp}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-
 def attendees_of(inp):
     found = []
     for key in ("attendees", "attendeeEmails", "guests", "invitees"):
@@ -541,7 +532,7 @@ def act(kind, category, what, **kw):
 
 
 def protected_paths(ctx):
-    ps = {os.path.join(HERE, "guard.py"), os.path.join(HERE, "guard_fast.py"), os.path.join(HERE, "guard_outcome.py"),
+    ps = {os.path.join(HERE, "guard.py"), os.path.join(HERE, "guard_fast.py"),
           os.path.join(HERE, "hooks.json"), os.path.join(os.path.expanduser("~"), ".mother", "workspace")}
     if ctx.ws:
         m = os.path.join(ctx.ws, ".mother")
@@ -2038,7 +2029,7 @@ def shell_self_edit(cmd, run, cwd, ctx):
             or any(f and f in low for f in tforms):
         return "home_settings"
     homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"],
-              ["guard.py", "guard_fast.py", "guard_outcome.py", "hooks.json"], "config")]
+              ["guard.py", "guard_fast.py", "hooks.json"], "config")]
     if ctx.ws:
         # a command that sets its own MOTHER_WORKSPACE / MOTHER_STATE_DIR is working on a test workspace
         test_ws = re.search(r"\b(?:mother_workspace|mother_state_dir)=", shell)
@@ -2729,7 +2720,7 @@ def classify_shell(cmd, cwd, ctx):
         return act("grants", "grants_file", "`mother channels %s` outside the channels loop's session: it reads "
                                             "replies as the manager's or acts on them (%s)" % (verb, cmd.strip()[:160]),
                    op="channels_session")
-    if not in_workspace(cwd, ctx) and not unattended_session():  # a `cd` out doesn't leave a worker's allow-list
+    if not in_workspace(cwd, ctx):
         return classify_bash(cmd, cwd, ctx)
     wa = classify_whatsapp(cmd, cwd, ctx)
     if wa:
@@ -2991,19 +2982,6 @@ def ws_protected(p, ws):
         or "/".join(parts) in ("agents.md", "memory/memory.md", "config.json", "capabilities.json")
 
 
-def unattended_write_refused(p, ws):
-    """A real path a chief worker or the chief may not write: outside the workspace, or a place an allowed command (or
-    a later session) runs code from: anything dotted at the root (.git, .claude, .githooks, .mother, .mcp.json, .env),
-    a .git, .githooks or .claude folder at any depth, scripts/, and skills/ (.claude/skills links there, and a skill
-    can run a shell line). Otherwise `git status` runs whatever ~/.gitconfig or .git/config names."""
-    p, ws = p.casefold(), ws.casefold()
-    if not inside(p, ws):
-        return True
-    parts = os.path.relpath(p, ws).replace(os.sep, "/").split("/")
-    return parts[0].startswith(".") or parts[0] in ("scripts", "skills") \
-        or any(x in (".git", ".githooks", ".claude") for x in parts)
-
-
 def ws_protected_tree(p, ws):
     """A path a cp/mv/rm/mkdir may not take as source or destination: a protected path, a folder above one
     (`memory`, the root) or a folder that holds one (checked on disk), so renaming folders can't swap one in."""
@@ -3041,8 +3019,6 @@ def sl_path(word, cwd, ws, write=False):
         _sl_fail("a protected workspace path (%s)" % word, kind)
     if write and not inside(p, ws):
         _sl_fail("a write outside the workspace (%s)" % word)
-    if write and unattended_session() and unattended_write_refused(p, ws):
-        _sl_fail("a place a chief worker or the chief may not write (%s)" % word)
 
 
 def _git_remotes(ws):
@@ -4023,45 +3999,30 @@ def valid_grant(g, scope, target, cfg, scopes, max_age, now, thread=None):
         return None
     if not isinstance(uses, int) or isinstance(uses, bool) or uses < 1:
         return None
-    pane = str(channel) == "pane"  # a Chief pane press: there is no message, so only a decision's bound grant may cite one
-    if pane and not all(isinstance(g.get(k), str) and g[k] for k in ("draft_sha", "decision")):
-        return None
+    if "draft_sha" in g or "decision" in g:
+        return None  # bound to one worker decision (before 0.18.0): decisions are gone, so it covers nothing
     if scope == "answer":
         if str(channel) != str(target) or not may_trigger(cfg, target, user):
             return None  # a teammate's message authorises only an answer in that channel, per its mode
     elif str(user) != str(owner_id(cfg)):
         return None  # only the manager's own message can authorise a write
-    if not pane and str(channel) not in dm_ids(cfg) | set(team_channels(cfg)):
+    if str(channel) not in dm_ids(cfg) | set(team_channels(cfg)):
         return None
     if not (now - max_age * 3600 <= ts <= now + 60):
         return None  # the cited message is too old, or in the future
     if not (now < expires <= ts + max_age * 3600):
         return None  # expired, or expiring later than the policy allows
-    key = "%s|%s" % (channel, src.get("ts"))
-    if g.get("decision"):  # one reply can answer several decisions: each one's grant has its own use
-        key += "|%s" % g["decision"]
-    return key, min(uses, scopes[scope])
+    return "%s|%s" % (channel, src.get("ts")), min(uses, scopes[scope])
 
 
-def grant_binds_call(g, tool, inp):
-    """False when `g` is bound to one exact call (it carries `draft_sha` or `decision`) and this isn't that call,
-    or the call isn't known. A grant with neither field covers what its scope and target say."""
-    if "draft_sha" not in g and "decision" not in g:
-        return True
-    want = g.get("draft_sha")
-    return isinstance(want, str) and bool(want) and tool is not None and inp is not None \
-        and want == draft_sha(tool, inp)
-
-
-def run_grant(a, ctx, now=None, tool=None, inp=None):
-    """Consume one use of a matching grant; return a description, or None. `tool` and `inp` are the call itself, what
-    a bound grant (draft_sha) is checked against."""
+def run_grant(a, ctx, now=None):
+    """Consume one use of a matching grant; return a description, or None."""
     sc = grant_scope_of(a)
     if not sc or not ctx.ws:
         return None
     found = None
     for cand in [sc] + ([("answer", sc[1], 1)] if sc[0] == "chat-reply" else []):
-        found = run_grant_scope(a, ctx, cand, now, tool, inp)
+        found = run_grant_scope(a, ctx, cand, now)
         if found:
             break
     return found
@@ -4095,7 +4056,7 @@ def carries_signature(a, cfg):
     return not a.get("blocks") or any(m in a["blocks"] for m in marks)
 
 
-def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
+def run_grant_scope(a, ctx, sc, now=None):
     scope, target, n = sc
     scopes, max_age = grant_limits(ctx.cfg)
     if scope not in scopes or not target or target not in allowed_targets(scope, ctx.cfg):
@@ -4119,7 +4080,7 @@ def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
                 return None  # rate limit, enforced here too in case the loop's own check is bypassed
         for g in data["grants"]:
             v = valid_grant(g, scope, target, ctx.cfg, scopes, max_age, now, thread=a.get("thread"))
-            if not v or not grant_binds_call(g, tool, inp):  # checked before the ledger: a mismatch costs no use
+            if not v:
                 continue
             key, cap = v
             used = 0
@@ -4129,12 +4090,9 @@ def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
             if used + n > cap:
                 continue
             use = {"at": now_iso(), "scope": scope, "target": target, "source": key, "n": n, "run": g.get("run")}
-            if g.get("draft_sha"):  # hooks/guard_outcome.py finds the use by it, and writes what the tool answered
-                use["draft_sha"] = g["draft_sha"]
             book["uses"].append(use)
             led.write(book)
-            whose = "the message" if scope == "answer" else \
-                "the manager's answer" if str(key).startswith("pane|") else "the manager's message"
+            whose = "the message" if scope == "answer" else "the manager's message"
             return "run grant %s on %s citing %s %s (%d/%d used)" % (scope, target, whose, key, used + n, cap)
     return None
 
@@ -4142,63 +4100,15 @@ def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
 # ------------------------------------------------------------------ decision
 
 
-# All the chief's post to the self-DM may hold: nothing that draws anything but the offered text.
-SELF_DM_POST_KEYS = {"channel_id", "channelId", "channel", "text", "unfurl_links", "unfurl_media", "mrkdwn"}
-
-
-def live_offer_text(ws):
-    """The text of the batch `mother decide batch` offered and `sent` hasn't used up, or None. .mother/chief/ is written
-    only by `mother chief` and `mother decide`, which is why it can vouch for a post."""
-    if not ws:
-        return None
-    doc, ok = read_json(os.path.join(ws, ".mother", "chief", "decisions.json"))
-    b = doc.get("batch") if ok and isinstance(doc, dict) else None
-    text = b.get("offered_text") if isinstance(b, dict) and "offered" in b else None
-    return text if isinstance(text, str) and text else None
-
-
-def self_dm_unattended(a, ctx, inp):
-    """A worker or the chief, on a chat call to the manager's own DM. That DM is where the manager answers decisions, and
-    both read other people's text, so a row they wrote could get a yes for a draft it doesn't show. A worker never writes
-    there; the chief posts the live offer, exactly. Normal sessions keep own_dm, so `mother decide` checks the DM too."""
-    if chief_worker():
-        return "deny", "%s: a chief worker never writes to the manager's own DM, because the manager answers decisions " \
-                       "there. Say it in your PROGRESS line, or file it with `mother decide propose`." % a["what"]
-    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json")) if ctx.ws else (None, False)
-    mine = ok and isinstance(doc, dict) and bool(ctx.sid) and doc.get("session_id") == ctx.sid
-    want = live_offer_text(ctx.ws)
-    if mine and want is not None and a.get("op") == "post" and isinstance(inp, dict) and set(inp) <= SELF_DM_POST_KEYS \
-            and inp.get("text") == want:
-        if inp.get("unfurl_links") is not False or inp.get("unfurl_media") is not False:
-            return "deny", "%s: post the batch with `unfurl_links: false` and `unfurl_media: false`, both set: a link " \
-                           "preview would draw text under it that nobody offered, and the post would then not count " \
-                           "as the batch." % a["what"]
-        return "allow", "%s: the live batch, exactly as `mother decide batch` offered it, previews off." % a["what"]
-    return "deny", "%s: the chief writes to the manager's own DM only to post the live batch, exactly as `mother decide " \
-                   "batch --json` printed its text, with nothing else in the call. Anything else for the manager is " \
-                   "recorded as `now`." % a["what"]
-
-
 def bypass_passes(ctx):
     """policy.bypass_passes_asks is true (an invalid config counts as false)."""
     return bool(ctx.ok) and ((ctx.cfg.get("policy") or {}).get("bypass_passes_asks") is True)
 
 
-def chief_worker():
-    """This process is a chief worker's: MOTHER_CHIEF_WORKER, set by `mother chief run` in its own environment."""
-    return bool(os.environ.get(CHIEF_WORKER_ENV, "").strip())
-
-
-def unattended_session():
-    """A chief worker or the chief's role: nobody is watching, and both read other people's text. No policy switch
-    opens anything here, which is what makes a bound grant the only way to send."""
-    return chief_worker() or os.environ.get(CHIEF_ROLE_ENV) == "chief"
-
-
 def shell_in_bypass(ctx, a):
     """policy.shell_in_bypass is true and this is a shell allow-list ask in a session that isn't hub-fed: the
     manager chose bypass mode, so the shell's own question goes; every other ask keeps its rule."""
-    return a["kind"] == "shell_unlisted" and bool(ctx.ok) and not unattended_session() \
+    return a["kind"] == "shell_unlisted" and bool(ctx.ok) \
         and ((ctx.cfg.get("policy") or {}).get("shell_in_bypass") is True) and not hub_fed(ctx)
 
 
@@ -4269,12 +4179,12 @@ def decide(a, ctx, transcript=None, tool=None, inp=None):
     if a["kind"] == "session":  # the manager's own sessions: always a question, never PAUSED or the never-list
         return "ask", "%s. Confirm it." % a["what"]
     if a["kind"] == "shell_unlisted":  # not outbound by itself: a question, PAUSED or not
-        if not hub_fed(ctx) and not unattended_session() and ctx.ok \
+        if not hub_fed(ctx) and ctx.ok \
                 and (ctx.cfg.get("policy") or {}).get("shell_unasked") is True:
             return "allow", "%s: policy.shell_unasked (not a hub-fed session)." % a["what"]
         # The manager's own typed line counts in any session, hub-fed included: it is consent given in that session,
         # with its context in view. A config switch is not, so shell_unasked above skips hub-fed sessions.
-        if not chief_worker() and ("shell", "*") in session_approvals(transcript):  # nobody types in a worker
+        if ("shell", "*") in session_approvals(transcript):
             return "allow", "%s: covered by the manager's `mother approve shell` line in this session." % a["what"]
         return "ask", "%s. Confirm it. (`mother approve shell` at the start of your message lets this session's " \
                       "shell commands through for 12 h.)" % a["what"]
@@ -4304,8 +4214,6 @@ def decide(a, ctx, transcript=None, tool=None, inp=None):
     if a["category"] in ALWAYS_NEVER:
         return "deny", "%s is on the never-list (%s). Do it by hand if it is really needed." % (
             a["what"], a["category"])
-    if a["kind"] == "chat" and unattended_session() and is_dm(a, ctx.cfg):
-        return self_dm_unattended(a, ctx, inp)
     if not ctx.ok:
         return "ask", "%s. No green list (%s): confirm it." % (a["what"], ctx.problem)
     auto, never = policy_lists(ctx.cfg)
@@ -4314,12 +4222,12 @@ def decide(a, ctx, transcript=None, tool=None, inp=None):
     g = green(a, ctx, auto)
     if g:
         return "allow", "%s: auto (%s)." % (a["what"], g[1])
-    if a["kind"] in ("chat", "tracker") and not chief_worker() \
+    if a["kind"] in ("chat", "tracker") \
             and covered_by_session(a, session_approvals(transcript), ctx.cfg):
         return "allow", "%s: covered by the manager's `mother approve` line in this session." % a["what"]
     if a["kind"] == "outbound_unknown":
         return "ask", "%s: the guard can't tell where this sends data or who sees it. Confirm it." % a["what"]
-    why = run_grant(a, ctx, tool=tool, inp=inp)
+    why = run_grant(a, ctx)
     if why:
         return "allow", "%s: %s." % (a["what"], why)
     return "ask", "%s reaches someone other than the manager (needs a yes: %s). Confirm it." % (
@@ -4798,10 +4706,7 @@ def channels_loop_shell(norm):
 
 def hub_fed(ctx):
     """The call's session reads hub lines (text from people who can message the manager): an id in
-    sessions.json in any state, a hub session, a session that ran `mother hub …` (CONTRACT §5e), or a chief worker,
-    from its first turn, before its id reaches sessions.json."""
-    if chief_worker():
-        return True
+    sessions.json in any state, a hub session, or a session that ran `mother hub …` (CONTRACT §5e)."""
     sid = ctx.sid
     if not (ctx.ws and sid):
         return False
@@ -4944,125 +4849,6 @@ def hub_gh_ok(prog, args):
     return True
 
 
-CHIEF_ROLE_ENV = "MOTHER_CHIEF_ROLE"
-CHIEF_RUN_VALUES = ("--title=", "--prompt=")
-
-
-def chief_session(ctx, payload):
-    """The call comes from the chief: MOTHER_CHIEF_ROLE is exactly `chief` in the hook's environment, the session
-    id is `session_id` in .mother/chief/chief.json (missing or unreadable: not the chief), the call is not a
-    sub-agent's (one carries its parent's session id), and neither .mother/PAUSED nor a dry run is on (both keep
-    today's rules). The role alone is not enough: a worker could set it."""
-    if os.environ.get(CHIEF_ROLE_ENV) != "chief" or not (ctx.ws and ctx.sid) or payload.get("agent_type") \
-            or paused(ctx) or os.environ.get(DRY_RUN_ENV, "").strip():
-        return False
-    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
-    want = doc.get("session_id") if ok and isinstance(doc, dict) else None
-    return isinstance(want, str) and bool(want) and want == ctx.sid
-
-
-def plugin_mother_args(cmd, heredoc=False):
-    """The words after `mother` when `cmd` is exactly one run of `mother`, this plugin's bin/mother by its own path
-    (not a symlink to it), or `python3` of it, never `${CLAUDE_PLUGIN_ROOT}`; else None. Read by the shell allow-list's
-    lexer (sl_lex): one stage, no newline, redirection or heredoc, and no `$` expansion, backtick, backslash, glob or
-    comment outside quotes, so a value may hold any other text quoted. `heredoc=True` also takes one heredoc with a
-    quoted delimiter (<<'WORD', <<"WORD", <<-'WORD'), whose body the shell never expands, so only the line that opens
-    it is checked for odd characters."""
-    head = cmd.split("\n", 1)[0] if heredoc else cmd
-    if (not heredoc and "\n" in cmd) or "\r" in head or hub_odd_chars(head) or "CLAUDE_PLUGIN_ROOT" in head:
-        return None  # the guard would read ${CLAUDE_PLUGIN_ROOT} as this plugin; the chief's shell has it unset
-    plugin = os.path.dirname(HERE)
-    try:
-        stages = sl_lex(cmd, plugin)
-    except Exception:
-        return None
-    if len(stages) != 1 or stages[0]["redirs"] or stages[0].get("sep") not in (("", "\n") if heredoc else ("",)) \
-            or len(stages[0]["heredocs"]) > (1 if heredoc else 0):
-        return None
-    words = stages[0]["words"]
-    mine = os.path.join(plugin, "bin", "mother")
-
-    def is_mine(p):  # the path as written, not through a symlink a session could repoint after this check
-        return os.path.isabs(p) and os.path.abspath(p) == mine and os.path.realpath(p) == os.path.realpath(mine)
-
-    if words[:1] == ["python3"]:
-        words = words[1:]
-        if not (words and is_mine(words[0])):
-            return None
-    elif not words or not (words[0] == "mother" or is_mine(words[0])):
-        return None
-    return words[1:]
-
-
-def chief_decide_args(args):
-    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8|'' --ts TS`.
-    `sent` without `--ts` passes here and `mother decide` refuses it."""
-    verb, rest = (args[0], args[1:]) if args else ("", [])
-    if verb == "batch":
-        return rest in ([], ["--json"])
-    if verb != "sent" or len(rest) not in (2, 4) or rest[0] != "--ids" or \
-            not re.fullmatch(r"(?:D\d+(?:,D\d+)*)?", rest[1]):
-        return False
-    return len(rest) == 2 or (rest[2] == "--ts" and bool(re.fullmatch(r"\d+(?:\.\d+)?", rest[3])))
-
-
-def chief_command(cmd):
-    """True for exactly one command the chief may run (plugin_mother_args): `mother chief lines|status|run|say …` or
-    `mother decide batch|sent …`. The chief shapes: `lines [--json]`, `status [--json]`,
-    `run <key> [--detach] [--title=T] [--prompt=P]` (each flag once, a non-empty value in the same token) and
-    `say <key> -- <text…>`."""
-    args = plugin_mother_args(cmd)
-    if args is None:
-        return False
-    if args[:1] == ["decide"]:
-        return chief_decide_args(args[1:])
-    if len(args) < 2 or args[0] != "chief":
-        return False
-    verb, rest = args[1], args[2:]
-    if verb in ("lines", "status"):
-        return rest in ([], ["--json"])
-    if not rest or not rest[0] or rest[0].startswith("-"):
-        return False
-    key, rest = rest[0], rest[1:]
-    if verb == "say":
-        return len(rest) >= 2 and rest[0] == "--"
-    if verb != "run":
-        return False
-    seen = set()
-    for a in rest:
-        flag = a if a == "--detach" else next((f for f in CHIEF_RUN_VALUES if a.startswith(f) and a != f), None)
-        if flag is None or flag in seen:
-            return False
-        seen.add(flag)
-    return True
-
-
-def worker_propose_command(cmd):
-    """True for exactly one `mother decide propose <key> --tool T --recommend R [--why W] [--urgent] --stdin`, with
-    the call's JSON in a quoted-delimiter heredoc or not (plugin_mother_args). It only files a pending decision."""
-    args = plugin_mother_args(cmd, heredoc=True)
-    if args is None or args[:2] != ["decide", "propose"]:
-        return False
-    keys, seen, i, rest = [], set(), 0, args[2:]
-    while i < len(rest):
-        a = rest[i]
-        i += 1
-        if a in ("--tool", "--recommend", "--why"):
-            if a in seen or i >= len(rest):
-                return False
-            seen.add(a)
-            i += 1
-        elif a in ("--urgent", "--stdin"):
-            if a in seen:
-                return False
-            seen.add(a)
-        elif a.startswith("-") or not a:
-            return False
-        else:
-            keys.append(a)
-    return len(keys) == 1 and {"--tool", "--recommend", "--stdin"} <= seen
-
-
 def hub_bad_field(v):
     """True when a nested input names a field that is, or ends in, url/uri/href/path/file/dest/destination."""
     if isinstance(v, dict):
@@ -5145,36 +4931,6 @@ def key_touch(tool, inp, cwd):
     if tool in ("Grep", "Glob", "LS"):
         return inside(key.casefold(), fp.casefold())
     return fp.casefold() == key.casefold()
-
-
-def chief_identity(ctx, payload):
-    """The chief's own session, or a sub-agent of it: MOTHER_CHIEF_ROLE=chief and the call's session id is
-    chief.json's, whatever PAUSED or a dry run says. Nobody watches it, so a question it raises is never seen."""
-    sid = payload.get("session_id")
-    if os.environ.get(CHIEF_ROLE_ENV) != "chief" or not ctx.ws or not (isinstance(sid, str) and sid):
-        return False
-    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json"))
-    want = doc.get("session_id") if ok and isinstance(doc, dict) else None
-    return isinstance(want, str) and bool(want) and want == sid
-
-
-CHIEF_NO_ASK = ("The chief runs unattended, so nobody would see this question: denied (%s). Do not retry it or try "
-                "another way; propose it as a decision for the manager instead (record the line as `now` with a "
-                "one-sentence why) and carry on.")
-
-WORKER_NO_ASK = ("A chief worker runs unattended, so nobody would see this question: denied (%s). Do not retry it or "
-                 "try another way; file what needs the manager's yes with `mother decide propose`, or say what you "
-                 "need in your PROGRESS line, and end the turn.")
-
-CHIEF_WORKER_ENV = "MOTHER_CHIEF_WORKER"
-# `mother hub <verb> [<sub>]` anywhere in a command (by name or path, python3 or not)
-WORKER_HUB_RE = re.compile(r"(?:^|[^\w.-])mother\s+hub\b\s*([\w-]*)\s*([\w-]*)")
-# what a worker may still run: reads that change no hub state
-WORKER_HUB_READS = {"", "status", "check", "show", "watching", "tail", "help", "-h", "--help"}
-WORKER_HUB_READ_SUBS = {("session", "for"), ("dms", "show")}
-
-
-WORKER_FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 
 DECISION_ANSWER_DENY = "Only the manager answers a decision: in the self-DM or the Chief pane. A session may " \
@@ -5343,194 +5099,6 @@ def decision_answer_shell(cmd):
     return False
 
 
-def worker_hub_path(inp, cwd, ctx):
-    """True when a file tool's target is, on real paths (casefolded), inside <ws>/.mother/hub/."""
-    if not ctx.ws:
-        return False
-    raw = inp.get("file_path") or inp.get("notebook_path") or ""
-    if not raw:
-        return False
-    fp = os.path.realpath(os.path.join(cwd or ctx.ws, os.path.expanduser(str(raw))))
-    d = os.path.realpath(os.path.join(ctx.ws, ".mother", "hub"))
-    return inside(fp.casefold(), d.casefold())
-
-
-def worker_hub_write(text):
-    """The `mother hub` write a command runs (decide, mute, follow, session add|drop|seen, pending, add, done, ...),
-    or None. Quotes and backslashes are dropped first, so a quoted verb still reads as one."""
-    norm = re.sub(r"[\"'\\]", "", text).casefold()
-    for m in WORKER_HUB_RE.finditer(norm):
-        verb, sub = m.group(1), m.group(2)
-        if verb in WORKER_HUB_READS or (verb, sub) in WORKER_HUB_READ_SUBS:
-            continue
-        return ("mother hub %s %s" % (verb, sub)).strip()
-    return None
-
-
-UNATTENDED_READS = ("cat", "ls", "head", "tail", "wc", "grep", "rg")
-_GIT_DIFF_READ = {"--oneline", "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "-p", "--patch",
-                  "--no-color", "--no-ext-diff", "--no-textconv", "--decorate", "--no-decorate"}
-UNATTENDED_GIT = {
-    "status": ({"-s", "--short", "--porcelain", "-b", "--branch"}, ()),
-    "log": (_GIT_DIFF_READ | {"--graph", "--all", "--follow", "--reverse", "--first-parent", "--merges", "--no-merges",
-                              "--abbrev-commit", "-n"},
-            ("--format=", "--pretty=", "--since=", "--until=", "--author=", "--grep=", "--max-count=", "--diff-filter=")),
-    "diff": (_GIT_DIFF_READ | {"--cached", "--staged"}, ("--diff-filter=",)),
-    "show": (_GIT_DIFF_READ | {"--no-patch"}, ("--format=", "--pretty=")),
-}
-UNATTENDED_GH = {"pr": ("view", "list", "diff", "checks", "status"), "issue": ("view", "list", "status"),
-                 "run": ("view", "list")}
-UNATTENDED_MOTHER = {("path",), ("version",), ("help",), ("status",), ("hub", "status"), ("hub", "check"),
-                     ("hub", "show"), ("hub", "watching"), ("hub", "help"), ("hub", "session", "for"),
-                     ("hub", "dms", "show")}
-
-
-def unattended_git_refused(args):
-    """git status|log|diff|show with only the options named above, exact: no prefix of anything, no `-c`, no `-C`."""
-    k = 0
-    while k < len(args) and args[k] in ("--no-pager", "--no-optional-locks"):
-        k += 1
-    sub = args[k] if k < len(args) else ""
-    if sub not in UNATTENDED_GIT:
-        return "git %s" % (sub or "with no subcommand")
-    flags, valued = UNATTENDED_GIT[sub]
-    for a in args[k + 1:]:
-        if a == "--":
-            break
-        if a.startswith("-") and a not in flags and not a.startswith(valued) \
-                and not (sub != "status" and re.fullmatch(r"-(?:\d+|n\d+|U\d+)", a)):
-            return "git %s %s" % (sub, a)
-    return None
-
-
-def unattended_stage_refused(st):
-    words = st["words"]
-    if st["heredocs"]:
-        return "a heredoc"
-    for op, target in st["redirs"]:
-        if ">" in op and target != "/dev/null" and not target.startswith("&"):
-            return "a redirect that writes (%s)" % target
-    prog, args = (words[0], words[1:]) if words else ("", [])
-    mine = os.path.join(os.path.dirname(HERE), "bin", "mother")
-    if prog == "mother" or (os.path.isabs(prog) and os.path.abspath(prog) == mine):
-        ok = any(tuple(args[:len(shape)]) == shape for shape in UNATTENDED_MOTHER)
-        return None if ok else "mother %s" % " ".join(args[:2])
-    if prog in UNATTENDED_READS:
-        return "rg %s" % args if prog == "rg" and any(a.startswith(("--pre", "--hostname-bin")) for a in args) else None
-    if prog == "git":
-        return unattended_git_refused(args)
-    if prog == "gh":
-        ok = args[1:2] and args[1] in UNATTENDED_GH.get(args[0] if args else "", ()) and reader_bash_ok("gh", args) \
-            and not any(a in ("--web", "-w") for a in args)
-        return None if ok else "gh %s" % " ".join(args[:2])
-    return prog or "an empty command"
-
-
-def unattended_shell_refused(cmd):
-    """What a chief worker's or the chief's shell command holds that isn't on their positive list, or None. The list is
-    a set of heads checked not to run code or write: `mother` reads, cat, ls, head, tail, wc, grep, rg, git
-    status|log|diff|show and gh reads, joined freely under the allow-list's strict grammar; for the chief also its
-    `mother chief` and `mother decide batch|sent` shapes and `mother hub decide`. A command passing it still meets the
-    allow-list's own path and option checks. Blocklists lost twice to git's abbreviations, so this is not one."""
-    if not chief_worker():
-        if chief_command(cmd) or plugin_mother_args(cmd, heredoc=True) == ["hub", "decide"]:
-            return None
-    try:
-        stages = sl_lex(cmd, os.path.dirname(HERE))
-    except Exception as e:  # _Unlisted says which part; anything it can't read isn't on a list
-        return str(e) or "a line the guard can't read"
-    if not stages:
-        return "an empty command"
-    for st in stages:
-        why = unattended_stage_refused(st)
-        if why:
-            return why
-    return None
-
-
-SL_HOME_MARK = "\0HOME"  # what `$HOME` and `~` read as below: a word holding it can't be vouched for
-UNATTENDED_CLUSTERS = {"cat": "benstuvAET", "ls": "aAbBcCdfFgGhiklmnopqrRsStTuUvxX1"}  # ls: no -L or -H, they follow links
-UNATTENDED_PATH_DENY = ("`%s`: a chief worker's or the chief's shell reads only inside the workspace, not into its guarded "
-                        "files, not through a link out of it. Use the Read tool for a file, or %s.")
-UNATTENDED_PATH_NEXT = ("say what you need in your PROGRESS line",  # a worker
-                        "propose it as a decision for the manager (record the line as `now`)")  # the chief
-
-
-def unattended_path_refused(word, base, ws):
-    """True unless `word`, from the folder `base`, resolves inside the workspace, outside what's guarded there, and
-    neither in nor above a folder holding the grant key or ~/.claude. base None: only an absolute path can be read."""
-    if base is None and not os.path.isabs(word):
-        return True
-    p = os.path.realpath(os.path.join(base or os.sep, word))
-    if not inside(p, ws) or (p != ws and ws_protected(p, ws)):
-        return True
-    home, state = _home_dirs()
-    fp, root = p.casefold(), ws.casefold()
-    for g in (state, os.path.join(home, ".mother"), os.path.join(home, ".claude")):
-        g = os.path.realpath(g).casefold()
-        if inside(g, fp) or (inside(fp, g) and not inside(root, g)):
-            return True
-    return False
-
-
-def unattended_read_paths(prog, args):
-    """(the path operands of one listed read, True when it reads the cwd with none given). Options come from a positive
-    table, so `grep --dereference-recursive` and its prefixes, `-S`, `-d recurse` and `rg -L` are off with anything else
-    unknown. grep -R follows links where -r doesn't."""
-    if prog in UNATTENDED_CLUSTERS:
-        opts, ops = _sl_args(args)
-        for o in opts:
-            if not re.fullmatch("-[%s]+" % UNATTENDED_CLUSTERS[prog], o):
-                _sl_fail("%s %s" % (prog, o))
-        return ops, prog == "ls" and not ops
-    vals, ops = _sl_opts(prog, args)
-    flags = [f for f, _ in vals]
-    if "-R" in flags:
-        _sl_fail("grep -R, which follows symbolic links (-r doesn't)")
-    if prog not in ("grep", "rg"):
-        return ops, False
-    paths = ops if any(f in ("-e", "--regexp", "-f", "--file", "--files") for f in flags) else ops[1:]
-    return paths + [v for f, v in vals if f == "-f"], not paths
-
-
-def unattended_git_paths(args):
-    """Every word of a listed git read that isn't an option: a pathspec, or a revision that reads as an ordinary name in
-    the workspace. All count, since `git diff` with a path outside the repo reads it, with no `--no-index`. A git read
-    always needs a cwd in the workspace."""
-    words = [a for a in args if a not in ("--no-pager", "--no-optional-locks")][1:]
-    k = words.index("--") if "--" in words else len(words)
-    return [a for a in words[:k] if not a.startswith("-")] + words[k + 1:], True
-
-
-def unattended_paths_refused(cmd, base, ctx):
-    """What a chief worker's or the chief's listed read holds that isn't confined to the workspace, or None. Run after
-    unattended_shell_refused: `mother` and `gh` take no paths; the chief's own shapes carry text, not paths."""
-    if not chief_worker() and (chief_command(cmd) or plugin_mother_args(cmd, heredoc=True) == ["hub", "decide"]):
-        return None
-    ws = os.path.realpath(ctx.ws) if ctx.ws else None
-    try:
-        for st in sl_lex(cmd, os.path.dirname(HERE), home=SL_HOME_MARK):
-            prog, args = st["words"][0], st["words"][1:]
-            if prog != "git" and prog not in UNATTENDED_READS:
-                continue
-            sources = [t for op, t in st["redirs"] if "<" in op and not t.startswith("&")]
-            if any(SL_HOME_MARK in w for w in args + sources):
-                return "a `~` or `$HOME` path"
-            paths, needs_cwd = unattended_git_paths(args) if prog == "git" else unattended_read_paths(prog, args)
-            if not ws:
-                return "%s with no workspace" % prog
-            for w in [x for x in paths if x != "-"] + [x for x in sources if x != "/dev/null"]:
-                if unattended_path_refused(w, base, ws):
-                    return "%s %s" % (prog, w)
-            if needs_cwd and (base is None or unattended_path_refused(".", base, ws)):
-                return "%s from a folder outside the workspace" % prog
-    except _Unlisted as e:
-        return str(e)
-    except Exception:
-        return "a line the guard can't read"
-    return None
-
-
 def oversized_command(raw):
     """A shell command too long to read before the hook's time is up: refused here, before any regex. Returns (decision,
     reason) or None."""
@@ -5543,12 +5111,8 @@ def oversized_command(raw):
             return None
     except Exception:
         return None
-    if unattended_session():
-        r = "deny", ("A %s command over 64 KB is too long for the guard to read in time, and nobody is watching here: "
-                     "denied. Say what you need in your PROGRESS line." % tool)
-    else:
-        r = "ask", "A %s command over 64 KB is too long for the guard to read in time. Confirm it, or put it in a " \
-                   "file." % tool
+    r = "ask", "A %s command over 64 KB is too long for the guard to read in time. Confirm it, or put it in a " \
+               "file." % tool
     try:
         log(load_ctx(), tool, {"kind": "oversized", "category": "shell"}, r[0], r[1])
     except Exception:
@@ -5557,8 +5121,8 @@ def oversized_command(raw):
 
 
 def guard_is_off(raw):
-    """The manager ran `mother guard off`: .mother/GUARD_OFF exists, so no rule runs and the model alone decides, workers
-    and the chief included. PAUSED still wins, so the kill switch works. Each call is still logged. Any doubt means on."""
+    """The manager ran `mother guard off`: .mother/GUARD_OFF exists, so no rule runs and the model alone decides.
+    PAUSED still wins, so the kill switch works. Each call is still logged. Any doubt means on."""
     try:
         ws = resolve_workspace()
         if not ws or not os.path.isfile(os.path.join(ws, ".mother", "GUARD_OFF")) \
@@ -5578,31 +5142,10 @@ def guard_is_off(raw):
 
 
 def run(raw):
-    """Returns (decision, reason) or None. Never raises. A question the chief's own session would raise is a deny
-    instead (chief_identity): it runs unattended and an ask would stall it unseen."""
+    """Returns (decision, reason) or None. Never raises."""
     if guard_is_off(raw):
         return None
-    big = oversized_command(raw)
-    if big:
-        return big
-    r = _run(raw)
-    if not (r and r[0] == "ask"):
-        return r
-    try:
-        payload = json.loads(raw or "")
-        if not isinstance(payload, dict):
-            return r
-        ctx = load_ctx()
-        if chief_worker():
-            reason = WORKER_NO_ASK % r[1]
-        elif chief_identity(ctx, payload):
-            reason = CHIEF_NO_ASK % r[1]
-        else:
-            return r
-        log(ctx, str(payload.get("tool_name")), {"kind": "chief", "category": "chief"}, "deny", reason)
-        return "deny", reason
-    except Exception:
-        return r
+    return oversized_command(raw) or _run(raw)
 
 
 def _run(raw):
@@ -5632,53 +5175,11 @@ def _run(raw):
             r = "deny", "%s on the grant key (%s): only `mother grant` reads it." % (tool, grant_key_path())
             log(ctx, tool, {"kind": "grant-key", "category": "grant_key"}, r[0], r[1])
             return r
-        # A chief worker (MOTHER_CHIEF_WORKER, set by `mother chief run` in the worker's own process env) reads
-        # untrusted text headless: it may read the hub but never change it (log lines, mute, drop sessions).
         text = str(inp.get("command") or "") if tool in ("Bash", "Monitor") or \
             tool.split("__")[-1] == "run_in_terminal" else ""
-        # A worker's exact `mother decide propose`: its body never reaches a shell and its arguments are checked, so a
-        # third party's words quoted into the draft can't stop the filing.
-        filing = tool == "Bash" and chief_worker() and not payload.get("agent_type") and worker_propose_command(text)
-        if text and not filing and decision_answer_shell(text):  # every session: a yes comes only from the manager
+        if text and decision_answer_shell(text):  # every session: a yes comes only from the manager
             log(ctx, tool, {"kind": "decision-answer", "category": "chief"}, "deny", DECISION_ANSWER_DENY)
             return "deny", DECISION_ANSWER_DENY
-        if text and not filing and chief_worker():
-            w = worker_hub_write(text)
-            if w:
-                r = "deny", ("`%s` from a chief worker: a worker may read the hub but never change it; say in your "
-                             "PROGRESS line what should be decided, and the chief decides it." % w)
-                log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
-                return r
-        if tool in WORKER_FILE_TOOLS and chief_worker() \
-                and worker_hub_path(inp, payload.get("cwd"), ctx):
-            r = "deny", ("%s under .mother/hub/ from a chief worker: the hub's state (cursor, sessions, mutes) is the "
-                         "chief's; say in your PROGRESS line what should change, and the chief decides it." % tool)
-            log(ctx, tool, {"kind": "chief-worker", "category": "hub"}, r[0], r[1])
-            return r
-        if tool in WORKER_FILE_TOOLS and unattended_session():
-            raw = inp.get("file_path") or inp.get("notebook_path") or ""
-            if raw and (not ctx.ws or unattended_write_refused(
-                    os.path.realpath(os.path.join(payload.get("cwd") or ctx.ws, os.path.expanduser(str(raw)))),
-                    os.path.realpath(ctx.ws))):
-                r = "deny", ("%s of %s: a chief worker or the chief writes only inside the workspace, and not under .git, "
-                             ".claude, .mother, scripts or skills or to a dotfile at its root, because an allowed command "
-                             "could run what lands there. Say what should change in your PROGRESS line."
-                             % (tool, str(raw)[:160]))
-                log(ctx, tool, {"kind": "unattended-write", "category": "chief"}, r[0], r[1])
-                return r
-        if text and not filing and unattended_session():
-            why = unattended_shell_refused(text)
-            if why:  # run() makes this question a deny; a session with the role but not the chief's id keeps its ask
-                r = "ask", "`%s` is not on the short list of read commands a chief worker or the chief may run" % why[:160]
-                log(ctx, tool, {"kind": "unattended-shell", "category": "chief"}, r[0], r[1])
-                return r
-            # the terminal tool runs wherever its tab is, which the payload doesn't say
-            why = unattended_paths_refused(text, (payload.get("cwd") or os.getcwd()) if tool in ("Bash", "Monitor")
-                                           else None, ctx)
-            if why:
-                r = "deny", UNATTENDED_PATH_DENY % (why[:160], UNATTENDED_PATH_NEXT[0 if chief_worker() else 1])
-                log(ctx, tool, {"kind": "unattended-shell", "category": "chief"}, r[0], r[1])
-                return r
         role = os.environ.get("MOTHER_CHANNEL_ROLE", "").strip()
         if role:
             r = channel_session(tool, inp, payload.get("cwd"), ctx, role)
@@ -5710,13 +5211,6 @@ def _run(raw):
                 if r != "normal":
                     log(ctx, tool, {"kind": "hub-session", "category": "hub"}, r[0], r[1])
                     return r
-        # The chief (MOTHER_CHIEF_ROLE=chief and its id in .mother/chief/chief.json) runs its own `mother chief`
-        # verbs unasked, hub-fed or not; every other session, a hub-fed worker included, gets the rules below.
-        if tool == "Bash" and chief_session(ctx, payload) and chief_command(str(inp.get("command") or "")):
-            return None
-        # A chief worker files what needs the manager's yes; that writes a pending decision and nothing else.
-        if filing:
-            return None
         a = classify(tool, inp, payload.get("cwd"), ctx)
         if a is None:
             # The channels loop's session: a plain `mother channels plan` that gets no decision, run as itself in the
@@ -5743,7 +5237,7 @@ def _run(raw):
         # In the workspace an ask stays an ask unless the manager set policy.bypass_passes_asks; the guard's own
         # files, grants.json and the persona files always ask.
         if r[0] == "ask" and a["kind"] not in ("config", "grants", "persona", "home_settings", "manager_only") \
-                and not a.get("keep_ask") and not unattended_session() \
+                and not a.get("keep_ask") \
                 and payload.get("permission_mode") == "bypassPermissions" \
                 and (bypass_passes(ctx) or shell_in_bypass(ctx, a) or not in_workspace(payload.get("cwd"), ctx)):
             log(ctx, tool, a, "pass", "bypassPermissions: " + r[1])
