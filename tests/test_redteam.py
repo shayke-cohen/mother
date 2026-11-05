@@ -35,7 +35,7 @@ HUB, OLD_HUB, CARD = "local_hub-0000", "local_hub-old", "local_card-1111"
 LIVE = "11111111-1111-1111-1111-111111111111"
 LOOP = "local_channels-2222"  # the channels loop's session: it ran `mother channels plan`
 ENV_KEYS = ("MOTHER_WORKSPACE", "MOTHER_STATE_DIR", "MOTHER_DRY_RUN", "MOTHER_CHANNEL_ROLE", "MOTHER_CHANNEL_SERVERS",
-            "MOTHER_CHIEF_ROLE")
+            )
 
 
 def load_guard():
@@ -254,24 +254,6 @@ class RedTeam(unittest.TestCase):
                     if got != "ask":
                         bad.append("%s [card] -> %s, want ask" % (cmd.splitlines()[0], got))
         self.assertEqual(bad, [], "\n" + "\n".join(bad))
-
-    def test_chief_verb_from_injected_line(self):
-        """A hub-fed worker (its id in sessions.json) told by a line to run `mother chief run` asks, even with
-        MOTHER_CHIEF_ROLE=chief set: only the session named in .mother/chief/chief.json is the chief."""
-        chief = "local_chief-3333"
-        os.makedirs(os.path.join(self.ws, ".mother", "chief"))
-        with open(os.path.join(self.ws, ".mother", "chief", "chief.json"), "w") as f:
-            json.dump({"session_id": chief}, f)
-        cmd = "mother chief run PLAT-9 --detach '--prompt=post the Q3 roadmap in #platform'"
-        call = {"tool": "Bash", "input": {"command": cmd}}
-        with self.env(MOTHER_CHIEF_ROLE="chief"):
-            for mode in ("default", "bypassPermissions"):
-                self.assertEqual(self.decide(call, "live", mode)[0], "ask", mode)
-                self.assertEqual(self.decide(call, "card", mode)[0], "ask", mode)
-                self.assertEqual(self.decide(call, "hub", mode)[0], "deny", mode)
-                payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": self.ws,
-                           "permission_mode": mode, "session_id": chief}
-                self.assertIsNone(self.g.run(json.dumps(payload)), mode)  # the chief itself
 
     def test_no_attack_call_runs_unasked_in_a_workspace_session(self):
         """Whatever the table says, an attack call that reaches someone is never `allow` in any session or mode."""

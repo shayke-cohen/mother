@@ -359,6 +359,16 @@ class CliTest(unittest.TestCase):
     def test_the_documented_chief_block_is_valid(self):
         self.init()
         cfg = self.write_config()
+        cfg["chief"] = {"daily_budget_usd": 8, "tldr_model": "opus", "triage_model": "sonnet"}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        r = run(["status"], self.env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("INVALID", r.stdout)
+
+    def test_a_chief_block_from_before_0_18_still_loads(self):
+        """The chief session's and its workers' keys are accepted and ignored, whatever they hold."""
+        self.init()
+        cfg = self.write_config()
         cfg["chief"] = {"max_workers": 2, "run_minutes": 15, "daily_budget_usd": 8, "chief_model": "sonnet", "worker_model": "",
                         "tick_seconds": 30, "tldr_model": "opus", "triage_model": "sonnet", "batch_minutes": 30,
                         "decision_hours": 48.5}
@@ -366,6 +376,9 @@ class CliTest(unittest.TestCase):
         r = run(["status"], self.env)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertNotIn("INVALID", r.stdout)
+        r = run(["chief", "status", "--json"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["budget"]["limit"], 8.0)
 
     def test_the_validator_knows_every_chief_setting(self):
         sys.path.insert(0, str(ROOT / "lib"))
@@ -377,11 +390,8 @@ class CliTest(unittest.TestCase):
     def test_a_bad_chief_block_is_named(self):
         self.init()
         for chief_block, frag in (("x", "chief must be an object"), ({"bogus": 1}, "unknown key chief.bogus"),
-                                  ({"max_workers": 0}, "chief.max_workers"), ({"max_workers": 1.5}, "chief.max_workers"),
-                                  ({"max_workers": True}, "chief.max_workers"), ({"run_minutes": 0}, "chief.run_minutes"),
-                                  ({"daily_budget_usd": -1}, "chief.daily_budget_usd"), ({"tick_seconds": "30"}, "chief.tick_seconds"),
-                                  ({"batch_minutes": 0}, "chief.batch_minutes"), ({"decision_hours": -2}, "chief.decision_hours"),
-                                  ({"chief_model": 3}, "chief.chief_model"), ({"worker_model": None}, "chief.worker_model"),
+                                  ({"daily_budget_usd": -1}, "chief.daily_budget_usd"),
+                                  ({"daily_budget_usd": True}, "chief.daily_budget_usd"),
                                   ({"tldr_model": "gpt"}, "chief.tldr_model"), ({"triage_model": "gpt"}, "chief.triage_model")):
             cfg = self.write_config()
             cfg["chief"] = chief_block
@@ -917,14 +927,14 @@ class ChiefCli(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(ws), True)
         shutil.copy(str(ROOT / "templates/workspace/config.example.json"), str(ws / "config.json"))
         env = dict(os.environ, MOTHER_WORKSPACE=str(ws), MOTHER_NOW="2026-11-01T09:00:00Z")
-        env.pop("MOTHER_CHIEF_ROLE", None)
         r = run(["chief", "status", "--json"], env)
         self.assertEqual(r.returncode, 0, r.stderr)
         doc = json.loads(r.stdout)
-        self.assertEqual((doc["version"], doc["at"], doc["workers"]), (1, "2026-11-01T09:00:00Z", []))
-        r = run(["chief", "role"], dict(env, MOTHER_WORKSPACE=str(ws / "missing")))
-        self.assertEqual((r.returncode, r.stdout), (0, "console\n"), r.stderr)
-        self.assertEqual(run(["chief", "bogus"], env).returncode, 2)
+        self.assertEqual((doc["version"], doc["at"], doc["led_by"]), (1, "2026-11-01T09:00:00Z", None))
+        self.assertNotIn("workers", doc)
+        for gone in (["chief", "bogus"], ["chief", "role"], ["chief", "run", "PLAT-1"], ["chief", "install"]):
+            self.assertEqual(run(gone, dict(env, MOTHER_WORKSPACE=str(ws / "missing"))).returncode, 2, gone)
+        self.assertNotEqual(run(["decide", "batch"], env).returncode, 0)
 
 
 class TestWhatsappConfig(unittest.TestCase):
