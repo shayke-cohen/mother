@@ -1285,7 +1285,7 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
 
 - **Files, all under `.mother/chief/` (machine-local, gitignored).** `chief.json` (`{session_id}`: the chief's own
   session id, a uuid4 made on first use; the guard reads it to know which session is the chief). `heartbeat.json`
-  (`{at, pid}`, written first on every tick, paused or not; the status calls the chief alive for 120 s). `wake.json`
+  (`{at, pid}`, plus `session_id` from a leading console; written first on every tick, paused or not; the status calls the chief alive for 120 s). `wake.json`
   (`{line_ids, at}`: the batch last woken for; the same batch is not woken again within 10 minutes). `queue.jsonl`
   (one `{key, text, source, at}` per line, `source` `say` | `route` | `release`; text stored byte for byte; taken
   atomically per key). `spend.json` (`{"YYYY-MM-DD": usd}` in the configured timezone, the last 14 days). `run/`
@@ -1653,6 +1653,26 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   - **Stores.** Write, Edit, MultiEdit, NotebookEdit and shell writes to `.mother/chief/decisions.json` and
     `.mother/hub/inbox.jsonl` ask in every session (denied under PAUSED and in the chief and workers), wherever they run
     and through paths the guard can't resolve, since the folder and file are named.
+
+- **No chief session: a console leads.** `tick --json --as <session_id>` is a console's pass. Under the hub lock it
+  reads `heartbeat.json`: when it is fresh (120 s) and another session wrote it (the chief's own heartbeat has no
+  `session_id`, so the chief always wins), nothing runs and it prints `{"skipped": "<why>"}`, exit 0. Otherwise the
+  caller leads: the heartbeat becomes `{at, pid, session_id}` and the tick runs as above. A leader that stops ticking
+  is replaced once its heartbeat is stale. Without `--as` nothing changes. `status --json` adds `led_by` (`chief` |
+  `console` | null), and the text says `chief: led by a desktop session`.
+- **What a leading console does** (`leadOnce` in `hooks/chief.tsx`; role `console`, desktop surface only, once a
+  minute; a terminal console only reads). After a tick it led that returned `judge` lines, it makes the triage model
+  call per line (none when the budget is spent) and sends `{judge, verdicts}` to `triage --stdin --decide`, which
+  records a decision for every judge line in one `hub decide`: `log` on the triage rule above (and for a `sweep`
+  line), `now` for the rest, with title and why from the verdict's title and tldr, else the line's title and
+  summary, and the line's link. No verdict (a failed call, an unreadable line list, no budget) is `now`, never
+  `log`; `manual` and `error` lines are always `now`. It prints `{paused, logged, now}`. A console never submits a
+  wake prompt and never posts the batch. Routing to a worker stays the tick's.
+- **Inbox section.** `status --json` carries `inbox` (the hub's open updates, which is what a `now` decision makes:
+  `{id, key, title, why, link, at, session}`, each text one safe line, newest first, at most 10) and `inbox_count`.
+  The Chief pane draws it above Workers: title, why, key, age, source link, and Open session (the key's live session,
+  else the item filled into the prompt, never sent), Done (`mother hub done`) and Snooze (`mother hub snooze`), the
+  Now panel's actions from `hooks/shared.ts`. The status line adds ` · N in inbox` when N > 0.
 
 ### The floor: session cards and "Needs you" (`lib/floor.py`, `mother floor`, `hooks/floor.ts`)
 

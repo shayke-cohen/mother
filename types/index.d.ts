@@ -238,6 +238,15 @@ export type ChiefStatus = {
   decisions?: ChiefDecision[]        // absent from an older CLI
   to_decide?: number                 // pending decisions; absent from an older CLI
   reply_problem?: string | null      // what stops self-DM replies from working, while decisions are open
+  led_by?: 'chief' | 'console' | null  // who wrote the heartbeat: the chief session, or a console leading (`tick --as`)
+  inbox?: ChiefInboxItem[]           // the hub's open updates (`now` decisions), newest first, at most 10
+  inbox_count?: number               // all of them
+}
+
+export type ChiefInboxItem = {
+  id: string   // U<n>
+  key: string; title: string; why: string; link: string; at: string | null
+  session: { key: string; title: string } | null   // the live hub session for the key
 }
 
 declare module 'claude-code' {

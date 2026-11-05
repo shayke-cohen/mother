@@ -457,7 +457,8 @@ test('test_console_snapshots_pinned_on_desktop_only', async ($, on) => {
   await clock.advance(60_000)                                                // every minute after that
   expect(p.mcp.length).toBe(2)
   expect(p.pinnedStdins.length).toBe(2)
-  expect(chiefCalls(out, 'tick')).toEqual([])
+  expect(chiefCalls(out, 'tick').map(a => a.slice(4))).toEqual([['--json', '--as', 'chief-1']])   // a desktop console offers to lead
+  expect(out.submits).toEqual([])
 })
 
 test('test_pinned_snapshot_terminal_never_asks', async ($, on) => {
@@ -2635,4 +2636,121 @@ test('test_needs_you_text_is_cleaned', async ($, on) => {
   expect((await ui.find({ key: `need:${CLI_A}:0` }))?.text).toBe('Go')
   expect(await ui.find({ key: `need:${CLI_A}:1` })).toBeUndefined()              // an option with no label is dropped
   await ui.unmount()
+})
+
+// ---- a leading console: tick --as, decisions in code, the Inbox section ----
+type Lead = { asks: any[]; decides: any[]; fills: string[]; hub: string[][] }
+const INBOX = [
+  { id: 'U2', key: 'PLAT-9', title: 'Review due', why: 'needs a look today', link: 'https://example.com/9', at: '2026-11-02T09:58:00Z', session: null },
+  { id: 'U1', key: 'PLAT-8', title: 'Build broke', why: 'red since noon', link: 'https://example.com/8', at: '2026-11-02T09:30:00Z',
+    session: { key: 'PLAT-8', title: 'Fix the build' } },
+]
+
+// A console whose tick answers `tick`; `reply` answers each model call by line id.
+async function bootLead($: any, on: any, o: { surface?: 'terminal' | 'desktop'; tick?: unknown; reply?: (id: string) => any; lines?: Cli;
+                                              over?: Record<string, unknown> } = {}) {
+  const surface = o.surface ?? 'desktop'
+  const l: Lead = { asks: [], decides: [], fills: [], hub: [] }
+  on('session.surfaces', () => ({ value: [surface] }))
+  on('mcp.call', () => ({ deny: 'not connected' }))
+  on('prompt.fill', (_: any, e: any) => { l.fills.push(e.text); return { isFilled: true } })
+  on('model.complete', (_: any, e: any) => {
+    l.asks.push(e)
+    return (o.reply ?? (() => answered(WORK)))(LINES.map(x => x.id).find(i => e.prompt.includes(`"id":"${i}"`)) ?? '')
+  })
+  const booted = await boot($, on, 'console', (argv, stdin) => {
+    if (argv[0] === 'tick') return { exitCode: 0, stdout: JSON.stringify(o.tick ?? { paused: false, wake: TICK_WAKE, judge: ['L1', 'L2'] }) }
+    if (argv[0] === 'lines') return o.lines ?? { exitCode: 0, stdout: JSON.stringify(LINES) }
+    if (argv[0] === 'triage') { l.decides.push(JSON.parse(String(stdin ?? 'null'))); return { exitCode: 0, stdout: '{"paused": false, "logged": [], "now": []}' } }
+    if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ led_by: 'console', inbox: INBOX, inbox_count: 2, ...(o.over ?? {}) })) }
+    return undefined
+  }, surface, 'desk-7')
+  l.hub = booted.out.argv.filter(a => a[2] === 'hub')
+  return { ...booted, l }
+}
+
+test('test_console_on_desktop_ticks_as_its_session_and_decides_in_code', async ($, on) => {
+  const { clock, out, l } = await bootLead($, on, { reply: id => id === 'L2' ? answered(FYI) : answered(WORK) })
+  expect(chiefCalls(out, 'tick')).toEqual([])                       // session.start never ticks
+  await clock.advance(60_000)
+  expect(chiefCalls(out, 'tick').map(a => a.slice(4))).toEqual([['--json', '--as', 'desk-7']])
+  expect(l.asks.length).toBe(2)
+  expect(chiefCalls(out, 'triage').map(a => a.slice(4))).toEqual([['--stdin', '--decide']])
+  expect(l.decides).toEqual([{ judge: ['L1', 'L2'], verdicts: [
+    { line_id: 'L1', key: 'PLAT-1', is_work: true, needs_attention: true, title: 'Build failed', tldr: 'CI is red on main' },
+    { line_id: 'L2', key: 'PLAT-2', is_work: false, needs_attention: false, title: 'Thanks', tldr: 'a thank-you' }] }])
+  expect(out.submits).toEqual([])                                   // never a wake prompt
+  expect(out.argv.filter(a => a[2] === 'decide')).toEqual([])       // and never the batch
+})
+
+test('test_skipped_tick_does_nothing_else', async ($, on) => {
+  const { clock, out, l } = await bootLead($, on, { tick: { skipped: 'the chief session is alive', judge: ['L1', 'L2'] } })   // judge: so only `skipped` stops it
+  await clock.advance(60_000)
+  expect(chiefCalls(out, 'tick').length).toBe(1)
+  expect(chiefCalls(out, 'lines')).toEqual([])
+  expect(chiefCalls(out, 'triage')).toEqual([])
+  expect(l.asks).toEqual([])
+  expect(out.submits).toEqual([])
+})
+
+test('test_failed_model_call_sends_the_line_with_no_verdict', async ($, on) => {
+  // no verdict is what makes `triage --decide` record `now`: a failed call can never log a line
+  const { clock, out, l } = await bootLead($, on, { reply: () => failed })
+  await clock.advance(60_000)
+  expect(l.asks.length).toBe(2)
+  expect(l.decides).toEqual([{ judge: ['L1', 'L2'], verdicts: [] }])
+  expect(out.submits).toEqual([])
+})
+
+test('test_over_budget_and_unreadable_lines_decide_untriaged', async ($, on) => {
+  const a = await bootLead($, on, { over: { budget: { spent: 20, limit: 20, over: true } } })
+  await a.clock.advance(60_000)
+  expect(a.l.asks).toEqual([])
+  expect(a.l.decides).toEqual([{ judge: ['L1', 'L2'], verdicts: [] }])
+})
+
+test('test_lines_read_failure_still_decides', async ($, on) => {
+  const { clock, l } = await bootLead($, on, { lines: { exitCode: 1, stderr: 'boom' } })
+  await clock.advance(60_000)
+  expect(l.asks).toEqual([])
+  expect(l.decides).toEqual([{ judge: ['L1', 'L2'], verdicts: [] }])
+})
+
+test('test_terminal_console_never_ticks_as', async ($, on) => {
+  const { clock, out, l } = await bootLead($, on, { surface: 'terminal' })
+  await clock.advance(60_000)
+  await clock.advance(60_000)
+  expect(chiefCalls(out, 'tick')).toEqual([])
+  expect(l.decides).toEqual([])
+})
+
+test('test_inbox_section_draws_and_its_buttons_run_the_hub_verbs', async ($, on) => {
+  const { out, l } = await bootLead($, on)
+  const hub = () => out.argv.filter(a => a[2] === 'hub').map(a => a.slice(3))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const seen = await texts(ui)
+  expect(seen).toContain('Inbox 2')
+  expect(seen.indexOf('Inbox 2')).toBeLessThan(seen.findIndex((t: string) => /^Workers /.test(t)))
+  expect(seen.indexOf('Review due')).toBeLessThan(seen.indexOf('Build broke'))     // newest first
+  expect(seen).toContain('needs a look today')
+  expect(await hasText(ui, /^PLAT-9 · 2m $/)).toBe(true)
+  expect((await ui.findAll({ type: 'Link' })).map((x: any) => x.props.href)).toEqual(['https://example.com/9', 'https://example.com/8'])
+  await ui.press({ key: 'inbox-done:U2' })
+  expect(hub()).toEqual([['done', 'U2']])
+  await ui.press({ key: 'inbox-snooze:U1' })
+  await ui.select({ key: 'inbox-snooze-pick:U1', value: 'tomorrow' })
+  expect(hub()).toEqual([['done', 'U2'], ['snooze', 'U1', 'tomorrow']])
+  await ui.press({ key: 'inbox-open:U1' })                                         // a live session: the Now panel's open
+  expect(l.fills).toEqual(['Open my "Fix the build" session'])
+  expect(hub().slice(2)).toEqual([['session', 'seen', 'PLAT-8']])
+  await ui.press({ key: 'inbox-open:U2' })                                         // none: the item, filled and never sent
+  expect(l.fills[1]).toContain('"Review due" — needs a look today (https://example.com/9)')
+  expect(out.submits).toEqual([])
+  await ui.unmount()
+})
+
+test('test_status_line_counts_the_inbox', () => {
+  expect(chiefStatusText(status({ inbox_count: 2 }) as any, 'console')).toBe(' · chief ● 0 working · 2 in inbox')
+  expect(chiefStatusText(status({ to_decide: 1, inbox_count: 1 }) as any, 'console')).toBe(' · chief ● 0 working · 1 to decide · 1 in inbox')
+  expect(chiefStatusText(status({ inbox_count: 0 }) as any, 'console')).toBe(' · chief ● 0 working')
 })
