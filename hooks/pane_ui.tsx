@@ -1,5 +1,6 @@
 import type { Color } from 'claude-code'
 
+import { oneLine } from './shared'
 import type { Dollar } from './shared'
 import type { ChiefDesktop, ChiefOpen, ChiefStatus } from '../types'
 
@@ -65,10 +66,11 @@ export function suggestedBrief(suggestion: string, title: string, why: string | 
 export type CardKind = 'need' | 'inbox' | 'sess' | 'today'
 
 // ---- tabs: one section at a time, or `all` stacked ----
-export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'all'
-export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'all']
+export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'team' | 'health' | 'all'
+export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'team', 'health', 'all']
 // A tab is data: an id, a label, how many items it holds and what draws them. `all` has no section of its own.
-export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown }
+// `text` replaces `<label> <count>` on the button (Health wears no count); `alert` adds a red dot.
+export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown; text?: string; alert?: boolean }
 
 // The tab shown: the manager's pick, else the first tab that holds something, else `all` (every empty line).
 export function shownTab(picked: string | null | undefined, tabs: readonly { id: TabId; count: number }[]): TabId {
@@ -80,14 +82,18 @@ export function shownTab(picked: string | null | undefined, tabs: readonly { id:
 export const tabIsNew = (t: { id: TabId; count: number }, seen: Record<string, number> | null | undefined): boolean =>
   t.id !== 'all' && t.count > (seen?.[t.id] ?? 0)
 
+// A tab that is not the shown one lights under the pointer: each is its own hover group, so only that tab does.
+export const tabHover = (id: string) => ({ scope: 'mother-tab:' + id, color: SELF_COLOR, underline: true, dimColor: false })
+
 // The tab row: a Button per tab with its count, the shown one primary; ` •` marks a tab with something new.
 export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<string, number> | null | undefined, onPick: (id: TabId) => unknown) {
-  const { Box, Button } = ui
+  const { Box, Button, Text } = ui
   return (
     <Box key="tabs" flexWrap="wrap" gap="xs" marginTop={1}>
-      {[...tabs.map(t => ({ id: t.id, text: `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, text: 'All' }].map(t => (
+      {[...tabs.map(t => ({ id: t.id, alert: !!t.alert, text: t.text ?? `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, alert: false, text: 'All' }].map(t => (
         <Button key={'tab:' + t.id} variant={t.id === shown ? 'primary' : 'secondary'} dimColor={t.id === 'all' && shown !== 'all'}
-          onPress={() => onPick(t.id)}>{t.text}</Button>
+          {...(t.id === shown ? {} : { hover: tabHover(t.id) })}
+          onPress={() => onPick(t.id)}>{t.alert ? <Text>{t.text}<Text color="error">{' ●'}</Text></Text> : t.text}</Button>
       ))}
     </Box>
   )
@@ -109,10 +115,11 @@ export const allCards = (open: boolean): ChiefOpen => ({ all: open, cards: {} })
 // ---- who leads, the budget, a session's state: short words and a colour each ----
 export type Pill = { text: string; color: Color }
 
+// Led, here or by another session, is healthy: green. Only nobody leading is red.
 export function leadPill(s: ChiefStatus, self: string | null): Pill {
   const by = typeof s.led_by === 'string' && s.led_by ? s.led_by : null
   return !by ? { text: 'nobody leading', color: 'error' }
-    : by === self ? { text: 'led here', color: 'success' } : { text: 'led by another session', color: 'warning' }
+    : by === self ? { text: 'led here', color: 'success' } : { text: 'led by another session', color: 'success' }
 }
 
 export const BUDGET_CELLS = 8
@@ -137,6 +144,40 @@ export function sessionPill(d: ChiefDesktop, asks: boolean, nowMs: number, ago: 
   return { text: age ? `idle ${age}` : 'idle', color: 'subtle' }
 }
 
+// ---- text: never cut mid-word ----
+// `text` on one line of at most `cap` characters: a longer one is cut at the last word boundary that fits and ends
+// with `…` (a single word longer than the cap is cut where the cap falls).
+export function clip(text: string | null | undefined, cap: number): string {
+  const t = String(text ?? '').split(/\s+/).filter(Boolean).join(' ')
+  if (t.length <= cap) return t
+  const head = t.slice(0, Math.max(1, cap - 1))
+  const at = head.lastIndexOf(' ')
+  return (at > 0 ? head.slice(0, at) : head).replace(/[\s.,;:!?-]+$/, '') + '…'
+}
+
+// A stored why as an expanded card shows it: whole, on one line. One that reaches a storage cap (300, or the 200 of
+// an older item) without ending a sentence was cut there, mid-word: its last partial word goes and `…` says so.
+export const WHY_MAX = 300          // what the hub stores of a line's summary
+const WHY_OLD_MAX = 200
+export function whyText(raw: unknown): string {
+  const t = oneLine(raw, WHY_MAX)
+  if ((t.length >= WHY_MAX - 1 || t.length === WHY_OLD_MAX) && !/[.!?…)\]"'”]$/.test(t)) return clip(t, t.length - 1)
+  return t
+}
+
+// What a card's second row says in place of a raw key: the CLI's `label` (a channel's name, a person, `mail thread`…)
+// when the status carries one, else the same words from the key's shape. Never a raw chat or mail id.
+export function humanLabel(u: { key?: string | null; label?: string | null; who?: string | null }): string {
+  const given = String(u.label ?? '').trim()
+  if (given) return given
+  const key = String(u.key ?? '').trim()
+  const source = sourceOf(key)
+  if (source === 'tracker' || source === 'code') return key
+  if (source === 'chat') return String(u.who ?? '').trim() || 'chat thread'
+  return source === 'mail' ? 'mail thread' : source === 'calendar' ? 'calendar' : source === 'manual' ? 'note'
+    : source === 'error' ? 'source error' : 'update'
+}
+
 // ---- elements ----
 // A small filled pill: the source or state of a card, the counts of the header strip.
 export function badge(ui: Ui, text: string, color: Color, key?: string) {
@@ -153,6 +194,12 @@ export function emptyLine(ui: Ui, key: string, text: string) {
 export function sectionHeading(ui: Ui, key: string, text: string) {
   const { Box, Text } = ui
   return <Box key={key} marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
+}
+
+// A small heading inside a tab: `Suggested`, `Top 3`, `On you (12)`.
+export function subHeading(ui: Ui, key: string, text: string) {
+  const { Box, Text } = ui
+  return <Box key={key} marginTop={1}><Text weight="semibold" dimColor>{text}</Text></Box>
 }
 
 export type CardFrame = {
@@ -178,13 +225,30 @@ export function card(ui: Ui, f: CardFrame, children: unknown) {
   )
 }
 
-// The title row: a plain Button whose press toggles the card; `▾` open, `▸` closed.
-export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPress: () => unknown, trailing?: unknown) {
+export const COMPACT_TITLE_MAX = 56
+
+// The title row: a plain Button whose press toggles the card; `▾` open, `▸` closed. `actions` (a compact card's
+// primary button, and a small second one) sit at the right end of the same row; the title is then one cut line.
+export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPress: () => unknown, trailing?: unknown, actions?: unknown) {
   const { Box, Button, Text } = ui
+  const toggle = (text: string) => (
+    <Button key={'toggle:' + id} plain onPress={onPress}><Text weight="semibold">{`${open ? '▾' : '▸'} ${text}`}</Text></Button>
+  )
+  if (!actions) {
+    return (
+      <Box key={'title:' + id} flexWrap="wrap" gap="xs">
+        {toggle(title)}
+        {trailing as any}
+      </Box>
+    )
+  }
   return (
-    <Box key={'title:' + id} flexWrap="wrap" gap="xs">
-      <Button key={'toggle:' + id} plain onPress={onPress}><Text weight="semibold">{`${open ? '▾' : '▸'} ${title}`}</Text></Button>
-      {trailing as any}
+    <Box key={'title:' + id} gap="xs" justifyContent="space-between">
+      <Box key={'title-text:' + id} gap="xs" flexShrink={1}>
+        {toggle(clip(title, COMPACT_TITLE_MAX))}
+        {trailing as any}
+      </Box>
+      <Box key={'title-acts:' + id} gap="xs" flexShrink={0}>{actions as any}</Box>
     </Box>
   )
 }
@@ -201,11 +265,12 @@ export type Portrait = {
 export const PORTRAIT_ALT = 'Mother, Chief of Stuff'
 export const WIDE_RATIO = 1.4
 const BANNER_COLUMNS = 44
-const BANNER_ROWS_MIN = 6
-const BANNER_ROWS_MAX = 14
+const BANNER_ROWS_MIN = 3
+const BANNER_ROWS_MAX = 6          // the terminal keeps the picture small
 const SPOT_COLUMNS = 10
 const SPOT_ROWS = 5
-const BANNER_PX = 352
+export const BANNER_W = 590        // the desktop banner's shape: the pane's width by a slim band
+export const BANNER_H = 110
 const SPOT_PX = 64
 const SVG_MAX = 131_072
 
@@ -221,9 +286,24 @@ export const jpegSvg = (j: { base64: string; width: number; height: number }): s
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${j.width} ${j.height}">` +
   `<image href="data:image/jpeg;base64,${j.base64}" width="${j.width}" height="${j.height}"/></svg>`
 
-// The picture and whether it is a banner, by the surface's name (a surface without Image still resolves one, to an
-// empty stand-in). Nothing where the surface has no element for it: the title says it.
-function portraitOf(ui: Ui, p: Portrait, surface: string): { el: unknown; banner: boolean } | null {
+const xml = (t: string): string => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+
+// The slim banner a wide picture makes on a surface with `Svg`: the picture's middle band (`slice` crops, never
+// squeezes) in a 590 x 110 viewBox, a dark gradient over its lower part, and the title drawn inside at the
+// bottom-left as SVG text (escaped; a generic font family, nothing fetched).
+export const bannerSvg = (j: { base64: string }, title = 'Mother', subtitle = 'Chief of Stuff'): string =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${BANNER_W} ${BANNER_H}" width="${BANNER_W}" height="${BANNER_H}">` +
+  '<defs><linearGradient id="shade" x1="0" y1="0" x2="0" y2="1"><stop offset="0.2" stop-color="#000" stop-opacity="0"/>' +
+  '<stop offset="1" stop-color="#000" stop-opacity="0.8"/></linearGradient></defs>' +
+  `<image href="data:image/jpeg;base64,${j.base64}" x="0" y="0" width="${BANNER_W}" height="${BANNER_H}" preserveAspectRatio="xMidYMid slice"/>` +
+  `<rect x="0" y="0" width="${BANNER_W}" height="${BANNER_H}" fill="url(#shade)"/>` +
+  `<text x="16" y="${BANNER_H - 30}" font-family="sans-serif" font-size="26" font-weight="700" fill="#fff">${xml(title)}</text>` +
+  `<text x="16" y="${BANNER_H - 12}" font-family="sans-serif" font-size="13" fill="#fff" fill-opacity="0.85">${xml(subtitle)}</text></svg>`
+
+// The picture, whether it is a banner, and whether that banner carries the title, by the surface's name (a surface
+// without Image still resolves one, to an empty stand-in). Nothing where the surface has no element for it: the
+// title says it.
+function portraitOf(ui: Ui, p: Portrait, surface: string): { el: unknown; banner: boolean; titled?: boolean } | null {
   const { Image, Svg } = ui as { Image?: any; Svg?: any }
   if (surface === 'terminal') {
     if (!Image) return null
@@ -231,50 +311,51 @@ function portraitOf(ui: Ui, p: Portrait, surface: string): { el: unknown; banner
     return { banner, el: <Image key="portrait" source={{ png: p.png }} columns={columns} rows={rows} alt={PORTRAIT_ALT} /> }
   }
   if (!Svg) return null
+  if (p.jpeg && portraitLayout(p.jpeg).banner) {
+    const slim = bannerSvg(p.jpeg)
+    if (slim.length <= SVG_MAX) return { banner: true, titled: true, el: <Svg source={slim} alt={PORTRAIT_ALT} width={BANNER_W} height={BANNER_H} /> }
+  }
   const wrapped = p.jpeg ? jpegSvg(p.jpeg) : ''
-  if (p.jpeg && wrapped.length <= SVG_MAX) {
-    const banner = portraitLayout(p.jpeg).banner
-    const width = banner ? BANNER_PX : SPOT_PX
-    return { banner, el: <Svg source={wrapped} alt={PORTRAIT_ALT} width={width} height={Math.round(width * p.jpeg.height / p.jpeg.width)} /> }
+  if (p.jpeg && wrapped.length <= SVG_MAX && !portraitLayout(p.jpeg).banner) {
+    return { banner: false, el: <Svg source={wrapped} alt={PORTRAIT_ALT} width={SPOT_PX} height={Math.round(SPOT_PX * p.jpeg.height / p.jpeg.width)} /> }
   }
   // no usable jpeg (a custom PNG alone cannot be drawn here): the bundled vector, as a spot
   return p.svg ? { banner: false, el: <Svg source={p.svg} alt={PORTRAIT_ALT} width={SPOT_PX} height={SPOT_PX} /> } : null
 }
 
 export type Strip = {
-  needs: number; inbox: number; sessions: number
+  needs: number; inbox: number; sessions: number   // the tabs carry these counts; the strip no longer draws them
   spent: number | undefined; limit: number | undefined; overBudget: boolean
   lead: Pill; beat: string
   portrait: Portrait | null
   surface: string       // `terminal` draws an Image; any other surface an Svg when it has one
+  guard?: string | null // `off` and `paused` each draw a red pill; `on`, or absent, nothing
 }
 
-// The header: the picture (a banner above, or a spot at the left), "Mother" and "Chief of Stuff", then the counts as pills, the budget as
-// `$1.50 / $20` with a mini bar, who leads, the heartbeat's age.
+// The header: the picture (a slim banner above, which carries the title on a surface with Svg, or a spot at the
+// left), "Mother" and "Chief of Stuff" unless the banner says them, then one line: the budget as `$1.50 / $20` with a
+// mini bar, who leads, the heartbeat's age, and a red pill while the guard is off or paused.
 export function headerStrip(ui: Ui, s: Strip) {
   const { Box, Text } = ui
   const bar = budgetBar(s.spent, s.limit)
   const limit = typeof s.limit === 'number' ? `$${Number.isInteger(s.limit) ? s.limit : s.limit.toFixed(2)}` : '$0'
   const drawn = s.portrait ? portraitOf(ui, s.portrait, s.surface) : null
   const banner = !!drawn?.banner
+  const titled = banner && !!drawn?.titled
   const picture = (drawn?.el ?? null) as any
   return (
     <Box key="strip-all" flexDirection="column">
-    {banner && picture ? <Box key="banner" marginBottom={1}>{picture}</Box> : null}
+    {banner && picture ? <Box key="banner" marginBottom={titled ? 0 : 1}>{picture}</Box> : null}
     <Box key="strip" gap={1}>
       {banner ? null : picture}
       <Box key="strip-text" flexDirection="column" flexGrow={1}>
-      <Text weight="bold" size="title" color={SELF_COLOR}>Mother</Text>
-      <Text dimColor size="caption">Chief of Stuff</Text>
-      <Box flexWrap="wrap" gap="xs">
-        {badge(ui, `${s.needs} need you`, s.needs ? NEED_COLOR : 'subtle', 'pill:needs')}
-        {badge(ui, `${s.inbox} inbox`, s.inbox ? 'permission' : 'subtle', 'pill:inbox')}
-        {badge(ui, `${s.sessions} session${s.sessions === 1 ? '' : 's'}`, s.sessions ? SESSION_COLOR : 'subtle', 'pill:sessions')}
-      </Box>
-      <Box flexWrap="wrap" gap="xs">
+      {titled ? null : <Text weight="bold" size="title" color={SELF_COLOR}>Mother</Text>}
+      {titled ? null : <Text dimColor size="caption">Chief of Stuff</Text>}
+      <Box key="strip-line" flexWrap="wrap" gap="xs">
         <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
         <Text key="pill:bar" color={bar.color}>{bar.text}</Text>
         {badge(ui, s.lead.text, s.lead.color, 'pill:lead')}
+        {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}
         <Text key="pill:beat" dimColor>{s.beat}</Text>
       </Box>
       </Box>

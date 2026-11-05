@@ -1,7 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { chiefStatusText, cleanTldr, ledByText } from './chief'
-import { budgetBar, isOpen, itemSource, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabIsNew } from './pane_ui'
+import { chiefStatusText, cleanTldr, ledByText, sessionOrder } from './chief'
+import { bannerSvg, budgetBar, clip, humanLabel, isOpen, itemSource, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
 import { CLI } from '../tests/fixtures/chief_cli'
+import { guardState, healthProblems, isWatcherError, sourceRows, teamGroups } from './pane_tabs'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-11-02T10:00:00Z')
@@ -311,7 +312,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -925,7 +926,7 @@ test('test_pane_draws_needs_you_and_an_option_sends_and_hides_the_card', async (
     t.sends.length = 0
     const ui = await shown($, clock, surface)
     const all = await texts(ui)
-    expect(all.slice(0, 3)).toEqual(['Mother', 'Chief of Stuff', ' 1 need you '])   // the header strip
+    expect(all.slice(0, 3)).toEqual(['Mother', 'Chief of Stuff', '$1.50 / $20'])   // the header strip: no count pills, the tabs carry them
     expect(all.indexOf('Needs you 1')).toBeGreaterThan(0)
     expect(all.indexOf('Needs you 1')).toBeLessThan(all.indexOf('Pinned 2'))     // above every other section
     expect(all).toContain('Ship now or wait for review?')
@@ -1119,7 +1120,7 @@ test('test_led_by_text_has_three_wordings', () => {
   expect(ledByText(older as any, 'desk-7')).toBe('nobody leading')
 })
 
-for (const [led, pill, color] of [['desk-7', 'led here', 'success'], ['desk-8', 'led by another session', 'warning'],
+for (const [led, pill, color] of [['desk-7', 'led here', 'success'], ['desk-8', 'led by another session', 'success'],
                                   [null, 'nobody leading', 'error']] as const) {
   test(`test_header_lead_pill: ${pill}`, async ($, on) => {
     await bootLead($, on, { over: { led_by: led } })
@@ -1127,7 +1128,7 @@ for (const [led, pill, color] of [['desk-7', 'led here', 'success'], ['desk-8', 
       const ui = await $.ui.mount({ ...PANE, surface })
       expect((await ui.find({ type: 'Text', text: ` ${pill} ` }))?.props.backgroundColor).toBe(color)
       expect(await hasText(ui, /^heartbeat now$/)).toBe(true)
-      expect((await texts(ui)).some((t: string) => /Chief [●○]|Workers|To decide|^Health$/.test(t))).toBe(false)
+      expect((await texts(ui)).some((t: string) => /Chief [●○]|Workers|To decide/.test(t))).toBe(false)
       await ui.unmount()
     }
   })
@@ -1148,9 +1149,11 @@ test('test_real_idle_status_draws_the_strip_and_empty_states', async ($, on) => 
   const { out } = await boot($, on, argv => argv[0] === 'status' ? CLI.status_idle : undefined)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const all = await texts(ui)
-  expect(all).toEqual(['Mother', 'Chief of Stuff', ' 0 need you ', ' 0 inbox ', ' 0 sessions ', '$0.00 / $20', '▱▱▱▱▱▱▱▱', ' nobody leading ', 'heartbeat 1h ago',
+  expect(all).toEqual(['Mother', 'Chief of Stuff', '$0.00 / $20', '▱▱▱▱▱▱▱▱', ' nobody leading ', 'heartbeat 1h ago',
                        'Nothing needs you', 'Inbox clear', 'No pinned sessions',
-                       'No Today list yet: the tick has not written now.json'])     // never a blank section
+                       'No Today list yet: the tick has not written now.json', 'No team list yet: the tick has not written now.json',
+                       'Health', 'Sources', 'No source report yet: the tick has not written now.json', 'Watcher', 'The watcher never ran',
+                       'Budget and lead', '$0.00 of $20.00 today', ' nobody leading ', 'heartbeat 1h ago', 'Guard', ' on '])     // never a blank section
   expect(String(out.status[out.status.length - 1] ?? '')).not.toMatch(/need you|in inbox|chief/)
   await ui.unmount()
 })
@@ -1165,6 +1168,9 @@ test('test_real_tick_with_nothing_to_do_asks_no_model', async ($, on) => {
 
 // ---- the pane's look: the header strip, cards, badges, collapse / expand, the selected card, suggested prompts ----
 const card = async (ui: any, id: string) => (await ui.find({ key: 'card:' + id }))?.props ?? {}
+const rowKeys = (el: any): string[] => (el?.children ?? []).map((c: any) => c.key ?? c.props?.key)
+// the texts of an element's own Text children (a Text's key is not kept in the drawn tree)
+const rowTexts = (el: any): string[] => (el?.children ?? []).filter((c: any) => c.type === 'Text').map((c: any) => (c.children ?? []).join(''))
 
 test('test_header_strip_counts_budget_and_colours', async ($, on) => {
   const { clock } = await bootFloor($, on, { cards: () => [asking()], cli: argv => argv[0] === 'status'
@@ -1172,9 +1178,11 @@ test('test_header_strip_counts_budget_and_colours', async ($, on) => {
   for (const surface of SURFACES) {
     const ui = await shown($, clock, surface)
     const pill = async (text: string) => { const f = await ui.find({ type: 'Text', text }); return f && (f.props.backgroundColor ?? f.props.color ?? 'plain') }
-    expect(await pill(' 1 need you ')).toBe('warning')
-    expect(await pill(' 7 inbox ')).toBe('permission')
-    expect(await pill(' 2 sessions ')).toBe('ide')
+    // the counts live on the tabs alone: no count pill in the strip
+    expect((await texts(ui)).filter((t: string) => /^ \d+ (need you|inbox|sessions?) $/.test(t))).toEqual([])
+    expect([await tabText(ui, 'needs'), await tabText(ui, 'inbox'), await tabText(ui, 'sessions')].map(t => String(t).replace(/ •$/, ''))).toEqual(['Needs you 1', 'Inbox 7', 'Sessions 2'])
+    // budget, bar, lead and heartbeat share one line
+    expect(rowTexts(await ui.find({ key: 'strip-line' })).map(t => t.replace(/^heartbeat .*/, 'heartbeat'))).toEqual(['$12.00 / $20', '▰▰▰▰▰▱▱▱', ' nobody leading ', 'heartbeat'])
     expect(await pill('$12.00 / $20')).toBe('plain')
     expect(await pill('▰▰▰▰▰▱▱▱')).toBe('warning')
     await ui.unmount()
@@ -1207,7 +1215,7 @@ test('test_inbox_cards_wear_a_badge_and_a_border_colour_per_source', async ($, o
     for (const [id, , source, color] of rows) {
       const b = await ui.find({ type: 'Text', text: ` ${source} ` })
       expect([id, b?.props.backgroundColor]).toEqual([id, color])
-      const c = await card(ui, 'inbox:' + id)
+      const c = await card(ui, (source === 'error' ? 'health:err:' : 'inbox:') + id)     // a watcher error is Health's card, not the Inbox's
       expect([id, c.borderColor, c.borderStyle]).toEqual([id, color, 'round'])
     }
     await ui.unmount()
@@ -1218,21 +1226,27 @@ test('test_cards_start_compact_and_the_title_row_toggles', async ($, on) => {
   await bootLead($, on, { expand: false })
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    // compact: the title row, the badge, key, age and the primary button; no why, no Done, no suggestions
+    // compact, two rows: the title with Open session and Done at its right end; the badge, label, age. No why, Snooze or suggestions
     expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('▸ Review due')
     expect((await ui.find({ key: 'inbox-open:U2' }))?.props.variant).toBe('primary')
+    expect(rowKeys(await ui.find({ key: 'card:inbox:U2' }))).toEqual(['title:inbox:U2', 'meta:inbox:U2'])
+    expect(rowKeys(await ui.find({ key: 'title-acts:inbox:U2' }))).toEqual(['inbox-open:U2', 'inbox-done:U2'])
+    expect((await ui.find({ key: 'title:inbox:U2' }))?.props.justifyContent).toBe('space-between')
+    expect((await ui.find({ key: 'inbox-done:U2' }))?.text).toBe('Done')
     expect(await hasText(ui, /^PLAT-9 · 2m $/)).toBe(true)
     expect(await hasText(ui, /needs a look today/)).toBe(false)
-    expect(await ui.find({ key: 'inbox-done:U2' })).toBeUndefined()
+    expect(await ui.find({ key: 'inbox-snooze:U2' })).toBeUndefined()
     expect(await ui.find({ key: 'inbox-sug:U2:0' })).toBeUndefined()
     await ui.press({ key: 'toggle:inbox:U2' })
     expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('▾ Review due')
     expect(await hasText(ui, /^needs a look today$/)).toBe(true)
     expect((await ui.find({ key: 'inbox-done:U2' }))?.text).toBe('Done')
+    expect(await ui.find({ key: 'title-acts:inbox:U2' })).toBeUndefined()          // expanded: the buttons sit in their own row
+    expect((await ui.find({ key: 'inbox-snooze:U2' }))?.text).toBe('Snooze')
     expect((await ui.find({ key: 'inbox-sug:U2:0' }))?.text).toBe('Summarise the ticket and propose a next step')
-    expect(await ui.find({ key: 'inbox-done:U1' })).toBeUndefined()                // the other card is untouched
+    expect(await ui.find({ key: 'inbox-snooze:U1' })).toBeUndefined()              // the other card is untouched
     await ui.press({ key: 'toggle:inbox:U2' })                                     // closed again, though it is the selected card
-    expect(await ui.find({ key: 'inbox-done:U2' })).toBeUndefined()
+    expect(await ui.find({ key: 'inbox-snooze:U2' })).toBeUndefined()
     await ui.unmount()
   }
   expect(isOpen(null, 'need:x', 'need', null)).toBe(true)
@@ -1252,11 +1266,11 @@ test('test_a_pressed_card_is_selected_bold_and_open_until_another_is_picked', as
   expect(out.argv.some(a => a[0] === 'open')).toBe(true)                           // and still runs
   expect(await look('inbox:U2')).toEqual(['bold', false])
   expect(await look('inbox:U1')).toEqual(['round', true])
-  expect((await ui.find({ key: 'inbox-done:U2' }))?.text).toBe('Done')             // the selected card is drawn in full
+  expect((await ui.find({ key: 'inbox-snooze:U2' }))?.text).toBe('Snooze')         // the selected card is drawn in full
   await ui.press({ key: 'toggle:inbox:U1' })
   expect(await look('inbox:U1')).toEqual(['bold', false])
   expect(await look('inbox:U2')).toEqual(['round', true])
-  expect(await ui.find({ key: 'inbox-done:U2' })).toBeUndefined()                  // no longer selected: compact again
+  expect(await ui.find({ key: 'inbox-snooze:U2' })).toBeUndefined()                // no longer selected: compact again
   await ui.unmount()
 })
 
@@ -1293,10 +1307,10 @@ test('test_chief_expand_and_collapse_set_every_card', async ($, on) => {
     const has = async (key: string) => (await ui.find({ key })) !== undefined
     // the defaults: Needs you in full, the sessions compact
     expect([await has('need-open:' + CLI_A), await has('say:' + CLI_A), await has('open:' + CLI_A)]).toEqual([true, false, true])
-    expect(await hasText(ui, /^Handler patched; tests next\.$/)).toBe(false)
+    expect([await hasText(ui, /^Handler patched; tests next\.$/), await hasText(ui, /^Waiting on review\.$/)]).toEqual([true, false])   // compact: the TL;DR's first line only
     expect(await run('expand')).toBe('Chief pane: every card expanded.')
     expect([await has('need-open:' + CLI_A), await has('say:' + CLI_A), await has('say:' + CLI_2)]).toEqual([true, true, true])
-    expect(await hasText(ui, /^Handler patched; tests next\.$/)).toBe(true)
+    expect([await hasText(ui, /^Handler patched; tests next\.$/), await hasText(ui, /^Waiting on review\.$/)]).toEqual([true, true])
     expect(await run('collapse')).toBe('Chief pane: every card collapsed.')
     expect([await has('need-open:' + CLI_A), await has('say:' + CLI_A), await has('open:' + CLI_A)]).toEqual([false, false, true])
     expect(await hasText(ui, /^Ship now or wait for review\?$/)).toBe(true)        // a compact Needs you card keeps its question
@@ -1363,18 +1377,26 @@ test('test_a_wide_picture_is_a_banner_above_the_header_strip', async ($, on) => 
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await term.find({ key: 'banner' })).toBeDefined()
   const [img] = await pictures(term, 'Image')
-  expect([img.alt, img.columns, img.rows, img.source]).toEqual(['Mother, Chief of Stuff', 44, 12, { png: PNG_1PX }])   // round(44 * 450 / 800 / 2)
+  expect([img.alt, img.columns, img.rows, img.source]).toEqual(['Mother, Chief of Stuff', 44, 6, { png: PNG_1PX }])   // small: at most 6 rows
   expect((await texts(term)).slice(0, 2)).toEqual(['Mother', 'Chief of Stuff'])            // the title stays in the strip
   await term.unmount()
-  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })      // the custom jpeg, wrapped in an SVG
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })      // the custom jpeg's middle band, as a slim banner
   expect(await desk.find({ key: 'banner' })).toBeDefined()
-  const [svg] = await pictures(desk, 'Svg')
-  expect([svg.alt, svg.width, svg.height]).toEqual(['Mother, Chief of Stuff', 352, 198])
-  expect(svg.source.startsWith('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450">')).toBe(true)
-  expect(svg.source).toContain('<image href="data:image/jpeg;base64,/9j/4AAQSkZJRg==" width="800" height="450"/>')
+  const [svg, ...others] = await pictures(desk, 'Svg')
+  expect(others).toEqual([])
+  expect([svg.alt, svg.width, svg.height]).toEqual(['Mother, Chief of Stuff', 590, 110])
+  expect(svg.source.startsWith('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 590 110" width="590" height="110">')).toBe(true)
+  expect(svg.source).toContain('<image href="data:image/jpeg;base64,/9j/4AAQSkZJRg==" x="0" y="0" width="590" height="110" preserveAspectRatio="xMidYMid slice"/>')
+  expect(svg.source).toMatch(/<linearGradient id="shade"[^>]*>.*stop-color="#000"/)        // a dark gradient under the title
+  expect(svg.source).toMatch(/<text [^>]*>Mother<\/text><text [^>]*>Chief of Stuff<\/text><\/svg>$/)   // the title, inside the picture
+  expect(svg.source).not.toMatch(/@font-face|@import|url\(http|<script|<foreignObject/)    // no external font, nothing fetched
+  expect((await texts(desk)).filter((t: string) => t === 'Mother' || t === 'Chief of Stuff')).toEqual([])   // so it isn't repeated below
+  expect((await texts(desk))[0]).toBe('$1.50 / $20')
   await desk.unmount()
-  expect(portraitLayout({ width: 2000, height: 100 })).toEqual({ banner: true, columns: 44, rows: 6 })    // clamped
-  expect(portraitLayout({ width: 140, height: 100 })).toEqual({ banner: true, columns: 44, rows: 14 })
+  expect(bannerSvg({ base64: 'AA==' }, 'A & <B>', '"C"')).toContain('>A &amp; &lt;B&gt;</text>')        // SVG text is escaped
+  expect(bannerSvg({ base64: 'AA==' }, 'A', '"C"')).toContain('>&quot;C&quot;</text>')
+  expect(portraitLayout({ width: 2000, height: 100 })).toEqual({ banner: true, columns: 44, rows: 3 })    // clamped
+  expect(portraitLayout({ width: 140, height: 100 })).toEqual({ banner: true, columns: 44, rows: 6 })     // never more than 6 rows
   expect(portraitLayout({ width: 139, height: 100 }).banner).toBe(false)
 })
 
@@ -1529,4 +1551,454 @@ test('test_today_tab_says_when_the_list_is_stale', async ($, on) => {
   expect(all).toContain('This list is stale: the tick has not run since it was written')
   expect(all).toContain('Nothing on you today')
   await ui.unmount()
+})
+
+// ---- the polish pass: guard pills, human labels and the whole why, the session order, Today's groups, tab hover ----
+for (const [guard, want] of [['on', null], [undefined, null], ['off', ' guard off '], ['paused', ' paused ']] as const) {
+  test(`test_header_guard_pill: ${guard ?? 'absent'}`, async ($, on) => {
+    await bootLead($, on, { over: guard === undefined ? {} : { guard } })
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      const pill = want ? await ui.find({ type: 'Text', text: want }) : undefined
+      expect(pill ? pill.props.backgroundColor : null).toBe(want ? 'error' : null)
+      expect(rowTexts(await ui.find({ key: 'strip-line' })).includes(want ?? ' guard off ')).toBe(!!want)   // in the header strip's one line
+      const all = await texts(ui)
+      expect(all.filter((t: string) => t === ' guard off ').length).toBe(guard === 'off' ? 1 : 0)
+      // the Health tab's Guard row says the same state as the pill (one helper reads it): ` off `, ` paused `, ` on `
+      expect(all.filter((t: string) => t === ' paused ').length).toBe(guard === 'paused' ? 2 : 0)
+      expect(all.includes(' off ')).toBe(guard === 'off')
+      expect(guardState(status(guard === undefined ? {} : { guard }) as any)).toBe(guard ?? null)
+      expect(guardState(status({ guard: 'on', health: { guard: 'paused' } }) as any)).toBe('paused')   // health.guard first
+      await ui.unmount()
+    }
+  })
+}
+
+test('test_text_is_never_cut_mid_word', () => {
+  expect(clip('one two three', 20)).toBe('one two three')
+  expect(clip('one two three four', 12)).toBe('one two…')
+  expect(clip('  spaced   out\nwords ', 40)).toBe('spaced out words')
+  expect(clip('abcdefghijklmnop', 8)).toBe('abcdefg…')                               // one long word: cut where the cap falls
+  expect(whyText('short and whole')).toBe('short and whole')
+  const cut200 = ('check whether the submission went through ' + 'again and '.repeat(20)).slice(0, 197) + 'sub'   // an older item, cut at 200
+  expect(cut200.length).toBe(200)
+  expect(whyText(cut200).endsWith('…')).toBe(true)
+  expect(whyText(cut200)).not.toMatch(/sub…$/)
+  const full = 'word '.repeat(58) + 'the last one.'                                   // 303 characters: past what the hub stores
+  expect(whyText(full).length).toBeLessThanOrEqual(300)
+  expect(whyText(full)).toMatch(/word the…$/)                                         // the partial last word goes
+  const whole = 'w'.repeat(3) + ' ' + 'ends on a sentence. '.repeat(9) + 'Done here.'   // exactly 200 and a full stop: left alone
+  expect(whyText(whole.padEnd(200, '!').slice(0, 200))).not.toMatch(/…$/)
+})
+
+test('test_human_label_stands_in_for_the_raw_key', () => {
+  expect(humanLabel({ key: 'C0123ABC/1699999999.000100', label: '#platform', who: 'Dana' })).toBe('#platform')   // the CLI's label wins
+  expect(humanLabel({ key: 'C0123ABC/1699999999.000100', who: 'Dana' })).toBe('Dana')
+  expect(humanLabel({ key: 'C0123ABC/1699999999.000100' })).toBe('chat thread')
+  expect(humanLabel({ key: 'D0123ABC/dm', who: '' })).toBe('chat thread')
+  expect(humanLabel({ key: 'mail:1a2b3c', who: 'Dana' })).toBe('mail thread')
+  expect(humanLabel({ key: 'PLAT-9' })).toBe('PLAT-9')
+  expect(humanLabel({ key: 'example/api#45' })).toBe('example/api#45')
+  expect(humanLabel({ key: 'cal:evt1' })).toBe('calendar')
+})
+
+test('test_inbox_card_shows_a_human_label_the_whole_why_and_the_raw_key_only_when_open', async ($, on) => {
+  const why = ('The owner asked twice whether the build for the store went out; ' + 'nobody answered and the release window closes tonight, so '.repeat(3)).trim() + ' reply.'
+  expect(why.length).toBeGreaterThan(200)
+  expect(why.length).toBeLessThan(299)
+  const inbox = [
+    { id: 'U1', key: 'C0123ABC/1699999999.000100', title: 'Build question', why, link: 'https://example.com/t', at: '2026-11-02T09:58:00Z', session: null,
+      source: 'chat', who: 'Dana', label: '#platform' },
+    { id: 'U2', key: 'mail:1a2b3c4d', title: 'Contract', why: 'x', link: '', at: '2026-11-02T09:50:00Z', session: null, source: 'mail', who: 'Sam', label: 'mail thread' },
+    { id: 'U3', key: 'D0123ABC/dm', title: 'Ping', why: 'x', link: '', at: '2026-11-02T09:40:00Z', session: null },   // an older CLI: no label
+  ]
+  await bootLead($, on, { expand: false, over: { inbox, inbox_count: 3 } })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const all = await texts(ui)
+    expect(all).toContain('#platform · 2m ')
+    expect(all).toContain('mail thread · 10m ')
+    expect(all).toContain('chat thread · 20m ')
+    expect(all.filter((t: string) => /C0123ABC|1699999999|1a2b3c4d|D0123ABC/.test(t))).toEqual([])   // compact: no raw id anywhere
+    await ui.press({ key: 'toggle:inbox:U1' })
+    expect(await hasText(ui, new RegExp('^' + why.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$'))).toBe(true)   // all of it, past 200
+    const raw = await ui.find({ type: 'Text', text: 'C0123ABC/1699999999.000100' })
+    expect(raw?.props.dimColor).toBe(true)                                                            // the raw key: expanded only, dim
+    expect(await hasText(ui, /1a2b3c4d/)).toBe(false)
+    await ui.press({ key: 'toggle:inbox:U1' })
+    await ui.unmount()
+  }
+})
+
+const TLDR_FIRST_LINE = 'Handler patched; tests next.'
+const at = (minsAgo: number) => new Date(NOW - minsAgo * 60_000).toISOString()
+test('test_sessions_sort_asking_then_active_then_idle', () => {
+  const d = (id: string, mins: number | null) => ({ ...PINNED, cli_session_id: id, last_activity_at: mins === null ? null : at(mins) })
+  const rows = [d('idle-old', 600), d('active-old', 10), d('asks-idle', 300), d('never', null), d('active-new', 1), d('idle-new', 60)]
+  expect(sessionOrder(rows as any, new Set(['asks-idle']), NOW).map(r => r.cli_session_id))
+    .toEqual(['asks-idle', 'active-new', 'active-old', 'idle-new', 'idle-old', 'never'])
+  expect(sessionOrder([], new Set(), NOW)).toEqual([])
+})
+
+test('test_compact_session_card_shows_one_tldr_line_or_the_question_and_asking_sorts_first', async ($, on) => {
+  const other = { ...PINNED_2, last_activity_at: at(1) }                                // more recent than the one that asks
+  const { clock } = await bootFloor($, on, { expand: false, cards: () => [asking()], cli: argv => argv[0] === 'status'
+    ? { exitCode: 0, stdout: JSON.stringify(status({ desktop: [other, PINNED] })) } : undefined })
+  await $.command.run({ command: 'chief', args: 'tab sessions' } as any)
+  for (const surface of SURFACES) {
+    const ui = await shown($, clock, surface)
+    const toggles = (await ui.findAll({ type: 'Button' })).map((b: any) => String(b.key)).filter((k: string) => k.startsWith('toggle:sess:'))
+    expect(toggles).toEqual(['toggle:sess:' + CLI_A, 'toggle:sess:' + CLI_2])           // the one that asks is first
+    expect(rowKeys(await ui.find({ key: 'card:sess:' + CLI_2 }))).toEqual(['title:sess:' + CLI_2, 'meta:sess:' + CLI_2])   // two rows
+    expect(rowKeys(await ui.find({ key: 'title-acts:sess:' + CLI_2 }))).toEqual(['open:' + CLI_2])
+    const tl = rowTexts(await ui.find({ key: 'meta:sess:' + CLI_2 })).pop() ?? ''
+    expect(tl.length).toBeGreaterThan(0)
+    expect(tl).not.toContain('\n')                                                      // one line of the TL;DR
+    expect(TLDR_FIRST_LINE.startsWith(tl.replace(/…$/, ''))).toBe(true)
+    expect(rowTexts(await ui.find({ key: 'meta:sess:' + CLI_A })).pop()).toBe('Ship now or wait for review?')   // what it asks, in place of the TL;DR
+    await ui.unmount()
+  }
+})
+
+test('test_today_groups_under_headings_and_show_more_expands_on_you', async ($, on) => {
+  const items = Array.from({ length: 12 }, (_, i) => NOW_ITEM('chat:' + (i + 10), 'on_you', 'Thing ' + (i + 10)))
+  const doc = NOW_DOC({ items: [...NOW_DOC().items, ...items] })
+  await boot($, on, undefined, 'desktop', 'sess-1', { [WS + '/.mother/now.json']: JSON.stringify(doc) }, {}, {}, false)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await tabText(ui, 'today')).toBe('Today 14')                                 // the tab keeps the total: 1 top + 13 on you
+    const shownItems = async () => (await ui.findAll({ type: 'Button' })).map((b: any) => String(b.key)).filter((k: string) => /^toggle:today:(?!top)/.test(k)).length
+    const all = await texts(ui)
+    expect(all.indexOf('Top 3')).toBeGreaterThan(-1)
+    expect(all.indexOf('Top 3')).toBeLessThan(all.indexOf('On you (13)'))
+    expect(await shownItems()).toBe(7)
+    expect((await ui.find({ key: 'today-more:on_you' }))?.text).toBe('Show 6 more')
+    expect(rowKeys(await ui.find({ key: 'card:today:chat:10' }))).toEqual(['title:today:chat:10', 'meta:today:chat:10'])   // compact: two rows
+    expect(rowKeys(await ui.find({ key: 'title-acts:today:chat:10' }))).toEqual(['today-open:chat:10'])
+    await ui.press({ key: 'today-more:on_you' })
+    expect(await shownItems()).toBe(13)
+    expect((await ui.find({ key: 'today-more:on_you' }))?.text).toBe('Show fewer')
+    expect(await tabText(ui, 'today')).toBe('Today 14')
+    await ui.press({ key: 'today-more:on_you' })
+    expect(await shownItems()).toBe(7)
+    await ui.unmount()
+  }
+})
+
+test('test_tabs_that_are_not_shown_light_under_the_pointer', async ($, on) => {
+  // the drawn tree a test reads carries no `hover`, so this checks the style each tab is given and that the pane
+  // still draws with it on both surfaces (a hover the engine refuses would skip the whole tree)
+  await bootLead($, on)
+  await $.command.run({ command: 'chief', args: 'tab inbox' } as any)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect([await tabVariant(ui, 'inbox'), await tabVariant(ui, 'needs'), await tabVariant(ui, 'all')]).toEqual(['primary', 'secondary', 'secondary'])
+    await ui.unmount()
+  }
+  expect(tabHover('needs')).toEqual({ scope: 'mother-tab:needs', color: 'claude', underline: true, dimColor: false })
+  expect(tabHover('needs').scope).not.toBe(tabHover('inbox').scope)                    // each tab its own group
+})
+
+// ---- Team, Health, Suggested, and Follow / Ignore on an Inbox card (hooks/pane_tabs.tsx) ----
+const nowFile = (doc: unknown) => ({ [WS + '/.mother/now.json']: JSON.stringify(doc) })
+const buttonKeys = async (ui: any, prefix: string) => (await ui.findAll({ type: 'Button' })).map((b: any) => String(b.key)).filter((k: string) => k.startsWith(prefix))
+
+test('test_team_tab_groups_neglected_items_by_team_and_shows_more', async ($, on) => {
+  const fills: string[] = []
+  on('prompt.fill', (_: any, e: any) => { fills.push(e.text); return { isFilled: true } })
+  const plat = Array.from({ length: 9 }, (_, n) => NOW_ITEM('ticket:P' + n, 'neglected', 'Plat ticket ' + n))
+  const items = [NOW_ITEM('chat:9', 'on_you', 'Not neglected'), NOW_ITEM('pr:o1', 'neglected', 'A PR nobody owns', { team: null }), ...plat,
+                 NOW_ITEM('chat:m1', 'neglected', 'A thread going cold', { team: 'MOB', since: '2026-10-31T10:00:00Z',
+                   actions: [{ id: 'S4', label: 'Nudge the owner', prompt: 'mother now do S4', task: 'x' }] })]
+  const { out } = await boot($, on, undefined, 'desktop', 'sess-1', nowFile(NOW_DOC({ top: [], items })), {}, {}, false)
+  const ran = (group: string) => out.argv.filter(a => a[2] === group).map(a => a.slice(3))
+  expect(teamGroups(NOW_DOC({ items }) as any).map(([t, list]) => [t, list.length])).toEqual([['PLAT', 9], ['MOB', 1], ['Other', 1]])   // largest first, no team last
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'tab:team' })
+    expect(await tabText(ui, 'team')).toBe('Team 11')
+    expect((await texts(ui)).filter((t: string) => /^(PLAT|MOB|Other) \d+$/.test(t))).toEqual(['PLAT 9', 'MOB 1', 'Other 1'])   // a heading per team, with its count
+    expect((await buttonKeys(ui, 'toggle:team:')).length).toBe(7 + 1 + 1)              // a group draws 7, the rest wait
+    expect((await ui.find({ key: 'team-more:PLAT' }))?.text).toBe('Show 2 more')
+    expect(await ui.find({ key: 'team-more:MOB' })).toBeUndefined()
+    await ui.press({ key: 'team-more:PLAT' })
+    expect((await buttonKeys(ui, 'toggle:team:')).length).toBe(11)
+    expect((await ui.find({ key: 'team-more:PLAT' }))?.text).toBe('Show fewer')
+    await ui.press({ key: 'team-more:PLAT' })
+    await ui.unmount()
+  }
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const all = await texts(ui)
+  expect(all).not.toContain('why chat:m1')                                          // compact: two rows, the why waits for the open card
+  expect(rowKeys(await ui.find({ key: 'card:team:chat:m1' }))).toEqual(['title:team:chat:m1', 'meta:team:chat:m1'])
+  expect(rowKeys(await ui.find({ key: 'title-acts:team:chat:m1' }))).toEqual(['team-doit:chat:m1', 'team-done:chat:m1'])
+  expect(all).toContain('2d ')                                                      // its age, from `since`
+  expect((await ui.find({ type: 'Text', text: ' tracker ' }))?.props.backgroundColor).toBe('permission')
+  expect((await ui.findAll({ type: 'Link' })).map((x: any) => x.props.href)).toContain('https://example.com/chat:m1')
+  expect((await ui.find({ key: 'team-doit:chat:m1' }))?.text).toBe('Nudge the owner')
+  await ui.press({ key: 'team-doit:chat:m1' })
+  expect(await texts(ui)).toContain('why chat:m1')                                  // pressed: selected, so drawn in full
+  await ui.press({ key: 'team-ask:chat:m1' })
+  expect(fills[0]).toBe('mother now do S4')                                         // filled, never submitted
+  expect(fills[1]).toContain('Help me close this out: "A thread going cold" — why chat:m1 (https://example.com/chat:m1)')
+  await ui.press({ key: 'team-snooze:chat:m1' })                                    // pressed: selected, so drawn in full
+  await ui.select({ key: 'team-snooze-pick:chat:m1', value: 'tomorrow' })
+  expect(ran('now')).toEqual([['snooze', 'chat:m1', 'tomorrow']])
+  await ui.press({ key: 'team-ignore:chat:m1' })
+  expect((await ui.find({ key: 'team-ignore-pick:chat:m1' }))?.props.options.map((o: any) => o.value)).toEqual(['item', 'week', 'channel'])
+  await ui.select({ key: 'team-ignore-pick:chat:m1', value: 'week' })
+  expect(ran('hub')).toEqual([['mute', '--for', '1w', '--', 'https://example.com/chat:m1']])   // the Now panel's Ignore: mute, then done
+  expect(ran('now')[1]).toEqual(['done', 'chat:m1'])
+  await ui.press({ key: 'team-done:pr:o1' })
+  expect(ran('now')[2]).toEqual(['done', 'pr:o1'])
+  await ui.press({ key: 'team-open:pr:o1' })
+  expect(out.opened).toContain('mother-inspector')
+  expect(out.submits).toEqual([])
+  await ui.unmount()
+})
+
+test('test_team_tab_with_nothing_neglected_is_one_dim_line', async ($, on) => {
+  await boot($, on, undefined, 'terminal', 'sess-1', nowFile(NOW_DOC({ items: [] })), {}, {}, false)
+  await $.command.run({ command: 'chief', args: 'tab team' } as any)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await tabText(ui, 'team')).toBe('Team 0')
+  expect(await texts(ui)).toContain('Nothing neglected in the teams')
+  await ui.unmount()
+})
+
+test('test_suggestions_lead_the_today_tab_with_their_actions', async ($, on) => {
+  const fills: string[] = []
+  on('prompt.fill', (_: any, e: any) => { fills.push(e.text); return { isFilled: true } })
+  const sug = Array.from({ length: 4 }, (_, n) => NOW_ITEM('todo:s' + n, 'suggestion', 'Suggestion ' + n,
+    { actions: [{ id: 'S' + (n + 5), label: 'Start it', prompt: '', task: 'x' }] }))
+  const { out } = await boot($, on, undefined, 'desktop', 'sess-1', nowFile(NOW_DOC({ items: [NOW_ITEM('chat:2', 'on_you', 'Answer the design question'), ...sug] })), {}, {}, false)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await tabText(ui, 'today')).toBe('Today 6')                                // one Top 3 entry, one on-you item, four suggestions
+  await ui.press({ key: 'tab:today' })
+  const all = await texts(ui)
+  expect(all).toContain('Suggested')
+  const toggles = await buttonKeys(ui, 'toggle:')
+  expect(toggles).toEqual(['toggle:sug:todo:s0', 'toggle:sug:todo:s1', 'toggle:sug:todo:s2', 'toggle:today:top:1', 'toggle:today:chat:2'])   // above the rest, three shown
+  expect((await ui.find({ type: 'Text', text: ' suggested ' }))?.props.backgroundColor).toBe('subtle')
+  expect((await ui.find({ key: 'sug-more' }))?.text).toBe('Show 1 more')
+  await ui.press({ key: 'sug-more' })
+  expect((await buttonKeys(ui, 'toggle:sug:')).length).toBe(4)
+  await ui.press({ key: 'sug-doit:todo:s3' })
+  expect(fills).toEqual(['mother now do S8'])                                       // an action with no prompt of its own
+  await ui.press({ key: 'sug-done:todo:s0' })
+  expect(out.argv.filter(a => a[2] === 'now').map(a => a.slice(3))).toEqual([['done', 'todo:s0']])
+  await ui.unmount()
+})
+
+const badgeColor = async (ui: any, text: string) => (await ui.find({ type: 'Text', text }))?.props.backgroundColor
+const WATCH_ERR = (id: string, source: string, at: string) => ({ id, key: 'watcher:' + source, title: `Couldn't read ${source}`, why: 'sign-in expired', link: '', at, session: null })
+const HEALTH = (over: Record<string, unknown> = {}) => ({ guard: 'on', watcher: null, watcher_errors: [], watcher_error_count: 0, undelivered: [], ...over })
+const COVERAGE = { calendar: { status: 'ok' }, chat: { status: 'partial', reason: 'two channels of nine could not be read: the token lacks a scope', since: '2026-11-02T04:00:00Z' },
+                   mail: { status: 'couldnt_check', reason: 'sign-in expired', since: '2026-10-31T10:00:00Z' }, workspace: { status: 'ok' }, zeta: { status: 'ok' } }
+
+// A session whose status carries `health`; hub and report calls are recorded, and `hub done` removes the error.
+async function bootHealth($: any, on: any, health: () => Record<string, unknown>, o: { doc?: unknown; over?: Record<string, unknown>; store?: Record<string, unknown>;
+                                                                                     report?: (name: string) => Cli } = {}) {
+  const reports: string[] = []
+  const booted = await boot($, on, argv => {
+    if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ ...(o.over ?? {}), health: health() })) }
+    if (argv[0] === 'report') { reports.push(argv[1]); return (o.report ?? (() => ({ exitCode: 0, stdout: '# Brief\n\nline\ttwo‮\n' })))(argv[1]) }
+    return undefined
+  }, 'desktop', 'sess-1', o.doc ? nowFile(o.doc) : {}, {}, o.store ?? {}, false)
+  return { ...booted, reports, hub: () => booted.out.argv.filter(a => a[2] === 'hub').map(a => a.slice(3)) }
+}
+
+test('test_health_tab_draws_a_row_per_source_with_its_status', async ($, on) => {
+  await bootHealth($, on, () => HEALTH(), { doc: NOW_DOC({ top: [], items: [], coverage: COVERAGE }) })
+  expect(sourceRows(NOW_DOC({ coverage: COVERAGE }) as any).map(([n]) => n)).toEqual(['workspace', 'chat', 'mail', 'calendar', 'zeta'])   // the fixed order, then the rest
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'tab:health' })
+    const all = await texts(ui)
+    const from = all.indexOf('Sources')
+    expect(all.slice(from + 1, from + 4)).toEqual([' ok ', 'workspace', ' partial '])   // a badge, then the source's name
+    expect(await badgeColor(ui, ' ok ')).toBe('success')
+    expect(await badgeColor(ui, ' partial ')).toBe('warning')
+    expect(await badgeColor(ui, ' couldnt check ')).toBe('error')                      // anything else is danger
+    expect(all).toContain('two channels of nine could not be read: the token lacks a scope')   // the reason, in full
+    expect(all).toContain('for 6h')
+    expect(all).toContain('for 2d')
+    expect(await ui.find({ key: 'health-src-why:workspace' })).toBeUndefined()         // an ok source says nothing more
+    expect(all).toContain('The watcher never ran')
+    await ui.unmount()
+  }
+})
+
+test('test_health_tab_shows_the_watcher_budget_lead_and_heartbeat', async ($, on) => {
+  const watcher = { at: '2026-11-02T09:20:00Z', every_seconds: 300, active: true, stale: true,
+                    sources: { chat: { status: 'ok', reason: '', since: null, at: null }, tracker: { status: 'couldnt_check', reason: 'the connector timed out', since: null, at: null } } }
+  await bootHealth($, on, () => HEALTH({ watcher }), { over: { led_by: 'sess-1' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab:health' })
+  const all = await texts(ui)
+  expect(all).toContain('last poll 40m ago')
+  expect(await badgeColor(ui, ' stale ')).toBe('error')
+  expect([await badgeColor(ui, ' chat ok '), await badgeColor(ui, ' tracker couldnt check ')]).toEqual(['success', 'error'])
+  expect(all).toContain('tracker: the connector timed out')
+  expect(all).toContain('$1.50 of $20.00 today')
+  expect(all.filter((t: string) => t === ' led here ').length).toBe(2)               // the strip's and Health's
+  expect(all.filter((t: string) => t === 'heartbeat now').length).toBe(2)            // the strip's and Health's
+  await ui.unmount()
+})
+
+test('test_watcher_errors_leave_the_inbox_for_health_with_done_all', async ($, on) => {
+  let errors = [WATCH_ERR('U7', 'chat', '2026-11-02T09:58:00Z'), WATCH_ERR('U8', 'mail', '2026-11-02T09:50:00Z')]
+  const inbox = [{ id: 'U1', key: 'PLAT-9', title: 'Review due', why: '', link: '', at: '2026-11-02T09:58:00Z', session: null }]
+  const ran: { argv: string[][] } = { argv: [] }
+  const left = () => errors.filter(u => !ran.argv.some(a => a[2] === 'hub' && a[3] === 'done' && a[4] === u.id))   // `hub done` settles one
+  const { clock, hub, out } = await bootHealth($, on, () => HEALTH({ watcher_errors: left(), watcher_error_count: left().length }), { over: { inbox, inbox_count: 1 } })
+  ran.argv = out.argv
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect([await tabText(ui, 'inbox'), await tabText(ui, 'health')]).toEqual(['Inbox 1', 'Health ●'])
+  await ui.press({ key: 'tab:all' })
+  expect(await ui.find({ key: 'card:inbox:U7' })).toBeUndefined()
+  expect((await card(ui, 'health:err:U7')).borderColor).toBe('error')
+  expect(await hasText(ui, /^watcher:chat · 2m$/)).toBe(true)
+  expect(await texts(ui)).toContain("Couldn't read chat")
+  expect((await ui.find({ key: 'health-done-all' }))?.text).toBe('Done all')
+  await ui.press({ key: 'health-done:U8' })
+  expect(hub()).toEqual([['done', 'U8']])
+  expect(await ui.find({ key: 'card:health:err:U8' })).toBeUndefined()               // the status was read again
+  expect(await ui.find({ key: 'health-done-all' })).toBeUndefined()                  // one left: no Done all
+  errors = [WATCH_ERR('U7', 'chat', '2026-11-02T09:58:00Z'), WATCH_ERR('U9', 'code', '2026-11-02T09:40:00Z')]
+  await clock.advance(60_000)
+  await ui.press({ key: 'health-done-all' })
+  expect(hub().slice(1)).toEqual([['done', 'U7'], ['done', 'U9']])
+  expect(await tabText(ui, 'health')).toBe('Health')
+  await ui.unmount()
+  // a status with no `health` (an older CLI): the items are still read out of the inbox
+  const old = status({ inbox: [...inbox, WATCH_ERR('U7', 'chat', '2026-11-02T09:58:00Z')] }) as any
+  expect([isWatcherError(old.inbox[0]), isWatcherError(old.inbox[1]), healthProblems(old, null)]).toEqual([false, true, 1])
+})
+
+test('test_undelivered_report_loads_on_expand_through_the_verb_and_dismiss_keeps_the_file', async ($, on) => {
+  const undelivered = [{ name: 'brief-unsent-2026-11-02.md', routine: 'brief', date: '2026-11-02', bytes: 2048 },
+                       { name: 'team-digest-unsent-2026-11-01.md', routine: 'team-digest', date: '2026-11-01', bytes: 300 },
+                       { name: '../config.json', routine: 'x', date: '2026-11-01', bytes: 1 }]
+  const store: Record<string, unknown> = {}
+  const { out, reports } = await bootHealth($, on, () => HEALTH({ undelivered }), { store })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await tabText(ui, 'health')).toBe('Health ●')
+  await ui.press({ key: 'tab:health' })
+  expect(await buttonKeys(ui, 'toggle:health:report:')).toEqual(['toggle:health:report:brief-unsent-2026-11-02.md', 'toggle:health:report:team-digest-unsent-2026-11-01.md'])   // newest first; a name off the pattern is never drawn
+  expect((await ui.find({ key: 'toggle:health:report:brief-unsent-2026-11-02.md' }))?.text).toBe('▸ brief · 2026-11-02')
+  expect(await texts(ui)).toContain('2.0 KB')
+  expect(reports).toEqual([])                                                        // nothing is read on a draw
+  await ui.press({ key: 'toggle:health:report:brief-unsent-2026-11-02.md' })
+  expect(reports).toEqual(['brief-unsent-2026-11-02.md'])                            // `mother chief report <name>`
+  const all = await texts(ui)
+  expect(all).toContain('# Brief')
+  expect(all).toContain('line two')                                                  // cleaned: the tab a space, the bidi override gone
+  expect((await ui.find({ key: 'toggle:health:report:brief-unsent-2026-11-02.md' }))?.text).toBe('▾ brief · 2026-11-02')
+  await ui.press({ key: 'health-dismiss:brief-unsent-2026-11-02.md' })
+  expect(await ui.find({ key: 'card:health:report:brief-unsent-2026-11-02.md' })).toBeUndefined()
+  expect(store.chiefDismissed).toEqual(['brief-unsent-2026-11-02.md'])               // kept past the session
+  expect(out.argv.some(a => a[0] === 'rm' || a.includes('unlink'))).toBe(false)      // nothing is deleted
+  expect(await texts(ui)).toContain('1 dismissed')
+  expect(await tabText(ui, 'health')).toBe('Health ●')                               // one report is still undelivered
+  await ui.press({ key: 'toggle:health:report:team-digest-unsent-2026-11-01.md' })
+  await ui.press({ key: 'toggle:health:report:team-digest-unsent-2026-11-01.md' })   // closed again: the text is forgotten
+  expect(await hasText(ui, /^# Brief$/)).toBe(false)
+  await ui.press({ key: 'toggle:health:report:team-digest-unsent-2026-11-01.md' })
+  await ui.press({ key: 'health-dismiss:team-digest-unsent-2026-11-01.md' })
+  expect(await tabText(ui, 'health')).toBe('Health')
+  await ui.press({ key: 'health-restore' })
+  expect(store.chiefDismissed).toEqual([])
+  expect(await tabText(ui, 'health')).toBe('Health ●')
+  await ui.unmount()
+})
+
+test('test_a_dismissed_report_stays_dismissed_in_the_next_session_and_a_refused_read_says_so', async ($, on) => {
+  const undelivered = [{ name: 'brief-unsent-2026-11-02.md', routine: 'brief', date: '2026-11-02', bytes: 10 },
+                       { name: 'dots-unsent-2026-11-02.md', routine: 'dots', date: '2026-11-02', bytes: 99999 }]
+  await bootHealth($, on, () => HEALTH({ undelivered }), { store: { chiefDismissed: ['brief-unsent-2026-11-02.md', 7, 'nope'] },
+                                                         report: () => ({ exitCode: 2, stderr: 'mother chief report: not an undelivered report\n' }) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'tab:health' })
+  expect(await buttonKeys(ui, 'toggle:health:report:')).toEqual(['toggle:health:report:dots-unsent-2026-11-02.md'])
+  await ui.press({ key: 'toggle:health:report:dots-unsent-2026-11-02.md' })
+  expect(await texts(ui)).toContain("Couldn't read this report")
+  await ui.unmount()
+})
+
+test('test_health_red_dot_rule_and_guard_states', async ($, on) => {
+  let health = HEALTH()
+  let doc: unknown = NOW_DOC({ top: [], items: [], coverage: { chat: { status: 'ok' }, mail: { status: 'ok' } } })
+  const { clock } = await bootHealth($, on, () => health, { doc })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab:health' })
+  const guard = async (word: string) => [await badgeColor(ui, ` ${word} `), await tabText(ui, 'health')]
+  expect(await guard('on')).toEqual(['success', 'Health'])                            // all well: no dot
+  health = HEALTH({ guard: 'off' })
+  await clock.advance(60_000)
+  expect(await guard('off')).toEqual(['error', 'Health ●'])
+  expect(await texts(ui)).toContain('every guard rule is off: the model alone decides')
+  health = HEALTH({ guard: 'paused' })
+  await clock.advance(60_000)
+  expect(await guard('paused')).toEqual(['error', 'Health ●'])
+  await ui.unmount()
+  const ok = status({ health: HEALTH() }) as any
+  const d = (coverage: unknown) => NOW_DOC({ coverage }) as any
+  expect(healthProblems(ok, d({ chat: { status: 'ok' } }))).toBe(0)
+  expect(healthProblems(ok, null)).toBe(0)
+  expect(healthProblems(ok, d({ chat: { status: 'partial' }, mail: { status: 'couldnt_check' } }))).toBe(2)          // a source that is not ok
+  expect(healthProblems(status({ health: HEALTH({ watcher_errors: [WATCH_ERR('U1', 'chat', '')] }) }) as any, null)).toBe(1)
+  const two = status({ health: HEALTH({ undelivered: [{ name: 'a-unsent-2026-11-01.md', routine: 'a', date: '2026-11-01', bytes: 1 }] }) }) as any
+  expect([healthProblems(two, null), healthProblems(two, null, ['a-unsent-2026-11-01.md'])]).toEqual([1, 0])       // an undelivered report, until dismissed
+  // health.guard wins over a top-level `guard`; either alone is read; neither is no alarm
+  expect(guardState(status({ guard: 'off', health: HEALTH({ guard: 'on' }) }) as any)).toBe('on')
+  expect(guardState(status({ guard: 'paused' }) as any)).toBe('paused')
+  expect(guardState(status({ guard: { state: 'off' } }) as any)).toBe('off')
+  expect([guardState(status() as any), healthProblems(status() as any, null)]).toEqual([null, 0])
+})
+
+test('test_inbox_follow_and_ignore_run_the_hub_verbs', async ($, on) => {
+  const inbox = [{ id: 'U1', key: 'PLAT-8', title: 'Build broke', why: '', link: '', at: '2026-11-02T09:50:00Z', session: null },
+                 { id: 'U2', key: 'C0123ABC/1699999999.000100', title: 'A thread', why: '', link: '', at: '2026-11-02T09:55:00Z', session: null },
+                 { id: 'U3', key: 'mail:abc', title: 'A mail', why: '', link: '', at: '2026-11-02T09:40:00Z', session: null }]
+  const { out } = await bootLead($, on, { over: { inbox, inbox_count: 3 } })
+  const hub = () => out.argv.filter(a => a[2] === 'hub').map(a => a.slice(3))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'inbox-follow:U3' })).toBeUndefined()                  // a mail key has nothing to follow
+  await ui.press({ key: 'inbox-follow:U1' })
+  expect(hub()).toEqual([['follow', '--project', '--', 'PLAT']])
+  expect(out.toasts.at(-1)).toBe('Following PLAT')
+  await ui.press({ key: 'inbox-follow:U2' })
+  expect(hub()[1]).toEqual(['follow', '--thread', '--', 'C0123ABC/1699999999.000100'])
+  await ui.press({ key: 'inbox-ignore:U1' })
+  expect((await ui.find({ key: 'inbox-ignore-pick:U1' }))?.props.options.map((o: any) => o.label)).toEqual(['Just this', 'This, for a week'])
+  await ui.select({ key: 'inbox-ignore-pick:U1', value: 'item' })
+  expect(hub().slice(2)).toEqual([['mute', '--', 'PLAT-8'], ['done', 'U1']])           // muted, then done: gone on the next status read
+  expect(await ui.find({ key: 'inbox-ignore-pick:U1' })).toBeUndefined()
+  await ui.press({ key: 'inbox-ignore:U2' })
+  expect((await ui.find({ key: 'inbox-ignore-pick:U2' }))?.props.options.map((o: any) => o.value)).toEqual(['item', 'week', 'channel'])   // a chat thread: its whole channel too
+  await ui.select({ key: 'inbox-ignore-pick:U2', value: 'channel' })
+  expect(hub().slice(4)).toEqual([['mute', '--scope', 'channel', '--', 'C0123ABC/1699999999.000100'], ['done', 'U2']])
+  await ui.press({ key: 'inbox-ignore:U3' })
+  await ui.select({ key: 'inbox-ignore-pick:U3', value: 'week' })
+  expect(hub().slice(6)).toEqual([['mute', '--for', '1w', '--', 'mail:abc'], ['done', 'U3']])
+  await ui.press({ key: 'inbox-done:U3' })                                           // the buttons that were there still are
+  expect(await ui.find({ key: 'inbox-snooze:U3' })).toBeDefined()
+  expect(out.submits).toEqual([])
+  await ui.unmount()
+})
+
+test('test_today_order_is_suggested_then_top_3_then_on_you', async ($, on) => {
+  const doc = NOW_DOC({ items: [...NOW_DOC().items, NOW_ITEM('todo:s1', 'suggestion', 'Try this')] })
+  await boot($, on, undefined, 'desktop', 'sess-1', { [WS + '/.mother/now.json']: JSON.stringify(doc) }, {}, {}, false)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'tab:today' })
+    const all = await texts(ui)
+    const order = ['Suggested', 'Top 3', 'On you (1)'].map(h => all.indexOf(h))
+    expect(order.every(i => i > -1)).toBe(true)
+    expect([...order].sort((a, b) => a - b)).toEqual(order)
+    expect(rowKeys(await ui.find({ key: 'card:sug:todo:s1' }))).toEqual(['title:sug:todo:s1', 'meta:sug:todo:s1'])   // compact, two rows, as every card
+    await ui.unmount()
+  }
 })

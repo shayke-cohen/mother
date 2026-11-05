@@ -183,11 +183,32 @@ export type ChiefStatus = {
   led_by?: string | null             // the session id that wrote the heartbeat while it is fresh (under 120 s), else null
   inbox?: ChiefInboxItem[]           // the hub's open updates (`now` decisions), newest first, at most 10
   inbox_count?: number               // all of them
+  guard?: 'on' | 'off' | 'paused'    // the guard: `paused` while .mother/PAUSED exists (it wins), `off` while .mother/GUARD_OFF does
+  health?: ChiefHealth               // the Health tab's reads; an Inbox item keyed `watcher:` is here, not in `inbox`
 }
+
+// `mother chief status --json` -> health (lib/chief.py health_doc): what the Chief pane's Health tab draws.
+export type ChiefHealth = {
+  guard?: 'on' | 'off' | 'paused'    // .mother/PAUSED (wins), .mother/GUARD_OFF, else on
+  // .mother/hub/watcher.json; null = the watcher never ran. `stale`: in active hours and older than twice its interval
+  watcher?: { at: string; every_seconds?: number; active?: boolean; stale?: boolean
+              sources?: Record<string, { status: string; reason?: string; since?: string | null; at?: string | null }> } | null
+  watcher_errors?: ChiefInboxItem[]  // the hub's open updates keyed `watcher:<source>`, newest first, at most 20
+  watcher_error_count?: number
+  // .mother/<routine>-unsent-<YYYY-MM-DD>.md: reports that did not reach the manager's DM, newest first, at most 20
+  undelivered?: { name: string; routine: string; date: string; bytes: number }[]
+}
+
+// The Health tab's own state: report names the manager dismissed (also kept in the plugin store as `chiefDismissed`),
+// and each expanded report's text as `mother chief report <name>` printed it (null = it could not be read).
+export type ChiefHealthState = { dismissed: string[]; reports: Record<string, string | null> }
 
 export type ChiefInboxItem = {
   id: string   // U<n>
   key: string; title: string; why: string; link: string; at: string | null
+  source?: string                    // the key's kind: chat, mail, tracker, code, calendar, manual, error, other
+  who?: string                       // the person its newest inbox line names; '' when none
+  label?: string                     // what a card shows in place of the raw key: a channel's name, a person, `mail thread`…
   session: { key: string; title: string } | null   // the live hub session for the key
 }
 
@@ -219,6 +240,7 @@ declare module 'claude-code' {
       chiefFloor: FloorState | null                 // `mother floor list --json` as last read, this session's id, and the cards answered from the pane since
       chiefOpen: ChiefOpen | null                   // which Chief pane cards are expanded; null = the defaults
       chiefTab: ChiefTabs | null                    // the Chief pane's tab and the counts last seen on each
+      chiefHealth: ChiefHealthState | null          // the Health tab: dismissed undelivered reports, loaded report texts
       chiefSelected: string | null                  // the card id (`sess:<cli id>`, `inbox:<U-id>`) a button was last pressed on; drawn with a bold border
     }
   }

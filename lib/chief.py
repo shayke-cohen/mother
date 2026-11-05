@@ -258,6 +258,7 @@ def tick(ws: Path, cfg: dict, at: datetime, session: Optional[str] = None) -> di
 # ---- triage: a cheap model's verdicts, made by the mod, decide every judge line in code ----
 
 TITLE_MAX, TLDR_MAX = 60, 200
+WHY_MAX = 300   # a `now` item's why: a verdict's tldr (200) or the line's own summary, which the hub stores up to 300
 TRIAGE_NEVER_LOG = ("manual", "error")  # a person's own line, and a source failure: never logged on a model's say-so
 
 def _verdict_ok(v) -> bool:
@@ -318,7 +319,7 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
                           "why": "triage: " + _one_line(v["title"], TITLE_MAX)})
         else:
             title = _one_line(v["title"] if v else str(l.get("title") or ""), TITLE_MAX) or _one_line(str(l["key"]), TITLE_MAX)
-            why = _one_line(v["tldr"] if v else str(l.get("summary") or ""), TLDR_MAX)
+            why = _one_line(v["tldr"] if v else str(l.get("summary") or ""), WHY_MAX)
             items.append({"line_id": l["id"], "key": l["key"], "decision": "now", "title": title, "why": why,
                           "link": l.get("link") or ""})
     if items:
@@ -331,18 +332,83 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
 INBOX_MAX = 10
 
 
-def inbox_items(ws: Path) -> List[dict]:
+def source_of(key) -> str:
+    """An item's source from its key's shape (docs/CONTRACT.md §5e "Formats"), as hooks/pane_ui.tsx `sourceOf`."""
+    k = str(key or "").strip()
+    if k.startswith("watcher:"):
+        return "error"
+    if k.startswith("mail:"):
+        return "mail"
+    if k.startswith("cal:"):
+        return "calendar"
+    if k.startswith("manual:"):
+        return "manual"
+    if k.startswith("wa:"):
+        return "chat"
+    if re.match(r"^[A-Z][A-Z0-9_]*-\d+$", k):
+        return "tracker"
+    if re.match(r"^[\w.-]+/[\w.-]+#\d+$", k):
+        return "code"
+    if re.match(r"^[A-Z0-9]+/(dm|\d+(\.\d+)?)$", k):
+        return "chat"
+    return "other"
+
+
+LABEL_MAX = 40
+_FIXED_LABELS = {"mail": "mail thread", "calendar": "calendar", "manual": "note", "error": "source error", "other": "update"}
+
+
+def _channel_names(cfg: dict) -> dict:
+    """{chat channel id: its configured name} across the config's teams."""
+    names = {}
+    for t in (cfg or {}).get("teams") or []:
+        for ch in (t.get("channels") or []) if isinstance(t, dict) else []:
+            if isinstance(ch, dict) and ch.get("id") and isinstance(ch.get("name"), str) and ch["name"].strip():
+                names[str(ch["id"])] = ch["name"].strip()
+    return names
+
+
+def item_label(key, who: str, channels: dict) -> str:
+    """What a card says in place of a raw key: a tracker key or `owner/repo#N` as it is; for chat the channel's
+    configured name, else the person, else `chat thread`; `mail thread`; `calendar`. Never a raw chat or mail id."""
+    k, source = str(key or "").strip(), source_of(key)
+    if source in ("tracker", "code"):
+        return safe_line(k, LABEL_MAX)
+    if source == "chat":
+        name = channels.get(k.split("/", 1)[0]) if "/" in k else None
+        if name:
+            return safe_line("#" + name.lstrip("#"), LABEL_MAX)
+        return safe_line(who, LABEL_MAX) or "chat thread"
+    return _FIXED_LABELS[source]
+
+
+def _who_by_key(ws: Path) -> dict:
+    """{key: who} from the newest inbox line of each key that names someone; a trailing `<id>` is left out."""
+    out = {}
+    for l in hub.read_inbox(ws):
+        who = l.get("who")
+        if isinstance(who, str) and who.strip():
+            out[l["key"]] = re.sub(r"\s*<[^<>]*>\s*$", "", who).strip()
+    return out
+
+
+def inbox_items(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
     """The hub's open updates (what a `now` decision makes), newest first, for the Chief pane's Inbox section. The
-    text is line- or model-written, so each field is one safe line. `session` is the live hub session for the key."""
+    text is line- or model-written, so each field is one safe line. `session` is the live hub session for the key.
+    `source` is the key's kind, `who` the person its newest inbox line names ('' when none) and `label` what a card
+    shows in place of the raw key (`item_label`)."""
     h, sessions = hub._hub_doc(ws), hub._sessions_doc(ws)
+    whos, channels = _who_by_key(ws), _channel_names(cfg or {})
     rows = []
     for u in h["updates"]:
         if not isinstance(u, dict) or u.get("state") != "open" or not isinstance(u.get("id"), str):
             continue
         hit = hub.find_session(sessions, [u.get("key")])
+        who = safe_line(whos.get(u.get("key")) or "", LABEL_MAX)
         rows.append({"id": u["id"], "key": safe_line(u.get("key"), PROGRESS_MAX),
-                     "title": safe_line(u.get("title"), TITLE_MAX), "why": safe_line(u.get("why"), TLDR_MAX),
+                     "title": safe_line(u.get("title"), TITLE_MAX), "why": safe_line(u.get("why"), WHY_MAX),
                      "link": u.get("link") if isinstance(u.get("link"), str) else "", "at": u.get("at"),
+                     "source": source_of(u.get("key")), "who": who, "label": item_label(u.get("key"), who, channels),
                      "session": ({"key": hit[0], "title": safe_line(hit[1].get("title") or hit[0], TITLE_MAX)}
                                  if hit and not _is_cli(hit[1]) else None)})
     rows.sort(key=lambda r: str(r["at"] or ""), reverse=True)
@@ -663,6 +729,99 @@ def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = 
 
 
 
+# ---- health: what the Chief pane's Health tab reads, so the mod opens no more files -----------------------------
+
+WATCHER_KEY_PREFIX = "watcher:"          # an Inbox item about a source the watcher could not read: not work
+WATCHER_ERRORS_MAX = 20
+UNSENT_RE = re.compile(r"^([a-z0-9-]+)-unsent-(\d{4}-\d{2}-\d{2})\.md$")
+UNSENT_MAX_BYTES = 64 * 1024
+UNDELIVERED_MAX = 20
+REASON_MAX = 300
+
+
+def split_watcher_errors(rows: List[dict]) -> Tuple[List[dict], List[dict]]:
+    """(watcher errors, the rest) of inbox_items rows, each in its given order."""
+    errors = [r for r in rows if str(r.get("key") or "").startswith(WATCHER_KEY_PREFIX)]
+    return errors, [r for r in rows if r not in errors]
+
+
+def guard_state(ws: Path) -> str:
+    """`paused` (.mother/PAUSED, which wins), `off` (.mother/GUARD_OFF) or `on`: the one read behind both the
+    status' top-level `guard` and `health.guard`."""
+    state = Path(ws) / ".mother"
+    return "paused" if (state / "PAUSED").exists() else "off" if (state / "GUARD_OFF").exists() else "on"
+
+
+def undelivered(ws: Path) -> List[dict]:
+    """Routine reports that could not be delivered to the manager's DM: <ws>/.mother/<routine>-unsent-<date>.md,
+    newest first, at most UNDELIVERED_MAX. Names only; `mother chief report <name>` prints one."""
+    rows = []
+    try:
+        names = sorted(os.listdir(str(Path(ws) / ".mother")))
+    except OSError:
+        return rows
+    for name in names:
+        m = UNSENT_RE.fullmatch(name)
+        path = Path(ws) / ".mother" / name
+        if not m or path.is_symlink() or not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        rows.append({"name": name, "routine": m.group(1), "date": m.group(2), "bytes": size})
+    rows.sort(key=lambda r: (r["date"], r["name"]), reverse=True)
+    return rows[:UNDELIVERED_MAX]
+
+
+def report_text(ws: Path, name: str) -> Optional[str]:
+    """One undelivered report's text, or None: a name off the pattern, a file that is missing, a link, outside
+    .mother/ or past 64 KB."""
+    if not isinstance(name, str) or not UNSENT_RE.fullmatch(name):
+        return None
+    base = Path(ws) / ".mother"
+    path = base / name
+    try:
+        if path.is_symlink() or not path.is_file() or path.resolve().parent != base.resolve():
+            return None
+        if path.stat().st_size > UNSENT_MAX_BYTES:
+            return None
+        return path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def watcher_health(ws: Path, at: datetime) -> Optional[dict]:
+    """The watcher's heartbeat (.mother/hub/watcher.json) as the pane draws it, or None when it never ran. `stale`
+    as `mother hub status` judges it: inside active hours and older than twice its interval."""
+    w = hub.load_json(ws, "watcher.json", {})
+    w = w if isinstance(w, dict) else {}
+    if not isinstance(w.get("at"), str) or not w["at"]:
+        return None
+    try:
+        every = int(w.get("every_seconds") or hub.DEFAULTS["every_seconds"])
+    except (TypeError, ValueError):
+        every = hub.DEFAULTS["every_seconds"]
+    active, age = bool(w.get("active")), hub._age(w.get("at"), at)
+    sources = {}
+    for cap, ent in sorted((w.get("sources") or {}).items() if isinstance(w.get("sources"), dict) else []):
+        if not isinstance(ent, dict):
+            continue
+        sources[safe_line(cap, 40)] = {
+            "status": safe_line(ent.get("status"), 40) or "unknown", "reason": safe_line(ent.get("reason"), REASON_MAX),
+            "since": ent.get("since") if isinstance(ent.get("since"), str) else None,
+            "at": ent.get("at") if isinstance(ent.get("at"), str) else None}
+    return {"at": w["at"], "every_seconds": every, "active": active,
+            "stale": active and (age is None or age > 2 * every), "sources": sources}
+
+
+def health_doc(ws: Path, at: datetime, errors: List[dict]) -> dict:
+    """ChiefStatus.health: the watcher, its errors (Inbox items keyed `watcher:`), undelivered reports, the guard."""
+    return {"guard": guard_state(ws), "watcher": watcher_health(ws, at),
+            "watcher_errors": errors[:WATCHER_ERRORS_MAX], "watcher_error_count": len(errors),
+            "undelivered": undelivered(ws)}
+
+
 # ---- status and the `mother chief` CLI ----------------------------------------------------------------
 
 ALIVE_SECONDS = 120
@@ -689,17 +848,19 @@ USAGE = """usage: mother chief <verb> ...
   portrait --json       the Chief pane's picture: .mother/portrait.png when it is a PNG of at most 2 MiB, else the
                         bundled one; prints {version, source, width, height, png (base64)}, plus jpeg, jpeg_width and
                         jpeg_height for a small .mother/portrait.jpg, and svg (the bundled vector)
+  report <name>         print one undelivered routine report (.mother/<routine>-unsent-<YYYY-MM-DD>.md, at most
+                        64 KB); exit 2 for any other name or file
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
 
 A valued option takes --opt=V or --opt V."""
 
-# verb: (boolean flags, valued options); no verb takes a positional
+# verb: (boolean flags, valued options); only `report` takes a positional
 VERBS = {
     "lines": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
-    "portrait": (("--json",), ()),
+    "portrait": (("--json",), ()), "report": ((), ()),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -794,14 +955,14 @@ def portrait_doc(ws: Path, bundled: Path = BUNDLED_PORTRAIT, bundled_svg: Path =
 
 def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     """The ChiefStatus document the mod reads (version 1). `led_by` is the session id that wrote the heartbeat
-    (`tick --as`) while that heartbeat is fresh (ALIVE_SECONDS), else None."""
+    (`tick --as`) while that heartbeat is fresh (ALIVE_SECONDS), else None. `guard` is `guard_state`."""
     ws = Path(ws)
     beat_doc = _read_obj(chief_dir(ws) / "heartbeat.json")
     beat = beat_doc.get("at")
     beat_at = hub._parse_at(beat)
     alive = beat_at is not None and (at - beat_at).total_seconds() < ALIVE_SECONDS
     leader = beat_doc.get("session_id")
-    inbox = inbox_items(ws)
+    errors, inbox = split_watcher_errors(inbox_items(ws, cfg))   # a `watcher:` item is not work: it goes to health
     tz = nowmod.Schedule.from_config(cfg or {}).tz
     spent, limit = round(spent_today(ws, at, tz), 6), float(settings(cfg)["daily_budget_usd"])
     unreadable = _spend_unreadable(ws)
@@ -813,6 +974,8 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "led_by": leader if alive and isinstance(leader, str) and leader else None,
         "inbox": inbox[:INBOX_MAX],
         "inbox_count": len(inbox),
+        "guard": guard_state(ws),
+        "health": health_doc(ws, at, errors),
     }
 
 
@@ -873,9 +1036,17 @@ def main(args, ws, cfg, at) -> int:
         opts, pos = _parse(rest, flags, valued)
     except ValueError as e:
         return _usage(str(e))
-    if pos:
+    if pos and verb != "report":
         return _usage("%s takes no arguments" % verb)
     ws = Path(ws)
+    if verb == "report":
+        text = report_text(ws, pos[0]) if len(pos) == 1 else None
+        if text is None:
+            print("mother chief report: not an undelivered report (a name like brief-unsent-2026-01-31.md, in "
+                  ".mother/, at most 64 KB)", file=sys.stderr)
+            return EXIT_USAGE
+        sys.stdout.write(text)
+        return EXIT_OK
     as_json = bool(opts.get("json"))
     if verb in ("pause", "resume"):
         (pause if verb == "pause" else resume)(ws)
