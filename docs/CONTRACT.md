@@ -1444,7 +1444,8 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     it. The mod does the guard's checks itself: nothing goes out under `MOTHER_DRY_RUN` or either PAUSED file, only the
     manager's `D…` channel is posted to, and `mother chief post-log --stdin` writes each attempt and its outcome to
     `guard.log` as `decision: "mod post: attempt|posted|unsure|failed|record dropped"`, with target and reason, never the text. A
-    post that may have landed (a timeout, no readable ts) is never re-posted before `batch_minutes`, and gets one wake
+    post that may have landed (a timeout, no readable ts) is never re-posted before `batch_minutes` while the chief's process runs (the hold is session state: after a
+    restart the 2 posts per content are the bound), and gets one wake
     line per batch. One that surely failed backs off 2, 4, 8 … minutes up to `batch_minutes`, with one wake line at the
     cap, or on its first failure if the batch holds an urgent decision. A new urgent decision ends a hold, at most 3
     times in a rolling hour and never within 2 minutes of the last attempt; past that it waits, and its card and toast
@@ -1460,21 +1461,33 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     - Per content: at most 2 counted posts, refused by `sent` or unsure alike. A recorded post clears the count. After
       the second, nothing for that content until 6 hours after its last post; then 2 more. A changed content starts at 0.
     - Across all contents: at most 4 counted posts in any rolling 60 minutes, urgent hold-ends included.
-    - So, exactly: while the rows and confirm lines don't change, at most 2 DMs in any window that ends 6 hours after
-      the second; and at most 4 in any hour whatever changes, which is 96 a day only if the content changes before every
-      post. Between counted posts that weren't recorded the hold applies (`batch_minutes`, default 30; ended early by an
+    - So, exactly, by when a post is counted: while the rows and confirm lines don't change, at most 2 posts in any window
+      that ends 6 hours after the second; and at most 4 counted in any hour whatever changes, which is 96 a day only if the
+      content changes before every post.
+    - By when a DM lands, one more: a hand post is counted when its line is queued, and can land up to the 30 minutes a
+      busy chief turn holds that line (`STUCK_TURN_MS`). With changing content and urgent hold-ends, 5 DMs can land inside
+      one rolling hour: line counted at 0, mod posts at 35, 38 and 41, the hand post at 45, the next post at 61 once 0 has
+      left the list. Each hand post whose count fell out of that hour before it landed adds one in the same way.
+    - Between counted posts that weren't recorded the hold applies (`batch_minutes`, default 30; ended early by an
       urgent decision at most 3 times an hour, never within 2 minutes of an attempt). A recorded post clears the hold,
       so a confirm-only batch can follow it at the next tick, inside the hourly 4.
-    - The counts live in the mod's `$.store` (key `chiefPostCounts`, one entry per workspace path), which the host keeps
-      between sessions: a reload of the mod, a restart of the chief's Claude process by `mother chief install`, the
+    - The counts live in the mod's `$.store`, one key per workspace (`chiefPostCounts:<workspace path>`), which the host
+      keeps between sessions: a reload of the mod, a restart of the chief's Claude process by `mother chief install`, the
       keeper restarting it (in a loop too) or the machine, all keep the hour's posts and the stop. Each write prunes:
       a post list keeps its last hour, and a workspace with no post for 7 hours (the cool-off and an hour) leaves the
-      store, as it then holds nothing. Counts that can't be read or written post nothing, and the Chief pane says so.
-      The rest of the post state (holds, wake lines, a `sent` owed) stays in session state.
+      store (`keys` and `delete`), as it then holds nothing. Counts that can't be read or written post nothing, and the
+      Chief pane says so.
+    - The rest of the post state (holds, wake lines, a `sent` owed) stays in session state, so a restart drops it. No
+      hold means the next post can go at the next tick, and a dropped `sent` leaves a landed post unrecorded, so its
+      content can be posted once more. The counts still hold: 2 per content, 4 an hour.
     - Outside the counts: a post that returned a clear error but landed anyway; a chief that posts the live offer
       against its routine (the guard lets that exact text through, previews off, until `sent`); green posts to the DM
       from normal sessions. A decision filed between the tick and `decide batch` is posted under the tick's key, so its
-      content can get one post more than 2; the hourly cap still holds.
+      content can get one post more than 2; the hourly cap still holds. Two processes on one workspace, when an old and a
+      new chief overlap in a restart: `$.store` locks each write, not a read and the write that follows, so one can lose
+      the other's count, which allows one more post per collision. A prune that reads a quiet workspace's key just as its
+      chief writes can delete that write. The store is per plugin source, so running Mother from another source (a dev
+      directory instead of the marketplace) starts from empty counts.
   - **A `sent` that fails.** No new batch goes out while one is owed. After 3 failures in a row the chief gets one wake
     line, "The batch record is failing", with the ids and ts to run `sent` with once, and the mod retries once per
     `batch_minutes`. A `sent` that exits 2 drops the debt, isn't a record failure and logs `mod post: record dropped`.

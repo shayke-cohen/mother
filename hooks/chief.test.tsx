@@ -27,6 +27,7 @@ function status(over: Record<string, unknown> = {}) {
 }
 
 type Cli = { exitCode: number; stdout?: string; stderr?: string }
+const ON_GET = '__test_on_get'
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, role: string, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
@@ -36,8 +37,16 @@ async function boot($: any, on: any, role: string, chief: (argv: string[], stdin
   mock.env(on, { HOME: '/home/m', ...env })
   const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
   // $.store, from memory: what a test seeds is what an earlier process left behind
-  on('store.get', (_: any, e: any) => (store === 'broken' ? { deny: 'unreadable' } : { value: store[e.key] }))
+  // per key, as the host merges each write into the file under its lock; `ON_GET` lets a test act as another process
+  on('store.get', (_: any, e: any) => {
+    if (store === 'broken') return { deny: 'unreadable' }
+    const v = store[e.key]
+    if (typeof store[ON_GET] === 'function') (store[ON_GET] as (k: string) => void)(e.key)
+    return { value: v }
+  })
   on('store.set', (_: any, e: any) => { if (store === 'broken') return { deny: 'unwritable' }; store[e.key] = e.value; return { value: undefined } })
+  on('store.delete', (_: any, e: any) => { if (store === 'broken') return { deny: 'unwritable' }; delete store[e.key]; return { value: undefined } })
+  on('store.keys', () => (store === 'broken' ? { deny: 'unreadable' } : { value: Object.keys(store).filter(k => k !== ON_GET) }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('ui.status', (_: any, e: any) => { out.status.push(e.text); return { value: undefined } })
   on('ui.toast', (_: any, e: any) => { out.toasts.push(e.text); return { value: undefined } })
@@ -2362,7 +2371,8 @@ test('test_a_stop_holds_while_only_the_header_changes', async ($, on) => {
 
 // ---- the counts outlive the chief's process: a keeper restarting it in a loop must not reset the cap or the stop ----
 const MIN = 60_000
-const seeded = (counts: Record<string, unknown>) => ({ chiefPostCounts: counts })
+const KEY = (ws: string) => `chiefPostCounts:${ws}`
+const seeded = (counts: Record<string, unknown>): Record<string, any> => Object.fromEntries(Object.entries(counts).map(([ws, c]) => [KEY(ws), c]))
 
 test('test_a_fresh_process_honours_the_hours_posts_an_earlier_one_made', async ($, on) => {
   // what the previous process left: 4 posts in the last 10 minutes, of other contents
@@ -2386,26 +2396,47 @@ test('test_a_fresh_process_keeps_an_earlier_ones_stop', async ($, on) => {
 })
 
 test('test_the_counts_are_per_workspace_and_old_ones_are_pruned', async ($, on) => {
-  const store: Record<string, any> = seeded({
-    '/other/ws': { offerKey: 'x', offerPosts: 2, offerLastAt: NOW - 8 * 60 * MIN, postsAt: [NOW - 8 * 60 * MIN] },   // long quiet
-    '/busy/ws': { offerKey: 'y', offerPosts: 1, offerLastAt: NOW - 2 * MIN, postsAt: [NOW - 2 * MIN, NOW - 90 * MIN] },
-  })
+  const busy = { offerKey: 'y', offerPosts: 1, offerLastAt: NOW - 2 * MIN, postsAt: [NOW - 2 * MIN, NOW - 90 * MIN] }
+  const store: Record<string, any> = {
+    ...seeded({ '/other/ws': { offerKey: 'x', offerPosts: 2, offerLastAt: NOW - 8 * 60 * MIN, postsAt: [NOW - 8 * 60 * MIN] },   // long quiet
+                '/busy/ws': busy }),
+    chiefPostCounts: { [WS]: { offerPosts: 2, postsAt: [] } },               // the one shared value an older build kept
+    toasted: ['kept'],                                                        // not ours to prune
+  }
   const { clock, posts } = await bootBatch($, on, UNSURE_POST, { files: EIGHT, store })
   await clock.advance(30_000)
   expect(posts.length).toBe(1)                                                // another workspace's posts don't count here
-  const counts = store.chiefPostCounts
-  expect(Object.keys(counts).sort()).toEqual(['/busy/ws', WS].sort())
-  expect(counts['/busy/ws'].postsAt).toEqual([NOW - 2 * MIN])                // its list keeps the hour
-  expect(counts[WS].offerPosts).toBe(1)
-  expect(counts[WS].postsAt.length).toBe(1)
+  expect(Object.keys(store).sort()).toEqual([KEY('/busy/ws'), KEY(WS), 'toasted'].sort())
+  expect(store[KEY('/busy/ws')]).toEqual(busy)                               // another workspace's key is its own process's to write
+  expect(store[KEY(WS)].offerPosts).toBe(1)
+  expect(store[KEY(WS)].postsAt.length).toBe(1)
+})
+
+test('test_two_workspaces_writing_at_once_lose_neither_count', async ($, on) => {
+  // another chief, in /second/ws, counts a post between this one's read and its write
+  const store: Record<string, any> = seeded({ '/second/ws': { offerKey: 's', offerPosts: 1, offerLastAt: NOW - MIN, postsAt: [NOW - MIN] } })
+  let raced = false
+  store[ON_GET] = (k: string) => {
+    if (raced || k !== KEY(WS)) return
+    raced = true
+    const other = store[KEY('/second/ws')]
+    store[KEY('/second/ws')] = { ...other, offerPosts: 2, offerLastAt: NOW, postsAt: [...other.postsAt, NOW] }
+  }
+  const { clock, posts } = await bootBatch($, on, UNSURE_POST, { files: EIGHT, store })
+  await clock.advance(30_000)
+  expect(posts.length).toBe(1)
+  expect(raced).toBe(true)
+  expect(store[KEY('/second/ws')].offerPosts).toBe(2)                         // its increment stands
+  expect(store[KEY('/second/ws')].postsAt).toEqual([NOW - MIN, NOW])
+  expect(store[KEY(WS)].offerPosts).toBe(1)                                   // and so does this one's
 })
 
 test('test_a_recorded_post_clears_the_contents_count_but_not_the_hours', async ($, on) => {
   const store: Record<string, any> = {}
   const { clock } = await bootBatch($, on, postedOk, { files: EIGHT, store })
   await clock.advance(30_000)
-  expect(store.chiefPostCounts[WS].offerPosts).toBe(0)
-  expect(store.chiefPostCounts[WS].postsAt.length).toBe(1)
+  expect(store[KEY(WS)].offerPosts).toBe(0)
+  expect(store[KEY(WS)].postsAt.length).toBe(1)
 })
 
 test('test_unreadable_counts_post_nothing', async ($, on) => {

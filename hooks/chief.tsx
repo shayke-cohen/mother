@@ -373,7 +373,8 @@ const idleAfter = (prev: ChiefBatchState | null): ChiefBatchState =>
 // content (4 is the cap). In $.store, by workspace, not in session state: a keeper that restarts the chief's process in a
 // loop must not reset the cap. Only a recorded batch clears a content's count (`recorded`), and only the hour the hour's.
 export type PostCounts = { offerKey: string | null; offerPosts: number; offerLastAt: number | null; postsAt: number[] }
-export const POSTS_STORE = 'chiefPostCounts'
+const POSTS_STORE = 'chiefPostCounts:'     // and the workspace's path
+const POSTS_STORE_OLD = 'chiefPostCounts'
 const COUNTS_KEEP_MS = COOL_OFF_MS + HOUR_MS   // a workspace quiet this long has nothing left to hold, so it's dropped
 const asCounts = (v: any): PostCounts => ({
   offerKey: typeof v?.offerKey === 'string' ? v.offerKey : null,
@@ -395,32 +396,39 @@ async function postCounts($: Dollar, bin: string): Promise<PostCounts | null> {
   const ws = await workspace($, bin)
   if (!ws) return null
   try {
-    const all: any = await $.store.get(POSTS_STORE)
-    return asCounts(all && typeof all === 'object' ? all[ws] : undefined)
+    return asCounts(await $.store.get(POSTS_STORE + ws))
   } catch {
     return null
   }
 }
 
-// Change this workspace's counts; false when they couldn't be written (nothing is posted then). Each write prunes:
-// a post list keeps its hour, and a workspace quiet past the cool-off and an hour leaves the store.
+const quietCounts = (c: PostCounts, nowMs: number): boolean => nowMs - Math.max(c.offerLastAt ?? 0, ...c.postsAt, 0) >= COUNTS_KEEP_MS
+
+// A workspace that has gone quiet leaves the store, as does the one shared value an older build kept. Another workspace's
+// live key is its own process's to write. Best effort: a prune that fails costs nothing but a key.
+async function pruneCounts($: Dollar, mine: string, nowMs: number): Promise<void> {
+  try {
+    for (const k of await $.store.keys()) {
+      if (k === POSTS_STORE_OLD) await $.store.delete(k)
+      else if (k.startsWith(POSTS_STORE) && k !== mine && quietCounts(asCounts(await $.store.get(k)), nowMs)) await $.store.delete(k)
+    }
+  } catch { /* the next write tries again */ }
+}
+
+// Change this workspace's counts; false when they couldn't be written (nothing is posted then). A post list keeps its
+// hour, and counts past the cool-off and an hour start over. One key per workspace: the host merges each write into the
+// store under its lock, so two chiefs in two workspaces can't lose each other's counts.
 async function writeCounts($: Dollar, bin: string, fn: (c: PostCounts) => PostCounts): Promise<boolean> {
   const ws = await workspace($, bin)
   if (!ws) return false
+  const key = POSTS_STORE + ws
   try {
     const nowMs = await $.clock.now()
-    const raw: any = await $.store.get(POSTS_STORE)
-    const all: Record<string, PostCounts> = {}
-    for (const [k, v] of Object.entries(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {})) {
-      const c = asCounts(v)
-      const prunedC = { ...c, postsAt: lastHour(c, nowMs) }
-      const quiet = nowMs - Math.max(c.offerLastAt ?? 0, ...c.postsAt, 0) >= COUNTS_KEEP_MS
-      if (k === ws || !quiet) all[k] = quiet ? asCounts(undefined) : prunedC
-    }
-    const mine = fn(all[ws] ?? asCounts(undefined))
-    if (mine.offerKey === null && mine.offerPosts === 0 && mine.postsAt.length === 0) delete all[ws]
-    else all[ws] = mine
-    await $.store.set(POSTS_STORE, all)
+    const had = asCounts(await $.store.get(key))
+    const mine = fn(quietCounts(had, nowMs) ? asCounts(undefined) : { ...had, postsAt: lastHour(had, nowMs) })
+    if (mine.offerKey === null && mine.offerPosts === 0 && mine.postsAt.length === 0) await $.store.delete(key)
+    else await $.store.set(key, mine)
+    await pruneCounts($, key, nowMs)
     return true
   } catch {
     return false
