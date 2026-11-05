@@ -173,28 +173,17 @@ Without it the Now panel shows `whatsapp ✗` and `mother hub status` says the s
 Finally run `/mother:hub` once in a pinned session, in normal permission mode (not bypass), and leave it open: it
 wakes on each update and routes it. `mother hub status` shows whether the watcher and hub are keeping up.
 
-**Turn on the chief (optional).** The chief is a long-lived Claude Code session that decides the hub's inbox lines
-and starts headless workers for the ones that need work; the Chief pane in the desktop app shows it, its workers and
-your pinned desktop sessions. On the home machine run `mother chief install`: it writes a launchd job whose keeper
-keeps a tmux session named `mother-chief` alive. The chief runs in bypass-permissions mode, so the first time run
-`tmux attach -t mother-chief` and accept that warning yourself; nothing accepts it for you. The chief replaces a
-desktop `/mother:hub` session (there is one inbox cursor), and the install refuses while one is active unless you
-pass `--force`. Caps (`max_workers`, `run_minutes`, `daily_budget_usd`, models) live in an optional `chief` block of
-`config.json`. After a plugin update run `mother chief install` again. `mother chief status` shows the state, and
-`mother chief pause` / `resume` is its own switch (it never touches `.mother/PAUSED`).
-
-A worker never sends anything itself. When it wants to post, reply or comment, it files a decision with the exact
-call; every so often (`batch_minutes`) the chief posts the open ones to your own DM, and the Chief pane shows them as
-cards. Reply `7 ok`, `7 no`, `7 edit: <text>` or `ok all`, or press a button. A call with several fields, such as a new
-ticket, can't be edited: reply `7: <your words>` to tell the worker what to change (a number followed by other words is
-just a note). Only your answer counts, and it lets that one call through, once, unchanged; every other send, post or
-comment the worker tries is refused, and it can't write to your DM at all. A call the guard could never let through,
-such as a reply in someone's DM, is refused when it's filed, so the worker tells you instead. Your own other sessions
-can still post to your DM, so a message there that looks like a batch but isn't one holds replies to the rows it names
-until the next real batch, which tells you. That check matches a pattern, so read a batch you didn't expect with care,
-and the Chief pane always shows the real draft. The next batch says what happened: "the call was made" means the guard let it through, not that the service accepted
-it. Workers are strict: no shell commands beyond a short allow-list (not even `npm test`) and file writes only inside the
-workspace. This is a guard, not a sandbox, and the decision flow needs a live check after you install.
+**The Chief pane (desktop app).** `/chief` opens a pane beside the chat with what needs you: **Needs you** (a pinned
+session that stopped on a question, with its options as buttons), the hub's **Inbox** (what the inbox lines came
+to, with Done, Snooze and Open session), your **pinned desktop sessions** (a two-line TL;DR, a chat box, a
+recommended reply as a chip you still press Send on, Open) and **Health**. One desktop session at a time leads: it
+reads the hub's inbox lines every minute, asks a cheap model whether each one needs attention, and records the
+answer in code, so nothing that reaches another person happens from here without your hand. Every message into a
+pinned session is asked by the guard, whoever sends it. `mother chief status` shows who leads and today's model
+spend against `daily_budget_usd` (an optional `chief` block of `config.json`, with `tldr_model` and `triage_model`);
+`mother chief pause` / `resume` is its own switch (it never touches `.mother/PAUSED`). Until 0.18.0 this layer also
+ran a long-lived chief session and headless workers that filed decisions to your DM; those are gone, and their old
+keys in `config.json` are ignored.
 
 **Another computer, same workspace:** install the plugin, run `mother link` as above, then
 `mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines

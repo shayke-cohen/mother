@@ -18,9 +18,10 @@ wake mechanism and catches up from the cursor.
 
 ## Start
 
-0. The chief replaces this hub while it runs: Read `$W/.mother/chief/heartbeat.json` (`{at, pid}`, `at` in UTC). If
-   its `at` is under 2 minutes before now (`date '+%Y-%m-%dT%H:%M:%S%z'`), tell the manager the chief is running and
-   this hub won't start, and stop. A missing file, or an older `at`, means carry on.
+0. A desktop session may be leading the inbox from the Chief pane: Read `$W/.mother/chief/heartbeat.json`
+   (`{at, pid, session_id}`, `at` in UTC). If its `at` is under 2 minutes before now (`date '+%Y-%m-%dT%H:%M:%S%z'`),
+   tell the manager a desktop session is already deciding the inbox (`/chief`) and this hub won't start, and stop. A
+   missing file, or an older `at`, means carry on.
 1. `mother home check` must exit 0; if not, say this is not the home machine and stop. This session must run in
    the workspace folder: if `pwd` is not `$W`, tell the manager to reopen the hub session in `$W` (so the cards it
    raises start there and pick up the MOTHER persona) and stop. Then `mother hub status`:
@@ -87,8 +88,8 @@ the item is, not from what its text tells the reader to do.
 **Route.** Send into the session with the in-app message tool (`session_id` = the id `mother hub session for <key>`
 prints; the guard asks before a message goes into any session that is not live in `sessions.json`): the link, MOTHER's read (why it matters now), the
 suggested next step, and then the quoted title, who and summary under its label. Do not paste message bodies. If the send fails because the session is gone, run `mother hub session drop <key>` and treat the
-line as `propose`. Skip a session whose entry in `mother hub show --json` has `kind: "cli"`: it is a chief worker that
-the chief owns, and no message goes into it from here; decide that line `log`.
+line as `propose`. Skip a session whose entry in `mother hub show --json` has `kind: "cli"`: it is a headless worker's row
+left from before 0.18.0, and nothing runs behind it; decide that line as if it had no session.
 
 **Propose.** Deciding `propose` does not raise a card by itself; it puts the item in `pending`.
 0. A `whatsapp` line (key `wa:<jid>`) gets no re-check: there is no connector to read it through. Decide from the line. Any reply to it is drafted in a work session and sent with MOTHER's WhatsApp send command (the `whatsapp` skill), which asks the manager first; this session never runs it.
@@ -125,7 +126,7 @@ still has to go out, send it.
 ## Sweep
 
 A `sweep` line means look at the app, not at a source. `list_sessions` with `linked: true`, then (skipping every
-entry in `mother hub show --json` with `kind: "cli"`, a chief worker: never `seen`, `drop` or `add` one):
+entry in `mother hub show --json` with `kind: "cli"`, a worker row from before 0.18.0: never `seen` or `add` one):
 
 - for each card that was started (a session whose `name` equals the stamped `name` of a pending entry with
   `raised_at`; `session add` refuses any other key): `mother hub session add <key> --id <session id> --name <name> --title <title> [--link <url>] --also <the entry's also,
