@@ -1452,8 +1452,8 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     chief runs `batch`, posts the text and runs `sent`; it may have landed, so the chief looks in the DM's history, runs
     `sent` with the ts if it's there, and never posts; or the record is failing, as below. Every post, the mod's and the
     chief's, passes `unfurl_links: false` and `unfurl_media: false`; the guard refuses the chief's post without both.
-  - **How many posts.** The mod counts a post just before `$.mcp.call`, so a reload of the mod in the middle of one
-    keeps it. A post that surely did not land (a clear error before or from the call) gives its count back. The wake line
+  - **How many posts.** The mod counts a post just before `$.mcp.call`, so a reload of the mod or a restart of the
+    chief's process in the middle of one keeps it; if the count can't be written, nothing is posted. A post that surely did not land (a clear error before or from the call) gives its count back. The wake line
     asking the chief for a hand post takes one, and isn't sent when none is left. An offer's content is its rows and
     confirm lines: `batch_key` in `mother chief tick --json`, a hash of the batch text without its header line (whose
     "done without you" count moves with every worker run), read without making an offer.
@@ -1465,9 +1465,12 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
       post. Between counted posts that weren't recorded the hold applies (`batch_minutes`, default 30; ended early by an
       urgent decision at most 3 times an hour, never within 2 minutes of an attempt). A recorded post clears the hold,
       so a confirm-only batch can follow it at the next tick, inside the hourly 4.
-    - The counts live in the mod's post state, `$.state`, which the host holds for the running session. A reload of the
-      mod keeps it. A restart of the chief's Claude process, by `mother chief install`, the keeper restarting it or the
-      machine, starts it empty, even though the session id is resumed: up to 4 more in that hour.
+    - The counts live in the mod's `$.store` (key `chiefPostCounts`, one entry per workspace path), which the host keeps
+      between sessions: a reload of the mod, a restart of the chief's Claude process by `mother chief install`, the
+      keeper restarting it (in a loop too) or the machine, all keep the hour's posts and the stop. Each write prunes:
+      a post list keeps its last hour, and a workspace with no post for 7 hours (the cool-off and an hour) leaves the
+      store, as it then holds nothing. Counts that can't be read or written post nothing, and the Chief pane says so.
+      The rest of the post state (holds, wake lines, a `sent` owed) stays in session state.
     - Outside the counts: a post that returned a clear error but landed anyway; a chief that posts the live offer
       against its routine (the guard lets that exact text through, previews off, until `sent`); green posts to the DM
       from normal sessions. A decision filed between the tick and `decide batch` is posted under the tick's key, so its

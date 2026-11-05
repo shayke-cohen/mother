@@ -30,12 +30,14 @@ type Cli = { exitCode: number; stdout?: string; stderr?: string }
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, role: string, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
-                    surface: 'terminal' | 'desktop' = 'terminal', sessionId = 'chief-1', files: Record<string, string> = {}, env: Record<string, string> = {}) {
+                    surface: 'terminal' | 'desktop' = 'terminal', sessionId = 'chief-1', files: Record<string, string> = {}, env: Record<string, string> = {},
+                    store: Record<string, unknown> | 'broken' = {}) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m', ...env })
   const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
-  on('store.get', () => ({ value: undefined }))
-  on('store.set', () => ({ value: undefined }))
+  // $.store, from memory: what a test seeds is what an earlier process left behind
+  on('store.get', (_: any, e: any) => (store === 'broken' ? { deny: 'unreadable' } : { value: store[e.key] }))
+  on('store.set', (_: any, e: any) => { if (store === 'broken') return { deny: 'unwritable' }; store[e.key] = e.value; return { value: undefined } })
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('ui.status', (_: any, e: any) => { out.status.push(e.text); return { value: undefined } })
   on('ui.toast', (_: any, e: any) => { out.toasts.push(e.text); return { value: undefined } })
@@ -1286,7 +1288,7 @@ const FILES = {
 const postedOk = () => ({ value: { content: [{ type: 'text', text: JSON.stringify({ ok: true, channel: DM, ts: POST_TS }) }], isError: false } })
 
 // A chief (or `role`) whose tick asks for a batch while `due()`; `mcp` answers the post.
-type BatchOpts = { role?: string; key?: () => string; due?: () => boolean; files?: Record<string, string>; sent?: () => Cli; batch?: () => Cli | undefined; tick?: Record<string, unknown>; env?: Record<string, string>; log?: () => Cli | undefined; decisions?: () => unknown[] }
+type BatchOpts = { role?: string; key?: () => string; store?: Record<string, unknown> | 'broken'; due?: () => boolean; files?: Record<string, string>; sent?: () => Cli; batch?: () => Cli | undefined; tick?: Record<string, unknown>; env?: Record<string, string>; log?: () => Cli | undefined; decisions?: () => unknown[] }
 // the tick's `batch_key` names what `decide batch` would print: as in the real CLI, other text is another key
 const keyOf = (got: Cli | undefined): string => {
   try { return String(JSON.parse(String(got?.stdout ?? JSON.stringify(BATCH)))?.text) } catch { return 'unreadable' }
@@ -1302,7 +1304,7 @@ async function bootBatch($: any, on: any, mcp: () => any, opts: BatchOpts = {}) 
     if (argv[0] === 'post-log') { logs.push(JSON.parse(String(stdin))); return opts.log?.() }
     if (argv[0] === 'status' && opts.decisions) return withDecisions(opts.decisions())
     return undefined
-  }, 'terminal', 'chief-1', opts.files ?? FILES, opts.env ?? {})
+  }, 'terminal', 'chief-1', opts.files ?? FILES, opts.env ?? {}, opts.store ?? {})
   return { ...booted, posts, logs }
 }
 const lineCount = (out: { submits: string[] }) => out.submits.filter(t => t.includes(WAKE_LINE)).length
@@ -2356,4 +2358,61 @@ test('test_a_stop_holds_while_only_the_header_changes', async ($, on) => {
   })
   for (let i = 0; i < 60; i++) await clock.advance(30_000)
   expect(posts.length).toBe(2)
+})
+
+// ---- the counts outlive the chief's process: a keeper restarting it in a loop must not reset the cap or the stop ----
+const MIN = 60_000
+const seeded = (counts: Record<string, unknown>) => ({ chiefPostCounts: counts })
+
+test('test_a_fresh_process_honours_the_hours_posts_an_earlier_one_made', async ($, on) => {
+  // what the previous process left: 4 posts in the last 10 minutes, of other contents
+  const store = seeded({ [WS]: { offerKey: 'older', offerPosts: 1, offerLastAt: NOW - 10 * MIN, postsAt: [NOW - 40 * MIN, NOW - 30 * MIN, NOW - 20 * MIN, NOW - 10 * MIN] } })
+  const { clock, posts } = await bootBatch($, on, postedOk, { files: EIGHT, store })
+  for (let i = 0; i < 39; i++) await clock.advance(30_000)                    // 19.5 minutes: all 4 still in the hour
+  expect(posts.length).toBe(0)
+  for (let i = 0; i < 2; i++) await clock.advance(30_000)                     // the oldest is past the hour
+  expect(posts.length).toBe(1)
+})
+
+test('test_a_fresh_process_keeps_an_earlier_ones_stop', async ($, on) => {
+  const store = seeded({ [WS]: { offerKey: BATCH.text, offerPosts: 2, offerLastAt: NOW - 60 * MIN, postsAt: [] } })
+  const { clock, posts } = await bootBatch($, on, postedOk, { files: EIGHT, store })
+  for (let i = 0; i < 20; i++) await clock.advance(30_000)
+  expect(posts.length).toBe(0)
+  expect(await stopShown($)).toBe(true)
+  await clock.advance(5 * 60 * MIN)                                           // 6 hours after its last post
+  await clock.advance(30_000)
+  expect(posts.length).toBeGreaterThan(0)
+})
+
+test('test_the_counts_are_per_workspace_and_old_ones_are_pruned', async ($, on) => {
+  const store: Record<string, any> = seeded({
+    '/other/ws': { offerKey: 'x', offerPosts: 2, offerLastAt: NOW - 8 * 60 * MIN, postsAt: [NOW - 8 * 60 * MIN] },   // long quiet
+    '/busy/ws': { offerKey: 'y', offerPosts: 1, offerLastAt: NOW - 2 * MIN, postsAt: [NOW - 2 * MIN, NOW - 90 * MIN] },
+  })
+  const { clock, posts } = await bootBatch($, on, UNSURE_POST, { files: EIGHT, store })
+  await clock.advance(30_000)
+  expect(posts.length).toBe(1)                                                // another workspace's posts don't count here
+  const counts = store.chiefPostCounts
+  expect(Object.keys(counts).sort()).toEqual(['/busy/ws', WS].sort())
+  expect(counts['/busy/ws'].postsAt).toEqual([NOW - 2 * MIN])                // its list keeps the hour
+  expect(counts[WS].offerPosts).toBe(1)
+  expect(counts[WS].postsAt.length).toBe(1)
+})
+
+test('test_a_recorded_post_clears_the_contents_count_but_not_the_hours', async ($, on) => {
+  const store: Record<string, any> = {}
+  const { clock } = await bootBatch($, on, postedOk, { files: EIGHT, store })
+  await clock.advance(30_000)
+  expect(store.chiefPostCounts[WS].offerPosts).toBe(0)
+  expect(store.chiefPostCounts[WS].postsAt.length).toBe(1)
+})
+
+test('test_unreadable_counts_post_nothing', async ($, on) => {
+  const { clock, posts } = await bootBatch($, on, postedOk, { files: EIGHT, store: 'broken' })
+  for (let i = 0; i < 4; i++) await clock.advance(30_000)
+  expect(posts.length).toBe(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /post counts can't be read or written/)).toBe(true)
+  await ui.unmount()
 })

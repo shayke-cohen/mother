@@ -323,7 +323,8 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 //   later batch replaced the offer.
 // - anything else: the re-read didn't find the offered text at that ts (final ruling I1). The post may have landed
 //   all the same, so it is handled as one that may have: one check line for the chief.
-// Posts are bounded whatever the outcomes. Each is counted before it goes out, so a reload during one keeps it; a post
+// Posts are bounded whatever the outcomes. Each is counted before it goes out, in $.store per workspace, so a reload or
+// a restart of the chief's process (a keeper looping it included) keeps the counts; a post
 // that surely did not land gives its count back, and the one hand-post line takes one. An offer's content (`batch_key`
 // from the tick: its rows and confirm lines, not the header; it makes no offer) gets 2 posts unless one is recorded; then posting stops until the content changes
 // or 6 hours after its last post. All batch posts together: 4 in any rolling hour, urgent ones too. docs/CONTRACT.md has
@@ -363,23 +364,69 @@ const FIRST_BACKOFF_MINUTES = 2
 const REFUSED_CALL_RE = /no connected|not connected|denied|refus|forbidden|unauthori[sz]ed|not allowed|permission|unknown tool|no such tool|not found|invalid|missing/i
 const TIMED_OUT_RE = /time[d\s-]*out/i
 const IDLE_BATCH: ChiefBatchState = { sentOwed: null, holdUntil: 0, failures: 0, wokenFor: null, lineDue: false, note: null, urgentSeen: [],
-  holdEnds: [], lastAttemptAt: null, sentFailures: 0, sentRetryAt: 0, recordLineDue: false, recordWoken: false, checkLine: null, offerKey: null, offerPosts: 0, offerLastAt: null, postsAt: [] }
-// Back to idle; the urgent rate limit outlives any one batch, or a landed post would reset it. So do the post counts:
-// only a recorded batch clears an offer's (`cleared`), and nothing clears the hour's but the hour.
+  holdEnds: [], lastAttemptAt: null, sentFailures: 0, sentRetryAt: 0, recordLineDue: false, recordWoken: false, checkLine: null }
+// Back to idle; the urgent rate limit outlives any one batch, or a landed post would reset it.
 const idleAfter = (prev: ChiefBatchState | null): ChiefBatchState =>
-  ({ ...IDLE_BATCH, holdEnds: prev?.holdEnds ?? [], lastAttemptAt: prev?.lastAttemptAt ?? null, offerKey: prev?.offerKey ?? null,
-    offerPosts: prev?.offerPosts ?? 0, offerLastAt: prev?.offerLastAt ?? null, postsAt: prev?.postsAt ?? [] })
-const cleared = (prev: ChiefBatchState | null): ChiefBatchState => ({ ...idleAfter(prev), offerKey: null, offerPosts: 0, offerLastAt: null })
-const lastHour = (st: ChiefBatchState, nowMs: number): number[] => (st.postsAt ?? []).filter(t => nowMs - t < HOUR_MS)
-const counted = (prev: ChiefBatchState | null, key: string, at: number): ChiefBatchState => {
-  const p = prev ?? IDLE_BATCH
-  return { ...p, offerKey: key, offerPosts: (p.offerKey === key ? p.offerPosts ?? 0 : 0) + 1, offerLastAt: at, postsAt: [...lastHour(p, at), at] }
+  ({ ...IDLE_BATCH, holdEnds: prev?.holdEnds ?? [], lastAttemptAt: prev?.lastAttemptAt ?? null })
+
+// The post counts: the content's posts not recorded (2 stop it), when its last one went, and the hour's posts of any
+// content (4 is the cap). In $.store, by workspace, not in session state: a keeper that restarts the chief's process in a
+// loop must not reset the cap. Only a recorded batch clears a content's count (`recorded`), and only the hour the hour's.
+export type PostCounts = { offerKey: string | null; offerPosts: number; offerLastAt: number | null; postsAt: number[] }
+export const POSTS_STORE = 'chiefPostCounts'
+const COUNTS_KEEP_MS = COOL_OFF_MS + HOUR_MS   // a workspace quiet this long has nothing left to hold, so it's dropped
+const asCounts = (v: any): PostCounts => ({
+  offerKey: typeof v?.offerKey === 'string' ? v.offerKey : null,
+  offerPosts: typeof v?.offerPosts === 'number' && v.offerPosts > 0 ? Math.floor(v.offerPosts) : 0,
+  offerLastAt: typeof v?.offerLastAt === 'number' ? v.offerLastAt : null,
+  postsAt: Array.isArray(v?.postsAt) ? v.postsAt.filter((t: unknown): t is number => typeof t === 'number') : [],
+})
+const lastHour = (c: PostCounts, nowMs: number): number[] => c.postsAt.filter(t => nowMs - t < HOUR_MS)
+const counted = (c: PostCounts, key: string, at: number): PostCounts =>
+  ({ offerKey: key, offerPosts: (c.offerKey === key ? c.offerPosts : 0) + 1, offerLastAt: at, postsAt: [...lastHour(c, at), at] })
+const uncounted = (c: PostCounts, at: number): PostCounts => {
+  const i = c.postsAt.lastIndexOf(at)
+  return { ...c, offerPosts: Math.max(0, c.offerPosts - 1), postsAt: c.postsAt.filter((_, n) => n !== i) }
 }
-const uncounted = (prev: ChiefBatchState | null, at: number): ChiefBatchState => {
-  const p = prev ?? IDLE_BATCH
-  const i = (p.postsAt ?? []).lastIndexOf(at)
-  return { ...p, offerPosts: Math.max(0, (p.offerPosts ?? 0) - 1), postsAt: (p.postsAt ?? []).filter((_, n) => n !== i) }
+const recorded = (c: PostCounts): PostCounts => ({ ...c, offerKey: null, offerPosts: 0, offerLastAt: null })
+
+// This workspace's counts, or null when they can't be read: then nothing is posted.
+async function postCounts($: Dollar, bin: string): Promise<PostCounts | null> {
+  const ws = await workspace($, bin)
+  if (!ws) return null
+  try {
+    const all: any = await $.store.get(POSTS_STORE)
+    return asCounts(all && typeof all === 'object' ? all[ws] : undefined)
+  } catch {
+    return null
+  }
 }
+
+// Change this workspace's counts; false when they couldn't be written (nothing is posted then). Each write prunes:
+// a post list keeps its hour, and a workspace quiet past the cool-off and an hour leaves the store.
+async function writeCounts($: Dollar, bin: string, fn: (c: PostCounts) => PostCounts): Promise<boolean> {
+  const ws = await workspace($, bin)
+  if (!ws) return false
+  try {
+    const nowMs = await $.clock.now()
+    const raw: any = await $.store.get(POSTS_STORE)
+    const all: Record<string, PostCounts> = {}
+    for (const [k, v] of Object.entries(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {})) {
+      const c = asCounts(v)
+      const prunedC = { ...c, postsAt: lastHour(c, nowMs) }
+      const quiet = nowMs - Math.max(c.offerLastAt ?? 0, ...c.postsAt, 0) >= COUNTS_KEEP_MS
+      if (k === ws || !quiet) all[k] = quiet ? asCounts(undefined) : prunedC
+    }
+    const mine = fn(all[ws] ?? asCounts(undefined))
+    if (mine.offerKey === null && mine.offerPosts === 0 && mine.postsAt.length === 0) delete all[ws]
+    else all[ws] = mine
+    await $.store.set(POSTS_STORE, all)
+    return true
+  } catch {
+    return false
+  }
+}
+const COUNTS_UNREAD = "batch not posted: the post counts can't be read or written, so nothing goes out"
 
 const urgentIds = (s: ChiefStatus | null): string[] => pendingDecisions(s).filter(d => d.urgent).map(d => d.id)
 
@@ -482,10 +529,12 @@ async function postBatch($: Dollar, bin: string, key: string): Promise<Attempt> 
   const batch = ids || doc.text
   const target = await batchTarget($, bin)
   if (typeof target === 'string') return { end: 'failed', why: target, batch, ids: list }
-  if (!(await logPost($, bin, target.tool, target.channel, 'attempt'))) return { end: 'failed', why: "the post log can't be written", batch, ids: list }
-
   const countedAt = await $.clock.now()
-  await update($, chiefBatchAtom, prev => counted(prev, key, countedAt))
+  if (!(await writeCounts($, bin, c => counted(c, key, countedAt)))) return { end: 'failed', why: "the post counts can't be written", batch, ids: list }
+  if (!(await logPost($, bin, target.tool, target.channel, 'attempt'))) {
+    await writeCounts($, bin, c => uncounted(c, countedAt))
+    return { end: 'failed', why: "the post log can't be written", batch, ids: list }
+  }
   const stop = new AbortController()
   let out: PostEnd | 'timeout'
   let call: Promise<PostResult> | null = null
@@ -511,7 +560,7 @@ async function postBatch($: Dollar, bin: string, key: string): Promise<Attempt> 
     }).catch(() => undefined)
     out = { end: 'unsure', why: `no answer from the post in ${MCP_TIMEOUT_MS / 1000} s` }
   }
-  if (out.end === 'failed') await update($, chiefBatchAtom, prev => uncounted(prev, countedAt))
+  if (out.end === 'failed') await writeCounts($, bin, c => uncounted(c, countedAt))
   await logPost($, bin, target.tool, target.channel, out.end, out.end === 'posted' ? '' : out.why)
   return out.end === 'posted' ? { end: 'posted', ids, ts: out.ts } : { end: out.end, why: out.why, batch, ids: list }
 }
@@ -526,7 +575,8 @@ async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: strin
   }
   const sent = await cli($, bin, ['sent', '--ids', owed.ids, '--ts', owed.ts], undefined, 'decide')
   if (sent.ok) {
-    await update($, chiefBatchAtom, prev => cleared(prev))
+    await writeCounts($, bin, recorded)
+    await update($, chiefBatchAtom, prev => idleAfter(prev))
     return
   }
   if (sent.code === SENT_REFUSED_EXIT) {
@@ -538,7 +588,7 @@ async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: strin
       return
     }
     // refused: handled as a post that may have landed. One check line, unless this was the offer's last post.
-    const stopped = (st.offerPosts ?? 0) >= POSTS_PER_OFFER
+    const stopped = ((await postCounts($, bin))?.offerPosts ?? POSTS_PER_OFFER) >= POSTS_PER_OFFER   // unread: say stopped
     const ids = owed.ids ? owed.ids.split(',') : []
     const note = safe(stopped ? stoppedNote(why || 'exit 2') : `the batch post couldn't be confirmed: ${why || 'exit 2'}`)
     passError = note
@@ -570,14 +620,24 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     return
   }
   const nowMs = await $.clock.now()
-  if ((st.offerPosts ?? 0) >= POSTS_PER_OFFER) {
-    if (st.offerKey === key && nowMs - (st.offerLastAt ?? 0) < COOL_OFF_MS) {
+  let counts = await postCounts($, bin)
+  if (!counts) {
+    passError = COUNTS_UNREAD
+    return
+  }
+  if (counts.offerPosts >= POSTS_PER_OFFER) {
+    if (counts.offerKey === key && nowMs - (counts.offerLastAt ?? 0) < COOL_OFF_MS) {
       passError = st.note?.startsWith(STOPPED) ? st.note : safe(stoppedNote('neither was recorded'))
       return
     }
-    const fresh = { offerKey: key, offerPosts: 0, offerLastAt: null, note: null, wokenFor: null }  // new content, or the 6 hours are up
-    st = { ...st, ...fresh }
-    await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), ...fresh }))
+    // new content, or the 6 hours are up
+    if (!(await writeCounts($, bin, c => ({ ...c, offerKey: key, offerPosts: 0, offerLastAt: null })))) {
+      passError = COUNTS_UNREAD
+      return
+    }
+    counts = { ...counts, offerKey: key, offerPosts: 0, offerLastAt: null }
+    st = { ...st, note: null, wokenFor: null }
+    await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), note: null, wokenFor: null }))
   }
   const seen = st.urgentSeen ?? []
   const holdEnds = (st.holdEnds ?? []).filter(t => nowMs - t < HOUR_MS)
@@ -588,7 +648,7 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     if (st.note) passError = st.note
     return
   }
-  if (lastHour(st, nowMs).length >= POSTS_PER_HOUR) {
+  if (lastHour(counts, nowMs).length >= POSTS_PER_HOUR) {
     passError = `batch not posted: ${POSTS_PER_HOUR} posts in the last hour is the limit, so it waits. Answer here meanwhile.`
     return
   }
@@ -616,15 +676,17 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     // one wake line per batch. Only a post that surely did not land asks for a hand post; one that may have landed
     // asks the chief to look for it and record it, never to post it again.
     const unsure = got.end === 'unsure'
-    const after = await batchState($)
-    const sameOffer = after.offerKey === key ? after.offerPosts ?? 0 : 0
-    // a hand post is a post: it takes a count now, and with none left the line waits and the mod keeps trying
-    const handRoom = sameOffer < POSTS_PER_OFFER && lastHour(after, nowMs).length < POSTS_PER_HOUR
-    const wake = (minutes >= cap || (got.end === 'failed' && hasUrgent)) && st.wokenFor !== got.batch && (unsure || handRoom)
+    const after = await postCounts($, bin)
+    const sameOffer = !after ? POSTS_PER_OFFER : after.offerKey === key ? after.offerPosts : 0
+    // a hand post is a post: it takes a count now, and with none left (or none readable) the line waits and the mod
+    // keeps trying
+    const handRoom = !!after && sameOffer < POSTS_PER_OFFER && lastHour(after, nowMs).length < POSTS_PER_HOUR
+    const wantLine = (minutes >= cap || (got.end === 'failed' && hasUrgent)) && st.wokenFor !== got.batch
+    const wake = wantLine && (unsure || (handRoom && await writeCounts($, bin, c => counted(c, key, nowMs))))
     const note = safe(unsure && sameOffer >= POSTS_PER_OFFER ? stoppedNote(got.why) : `couldn't post the batch: ${got.why}`)
     passError = note
     await update($, chiefBatchAtom, prev => ({
-      ...(wake && !unsure ? counted(prev, key, nowMs) : prev ?? IDLE_BATCH), failures, note, holdUntil: nowMs + minutes * 60_000,
+      ...(prev ?? IDLE_BATCH), failures, note, holdUntil: nowMs + minutes * 60_000,
       wokenFor: wake ? got.batch : st.wokenFor, lineDue: (wake && !unsure) || st.lineDue,
       checkLine: wake && unsure ? checkWakeLine(got.ids, nowMs, UNSURE_WHY) : (st.checkLine ?? null),
       urgentSeen: [...new Set([...urgent, ...got.ids])],

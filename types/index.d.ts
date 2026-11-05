@@ -210,10 +210,6 @@ export type ChiefBatchState = {
   recordLineDue: boolean   // the "batch record is failing" line goes out with the next wake
   recordWoken: boolean     // that line already went out for this debt
   checkLine?: string | null   // the may-have-landed line (look for the batch, record it, never post) for the next wake
-  offerKey?: string | null // the content (`batch_key`) the post count below is for
-  offerPosts?: number      // posts of that content not recorded; 2 stop the posting until it changes or the 6 hours are up
-  offerLastAt?: number | null  // epoch ms of that content's last post
-  postsAt?: number[]       // epoch ms of the last hour's batch posts, of any content; 4 is the cap; outlives a batch
 }
 
 export type ChiefStatus = {
