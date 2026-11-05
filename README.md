@@ -186,11 +186,15 @@ pass `--force`. Caps (`max_workers`, `run_minutes`, `daily_budget_usd`, models) 
 A worker never sends anything itself. When it wants to post, reply or comment, it files a decision with the exact
 call; every so often (`batch_minutes`) the chief posts the open ones to your own DM, and the Chief pane shows them as
 cards. Reply `7 ok`, `7 no`, `7 edit: <text>` or `ok all`, or press a button. A call with several fields, such as a new
-ticket, can't be edited: reply `7 <your words>` to tell the worker what to change. Only your answer counts, and it
-lets that one call through, once, unchanged; anything else the worker tries is refused. The next batch says what
-happened: "the call was made" means the guard let it through, not that the service accepted it. Workers are strict: no shell
-commands beyond a short allow-list (not even `npm test`) and file writes only inside the workspace. This is a guard,
-not a sandbox, and the decision flow needs a live check after you install.
+ticket, can't be edited: reply `7: <your words>` to tell the worker what to change (a number followed by other words is
+just a note). Only your answer counts, and it lets that one call through, once, unchanged; every other send, post or
+comment the worker tries is refused, and it can't write to your DM at all. A call the guard could never let through,
+such as a reply in someone's DM, is refused when it's filed, so the worker tells you instead. Your own other sessions
+can still post to your DM, so a message there that looks like a batch but isn't one holds replies to the rows it names
+until the next real batch, which tells you. That check matches a pattern, so read a batch you didn't expect with care,
+and the Chief pane always shows the real draft. The next batch says what happened: "the call was made" means the guard let it through, not that the service accepted
+it. Workers are strict: no shell commands beyond a short allow-list (not even `npm test`) and file writes only inside the
+workspace. This is a guard, not a sandbox, and the decision flow needs a live check after you install.
 
 **Another computer, same workspace:** install the plugin, run `mother link` as above, then
 `mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines

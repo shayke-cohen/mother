@@ -330,10 +330,13 @@ HEADER = (
     "without the "
     "manager's yes. When the work needs it, don't make the call: file it with exactly this one command, as a heredoc "
     "(a pipe or a `< file` is refused), then end your turn:\n"
-    "mother decide propose <key> --tool <tool> --recommend <send|skip> --why '<one line>' --stdin <<'EOF'\n"
+    "mother decide propose <key> --tool <tool> --recommend <send|skip> --why '<one line, no apostrophes>' --stdin <<'EOF'\n"
     "<the exact tool input as JSON>\n"
     "EOF\n"
-    "Sign a chat post or a tracker comment with the agent's signature in its text, or propose refuses it. When a turn "
+    "<key> is your own key. Sign a chat post or a tracker comment with the agent's signature (\"<agent name> (AI)\") in "
+    "its text, or propose refuses it. It also refuses a target no grant can reach, such as a DM or a channel outside the "
+    "teams in config.json: say those in your PROGRESS line for the manager to do by hand. You never post to the manager's "
+    "own DM. When a turn "
     "says a decision was approved, make exactly that call, and say in your PROGRESS line whether it worked. End every "
     "turn with one line: "
     "PROGRESS: <what is true now>.\n\n")
@@ -698,7 +701,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
         out["paused"] = True
         return out
     out["reconciled"] = _reconcile(ws)
-    decisions.settle(ws, at)
+    decisions.settle(ws, at, cfg)
     _unstick(ws, at)
 
     mute = hub.live_mute(hub.merged_watch(cfg, hub.load_watch(ws))["mute"] or {}, at)
@@ -1474,7 +1477,8 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         })
     rows.sort(key=lambda r: r["last_run_at"] or "", reverse=True)
     rows.sort(key=lambda r: not r["running"])
-    open_ = [{"id": d.get("id"), "key": d.get("key"), "kind": d.get("kind"), "target": decisions.plain_target(d),
+    open_ = [{"id": d.get("id"), "key": d.get("key"), "kind": d.get("kind"), "tool": _safe(d.get("tool")),
+              "target": decisions.plain_target(d),
               "recommendation": safe_line(d.get("recommendation"), PROGRESS_MAX),
               "why": safe_line(d.get("why"), PROGRESS_MAX), "text": _safe(d.get("text") or "")[:DECISION_TEXT_MAX],
               "full_text": _safe(decisions.draft_text(d.get("input"))), "urgent": bool(d.get("urgent")),

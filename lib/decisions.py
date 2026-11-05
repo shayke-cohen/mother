@@ -2,9 +2,9 @@
 (never a model) writes a single-use grant bound to that call (`answer`).
 
   propose <key> --tool T --recommend R [--why W] [--urgent] --stdin     stdin: the tool's input JSON
-  answer <n> <ok|no|edit|say> --via pane|typed [-- <text>]              the Chief pane's answer (mod only)
+  answer <n> <ok|no|edit|say> --via pane [-- <text>]                    the Chief pane's answer (mod only)
   batch [--json]                                                        the message due for the manager's DM, if any
-  sent [--ids D7,D8|''] [--ts TS]                                       that message went out (TS: its Slack ts)
+  sent [--ids D7,D8|''] --ts TS                                         that message went out (TS: its Slack ts, re-read)
 
 State is <workspace>/.mother/chief/decisions.json, changed only under `locked(ws)` (flock on decisions.lock) and
 written atomically. Python 3.9 stdlib only.
@@ -56,7 +56,7 @@ def locked(ws: Path):
 
 def _empty() -> dict:
     return {"version": 1, "next": 1, "decisions": [], "batch": {"last_at": None, "announced": {}}, "confirm": [],
-            "replied": {}}
+            "replied": {}, "retry_at": {}, "void": []}
 
 
 def _id_number(d: dict) -> Optional[int]:
@@ -83,8 +83,13 @@ def load(ws: Path) -> dict:
     decision id to the stamp of the batch that showed it to the manager; any other shape reads as no announcements.
     `batch.offered`, `offered_ids` and `offered_at` are the live offer: the confirm-line count, the ids and the time of
     the last `batch` command, until `sent` uses it.
+    `batch.offered_text` is the live offer's text, which is all the guard lets the chief post to the self-DM. `offers`
+    holds each offer since the last `sent` (a post that may have landed can still be proved), `posts` the batches proved
+    posted: their ts and every text they could have shown.
     `replied` maps an inbox line that looked like a reply to whether its re-read message was one (a line behind the
-    cursor is applied once), or to the failed reads so far. `next` is past every id in the file: an id is never reused."""
+    cursor is applied once), or to the failed reads so far; `retry_at` says when a line past REPLY_TRIES is read next.
+    `void` lists the app-posted messages that looked like a batch and weren't: the ids they name, and from when until
+    when a reply to those ids is held. `next` is past every id in the file: an id is never reused."""
     doc = _empty()
     try:
         raw = json.loads(_path(ws).read_text())
@@ -108,10 +113,23 @@ def load(ws: Path) -> dict:
             doc["batch"]["offered_ids"] = [i for i in b["offered_ids"] if isinstance(i, str)]
         if isinstance(b.get("offered_at"), str):
             doc["batch"]["offered_at"] = b["offered_at"]
+        if isinstance(b.get("offered_text"), str):
+            doc["batch"]["offered_text"] = b["offered_text"]
+        if isinstance(b.get("offers"), list):
+            doc["batch"]["offers"] = [o for o in b["offers"] if isinstance(o, dict) and isinstance(o.get("text"), str)
+                                      and isinstance(o.get("ids"), list) and isinstance(o.get("at"), str)]
+        if isinstance(b.get("posts"), list):
+            doc["batch"]["posts"] = [x for x in b["posts"] if isinstance(x, dict) and isinstance(x.get("ts"), str)
+                                     and isinstance(x.get("texts"), list)]
     if isinstance(raw.get("confirm"), list):
         doc["confirm"] = [x for x in raw["confirm"] if isinstance(x, str)]
     if isinstance(raw.get("replied"), dict):
         doc["replied"] = {k: v for k, v in raw["replied"].items() if isinstance(v, int)}  # a bool is an int too
+    if isinstance(raw.get("retry_at"), dict):
+        doc["retry_at"] = {k: v for k, v in raw["retry_at"].items() if isinstance(v, str)}
+    if isinstance(raw.get("void"), list):
+        doc["void"] = [v for v in raw["void"] if isinstance(v, dict) and isinstance(v.get("from"), str)
+                       and isinstance(v.get("ids"), list)]
     return doc
 
 
@@ -138,6 +156,24 @@ def _signed(kind: str, tool: str, inp: dict, cfg: dict) -> bool:
     return kind not in SIGNED_KINDS or guard.carries_signature(guard.classify_mcp(tool, inp), cfg)
 
 
+TARGET_REFUSED = "the guard refused the call: target not allowed"
+
+
+def grant_problem(kind: str, target, cfg: dict) -> Optional[str]:
+    """Why the guard could never honour a grant for this call, whatever the manager answers, or None. It asks the guard's
+    own functions, so the two can't disagree."""
+    if kind == "manual":
+        return None
+    scopes = guard.grant_limits(cfg)[0]
+    if kind not in scopes:
+        return "policy.grants turns %s off" % kind
+    if scopes[kind] < 1:
+        return "policy.grants allows %s no uses" % kind
+    if not target or str(target) not in guard.allowed_targets(kind, cfg):
+        return TARGET_REFUSED
+    return None
+
+
 def propose(ws: Path, cfg: dict, at: datetime, key: str, tool: str, inp: dict, recommendation: str,
             why: str = "", urgent: bool = False) -> dict:
     if not isinstance(inp, dict):
@@ -155,6 +191,12 @@ def propose(ws: Path, cfg: dict, at: datetime, key: str, tool: str, inp: dict, r
         raise ValueError("this %s isn't signed, so the guard would refuse it even with the manager's yes. Sign it: put "
                          "%s in the text%s, then file it again" % (
                              kind, marks[0], " and the blocks" if guard.classify_mcp(tool, inp).get("blocks") else ""))
+    problem = grant_problem(kind, target, cfg)
+    if problem:  # the manager's yes couldn't send it: don't let them give one
+        where = "%s isn't a team channel a grant can reach (a DM, an external channel or one set to off never is)" \
+            % target if kind.startswith("chat-") else "%s isn't a tracker project in config.json" % target
+        raise ValueError("%s, so even the manager's yes couldn't send this. Say in your PROGRESS line what the manager "
+                         "should do by hand" % (problem if problem != TARGET_REFUSED else "%s: %s" % (problem, where)))
     hours = chief.settings(cfg)["decision_hours"]
     with locked(ws):
         if key not in chief.workers(ws):
@@ -260,7 +302,7 @@ def signed_edit(d: dict, cfg: dict, text: str) -> dict:
     """`d`'s input with the manager's `text`, still carrying the signature the guard wants, or the grant could never
     match. Their words stay as typed; the signature the draft carried goes on a line after them when they left it
     out. ValueError when that isn't possible."""
-    tell = "Tell the worker what to change: %s <your words>" % str(d.get("id"))[1:]
+    tell = "Tell the worker what to change: %s: <your words>" % str(d.get("id"))[1:]
     fields = [chief.safe_line(f, 60) for f, _ in draft_fields(d["input"], settings=False)]
     if len(fields) > 1:  # new text in one would send the others unread: the manager can say what to change instead
         raise ValueError("this call sends %s, and an edit can only replace one. %s" % (" and ".join(fields), tell))
@@ -294,20 +336,30 @@ def edit_view(d: dict, cfg: dict) -> dict:
 
 
 _NUM = re.compile(r"^d?(\d+)$")
-_START_NUM = re.compile(r"^d?\d+(?!\w)", re.I)
+_START_NUM = re.compile(r"^d?\d+(?!\w)(.*)$", re.I | re.S)
+_SAY = re.compile(r"^d?(\d+)\s*:(.*)$", re.I | re.S)
 _START_WORD = re.compile(r"^(\S+)\s+(?:d?\d+|all)(?!\w)", re.I)
 _EDIT = re.compile(r"^\s*d?(\d+)\s+edit(?!\w)(.*)$", re.I | re.S)
 
 
 def _starts_like_reply(t: str) -> bool:
-    if _START_NUM.match(t):
-        return True
+    """A number counts only when a verb, a colon or nothing follows it. Ruling T2: "2 things for tomorrow" is a note."""
+    m = _START_NUM.match(t)
+    if m:
+        rest = m.group(1).lstrip(" \t")
+        if not rest.strip() or rest[0] in ":,;\r\n":
+            return True
+        word = re.split(r"[\s,;]", rest, maxsplit=1)[0].lower()
+        return bool(re.match(r"edit(?!\w)", word)) or word in (channels.SEND_WORDS | channels.NO_WORDS)
     m = _START_WORD.match(t)
     return bool(m) and m.group(1).lower() in (channels.SEND_WORDS | channels.NO_WORDS)
 
 
 def _clause(c: str, open_ids: Set[int]) -> Optional[list]:
     """Items for one non-edit clause, or None when it doesn't parse."""
+    said = _SAY.match(c)
+    if said:
+        return [(int(said.group(1)), "say", " ".join(said.group(2).split()))] if said.group(2).strip() else None
     toks = c.split()
     if len(toks) < 2:
         return None
@@ -335,7 +387,7 @@ def _clause(c: str, open_ids: Set[int]) -> Optional[list]:
         if rest:
             out.append((n, "say", " ".join(rest)))
         return out
-    return [(n, "say", " ".join(toks[1:]))]
+    return None  # a number and free words: words for the worker take a colon, `7: <words>`
 
 
 def parse_reply(text: str, open_ids: Set[int]) -> Optional[List[Tuple[int, str, str]]]:
@@ -371,7 +423,7 @@ def parse_reply(text: str, open_ids: Set[int]) -> Optional[List[Tuple[int, str, 
 GRANT_HOURS = 2
 PREVIEW_MAX = 200
 VERBS = ("ok", "no", "edit", "say")
-VIAS = ("pane", "typed")  # a Slack reply goes through answer_reply, which reads what the manager wrote
+VIAS = ("pane",)  # a Slack reply goes through answer_reply, which reads what the manager wrote
 UNREADABLE = "I couldn't read that reply, so nothing was applied. Use: 7 ok · 7 no · 7 edit: your text · ok all"
 UNCONFIRMED = "I couldn't confirm that reply came from you (%s)."
 _SLACK_LINK = re.compile(r"<(https?:[^|>\s]*)(?:\|([^>]*))?>")
@@ -420,27 +472,69 @@ def _fetch_slack(cfg: dict, channel: str, ts: str) -> Optional[dict]:
         _close_clients(clients)
 
 
+HISTORY_PAGE = 100
+HISTORY_PAGES = 5
+
+
+def _read_history(clients: dict, channel: str, oldest: str) -> List[dict]:
+    """Every message in `channel` from `oldest` on. Raises when it can't get them all: a truncated read must not pass as
+    a clean one."""
+    from hub_mcp import McpError
+    c = clients.get("chat")
+    if c is None or isinstance(c, Exception):
+        raise c if isinstance(c, Exception) else McpError("other", "no chat client")
+    out, cursor = [], None
+    for _ in range(HISTORY_PAGES):
+        args = {"channel_id": channel, "oldest": oldest, "inclusive": True, "limit": HISTORY_PAGE}
+        if cursor:
+            args["cursor"] = cursor
+        res = c.call("get_channel_history", args)
+        msgs = res.get("messages") if isinstance(res, dict) else None
+        if not isinstance(msgs, list):
+            raise McpError("other", "the DM's history came back with no messages list")
+        out.extend(m for m in msgs if isinstance(m, dict))
+        if not res.get("has_more"):
+            return out
+        cursor = (res.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+    raise McpError("other", "the DM's history is longer than one read can check")
+
+
+class _Slack:
+    """The tick's reads: callable as a `fetch`, with `history`. It starts the chat server on its first read and keeps it
+    for the rest of the `with`: one client per tick. A connection that can't be made fails every read of the session
+    without trying again."""
+
+    def __init__(self, cfg: dict):
+        self.cfg, self.clients, self.error = cfg, None, None
+
+    def _open(self) -> dict:
+        if self.error is not None:
+            raise self.error
+        if self.clients is None:
+            try:
+                self.clients = _chat_clients(self.cfg)
+            except Exception as e:
+                self.error = e
+                raise
+        return self.clients
+
+    def __call__(self, _cfg, channel, ts):
+        return _read_message(self._open(), channel, ts)
+
+    def history(self, channel, oldest):
+        return _read_history(self._open(), channel, oldest)
+
+
 @contextlib.contextmanager
 def _slack_session(cfg: dict):
-    """A `fetch` that starts the chat server on its first read and keeps it for the rest of this `with`: one client
-    per tick. A connection that can't be made fails every read of the session without trying again."""
-    state = {}
-
-    def fetch(_cfg, channel, ts):
-        if "error" in state:
-            raise state["error"]
-        if "clients" not in state:
-            try:
-                state["clients"] = _chat_clients(cfg)
-            except Exception as e:
-                state["error"] = e
-                raise
-        return _read_message(state["clients"], channel, ts)
+    s = _Slack(cfg)
     try:
-        yield fetch
+        yield s
     finally:
-        if "clients" in state:
-            _close_clients(state["clients"])
+        if s.clients is not None:
+            _close_clients(s.clients)
 
 
 def _typed_message(cfg: dict, channel: str, ts: str, fetch=None) -> Tuple[Optional[dict], Optional[str], bool]:
@@ -500,19 +594,23 @@ def answer_reply(ws: Path, cfg: dict, at: datetime, channel: str, ts: str, fetch
 
 
 def _reply(ws: Path, cfg: dict, at: datetime, channel: str, ts: str, fetch=None) -> Tuple[str, List[str]]:
-    """answer_reply's work: (state, result lines), state applied | not_reply | unreadable | unconfirmed | retry. Only
-    `retry` could come out differently on another read."""
+    """answer_reply's work: (state, result lines), state applied | held | not_reply | unreadable | unconfirmed | retry.
+    Only `retry` could come out differently on another read. `held`: it answers a row a counterfeit named, so nothing is
+    applied, even `ok all` or a reply naming other rows too; the manager was told once, when the counterfeit was found."""
     ws = Path(ws)
     msg, why, again = _typed_message(cfg, channel, ts, fetch)
     if why:
         return ("retry" if again else "unconfirmed"), [UNCONFIRMED % why]
     with locked(ws):
         open_ids = _reply_open_ids(ws, ts)
+        voided = _voided_at(load(ws), ts)
     items = parse_reply(msg.get("text"), open_ids)
     if items is None:
         return "not_reply", []
     if not items:
         return "unreadable", [UNREADABLE]
+    if any("D%d" % n in voided for n, _, _ in items):
+        return "held", []
     source = {"via": "slack", "channel": channel, "ts": ts}
     lines, refused = [], set()
     for n, verb, payload in items:
@@ -538,9 +636,10 @@ def _grant(d: dict, cfg: dict, at: datetime, owner: str, source: dict) -> dict:
         src = {"channel": source["channel"], "user": owner, "ts": source["ts"]}
     else:
         src = {"channel": "pane", "user": owner, "ts": "%.6f" % now}
-    scopes, max_age = guard.grant_limits(cfg)
-    if d["kind"] not in scopes:
-        raise ValueError("policy.grants turns %s off" % d["kind"])
+    problem = grant_problem(d["kind"], d.get("target"), cfg)
+    if problem:
+        raise ValueError(problem)
+    max_age = guard.grant_limits(cfg)[1]
     t = guard.parse_time(src["ts"])
     if t is None:
         raise ValueError("the reply's timestamp can't be read")
@@ -572,7 +671,7 @@ def _set_grant(ws: Path, did: str, g: Optional[dict]) -> Optional[str]:
 
 
 def answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, source: dict) -> str:
-    """Apply a Chief pane (or typed) answer to decision D<n>; the one-line result for the manager. A Slack reply goes
+    """Apply a Chief pane answer to decision D<n>; the one-line result for the manager. A Slack reply goes
     through `answer_reply` instead. A yes writes a grant bound to the exact call (`draft_sha`), single-use and
     short-lived. Lock order: decisions, then grants, then the hub lock (enqueue, update_worker)."""
     if (source or {}).get("via") not in VIAS:
@@ -638,7 +737,7 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
                                        "unchanged, then end the turn.\nTool: %s\nInput: %s"
                           % (did, d["tool"], canonical(d["input"])), "decision")
             _resume(ws, key)
-            return True, "%s approved: %s will make that one call." % (did, key)
+            return True, _approved_line(ws, cfg, at, did, key)
         problem = _set_grant(ws, did, None)  # no live grant survives an answer that doesn't send
         if problem:
             return False, "%s is still open: %s." % (did, problem)
@@ -662,6 +761,19 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
         return True, result
 
 
+def _approved_line(ws: Path, cfg: dict, at: datetime, did: str, key: str) -> str:
+    """An approval's result, which promises the call only when a run can start. Saying so can't undo the approval."""
+    try:
+        why = "it's held" if (chief.workers(ws).get(key) or {}).get("held") else chief.refusal(ws, cfg, at)
+    except Exception as e:
+        _log(ws, "approved %s: %r" % (did, e))
+        why = None
+    if why:
+        return "%s approved, but %s can't run yet (%s). If that outlasts the approval, nothing goes out, and a later " \
+               "batch says so." % (did, key, why)
+    return "%s approved: %s will make that one call." % (did, key)
+
+
 def _expire(ws: Path, doc: dict, d: dict, at: datetime) -> None:
     """A pending decision ran out of time. The caller holds `locked(ws)`."""
     did, key = d.get("id"), d.get("key")
@@ -683,7 +795,8 @@ def _log(ws: Path, msg: str) -> None:
         pass
 
 
-def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: set, live: dict, busy: set, queue: list) -> None:
+def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: set, live: dict, busy: set, queue: list,
+               cfg: Optional[dict] = None) -> None:
     """Close one approved decision when what happened to it is known. The ledger proves the guard let the call through,
     not that the service accepted it, so the wording says only that."""
     did, key = d.get("id"), d.get("key")
@@ -721,6 +834,7 @@ def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: set, live: dict
         return
     _set_grant(ws, did, None)
     d["status"] = "failed"
+    why = grant_problem(d.get("kind"), d.get("target"), cfg) if cfg is not None else None
     if w is None:
         doc["confirm"].append("%s: the worker is gone and the call wasn't made; nothing went out" % did)
         note = ""
@@ -728,18 +842,21 @@ def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: set, live: dict
         doc["confirm"].append("%s: the worker failed after your yes; it's back with the worker" % did)
         note = "%s: your run failed after the manager's yes, so the call wasn't made. File it again if it's still " \
                "needed." % did
+    elif why:
+        doc["confirm"].append("%s: %s; nothing went out, and it's back with the worker." % (did, why))
+        note = "%s: %s, so nothing went out. Filing it again won't help unless that changes." % (did, why)
     else:
         doc["confirm"].append("%s: the worker's turn ended without the call you approved; nothing went out, and it's "
                               "back with the worker." % did)
-        note = "%s: your turn ended without the approved call, so nothing went out. If the guard refused it, the input " \
-               "wasn't the approved one. File it again if it's still needed." % did
+        note = "%s: your turn ended without the approved call, so nothing went out. The approval covered that exact " \
+               "call, once. File it again if it's still needed." % did
     save(ws, doc)
     if w is not None:
         chief.enqueue(ws, at, key, note, "decision")
         _resume(ws, key)
 
 
-def settle(ws: Path, at: datetime) -> None:
+def settle(ws: Path, at: datetime, cfg: Optional[dict] = None) -> None:
     """The tick's pass over the queue: expire what ran out of time, and close each approved decision once its outcome is
     known, so nothing stays approved past its grant. A run has ended when the worker is gone, or its run lock is free,
     it isn't marked working and its approval has left the queue. A ledger that can't be read says nothing, so those
@@ -767,7 +884,7 @@ def settle(ws: Path, at: datetime) -> None:
         live, busy = chief.workers(ws), set(chief.running(ws))
         for d in approved:
             try:
-                _close_one(ws, doc, d, at, used, live, busy, queue)
+                _close_one(ws, doc, d, at, used, live, busy, queue, cfg)
             except Exception as e:
                 _log(ws, "settle %s: %r" % (d.get("id"), e))
 
@@ -776,6 +893,19 @@ def settle(ws: Path, at: datetime) -> None:
 
 REPLIED_KEEP = 200
 REPLY_TRIES = 3
+RETRY_FIRST_SECONDS = 60
+RETRY_MAX_SECONDS = 30 * 60
+VOID_KEEP = 50
+READ_FAILED = "Slack read failed; I'll apply your reply when I can read it"
+READ_GAVE_UP = "Slack still can't be read and no decision your message could answer is open, so it wasn't applied."
+READ_LATE = "I read your message late: it isn't an answer to a decision, so nothing was applied. Send it again if it " \
+            "was meant for me."
+COUNTERFEIT = "A message in this DM that looked like a decision batch didn't come from Mother, so replies to %s after " \
+              "it were held. Answer %s again from this batch."
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060\ufeff]")
+_ANY_ID = re.compile(r"\bD(\d+)\b", re.I)
+_RECOMMEND = re.compile(r"\brecommend", re.I)
+_FOOTER = re.compile(r"reply in this dm|\bok all\b.*\bd?\d+\s+(?:ok|no)\b|\bd?\d+\s+(?:ok|no)\b.*\bok all\b", re.I | re.S)
 
 
 def is_reply_line(l: dict) -> bool:
@@ -795,6 +925,8 @@ def for_chief(ws: Path, lines: List[dict]) -> List[dict]:
             v = seen.get(l["id"])
             if v is True:
                 continue
+            if type(v) is int and v >= REPLY_TRIES:  # an outage can last hours: the reply waits, the rest don't
+                continue
             if v is not False:
                 break
         out.append(l)
@@ -806,6 +938,7 @@ def _record_reply(ws: Path, lid: str, state, lines: List[str]) -> None:
         doc = load(ws)
         doc["replied"][lid] = state
         doc["replied"] = dict(list(doc["replied"].items())[-REPLIED_KEEP:])
+        doc["retry_at"].pop(lid, None)
         doc["confirm"].extend(lines)
         save(ws, doc)
 
@@ -828,31 +961,149 @@ def reply_channel(ws: Path, cfg: dict) -> Tuple[Optional[str], Optional[str]]:
     return inbox, None
 
 
+def _record_failed_read(ws: Path, at: datetime, lid: str, ts: str, why: str) -> None:
+    """One more failed read of a reply. It stays pending while a decision it could answer does: the manager is told once
+    at REPLY_TRIES, and the reads back off from there."""
+    _log(ws, "reply %s: read failed: %s" % (lid, why))
+    with locked(ws):
+        doc = load(ws)
+        tries = doc["replied"].get(lid, 0) + 1
+        doc["replied"][lid] = tries
+        doc["replied"] = dict(list(doc["replied"].items())[-REPLIED_KEEP:])
+        if tries >= REPLY_TRIES:
+            if _reply_open_ids(ws, ts):
+                if tries == REPLY_TRIES:
+                    doc["confirm"].append(READ_FAILED)
+                wait = min(RETRY_MAX_SECONDS, RETRY_FIRST_SECONDS * 2 ** min(tries - REPLY_TRIES, 16))
+                doc["retry_at"][lid] = hub._iso(at + timedelta(seconds=wait))
+            else:
+                doc["replied"][lid] = False
+                doc["retry_at"].pop(lid, None)
+                doc["confirm"].append(READ_GAVE_UP)
+        save(ws, doc)
+
+
+def _text_of_message(msg: dict) -> str:
+    """All a message shows, as plain characters: its text, what Slack escaped undone, invisible characters gone, and any
+    blocks or attachments, which is what Slack draws when they are there."""
+    parts = [_norm(msg.get("text"))]
+    for k in ("blocks", "attachments"):
+        if msg.get(k):
+            parts.append(json.dumps(msg[k], ensure_ascii=False))
+    return _INVISIBLE.sub("", "\n".join(parts))
+
+
+def rows_named(msg: dict) -> Optional[List[str]]:
+    """The ids a message names when it looks like a decision batch (`D<n>` with `recommend`, or the Reply footer), else
+    None. A pattern is a net, not a proof: the guard's rule on unattended sessions is the other half."""
+    text = _text_of_message(msg)
+    ids = ["D%s" % n for n in _ANY_ID.findall(text)]
+    if (ids and _RECOMMEND.search(text)) or _FOOTER.search(text):
+        return sorted(set(ids), key=lambda i: int(i[1:]))
+    return None
+
+
+def _voided_at(doc: dict, ts: str) -> Set[str]:
+    """The ids a reply typed at `ts` can't answer: a counterfeit named them before it, and no real batch came between."""
+    at, out = guard.parse_time(ts), set()
+    for v in doc["void"]:
+        began, ended = guard.parse_time(v.get("from")), guard.parse_time(v.get("until"))
+        if at is not None and began is not None and began < at and (ended is None or at < ended):
+            out.update(i for i in v["ids"] if isinstance(i, str))
+    return out
+
+
+def _scan_from(doc: dict, first_reply: float) -> Optional[str]:
+    """Where a scan starts: the last real batch before the earliest reply, so a counterfeit a late line was typed after
+    is still seen. With none recorded, the first announcement. None: nothing is announced, so no reply can apply."""
+    posts = [x["ts"] for x in doc["batch"].get("posts") or [] if (guard.parse_time(x["ts"]) or 0) < first_reply]
+    if posts:
+        return max(posts, key=guard.parse_time)
+    open_ = {d.get("id") for d in doc["decisions"] if d.get("status") == "pending"}
+    stamps = [guard.parse_time(v) for k, v in doc["batch"]["announced"].items() if k in open_]
+    stamps = [t for t in stamps if t is not None]
+    return "%.6f" % min(stamps) if stamps else None
+
+
+def scan_counterfeits(ws: Path, channel: str, history, first_reply: float) -> None:
+    """Find app-posted messages in the self-DM that look like a decision batch and aren't one, before any reply is
+    applied. Each is recorded once and told once. A normal session keeps its green post to the DM, so a reply can't
+    assume what it answers came from `batch`. Raises when the DM can't be read: the replies then wait."""
+    with locked(ws):
+        doc = load(ws)
+        since = _scan_from(doc, first_reply)
+    if since is None:
+        return
+    msgs = history(channel, since)
+    with locked(ws):
+        doc = load(ws)
+        b = doc["batch"]
+        known = {_norm(t) for x in b.get("posts") or [] for t in x["texts"] if isinstance(t, str)}
+        known |= {_norm(o["text"]) for o in b.get("offers") or []}
+        seen = {v["from"] for v in doc["void"]}
+        open_ = {d.get("id") for d in doc["decisions"] if d.get("status") == "pending"}
+        changed = False
+        for m in sorted((m for m in msgs if isinstance(m.get("ts"), str)), key=lambda m: guard.parse_time(m["ts"]) or 0):
+            if m["ts"] in seen or not _app_posted(m) or (_norm(m.get("text")) in known and _plain(m)):
+                continue
+            ids = rows_named(m)
+            if ids is None:
+                continue
+            ids = [i for i in ids if i in open_] or ([] if ids else sorted(open_, key=lambda i: int(i[1:])))
+            if not ids:  # it names only closed rows: no reply can reach them
+                continue
+            start = guard.parse_time(m["ts"]) or 0
+            later = [x["ts"] for x in b.get("posts") or [] if (guard.parse_time(x["ts"]) or 0) > start]
+            doc["void"].append({"from": m["ts"], "ids": ids,
+                                "until": min(later, key=guard.parse_time) if later else None})
+            doc["confirm"].append(COUNTERFEIT % ((", ".join(ids),) * 2))
+            changed = True
+        if changed:
+            doc["void"] = doc["void"][-VOID_KEEP:]
+            save(ws, doc)
+
+
 def apply_replies(ws: Path, cfg: dict, at: datetime, lines: List[dict]) -> Set[str]:
     """Apply every reply among `lines`, each once, even one the cursor can't reach yet. Result lines go to `confirm`.
-    Returns the ids to log: the replies that reached the queue. A failed Slack read is tried again next tick, and
-    `for_chief` stops there until it settles. Anything else keeps its normal path: a note that isn't a reply, and one that only starts like a reply, which gets
-    the help line. So does a line after REPLY_TRIES failed reads. One bad line is logged and can't stop the others."""
+    Returns the ids to log: the replies that reached the queue, or were held. The self-DM is scanned for counterfeits
+    first. A failed Slack read is tried again next tick, `for_chief` stopping there, and after REPLY_TRIES the manager is
+    told once and the reads back off until no decision it could answer is left; `for_chief` then passes it by. Anything
+    else keeps its normal path: a note that isn't a reply, and one that only starts like a reply, which gets the help
+    line. One bad line is logged and can't stop the others."""
     ws = Path(ws)
-    channel = reply_channel(ws, cfg)[0]
+    channel, problem = reply_channel(ws, cfg)
     candidates = [l for l in lines if is_reply_line(l)]
-    seen = load(ws)["replied"]
-    todo = [l for l in candidates if not isinstance(seen.get(l["id"]), bool)]
+    doc = load(ws)
+    seen = doc["replied"]
+    now = at.timestamp()
+    todo = [l for l in candidates if not isinstance(seen.get(l["id"]), bool)
+            and (guard.parse_time(doc["retry_at"].get(l["id"])) or 0) <= now]
     if todo:
         with _slack_session(cfg) as fetch:
+            unread = None
+            stamps = [guard.parse_time(l["id"].rsplit(":", 1)[-1]) for l in todo]
+            stamps = [t for t in stamps if t is not None]
+            if channel and stamps:
+                try:
+                    scan_counterfeits(ws, channel, fetch.history, min(stamps))
+                except Exception as e:
+                    unread = "Slack couldn't be read: %s" % (str(e) or type(e).__name__)
             for l in todo:
                 lid = l["id"]
+                ts = lid.rsplit(":", 1)[-1]
                 try:
-                    state, got = _reply(ws, cfg, at, channel, lid.rsplit(":", 1)[-1], fetch)
-                    if state == "retry":
-                        tries = load(ws)["replied"].get(lid, 0) + 1
-                        _log(ws, "reply %s: read %d failed: %s" % (lid, tries, got[0]))
-                        if tries < REPLY_TRIES:
-                            _record_reply(ws, lid, tries, [])
-                        else:
-                            _record_reply(ws, lid, False, [UNREADABLE])
+                    if not channel:  # the config is what's wrong, not where the manager typed
+                        state, got = "unconfirmed", [UNCONFIRMED % (problem or "no self-DM channel")]
+                    elif unread:
+                        state, got = "retry", [unread]
                     else:
-                        _record_reply(ws, lid, state == "applied", got)
+                        state, got = _reply(ws, cfg, at, channel, ts, fetch)
+                    if state == "retry":
+                        _record_failed_read(ws, at, lid, ts, got[0])
+                        continue
+                    if state == "not_reply" and type(seen.get(lid)) is int and seen[lid] >= REPLY_TRIES:
+                        got = [READ_LATE]  # the chief was let past it, so it may never see this one
+                    _record_reply(ws, lid, state in ("applied", "held"), got)
                 except Exception as e:
                     _log(ws, "reply %s: %r" % (lid, e))
                     try:
@@ -880,6 +1131,7 @@ def forget_replies(ws: Path, ids: Set[str]) -> None:
     with locked(ws):
         doc = load(ws)
         doc["replied"] = {k: v for k, v in doc["replied"].items() if k not in ids}
+        doc["retry_at"] = {k: v for k, v in doc["retry_at"].items() if k not in ids}
         save(ws, doc)
 
 
@@ -888,6 +1140,9 @@ def forget_replies(ws: Path, ids: Set[str]) -> None:
 WHY_MAX = 100
 CONFIRM_MAX = 400  # a manual result line and its pointer to the pane fit
 ALSO_SENDS_MAX = 5
+OFFERS_KEEP = 5
+POSTS_KEEP = 5
+NO_OFFER = "no batch is waiting to be recorded: `mother decide batch` makes one"
 _SLACK_TS = re.compile(r"^\d+(?:\.\d+)?$")
 
 
@@ -975,16 +1230,83 @@ def offer(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
             b["offered"] = min(b.get("offered", len(doc["confirm"])), len(doc["confirm"]))
             b["offered_ids"] = list(got["ids"])
             b["offered_at"] = hub._iso(at)
+            b["offered_text"] = got["text"]
+            b["offers"] = (b.get("offers") or [])[-(OFFERS_KEEP - 1):] + [
+                {"text": got["text"], "ids": list(got["ids"]), "at": b["offered_at"]}]
             save(ws, doc)
     return got
 
 
-def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None) -> None:
-    """The batch was posted. `ids` count as announced at `ts`, the post's own Slack ts (now when none is given). They
-    must be ids the last `offer` handed out, and the stamp is never earlier than that offer: the manager can only answer
-    what they saw. A decision keeps its first stamp, so a reply to an earlier batch stays good. Clears the confirm lines
-    that offer handed out; a line that arrived while the post was going out stays. Uses the offer up. ValueError with
-    no live offer, on a `ts` that isn't a Slack ts, or on an id that wasn't offered: nothing is written."""
+class SlackReadFailed(Exception):
+    """The post couldn't be checked: worth trying again, unlike a post that isn't there."""
+
+
+def _norm(text) -> str:
+    """A message's text for comparing with what was offered, however often the path to Slack escaped it. It is compared
+    with text this code wrote, so undoing an escape too many can't let anything else match."""
+    t = text if isinstance(text, str) else ""
+    for _ in range(3):
+        u = slack_text(t)
+        if u == t:
+            break
+        t = u
+    return "\n".join(l.rstrip() for l in t.replace("\r\n", "\n").split("\n")).strip()
+
+
+def _app_posted(msg: dict) -> bool:
+    return bool(msg.get("app_id") or msg.get("bot_id") or msg.get("subtype") == "bot_message")
+
+
+def _plain(msg: dict) -> bool:
+    """It draws what its `text` says: no attachments, and no blocks but the rich_text Slack adds on its own."""
+    blocks = msg.get("blocks") or []
+    return not msg.get("attachments") and isinstance(blocks, list) \
+        and all(isinstance(x, dict) and x.get("type") == "rich_text" for x in blocks)
+
+
+def _batch_channel(cfg: dict) -> Optional[str]:
+    """The D… channel a batch goes to: the first in manager.chat_dm, as the Chief pane's mod picks it."""
+    m = cfg.get("manager") or {}
+    ids = list(guard.as_list(m.get("chat_dm"))) + list(guard.as_list(m.get("chat_user")))
+    return next((x for x in ids if isinstance(x, str) and re.match(r"^D[A-Z0-9]+$", x)), None)
+
+
+def record_post(ws: Path, cfg: dict, at: datetime, ids: List[str], ts: Optional[str], fetch=None) -> None:
+    """`mother decide sent`: re-read the message at `ts` in the self-DM and stamp only if it is app-posted and says what
+    was offered. A stamp is what lets a reply reach a decision, so it must prove a post. ValueError when the proof fails,
+    SlackReadFailed when it can't be looked at. Nothing is written either way, and the offer stays live."""
+    if ts is None or not _SLACK_TS.match(str(ts)):
+        raise ValueError("--ts must be the Slack ts of the batch you posted: it is re-read before anything is recorded")
+    ws = Path(ws)
+    with locked(ws):
+        if "offered" not in load(ws)["batch"]:
+            raise ValueError(NO_OFFER)
+    channel = _batch_channel(cfg)
+    if not channel:
+        raise ValueError("config.json has no D… channel for the manager, so the post can't be checked")
+    try:
+        msg = (fetch or _fetch_slack)(cfg, channel, str(ts))
+    except Exception as e:
+        raise SlackReadFailed("couldn't read %s in %s to check the post (%s); nothing was recorded, try again" % (
+            ts, channel, str(e) or type(e).__name__))
+    if not isinstance(msg, dict) or msg.get("ts") != str(ts):
+        raise ValueError("Slack shows no message at %s in %s, so nothing was recorded. Use the ts of the batch you posted"
+                         % (ts, channel))
+    if not _app_posted(msg):
+        raise ValueError("the message at %s wasn't posted by the app, so it isn't the batch; nothing was recorded" % ts)
+    if not _plain(msg):
+        raise ValueError("the message at %s carries blocks or attachments, so it isn't the batch; nothing was recorded" % ts)
+    sent(ws, at, ids, str(ts), posted=msg.get("text"))
+
+
+def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None, posted: Optional[str] = None) -> None:
+    """Record a posted batch; the CLI's way here is `record_post`, which proves the post first. `ids` count as announced
+    at `ts`, the post's own Slack ts (now when none is given). They must be ids the offer handed out, the one whose text
+    is `posted` when given (a late post can prove an earlier offer) and the last one otherwise, and the stamp is never
+    earlier than that offer: the manager can only answer what they saw. A decision keeps its first stamp, so a reply to an
+    earlier batch stays good. Ends the void of any counterfeit before it. Clears the confirm lines that offer handed
+    out; a line that arrived while the post was going out stays. Uses the offer up. ValueError with no live offer, on a
+    `ts` that isn't a Slack ts, on text no offer had, or on an id that wasn't offered: nothing is written."""
     if ts is not None and not _SLACK_TS.match(str(ts)):
         raise ValueError("--ts must be the post's Slack ts")
     ws = Path(ws)
@@ -993,12 +1315,22 @@ def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None) -> No
         open_ = {d.get("id") for d in doc["decisions"] if d.get("status") == "pending"}
         b = doc["batch"]
         if "offered" not in b:
-            raise ValueError("no batch is waiting to be recorded: `mother decide batch` makes one")
-        extra = [i for i in ids if i not in (b.get("offered_ids") or [])]
+            raise ValueError(NO_OFFER)
+        offers = b.get("offers") or []
+        shown, offered_at = b.get("offered_ids") or [], b.get("offered_at")
+        if posted is not None:
+            match = next((o for o in reversed(offers) if _norm(o["text"]) == _norm(posted)), None)
+            if match is None:
+                raise ValueError("the message at %s isn't the batch `mother decide batch` offered: its text differs. "
+                                 "Nothing was recorded" % ts)
+            shown, offered_at = match["ids"], match["at"]
+        extra = [i for i in ids if i not in shown]
         if extra:
             raise ValueError("%s wasn't in the batch `mother decide batch` offered" % ", ".join(extra))
         stamp = str(ts) if ts is not None else hub._iso(at)
-        offered_at = b.pop("offered_at", None)
+        b.pop("offered_at", None)
+        b.pop("offered_text", None)
+        b.pop("offers", None)
         floor = guard.parse_time(offered_at)
         if floor is not None and guard.parse_time(stamp) < floor:
             stamp = offered_at
@@ -1010,6 +1342,11 @@ def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None) -> No
         b["announced"] = announced
         b["last_at"] = hub._iso(at)
         doc["confirm"] = doc["confirm"][b.pop("offered"):]
+        if ts is not None:
+            b["posts"] = (b.get("posts") or [])[-(POSTS_KEEP - 1):] + [{"ts": str(ts), "texts": [o["text"] for o in offers]}]
+            for v in doc["void"]:
+                if v.get("until") is None and (guard.parse_time(v.get("from")) or 0) < (guard.parse_time(str(ts)) or 0):
+                    v["until"] = str(ts)
         save(ws, doc)
 
 
@@ -1062,6 +1399,10 @@ def main(args, ws, cfg, out=sys.stdout, err=sys.stderr, at: Optional[datetime] =
     if len(pos) != 1 or not pos[0] or not o.get("tool") or not o.get("recommend") or not o.get("stdin"):
         print("usage:\n" + USAGE, file=err)
         return 2
+    me = os.environ.get(guard.CHIEF_WORKER_ENV, "").strip()
+    if me and me != pos[0]:  # the approval's instruction would land with the other worker
+        print("mother decide: you are %s, so file under %s, not %s" % (me, me, pos[0]), file=err)
+        return 1
     try:
         inp = json.loads(sys.stdin.read())
     except ValueError:
@@ -1108,7 +1449,10 @@ def _main_batch(verb, rest, ws, cfg, out, err, at) -> int:
         print("mother decide: --ids takes D7,D8, or '' for a batch of confirm lines only", file=err)
         return 2
     try:
-        sent(ws, at, raw.split(",") if raw else [], o.get("ts"))
+        record_post(ws, cfg or {}, at, raw.split(",") if raw else [], o.get("ts"))
+    except SlackReadFailed as e:
+        print("mother decide: %s" % e, file=err)
+        return 3
     except ValueError as e:
         print("mother decide: %s" % e, file=err)
         return 2
@@ -1117,7 +1461,7 @@ def _main_batch(verb, rest, ws, cfg, out, err, at) -> int:
 
 
 def _main_answer(rest, ws, cfg, out, err, at) -> int:
-    """mother decide answer <n> <ok|no|edit|say> --via pane|typed [-- <text>] — for the Chief pane only. Refused in a
+    """mother decide answer <n> <ok|no|edit|say> --via pane [-- <text>] — for the Chief pane only. Refused in a
     worker's process, behind the guard's deny. Not on MOTHER_CHIEF_ROLE: the pane's mod runs in the chief's session and
     inherits it (hooks/chief.tsx reads its role the same way)."""
     if os.environ.get(guard.CHIEF_WORKER_ENV, "").strip():
@@ -1134,9 +1478,9 @@ def _main_answer(rest, ws, cfg, out, err, at) -> int:
         print("mother decide: %s" % e, file=err)
         return 2
     m = _NUM.match(pos[0].lower()) if len(pos) == 2 else None
-    if not m or pos[1] not in VERBS or o.get("via") not in ("pane", "typed") \
+    if not m or pos[1] not in VERBS or o.get("via") not in VIAS \
             or (pos[1] in ("edit", "say") and not payload.strip()):
-        print("usage: mother decide answer <n> <ok|no|edit|say> --via pane|typed [-- <text>]", file=err)
+        print("usage: mother decide answer <n> <ok|no|edit|say> --via pane [-- <text>]", file=err)
         return 2
     ok, msg = _answer(Path(ws), cfg or {}, at or datetime.now(timezone.utc), int(m.group(1)), pos[1], payload,
                       {"via": o["via"]})

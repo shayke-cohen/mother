@@ -37,7 +37,7 @@ export const CLI = {
  },
  "status_pending": {
   "exitCode": 0,
-  "stdout": "{\n  \"version\": 1,\n  \"at\": \"2026-11-02T09:00:00Z\",\n  \"paused\": false,\n  \"chief\": {\n    \"alive\": true,\n    \"heartbeat_at\": \"2026-11-02T09:00:00Z\",\n    \"session_id\": null\n  },\n  \"budget\": {\n    \"spent\": 0.0,\n    \"limit\": 20.0,\n    \"unreadable\": false,\n    \"over\": false\n  },\n  \"workers\": [\n    {\n      \"key\": \"PLAT-1\",\n      \"title\": \"Plat one\",\n      \"status\": \"waiting_decision\",\n      \"held\": false,\n      \"running\": false,\n      \"progress\": \"\",\n      \"cost\": 0.0,\n      \"runs\": 0,\n      \"last_run_at\": null,\n      \"session_id\": \"00000000-0000-4000-8000-000000000001\",\n      \"queued\": 0,\n      \"resume\": \"claude --resume 00000000-0000-4000-8000-000000000001\",\n      \"unseen\": 0\n    }\n  ],\n  \"desktop\": [],\n  \"decisions\": [\n    {\n      \"id\": \"D1\",\n      \"key\": \"PLAT-1\",\n      \"kind\": \"chat-reply\",\n      \"target\": \"C00000001, thread_ts 1700000000.000100\",\n      \"recommendation\": \"send\",\n      \"why\": \"they <asked> @x\",\n      \"text\": \"We ship Tuesday.\\n:sparkles: *Agnes (AI)* · on behalf of Dana\",\n      \"full_text\": \"We ship Tuesday.\\n:sparkles: *Agnes (AI)* · on behalf of Dana\",\n      \"urgent\": false,\n      \"status\": \"pending\",\n      \"created\": \"2026-11-02T09:00:00Z\",\n      \"expires\": \"2026-11-02T09:00:00Z\",\n      \"edit_refusal\": null,\n      \"edit_text\": \"We ship Tuesday.\\n:sparkles: *Agnes (AI)* · on behalf of Dana\"\n    },\n    {\n      \"id\": \"D2\",\n      \"key\": \"PLAT-1\",\n      \"kind\": \"tracker-create\",\n      \"target\": \"PLAT, issueType Bug\",\n      \"recommendation\": \"send\",\n      \"why\": \"\",\n      \"text\": \"\",\n      \"full_text\": \"summary: s\\n\\ndescription: d\",\n      \"urgent\": true,\n      \"status\": \"pending\",\n      \"created\": \"2026-11-02T09:00:00Z\",\n      \"expires\": \"2026-11-02T09:00:00Z\",\n      \"edit_refusal\": \"this call sends summary and description, and an edit can only replace one. Tell the worker what to change: 2 <your words>\",\n      \"edit_text\": null\n    },\n    {\n      \"id\": \"D3\",\n      \"key\": \"PLAT-1\",\n      \"kind\": \"manual\",\n      \"target\": \"a@example.com\",\n      \"recommendation\": \"send\",\n      \"why\": \"\",\n      \"text\": \"y\",\n      \"full_text\": \"subject: x\\n\\nbody: y\",\n      \"urgent\": false,\n      \"status\": \"pending\",\n      \"created\": \"2026-11-02T09:00:00Z\",\n      \"expires\": \"2026-11-02T09:00:00Z\",\n      \"edit_refusal\": \"this call sends subject and body, and an edit can only replace one. Tell the worker what to change: 3 <your words>\",\n      \"edit_text\": null\n    }\n  ],\n  \"to_decide\": 3,\n  \"reply_problem\": null\n}\n",
+  "stdout": "{\n  \"version\": 1,\n  \"at\": \"2026-11-02T09:00:00Z\",\n  \"paused\": false,\n  \"chief\": {\n    \"alive\": true,\n    \"heartbeat_at\": \"2026-11-02T09:00:00Z\",\n    \"session_id\": null\n  },\n  \"budget\": {\n    \"spent\": 0.0,\n    \"limit\": 20.0,\n    \"unreadable\": false,\n    \"over\": false\n  },\n  \"workers\": [\n    {\n      \"key\": \"PLAT-1\",\n      \"title\": \"Plat one\",\n      \"status\": \"waiting_decision\",\n      \"held\": false,\n      \"running\": false,\n      \"progress\": \"\",\n      \"cost\": 0.0,\n      \"runs\": 0,\n      \"last_run_at\": null,\n      \"session_id\": \"00000000-0000-4000-8000-000000000001\",\n      \"queued\": 0,\n      \"resume\": \"claude --resume 00000000-0000-4000-8000-000000000001\",\n      \"unseen\": 0\n    }\n  ],\n  \"desktop\": [],\n  \"decisions\": [\n    {\n      \"id\": \"D1\",\n      \"key\": \"PLAT-1\",\n      \"kind\": \"chat-reply\",\n      \"tool\": \"mcp__chat__slack__post_message\",\n      \"target\": \"C00000001, thread_ts 1700000000.000100\",\n      \"recommendation\": \"send\",\n      \"why\": \"they <asked> @x\",\n      \"text\": \"We ship Tuesday.\\n:sparkles: *Agnes (AI)* · on behalf of Dana\",\n      \"full_text\": \"We ship Tuesday.\\n:sparkles: *Agnes (AI)* · on behalf of Dana\",\n      \"urgent\": false,\n      \"status\": \"pending\",\n      \"created\": \"2026-11-02T09:00:00Z\",\n      \"expires\": \"2026-11-02T09:00:00Z\",\n      \"edit_refusal\": null,\n      \"edit_text\": \"We ship Tuesday.\\n:sparkles: *Agnes (AI)* · on behalf of Dana\"\n    },\n    {\n      \"id\": \"D2\",\n      \"key\": \"PLAT-1\",\n      \"kind\": \"tracker-create\",\n      \"tool\": \"mcp__tracker__jira__create-issue\",\n      \"target\": \"PLAT, issueType Bug\",\n      \"recommendation\": \"send\",\n      \"why\": \"\",\n      \"text\": \"\",\n      \"full_text\": \"summary: s\\n\\ndescription: d\",\n      \"urgent\": true,\n      \"status\": \"pending\",\n      \"created\": \"2026-11-02T09:00:00Z\",\n      \"expires\": \"2026-11-02T09:00:00Z\",\n      \"edit_refusal\": \"this call sends summary and description, and an edit can only replace one. Tell the worker what to change: 2: <your words>\",\n      \"edit_text\": null\n    },\n    {\n      \"id\": \"D3\",\n      \"key\": \"PLAT-1\",\n      \"kind\": \"manual\",\n      \"tool\": \"mcp__mail__gmail__send-gmail-message\",\n      \"target\": \"a@example.com\",\n      \"recommendation\": \"send\",\n      \"why\": \"\",\n      \"text\": \"y\",\n      \"full_text\": \"subject: x\\n\\nbody: y\",\n      \"urgent\": false,\n      \"status\": \"pending\",\n      \"created\": \"2026-11-02T09:00:00Z\",\n      \"expires\": \"2026-11-02T09:00:00Z\",\n      \"edit_refusal\": \"this call sends subject and body, and an edit can only replace one. Tell the worker what to change: 3: <your words>\",\n      \"edit_text\": null\n    }\n  ],\n  \"to_decide\": 3,\n  \"reply_problem\": null\n}\n",
   "stderr": ""
  },
  "sent_before_batch": {
@@ -49,6 +49,16 @@ export const CLI = {
   "exitCode": 0,
   "stdout": "{\"text\": \"3 to decide · 0 done without you\\nD1 · PLAT-1 · chat-reply on C00000001, thread_ts 1700000000.000100: \\\"We ship Tuesday. :sparkles: *Agnes (AI)* · on behalf of Dana\\\" · why: they &lt;asked&gt; @​x · recommend: send\\nD2 · PLAT-1 · tracker-create on PLAT, issueType Bug: \\\"s\\\" · also sends: description · recommend: send\\nD3 · PLAT-1 · manual on a@​example.com: \\\"y\\\" · also sends: subject · recommend: send\\nReply in this DM, not in a thread: 7 ok · 7 no · 7 edit: your text · ok all\", \"ids\": [\"D1\", \"D2\", \"D3\"]}\n",
   "stderr": ""
+ },
+ "sent_not_the_batch": {
+  "exitCode": 2,
+  "stdout": "",
+  "stderr": "mother decide: the message at 1762077600.000100 isn't the batch `mother decide batch` offered: its text differs. Nothing was recorded\n"
+ },
+ "sent_read_failed": {
+  "exitCode": 3,
+  "stdout": "",
+  "stderr": "mother decide: couldn't read 1762077600.000100 in D00000001 to check the post (other: no hub chat connection in config); nothing was recorded, try again\n"
  },
  "sent_ok": {
   "exitCode": 0,
@@ -67,7 +77,7 @@ export const CLI = {
  },
  "edit_several_fields": {
   "exitCode": 1,
-  "stdout": "{\"ok\": false, \"message\": \"D2 is still open: this call sends summary and description, and an edit can only replace one. Tell the worker what to change: 2 <your words>.\"}\n",
+  "stdout": "{\"ok\": false, \"message\": \"D2 is still open: this call sends summary and description, and an edit can only replace one. Tell the worker what to change: 2: <your words>.\"}\n",
   "stderr": ""
  },
  "answer_ok": {
@@ -88,7 +98,7 @@ export const CLI = {
  "answer_usage": {
   "exitCode": 2,
   "stdout": "",
-  "stderr": "usage: mother decide answer <n> <ok|no|edit|say> --via pane|typed [-- <text>]\n"
+  "stderr": "usage: mother decide answer <n> <ok|no|edit|say> --via pane [-- <text>]\n"
  },
  "post_log": {
   "exitCode": 0,

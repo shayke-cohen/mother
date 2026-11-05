@@ -29,7 +29,24 @@ CONFIG = {"version": 1, "agent": {"name": "Agnes", "emoji": ":sparkles:", "manag
                       "chat_dm": ["U00000001", "D00000001"]},
           "workspace": {"git_remote": None, "home_machine": None},
           "connectors": {"chat": "slack", "tracker": "jira", "mail": "gmail", "calendar": "google", "code": "github"},
-          "teams": [], "policy": {"autonomy": "functional"}}
+          "teams": [{"slug": "platform", "name": "Platform", "tracker": {"project": "PLAT", "board": 1234},
+                     "channels": [{"id": "C00000001", "name": "#platform", "mode": "draft"}]}],
+          "policy": {"autonomy": "functional"}}
+# `mother decide sent` re-reads the post, so its capture runs the real bin/mother with the Slack read answered from a file.
+# The stand-in is here, on the test's side: production has no switch that turns the read off.
+WITH_POST = """
+import json, os, runpy, sys
+sys.path.insert(0, os.path.join(sys.argv[1], "lib"))
+import decisions
+posted = sys.argv[2]
+def read(cfg, channel, ts):
+    with open(posted) as f:
+        return dict(json.load(f), ts=ts)
+decisions._fetch_slack = read
+script = os.path.join(sys.argv[1], "bin", "mother")
+sys.argv = [script] + sys.argv[3:]
+runpy.run_path(script, run_name="__main__")
+"""
 
 
 def normal(text: str) -> str:
@@ -60,6 +77,13 @@ def capture() -> dict:
             p = subprocess.run([sys.executable, MOTHER] + list(args), input=stdin, capture_output=True, text=True, env=env)
             out[name] = {"exitCode": p.returncode, "stdout": normal(p.stdout), "stderr": normal(p.stderr)}
 
+        posted = os.path.join(tmp, "posted.json")
+
+        def run_sent(name, *args):
+            p = subprocess.run([sys.executable, "-c", WITH_POST, ROOT, posted] + list(args), capture_output=True,
+                               text=True, env=env)
+            out[name] = {"exitCode": p.returncode, "stdout": normal(p.stdout), "stderr": normal(p.stderr)}
+
         def file_it(name, tool, inp, *extra):
             run(name, "decide", "propose", "PLAT-1", "--tool", tool, "--recommend", "send", *extra, "--stdin",
                 stdin=json.dumps(inp))
@@ -74,11 +98,17 @@ def capture() -> dict:
         file_it("propose_mail", MAIL, {"to": ["a@example.com"], "subject": "x", "body": "y"})
         run("tick_due", "chief", "tick", "--json")
         run("status_pending", "chief", "status", "--json")
-        run("sent_before_batch", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)
+        run_sent("sent_before_batch", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)
         run("batch_due", "decide", "batch", "--json")
-        run("sent_ok", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)
-        run("sent_again", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)
-        run("sent_no_ids", "decide", "sent", "--ids", "", "--ts", POST_TS)
+        with open(posted, "w") as f:
+            json.dump({"app_id": "A00000001", "text": "not the batch"}, f)
+        run_sent("sent_not_the_batch", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)
+        run("sent_read_failed", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)  # no chat connection in this config
+        with open(posted, "w") as f:
+            json.dump({"app_id": "A00000001", "text": json.loads(out["batch_due"]["stdout"])["text"]}, f)
+        run_sent("sent_ok", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)
+        run_sent("sent_again", "decide", "sent", "--ids", "D1,D2,D3", "--ts", POST_TS)
+        run_sent("sent_no_ids", "decide", "sent", "--ids", "", "--ts", POST_TS)
         run("edit_several_fields", "decide", "answer", "2", "edit", "--via", "pane", "--", "new words")
         run("answer_ok", "decide", "answer", "1", "ok", "--via", "pane")
         run("answer_again", "decide", "answer", "1", "ok", "--via", "pane")

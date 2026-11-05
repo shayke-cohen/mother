@@ -541,9 +541,10 @@ class TestWaitsOnDecision(Base):
         self.assertEqual(len(doc["decisions"]), 1)
         got = doc["decisions"][0]
         self.assertEqual(sorted(got), sorted(["id", "key", "kind", "target", "recommendation", "why", "text",
-                                              "full_text", "edit_refusal", "edit_text", "urgent", "status", "created", "expires"]))
+                                              "full_text", "edit_refusal", "edit_text", "urgent", "status", "created", "expires", "tool"]))
         self.assertEqual(got["target"], "a@b.c")
         self.assertEqual(got["full_text"], "y" * 500)
+        self.assertEqual(got["tool"], self.MAIL)  # the card names the tool and server
         self.assertEqual((got["id"], got["key"], got["kind"], got["recommendation"], got["why"], got["urgent"],
                           got["status"], got["created"], got["expires"]),
                          ("D1", "PLAT-1", "manual", "send", "asked", True, "pending", d1["created"], d1["expires"]))
@@ -589,7 +590,8 @@ class TestTickDecisions(Base):
     MAIL = "mcp__mail__gmail__send-gmail-message"
     SIG = "Mother (AI)"
     DM, OWNER = "D00000001", "U00000001"
-    CFG = {"agent": {"name": "Mother"}, "manager": {"chat_dm": ["U00000001", "D00000001"]}}
+    CFG = {"agent": {"name": "Mother"}, "manager": {"chat_dm": ["U00000001", "D00000001"]},
+           "teams": [{"slug": "platform", "tracker": {"project": "PLAT"}, "channels": [{"id": "C00000001", "mode": "draft"}]}]}
     TS = "%.6f" % (AT.timestamp() + 60)
     LATER = AT + timedelta(seconds=120)
     HELP = "I couldn't read that reply, so nothing was applied. Use: 7 ok · 7 no · 7 edit: your text · ok all"
@@ -606,10 +608,15 @@ class TestTickDecisions(Base):
         self.words = {}
         self.sessions = 0
 
+        def read(cfg, channel, ts):
+            return self.fetch(cfg, channel, ts)
+        read.history = lambda channel, oldest: self.dm_history
+
         @contextlib.contextmanager
         def session(cfg):
             self.sessions += 1
-            yield self.fetch
+            yield read
+        self.dm_history = []
         p = mock.patch.object(decisions, "_slack_session", session)
         p.start()
         self.addCleanup(p.stop)
@@ -708,7 +715,7 @@ class TestTickDecisions(Base):
     def test_tick_unreadable_reply_confirms_help(self):
         self.file()
         self.announce("D1")
-        for text, ts in (("1 maybe yes, 2 ok", self.TS), ("9 ok", "%.6f" % (AT.timestamp() + 61))):
+        for text, ts in (("1 ok 2 3", self.TS), ("9 ok", "%.6f" % (AT.timestamp() + 61))):
             self.inbox(self.manual(text, ts))
         r = self.tick()
         self.assertEqual(self.doc()["confirm"], [self.HELP, self.HELP])
@@ -729,12 +736,58 @@ class TestTickDecisions(Base):
             r = self.tick()
             self.assertEqual((r["decided"], r["judge"], self.doc()["confirm"], self.status()), ([], [], [], "pending"))
             self.assertEqual(chief.lines(self.ws), [])
-        r = self.tick()  # the third failed read: the line goes the normal way, with the help line
-        self.assertEqual((r["decided"], r["judge"], self.status()), ([], [l["id"]], "pending"))
-        self.assertEqual(self.doc()["confirm"], [self.HELP])
+        r = self.tick()  # the third failed read: it stays pending, the manager is told once, and the chief isn't handed it
+        self.assertEqual((r["decided"], r["judge"], self.status()), ([], [], "pending"))
+        self.assertEqual(self.doc()["confirm"], [decisions.READ_FAILED])
         self.assertNotIn("secret-detail", json.dumps(self.doc()))
-        self.tick()
+        self.tick()                                              # backed off
         self.assertEqual(len(self.fetched), 3)
+        r = self.tick(at=self.LATER + timedelta(minutes=5))      # Slack is back
+        self.assertEqual(self.status(), "approved")
+        self.assertEqual([x["line_id"] for x in r["decided"]], [l["id"]])
+
+    def test_a_reply_outliving_the_hold_is_still_applied_behind_the_cursor(self):
+        """Past the hold the chief's decide may jump it. The reply keeps its retries and is still logged once."""
+        self.file()
+        self.announce("D1")
+        l, later = self.manual("1 ok"), line(key="PLAT-7")
+        self.inbox(l, later)
+        self.fail_fetch = 3
+        for _ in range(3):
+            r = self.tick()
+        self.assertEqual(r["judge"], [later["id"]])
+        hub.decide(self.ws, self.CFG, self.LATER, [{"line_id": later["id"], "key": later["key"], "decision": "log"}])
+        self.tick(at=self.LATER + timedelta(minutes=5))
+        self.assertEqual(self.status(), "approved")
+        self.assertIn(l["id"], {x["line_id"] for x in hub._hub_doc(self.ws)["routed"]})
+
+    def test_a_note_starting_with_a_number_reaches_the_chief(self):
+        """Ruling T2: it answers nothing and gets no help line, with D2 open and announced."""
+        self.file()
+        self.file(words="two")
+        self.announce("D1", "D2")
+        note = self.manual("2 things for tomorrow")
+        self.inbox(note)
+        r = self.tick()
+        self.assertEqual(r["judge"], [note["id"]])
+        self.assertEqual([d["status"] for d in self.doc()["decisions"]], ["pending", "pending"])
+        self.assertEqual(self.doc()["confirm"], [])
+        self.assertEqual(self.fetched, [])                       # not a reply, so no read
+
+    def test_the_tick_holds_a_reply_after_a_counterfeit_row(self):
+        self.file()
+        self.announce("D1")
+        self.dm_history = [{"ts": "%.6f" % (AT.timestamp() + 50), "app_id": "A00000001", "bot_id": "B00000001",
+                            "text": 'D1 · w · chat-post on C00000001: "thanks" · recommend: send'}]
+        l = self.manual("1 ok")
+        self.inbox(l)
+        r = self.tick()
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual([x["line_id"] for x in r["decided"]], [l["id"]])  # logged, not handed on as a note
+        self.assertEqual(r["judge"], [])
+        self.assertEqual(len(self.doc()["confirm"]), 1)
+        self.assertIn("didn't come from Mother", self.doc()["confirm"][0])
+        self.assertIs(r["batch"], True)
 
     def test_tick_slack_failure_then_success_applies(self):
         self.file()
@@ -749,7 +802,7 @@ class TestTickDecisions(Base):
 
     def test_no_wake_for_lines_after_a_held_note(self):
         """The chief can't move the cursor past a note waiting on a re-read, so the note can't be lost."""
-        note = self.manual("2 things for tomorrow")
+        note = self.manual("no 2 things for tomorrow")
         later = line(key="PLAT-7")
         self.inbox(note, later)
         self.fail_fetch = 3
@@ -762,14 +815,14 @@ class TestTickDecisions(Base):
         self.assertEqual(r["judge"], [note["id"], later["id"]])
         self.assertIsNotNone(r["wake"])
         self.assertEqual([l["id"] for l in chief.lines(self.ws)], [note["id"], later["id"]])
-        self.assertEqual(self.doc()["confirm"], [self.HELP])
+        self.assertEqual(self.doc()["confirm"], [decisions.READ_GAVE_UP])  # nothing was open for it to answer
         hub.decide(self.ws, self.CFG, self.LATER, [{"line_id": note["id"], "key": note["key"], "decision": "now"},
                                                    {"line_id": later["id"], "key": later["key"], "decision": "log"}])
         routed = {x["line_id"] for x in hub._hub_doc(self.ws)["routed"]}
         self.assertIn(note["id"], routed)
 
     def test_held_note_read_recovers_and_routes(self):
-        note = self.manual("2 things for tomorrow")
+        note = self.manual("no 2 things for tomorrow")
         later = line(key="PLAT-7")
         self.inbox(note, later)
         self.fail_fetch = 1
@@ -778,7 +831,7 @@ class TestTickDecisions(Base):
 
     def test_lines_before_a_held_note_still_wake(self):
         first = line(key="PLAT-7")
-        note = self.manual("2 things for tomorrow")
+        note = self.manual("no 2 things for tomorrow")
         self.inbox(first, note, line(key="PLAT-8"))
         self.fail_fetch = 1
         self.assertEqual(self.tick()["judge"], [first["id"]])
@@ -1414,8 +1467,13 @@ class TestTickDecisions(Base):
         self.assertEqual((self.doc()["batch"]["last_at"], self.doc()["batch"]["announced"]), (None, {}))
 
     def cli(self, *args, env=None):
+        """The CLI, with the post it re-reads there: an app-posted message saying what's on offer."""
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, env or {}):
+
+        def posted(cfg, channel, ts):
+            return {"ts": ts, "app_id": "A00000001", "bot_id": "B00000001",
+                    "text": self.doc()["batch"].get("offered_text")}
+        with mock.patch.dict(os.environ, env or {}), mock.patch.object(decisions, "_fetch_slack", posted):
             code = decisions.main(list(args), self.ws, self.CFG, out, err, at=self.LATER)
         return code, out.getvalue(), err.getvalue()
 
@@ -1496,7 +1554,7 @@ class TestTickDecisions(Base):
             doc = self.doc()
             doc["confirm"].append("came during the post")
             decisions.save(self.ws, doc)
-        self.assertEqual(self.cli("sent", "--ids", "")[0], 0)
+        self.assertEqual(self.cli("sent", "--ids", "", "--ts", self.TS)[0], 0)
         self.assertEqual(self.doc()["confirm"], ["came during the post"])
         self.assertIs(self.doc()["batch"].get("offered"), None)
 
@@ -1510,7 +1568,7 @@ class TestTickDecisions(Base):
             doc["confirm"] = ["a"]
             decisions.save(self.ws, doc)
         self.cli("batch", "--json")
-        self.assertEqual(self.cli("sent")[0], 0)
+        self.assertEqual(self.cli("sent", "--ts", self.TS)[0], 0)
         self.assertEqual(self.doc()["confirm"], [])
 
     def test_cli_sent_with_an_empty_id_list(self):
@@ -1577,6 +1635,18 @@ class TestTickDecisions(Base):
         with contextlib.redirect_stdout(out):
             chief.main(["tick", "--json"], self.ws, self.CFG, AT)
         self.assertIs(json.loads(out.getvalue())["batch"], True)
+
+
+class TestHeaderSaysTheRules(unittest.TestCase):
+    """Final Minors 3 and 6, and C1: what a new worker is told matches what the guard and propose do."""
+
+    def test_it_names_what_would_otherwise_be_a_surprise(self):
+        h = chief.HEADER % ("PLAT-1", "t")
+        self.assertIn("no apostrophes", h)                 # one would end the quoted --why, and the filing is denied
+        self.assertIn("(AI)", h)                           # what the signature is
+        self.assertIn("your own key", h)
+        self.assertIn("never post to the manager's own DM", h)
+        self.assertIn("target no grant can reach", h)
 
 
 class TestSettingsCoerce(unittest.TestCase):

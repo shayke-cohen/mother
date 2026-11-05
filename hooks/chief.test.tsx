@@ -1997,7 +1997,7 @@ test('test_real_several_fields_have_no_edit_and_say_why', async ($, on) => {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ key: 'decide-edit:D2' })).toBeUndefined()
     expect(await ui.find({ key: 'decide-edit:D3' })).toBeUndefined()
-    expect(await hasText(ui, /^No Edit here: this call sends summary and description, and an edit can only replace one\. Tell the worker what to change: 2 <your words>/)).toBe(true)
+    expect(await hasText(ui, /^No Edit here: this call sends summary and description, and an edit can only replace one\. Tell the worker what to change: 2: <your words>/)).toBe(true)
     await ui.press({ key: 'decide-edit:D1' })                                       // the single-field one still edits
     expect(String((await ui.find({ key: 'decide-text:D1' }))?.props?.value)).toMatch(/^We ship Tuesday\.\n.*Agnes \(AI\)/)
     await ui.press({ key: 'decide-cancel:D1' })

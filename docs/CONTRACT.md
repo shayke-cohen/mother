@@ -1427,8 +1427,14 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     announced at that ts (a decision keeps its first stamp) and clears the confirmation lines the batch offered; a line
     that arrived during the post stays. It needs a live offer from `batch`, each offer is used once, and the ids must
     be ones that offer named: otherwise it exits 2 and writes nothing, `--ids ''` and a repeat of a successful `sent`
-    included, as it does for a bad `--ids` or `--ts`. So the order is `batch`, post, `sent`. A batch of confirmation
-    lines alone uses `--ids ''`. The stamp is never earlier than the offer.
+    included, as it does for a bad `--ids` or a missing or bad `--ts`. So the order is `batch`, post, `sent`. A batch of
+    confirmation lines alone uses `--ids ''`. The stamp is never earlier than the offer. A stamp must prove a post: `sent`
+    re-reads the message at `--ts` in the manager's first `D…` channel, through the read `answer` uses, and stamps only
+    when it is app-posted, draws nothing but its text (no attachments, no blocks but `rich_text`) and its text equals the
+    offer's after Slack's escaping is undone. An earlier offer since the last `sent` counts, for a post that landed late,
+    and then only that offer's ids can be stamped. Exits: no live offer, 2, with "no batch is waiting"; no such message, not
+    app-posted or other text, 2, with a message without that phrase, and the offer stays live; a read that failed, 3, which
+    is worth retrying and stamps nothing.
   - **The post.** The chief's mod posts the batch with `$.mcp.call`, which is not a tool call, so the guard doesn't see
     it. The mod does the guard's checks itself: nothing goes out under `MOTHER_DRY_RUN` or either PAUSED file, only the
     manager's `D…` channel is posted to, and `mother chief post-log --stdin` writes each attempt and its outcome to
@@ -1450,17 +1456,33 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     there are several. A call `edit` can't take has no Edit button, and its card shows `edit_refusal` from the status.
   - **Answering.** Two routes, and only these. A reply in the manager's own DM: a `manual` inbox line whose id, channel
     and timestamp are re-read from Slack (`get_channel_history`) and the text parsed from the message as fetched, not
-    from the watcher's summary: `7 ok`, `7 no`, `7 edit: <text>`, `7 <words>` for the worker, `ok all`, several on separate lines. A reply counts
+    from the watcher's summary: `7 ok`, `7 no`, `7 edit: <text>`, `7: <words>` for the worker, `ok all`, several on separate lines. A number followed
+    by other words isn't a reply: "2 things for tomorrow" keeps its normal path to the chief. A reply counts
     only for a decision filed and announced before the reply was typed. Or a button in the Chief pane
     (`mother decide answer <n> ok|no|edit --via pane`). A line that can't be verified or read applies nothing and the
     decision stays open: it gets the help line and keeps its normal path, so a note that only looks like a reply isn't
-    lost. A failed Slack read is retried for 3 ticks first. There are no typed `/chief` answer commands (`/chief decisions` only lists).
+    lost. A failed Slack read isn't a bad reply: it holds the lines after it for 3 ticks, and then the manager is told
+    once, "Slack read failed; I'll apply your reply when I can read it", the chief's lines go on without it, and the read
+    backs off from 1 minute to 30 until no decision it could answer is open, when the manager is told it wasn't applied.
+    There are no typed `/chief` answer commands (`/chief decisions` only lists).
+  - **Counterfeit rows.** Before applying replies, the tick reads the DM from the last real batch before the earliest
+    reply (a read it can't finish, truncated included, holds the replies like a failed read). An app-posted message there
+    that looks like a decision batch (`D<n>` with `recommend`, or the Reply footer, in its text, blocks or attachments) and
+    isn't a text a real batch offered names rows: the open ids it gives, or every open row if it gives none. A reply typed
+    after it and before the next real batch that names one of them, `ok all` included, applies nothing and is logged. The
+    manager is told once per message in the next batch: a message that looked like a batch didn't come from Mother, and
+    what to answer again. Normal sessions keep their green post to this DM, which is why the reply side checks. It is a
+    pattern, so a row worded some other way gets past it. The pane always shows the real draft.
     Code writes the result: `ok` and `edit` write a grant and queue the approved call for the worker; `no` and a
     redirect queue the manager's words. `edit` replaces the draft's text (keeping the signature), so the grant binds
     to the edited call. It refuses a call with several fields (a new ticket's summary and description, mail's subject
     and body), blocks, or no text field: new text in one field would send the others unread, so the manager tells the
-    worker what to change instead (`7 <words>`). An answer made while `.mother/PAUSED` or `chief/PAUSED` exists writes no grant and the decision
-    stays pending, as does one the policy would refuse (scope off, a reply older than the grant age limit).
+    worker what to change instead (`7: <words>`). An answer made while `.mother/PAUSED` or `chief/PAUSED` exists writes no grant and the decision
+    stays pending, as does one the policy would refuse (scope off, a target that left `allowed_targets`, a reply older
+    than the grant age limit). `propose` refuses, up front, a call whose target `guard.allowed_targets` wouldn't let a grant
+    reach (a DM, an external or `off` channel, a channel or project outside the config's teams) or whose scope has no uses,
+    and it refuses a worker filing under another worker's key. `approved` says so when no run can start (held, over
+    budget), rather than promising the call.
   - **The bound grant.** One live grant per decision: `uses: 1`, `run: "chief:D<n>"`, `decision: D<n>`, `draft_sha`,
     scope and target from the decision, expiring at the earliest of two hours, the decision's `expires` and the policy's
     cited-message age limit. `draft_sha` is the sha256 of the tool name and input as sorted compact JSON, defined once in
@@ -1471,7 +1493,9 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     (<kind> on <target>)`. The ledger proves the guard let the call through, not that the service accepted it, so that's
     all the line says. No use, and the grant ran out: `expired`, `D<n>: approved but not used in time; nothing went
     out`. No use, and the run ended: `failed`, either `D<n>: the worker failed after your yes; it's back with the worker`
-    or `D<n>: the worker's turn ended without the call you approved; nothing went out, and it's back with the worker.`
+    or `D<n>: the worker's turn ended without the call you approved; nothing went out, and it's back with the worker.`,
+    or, when the target is no longer one a grant can reach, `D<n>: the guard refused the call: target not allowed; nothing
+    went out, and it's back with the worker.`
     The worker gets a note in each case but `sent`. A pending decision past `expires` becomes `expired`, `D<n> expired
     unanswered.`, and its grant is removed. A ledger that can't be read leaves the decision `approved` until it can.
   - **What a worker can't do.** No shell command off the guard's allow-list, so no `npm test` and no `python3 -m
@@ -1503,9 +1527,14 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     workspace open nothing, and the shell allow-list applies wherever the command's cwd is. A worker counts as hub-fed
     from its first turn, and a typed `mother approve` line doesn't count in it. Every ask from a worker is a deny that
     tells it to file a decision or say what it needs in its PROGRESS line, as the chief's asks already are. What remains
-    open: reads, workspace edits, the allow-list, the manager's own DM, a live bound grant, a worker's exact `mother
-    decide propose` (checked before the text rule, so quoted third-party text can't stop a filing), and the chief's
-    `mother chief …` and `mother decide batch [--json]`, `sent --ids D7,D8|'' [--ts TS]`.
+    open: reads, workspace edits, the allow-list, a live bound grant, a worker's exact `mother decide propose` (checked
+    before the text rule, so quoted third-party text can't stop a filing), and the chief's `mother chief …` and `mother
+    decide batch [--json]`, `sent --ids D7,D8|'' --ts TS`.
+  - **The self-DM is the approval surface.** A worker's chat call to the manager's own DM is a deny, whatever the policy
+    says. The chief's is allowed only for a plain post from the chief's own session whose `text` equals the live offer
+    (`batch.offered_text` in `decisions.json`, gone once `sent` uses it), with only the channel, the text and link and
+    format settings in the call; edits, reactions and threads are denied. A normal session keeps `own_dm`, and the tick's
+    counterfeit check covers that side.
   - **A positive shell list.** With `MOTHER_CHIEF_WORKER` or `MOTHER_CHIEF_ROLE=chief`, every stage of a shell command must
     be one of: `cat`, `ls`, `head`, `tail`, `wc`, `grep`, `rg` (no `--pre`, `--hostname-bin`); `git status|log|diff|show`
     with an exact set of options, no prefixes (no `push`, `fetch`, `pull`, `commit`, `add`, `-c`, `-C`, `--output`,

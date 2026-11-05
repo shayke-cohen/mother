@@ -1,6 +1,7 @@
 """Tests for lib/decisions.py — the decision queue.
 Run: python3 -m unittest tests.test_decisions -v
 """
+import contextlib
 import io
 import json
 import os
@@ -23,7 +24,8 @@ AT = datetime(2026, 11, 1, 9, 0, tzinfo=UTC)
 POST = "mcp__chat__slack__post_message"
 MAIL = "mcp__mail__gmail__send-gmail-message"
 SIG = "Mother (AI)"
-SIGNED = {"agent": {"name": "Mother"}}
+TEAMS = [{"slug": "platform", "tracker": {"project": "PLAT"}, "channels": [{"id": "C00000001", "mode": "draft"}]}]
+SIGNED = {"agent": {"name": "Mother"}, "teams": TEAMS}  # C00000001 and PLAT are targets the guard lets a grant reach
 REPLY = {"channel": "C00000001", "text": "hello " + SIG, "thread_ts": "1700000000.000100"}
 
 
@@ -91,7 +93,8 @@ class ProposeTest(Base):
 
     def test_load_defaults(self):
         self.assertEqual(decisions.load(self.ws), {"version": 1, "next": 1, "decisions": [],
-                                                   "batch": {"last_at": None, "announced": {}}, "confirm": [], "replied": {}})
+                                                   "batch": {"last_at": None, "announced": {}}, "confirm": [], "replied": {},
+                                                   "retry_at": {}, "void": []})
 
 
 class EditedInputTest(unittest.TestCase):
@@ -188,7 +191,7 @@ class ReplyGrammarTest(unittest.TestCase):
 
     def test_reply_no_list_and_say(self):
         self.assertEqual(decisions.parse_reply("no 7 8", self.OPEN), [(7, "no", ""), (8, "no", "")])
-        self.assertEqual(decisions.parse_reply("9 wait until Monday", self.OPEN), [(9, "say", "wait until Monday")])
+        self.assertEqual(decisions.parse_reply("9: wait until Monday", self.OPEN), [(9, "say", "wait until Monday")])
 
     def test_reply_duplicates_kept(self):
         self.assertEqual(decisions.parse_reply("ok 7, 7 no", self.OPEN), [(7, "ok", ""), (7, "no", "")])
@@ -598,7 +601,7 @@ class AnswerTest(Base):
                      ["answer", "1", "maybe", "--via", "pane"], ["answer", "1", "ok", "--via", "slack"]):
             self.assertEqual(decisions.main(args, self.ws, CFG, io.StringIO(), io.StringIO(), at=AT), 2, args)
         out = io.StringIO()
-        self.assertEqual(decisions.main(["answer", "1", "ok", "--via", "typed"], self.ws, CFG, out, io.StringIO(),
+        self.assertEqual(decisions.main(["answer", "1", "ok", "--via", "pane"], self.ws, CFG, out, io.StringIO(),
                                         at=AT), 1)
         self.assertEqual(json.loads(out.getvalue()), {"ok": False, "message": "D1 is already approved."})
 
@@ -631,7 +634,7 @@ class SignatureTest(Base):
         self.assertIn("agent", str(e.exception))
 
     def test_propose_accepts_the_configured_signature(self):
-        cfg = {"agent": {"signature": ":sparkles: on behalf"}}
+        cfg = {"agent": {"signature": ":sparkles: on behalf"}, "teams": TEAMS}
         d = decisions.propose(self.ws, cfg, AT, "PLAT-1", POST, dict(REPLY, text="hi :sparkles: on behalf"), "r")
         self.assertEqual(d["kind"], "chat-reply")
 
@@ -710,10 +713,10 @@ class DraftTextTest(Base):
         several = self.propose(tool=tool, inp={"projectKey": "PLAT", "summary": "s", "description": "d"})
         view = decisions.edit_view(several, SIGNED)
         self.assertIn("summary and description", view["edit_refusal"])
-        self.assertIn("2 <your words>", view["edit_refusal"])
+        self.assertIn("2: <your words>", view["edit_refusal"])
         self.assertIsNone(view["edit_text"])
         no_text = self.propose(tool=tool, inp={"projectKey": "PLAT", "summary": "only"})
-        self.assertIn("3 <your words>", decisions.edit_view(no_text, SIGNED)["edit_refusal"])
+        self.assertIn("3: <your words>", decisions.edit_view(no_text, SIGNED)["edit_refusal"])
 
     def test_edit_view_text_leaves_out_a_shown_setting(self):
         d = self.propose(inp=dict(REPLY, reply_broadcast=True))
@@ -873,6 +876,650 @@ class AnswerEnvironment(unittest.TestCase):
             code = decisions.main(["answer", "1", "ok", "--via", "pane"], self.ws, {}, out, err)
         self.assertEqual(code, 0)
         called.assert_called_once()
+
+
+class TargetEligibility(Base):
+    """Final I2: a call the guard could never let through is refused when it's filed, using the guard's own function."""
+
+    def test_refuses_targets_the_guard_would_deny(self):
+        for inp, tool in ((dict(REPLY, channel="D12345678"), POST),                       # a colleague's DM
+                          (dict(REPLY, channel="C00000099"), POST),                       # no team has it
+                          ({"issueIdOrKey": "OTHER-1", "comment": "x " + SIG},
+                           "mcp__tracker__jira__comment-on-issue")):
+            with self.assertRaises(ValueError) as e:
+                self.propose(inp=inp, tool=tool)
+            self.assertIn("the guard refused the call: target not allowed", str(e.exception))
+        self.assertEqual(decisions.load(self.ws)["decisions"], [])
+
+    def test_refuses_an_external_or_off_channel(self):
+        for extra in ({"external": True}, {"mode": "off"}):
+            ch = dict({"id": "C00000001", "mode": "draft"}, **extra)
+            cfg = dict(SIGNED, teams=[{"slug": "p", "channels": [ch]}])
+            with self.assertRaises(ValueError):
+                decisions.propose(self.ws, cfg, AT, "PLAT-1", POST, dict(REPLY), "r")
+
+    def test_refuses_a_scope_with_no_uses(self):
+        cfg = dict(SIGNED, policy={"grants": {"scopes": {"chat-reply": {"max_uses_per_source": 0}}}})
+        with self.assertRaises(ValueError) as e:
+            decisions.propose(self.ws, cfg, AT, "PLAT-1", POST, dict(REPLY), "r")
+        self.assertIn("chat-reply", str(e.exception))
+
+    def test_a_manual_kind_has_no_target_to_refuse(self):
+        self.assertEqual(self.propose(tool=MAIL, inp={"to": "a@b.c", "body": "x"})["kind"], "manual")
+
+    def test_the_decision_uses_the_guards_function(self):
+        with mock.patch.object(decisions.guard, "allowed_targets", return_value=set()) as got:
+            with self.assertRaises(ValueError):
+                self.propose()
+        got.assert_called_once_with("chat-reply", SIGNED)
+
+    def test_no_grant_when_the_target_went_away_after_filing(self):
+        self.propose()
+        cfg = dict(CFG, teams=[])
+        msg = decisions.answer(self.ws, cfg, AT, 1, "ok", "", {"via": "pane"})
+        self.assertIn("still open", msg)
+        self.assertIn("target not allowed", msg)
+        self.assertEqual(decisions.load(self.ws)["decisions"][0]["status"], "pending")
+
+    def closed(self, cfg):
+        self.propose()
+        decisions.answer(self.ws, CFG, AT, 1, "ok", "", {"via": "pane"})
+        chief.drop_queued(self.ws, "PLAT-1", "D1 approved by")
+        decisions.settle(self.ws, AT + timedelta(seconds=5), cfg)
+        return decisions.load(self.ws), chief._read_queue(self.ws)
+
+    def test_closure_names_the_guards_refusal(self):
+        doc, queue = self.closed(dict(CFG, teams=[]))
+        self.assertEqual(doc["decisions"][0]["status"], "failed")
+        self.assertIn("the guard refused the call: target not allowed", doc["confirm"][0])
+        self.assertIn("the guard refused the call: target not allowed", queue[-1]["text"])
+        self.assertNotIn("input", doc["confirm"][0] + queue[-1]["text"])
+
+    def test_closure_does_not_claim_the_input_changed(self):
+        doc, queue = self.closed(CFG)
+        self.assertNotIn("the input wasn't the approved one", queue[-1]["text"])
+        self.assertIn("nothing went out", doc["confirm"][0])
+
+
+class NumberAndWords(unittest.TestCase):
+    """Final Minor 1 (ruling T2): a number followed by free words is not a reply."""
+    OPEN = {2, 7, 8, 9}
+
+    def test_a_note_starting_with_a_number_is_not_a_reply(self):
+        for t in ("2 things for tomorrow", "9 wait until Monday", "D2 things", "2. things", "7 okay then"):
+            self.assertIsNone(decisions.parse_reply(t, self.OPEN), t)
+
+    def test_words_for_the_worker_take_a_colon(self):
+        self.assertEqual(decisions.parse_reply("9: wait until Monday", self.OPEN), [(9, "say", "wait until Monday")])
+        self.assertEqual(decisions.parse_reply("D9 : wait", self.OPEN), [(9, "say", "wait")])
+        self.assertEqual(decisions.parse_reply("9:", self.OPEN), [])
+
+    def test_no_with_words_stays(self):
+        self.assertEqual(decisions.parse_reply("8 no not now", self.OPEN), [(8, "no", ""), (8, "say", "not now")])
+
+    def test_a_later_clause_with_free_words_applies_nothing(self):
+        self.assertEqual(decisions.parse_reply("7 ok, 9 wait", self.OPEN), [])
+
+    def test_still_reply_shaped(self):
+        for t in ("7", "7,", "7 ok then", "7 edit"):
+            self.assertEqual(decisions.parse_reply(t, self.OPEN), [], t)
+
+    def test_is_reply_line_lets_the_note_through(self):
+        line = {"kind": "manual", "source": "chat", "summary": "2 things for tomorrow"}
+        self.assertFalse(decisions.is_reply_line(line))
+
+    def test_the_refusal_names_the_form_that_works(self):
+        d = {"id": "D2", "tool": "mcp__tracker__jira__create-issue",
+             "input": {"projectKey": "PLAT", "summary": "s", "description": "d"}}
+        got = decisions.edit_view(d, SIGNED)["edit_refusal"]
+        self.assertIn("2: <your words>", got)
+        self.assertEqual(decisions.parse_reply("2: <your words>", {2}), [(2, "say", "<your words>")])
+
+
+POST_TS = "%.6f" % (AT.timestamp() + 40)
+
+
+def app_msg(ts, text, **kw):
+    m = {"ts": ts, "app_id": "A00000001", "bot_id": "B00000001", "text": text}
+    m.update(kw)
+    return m
+
+
+class SlackBase(Base):
+    def setUp(self):
+        super().setUp()
+        sdir = tempfile.TemporaryDirectory()
+        self.addCleanup(sdir.cleanup)
+        env = mock.patch.dict(os.environ, {"MOTHER_STATE_DIR": sdir.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def doc(self):
+        return decisions.load(self.ws)
+
+    def cli_sent(self, slack, ids="D1", ts=POST_TS, *extra):
+        """`mother decide sent`, the Slack read answered by `slack` (a function of channel and ts)."""
+        out, err = io.StringIO(), io.StringIO()
+        args = ["sent", "--ids", ids] + (["--ts", ts] if ts else [])
+        with mock.patch.object(decisions, "_fetch_slack", lambda cfg, ch, t: slack(ch, t)):
+            code = decisions.main(args, self.ws, CFG, out, err, at=AT + timedelta(seconds=41))
+        return code, err.getvalue()
+
+
+class SentProvesAPost(SlackBase):
+    """Final I1: a stamp must prove a post."""
+
+    def setUp(self):
+        super().setUp()
+        self.propose(why="they <asked> & @x")
+        self.text = decisions.offer(self.ws, CFG, AT + timedelta(seconds=30))["text"]
+
+    def assert_not_stamped(self):
+        self.assertEqual(self.doc()["batch"]["announced"], {})
+        self.assertIn("offered", self.doc()["batch"])  # the offer stays: nothing was used up
+
+    def test_the_posted_batch_is_stamped_at_its_ts(self):
+        seen = []
+
+        def slack(ch, ts):
+            seen.append((ch, ts))
+            return app_msg(ts, self.text)
+        code, err = self.cli_sent(slack)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(seen, [(DM, POST_TS)])
+        self.assertEqual(self.doc()["batch"]["announced"], {"D1": POST_TS})
+        self.assertNotIn("offered", self.doc()["batch"])
+
+    def test_nothing_posted_is_refused(self):
+        code, err = self.cli_sent(lambda ch, ts: None)
+        self.assertEqual(code, 2)
+        self.assertIn("no message", err)
+        self.assertNotIn("no batch is waiting", err)
+        self.assert_not_stamped()
+
+    def test_other_text_is_refused(self):
+        code, err = self.cli_sent(lambda ch, ts: app_msg(ts, self.text + " and one more line"))
+        self.assertEqual(code, 2)
+        self.assertIn("isn't the batch", err)
+        self.assertNotIn("no batch is waiting", err)
+        self.assert_not_stamped()
+
+    def test_a_message_the_manager_typed_is_refused(self):
+        code, err = self.cli_sent(lambda ch, ts: typed_msg(ts=ts, text=self.text))
+        self.assertEqual(code, 2)
+        self.assertNotIn("no batch is waiting", err)
+        self.assert_not_stamped()
+
+    def test_a_failed_read_is_retryable_and_stamps_nothing(self):
+        def slack(ch, ts):
+            raise RuntimeError("429")
+        code, err = self.cli_sent(slack)
+        self.assertEqual(code, 3)
+        self.assertIn("429", err)
+        self.assert_not_stamped()
+
+    def test_no_live_offer_keeps_its_phrase(self):
+        self.assertEqual(self.cli_sent(lambda ch, ts: app_msg(ts, self.text))[0], 0)
+        code, err = self.cli_sent(lambda ch, ts: app_msg(ts, self.text))
+        self.assertEqual(code, 2)
+        self.assertIn("no batch is waiting", err)
+
+    def test_no_ts_is_refused(self):
+        code, err = self.cli_sent(lambda ch, ts: self.fail("no read without a ts"), "D1", None)
+        self.assertEqual(code, 2)
+        self.assertIn("--ts", err)
+        self.assert_not_stamped()
+
+    def test_slacks_escaping_does_not_refuse_the_real_post(self):
+        self.assertIn("&lt;asked&gt;", self.text)
+        once = self.text.replace("&", "&amp;")
+        for wire in (self.text, once, once.replace("&amp;lt;", "<").replace("&amp;gt;", ">")):
+            self.setUp_again()
+            self.assertEqual(self.cli_sent(lambda ch, ts: app_msg(ts, wire))[0], 0, wire)
+
+    def setUp_again(self):
+        with decisions.locked(self.ws):
+            doc = self.doc()
+            doc["batch"] = {"last_at": None, "announced": {}}
+            decisions.save(self.ws, doc)
+        decisions.offer(self.ws, CFG, AT + timedelta(seconds=30))
+
+    def test_an_earlier_offers_post_stamps_only_what_it_showed(self):
+        """A post that may have landed, then a newer offer: the late ts still proves the older text."""
+        decisions.propose(self.ws, CFG, AT + timedelta(seconds=31), "PLAT-1", POST, dict(REPLY, text="two " + SIG), "r")
+        newer = decisions.offer(self.ws, CFG, AT + timedelta(seconds=40))
+        self.assertEqual(newer["ids"], ["D1", "D2"])
+        code, err = self.cli_sent(lambda ch, ts: app_msg(ts, self.text), "D1,D2")
+        self.assertEqual(code, 2)
+        self.assertIn("D2", err)
+        self.assertEqual(self.cli_sent(lambda ch, ts: app_msg(ts, self.text), "D1")[0], 0)
+        self.assertEqual(self.doc()["batch"]["announced"], {"D1": POST_TS})
+
+    def test_a_worker_process_is_still_refused(self):
+        with mock.patch.dict(os.environ, {"MOTHER_CHIEF_WORKER": "PLAT-1"}):
+            self.assertEqual(self.cli_sent(lambda ch, ts: app_msg(ts, self.text))[0], 1)
+        self.assert_not_stamped()
+
+
+class FakeSlack:
+    """What `_slack_session` yields: the one-message read and the history read, over a list of messages."""
+
+    def __init__(self, messages=()):
+        self.messages = list(messages)
+        self.history_calls = []
+        self.fail_history = 0
+        self.fail_fetch = 0
+
+    def __call__(self, cfg, channel, ts):
+        if self.fail_fetch:
+            self.fail_fetch -= 1
+            raise RuntimeError("429 read")
+        return next((m for m in self.messages if m["ts"] == ts), None)
+
+    def history(self, channel, oldest):
+        self.history_calls.append((channel, oldest))
+        if self.fail_history:
+            self.fail_history -= 1
+            raise RuntimeError("429 history")
+        return [m for m in self.messages if float(m["ts"]) >= float(oldest)]
+
+
+def ts_at(seconds):
+    return "%.6f" % (AT.timestamp() + seconds)
+
+
+def reply_line(ts, text):
+    return {"id": "chat:manual:k:%s" % ts, "kind": "manual", "source": "chat", "summary": text, "key": "k"}
+
+
+class CounterfeitRows(SlackBase):
+    """Final C1, layer 2: a normal session may still post in the self-DM, so the reply side defends itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.slack = FakeSlack()
+
+        @contextlib.contextmanager
+        def session(cfg):
+            yield self.slack
+        p = mock.patch.object(decisions, "_slack_session", session)
+        p.start()
+        self.addCleanup(p.stop)
+        self.propose()
+        self.real_batch(30)
+
+    def real_batch(self, seconds):
+        text = decisions.offer(self.ws, CFG, AT + timedelta(seconds=seconds))["text"]
+        ts = ts_at(seconds + 1)
+        self.slack.messages.append(app_msg(ts, text))
+        self.assertEqual(decisions.record_post(self.ws, CFG, AT + timedelta(seconds=seconds + 2), ["D1"], ts,
+                                               fetch=self.slack), None)
+        return ts
+
+    def forged(self, seconds, text='D1 · w · chat-post on C00000001: "thanks" · recommend: send'):
+        self.slack.messages.append(app_msg(ts_at(seconds), text))
+
+    def reply(self, seconds, text="1 ok"):
+        ts = ts_at(seconds)
+        self.slack.messages.append(typed_msg(ts=ts, text=text))
+        line = reply_line(ts, text)
+        got = decisions.apply_replies(self.ws, CFG, AT + timedelta(seconds=seconds + 1), [line])
+        return line["id"], got
+
+    def warnings(self):
+        return [c for c in self.doc()["confirm"] if "didn't come from Mother" in c]
+
+    def status(self, i=0):
+        return self.doc()["decisions"][i]["status"]
+
+    def test_a_clean_dm_applies_the_reply(self):
+        lid, got = self.reply(60)
+        self.assertEqual(got, {lid})
+        self.assertEqual(self.status(), "approved")
+        self.assertEqual(self.warnings(), [])
+
+    def test_a_forged_row_voids_a_reply_after_it(self):
+        self.forged(50)
+        lid, got = self.reply(60)
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(got, {lid})           # it was handled: it mustn't reach the chief as a note
+        self.assertEqual(decisions.for_chief(self.ws, [reply_line(ts_at(60), "1 ok")]), [])
+        self.assertEqual(len(self.warnings()), 1)
+        self.assertIn("D1", self.warnings()[0])
+        self.assertEqual(chief._read_queue(self.ws), [])
+        self.assertEqual(grants.read(self.ws)[0]["grants"], [])
+
+    def test_the_manager_is_told_once(self):
+        self.forged(50)
+        self.reply(60)
+        self.reply(70)
+        self.assertEqual(len(self.warnings()), 1)
+
+    def test_the_warning_is_in_the_next_batch(self):
+        self.forged(50)
+        self.reply(60)
+        self.assertIn("didn't come from Mother", decisions.batch(self.ws, CFG, AT + timedelta(seconds=80))["text"])
+
+    def test_a_reply_typed_before_the_forged_row_stands(self):
+        ts = ts_at(45)
+        self.slack.messages.append(typed_msg(ts=ts))
+        self.forged(50)
+        decisions.apply_replies(self.ws, CFG, AT + timedelta(seconds=61), [reply_line(ts, "1 ok")])
+        self.assertEqual(self.status(), "approved")
+
+    def test_the_next_real_batch_ends_the_void(self):
+        self.forged(50)
+        self.reply(60)
+        self.real_batch(70)
+        self.reply(80)
+        self.assertEqual(self.status(), "approved")
+
+    def test_a_reply_read_late_from_inside_the_void_stays_void(self):
+        self.forged(50)
+        self.reply(55)
+        ts = ts_at(60)
+        self.slack.messages.append(typed_msg(ts=ts))
+        self.real_batch(70)
+        decisions.apply_replies(self.ws, CFG, AT + timedelta(seconds=81), [reply_line(ts, "1 ok")])
+        self.assertEqual(self.status(), "pending")
+
+    def test_a_forged_row_seen_only_after_the_next_batch_still_voids(self):
+        """The watcher can bring the reply after the next batch went out: the scan starts at the batch before the reply."""
+        self.forged(50)
+        ts = ts_at(60)
+        self.slack.messages.append(typed_msg(ts=ts))
+        decisions.propose(self.ws, CFG, AT + timedelta(seconds=65), "PLAT-1", POST, dict(REPLY, text="two " + SIG), "r",
+                          urgent=True)
+        self.real_batch(70)
+        decisions.apply_replies(self.ws, CFG, AT + timedelta(seconds=81), [reply_line(ts, "1 ok")])
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(len(self.warnings()), 1)
+
+    def test_ok_all_is_held_whole(self):
+        decisions.propose(self.ws, CFG, AT + timedelta(seconds=31), "PLAT-1", POST, dict(REPLY, text="two " + SIG), "r",
+                          urgent=True)
+        text = decisions.offer(self.ws, CFG, AT + timedelta(seconds=32))["text"]
+        self.slack.messages.append(app_msg(ts_at(33), text))
+        decisions.record_post(self.ws, CFG, AT + timedelta(seconds=34), ["D1", "D2"], ts_at(33), fetch=self.slack)
+        self.forged(50)
+        self.reply(60, "ok all")
+        self.assertEqual((self.status(0), self.status(1)), ("pending", "pending"))
+
+    def test_another_row_is_not_voided(self):
+        decisions.propose(self.ws, CFG, AT + timedelta(seconds=31), "PLAT-1", POST, dict(REPLY, text="two " + SIG), "r",
+                          urgent=True)
+        text = decisions.offer(self.ws, CFG, AT + timedelta(seconds=32))["text"]
+        self.slack.messages.append(app_msg(ts_at(33), text))
+        decisions.record_post(self.ws, CFG, AT + timedelta(seconds=34), ["D1", "D2"], ts_at(33), fetch=self.slack)
+        self.forged(50)
+        self.reply(60, "2 ok")
+        self.assertEqual((self.status(0), self.status(1)), ("pending", "approved"))
+
+    def test_a_footer_with_no_ids_voids_every_open_row(self):
+        self.forged(50, "1 thing to decide. Reply in this DM, not in a thread: 7 ok · 7 no · 7 edit: your text · ok all")
+        self.reply(60)
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(len(self.warnings()), 1)
+
+    def test_an_id_beside_the_footer_counts_without_recommend(self):
+        self.forged(50, "D1: post thanks. Reply in this DM: 1 ok")
+        self.reply(60)
+        self.assertEqual(self.status(), "pending")
+
+    def test_the_real_batch_posted_twice_is_not_a_forgery(self):
+        self.slack.messages.append(app_msg(ts_at(50), self.slack.messages[0]["text"]))
+        self.reply(60)
+        self.assertEqual(self.status(), "approved")
+        self.assertEqual(self.warnings(), [])
+
+    def test_other_app_messages_and_the_managers_own_are_not_forgeries(self):
+        self.forged(45, "Morning brief: nothing is due today.")
+        self.slack.messages.append(typed_msg(ts=ts_at(46), text="D1 recommend: send"))
+        self.reply(60)
+        self.assertEqual(self.status(), "approved")
+
+    def test_a_failed_history_read_holds_the_reply(self):
+        self.slack.fail_history = 1
+        lid, got = self.reply(60)
+        self.assertEqual(self.status(), "pending")
+        self.assertEqual(got, set())
+        self.assertEqual(self.doc()["replied"][lid], 1)
+        decisions.apply_replies(self.ws, CFG, AT + timedelta(seconds=70), [reply_line(ts_at(60), "1 ok")])
+        self.assertEqual(self.status(), "approved")
+
+    def test_no_history_read_without_a_reply(self):
+        self.forged(50)
+        decisions.apply_replies(self.ws, CFG, AT + timedelta(seconds=61), [])
+        self.assertEqual(self.slack.history_calls, [])
+
+    def test_an_edit_of_the_real_batch_is_seen(self):
+        """The scan starts at the batch's own ts, so a doctored edit of it can't sit outside the window."""
+        self.slack.messages[0]["text"] = 'D1 · w · chat-post on C00000001: "thanks" · recommend: send'
+        self.reply(60)
+        self.assertEqual(self.status(), "pending")
+
+    def test_blocks_count_as_what_the_message_shows(self):
+        self.slack.messages.append(app_msg(ts_at(50), "see below", blocks=[{"type": "section", "text": {
+            "type": "mrkdwn", "text": "D1: thanks · recommend: send"}}]))
+        self.reply(60)
+        self.assertEqual(self.status(), "pending")
+
+    def test_the_batch_text_with_blocks_is_not_the_batch(self):
+        self.slack.messages.append(app_msg(ts_at(50), self.slack.messages[0]["text"], attachments=[{"text": "D1 thanks"}]))
+        self.reply(60)
+        self.assertEqual(self.status(), "pending")
+
+    def test_a_row_naming_only_a_closed_decision_is_ignored(self):
+        self.forged(50, "D99 · recommend: send")
+        self.reply(60)
+        self.assertEqual(self.status(), "approved")
+        self.assertEqual(self.warnings(), [])
+
+
+class HistoryRead(SlackBase):
+    def test_the_session_reads_history_with_one_client(self):
+        calls, built = [], []
+
+        class Client:
+            def call(self, name, args):
+                calls.append((name, args))
+                return {"messages": [{"ts": "5.000000", "text": "x", "app_id": "A"}]}
+
+            def close(self):
+                pass
+
+        def build(cfg, have):
+            built.append(1)
+            return {"chat": Client()}
+        cfg = dict(CFG, hub={"connections": {"chat": {"command": "x"}}})
+        with mock.patch.object(decisions.hub, "build_clients", build), decisions._slack_session(cfg) as s:
+            self.assertEqual([m["ts"] for m in s.history(DM, "1.000000")], ["5.000000"])
+            s(cfg, DM, "5.000000")
+        self.assertEqual(built, [1])
+        self.assertEqual(calls[0], ("get_channel_history", {"channel_id": DM, "oldest": "1.000000", "inclusive": True,
+                                                            "limit": decisions.HISTORY_PAGE}))
+
+    def test_a_truncated_history_is_a_failed_read(self):
+        """A truncated read must not pass as a clean one."""
+        class Client:
+            def call(self, name, args):
+                return {"messages": [], "has_more": True}
+
+            def close(self):
+                pass
+        cfg = dict(CFG, hub={"connections": {"chat": {"command": "x"}}})
+        with mock.patch.object(decisions.hub, "build_clients", lambda c, h: {"chat": Client()}), \
+                decisions._slack_session(cfg) as s:
+            with self.assertRaises(Exception):
+                s.history(DM, "1.000000")
+
+    def test_history_follows_the_cursor(self):
+        pages = [{"messages": [{"ts": "5.000000"}], "has_more": True, "response_metadata": {"next_cursor": "n"}},
+                 {"messages": [{"ts": "6.000000"}], "has_more": False}]
+        seen = []
+
+        class Client:
+            def call(self, name, args):
+                seen.append(args.get("cursor"))
+                return pages.pop(0)
+
+            def close(self):
+                pass
+        cfg = dict(CFG, hub={"connections": {"chat": {"command": "x"}}})
+        with mock.patch.object(decisions.hub, "build_clients", lambda c, h: {"chat": Client()}), \
+                decisions._slack_session(cfg) as s:
+            self.assertEqual([m["ts"] for m in s.history(DM, "1.000000")], ["5.000000", "6.000000"])
+        self.assertEqual(seen, [None, "n"])
+
+
+class SlackOutage(SlackBase):
+    """Final I3: an outage isn't a bad reply. The reply waits, the manager is told once, and it applies when it can."""
+    TOLD = "Slack read failed; I'll apply your reply when I can read it"
+
+    def setUp(self):
+        super().setUp()
+        self.slack = FakeSlack()
+
+        @contextlib.contextmanager
+        def session(cfg):
+            yield self.slack
+        p = mock.patch.object(decisions, "_slack_session", session)
+        p.start()
+        self.addCleanup(p.stop)
+        self.propose()
+        text = decisions.offer(self.ws, CFG, AT + timedelta(seconds=30))["text"]
+        self.slack.messages.append(app_msg(ts_at(31), text))
+        decisions.record_post(self.ws, CFG, AT + timedelta(seconds=32), ["D1"], ts_at(31), fetch=self.slack)
+        self.ts = ts_at(60)
+        self.line = reply_line(self.ts, "1 ok")
+        self.slack.messages.append(typed_msg(ts=self.ts))
+
+    def tick(self, seconds):
+        return decisions.apply_replies(self.ws, CFG, AT + timedelta(seconds=seconds), [self.line])
+
+    def fail_three(self):
+        self.slack.fail_fetch = 3
+        for s in (61, 91, 121):
+            self.tick(s)
+
+    def told(self):
+        return [c for c in decisions.load(self.ws)["confirm"] if c == self.TOLD]
+
+    def test_three_failures_tell_the_manager_once_and_keep_it_pending(self):
+        self.fail_three()
+        self.assertEqual(len(self.told()), 1)
+        self.assertEqual(self.doc()["decisions"][0]["status"], "pending")
+        self.assertNotIn(decisions.UNREADABLE, self.doc()["confirm"])
+        self.assertEqual(decisions.waiting_reads(self.ws), {self.line["id"]})
+        self.slack.fail_fetch = 5
+        self.tick(400)
+        self.tick(4000)
+        self.assertEqual(len(self.told()), 1)
+
+    def test_it_applies_when_slack_comes_back(self):
+        self.fail_three()
+        self.assertEqual(self.tick(4000), {self.line["id"]})
+        self.assertEqual(self.doc()["decisions"][0]["status"], "approved")
+
+    def test_retries_back_off(self):
+        self.fail_three()
+        reads = []
+
+        class Counting(FakeSlack):
+            def __call__(s, cfg, channel, ts):
+                reads.append(ts)
+                raise RuntimeError("429")
+        self.slack = Counting(self.slack.messages)
+        for s in range(150, 400, 30):
+            self.tick(s)
+        self.assertLess(len(reads), 5)
+        self.assertGreaterEqual(len(reads), 1)
+        reads.clear()
+        self.tick(100000)
+        self.assertEqual(len(reads), 1)  # a long gap never stops the retries
+
+    def test_a_reply_that_was_read_and_does_not_parse_gets_the_help_line(self):
+        self.fail_three()
+        self.slack.messages[-1] = typed_msg(ts=self.ts, text="1 ok 2 3")
+        self.tick(4000)
+        self.assertIn(decisions.UNREADABLE, self.doc()["confirm"])
+        self.assertIs(self.doc()["replied"][self.line["id"]], False)
+
+    def test_the_hold_on_the_chief_ends_after_three(self):
+        note = {"id": "chat:manual:n:%s" % ts_at(62), "kind": "manual", "source": "chat", "summary": "a note", "key": "n"}
+        self.slack.fail_fetch = 1
+        self.tick(61)
+        self.assertEqual(decisions.for_chief(self.ws, [self.line, note]), [])       # held, as ruled
+        self.slack.fail_fetch = 2
+        self.tick(91)
+        self.tick(121)
+        self.assertEqual(decisions.for_chief(self.ws, [self.line, note]), [note])   # past it, and the reply stays out
+
+    def test_it_gives_up_when_nothing_it_could_answer_is_left(self):
+        self.fail_three()
+        self.slack.fail_fetch = 99
+        decisions.settle(self.ws, AT + timedelta(hours=49))
+        self.tick(49 * 3600 + 10)
+        self.assertEqual(decisions.waiting_reads(self.ws), set())
+        self.assertIs(self.doc()["replied"][self.line["id"]], False)
+        self.assertTrue(any("wasn't applied" in c for c in self.doc()["confirm"]))
+
+
+class FinalMinors(SlackBase):
+    def test_a_worker_files_only_under_its_own_key(self):
+        """Minor 3: the approval instruction would land with the other worker."""
+        chief.register_worker(self.ws, AT, "PLAT-2", "Other")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"MOTHER_CHIEF_WORKER": "PLAT-2"}), \
+                mock.patch("sys.stdin", io.StringIO(json.dumps(REPLY))):
+            code = decisions.main(["propose", "PLAT-1", "--tool", POST, "--recommend", "r", "--stdin"], self.ws, SIGNED,
+                                  out, err, at=AT)
+        self.assertEqual(code, 1)
+        self.assertIn("PLAT-2", err.getvalue())
+        self.assertEqual(self.doc()["decisions"], [])
+
+    def test_approved_says_when_no_run_can_start(self):
+        """Minor 4: "will make that one call" isn't true over budget or held."""
+        self.propose()
+        with mock.patch.object(decisions.chief, "refusal", return_value="over today's budget ($5.00 of $5.00)"):
+            msg = decisions.answer(self.ws, CFG, AT, 1, "ok", "", {"via": "pane"})
+        self.assertIn("approved", msg)
+        self.assertIn("over today's budget", msg)
+        self.assertNotIn("will make that one call", msg)
+
+    def test_approved_says_when_the_worker_is_held(self):
+        self.propose()
+        chief.update_worker(self.ws, "PLAT-1", held=True)
+        msg = decisions.answer(self.ws, CFG, AT, 1, "ok", "", {"via": "pane"})
+        self.assertIn("held", msg)
+        self.assertNotIn("will make that one call", msg)
+
+    def test_typed_is_gone(self):
+        """Minor 7: ruling F2b dropped the typed path."""
+        self.propose()
+        self.assertEqual(decisions.VIAS, ("pane",))
+        err = io.StringIO()
+        self.assertEqual(decisions.main(["answer", "1", "ok", "--via", "typed"], self.ws, CFG, io.StringIO(), err, at=AT), 2)
+        self.assertNotIn("typed", decisions.USAGE)
+        self.assertNotIn("typed", err.getvalue())
+        self.assertIn("still open", decisions.answer(self.ws, CFG, AT, 1, "ok", "", {"via": "typed"}))
+        self.assertEqual(self.doc()["decisions"][0]["status"], "pending")
+
+    def test_a_config_problem_is_named_not_blamed_on_the_dm(self):
+        """Minor 9: with follow.inbox and chat_dm apart, the reply was in the DM; the config is what's wrong."""
+        watch = hub.load_watch(self.ws)
+        watch.setdefault("follow", {})["inbox"] = "D00000002"
+        hub.save_watch(self.ws, watch)
+        self.propose()
+
+        @contextlib.contextmanager
+        def session(cfg):
+            yield FakeSlack()
+        with mock.patch.object(decisions, "_slack_session", session):
+            decisions.apply_replies(self.ws, CFG, LATER, [reply_line(SRC_TS, "1 ok")])
+        said = " ".join(self.doc()["confirm"])
+        self.assertNotIn("it isn't in your own DM", said)
+        self.assertIn("D00000002", said)
 
 
 if __name__ == "__main__":
