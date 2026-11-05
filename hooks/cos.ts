@@ -6,8 +6,9 @@ import type { ChiefCase, ChiefDesktop, ChiefStatus } from '../types'
 //  - `caseBrief` is the text "Open session" types into a new session.
 //  - A session whose first prompt is that brief claims the item's key (`mother chief claim --stdin`), so the hub routes
 //    later lines of the key to it and it is on the floor (Needs you) though it is not pinned.
-//  - Each console pass, a session that holds live claims takes what was routed to them (`mother chief relays --for
-//    <id> --take`) and submits it into itself as ONE prompt, framed as other people's words.
+//  - Each console pass, a session that holds live claims reads what was routed to them (`mother chief relays --for
+//    <id>`), submits it into itself as ONE prompt, framed as other people's words, and only once that prompt entered
+//    acknowledges those lines (`relays --ack --stdin`): a failed submit loses nothing.
 // Every write goes through `mother chief …`; nothing here edits a hub file.
 
 export const CASE_PREFIX = 'Mother case:'
@@ -30,7 +31,7 @@ const RELAY_WHO_MAX = 80
 const RELAY_SUMMARY_MAX = 300
 
 export type CaseItem = { id?: string | null; key?: string | null; title?: string | null; why?: string | null; link?: string | null }
-export type RelayLine = { key: string; at: string | null; who: string; title: string; summary: string; link: string }
+export type RelayLine = { id: string; key: string; at: string | null; who: string; title: string; summary: string; link: string }
 
 // The brief a new session starts from. Every item text is one cleaned line; a key off the hub's grammar gets no `Key:`
 // line (so that session claims nothing), an id that is not a U-id no closing command.
@@ -64,14 +65,16 @@ export function parseCase(text: unknown): { key: string; title: string; link: st
 // ---- this session's own state: a mod reload starts it over ----
 let promptsSeen = 0
 let turnRunning = false
-let relayAt: number[] = []       // when this session submitted a relay, the last hour's
-let relayBusy = false
+let relayAt: number[] = []       // when this session tried to submit a relay, the last hour's (a failed try counts)
+let relayBusy = false            // one delivery at a time: read, submit, acknowledge
+const relaySubmitted = new Set<string>()   // line ids this session submitted and has not yet acknowledged: never submitted again
 
 export function resetCos(): void {
   promptsSeen = 0
   turnRunning = false
   relayAt = []
   relayBusy = false
+  relaySubmitted.clear()
 }
 
 // The main loop's turn started or ended (a subagent's carries an agentId and is not counted).
@@ -160,24 +163,51 @@ function parseRelays(out: string | null): RelayLine[] {
   try {
     const v = JSON.parse(out)
     if (!Array.isArray(v)) return []
-    return v.filter(l => !!l && typeof l === 'object' && typeof l.key === 'string').map(l => ({
-      key: String(l.key), at: typeof l.at === 'string' ? l.at : null, who: String(l.who ?? ''), title: String(l.title ?? ''),
+    return v.filter(l => !!l && typeof l === 'object' && typeof l.id === 'string' && l.id && typeof l.key === 'string').map(l => ({
+      id: String(l.id), key: String(l.key), at: typeof l.at === 'string' ? l.at : null, who: String(l.who ?? ''), title: String(l.title ?? ''),
       summary: String(l.summary ?? ''), link: String(l.link ?? '') }))
   } catch {
     return []
   }
 }
 
+// Acknowledge every line this session submitted (`relays --ack --stdin`); a failed ack keeps them for the next pass,
+// and until then they are never submitted again.
+async function ackSubmitted($: Dollar, bin: string, id: string): Promise<void> {
+  if (!relaySubmitted.size) return
+  const ids = [...relaySubmitted]
+  if ((await chiefCli($, bin, ['relays', '--for', id, '--ack', '--stdin'], JSON.stringify(ids))) !== null) for (const i of ids) relaySubmitted.delete(i)
+}
+
+// Submit the lines as one prompt, then acknowledge them. A submit that throws or is dropped acknowledges nothing: the
+// lines stay waiting and a later pass tries again. Detached from the pass (a prompt may enter only once the session
+// is idle); `relayBusy` holds until it is over.
+async function deliver($: Dollar, bin: string, id: string, lines: RelayLine[], nowMs: number): Promise<void> {
+  try {
+    const r = await $.prompt.submit({ text: relayText(lines, nowMs) })
+    if (!r || typeof (r as { drop?: unknown }).drop === 'string') return
+    for (const l of lines) relaySubmitted.add(l.id)
+    await ackSubmitted($, bin, id)
+  } catch {
+    // not entered: nothing is acknowledged
+  } finally {
+    relayBusy = false
+  }
+}
+
 // One relay attempt for this session, from the status just read. Nothing unless it holds a live claim with lines
-// waiting, no turn is running here, and its bounds allow one more submit. Relay off: only `force` (the card's Deliver
-// now, pressed in this session) or the CLI's deliver-once flag (pressed in another) takes. The lines are taken
-// (`relays --take`, once, under the hub lock) and submitted as one prompt. True when a prompt was submitted.
+// waiting, no turn is running here, and its bounds allow one more attempt (a failed submit counts, so it cannot loop).
+// Relay off: only `force` (the card's Deliver now, pressed in this session) or the CLI's deliver-once flag (pressed
+// in another) delivers. The lines are read, not removed (`relays --for`); those this session already submitted are
+// skipped; the rest, at most 10, go in as one prompt and are acknowledged once it entered. True when a submit started.
 export async function relayPass($: Dollar, bin: string, s: ChiefStatus | null, force = false): Promise<boolean> {
   if (relayBusy || !s) return false
   relayBusy = true
+  let started = false
   try {
     let id = ''
     try { id = String((await $.session.id()) ?? '') } catch { return false }
+    await ackSubmitted($, bin, id)   // an ack that failed last time
     const meta = caseMeta(s, id)
     if (!meta || meta.unseen <= 0) return false
     const asked = force || meta.deliver
@@ -186,17 +216,17 @@ export async function relayPass($: Dollar, bin: string, s: ChiefStatus | null, f
     const nowMs = await $.clock.now()
     relayAt = relayAt.filter(t => nowMs - t < 3_600_000)
     if (relayAt.length >= RELAY_PER_HOUR) return false
-    if (!asked && relayAt.length && nowMs - relayAt[relayAt.length - 1] < RELAY_GAP_MS) return false
-    const lines = parseRelays(await chiefCli($, bin, ['relays', '--for', id, '--take', ...(force ? ['--force'] : [])]))
+    if (!force && relayAt.length && nowMs - relayAt[relayAt.length - 1] < RELAY_GAP_MS) return false
+    const lines = parseRelays(await chiefCli($, bin, ['relays', '--for', id])).filter(l => !relaySubmitted.has(l.id)).slice(0, RELAY_LINES_MAX)
     if (!lines.length) return false
     relayAt.push(nowMs)
-    // not awaited: the prompt runs as a turn of its own once the session is idle, and a pass never waits for a turn
-    void $.prompt.submit({ text: relayText(lines, nowMs) }).catch(() => undefined)
+    started = true
+    void deliver($, bin, id, lines, nowMs)   // releases relayBusy when it is over
     return true
   } catch {
     return false
   } finally {
-    relayBusy = false
+    if (!started) relayBusy = false
   }
 }
 

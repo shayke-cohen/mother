@@ -1127,56 +1127,62 @@ class TestCases(Base):
         r = self.rows()["PLAT-7"]
         self.assertEqual((r["cli_session_id"], r["state"], r["opened_at"]), (self.B, "live", hub._iso(AT + timedelta(days=8))))
 
-    def test_relays_take_only_this_sessions_keys_once(self):
+    def ack(self, cli, lines):
+        return chief.relay_ack(self.ws, AT, cli, [l["id"] for l in lines])
+
+    def test_relays_read_without_removing_and_ack_only_this_sessions(self):
         self.now_item("PLAT-7")
         self.now_item("PLAT-8")
         self.claim("PLAT-7", self.A)
         self.claim("PLAT-8", self.B)
         a = self.follow_up("PLAT-7", 10)
-        self.follow_up("PLAT-8", 20)
+        b = self.follow_up("PLAT-8", 20)
         self.assertEqual(self.rows()["PLAT-7"]["unseen"], 1)
         self.assertEqual(len(hub._hub_doc(self.ws)["updates"]), 2)                         # a route, no new item
-        peek = chief.relays(self.ws, AT, self.A)
-        self.assertEqual(peek, [{"key": "PLAT-7", "at": hub._iso(AT + timedelta(seconds=10)), "who": "Dana",
-                                 "title": "re", "summary": "any news?", "link": a["link"]}])
-        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), peek)
-        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), [])                 # taken once
+        got = chief.relays(self.ws, AT, self.A)
+        self.assertEqual(got, [{"id": a["id"], "key": "PLAT-7", "at": hub._iso(AT + timedelta(seconds=10)), "who": "Dana",
+                                "title": "re", "summary": "any news?", "link": a["link"]}])
+        self.assertEqual(chief.relays(self.ws, AT, self.A), got)                           # a read removes nothing
+        self.assertEqual((self.rows()["PLAT-7"]["unseen"], chief.cases(self.ws)[0]["unseen"]), (1, 1))
+        self.assertEqual(chief.relay_ack(self.ws, AT, self.A, [b["id"], "nope", 7]), 0)    # another session's line: ignored
+        self.assertEqual([c["unseen"] for c in chief.cases(self.ws)], [1, 1])
+        self.assertEqual(self.ack(self.A, got), 1)
+        self.assertEqual(self.ack(self.A, got), 0)                                         # acknowledged once
+        self.assertEqual(chief.relays(self.ws, AT, self.A), [])
         self.assertEqual(self.rows()["PLAT-7"]["unseen"], 0)
         self.assertEqual(self.rows()["PLAT-8"]["unseen"], 1)                               # the other session's still waits
         self.assertEqual([c["unseen"] for c in chief.cases(self.ws)], [0, 1])
         for n in range(30, 42):
             self.follow_up("PLAT-7", n)
-        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True)), chief.RELAY_MAX)
-        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 2)                               # the rest wait
-        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True)), 2)
+        more = chief.relays(self.ws, AT, self.A)
+        self.assertEqual(len(more), 12)
+        self.assertEqual(self.ack(self.A, more[:10]), 10)                                  # only the ids named
+        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 2)
+        self.assertEqual(chief.relays(self.ws, AT, self.A), more[10:])
 
     def test_relay_lines_survive_the_hubs_routed_cap_and_are_cleaned(self):
         self.now_item("PLAT-7")
         self.claim("PLAT-7", self.A)
-        self.follow_up("PLAT-7", 5, who="Da‮na", summary="x" * 500)
+        self.follow_up("PLAT-7", 5, who="Da\u202ena", summary="x" * 500)
         for n in range(hub.ROUTED_MAX + 5):                                                # push it out of hub.json's routed
             l = line(key="LOG-%d" % n, at=hub._iso(AT + timedelta(seconds=100 + n)))
             hub.append_inbox(self.ws, [l])
             hub.decide(self.ws, {}, AT, [{"line_id": l["id"], "key": l["key"], "decision": "log"}])
-        got = chief.relays(self.ws, AT, self.A, take=True)
+        got = chief.relays(self.ws, AT, self.A)
         self.assertEqual([(g["who"], len(g["summary"])) for g in got], [("Dana", 300)])
 
-    def test_relay_flag_holds_lines_until_forced_or_asked(self):
+    def test_relay_flag_and_the_deliver_once_flag(self):
         self.now_item("PLAT-7")
         self.claim("PLAT-7", self.A)
         self.follow_up("PLAT-7", 10)
         self.assertTrue(chief.relay_on(self.ws))
         chief.set_relay(self.ws, False)
         self.assertFalse(chief.status_doc(self.ws, {}, AT)["relay"]["on"])
-        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), [])
         self.assertEqual(chief.cases(self.ws)[0]["unseen"], 1)                             # still waiting, shown as N new
         chief.relay_deliver(self.ws, self.A)
         self.assertIs(chief.cases(self.ws)[0]["deliver_now"], True)
-        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True)), 1)             # once
+        self.assertEqual(self.ack(self.A, chief.relays(self.ws, AT, self.A)), 1)           # delivered: the flag is used up
         self.assertIs(chief.cases(self.ws)[0]["deliver_now"], False)
-        self.follow_up("PLAT-7", 20)
-        self.assertEqual(chief.relays(self.ws, AT, self.A, take=True), [])
-        self.assertEqual(len(chief.relays(self.ws, AT, self.A, take=True, force=True)), 1)
         chief.set_relay(self.ws, True)
         self.assertTrue(chief.relay_on(self.ws))
 
@@ -1216,9 +1222,13 @@ class TestCases(Base):
                                          "label": "PLAT-7", "unseen": 1, "last_routed_at": hub._iso(AT + timedelta(seconds=10)),
                                          "opened_at": hub._iso(AT), "deliver_now": False}])
         self.assertEqual(run("relay", "off")[1], "relay off: 1 line(s) waiting\n")
-        self.assertEqual(json.loads(run("relays", "--for", self.A, "--take")[1]), [])
         self.assertEqual(run("relay", "deliver", "--for", self.A)[0], 0)
-        self.assertEqual(len(json.loads(run("relays", "--for", self.A, "--take")[1])), 1)
+        waiting = json.loads(run("relays", "--for", self.A)[1])
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(run("relays", "--for", self.A, "--ack")[0], 2)                    # the ids come on stdin
+        self.assertEqual(run("relays", "--for", self.A, "--ack", "--stdin", stdin="{}")[0], 2)
+        self.assertEqual(run("relays", "--for", self.A, "--ack", "--stdin", stdin=json.dumps([waiting[0]["id"]]))[1], '{"acked": 1}\n')
+        self.assertEqual(json.loads(run("relays", "--for", self.A)[1]), [])
         self.assertEqual(run("relay", "on")[1], "relay on\n")
         self.assertEqual(run("relay", "status")[1], "relay on\n")
         self.assertEqual([run("relay")[0], run("relay", "maybe")[0], run("relays")[0], run("relay", "deliver")[0]], [2, 2, 2, 2])

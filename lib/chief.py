@@ -476,7 +476,7 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
                 extras[res["update_id"]] = verdict_extra(by_id.get(res["line_id"]))
         if extras:
             _store_extras(ws, extras)
-        sync_relays(ws)   # a line routed to a case session waits in relays.json for that session to take
+        sync_relays(ws)   # a line routed to a case session waits in relays.json for that session to deliver
     out["logged"] = [it["line_id"] for it in items if it["decision"] == "log"]
     out["now"] = [it["line_id"] for it in items if it["decision"] == "now"]
     return out
@@ -584,10 +584,9 @@ def inbox_items(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
 # ---- cases: a desktop session that owns one inbox item until it is closed (skills/cos, hooks/cos.ts) ----------
 # A case is a row in the hub's sessions.json (`kind: "case"`, `session_id` = the session's CLI id), so hub.decide
 # routes later lines of the key to it. What was routed and not yet delivered into the session waits in
-# chief/relays.json; the owning session's own mod takes it (`relays --take`) and submits it there.
+# chief/relays.json; the owning session's own mod reads it (`relays`), submits it there, then acknowledges it (`relays --ack`).
 
 CASE_STALE_DAYS = 7
-RELAY_MAX = 10             # lines one `relays --take` hands out; the rest wait
 RELAY_DONE_KEEP = 200      # delivered line ids remembered per key
 RELAY_WAIT_MAX = 100       # waiting lines kept per key, newest
 RELAY_WHO_MAX, RELAY_SUMMARY_MAX = 80, 300
@@ -727,43 +726,54 @@ def sync_relays(ws: Path) -> None:
             _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
 
 
-def relays(ws: Path, at: datetime, cli: str, take: bool = False, force: bool = False,
-           limit: int = RELAY_MAX) -> List[dict]:
+def relays(ws: Path, at: datetime, cli: str) -> List[dict]:
     """The routed lines not yet delivered into session `cli`, for the live cases it holds, oldest first:
-    [{key, at, who, title, summary, link}]. `take` hands out at most `limit`, marks them delivered and sets each
-    row's `unseen` to what still waits, all under the hub lock, so a line is taken once. With relay off a take
-    gives nothing unless `force` or the session's deliver-once flag is set (the flag is then removed)."""
+    [{id, key, at, who, title, summary, link}]. Nothing is removed: the session submits them, then acknowledges the
+    ids it delivered (`relay_ack`). New routes are copied in from hub.json on the way."""
     ws = Path(ws)
     inbox = {l["id"]: l for l in hub.read_inbox(ws)}
     with hub.locked(ws):
         sess = hub._sessions_doc(ws)
         doc = _relays_doc(ws)
-        changed = _merge_routed(doc, hub._hub_doc(ws), sess, inbox)
-        mine = [sk for sk, r in sess["sessions"].items() if _is_case(r) and r.get("cli_session_id") == cli]
-        rows = sorted(((w, sk) for sk in mine for w in (doc["keys"].get(sk) or {}).get("waiting", [])),
-                      key=lambda x: str(x[0].get("at") or ""))
-        flag = _deliver_flag(ws, cli) if CLI_ID_RE.fullmatch(cli or "") else None
-        if take and not (relay_on(ws) or force or (flag is not None and flag.exists())):
-            rows = []
-        elif take:
-            rows = rows[:max(0, limit)]
-            for w, sk in rows:
-                ent = doc["keys"][sk]
-                ent["waiting"] = [x for x in ent["waiting"] if x.get("line_id") != w.get("line_id")]
-                ent["done"] = (ent["done"] + [w.get("line_id")])[-RELAY_DONE_KEEP:]
-            for sk in mine:
-                sess["sessions"][sk]["unseen"] = len((doc["keys"].get(sk) or {}).get("waiting", []))
-            if mine:
-                hub.save_json(ws, "sessions.json", sess)
-            changed = changed or bool(rows)
-            if flag is not None:
-                try:
-                    flag.unlink()
-                except OSError:
-                    pass
-        if changed:
+        if _merge_routed(doc, hub._hub_doc(ws), sess, inbox):
             _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
-    return [{k: w.get(k) for k in ("key", "at", "who", "title", "summary", "link")} for w, _sk in rows]
+        mine = [sk for sk, r in sess["sessions"].items() if _is_case(r) and r.get("cli_session_id") == cli]
+        rows = sorted((w for sk in mine for w in (doc["keys"].get(sk) or {}).get("waiting", [])),
+                      key=lambda w: str(w.get("at") or ""))
+    return [dict({"id": w.get("line_id")}, **{k: w.get(k) for k in ("key", "at", "who", "title", "summary", "link")})
+            for w in rows]
+
+
+def relay_ack(ws: Path, at: datetime, cli: str, ids) -> int:
+    """Session `cli` delivered the lines `ids` (as `relays` named them): they stop waiting, each of its rows'
+    `unseen` becomes what still waits, and its deliver-once flag is removed. Under the hub lock; an id that is not
+    waiting for this session is ignored. Returns how many were acknowledged."""
+    ws = Path(ws)
+    ids = {i for i in (ids or []) if isinstance(i, str)}
+    n = 0
+    with hub.locked(ws):
+        sess = hub._sessions_doc(ws)
+        doc = _relays_doc(ws)
+        mine = [sk for sk, r in sess["sessions"].items() if _is_case(r) and r.get("cli_session_id") == cli]
+        for sk in mine:
+            ent = doc["keys"].get(sk) or {"waiting": [], "done": []}
+            hit = [w.get("line_id") for w in ent["waiting"] if w.get("line_id") in ids]
+            if hit:
+                ent["waiting"] = [w for w in ent["waiting"] if w.get("line_id") not in ids]
+                ent["done"] = (ent["done"] + hit)[-RELAY_DONE_KEEP:]
+                doc["keys"][sk] = ent
+                n += len(hit)
+            sess["sessions"][sk]["unseen"] = len(ent["waiting"])
+        if mine:
+            hub.save_json(ws, "sessions.json", sess)
+        if n:
+            _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
+        if CLI_ID_RE.fullmatch(cli or ""):
+            try:
+                _deliver_flag(ws, cli).unlink()
+            except OSError:
+                pass
+    return n
 
 
 def cases(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
@@ -1231,10 +1241,11 @@ USAGE = """usage: mother chief <verb> ...
                         the hub's sessions.json becomes a live case of that session, so later lines of the key
                         route to it. Refused (exit 1) with no open inbox item for the key, or when the key is
                         live in another session whose row is under 7 days old
-  relays --for <session_id> [--take] [--force]
+  relays --for <session_id> [--ack --stdin]
                         the routed lines not yet delivered into that session, for the cases it holds: a JSON
-                        array of {key, at, who, title, summary, link}. --take hands out at most 10, once; with
-                        relay off it gives none unless --force or `relay deliver` asked for it
+                        array of {id, key, at, who, title, summary, link}; nothing is removed. --ack --stdin: the
+                        session delivered the lines whose ids are the JSON array on stdin; they stop waiting;
+                        prints {acked: N}
   relay on | off | status | deliver --for <session_id>
                         the machine-local relay switch (.mother/chief/RELAY_OFF); deliver: that session delivers
                         what waits once, on its next pass, though relay is off
@@ -1249,7 +1260,7 @@ VERBS = {
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
     "portrait": (("--json",), ()), "report": ((), ()),
-    "claim": (("--stdin",), ()), "relays": (("--take", "--force", "--json"), ("--for",)), "relay": ((), ("--for",)),
+    "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -1431,8 +1442,18 @@ def _case_verb(ws: Path, cfg: dict, at: datetime, verb: str, opts: dict, pos: Li
     if verb == "relays":
         if not (isinstance(who, str) and who.strip()):
             return _usage("relays needs --for <session_id>")
-        print(json.dumps(relays(ws, at, who, take=bool(opts.get("take")), force=bool(opts.get("force"))),
-                         indent=2, ensure_ascii=False))
+        if opts.get("ack"):
+            if not opts.get("stdin"):
+                return _usage("relays --ack reads the delivered line ids from stdin: pass --stdin")
+            try:
+                ids = json.loads(sys.stdin.read())
+            except ValueError as e:
+                return _usage("relays --ack: stdin is not JSON (%s)" % e)
+            if not isinstance(ids, list):
+                return _usage("relays --ack: stdin must be a JSON array of line ids")
+            print(json.dumps({"acked": relay_ack(ws, at, who, ids)}))
+            return EXIT_OK
+        print(json.dumps(relays(ws, at, who), indent=2, ensure_ascii=False))
         return EXIT_OK
     sub = pos[0] if len(pos) == 1 else ""
     if sub == "deliver":
