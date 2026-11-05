@@ -4166,7 +4166,11 @@ def self_dm_unattended(a, ctx, inp):
     want = live_offer_text(ctx.ws)
     if mine and want is not None and a.get("op") == "post" and isinstance(inp, dict) and set(inp) <= SELF_DM_POST_KEYS \
             and inp.get("text") == want:
-        return "allow", "%s: the live batch, exactly as `mother decide batch` offered it." % a["what"]
+        if inp.get("unfurl_links") is not False or inp.get("unfurl_media") is not False:
+            return "deny", "%s: post the batch with `unfurl_links: false` and `unfurl_media: false`, both set: a link " \
+                           "preview would draw text under it that nobody offered, and the post would then not count " \
+                           "as the batch." % a["what"]
+        return "allow", "%s: the live batch, exactly as `mother decide batch` offered it, previews off." % a["what"]
     return "deny", "%s: the chief writes to the manager's own DM only to post the live batch, exactly as `mother decide " \
                    "batch --json` printed its text, with nothing else in the call. Anything else for the manager is " \
                    "recorded as `now`." % a["what"]
@@ -4988,7 +4992,8 @@ def plugin_mother_args(cmd, heredoc=False):
 
 
 def chief_decide_args(args):
-    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8|'' [--ts TS]`."""
+    """The two `mother decide` shapes the chief runs to post a batch: `batch [--json]`, `sent --ids D7,D8|'' --ts TS`.
+    `sent` without `--ts` passes here and `mother decide` refuses it."""
     verb, rest = (args[0], args[1:]) if args else ("", [])
     if verb == "batch":
         return rest in ([], ["--json"])

@@ -1430,13 +1430,15 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     included, as it does for a bad `--ids` or a missing or bad `--ts`. So the order is `batch`, post, `sent`. A batch of
     confirmation lines alone uses `--ids ''`. The stamp is never earlier than the offer. A stamp must prove a post: `sent`
     re-reads the message at `--ts` in the manager's first `D…` channel, through the read `answer` uses, and stamps only
-    when it is app-posted, draws nothing but its text (no attachments but a preview of its own link, no blocks but `rich_text`) and its text equals the
-    offer's in the one form both are compared in (`_norm`): auto-links and `<url|label>` as their text, entities undone,
-    every emoji spelling, Unicode or `:shortcode:`, as one placeholder, and no trailing spaces. A zero-width space stays,
-    and words, ids, numbers and targets must match. An earlier offer since the last `sent` counts, for a post that landed late,
+    when it is app-posted, draws nothing but its text (no attachments at all, a preview included, since every batch is posted with previews
+    off; no blocks but `rich_text`) and its text says what the offer's does (`_same_text`). Both are compared in one form
+    (`_norm`): the links in the raw text, and only those, as their text (`<url|label>` its label, `<url>` the url), then
+    entities undone, so escaped link markup in a draft keeps its address; a run of Unicode emoji as one placeholder; no
+    trailing spaces. A `:shortcode:` and a zero-width space stay as written, since Slack keeps both. A shortcode in the
+    stored text stands for an emoji only where the offer has a Unicode emoji (Slack stores ✅ as `:white_check_mark:`);
+    anywhere else it is words. Words, ids, numbers and targets must match. An earlier offer since the last `sent` counts, for a post that landed late,
     and then only that offer's ids can be stamped. Exits: no live offer, 2, with "no batch is waiting"; no such message, not
-    app-posted, not plain (blocks other than rich_text, an attachment that isn't a preview of the message's own link, a
-    link labelled as anything but its address) or other text, 2, with a message without that phrase, and the offer stays live; a read that failed, 3, which
+    app-posted, not plain (blocks other than rich_text, any attachment, a link labelled as anything but its address) or other text, 2, with a message without that phrase, and the offer stays live; a read that failed, 3, which
     is worth retrying and stamps nothing.
   - **The post.** The chief's mod posts the batch with `$.mcp.call`, which is not a tool call, so the guard doesn't see
     it. The mod does the guard's checks itself: nothing goes out under `MOTHER_DRY_RUN` or either PAUSED file, only the
@@ -1449,19 +1451,27 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     still show it. A wake line says one of three things (`routines/chief.md`): the post surely did not land, so the
     chief runs `batch`, posts the text and runs `sent`; it may have landed, so the chief looks in the DM's history, runs
     `sent` with the ts if it's there, and never posts; or the record is failing, as below. Every post, the mod's and the
-    chief's, passes `unfurl_links: false` and `unfurl_media: false`.
-  - **How many posts.** A post counts from before it goes out, kept with the mod's post state, which is session state:
-    a reload of the mod keeps the counts. A post that surely did not land gives its count back; the wake line asking
-    for a hand post takes one. An offer's content (`batch_key` in `mother chief tick --json`, a hash of its text, read
-    without making an offer) gets 2 posts unless one is recorded, whether they were refused by `sent` or unsure. Then
-    posting stops, and the Chief pane says so, until the content changes or 6 hours after the last post, whichever is
-    first. Across all contents, batch posts stop at 4 in any rolling hour, and an urgent decision waits like the rest.
-    The worst case is therefore 2 DMs per 6 hours while the batch's content doesn't change, and 4 DMs in any hour, up to
-    96 a day, only if the content changes each time and the posts go on landing. With the default `batch_minutes` of 30
-    an unrecorded post holds the next for 30 minutes, so the 4 needs urgent decisions or recorded posts. Not counted:
-    a post that returned a clear error but landed anyway; a chief that posts the live offer against its routine (the
-    guard lets the exact text through until `sent`); a green post to the DM from a normal session; and a new chief
-    session starts its counts at zero, so `mother chief install` can add up to 4 more.
+    chief's, passes `unfurl_links: false` and `unfurl_media: false`; the guard refuses the chief's post without both.
+  - **How many posts.** The mod counts a post just before `$.mcp.call`, so a reload of the mod in the middle of one
+    keeps it. A post that surely did not land (a clear error before or from the call) gives its count back. The wake line
+    asking the chief for a hand post takes one, and isn't sent when none is left. An offer's content is its rows and
+    confirm lines: `batch_key` in `mother chief tick --json`, a hash of the batch text without its header line (whose
+    "done without you" count moves with every worker run), read without making an offer.
+    - Per content: at most 2 counted posts, refused by `sent` or unsure alike. A recorded post clears the count. After
+      the second, nothing for that content until 6 hours after its last post; then 2 more. A changed content starts at 0.
+    - Across all contents: at most 4 counted posts in any rolling 60 minutes, urgent hold-ends included.
+    - So, exactly: while the rows and confirm lines don't change, at most 2 DMs in any window that ends 6 hours after
+      the second; and at most 4 in any hour whatever changes, which is 96 a day only if the content changes before every
+      post. Between counted posts that weren't recorded the hold applies (`batch_minutes`, default 30; ended early by an
+      urgent decision at most 3 times an hour, never within 2 minutes of an attempt). A recorded post clears the hold,
+      so a confirm-only batch can follow it at the next tick, inside the hourly 4.
+    - The counts live in the mod's post state, `$.state`, which the host holds for the running session. A reload of the
+      mod keeps it. A restart of the chief's Claude process, by `mother chief install`, the keeper restarting it or the
+      machine, starts it empty, even though the session id is resumed: up to 4 more in that hour.
+    - Outside the counts: a post that returned a clear error but landed anyway; a chief that posts the live offer
+      against its routine (the guard lets that exact text through, previews off, until `sent`); green posts to the DM
+      from normal sessions. A decision filed between the tick and `decide batch` is posted under the tick's key, so its
+      content can get one post more than 2; the hourly cap still holds.
   - **A `sent` that fails.** No new batch goes out while one is owed. After 3 failures in a row the chief gets one wake
     line, "The batch record is failing", with the ids and ts to run `sent` with once, and the mod retries once per
     `batch_minutes`. A `sent` that exits 2 drops the debt, isn't a record failure and logs `mod post: record dropped`.

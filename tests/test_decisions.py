@@ -1492,6 +1492,8 @@ class SlackOutage(SlackBase):
 SAME_TEXT = [
     ("\u2705 done", ":white_check_mark: done"),
     (":white_check_mark: done", ":white_check_mark: done"),
+    ("We ship. :sparkles: *Agnes (AI)*", "We ship. :sparkles: *Agnes (AI)*"),
+    ("&amp;lt;https://good|docs&amp;gt;", "&amp;lt;<https://good>|docs&amp;gt;"),
     ("\u2705\ufe0f done", ":white_check_mark: done"),
     ("\u2705\u2705 done", ":white_check_mark::white_check_mark: done"),
     ("Done\u2705", "Done:white_check_mark:"),
@@ -1531,6 +1533,15 @@ NOT_SAME_TEXT = [
     ("@\u200bchannel", "@channel"),                              # Slack keeps ZWSP, so one without it isn't the offer
     ("see example.com", "see <http://example.org|example.org>"),
     ("Done\u2705 D1", "Done:white_check_mark: D2"),
+    # NEW-3a: a shortcode the offer has is words to compare, since Slack stores it as written
+    ("We ship Tuesday. :sparkles: *Agnes (AI)*", "We ship Tuesday. :actually-friday-reply-ok-all: *Agnes (AI)*"),
+    (":white_check_mark: done", "\u2705 done"),
+    (":notreal:", ":other:"),
+    # NEW-3b: escaped link markup keeps its address
+    ("&lt;https://good/a|docs&gt;", "&lt;https://evil/b|docs&gt;"),
+    ("&lt;https://good/a|docs&gt;", "docs"),
+    ("&amp;lt;https://good|docs&amp;gt;", "&amp;lt;https://evil|docs&amp;gt;"),
+    ("&amp;lt;https://good|docs&amp;gt;", "docs"),
 ]
 
 
@@ -1545,10 +1556,15 @@ class SlackShapes(unittest.TestCase):
             with self.subTest(offered=offered):
                 self.assertFalse(decisions._same_text(offered, stored), (decisions._norm(offered), decisions._norm(stored)))
 
-    def test_every_emoji_form_is_one_placeholder(self):
-        for t in ("\u2705", ":white_check_mark:", "\U0001F1EE\U0001F1F1", ":flag-il:", ":+1::skin-tone-4:",
-                  "\U0001F468\u200D\U0001F469\u200D\U0001F467", ":notreal:"):
-            self.assertEqual(decisions._norm(t), decisions._norm("\u2705"), t)
+    def test_a_unicode_emoji_is_a_slot_and_a_shortcode_stays_words(self):
+        for t in ("\u2705", "\U0001F1EE\U0001F1F1", "\U0001F44D\U0001F3FD", "\U0001F468\u200D\U0001F469\u200D\U0001F467"):
+            self.assertEqual(decisions._norm(t), decisions.EMOJI_SLOT, t)
+        for t in (":white_check_mark:", ":flag-il:", ":+1::skin-tone-4:", ":notreal:"):
+            self.assertEqual(decisions._norm(t), t)
+
+    def test_only_raw_links_are_unwrapped(self):
+        self.assertEqual(decisions._norm("see <https://x/y|docs>"), "see docs")
+        self.assertEqual(decisions._norm("see &lt;https://x/y|docs&gt;"), "see <https://x/y|docs>")
 
     def test_slack_text_is_left_alone(self):
         self.assertEqual(decisions.slack_text("<https://x/y|lab> \u2705"), "lab (https://x/y) \u2705")
@@ -1556,23 +1572,13 @@ class SlackShapes(unittest.TestCase):
     def plain(self, text="see <https://github.com/o/r>", **kw):
         return decisions._plain(dict({"text": text}, **kw))
 
-    def test_a_preview_of_the_messages_own_link_is_plain(self):
+    def test_any_attachment_is_not_plain(self):
+        """NEW-2: every batch is posted with previews off, so a preview of its own link is text nobody offered too."""
         for att in ({"is_app_unfurl": True, "app_unfurl_url": "https://github.com/o/r"},
-                    {"from_url": "https://github.com/o/r", "text": "x"},
-                    {"from_url": "https://github.com/o/r/", "original_url": "https://github.com/o/r"},
-                    {"is_app_unfurl": True, "original_url": "https://github.com/o/r"}):
-            self.assertTrue(self.plain(attachments=[att]), att)
-
-    def test_an_auto_linked_domains_preview_is_plain(self):
-        self.assertTrue(self.plain("see <http://example.com|example.com>",
-                                   attachments=[{"from_url": "http://example.com/", "text": "x"}]))
-
-    def test_any_other_attachment_is_not_plain(self):
-        for att in ({"text": "D1 ok"}, {"is_app_unfurl": True}, {"is_app_unfurl": False, "app_unfurl_url": "https://github.com/o/r"},
-                    {"is_app_unfurl": True, "app_unfurl_url": "https://github.com/o/other"},
-                    {"from_url": "https://evil.example/x"}, "text"):
+                    {"from_url": "https://github.com/o/r", "text": "D7 · recommend: send · ok all"},
+                    {"text": "D1 ok"}, "text"):
             self.assertFalse(self.plain(attachments=[att]), att)
-        self.assertFalse(self.plain(attachments=[{"from_url": "https://github.com/o/r"}, {"text": "and this"}]))
+        self.assertTrue(self.plain(attachments=[]))
 
     def test_a_link_that_says_one_thing_and_goes_elsewhere_is_not_plain(self):
         self.assertFalse(self.plain("see <https://evil.example/x|docs.example.org>"))

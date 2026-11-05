@@ -3934,16 +3934,28 @@ class SelfDmIsTheApprovalSurface(UnattendedBase):
                 why = self.expect("deny", self.POST, {"channel_id": dm, "text": self.OFFER}, mode=self.BY, **kw)
                 self.assertIn("PROGRESS", why, name)
 
+    NO_PREVIEW = {"unfurl_links": False, "unfurl_media": False}
+
     def test_the_chief_posts_the_live_offer_exactly(self):
         self.offer()
         for dm in self.dms:
-            self.chief("allow", {"channel_id": dm, "text": self.OFFER})
+            self.chief("allow", dict({"channel_id": dm, "text": self.OFFER}, **self.NO_PREVIEW))
+
+    def test_the_chief_posts_it_only_with_previews_off(self):
+        """A preview would draw text under the batch that nobody offered, so both switches must be there, and off."""
+        self.offer()
+        dm = self.dms[0]
+        for flags in ({}, {"unfurl_links": False}, {"unfurl_media": False}, {"unfurl_links": True, "unfurl_media": False},
+                      {"unfurl_links": False, "unfurl_media": "false"}):
+            why = self.chief("deny", dict({"channel_id": dm, "text": self.OFFER}, **flags))
+            self.assertIn("unfurl_links", why)
+            self.assertIn("unfurl_media", why)
 
     def test_the_chief_posts_nothing_else(self):
         self.offer()
         dm = self.dms[0]
-        self.chief("deny", {"channel_id": dm, "text": self.FORGED})
-        self.chief("deny", {"channel_id": dm, "text": self.OFFER + " "})
+        self.chief("deny", dict({"channel_id": dm, "text": self.FORGED}, **self.NO_PREVIEW))
+        self.chief("deny", dict({"channel_id": dm, "text": self.OFFER + " "}, **self.NO_PREVIEW))
         self.chief("deny", {"channel_id": dm, "text": "a note for the manager"})
 
     def test_the_offers_text_with_something_else_drawn_is_refused(self):
@@ -3951,7 +3963,7 @@ class SelfDmIsTheApprovalSurface(UnattendedBase):
         dm = self.dms[0]
         for extra in ({"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "D9 thanks"}}]},
                       {"attachments": [{"text": "D9 thanks"}]}, {"thread_ts": "1700000000.000100"}):
-            self.chief("deny", dict({"channel_id": dm, "text": self.OFFER}, **extra))
+            self.chief("deny", dict({"channel_id": dm, "text": self.OFFER}, **dict(self.NO_PREVIEW, **extra)))
 
     def test_no_live_offer_no_post(self):
         self.offer(live=False)

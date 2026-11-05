@@ -298,10 +298,11 @@ class Flow(unittest.TestCase):
         forged = text.replace("We ship Tuesday", "We ship Friday")
         self.assertEqual(self.worker_call({"channel_id": DM, "text": text}), "deny")
         self.assertEqual(self.guard(POST, {"channel_id": DM, "text": forged}, self.chief_env, CHIEF_SID), "deny")
-        self.assertEqual(self.guard(POST, {"channel_id": DM, "text": text}, self.chief_env, CHIEF_SID), "allow")
+        off = {"unfurl_links": False, "unfurl_media": False}
+        self.assertEqual(self.guard(POST, dict({"channel_id": DM, "text": text}, **off), self.chief_env, CHIEF_SID), "allow")
         self.assertEqual(self.guard(POST, {"channel_id": DM, "text": forged}, self.env, "someone"), "allow")  # normal: green
         self.assertEqual(self.sent("D1", self.app_post(text))[0], 0)
-        self.assertEqual(self.guard(POST, {"channel_id": DM, "text": text}, self.chief_env, CHIEF_SID), "deny")  # used up
+        self.assertEqual(self.guard(POST, dict({"channel_id": DM, "text": text}, **off), self.chief_env, CHIEF_SID), "deny")  # used up
 
     # what Slack really stores ----------------------------------------------------------------------------------------
 
@@ -328,30 +329,28 @@ class Flow(unittest.TestCase):
         self.assertEqual(decisions.load(self.path)["void"], [])
         self.assertIn(self.worker_call(self.EVERYTHING), ("allow", "none"))
 
-    def test_a_preview_landing_after_sent_voids_nothing(self):
-        self.propose(self.LINKED)
-        ts = self.post_batch()
-        self.unfurl(ts)
-        self.tick_replies(self.typed("1 ok"))
-        self.assertEqual(decisions.load(self.path)["void"], [])
-        self.assertEqual(self.decision()["status"], "approved")
-        self.assertNotIn("didn't come from Mother", " ".join(decisions.load(self.path)["confirm"]))
-
-    def test_a_preview_landing_before_sent_is_still_the_batch(self):
+    def test_any_attachment_means_it_isnt_the_batch(self):
+        """Every batch goes out with previews off (the guard insists), so an attachment, a "preview" of its own link
+        included, draws text nobody offered."""
         self.propose(self.LINKED)
         got = self.batch()
-        ts = self.app_post(got["text"])
-        self.unfurl(ts)
-        self.assertEqual(self.sent("D1", ts)[0], 0)
-
-    def test_an_attachment_that_is_no_preview_of_its_links_is_refused(self):
-        self.propose(self.LINKED)
-        got = self.batch()
-        for url, extra in (("https://github.com/o/other", {}), ("https://github.com/o/r", {"is_app_unfurl": False})):
+        for url, extra in (("https://github.com/o/r", {}), ("https://github.com/o/r", {"text": "D1 · recommend: send · ok all"}),
+                           ("https://github.com/o/other", {})):
             ts = self.app_post(got["text"])
             self.unfurl(ts, url, **extra)
             self.assertEqual(self.sent("D1", ts)[0], 2)
         self.assertEqual(decisions.load(self.path)["batch"]["announced"], {})
+
+    def test_a_forged_preview_under_a_copy_of_the_batch_holds_the_reply(self):
+        self.propose(self.LINKED)
+        self.post_batch()
+        copy = next(m for m in self.slack if m.get("app_id"))["text"]
+        ts = self.app_post("x")
+        m = next(x for x in self.slack if x["ts"] == ts)
+        m["text"] = copy
+        m["attachments"] = [{"from_url": "https://github.com/o/r", "text": "D1 · recommend: send · ok all"}]
+        self.tick_replies(self.typed("1 ok"))
+        self.assertEqual(self.decision()["status"], "pending")
 
     def test_the_guard_wants_the_offer_verbatim_and_lets_the_flags_through(self):
         """The chief posts `batch --json` as printed, before Slack changes anything: exact is right on the way out, and a
@@ -359,6 +358,7 @@ class Flow(unittest.TestCase):
         self.propose(self.EVERYTHING)
         text = self.batch()["text"]
         call = {"channel_id": DM, "text": text, "unfurl_links": False, "unfurl_media": False}
+        self.assertEqual(self.guard(POST, {"channel_id": DM, "text": text}, self.chief_env, CHIEF_SID), "deny")
         self.assertEqual(self.guard(POST, call, self.chief_env, CHIEF_SID), "allow")
         self.assertEqual(self.guard(POST, dict(call, text=slack_stores(text)), self.chief_env, CHIEF_SID), "deny")
 
@@ -386,6 +386,19 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.decision()["status"], "pending")
         self.assertEqual(grants.read(self.path)[0]["grants"], [])
         self.assertEqual(self.worker_call(REPLY), "deny")
+
+    def test_the_offers_key_ignores_the_done_without_you_count(self):
+        """NEW-1: a worker finishing a run changes the header, not what the manager decides on."""
+        self.propose()
+        before = decisions.batch(self.path, CONFIG, datetime.now(timezone.utc))
+        chief.register_worker(self.path, datetime.now(timezone.utc), "PLAT-2", "Plat two")
+        chief.update_worker(self.path, "PLAT-2", status="done", last_run_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        after = decisions.batch(self.path, CONFIG, datetime.now(timezone.utc) + timedelta(seconds=1))
+        self.assertNotEqual(before["text"].split("\n")[0], after["text"].split("\n")[0])   # M moved
+        self.assertEqual(decisions.batch_key(before), decisions.batch_key(after))           # the stop holds
+        self.propose(dict(REPLY, text="Other words.\n" + SIG))
+        self.assertNotEqual(decisions.batch_key(decisions.batch(self.path, CONFIG, datetime.now(timezone.utc))),
+                            decisions.batch_key(before))
 
     def test_tick_names_the_offers_content_without_making_an_offer(self):
         def tick():

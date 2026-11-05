@@ -32,7 +32,7 @@ export const CLI = {
  },
  "tick_due": {
   "exitCode": 0,
-  "stdout": "{\n  \"paused\": false,\n  \"decided\": [],\n  \"wake\": null,\n  \"judge\": [],\n  \"dispatched\": [],\n  \"reconciled\": [],\n  \"batch\": true,\n  \"batch_key\": \"4539f76eff74baea\"\n}\n",
+  "stdout": "{\n  \"paused\": false,\n  \"decided\": [],\n  \"wake\": null,\n  \"judge\": [],\n  \"dispatched\": [],\n  \"reconciled\": [],\n  \"batch\": true,\n  \"batch_key\": \"1dc3eaf3ed95f564\"\n}\n",
   "stderr": ""
  },
  "status_pending": {

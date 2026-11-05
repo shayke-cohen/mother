@@ -1230,9 +1230,12 @@ def batch(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
 
 
 def batch_key(got: Optional[dict]) -> Optional[str]:
-    """What a batch says, as a short hash: `mother chief tick` hands it to the mod, which counts posts per offer content
-    and must see a change without making an offer. None when nothing is due."""
-    return hashlib.sha256(got["text"].encode("utf-8")).hexdigest()[:16] if got else None
+    """What the manager decides on in a batch, as a short hash: its rows and confirm lines, not the header, whose "done
+    without you" count moves whenever a worker finishes a run. `mother chief tick` hands it to the mod, which counts posts
+    per offer content and must see a change without making an offer. None when nothing is due."""
+    if not got:
+        return None
+    return hashlib.sha256("\n".join(got["text"].split("\n")[1:]).encode("utf-8")).hexdigest()[:16]
 
 
 def offer(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
@@ -1274,8 +1277,9 @@ _UNI_EMOJI = "(?:[%s]|[0-9#*]\ufe0f?\u20e3)[\U000E0020-\U000E007F]*" % _EMOJI_CH
 # A name holds a letter, or it's one of these: `:30:` in 10:30:45 is a time, and two times must not compare equal.
 _CODE = r":(?:[a-z0-9_+'\-]*[a-z][a-z0-9_+'\-]*|\+1|-1|100|1234):(?::skin-tone-[2-6](?:-[2-6])?:)?"
 _JOIN = "[\u200d\ufe0f]*"
-_EMOJI_RUN = re.compile(r"(?:(?<![\w:])%s(?!\w)|%s)(?:%s(?:%s(?!\w)|%s))*%s" % (_CODE, _UNI_EMOJI, _JOIN, _CODE, _UNI_EMOJI, _JOIN))
-_GLUED_SLOT = "(?:%s|%s%s)+" % (EMOJI_SLOT, _CODE, _JOIN)
+_EMOJI_RUN = re.compile("%s(?:%s%s)*%s" % (_UNI_EMOJI, _JOIN, _UNI_EMOJI, _JOIN))
+# where the offer has an emoji, what Slack stored there: the emoji, or its shortcodes (a family can be one name or several)
+_SLOT_STORED = "(?:%s|%s)(?:%s(?:%s|%s))*%s" % (EMOJI_SLOT, _CODE, _JOIN, EMOJI_SLOT, _CODE, _JOIN)
 _ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 
 
@@ -1290,13 +1294,14 @@ def _unwired(m) -> str:
 
 
 def _norm(text) -> str:
-    """A message's text in the one form a post and an offer are compared in, whatever Slack did to it: `<url|label>` as
-    its label, `<url>` as the url, entities undone (however often the path to Slack escaped them), every emoji spelling
-    as one EMOJI_SLOT, and no trailing spaces on a line. A zero-width space stays: Slack keeps it. For comparing only:
-    `slack_text` is what a reader gets."""
-    t = text if isinstance(text, str) else ""
+    """A message's text in the one form a post and an offer are compared in, whatever Slack did to it: the links in the
+    raw text (`<url|label>` as its label, `<url>` as the url) and only those, then entities undone (however often the path
+    to Slack escaped them), so escaped link markup in a draft keeps its address; a run of Unicode emoji as one EMOJI_SLOT;
+    no trailing spaces on a line. A `:shortcode:` stays as written, and so does a zero-width space: Slack keeps both. For
+    comparing only: `slack_text` is what a reader gets."""
+    t = _WIRE_LINK.sub(_unwired, text if isinstance(text, str) else "")
     for _ in range(3):
-        u = _unescaped(_WIRE_LINK.sub(_unwired, t))
+        u = _unescaped(t)
         if u == t:
             break
         t = u
@@ -1305,12 +1310,13 @@ def _norm(text) -> str:
 
 
 def _same_text(offered, stored) -> bool:
-    """`stored` says what `offered` said. A shortcode touching a word ("Done:white_check_mark:") reads as an emoji only
-    where the offer has one: anywhere else `key:one:two` is words, and words must match."""
+    """`stored` says what `offered` said. Slack stores a Unicode emoji as its shortcode, so a shortcode in `stored`
+    stands for an emoji only where the offer has a Unicode one. Anywhere else, a shortcode the offer has included, it is
+    words, and words must match."""
     a, b = _norm(offered), _norm(stored)
     if a == b:
         return True
-    return EMOJI_SLOT in a and re.fullmatch(_GLUED_SLOT.join(map(re.escape, a.split(EMOJI_SLOT))), b) is not None
+    return EMOJI_SLOT in a and re.fullmatch(_SLOT_STORED.join(map(re.escape, a.split(EMOJI_SLOT))), b) is not None
 
 
 def _app_posted(msg: dict) -> bool:
@@ -1321,23 +1327,14 @@ def _bare_url(u: str) -> str:
     return re.sub(r"^(?:https?://|mailto:|tel:)", "", _unescaped(u or ""), flags=re.I).rstrip("/").lower()
 
 
-def _is_preview(att, text: str) -> bool:
-    """A link preview of a link in the message's own text, which Slack adds after the post and nobody wrote. `edited`
-    comes with it, so `edited` on a post means nothing."""
-    if not isinstance(att, dict) or not (att.get("is_app_unfurl") is True or att.get("from_url")):
-        return False
-    links = {u.rstrip("/") for u in re.findall(r"(?:https?://|mailto:|tel:)[^\s|<>]+", _unescaped(text))}
-    return any(isinstance(att.get(k), str) and _unescaped(att[k]).rstrip("/") in links
-               for k in ("app_unfurl_url", "from_url", "original_url"))
-
-
 def _plain(msg: dict) -> bool:
-    """It draws what its `text` says: no attachments but a preview of its own links, no blocks but the rich_text Slack adds
-    on its own, and no link labelled as anything but its address (an offer has none, and Slack's auto-links are that)."""
+    """It draws what its `text` says: no attachments (every batch is posted with previews off, which the guard insists
+    on, so even a preview is text nobody offered), no blocks but the rich_text Slack adds on its own, and no link labelled
+    as anything but its address (an offer has none, and Slack's auto-links are that). `edited` means nothing: a preview
+    sets it, and nobody edits a batch."""
     blocks = msg.get("blocks") or []
     text = msg.get("text") if isinstance(msg.get("text"), str) else ""
-    atts = msg.get("attachments") or []
-    return isinstance(atts, list) and all(_is_preview(a, text) for a in atts) and isinstance(blocks, list) \
+    return not msg.get("attachments") and isinstance(blocks, list) \
         and all(isinstance(x, dict) and x.get("type") == "rich_text" for x in blocks) \
         and all(not m.group(2) or _bare_url(m.group(2)) == _bare_url(m.group(1)) for m in _WIRE_LINK.finditer(text))
 

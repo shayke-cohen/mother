@@ -2346,3 +2346,14 @@ test('test_an_urgent_decision_respects_the_hourly_cap', async ($, on) => {
   expect(posts.length).toBeLessThanOrEqual(4)
   expect(posts.length).toBeGreaterThan(2)
 })
+
+// NEW-1: the key is what the manager decides on, so a header that moves (another worker done) doesn't restart the posting
+test('test_a_stop_holds_while_only_the_header_changes', async ($, on) => {
+  let n = 0
+  const { clock, posts } = await bootBatch($, on, UNSURE_POST, {
+    files: EIGHT, key: () => 'the same rows',
+    batch: () => ({ exitCode: 0, stdout: JSON.stringify({ ...BATCH, text: BATCH.text.replace('0 done', `${n++} done`) }) }),
+  })
+  for (let i = 0; i < 60; i++) await clock.advance(30_000)
+  expect(posts.length).toBe(2)
+})

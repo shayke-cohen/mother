@@ -325,7 +325,7 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 //   all the same, so it is handled as one that may have: one check line for the chief.
 // Posts are bounded whatever the outcomes. Each is counted before it goes out, so a reload during one keeps it; a post
 // that surely did not land gives its count back, and the one hand-post line takes one. An offer's content (`batch_key`
-// from the tick, which makes no offer) gets 2 posts unless one is recorded; then posting stops until the content changes
+// from the tick: its rows and confirm lines, not the header; it makes no offer) gets 2 posts unless one is recorded; then posting stops until the content changes
 // or 6 hours after its last post. All batch posts together: 4 in any rolling hour, urgent ones too. docs/CONTRACT.md has
 // the worst case.
 // A `sent` that fails otherwise (a Slack read that failed, a lock) keeps the debt and is retried as above.
