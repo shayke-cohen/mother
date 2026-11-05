@@ -1326,13 +1326,23 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   driven.
 - **`ChiefStatus`** (`status --json`, version 1, `types/index.d.ts`): `{version, at, paused, chief: {alive,
   heartbeat_at}, budget: {spent, limit, unreadable, over}, desktop: [{session_id, cli_session_id, title, cwd, repo,
-  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard}`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
+  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard, health}`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
   `led_by` is that heartbeat's `session_id` while it is alive, else null. `desktop` is the snapshot rows still live in
   the app (`last_report` is the first 200 characters of the last turn report). `spent` reads 0 when `spend.json` is
   unreadable; `unreadable` is then true, and `over` (spent at the limit, or unreadable) says no model call is made.
   `inbox` is the hub's open updates, which is what a `now` decision makes (`{id, key, title, why, link, at, session}`,
-  each text one safe line, newest first, at most 10) and `inbox_count` all of them. The text form (`status`) prints
-  who leads, the budget, and the pinned and inbox counts.
+  each text one safe line, newest first, at most 10) and `inbox_count` all of them. An open update keyed
+  `watcher:<source>` (a source the watcher could not read) is not work: it is left out of both and listed in `health`.
+  The text form (`status`) prints who leads, the budget, and the pinned and inbox counts.
+- **`health`** (in `status --json`; `health_doc`), so the pane reads no more files: `{guard, watcher, watcher_errors,
+  watcher_error_count, undelivered}`. `guard` is `paused` (`.mother/PAUSED`, which wins), `off` (`.mother/GUARD_OFF`)
+  or `on`. `watcher` is null when `.mother/hub/watcher.json` has no `at`, else `{at, every_seconds, active, stale,
+  sources: {<name>: {status, reason, since, at}}}`, `stale` as `mother hub status` judges it (in active hours and older
+  than twice the interval). `watcher_errors` are the `watcher:` updates in the Inbox item shape, newest first, at most
+  20. `undelivered` lists `<workspace>/.mother/<routine>-unsent-<YYYY-MM-DD>.md`, the routine reports that could not
+  be delivered to the manager's DM: `[{name, routine, date, bytes}]`, newest first, at most 20, plain files only.
+  `mother chief report <name>` prints one such file's text; a name off `^[a-z0-9-]+-unsent-\d{4}-\d{2}-\d{2}\.md$`,
+  a missing file, a link, a file outside `.mother/` or one past 64 KB exits 2 and prints nothing.
 - **TL;DR, chips and Open on the Chief pane.** `mother chief tail --json` prints `{version: 1, model, sessions:
   [{id, kind: "pinned", fingerprint, text, cached?}]}`: one row per pinned session (`id` its CLI id) with something
   to summarise. `text` is the transcript's last 12 main-thread user and assistant messages from
@@ -1376,9 +1386,10 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   toggles a card (`chiefOpen`); Needs you starts expanded, the rest compact, `/chief expand | collapse` sets all.
   The card a button was last pressed on is the selected one (`chiefSelected`): a bold border, and open. An empty
   section is one dim line. The status line adds ` · N need you` and ` · N in inbox`, each only when N > 0.
-- **Tabs.** Under the strip, a row of buttons with counts: `Needs you`, `Inbox`, `Sessions`, `Today`, then `All`.
+- **Tabs.** Under the strip, a row of buttons with counts: `Needs you`, `Inbox`, `Sessions`, `Today`, `Team`, `Health`
+  (no count; a red dot when something is wrong), then `All`.
   Only the shown tab's section is drawn (no heading: the tab is it); `All` stacks every section under its heading.
-  The shown tab is the manager's pick (`chiefTab.picked`, by a press or `/chief tab needs|inbox|sessions|today|all`),
+  The shown tab is the manager's pick (`chiefTab.picked`, by a press or `/chief tab needs|inbox|sessions|today|team|health|all`),
   else the first tab that holds something, else `All`. A tab whose count is above the count it had when last opened
   or left (`chiefTab.seen`) ends ` •`. The list is data (`{id, label, count, section}`), so a later group is one row.
   **Today** is the Now list as `hooks/register.tsx` read it (its poll, its `doc` atom; nothing is read again): today's
@@ -1386,6 +1397,24 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   done <rank>`), then the on-you items no entry names, at most 10 (Open = the item's Inspector page, Ask Mother,
   Done = `mother now done <id>`), through the Now panel's own verb and loader. No now.json, or one past
   `stale_after`, is said in one dim line.
+- **Team, Health, Suggested** (`hooks/pane_tabs.tsx`; each is one row of the tab list). A Now item is a card with its
+  title, why, age (`since`), source link, the tick's first action, Ask Mother and Done; expanded it adds Open, Snooze
+  and Ignore… with the Now panel's verbs and choices (`mother now done|snooze`, `mother hub mute …` then done).
+  **Team** (`Team N`) is the `neglected` items under a heading per `team` (none = `Other`, last; else largest first),
+  7 cards a group, then `Show N more`. **Suggested** is the `suggestion` items, 3 then `Show N more`, at the top of
+  Today and in its count. **Health** draws: *Sources*, a row per now.json `coverage` entry (workspace, chat, tracker,
+  code, mail, calendar, then any other) with a status badge (`ok` green, `partial` amber, anything else red) and, for
+  one that is not ok, its `reason` in full and its age from `since`; *Watcher*, the last poll's age, `stale`, and a
+  badge per polled source; *Watcher errors*, compact red cards with Done (`mother hub done <id>`) and `Done all` from
+  2; *Undelivered reports*, a row per `health.undelivered` entry whose press runs `mother chief report <name>` and
+  shows the text as plain lines (cleaned as every untrusted text is, at most 200 lines; never read on a draw), with
+  Dismiss, which deletes nothing: the name joins `chiefHealth.dismissed`, kept in the plugin store as
+  `chiefDismissed` (the last 50), and `Show again` empties it; *Budget and lead*; *Guard*, `on` (green), `off` or
+  `paused` (red), from `health.guard`, else a top-level `guard`. The red dot: a source that is not ok, a watcher
+  error, an undelivered report not dismissed, or a guard that is not on. An expanded **Inbox** card also has Follow
+  (`mother hub follow --project|--repo|--thread|--whatsapp`, by the key's shape; none for mail, calendar and manual
+  keys) and Ignore… (`mother hub mute -- <key>`, `--for 1w`, or `--scope channel` for a chat thread, then `hub done`),
+  the Now panel's own helpers.
 - **The picture.** `mother chief portrait --json` prints `{version: 1, source: "custom" | "bundled", width, height,
   png, jpeg?, jpeg_width?, jpeg_height?, svg?}`. `png` (base64, with `width` and `height` from its IHDR) is
   `<workspace>/.mother/portrait.png` when it is a PNG of at most 2 MiB, else the plugin's

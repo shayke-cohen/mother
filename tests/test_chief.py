@@ -454,7 +454,7 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "led_by", "inbox",
-                                    "inbox_count", "guard"})
+                                    "inbox_count", "guard", "health"})
         self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
@@ -513,6 +513,100 @@ class TestMain(Base):
 
 
 
+
+
+class TestHealth(Base):
+    main = TestMain.main
+
+    def seed_updates(self, *keys):
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "hub.json", {"version": 1, "updates": [
+                {"id": "U%d" % (n + 1), "key": k, "title": "T " + k, "why": "w", "link": None,
+                 "at": hub._iso(AT - timedelta(minutes=n)), "state": "open"} for n, k in enumerate(keys)]})
+
+    def unsent(self, name, text="report\n"):
+        (self.ws / ".mother").mkdir(exist_ok=True)
+        (self.ws / ".mother" / name).write_text(text)
+
+    def test_health_of_an_empty_workspace(self):
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["health"], {
+            "guard": "on", "watcher": None, "watcher_errors": [], "watcher_error_count": 0, "undelivered": []})
+
+    def test_guard_states_and_paused_wins(self):
+        state = self.ws / ".mother"
+        state.mkdir()
+        (state / "GUARD_OFF").write_text("")
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["health"]["guard"], "off")
+        (state / "PAUSED").write_text("")
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["health"]["guard"], "paused")
+        (state / "GUARD_OFF").unlink()
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["health"]["guard"], "paused")
+
+    def test_watcher_errors_leave_the_inbox_and_its_count(self):
+        self.seed_updates("PLAT-1", "watcher:chat", "watcher:mail")
+        doc = chief.status_doc(self.ws, {}, AT)
+        self.assertEqual(([u["key"] for u in doc["inbox"]], doc["inbox_count"]), (["PLAT-1"], 1))
+        h = doc["health"]
+        self.assertEqual(([u["id"] for u in h["watcher_errors"]], h["watcher_error_count"]), (["U2", "U3"], 2))
+        self.assertEqual(set(h["watcher_errors"][0]), {"id", "key", "title", "why", "link", "at", "session",
+                                                        "source", "who", "label"})
+
+    def test_watcher_heartbeat_and_sources(self):
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "watcher.json", {
+                "at": hub._iso(AT - timedelta(minutes=30)), "every_seconds": 300, "active": True, "sources": {
+                    "chat": {"status": "ok", "at": hub._iso(AT - timedelta(minutes=30))},
+                    "mail": {"status": "couldnt_check", "reason": "sign-in\u202e expired\nagain",
+                             "since": "2026-11-01T07:00:00Z"}, "junk": "x"}})
+        w = chief.status_doc(self.ws, {}, AT)["health"]["watcher"]
+        self.assertEqual((w["at"], w["every_seconds"], w["active"], w["stale"]),
+                         (hub._iso(AT - timedelta(minutes=30)), 300, True, True))
+        self.assertEqual(sorted(w["sources"]), ["chat", "mail"])
+        self.assertEqual(w["sources"]["chat"]["status"], "ok")
+        self.assertEqual(w["sources"]["mail"], {"status": "couldnt_check", "reason": "sign-in expired again",
+                                                "since": "2026-11-01T07:00:00Z", "at": None})
+        with hub.locked(self.ws):   # outside active hours an old poll is not stale
+            hub.save_json(self.ws, "watcher.json", {"at": hub._iso(AT - timedelta(hours=9)), "active": False})
+        self.assertIs(chief.status_doc(self.ws, {}, AT)["health"]["watcher"]["stale"], False)
+
+    def test_undelivered_lists_matching_files_newest_first(self):
+        self.unsent("brief-unsent-2026-10-30.md", "old\n")
+        self.unsent("team-digest-unsent-2026-11-01.md", "newer\n")
+        self.unsent("brief-unsent-2026-11-01.md")
+        for other in ("Brief-unsent-2026-11-01.md", "brief-unsent-2026-11-01.txt", "brief-unsent-20261101.md",
+                      "now.json"):
+            self.unsent(other)
+        (self.ws / ".mother" / "dots-unsent-2026-11-01.md").mkdir()      # a folder is not a report
+        got = chief.status_doc(self.ws, {}, AT)["health"]["undelivered"]
+        self.assertEqual(got, [
+            {"name": "team-digest-unsent-2026-11-01.md", "routine": "team-digest", "date": "2026-11-01", "bytes": 6},
+            {"name": "brief-unsent-2026-11-01.md", "routine": "brief", "date": "2026-11-01", "bytes": 7},
+            {"name": "brief-unsent-2026-10-30.md", "routine": "brief", "date": "2026-10-30", "bytes": 4}])
+
+    def test_report_prints_one_file(self):
+        self.unsent("brief-unsent-2026-11-01.md", "# Brief\nline two\n")
+        self.assertEqual(self.main("report", "brief-unsent-2026-11-01.md"), (0, "# Brief\nline two\n", ""))
+
+    def test_report_bad_names_exit_2(self):
+        self.unsent("brief-unsent-2026-11-01.md")
+        (self.ws / "config.json").write_text("{}")
+        (self.ws / ".mother" / "sub").mkdir()
+        (self.ws / ".mother" / "sub" / "brief-unsent-2026-11-01.md").write_text("x")
+        self.unsent("big-unsent-2026-11-01.md", "x" * (chief.UNSENT_MAX_BYTES + 1))
+        self.unsent("edge-unsent-2026-11-01.md", "x" * chief.UNSENT_MAX_BYTES)
+        os.symlink(str(self.ws / "config.json"), str(self.ws / ".mother" / "link-unsent-2026-11-01.md"))
+        bad = ["../config.json", "config.json", "now.json", "sub/brief-unsent-2026-11-01.md",
+               "../.mother/brief-unsent-2026-11-01.md", "/etc/passwd", "brief-unsent-2026-11-02.md",
+               "BRIEF-unsent-2026-11-01.md", "brief-unsent-2026-11-01.md\n", "big-unsent-2026-11-01.md",
+               "link-unsent-2026-11-01.md", ""]
+        for name in bad:
+            code, out, err = self.main("report", name)
+            self.assertEqual((code, out), (2, ""), name)
+            self.assertIn("not an undelivered report", err)
+        self.assertEqual(self.main("report")[0], 2)                                       # no name
+        self.assertEqual(self.main("report", "a-unsent-2026-11-01.md", "b-unsent-2026-11-01.md")[0], 2)
+        self.assertEqual(self.main("report", "edge-unsent-2026-11-01.md")[0], 0)          # exactly 64 KB reads
+        self.assertEqual(self.main("status", "x")[0], 2)                                  # no other verb takes a name
 
 
 class TestStatusAndText(Base):

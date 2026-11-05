@@ -7,9 +7,12 @@ import { nowVerb, openInspector } from './register'
 import type { FloorState } from './floor'
 import type { Dollar } from './shared'
 import { ACTIVE_MINUTES, SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, TAB_IDS, TOP_COLOR, allCards, badge, card, clip, emptyLine, headerStrip,
-         humanLabel, isOpen, itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabRow,
-         titleRow, toggled } from './pane_ui'
+         humanLabel, isOpen, itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, subHeading, suggestedBrief, suggestionsFor, tabRow,
+         titleRow, toggled, whyText } from './pane_ui'
 import type { Portrait, Tab, TabId, Ui } from './pane_ui'
+import { guardState, healthProblems, healthSection, inboxFollowIgnore, inboxIgnorePick, isWatcherError, loadDismissed, suggestedRows, suggestedSection,
+         teamCount, teamSection } from './pane_tabs'
+import type { ChiefHealthState } from '../types'
 import type { ChiefChip, ChiefDesktop, ChiefInboxItem, ChiefOpen, ChiefStatus, ChiefTabs, ChiefTldr, NowDoc, NowItem, NowTop } from '../types'
 
 // The Chief pane: which session leads, Needs you, the Inbox, and one card per pinned desktop session with a chat box.
@@ -22,6 +25,7 @@ export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as co
 export const chiefOpenAtom = atom({ plugin: 'mother', key: 'chiefOpen' } as const, null)
 export const chiefSelectedAtom = atom({ plugin: 'mother', key: 'chiefSelected' } as const, null)
 export const chiefTabAtom = atom({ plugin: 'mother', key: 'chiefTab' } as const, null)
+const healthAtom = atom({ plugin: 'mother', key: 'chiefHealth' } as const, null)   // written in hooks/pane_tabs.tsx; only read here
 const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)   // now.json as register.tsx last read it; only read here
 const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)   // written in hooks/floor.ts; a read names a const of this file
 
@@ -103,16 +107,7 @@ const TRIAGE_MAX_TOKENS = 300
 const TRIAGE_TIMEOUT_MS = 20_000
 const TITLE_MAX = 60
 const TLDR_MAX = 200
-const WHY_MAX = 300          // what the hub stores of a line's summary; an expanded card shows all of it
 const PREVIEW_MAX = 64       // a compact card's one line of TL;DR or question
-
-// A stored why as an expanded card shows it: whole, on one line. One that reaches a storage cap (300, or the 200 of
-// an older item) without ending a sentence was cut there, mid-word: its last partial word goes and `…` says so.
-export function whyText(raw: unknown): string {
-  const t = oneLine(raw, WHY_MAX)
-  if ((t.length >= WHY_MAX - 1 || t.length === TLDR_MAX) && !/[.!?…)\]"'”]$/.test(t)) return clip(t, t.length - 1)
-  return t
-}
 
 type ChiefLine = { id: string; key: string; kind?: string | null; title?: unknown; who?: unknown; link?: unknown; summary?: unknown; session?: unknown }
 type Verdict = { line_id: string; key: string; is_work: boolean; needs_attention: boolean; title: string; tldr: string }
@@ -638,7 +633,8 @@ async function loadPortrait($: Dollar, bin: string): Promise<void> {
 
 // What each card's buttons share: a press selects the card first, then runs.
 type CardCtx = { open: ChiefOpen | null; selected: string | null; portrait?: Portrait | null; surface?: string
-                 tabs?: ChiefTabs | null; doc?: NowDoc | null }
+                 tabs?: ChiefTabs | null; doc?: NowDoc | null
+                 health?: ChiefHealthState | null }   // the Health tab's dismissed reports and loaded texts (hooks/pane_tabs.tsx)
 
 // ---- Today: the tick's Top 3 and the on-you items of now.json, as register.tsx read it (its poll, its atom) ----
 // Its buttons are the Now panel's own, from register.tsx: `nowVerb` runs `mother now …` and re-reads now.json at once
@@ -660,7 +656,7 @@ export function tabCounts(s: ChiefStatus | null, floor: FloorState | null, doc: 
   const today = todayRows(doc, nowMs)
   const inbox = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
   return { needs: needsYou(s, floor).length, inbox, sessions: Array.isArray(s?.desktop) ? s!.desktop!.length : 0,
-           today: today.top.length + today.items.length, all: 0 }
+           today: today.top.length + today.items.length + suggestedRows(doc).length, all: 0, team: teamCount(doc), health: healthProblems(s, doc) }
 }
 
 // The manager picked a tab: it stays, and the tab left and the tab opened are both seen at their counts of now.
@@ -672,13 +668,8 @@ async function pickTab($: Dollar, id: TabId, counts: Record<TabId, number>): Pro
   })
 }
 
-// A small heading inside a tab: `Top 3`, `On you (12)`.
-function subHeading(ui: Ui, key: string, text: string) {
-  const { Box, Text } = ui
-  return <Box key={key} marginTop={1}><Text weight="semibold" dimColor>{text}</Text></Box>
-}
-
-function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undefined, nowMs: number, ctx: CardCtx, heading: boolean) {
+// `suggested` is the Suggested group's elements (hooks/pane_tabs.tsx): drawn first, above Top 3 and On you.
+function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undefined, nowMs: number, ctx: CardCtx, heading: boolean, suggested: unknown[] = []) {
   const { Box, Text, Button, Link } = ui
   const { top, items } = todayRows(doc, nowMs)
   const count = top.length + items.length
@@ -687,6 +678,7 @@ function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undef
   if (!doc) return [emptyLine(ui, 'today-empty', 'No Today list yet: the tick has not written now.json')]
   if (nowMs > Date.parse(doc.stale_after)) out.push(emptyLine(ui, 'today-stale', 'This list is stale: the tick has not run since it was written'))
   if (!count) out.push(emptyLine(ui, 'today-none', 'Nothing on you today'))
+  out.push(...suggested)
   const fill = (text: string) => $.prompt.fill({ text, mode: 'replace' }).catch(() => undefined)
   const go = (args: string[]) => nowVerb($, bin, args)
   const byId = new Map((doc.items ?? []).map(i => [i.id, i]))
@@ -771,7 +763,7 @@ async function inboxVerb($: Dollar, bin: string, args: string[]): Promise<boolea
 }
 function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: number, drafts: Record<string, string> | null, ctx: CardCtx, heading = true) {
   const { Box, Text, Button, Select, Link } = ui
-  const items: ChiefInboxItem[] = (Array.isArray(s.inbox) ? s.inbox : []).filter(u => !!u && typeof u.id === 'string')
+  const items: ChiefInboxItem[] = (Array.isArray(s.inbox) ? s.inbox : []).filter(u => !!u && typeof u.id === 'string' && !isWatcherError(u))
     .sort((a, b) => (Date.parse(b.at ?? '') || 0) - (Date.parse(a.at ?? '') || 0)).slice(0, INBOX_SHOWN)
   if (!items.length) return emptyLine(ui, 'inbox-empty', 'Inbox clear')
   const total = typeof s.inbox_count === 'number' ? s.inbox_count : items.length
@@ -823,6 +815,7 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
             ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
                 {openBtn}
                 {doneBtn}
+                {inboxFollowIgnore($, ui, u, goHub, press)}
                 <Button key={pickKey} onPress={press(() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey)
                   : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [pickKey]: '1' })))}>Snooze</Button>
               </Box>
@@ -831,6 +824,7 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
             ? <Select key={'inbox-snooze-pick:' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
                 onSelect={(value: string) => clearDraft($, pickKey).then(() => goHub(['snooze', u.id, value]))} />
             : null,
+          open ? inboxIgnorePick($, ui, u, drafts, goHub) : null,
         ])
       })}
     </Box>
@@ -979,7 +973,10 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     { id: 'sessions', label: 'Sessions', count: counts.sessions, section: h => [
       pinned.length ? (h ? sectionHeading(ui, 'pinned-heading', `Pinned ${pinned.length}`) : null) : emptyLine(ui, 'pinned-empty', 'No pinned sessions'),
       ...pinned.map(pinnedCard)] },
-    { id: 'today', label: 'Today', count: counts.today, section: h => todaySection($, ui, bin, ctx.doc, nowMs, ctx, h) },
+    { id: 'today', label: 'Today', count: counts.today, section: h => todaySection($, ui, bin, ctx.doc, nowMs, ctx, h, suggestedSection($, ui, bin, ctx.doc, nowMs, drafts, ctx)) },
+    { id: 'team', label: 'Team', count: counts.team, section: h => teamSection($, ui, bin, ctx.doc, nowMs, drafts, ctx, h) },
+    { id: 'health', label: 'Health', text: 'Health', count: healthProblems(s, ctx.doc, ctx.health?.dismissed), alert: healthProblems(s, ctx.doc, ctx.health?.dismissed) > 0,
+      section: h => healthSection($, ui, bin, s, ctx.doc, nowMs, ctx, self, args => inboxVerb($, bin, args), h) },
   ]
   const shown = shownTab(ctx.tabs?.picked, tabs)
   const drawn = shown === 'all' ? tabs : tabs.filter(t => t.id === shown)
@@ -988,7 +985,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       {headerStrip(ui, { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
                          sessions: pinned.length, spent: s.budget?.spent, limit: s.budget?.limit,
                          overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self), beat,
-                         portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: s.guard ?? null })}
+                         portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: guardState(s) })}   // the one read the Health tab's Guard row shows
       {s.budget?.unreadable
         ? <Text color="error">Budget: spend file unreadable — no model call is made until it reads again.</Text>
         : s.budget?.over
@@ -1042,6 +1039,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   spendOwed.length = 0
   spendFlushing = false
   await loadPortrait($, bin)
+  await loadDismissed($)
   await reloadStatus($, bin)
   // not awaited: a slow list_sessions (up to its 10 s timeout) must not hold up the session's start
   void snapshotPinned($, bin).then(() => reloadStatus($, bin)).catch(() => undefined)
@@ -1113,7 +1111,7 @@ export function registerChief(on: On, configured: string): void {
       await pickTab($, tab as TabId, tabCounts(lastStatus, await read($, floorAtom), await read($, docAtom), await $.clock.now()))
       return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|all]' }
+    return { text: 'Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|team|health|all]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
@@ -1124,6 +1122,6 @@ export function registerChief(on: On, configured: string): void {
     return paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
       await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
       await read($, floorAtom), self, { open: await read($, chiefOpenAtom), selected: await read($, chiefSelectedAtom), portrait,
-        surface: String(e.surface), tabs: await read($, chiefTabAtom), doc: await read($, docAtom) })
+        surface: String(e.surface), tabs: await read($, chiefTabAtom), doc: await read($, docAtom), health: await read($, healthAtom) })
   })
 }

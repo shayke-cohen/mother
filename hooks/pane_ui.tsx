@@ -1,5 +1,6 @@
 import type { Color } from 'claude-code'
 
+import { oneLine } from './shared'
 import type { Dollar } from './shared'
 import type { ChiefDesktop, ChiefOpen, ChiefStatus } from '../types'
 
@@ -65,10 +66,11 @@ export function suggestedBrief(suggestion: string, title: string, why: string | 
 export type CardKind = 'need' | 'inbox' | 'sess' | 'today'
 
 // ---- tabs: one section at a time, or `all` stacked ----
-export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'all'
-export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'all']
+export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'team' | 'health' | 'all'
+export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'team', 'health', 'all']
 // A tab is data: an id, a label, how many items it holds and what draws them. `all` has no section of its own.
-export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown }
+// `text` replaces `<label> <count>` on the button (Health wears no count); `alert` adds a red dot.
+export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown; text?: string; alert?: boolean }
 
 // The tab shown: the manager's pick, else the first tab that holds something, else `all` (every empty line).
 export function shownTab(picked: string | null | undefined, tabs: readonly { id: TabId; count: number }[]): TabId {
@@ -85,13 +87,13 @@ export const tabHover = (id: string) => ({ scope: 'mother-tab:' + id, color: SEL
 
 // The tab row: a Button per tab with its count, the shown one primary; ` •` marks a tab with something new.
 export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<string, number> | null | undefined, onPick: (id: TabId) => unknown) {
-  const { Box, Button } = ui
+  const { Box, Button, Text } = ui
   return (
     <Box key="tabs" flexWrap="wrap" gap="xs" marginTop={1}>
-      {[...tabs.map(t => ({ id: t.id, text: `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, text: 'All' }].map(t => (
+      {[...tabs.map(t => ({ id: t.id, alert: !!t.alert, text: t.text ?? `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, alert: false, text: 'All' }].map(t => (
         <Button key={'tab:' + t.id} variant={t.id === shown ? 'primary' : 'secondary'} dimColor={t.id === 'all' && shown !== 'all'}
           {...(t.id === shown ? {} : { hover: tabHover(t.id) })}
-          onPress={() => onPick(t.id)}>{t.text}</Button>
+          onPress={() => onPick(t.id)}>{t.alert ? <Text>{t.text}<Text color="error">{' ●'}</Text></Text> : t.text}</Button>
       ))}
     </Box>
   )
@@ -153,6 +155,16 @@ export function clip(text: string | null | undefined, cap: number): string {
   return (at > 0 ? head.slice(0, at) : head).replace(/[\s.,;:!?-]+$/, '') + '…'
 }
 
+// A stored why as an expanded card shows it: whole, on one line. One that reaches a storage cap (300, or the 200 of
+// an older item) without ending a sentence was cut there, mid-word: its last partial word goes and `…` says so.
+export const WHY_MAX = 300          // what the hub stores of a line's summary
+const WHY_OLD_MAX = 200
+export function whyText(raw: unknown): string {
+  const t = oneLine(raw, WHY_MAX)
+  if ((t.length >= WHY_MAX - 1 || t.length === WHY_OLD_MAX) && !/[.!?…)\]"'”]$/.test(t)) return clip(t, t.length - 1)
+  return t
+}
+
 // What a card's second row says in place of a raw key: the CLI's `label` (a channel's name, a person, `mail thread`…)
 // when the status carries one, else the same words from the key's shape. Never a raw chat or mail id.
 export function humanLabel(u: { key?: string | null; label?: string | null; who?: string | null }): string {
@@ -182,6 +194,12 @@ export function emptyLine(ui: Ui, key: string, text: string) {
 export function sectionHeading(ui: Ui, key: string, text: string) {
   const { Box, Text } = ui
   return <Box key={key} marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
+}
+
+// A small heading inside a tab: `Suggested`, `Top 3`, `On you (12)`.
+export function subHeading(ui: Ui, key: string, text: string) {
+  const { Box, Text } = ui
+  return <Box key={key} marginTop={1}><Text weight="semibold" dimColor>{text}</Text></Box>
 }
 
 export type CardFrame = {
