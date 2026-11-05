@@ -166,18 +166,109 @@ def _session_kind(sessions: dict, line: dict) -> Optional[str]:
     return "desktop" if hit is not None and not _is_cli(hit[1]) else None
 
 
-def lines(ws: Path) -> List[dict]:
+def _manager_names(cfg: dict) -> Tuple[str, str]:
+    """(name, short name) of the manager from config.json -> agent; '' for one that is not set."""
+    a = (cfg or {}).get("agent")
+    a = a if isinstance(a, dict) else {}
+    name = safe_line(a.get("manager") if isinstance(a.get("manager"), str) else "", NAME_MAX)
+    short = safe_line(a.get("manager_short") if isinstance(a.get("manager_short"), str) else "", NAME_MAX)
+    return name, short
+
+
+def _to_manager(cfg: dict, l: dict) -> Optional[str]:
+    """`addressed` for a direct message, `mentioned` when the line's text names the manager (their chat id as a
+    mention, or their name or short name as a word), else None: only what the line itself shows."""
+    key = str(l.get("key") or "")
+    if key.endswith("/dm") or (key.startswith("wa:") and not key.endswith("@g.us")):
+        return "addressed"
+    text = "%s %s" % (l.get("title") or "", l.get("summary") or "")
+    me = hub.build_me(cfg or {})
+    if me.get("chat") and "<@%s" % me["chat"] in text:
+        return "mentioned"
+    for n in _manager_names(cfg):
+        if len(n) >= 2 and re.search(r"(?<!\w)@?%s(?!\w)" % re.escape(n), text, re.IGNORECASE):
+            return "mentioned"
+    return None
+
+
+def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
     """The lines waiting for a decision: the digest after the cursor, trimmed to the fields triage needs, plus
-    `session` ("desktop" for a live hub session, else None)."""
+    `session` ("desktop" for a live hub session, else None), `source` (the key's kind), `channel` (a chat channel's
+    configured name, else None) and `to_manager` (`addressed`, `mentioned` or None, as `_to_manager`)."""
     ws = Path(ws)
     sessions = hub._sessions_doc(ws)
+    channels = _channel_names(cfg or {})
     out = []
     for l in _pending_lines(ws):
         d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
         d["also"] = list(l.get("also") or [])
         d["session"] = _session_kind(sessions, l)
+        key = str(l.get("key") or "")
+        d["source"] = source_of(key)
+        name = channels.get(key.split("/", 1)[0]) if d["source"] == "chat" and "/" in key else None
+        d["channel"] = safe_line(name, LABEL_MAX) if name else None
+        d["to_manager"] = _to_manager(cfg or {}, l)
         out.append(d)
     return out
+
+
+# ---- triage context: who the manager is and what they run, names only, for the triage prompt ----
+
+NAME_MAX = 40
+CONTEXT_MAX = 1500          # characters of the context as compact JSON
+CONTEXT_TEAMS, CONTEXT_PEOPLE, CONTEXT_LIST = 8, 12, 12
+
+
+def triage_context(ws: Path, cfg: dict) -> dict:
+    """`context --json`: {version, manager: {name, short}, teams: [{name, people: [names]}], projects, repos}. Names
+    only: no ids, no emails. `projects` and `repos` are what the hub follows (config and the watch list) plus each
+    team's own. Trimmed from the end of its longest list until the compact JSON is at most CONTEXT_MAX characters."""
+    cfg = cfg or {}
+    name, short = _manager_names(cfg)
+    teams, projects, repos = [], [], []
+
+    def add(dst, v):
+        v = safe_line(v, NAME_MAX) if isinstance(v, str) else ""
+        if v and v not in dst and len(dst) < CONTEXT_LIST:
+            dst.append(v)
+
+    for t in cfg.get("teams") if isinstance(cfg.get("teams"), list) else []:
+        if not isinstance(t, dict):
+            continue
+        people = []
+        for p in t.get("people") if isinstance(t.get("people"), list) else []:
+            add(people, p.get("name") if isinstance(p, dict) else None)
+        tname = safe_line(t.get("name") if isinstance(t.get("name"), str) else "", NAME_MAX) \
+            or safe_line(t.get("slug") if isinstance(t.get("slug"), str) else "", NAME_MAX)
+        if tname and len(teams) < CONTEXT_TEAMS:
+            teams.append({"name": tname, "people": people[:CONTEXT_PEOPLE]})
+        tr = t.get("tracker")
+        add(projects, tr.get("project") if isinstance(tr, dict) else None)
+        for r in t.get("repos") if isinstance(t.get("repos"), list) else []:
+            add(repos, r)
+    try:
+        watch = hub.merged_watch(cfg, hub.load_watch(ws))
+    except Exception:  # an unreadable watch list: the config's own teams still say enough
+        watch = {}
+    for k in (watch.get("tracker") or {}).get("projects") or []:
+        add(projects, k)
+    for r in (watch.get("code") or {}).get("repos") or []:
+        add(repos, r)
+    doc = {"version": 1, "manager": {"name": name, "short": short}, "teams": teams, "projects": projects, "repos": repos}
+
+    def size():
+        return len(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+
+    while size() > CONTEXT_MAX:
+        lists = [repos, projects] + [t["people"] for t in teams]
+        longest = max(lists, key=len)
+        if longest:
+            longest.pop()
+        elif teams:
+            teams.pop()
+        else:
+            break
+    return doc
 
 
 def _read_obj(path: Path) -> dict:
@@ -267,6 +358,61 @@ def _verdict_ok(v) -> bool:
             and isinstance(v.get("title"), str) and isinstance(v.get("tldr"), str))
 
 
+KINDS, ONS, URGENCIES = ("decide", "reply", "act", "fyi"), ("manager", "team", "other"), ("now", "today", "later")
+KIND_DEFAULT, ON_DEFAULT, URGENCY_DEFAULT = "act", "manager", "today"
+ACTIONS_MAX, ACTION_LABEL_MAX, ACTION_PROMPT_MAX = 3, 24, 300
+TRIAGE_FILE = "triage.json"   # .mother/chief/triage.json: {version, items: {<update id>: {kind, on, urgency, actions}}}
+
+
+def clean_actions(actions) -> List[dict]:
+    """A verdict's actions as a card may show them: at most 3 of {label, prompt}, each one safe line (24 and 300
+    characters), both non-empty. Anything off-shape is dropped."""
+    out = []
+    for a in actions if isinstance(actions, list) else []:
+        if not isinstance(a, dict) or not isinstance(a.get("label"), str) or not isinstance(a.get("prompt"), str):
+            continue
+        label, prompt = safe_line(a["label"], ACTION_LABEL_MAX), safe_line(a["prompt"], ACTION_PROMPT_MAX)
+        if label and prompt:
+            out.append({"label": label, "prompt": prompt})
+        if len(out) == ACTIONS_MAX:
+            break
+    return out
+
+
+def verdict_extra(v) -> Optional[dict]:
+    """{kind, on, urgency, actions} from a verdict that carries any of them, else None (the older four-field
+    verdict). An unknown kind reads `act`, an unknown `on` `manager`, an unknown urgency `today`."""
+    if not isinstance(v, dict) or not any(k in v for k in ("kind", "on", "urgency", "actions")):
+        return None
+
+    def pick(name, allowed, default):
+        return v[name] if isinstance(v.get(name), str) and v[name] in allowed else default
+
+    return {"kind": pick("kind", KINDS, KIND_DEFAULT), "on": pick("on", ONS, ON_DEFAULT),
+            "urgency": pick("urgency", URGENCIES, URGENCY_DEFAULT), "actions": clean_actions(v.get("actions"))}
+
+
+def _triage_items(ws: Path) -> dict:
+    items = _read_obj(chief_dir(ws) / TRIAGE_FILE).get("items")
+    return items if isinstance(items, dict) else {}
+
+
+def _store_extras(ws: Path, extras: dict) -> None:
+    """Keep each `now` item's verdict extras by update id (None drops one: the item was decided again with no
+    verdict), and drop the entries whose update the hub no longer holds."""
+    with hub.locked(ws):
+        items = _triage_items(ws)
+        for uid, extra in extras.items():
+            if extra is None:
+                items.pop(uid, None)
+            else:
+                items[uid] = extra
+        held = {u.get("id") for u in hub._hub_doc(ws)["updates"] if isinstance(u, dict)}
+        items = {k: v for k, v in items.items() if k in held}
+        chief_dir(ws).mkdir(parents=True, exist_ok=True)
+        _write_atomic(chief_dir(ws) / TRIAGE_FILE, json.dumps({"version": 1, "items": items}, ensure_ascii=False) + "\n")
+
+
 def _folds_others(raw: List[dict], start: int, l: dict) -> bool:
     """True when deciding `l` would also settle another line: an update stands for every same-key update after the
     cursor with no later `at` (hub.decide moves the cursor past them all; the digest showed only the newest)."""
@@ -284,7 +430,8 @@ def _one_line(text: str, cap: int) -> str:
 def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts: List[dict]) -> dict:
     """Decide every `judge` line in code, for the leading session (no model turn).
 
-    `verdicts` is [{line_id, key, is_work, needs_attention, title, tldr}]. A line is logged when it has a well-formed
+    `verdicts` is [{line_id, key, is_work, needs_attention, title, tldr, kind?, on?, urgency?, actions?}]; the last
+    four (`verdict_extra`) are kept for a `now` item in .mother/chief/triage.json by its update id. A line is logged when it has a well-formed
     verdict for its key that says is_work false or needs_attention false (never a `manual` or `error` line, one whose
     key has a live session, or an update whose decide would also fold other same-key updates), with
     `why: "triage: <title>"`, and a `sweep` line is logged too: it asks a hub session to look again, and there is none. Every
@@ -323,7 +470,13 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
             items.append({"line_id": l["id"], "key": l["key"], "decision": "now", "title": title, "why": why,
                           "link": l.get("link") or ""})
     if items:
-        hub.decide(ws, cfg, at, items)
+        extras = {}
+        for res in hub.decide(ws, cfg, at, items):
+            if res.get("decision") == "now" and res.get("update_id"):
+                extras[res["update_id"]] = verdict_extra(by_id.get(res["line_id"]))
+        if extras:
+            _store_extras(ws, extras)
+        sync_relays(ws)   # a line routed to a case session waits in relays.json for that session to deliver
     out["logged"] = [it["line_id"] for it in items if it["decision"] == "log"]
     out["now"] = [it["line_id"] for it in items if it["decision"] == "now"]
     return out
@@ -392,13 +545,22 @@ def _who_by_key(ws: Path) -> dict:
     return out
 
 
+def _item_session(hit) -> dict:
+    """An inbox item's live session: {key, title}, plus kind and cli_session_id when it is a case."""
+    d = {"key": hit[0], "title": safe_line(hit[1].get("title") or hit[0], TITLE_MAX)}
+    if hit[1].get("kind") == "case":
+        d.update({"kind": "case", "cli_session_id": hit[1].get("cli_session_id")})
+    return d
+
+
 def inbox_items(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
-    """The hub's open updates (what a `now` decision makes), newest first, for the Chief pane's Inbox section. The
+    """The hub's open updates (what a `now` decision makes), by urgency (`now`, `today`, `later`; none reads
+    `today`) then newest first, each with its triage `kind`, `on`, `urgency` and `actions` when it has them, for the Chief pane's Inbox section. The
     text is line- or model-written, so each field is one safe line. `session` is the live hub session for the key.
     `source` is the key's kind, `who` the person its newest inbox line names ('' when none) and `label` what a card
     shows in place of the raw key (`item_label`)."""
     h, sessions = hub._hub_doc(ws), hub._sessions_doc(ws)
-    whos, channels = _who_by_key(ws), _channel_names(cfg or {})
+    whos, channels, extras = _who_by_key(ws), _channel_names(cfg or {}), _triage_items(ws)
     rows = []
     for u in h["updates"]:
         if not isinstance(u, dict) or u.get("state") != "open" or not isinstance(u.get("id"), str):
@@ -409,10 +571,233 @@ def inbox_items(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
                      "title": safe_line(u.get("title"), TITLE_MAX), "why": safe_line(u.get("why"), WHY_MAX),
                      "link": u.get("link") if isinstance(u.get("link"), str) else "", "at": u.get("at"),
                      "source": source_of(u.get("key")), "who": who, "label": item_label(u.get("key"), who, channels),
-                     "session": ({"key": hit[0], "title": safe_line(hit[1].get("title") or hit[0], TITLE_MAX)}
-                                 if hit and not _is_cli(hit[1]) else None)})
+                     "session": (_item_session(hit) if hit and not _is_cli(hit[1]) else None)})
+        # the triage verdict's extras, cleaned again on the way out (the file is only data); None / [] when none
+        x = verdict_extra(extras.get(u["id"])) or {"kind": None, "on": None, "urgency": None, "actions": []}
+        rows[-1].update(x)
     rows.sort(key=lambda r: str(r["at"] or ""), reverse=True)
+    rows.sort(key=lambda r: URGENCIES.index(r["urgency"] or URGENCY_DEFAULT))   # stable: newest first inside one urgency
     return rows
+
+
+
+# ---- cases: a desktop session that owns one inbox item until it is closed (skills/cos, hooks/cos.ts) ----------
+# A case is a row in the hub's sessions.json (`kind: "case"`, `session_id` = the session's CLI id), so hub.decide
+# routes later lines of the key to it. What was routed and not yet delivered into the session waits in
+# chief/relays.json; the owning session's own mod reads it (`relays`), submits it there, then acknowledges it (`relays --ack`).
+
+CASE_STALE_DAYS = 7
+RELAY_DONE_KEEP = 200      # delivered line ids remembered per key
+RELAY_WAIT_MAX = 100       # waiting lines kept per key, newest
+RELAY_WHO_MAX, RELAY_SUMMARY_MAX = 80, 300
+
+
+def relay_on(ws: Path) -> bool:
+    """Relay is on unless the machine-local switch .mother/chief/RELAY_OFF exists."""
+    return not (chief_dir(ws) / "RELAY_OFF").exists()
+
+
+def set_relay(ws: Path, on: bool) -> None:
+    path = chief_dir(ws) / "RELAY_OFF"
+    if on:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+
+
+def _deliver_flag(ws: Path, cli: str) -> Path:
+    return chief_dir(ws) / "relay-now" / cli
+
+
+def relay_deliver(ws: Path, cli: str) -> None:
+    """Ask the session `cli` to deliver what waits once, on its next pass, though relay is off."""
+    path = _deliver_flag(ws, cli)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+
+
+def _is_case(s) -> bool:
+    return isinstance(s, dict) and s.get("kind") == "case" and s.get("state") == "live"
+
+
+def _row_age_days(row: dict, at: datetime) -> float:
+    """Days since the row was opened or last routed to, whichever is later; unreadable stamps read as stale."""
+    stamps = [hub._parse_at(row.get(k)) for k in ("opened_at", "last_routed_at")]
+    stamps = [t for t in stamps if t is not None]
+    return (at - max(stamps)).total_seconds() / 86400.0 if stamps else float("inf")
+
+
+def claim(ws: Path, cfg: dict, at: datetime, doc) -> dict:
+    """A session claims a key (`claim --stdin` {key, session_id, title, link}): its sessions.json row becomes a live
+    case of that session, and the key's open update is linked to it. ValueError when refused: an off-shape key or
+    session id, no open inbox item for the key (a claim never makes a route for a key the hub did not raise), or a
+    key live in another session whose row is younger than CASE_STALE_DAYS."""
+    if not isinstance(doc, dict):
+        raise ValueError("stdin must be a JSON object {key, session_id, title, link}")
+    key, cli = doc.get("key"), doc.get("session_id")
+    if not (isinstance(key, str) and hub._KEY_TOKEN.fullmatch(key)):
+        raise ValueError("key is not a hub key")
+    if not (isinstance(cli, str) and CLI_ID_RE.fullmatch(cli)):
+        raise ValueError("session_id is not a session id")
+    link = doc.get("link")
+    link = link if isinstance(link, str) and re.match(r"https?://\S+$", link) else None
+    stamp = hub._iso(at)
+    with hub.locked(ws):
+        sess, h = hub._sessions_doc(ws), hub._hub_doc(ws)
+        items = sess["sessions"]
+        upd = next((u for u in h["updates"] if isinstance(u, dict) and u.get("key") == key
+                    and u.get("state") != "done"), None)
+        hit = hub.find_session(sess, [key])
+        mine = None
+        if hit is not None and not _is_cli(hit[1]):
+            if str(hit[1].get("session_id")) == cli:
+                mine = hit
+            elif _row_age_days(hit[1], at) <= CASE_STALE_DAYS:
+                raise ValueError("%s is live in another session; refusing to repoint it" % key)
+            else:
+                hit[1]["state"] = "dropped"   # a stale owner: the key moves to the claiming session
+        if mine is None and upd is None:
+            raise ValueError("%s has no open inbox item; nothing to claim" % key)
+        sk = mine[0] if mine else key
+        prev = mine[1] if mine else {}
+        title = safe_line(doc.get("title") or (upd or {}).get("title") or prev.get("title") or key, TITLE_MAX)
+        items[sk] = {"session_id": cli, "cli_session_id": cli, "kind": "case",
+                     "name": prev.get("name") or "case-" + re.sub(r"[^A-Za-z0-9]+", "-", key).strip("-")[:40],
+                     "title": title, "link": link or (upd or {}).get("link") or prev.get("link") or None,
+                     "also": [a for a in (prev.get("also") or []) if isinstance(a, str)],
+                     "opened_at": prev.get("opened_at") or stamp, "last_routed_at": prev.get("last_routed_at"),
+                     "unseen": int(prev.get("unseen") or 0), "state": "live"}
+        if upd is not None:
+            upd["session_id"] = cli
+        h["pending"] = [p for p in h["pending"] if p.get("key") != key]
+        hub.save_json(ws, "sessions.json", sess)
+        hub._save_hub(ws, h, sess, cfg, at)
+    return {"ok": True, "key": sk, "session_id": cli, "update_id": upd.get("id") if upd else None}
+
+
+def _relays_doc(ws: Path) -> dict:
+    d = _read_obj(chief_dir(ws) / "relays.json")
+    if not isinstance(d.get("keys"), dict):
+        d = {"version": 1, "keys": {}}
+    return d
+
+
+def _merge_routed(doc: dict, h: dict, sess: dict, inbox: Optional[dict]) -> bool:
+    """Copy hub.json's routes to live case sessions into `doc` (relays.json) as waiting lines, once each; forget the
+    keys that are no longer a live case. `inbox` is {line id: line} (None = counts only, no text). True when `doc`
+    changed."""
+    rows = {sk: r for sk, r in sess["sessions"].items() if _is_case(r)}
+    changed = False
+    for sk in [k for k in doc["keys"] if k not in rows]:
+        del doc["keys"][sk]
+        changed = True
+    for e in h["routed"]:
+        if not isinstance(e, dict) or e.get("decision") != "route" or not isinstance(e.get("line_id"), str):
+            continue
+        hit = hub.find_session({"sessions": rows}, [e.get("key")])
+        if hit is None or hit[1].get("session_id") != e.get("session_id"):
+            continue
+        ent = doc["keys"].setdefault(hit[0], {"waiting": [], "done": []})
+        if e["line_id"] in ent["done"] or any(w.get("line_id") == e["line_id"] for w in ent["waiting"]):
+            continue
+        l = (inbox or {}).get(e["line_id"]) or {}
+        link = l.get("link")
+        ent["waiting"].append({
+            "line_id": e["line_id"], "key": safe_line(e.get("key"), PROGRESS_MAX), "at": e.get("at"),
+            "who": safe_line(re.sub(r"\s*<[^<>]*>\s*$", "", str(l.get("who") or "")), RELAY_WHO_MAX),
+            "title": safe_line(l.get("title"), TITLE_MAX), "summary": safe_line(l.get("summary"), RELAY_SUMMARY_MAX),
+            "link": link if isinstance(link, str) and re.match(r"https?://\S+$", link) else ""})
+        ent["waiting"] = ent["waiting"][-RELAY_WAIT_MAX:]
+        changed = True
+    return changed
+
+
+def sync_relays(ws: Path) -> None:
+    """Move new routes to case sessions from hub.json (which keeps only its last 50 decisions) into relays.json."""
+    ws = Path(ws)
+    inbox = {l["id"]: l for l in hub.read_inbox(ws)}
+    with hub.locked(ws):
+        doc = _relays_doc(ws)
+        if _merge_routed(doc, hub._hub_doc(ws), hub._sessions_doc(ws), inbox):
+            _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
+
+
+def relays(ws: Path, at: datetime, cli: str) -> List[dict]:
+    """The routed lines not yet delivered into session `cli`, for the live cases it holds, oldest first:
+    [{id, key, at, who, title, summary, link}]. Nothing is removed: the session submits them, then acknowledges the
+    ids it delivered (`relay_ack`). New routes are copied in from hub.json on the way."""
+    ws = Path(ws)
+    inbox = {l["id"]: l for l in hub.read_inbox(ws)}
+    with hub.locked(ws):
+        sess = hub._sessions_doc(ws)
+        doc = _relays_doc(ws)
+        if _merge_routed(doc, hub._hub_doc(ws), sess, inbox):
+            _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
+        mine = [sk for sk, r in sess["sessions"].items() if _is_case(r) and r.get("cli_session_id") == cli]
+        rows = sorted((w for sk in mine for w in (doc["keys"].get(sk) or {}).get("waiting", [])),
+                      key=lambda w: str(w.get("at") or ""))
+    return [dict({"id": w.get("line_id")}, **{k: w.get(k) for k in ("key", "at", "who", "title", "summary", "link")})
+            for w in rows]
+
+
+def relay_ack(ws: Path, at: datetime, cli: str, ids) -> int:
+    """Session `cli` delivered the lines `ids` (as `relays` named them): they stop waiting, each of its rows'
+    `unseen` becomes what still waits, and its deliver-once flag is removed. Under the hub lock; an id that is not
+    waiting for this session is ignored. Returns how many were acknowledged."""
+    ws = Path(ws)
+    ids = {i for i in (ids or []) if isinstance(i, str)}
+    n = 0
+    with hub.locked(ws):
+        sess = hub._sessions_doc(ws)
+        doc = _relays_doc(ws)
+        mine = [sk for sk, r in sess["sessions"].items() if _is_case(r) and r.get("cli_session_id") == cli]
+        for sk in mine:
+            ent = doc["keys"].get(sk) or {"waiting": [], "done": []}
+            hit = [w.get("line_id") for w in ent["waiting"] if w.get("line_id") in ids]
+            if hit:
+                ent["waiting"] = [w for w in ent["waiting"] if w.get("line_id") not in ids]
+                ent["done"] = (ent["done"] + hit)[-RELAY_DONE_KEEP:]
+                doc["keys"][sk] = ent
+                n += len(hit)
+            sess["sessions"][sk]["unseen"] = len(ent["waiting"])
+        if mine:
+            hub.save_json(ws, "sessions.json", sess)
+        if n:
+            _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
+        if CLI_ID_RE.fullmatch(cli or ""):
+            try:
+                _deliver_flag(ws, cli).unlink()
+            except OSError:
+                pass
+    return n
+
+
+def cases(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
+    """The live case rows for the pane and for each session's own mod: [{key, cli_session_id, title, link, label,
+    unseen, last_routed_at, opened_at, deliver_now}], oldest first. `unseen` is how many routed lines wait to be
+    delivered. Reads only."""
+    sess, doc = hub._sessions_doc(ws), _relays_doc(ws)
+    _merge_routed(doc, hub._hub_doc(ws), sess, None)
+    whos, channels = _who_by_key(ws), _channel_names(cfg or {})
+    out = []
+    for sk, r in sess["sessions"].items():
+        cli = r.get("cli_session_id") if _is_case(r) else None
+        if not (isinstance(cli, str) and CLI_ID_RE.fullmatch(cli)):
+            continue
+        link = r.get("link")
+        out.append({"key": safe_line(sk, PROGRESS_MAX), "cli_session_id": cli,
+                    "title": safe_line(r.get("title") or sk, TITLE_MAX),
+                    "link": link if isinstance(link, str) else None,
+                    "label": item_label(sk, safe_line(whos.get(sk) or "", LABEL_MAX), channels),
+                    "unseen": len((doc["keys"].get(sk) or {}).get("waiting", [])),
+                    "last_routed_at": r.get("last_routed_at"), "opened_at": r.get("opened_at"),
+                    "deliver_now": _deliver_flag(ws, cli).exists()})
+    out.sort(key=lambda c: str(c["opened_at"] or ""))
+    return out
 
 
 # ---- pinned desktop sessions: a snapshot the console writes from list_sessions, read back for the pane ----------
@@ -836,6 +1221,8 @@ USAGE = """usage: mother chief <verb> ...
                         decided in code, `log` when its verdict says it needs no attention and `now` for the rest;
                         prints {paused, logged, now}
   lines [--json]        the inbox lines waiting for a decision
+  context --json        what the triage prompt says about the manager: their name, the teams with their people's
+                        names, the followed tracker projects and repos; names only, at most 1500 characters
   status [--json]       paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}
@@ -850,17 +1237,30 @@ USAGE = """usage: mother chief <verb> ...
                         jpeg_height for a small .mother/portrait.jpg, and svg (the bundled vector)
   report <name>         print one undelivered routine report (.mother/<routine>-unsent-<YYYY-MM-DD>.md, at most
                         64 KB); exit 2 for any other name or file
+  claim --stdin         a session claims an inbox item's key ({key, session_id, title, link} on stdin): its row in
+                        the hub's sessions.json becomes a live case of that session, so later lines of the key
+                        route to it. Refused (exit 1) with no open inbox item for the key, or when the key is
+                        live in another session whose row is under 7 days old
+  relays --for <session_id> [--ack --stdin]
+                        the routed lines not yet delivered into that session, for the cases it holds: a JSON
+                        array of {id, key, at, who, title, summary, link}; nothing is removed. --ack --stdin: the
+                        session delivered the lines whose ids are the JSON array on stdin; they stop waiting;
+                        prints {acked: N}
+  relay on | off | status | deliver --for <session_id>
+                        the machine-local relay switch (.mother/chief/RELAY_OFF); deliver: that session delivers
+                        what waits once, on its next pass, though relay is off
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
 
 A valued option takes --opt=V or --opt V."""
 
-# verb: (boolean flags, valued options); only `report` takes a positional
+# verb: (boolean flags, valued options); only `report` and `relay` take a positional
 VERBS = {
-    "lines": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
+    "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
     "portrait": (("--json",), ()), "report": ((), ()),
+    "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -974,6 +1374,8 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "led_by": leader if alive and isinstance(leader, str) and leader else None,
         "inbox": inbox[:INBOX_MAX],
         "inbox_count": len(inbox),
+        "cases": cases(ws, cfg),
+        "relay": {"on": relay_on(ws)},
         "guard": guard_state(ws),
         "health": health_doc(ws, at, errors),
     }
@@ -1021,6 +1423,54 @@ def _print_status(doc: dict) -> None:
     print("pinned: %d   inbox: %d" % (len(doc["desktop"]), doc["inbox_count"]))
 
 
+def _case_verb(ws: Path, cfg: dict, at: datetime, verb: str, opts: dict, pos: List[str]) -> int:
+    """`claim --stdin`, `relays --for`, `relay on|off|status|deliver`."""
+    who = opts.get("for")
+    if verb == "claim":
+        if not opts.get("stdin"):
+            return _usage("claim reads {key, session_id, title, link} from stdin: pass --stdin")
+        try:
+            doc = json.loads(sys.stdin.read())
+        except ValueError as e:
+            return _usage("claim: stdin is not JSON (%s)" % e)
+        try:
+            print(json.dumps(claim(ws, cfg, at, doc)))
+        except ValueError as e:
+            print("mother chief claim: %s" % e, file=sys.stderr)
+            return EXIT_FAILED
+        return EXIT_OK
+    if verb == "relays":
+        if not (isinstance(who, str) and who.strip()):
+            return _usage("relays needs --for <session_id>")
+        if opts.get("ack"):
+            if not opts.get("stdin"):
+                return _usage("relays --ack reads the delivered line ids from stdin: pass --stdin")
+            try:
+                ids = json.loads(sys.stdin.read())
+            except ValueError as e:
+                return _usage("relays --ack: stdin is not JSON (%s)" % e)
+            if not isinstance(ids, list):
+                return _usage("relays --ack: stdin must be a JSON array of line ids")
+            print(json.dumps({"acked": relay_ack(ws, at, who, ids)}))
+            return EXIT_OK
+        print(json.dumps(relays(ws, at, who), indent=2, ensure_ascii=False))
+        return EXIT_OK
+    sub = pos[0] if len(pos) == 1 else ""
+    if sub == "deliver":
+        if not (isinstance(who, str) and CLI_ID_RE.fullmatch(who)):
+            return _usage("relay deliver needs --for <session_id>")
+        relay_deliver(ws, who)
+        print("relay: that session delivers what waits on its next pass")
+        return EXIT_OK
+    if sub not in ("on", "off", "status"):
+        return _usage("relay takes on, off, status or deliver --for <session_id>")
+    if sub != "status":
+        set_relay(ws, sub == "on")
+    waiting = sum(c["unseen"] for c in cases(ws, cfg))
+    print("relay %s%s" % ("on" if relay_on(ws) else "off", ": %d line(s) waiting" % waiting if waiting else ""))
+    return EXIT_OK
+
+
 def main(args, ws, cfg, at) -> int:
     """`mother chief <verb>`."""
     args = list(args)
@@ -1036,7 +1486,7 @@ def main(args, ws, cfg, at) -> int:
         opts, pos = _parse(rest, flags, valued)
     except ValueError as e:
         return _usage(str(e))
-    if pos and verb != "report":
+    if pos and verb not in ("report", "relay"):
         return _usage("%s takes no arguments" % verb)
     ws = Path(ws)
     if verb == "report":
@@ -1048,17 +1498,22 @@ def main(args, ws, cfg, at) -> int:
         sys.stdout.write(text)
         return EXIT_OK
     as_json = bool(opts.get("json"))
+    if verb in ("claim", "relays", "relay"):
+        return _case_verb(ws, cfg, at, verb, opts, pos)
     if verb in ("pause", "resume"):
         (pause if verb == "pause" else resume)(ws)
         print("chief %s" % ("paused" if verb == "pause" else "resumed"))
         return EXIT_OK
     if verb == "lines":
-        got = lines(ws)
+        got = lines(ws, cfg)
         if as_json:
             print(json.dumps(got, indent=2, ensure_ascii=False))
         else:
             for l in got:
                 print("%s  %s  [%s]  %s: %s" % (l["id"], l["key"], l["session"] or "-", l["who"], l["title"]))
+        return EXIT_OK
+    if verb == "context":
+        print(json.dumps(triage_context(ws, cfg), ensure_ascii=False))
         return EXIT_OK
     if verb == "triage":
         if not (opts.get("stdin") and opts.get("decide")):

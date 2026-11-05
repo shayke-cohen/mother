@@ -140,7 +140,7 @@ class TestTick(Base):
         self.assertEqual(got, {"PLAT-3": "desktop", "PLAT-4": None, "PLAT-9": None, "PLAT-5": None})  # a worker row is none
         first = chief.lines(self.ws)[0]
         self.assertEqual(sorted(first), sorted(["id", "key", "kind", "title", "who", "link", "summary", "also",
-                                                "session"]))
+                                                "session", "source", "channel", "to_manager"]))
 
     def test_tick_stops_at_first_judgment_line(self):
         self.mute("PLAT-1")
@@ -215,20 +215,20 @@ class TestTick(Base):
         self.assertIsNone(self.cursor())
 
 
-def verdict(l, is_work=True, needs_attention=True, title="T", tldr="D"):
-    return {"line_id": l["id"], "key": l["key"], "is_work": is_work, "needs_attention": needs_attention,
-            "title": title, "tldr": tldr}
+def verdict(l, is_work=True, needs_attention=True, title="T", tldr="D", **extra):
+    return dict({"line_id": l["id"], "key": l["key"], "is_work": is_work, "needs_attention": needs_attention,
+                 "title": title, "tldr": tldr}, **extra)
 
 
 class TestLeader(Base):
     """`tick --as <session>`: one desktop session leads, and code decides the judge lines."""
     inbox = TestTick.inbox
 
-    def main(self, *args, at=AT, stdin=None):
+    def main(self, *args, at=AT, stdin=None, cfg=None):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
                 mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
-            code = chief.main(list(args), self.ws, {}, at)
+            code = chief.main(list(args), self.ws, cfg or {}, at)
         return code, out.getvalue(), err.getvalue()
 
     def beat(self):
@@ -314,6 +314,78 @@ class TestLeader(Base):
         judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
         r = chief.triage_decide(self.ws, {}, AT, judge, [])
         self.assertEqual((r["logged"], r["now"]), ([], [a["id"], b["id"]]))
+
+    def test_decide_stores_the_richer_verdict_and_status_returns_it(self):
+        a, b, c = line(key="PLAT-7"), line(key="PLAT-8"), line(key="PLAT-9")
+        self.inbox(a, b, c)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        acts = [{"label": "Draft  reply\u202e", "prompt": "Read the thread,\nthen draft a reply; don't send"},
+                {"label": "x" * 40, "prompt": "p" * 400}, {"label": "", "prompt": "no label"}, "junk",
+                {"label": "Third", "prompt": "3"}, {"label": "Fourth", "prompt": "4"}]
+        body = {"judge": judge, "verdicts": [
+            verdict(a, kind="decide", on="manager", urgency="later", actions=acts),
+            verdict(b, kind="bogus", on=7, urgency="now"),            # bad enums fall back
+            verdict(c)]}                                              # the older four-field verdict
+        self.assertEqual(self.main("triage", "--stdin", "--decide", stdin=json.dumps(body))[0], 0)
+        code, out, _ = self.main("status", "--json")
+        rows = json.loads(out)["inbox"]
+        self.assertEqual([r["key"] for r in rows], ["PLAT-8", "PLAT-9", "PLAT-7"])   # now, today (none), later
+        got = {r["key"]: (r["kind"], r["on"], r["urgency"], r["actions"]) for r in rows}
+        self.assertEqual(got["PLAT-8"], ("act", "manager", "now", []))
+        self.assertEqual(got["PLAT-9"], (None, None, None, []))
+        self.assertEqual(got["PLAT-7"], ("decide", "manager", "later", [
+            {"label": "Draft reply", "prompt": "Read the thread, then draft a reply; don't send"},
+            {"label": "x" * 24, "prompt": "p" * 300}, {"label": "Third", "prompt": "3"}]))
+        stored = json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())
+        self.assertEqual(sorted(stored["items"]), ["U1", "U2"])       # by update id; nothing for the old shape
+        self.assertNotIn("kind", hub._hub_doc(self.ws)["updates"][0])  # the hub's own schema is untouched
+        # the same key decided again with no verdict drops what was stored for it
+        d = line(key="PLAT-7", at="2026-10-29T10:00:00Z")
+        self.inbox(d)
+        chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT, session="s-1")["judge"], [])
+        self.assertEqual(sorted(json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())["items"]), ["U2"])
+
+    def test_fyi_logs_and_manual_and_error_never_do(self):
+        a, m = line(key="PLAT-7"), line(source="manual", kind="manual", key="PLAT-3")
+        e = line(source="tracker", kind="error", key="watcher:tracker")
+        self.inbox(a, m, e)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        fyi = dict(needs_attention=False, kind="fyi", on="other", urgency="later", actions=[])
+        r = chief.triage_decide(self.ws, {}, AT, judge, [verdict(a, **fyi), verdict(m, **fyi), verdict(e, **fyi)])
+        self.assertEqual((r["logged"], r["now"]), ([a["id"]], [m["id"], e["id"]]))
+
+    def test_context_is_names_only_and_capped(self):
+        cfg = {"agent": {"manager": "Dana Levi", "manager_short": "Dana"},
+               "manager": {"email": "dana@example.com", "chat_dm": "U00000000"},
+               "teams": [{"slug": "platform", "name": "Platform team", "tracker": {"project": "PLAT"},
+                          "repos": ["example-org/platform-api"],
+                          "people": [{"name": "Sam Roe", "email": "sam@example.com", "chat": "U00000001"}, {"name": ""}]}],
+               "hub": {"watch": {"tracker": {"projects": ["OPS"]}, "code": {"repos": ["example-org/web"]}}}}
+        code, out, _ = self.main("context", "--json", cfg=cfg)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {
+            "version": 1, "manager": {"name": "Dana Levi", "short": "Dana"},
+            "teams": [{"name": "Platform team", "people": ["Sam Roe"]}],
+            "projects": ["PLAT", "OPS"], "repos": ["example-org/platform-api", "example-org/web"]})
+        for secret in ("example.com", "U0000"):
+            self.assertNotIn(secret, out)
+        self.assertEqual(chief.triage_context(self.ws, {}), {
+            "version": 1, "manager": {"name": "", "short": ""}, "teams": [], "projects": [], "repos": []})
+        big = {"teams": [{"name": "Team %d" % t, "people": [{"name": "Person %d-%d %s" % (t, i, "x" * 30)} for i in range(30)]}
+                         for t in range(12)]}
+        doc = chief.triage_context(self.ws, big)
+        self.assertLessEqual(len(json.dumps(doc, separators=(",", ":"))), chief.CONTEXT_MAX)
+        self.assertTrue(doc["teams"])
+
+    def test_lines_say_source_channel_and_whether_the_manager_is_named(self):
+        cfg = {"agent": {"manager": "Dana Levi", "manager_short": "Dana"}, "manager": {"chat_user": "U0DDDDDDD"},
+               "teams": [{"channels": [{"id": "C0AAAAAAA", "name": "platform"}]}]}
+        self.inbox(line(source="chat", key="C0AAAAAAA/1700000000.000100", summary="<@U0DDDDDDD> can you approve?"),
+                   line(source="chat", key="D0DDDDDDD/dm", summary="hi"),
+                   line(key="PLAT-4", summary="dana, please look"), line(key="PLAT-5", summary="Danas build"))
+        got = [(l["source"], l["channel"], l["to_manager"]) for l in chief.lines(self.ws, cfg)]
+        self.assertEqual(got, [("chat", "platform", "mentioned"), ("chat", None, "addressed"),
+                               ("tracker", None, "mentioned"), ("tracker", None, None)])
 
     def test_decide_needs_the_object_shape(self):
         self.assertEqual(self.main("triage", "--stdin", "--decide", stdin="[]")[0], 2)
@@ -454,7 +526,7 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "led_by", "inbox",
-                                    "inbox_count", "guard", "health"})
+                                    "inbox_count", "cases", "relay", "guard", "health"})
         self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
@@ -549,7 +621,7 @@ class TestHealth(Base):
         h = doc["health"]
         self.assertEqual(([u["id"] for u in h["watcher_errors"]], h["watcher_error_count"]), (["U2", "U3"], 2))
         self.assertEqual(set(h["watcher_errors"][0]), {"id", "key", "title", "why", "link", "at", "session",
-                                                        "source", "who", "label"})
+                                                        "source", "who", "label", "kind", "on", "urgency", "actions"})
 
     def test_watcher_heartbeat_and_sources(self):
         with hub.locked(self.ws):
@@ -998,3 +1070,165 @@ class PortraitTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCases(Base):
+    """A case: a session that owns one inbox item (claim), gets its follow-ups (relays) and closes it (hub done)."""
+    A = "11111111-1111-4111-8111-111111111111"
+    B = "22222222-2222-4222-8222-222222222222"
+
+    def now_item(self, key, at=AT, title="t"):
+        a = line(key=key, title=title, at=hub._iso(at))
+        hub.append_inbox(self.ws, [a])
+        return hub.decide(self.ws, {}, at, [{"line_id": a["id"], "key": key, "decision": "now", "title": title, "why": "w"}])[0]
+
+    def follow_up(self, key, n, at=AT, who="Dana <U0DDDDDDD>", summary="any news?"):
+        a = line(key=key, at=hub._iso(at + timedelta(seconds=n)), who=who, summary=summary, title="re")
+        hub.append_inbox(self.ws, [a])
+        chief.triage_decide(self.ws, {}, at + timedelta(seconds=n), [a["id"]], [])
+        return a
+
+    def claim(self, key, cli, at=AT, **kw):
+        return chief.claim(self.ws, {}, at, dict({"key": key, "session_id": cli, "title": "Fix it", "link": "https://example.com/1"}, **kw))
+
+    def rows(self):
+        return hub._sessions_doc(self.ws)["sessions"]
+
+    def test_claim_makes_a_live_case_and_links_the_update(self):
+        uid = self.now_item("PLAT-7")["update_id"]
+        got = self.claim("PLAT-7", self.A)
+        self.assertEqual(got, {"ok": True, "key": "PLAT-7", "session_id": self.A, "update_id": uid})
+        r = self.rows()["PLAT-7"]
+        self.assertEqual((r["state"], r["kind"], r["cli_session_id"], r["session_id"], r["opened_at"], r["unseen"]),
+                         ("live", "case", self.A, self.A, hub._iso(AT), 0))
+        u = hub._hub_doc(self.ws)["updates"][0]
+        self.assertEqual((u["id"], u["state"], u["session_id"]), (uid, "open", self.A))   # kept, and linked
+        item = chief.inbox_items(self.ws)[0]
+        self.assertEqual(item["session"], {"key": "PLAT-7", "title": "Fix it", "kind": "case", "cli_session_id": self.A})
+        self.assertEqual(self.claim("PLAT-7", self.A)["key"], "PLAT-7")                    # again, same session: fine
+
+    def test_claim_refusals(self):
+        for doc, why in (({"key": "PLAT-7", "session_id": self.A}, "no open inbox item"),
+                         ({"key": "bad key", "session_id": self.A}, "not a hub key"),
+                         ({"key": "PLAT-7", "session_id": "nope"}, "not a session id"), ([], "JSON object")):
+            with self.assertRaises(ValueError) as e:
+                chief.claim(self.ws, {}, AT, doc)
+            self.assertIn(why, str(e.exception))
+        self.assertEqual(self.rows(), {})
+
+    def test_claim_repoint_refused_until_the_row_is_stale(self):
+        self.now_item("PLAT-7")
+        self.claim("PLAT-7", self.A)
+        with self.assertRaises(ValueError) as e:
+            self.claim("PLAT-7", self.B, at=AT + timedelta(days=6))
+        self.assertIn("live in another session", str(e.exception))
+        self.assertEqual(self.rows()["PLAT-7"]["cli_session_id"], self.A)
+        self.claim("PLAT-7", self.B, at=AT + timedelta(days=8))                            # older than 7 days: allowed
+        r = self.rows()["PLAT-7"]
+        self.assertEqual((r["cli_session_id"], r["state"], r["opened_at"]), (self.B, "live", hub._iso(AT + timedelta(days=8))))
+
+    def ack(self, cli, lines):
+        return chief.relay_ack(self.ws, AT, cli, [l["id"] for l in lines])
+
+    def test_relays_read_without_removing_and_ack_only_this_sessions(self):
+        self.now_item("PLAT-7")
+        self.now_item("PLAT-8")
+        self.claim("PLAT-7", self.A)
+        self.claim("PLAT-8", self.B)
+        a = self.follow_up("PLAT-7", 10)
+        b = self.follow_up("PLAT-8", 20)
+        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 1)
+        self.assertEqual(len(hub._hub_doc(self.ws)["updates"]), 2)                         # a route, no new item
+        got = chief.relays(self.ws, AT, self.A)
+        self.assertEqual(got, [{"id": a["id"], "key": "PLAT-7", "at": hub._iso(AT + timedelta(seconds=10)), "who": "Dana",
+                                "title": "re", "summary": "any news?", "link": a["link"]}])
+        self.assertEqual(chief.relays(self.ws, AT, self.A), got)                           # a read removes nothing
+        self.assertEqual((self.rows()["PLAT-7"]["unseen"], chief.cases(self.ws)[0]["unseen"]), (1, 1))
+        self.assertEqual(chief.relay_ack(self.ws, AT, self.A, [b["id"], "nope", 7]), 0)    # another session's line: ignored
+        self.assertEqual([c["unseen"] for c in chief.cases(self.ws)], [1, 1])
+        self.assertEqual(self.ack(self.A, got), 1)
+        self.assertEqual(self.ack(self.A, got), 0)                                         # acknowledged once
+        self.assertEqual(chief.relays(self.ws, AT, self.A), [])
+        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 0)
+        self.assertEqual(self.rows()["PLAT-8"]["unseen"], 1)                               # the other session's still waits
+        self.assertEqual([c["unseen"] for c in chief.cases(self.ws)], [0, 1])
+        for n in range(30, 42):
+            self.follow_up("PLAT-7", n)
+        more = chief.relays(self.ws, AT, self.A)
+        self.assertEqual(len(more), 12)
+        self.assertEqual(self.ack(self.A, more[:10]), 10)                                  # only the ids named
+        self.assertEqual(self.rows()["PLAT-7"]["unseen"], 2)
+        self.assertEqual(chief.relays(self.ws, AT, self.A), more[10:])
+
+    def test_relay_lines_survive_the_hubs_routed_cap_and_are_cleaned(self):
+        self.now_item("PLAT-7")
+        self.claim("PLAT-7", self.A)
+        self.follow_up("PLAT-7", 5, who="Da\u202ena", summary="x" * 500)
+        for n in range(hub.ROUTED_MAX + 5):                                                # push it out of hub.json's routed
+            l = line(key="LOG-%d" % n, at=hub._iso(AT + timedelta(seconds=100 + n)))
+            hub.append_inbox(self.ws, [l])
+            hub.decide(self.ws, {}, AT, [{"line_id": l["id"], "key": l["key"], "decision": "log"}])
+        got = chief.relays(self.ws, AT, self.A)
+        self.assertEqual([(g["who"], len(g["summary"])) for g in got], [("Dana", 300)])
+
+    def test_relay_flag_and_the_deliver_once_flag(self):
+        self.now_item("PLAT-7")
+        self.claim("PLAT-7", self.A)
+        self.follow_up("PLAT-7", 10)
+        self.assertTrue(chief.relay_on(self.ws))
+        chief.set_relay(self.ws, False)
+        self.assertFalse(chief.status_doc(self.ws, {}, AT)["relay"]["on"])
+        self.assertEqual(chief.cases(self.ws)[0]["unseen"], 1)                             # still waiting, shown as N new
+        chief.relay_deliver(self.ws, self.A)
+        self.assertIs(chief.cases(self.ws)[0]["deliver_now"], True)
+        self.assertEqual(self.ack(self.A, chief.relays(self.ws, AT, self.A)), 1)           # delivered: the flag is used up
+        self.assertIs(chief.cases(self.ws)[0]["deliver_now"], False)
+        chief.set_relay(self.ws, True)
+        self.assertTrue(chief.relay_on(self.ws))
+
+    def test_done_closes_the_case_and_later_activity_is_a_new_item(self):
+        uid = self.now_item("PLAT-7")["update_id"]
+        self.claim("PLAT-7", self.A)
+        later = AT + timedelta(days=3)                                                     # past the item's TTL: a case's item stays
+        self.follow_up("PLAT-7", 10, at=later)
+        self.assertEqual([u["id"] for u in hub._hub_doc(self.ws)["updates"]], [uid])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(hub.main(["done", uid], self.ws, {}, later), 0)
+        self.assertEqual(self.rows()["PLAT-7"]["state"], "done")
+        self.assertEqual(chief.cases(self.ws), [])
+        a = self.follow_up("PLAT-7", 60, at=later)
+        res = [r for r in hub._hub_doc(self.ws)["routed"] if r["line_id"] == a["id"]][0]
+        self.assertEqual(res["decision"], "now")                                           # a new Inbox card, not a route
+        self.assertEqual(chief.relays(self.ws, later, self.A), [])
+
+    def test_status_cases_and_the_cli_verbs(self):
+        self.now_item("PLAT-7")
+
+        def run(*args, stdin=""):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = chief.main(list(args), self.ws, {}, AT)
+            return code, out.getvalue(), err.getvalue()
+
+        body = json.dumps({"key": "PLAT-7", "session_id": self.A, "title": "Fix it", "link": "https://example.com/1"})
+        self.assertEqual(run("claim", "--stdin", stdin=body)[0], 0)
+        code, _, err = run("claim", "--stdin", stdin=body.replace(self.A, self.B))
+        self.assertEqual((code, "refusing to repoint" in err), (1, True))
+        self.assertEqual(run("claim")[0], 2)
+        self.follow_up("PLAT-7", 10)
+        doc = chief.status_doc(self.ws, {}, AT)
+        self.assertEqual(doc["relay"], {"on": True})
+        self.assertEqual(doc["cases"], [{"key": "PLAT-7", "cli_session_id": self.A, "title": "Fix it", "link": "https://example.com/1",
+                                         "label": "PLAT-7", "unseen": 1, "last_routed_at": hub._iso(AT + timedelta(seconds=10)),
+                                         "opened_at": hub._iso(AT), "deliver_now": False}])
+        self.assertEqual(run("relay", "off")[1], "relay off: 1 line(s) waiting\n")
+        self.assertEqual(run("relay", "deliver", "--for", self.A)[0], 0)
+        waiting = json.loads(run("relays", "--for", self.A)[1])
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(run("relays", "--for", self.A, "--ack")[0], 2)                    # the ids come on stdin
+        self.assertEqual(run("relays", "--for", self.A, "--ack", "--stdin", stdin="{}")[0], 2)
+        self.assertEqual(run("relays", "--for", self.A, "--ack", "--stdin", stdin=json.dumps([waiting[0]["id"]]))[1], '{"acked": 1}\n')
+        self.assertEqual(json.loads(run("relays", "--for", self.A)[1]), [])
+        self.assertEqual(run("relay", "on")[1], "relay on\n")
+        self.assertEqual(run("relay", "status")[1], "relay on\n")
+        self.assertEqual([run("relay")[0], run("relay", "maybe")[0], run("relays")[0], run("relay", "deliver")[0]], [2, 2, 2, 2])

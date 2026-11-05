@@ -170,6 +170,16 @@ export type FloorCard = {
 }
 export type FloorState = { cards: FloorCard[]; self: string | null; answered: string[] }
 
+// A session that owns one inbox item's key until it is closed (hooks/cos.ts, skills/cos): a `kind: "case"` row of the
+// hub's sessions.json. `unseen` is how many routed lines wait to be delivered into it.
+export type ChiefCase = {
+  key: string; cli_session_id: string; title: string; link: string | null
+  label?: string                     // what a card shows in place of the raw key
+  unseen: number
+  last_routed_at: string | null; opened_at: string | null
+  deliver_now?: boolean              // `mother chief relay deliver` asked it to deliver once though relay is off
+}
+
 // `mother chief status --json` (lib/chief.py status_doc, version 1).
 export type ChiefStatus = {
   version: 1
@@ -183,6 +193,8 @@ export type ChiefStatus = {
   led_by?: string | null             // the session id that wrote the heartbeat while it is fresh (under 120 s), else null
   inbox?: ChiefInboxItem[]           // the hub's open updates (`now` decisions), newest first, at most 10
   inbox_count?: number               // all of them
+  cases?: ChiefCase[]                // live case sessions (lib/chief.py cases), oldest first
+  relay?: { on: boolean }            // false while .mother/chief/RELAY_OFF exists: routed lines wait, nothing is submitted
   guard?: 'on' | 'off' | 'paused'    // the guard: `paused` while .mother/PAUSED exists (it wins), `off` while .mother/GUARD_OFF does
   health?: ChiefHealth               // the Health tab's reads; an Inbox item keyed `watcher:` is here, not in `inbox`
 }
@@ -209,7 +221,12 @@ export type ChiefInboxItem = {
   source?: string                    // the key's kind: chat, mail, tracker, code, calendar, manual, error, other
   who?: string                       // the person its newest inbox line names; '' when none
   label?: string                     // what a card shows in place of the raw key: a channel's name, a person, `mail thread`…
-  session: { key: string; title: string } | null   // the live hub session for the key
+  // the triage verdict, from .mother/chief/triage.json; null / [] for an item decided with none (hooks/pane_ui.tsx verdictExtra)
+  kind?: 'decide' | 'reply' | 'act' | 'fyi' | null
+  on?: 'manager' | 'team' | 'other' | null
+  urgency?: 'now' | 'today' | 'later' | null
+  actions?: { label: string; prompt: string }[]   // at most 3, the first the recommended one
+  session: { key: string; title: string; kind?: 'case'; cli_session_id?: string } | null   // the live hub session for the key; a case names its session
 }
 
 // Which Chief pane cards are drawn in full. `cards` holds the manager's toggles by card id (`need:<cli id>`,

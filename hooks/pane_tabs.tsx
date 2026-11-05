@@ -4,7 +4,8 @@ import type { Color } from 'claude-code'
 import { SNOOZES, age, ago, askPrompt, isUrl, oneLine, safe } from './shared'
 import type { Dollar } from './shared'
 import { THREAD_KEY, followArgs, ignoreArgs, ignoreOptions, nowVerb, openInspector } from './register'
-import { SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, money, sectionHeading, subHeading, titleRow, toggled, whyText } from './pane_ui'
+import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, money, sectionHeading, subHeading, titleRow,
+         toggled, whyText } from './pane_ui'
 import type { Ui } from './pane_ui'
 import type { ChiefHealth, ChiefHealthState, ChiefInboxItem, ChiefOpen, ChiefStatus, NowDoc, NowItem } from '../types'
 
@@ -59,12 +60,14 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
   const title = oneLine(i.title, TITLE_MAX)
   const why = whyText(i.why)
   const link = isUrl(i.link) ? i.link : null
-  const action = i.actions?.[0]
+  const acts = (i.actions ?? []).slice(0, ACTIONS_SHOWN)   // the tick's actions, the first primary; run as the Now panel runs them
+  const action = acts[0]
   const snoozeKey = `${kind}-snooze:${i.id}`
   const ignoreKey = `${kind}-ignore:${i.id}`
   const label = kind === 'sug' ? 'suggested' : source === 'other' ? 'neglected' : source
   const doIt = action
-    ? <Button key={`${kind}-doit:${i.id}`} variant="primary" onPress={press(() => fill($, action.prompt || `mother now do ${action.id}`))}>{oneLine(action.label, 40) || 'Do it'}</Button>
+    ? acts.map((a, n) => <Button key={n === 0 ? `${kind}-doit:${i.id}` : `${kind}-act:${i.id}:${n}`} variant={n === 0 ? 'primary' : 'secondary'}
+        onPress={press(() => fill($, a.prompt || `mother now do ${a.id}`))}>{oneLine(a.label, n === 0 ? 40 : ACTION_LABEL_MAX) || 'Do it'}</Button>)
     : null
   const ask = <Button key={`${kind}-ask:${i.id}`} variant={action ? 'secondary' : 'primary'} onPress={press(() => fill($, askPrompt(title, why, i.link)))}>Ask Mother</Button>
   const done = <Button key={`${kind}-done:${i.id}`} onPress={press(() => go(['done', i.id]))}>Done</Button>
@@ -76,6 +79,7 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
       {link ? <Link href={link}>source ↗</Link> : null}
     </Box>,
     open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
+    ...(open ? acts.map((a, n) => <Text key={`says:${id}:${n}`} dimColor wrap="wrap">{`${oneLine(a.label, 40)}: ${oneLine(a.task || a.prompt, 300)}`}</Text>) : []),
     open
       ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
           {doIt}

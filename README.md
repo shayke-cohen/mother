@@ -215,7 +215,9 @@ design review", "prep my 1:1 with Sam", "what did I promise", "set up a new proj
 skill: `brief`, `now`, `todo`, `remember`, `one-on-one`, `commitments`,
 `meeting`, `project`, `team` and so on. With WhatsApp set up (`mother whatsapp setup`), "what did Sam say on
 WhatsApp" or "WhatsApp Dana that I'm late" go to the `whatsapp` skill: it reads any chat, and each message to
-someone else waits for your yes in the permission prompt.
+someone else waits for your yes in the permission prompt. "Open session" on a Chief pane Inbox card starts a
+session on the `cos` skill: it owns that one item until it is closed, and later activity on the thread is delivered
+into it (`/chief relay off` holds that back).
 
 The hub is optional and runs on your home machine. Set the `hub` block in `config.json` (with `enabled: true`), install the watcher with
 `mother hub install` (it polls your sources read-only and appends what changed to a local inbox), then run
@@ -311,7 +313,7 @@ Useful commands in your terminal:
 |---|---|
 | `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `runs`, `path`, `link`, `speak`, `tts`, `channels`, `items`, `eval`, `health`, `now` (Python 3.9 stdlib) |
 | `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
-| `skills/` | `setup`, `doctor`, `routine`, `brief`, `now`, `digest`, `dots`, `commitments`, `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember` |
+| `skills/` | `setup`, `doctor`, `routine`, `brief`, `now`, `digest`, `dots`, `commitments`, `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `cos` |
 | `agents/` | Read-only sub-agents: `reader` (one source) and `critic` (one draft) |
 | `lib/` | `channels.py` (reply-mode engine), `now.py` (the Now list), `health.py` (per-server connector health, the only writer of `capabilities.json`), `items.py` (reader evidence check), `evals.py` (A/B harness) |
 | `routines/` | What each scheduled run does |

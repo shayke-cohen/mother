@@ -59,7 +59,7 @@ holds code a later session would run.
 | `docs/` | CONTRACT (spec), DESIGN (why), ROADMAP (stages) | `docs/drafts/`, `docs/superpowers/` are untracked personal notes |
 
 Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `digest`, `dots`, `commitments`,
-`one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`.
+`one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`, `cos`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
 `meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
