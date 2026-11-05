@@ -1079,6 +1079,23 @@ async function onDesktop($: Dollar): Promise<boolean> {
   try { return (await $.session.surfaces()).includes('desktop') } catch { return false }
 }
 
+// A new desktop session in the workspace with the brief already typed (the app's own new-session link); the manager
+// reads it and presses Enter, since the brief is built from someone else's text. Anywhere that fails, the brief fills
+// this session's prompt instead.
+export const newSessionLink = (text: string, folder: string): string =>
+  `claude://code/new?q=${encodeURIComponent(text)}&folder=${encodeURIComponent(folder)}`
+async function openNew($: Dollar, bin: string, text: string): Promise<void> {
+  const fill = () => $.prompt.fill({ text, mode: 'replace' }).catch(() => undefined)
+  if (!(await onDesktop($))) { await fill(); return }
+  const ws = await workspace($, bin)
+  if (!ws.startsWith('/')) { await fill(); return }
+  try {
+    const ran = await $.process.run(['open', newSessionLink(text, ws)], { timeoutMs: DEFAULT_TIMEOUT_MS })
+    if (ran.exitCode === 0) { $.ui.toast('New session opened with the brief typed: press Enter there to start it'); return }
+  } catch { /* fall through */ }
+  await fill()
+}
+
 async function workspace($: Dollar, bin: string): Promise<string> {
   try {
     const ran = await $.process.run(['python3', bin, 'path'])
@@ -1277,7 +1294,7 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
             <Box flexWrap="wrap" gap="xs">
               <Button key={'inbox-open:' + u.id} onPress={() => {
                 if (u.session) openSession($, goHub, u.session.key, { title: oneLine(u.session.title, TITLE_MAX) })
-                else void $.prompt.fill({ text: askPrompt(title, why, isUrl(u.link) ? u.link : null), mode: 'replace' })
+                else void openNew($, bin, askPrompt(title, why, isUrl(u.link) ? u.link : null))
               }}>Open session</Button>
               <Button key={'inbox-done:' + u.id} onPress={() => goHub(['done', u.id])}>Done</Button>
               <Button key={pickKey} onPress={() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey) : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [pickKey]: '1' }))}>Snooze</Button>
