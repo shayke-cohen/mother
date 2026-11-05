@@ -11,7 +11,7 @@ Every part of v0 is built against this file. Change it first, then the code.
                            `mother_bin` (empty default = `${plugin root}/bin/mother`; a leading `~` is $HOME)
 bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now
 hooks/hooks.json           `modules: ["./register.tsx"]` (the Now panel); PreToolUse → hooks/guard.py (every other tool
-                           via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`. A panel module that fails to
+                           via hooks/guard_fast.py); PostToolUse + PostToolUseFailure on `mcp__…` → hooks/guard_outcome.py (what a decision's call answered, §5g); Stop + SessionEnd → `mother sync --quiet`. A panel module that fails to
                            load leaves the command hooks running
 hooks/guard.py             approval guard (see §5)
 hooks/guard_fast.py        the guard's fast path: every tool the main matcher doesn't take; escalates to guard.py for
@@ -622,7 +622,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   (config, ledger, log, PAUSED, hooks) ask.
 - A shell command asks as a self-edit only when it can write (a redirect other than `/dev/null` or `2>&1`,
   `rm`/`mv`/`cp`/`sed -i`/…, or a script that opens a file for writing) **and** it reaches the running copy:
-  it names `guard.py`/`guard_fast.py`/`hooks.json` together with the installed plugin's path (`${CLAUDE_PLUGIN_ROOT}`,
+  it names `guard.py`/`guard_fast.py`/`guard_outcome.py`/`hooks.json` together with the installed plugin's path (`${CLAUDE_PLUGIN_ROOT}`,
   `.claude/plugins/`), or `config.json`/`PAUSED`/`ledger.json`/`guard.log` together with the workspace's
   path (`$MOTHER_WORKSPACE`, `$(cat ~/.mother/workspace)`, the path itself), or it runs from inside either
   without a `cd`; or it writes `~/.mother/workspace`. The same names in a checkout of this repo, another
@@ -1312,8 +1312,20 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   at or before a worker's `inbox_mark` is left to the chief (it was pending when the chief started that worker, so
   it is the worker's prompt): the chief records it as `route` after `run --detach`, and it is delivered once. It
   then starts queued, unheld, non-failed workers within `max_workers`, unless today's budget is spent or
-  `spend.json` is unreadable (then nothing starts until the day rolls or the file reads again). The mod (`hooks/chief.tsx`) calls it every
+  `spend.json` is unreadable (then nothing starts until the day rolls or the file reads again). A failed worker stays
+  failed, with what's queued kept for its next run, until it gets new input: a `say`, `run` or `release`, or the
+  manager's yes or words on one of its decisions. A note about a failure (a closed decision, an expiry) or a routed line
+  is not new input, and a filing doesn't clear a failure. The exception to the manager's answer: a run stopped by a
+  limit (below) would only stop again, so it stays failed, the approval line says why, and the approval rides with the
+  next `say` or `run` if that comes before the grant runs out. The mod (`hooks/chief.tsx`) calls it every
   `tick_seconds` and sends the wake into the chief session when no turn is running.
+- **A run that failed.** `progress` holds the real reason: the result event's `result` (claude writes `subtype: "success"`
+  with `is_error: true` on a run that stopped on a spend limit), else `api_error`, `errors`, a subtype other than
+  `success`, or stderr when the stream had no words for it. `status` and `chief status` print it, and the pane's card
+  shows it in place of the TL;DR while the worker is failed. A **limit** is a usage, spend or rate limit, or a login
+  that's gone (`chief.stopped_by_limit`, on the text of that reason). It reaches the DM only through a decision: the lines
+  for an approval it stopped carry the reason. A failed worker with no decision open shows on its card and nowhere else.
+  Detecting one, pausing the workers and sending one DM is the design's Phase 3 and isn't built.
 - **Triage.** Before a wake, the mod asks the model (`chief.triage_model`, `$.model.complete`, 20 s timeout, 300 tokens) for a verdict
   `{is_work, needs_attention, title, tldr}` per judge line (never for a `manual` line or one whose key has a live
   session) and passes them to `mother chief triage --stdin`, which logs the leading lines that need no judgment
@@ -1404,13 +1416,17 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   `dms set|drop`, the job verbs) is denied, and the reads (`status`, `check`, `show`, `watching`, `tail`,
   `session for`, `dms show`) stay.
 - **Decisions (Phase 2).** A worker never sends. It files the exact call it wants to make, with `mother decide propose
-  <key> --tool T --recommend R [--why W] [--urgent] --stdin` (stdin is the tool's input JSON), and ends its turn. A
+  <key> --tool T --recommend R [--why W] [--urgent] --stdin` (stdin is the tool's input JSON), and ends its turn. `T`
+  must be the tool's name as this worker has it, because the grant binds the name with the input: a `-p` worker's Slack
+  tool can carry another server prefix than a desktop session's (`mcp__slack__…`, not the one a desktop session lists),
+  the guard classifies both alike so `propose` can't tell, and a call under any other name is refused after the yes. The
+  worker header says so. A
   chat post, reply or tracker comment must carry the agent's signature or the filing is refused. The decision lands in
   `.mother/chief/decisions.json` (changed under `decisions.lock`, atomically) as `D<n>`: `{id, key, kind, tool, input,
   target, thread, text, draft_sha, recommendation, why, urgent, status, created, expires, answer}`. `kind` is
   `chat-post`, `chat-reply`, `tracker-create`, `tracker-comment` or `tracker-transition`; any other call is `manual`
   (approving it hands the manager the text to do by hand, and no grant is written). `status` is `pending`, `approved`,
-  `rejected`, `redirected`, `expired`, `sent`, `failed` or `manual`. `expires` is `decision_hours` after the filing. The
+  `rejected`, `redirected`, `expired`, `sent`, `failed`, `unconfirmed` or `manual`. `expires` is `decision_hours` after the filing. The
   worker's status becomes `waiting_decision` while one of its decisions is pending; `tick` starts it again only when
   an answer is queued for it (queue source `decision`, or a `say`).
   - **The batch.** `tick --json` gains `"batch": bool`. A batch is due when a pending decision hasn't been announced and
@@ -1422,7 +1438,8 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     A decision's line is `D7 · <key> · <kind> on <target>: "<first 200 chars of the draft>" · why: <why> · recommend:
     <recommendation>`. The `why` part is left out when empty. `<target>` can be composite (`C00000001, thread_ts 1700…`).
     Everything a worker or a service wrote is one line, capped, with `& < >` escaped and `@` broken, so it can't draw a
-    link or a mention. Replies typed in the batch's thread are ignored.
+    mention or a relabelled link. A bare domain in it may still become a link to itself (Slack auto-links it, label equal
+    to address), and Slack renders the signature's bold. Replies typed in the batch's thread are ignored.
   - **`sent`.** `mother decide sent --ids D7,D8|'' --ts <the post's ts>` records the batch time, stamps each id as
     announced at that ts (a decision keeps its first stamp) and clears the confirmation lines the batch offered; a line
     that arrived during the post stays. It needs a live offer from `batch`, each offer is used once, and the ids must
@@ -1527,21 +1544,34 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     than the grant age limit). `propose` refuses, up front, a call whose target `guard.allowed_targets` wouldn't let a grant
     reach (a DM, an external or `off` channel, a channel or project outside the config's teams) or whose scope has no uses,
     and it refuses a worker filing under another worker's key. `approved` says so when no run can start (held, over
-    budget), rather than promising the call.
+    budget, its last run stopped by a limit), rather than promising the call.
   - **The bound grant.** One live grant per decision: `uses: 1`, `run: "chief:D<n>"`, `decision: D<n>`, `draft_sha`,
     scope and target from the decision, expiring at the earliest of two hours, the decision's `expires` and the policy's
     cited-message age limit. `draft_sha` is the sha256 of the tool name and input as sorted compact JSON, defined once in
     `hooks/guard.py`. The worker is told to make that one call with the input unchanged; the guard allows it only if the
     hash matches, and a mismatch costs no use. No other call of the worker is covered.
   - **Closing the loop.** `tick` closes an approved decision once its outcome is known, and the next batch carries the
-    line. A use in the ledger (run `chief:D<n>`) with the worker's run ended becomes `sent`: `✓ D<n>: the call was made
-    (<kind> on <target>)`. The ledger proves the guard let the call through, not that the service accepted it, so that's
-    all the line says. No use, and the grant ran out: `expired`, `D<n>: approved but not used in time; nothing went
-    out`. No use, and the run ended: `failed`, either `D<n>: the worker failed after your yes; it's back with the worker`
+    line. A use in the ledger (run `chief:D<n>`, with the grant's `draft_sha`) proves only that the guard let the call
+    through: Slack's `ok: false` comes back as a successful tool call. So `hooks/guard_outcome.py`, on PostToolUse and
+    PostToolUseFailure for `mcp__…`, writes onto that use what the tool answered: `outcome` `ok`, `failed` or `unclear`, and
+    `error`, a short code (`[A-Za-z][A-Za-z0-9_.-]{0,59}`, else `error` or `tool_error`). No other part of a response reaches
+    any file. `failed` is `ok: false`, `success: false`, an MCP `isError` result, a failure event or an `error` field,
+    bare or under `data`, `result` or MCP text. `ok` is `ok: true` or an answer carrying what it made (`ts`, `id`, `key`).
+    `unclear` is anything else: words, an empty answer, a timeout or an interrupt, after which the send may have landed.
+    It leaves in one small read when no use is waiting, never loads `guard.py`, always exits 0, prints nothing, and gives
+    up after 2 s on the lock. With the worker's run ended: a seen success is `sent`, `✓ D<n>: the call was made (<kind> on
+    <target>)`. A seen failure is `failed`, `✗ D<n>: the send failed: <code> (<kind> on <target>). The approval is spent,
+    so a retry needs a new decision.`, and the worker is told too. Nothing seen (a hook that didn't fire, a use an older
+    guard wrote) or `unclear` is `unconfirmed`, with no tick: `D<n>: the guard let the call through, but its result
+    wasn't seen, so it may not have gone out (<kind> on <target>). Check it before you count on it.` It doesn't say the
+    call was made, because another plugin's PreToolUse hook can still stop a call this guard passed. A grant stays spent
+    in all three. No use, and the grant ran out: `expired`, `D<n>: approved but not used in time; nothing went
+    out`, with `(its last run stopped: <reason>)` when a limit stopped the worker. No use, and the run ended: `failed`,
+    either `D<n>: the worker failed after your yes (<reason>); nothing went out, and it's back with the worker`
     or `D<n>: the worker's turn ended without the call you approved; nothing went out, and it's back with the worker.`,
     or, when the target is no longer one a grant can reach, `D<n>: the guard refused the call: target not allowed; nothing
     went out, and it's back with the worker.`
-    The worker gets a note in each case but `sent`. A pending decision past `expires` becomes `expired`, `D<n> expired
+    The worker gets a note in each case but `sent` and `unconfirmed`. A pending decision past `expires` becomes `expired`, `D<n> expired
     unanswered.`, and its grant is removed. A ledger that can't be read leaves the decision `approved` until it can.
   - **What a worker can't do.** No shell command off the guard's allow-list, so no `npm test` and no `python3 -m
     unittest`: a worker reads, drafts and files decisions. File tools write only inside the workspace and not to the
