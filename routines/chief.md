@@ -89,8 +89,9 @@ the exact text of the live offer.
 1. Run `mother decide batch --json`. It prints `{"text", "ids"}`, or `null` when nothing is due: then stop.
 2. Post `text` to the manager's own DM, verbatim: the exact `batch --json` text, with nothing added, cut or changed.
 3. Run `mother decide sent --ids <ids, comma-separated> --ts <the post's ts>`. When `ids` is empty, use `--ids ''`.
-   Without this the next wake posts it again. `sent` re-reads the post and stamps it only if it is that text. If it
-   exits non-zero, stop: never post a second time.
+   Without this the next wake posts it again. `sent` re-reads the post and stamps it only if it is that text. Exit 3
+   means the read failed, not the post: run the same `sent` once more. Any other non-zero exit, or a second 3: stop,
+   and never post a second time.
 
 **"may have landed"**: the post timed out, gave no ts, or `sent` couldn't find it. Never re-post it, and don't run
 `mother decide batch`: that makes a new offer, which the post you are looking for won't match.
@@ -98,7 +99,8 @@ the exact text of the live offer.
 1. Read the manager's own DM history with the chat connector's history read, from the ts the wake gives.
 2. If an app-posted message there is the batch (it lists the ids the wake gives), run
    `mother decide sent --ids <those ids> --ts <its ts>` once. When the wake says it has no ids, use `--ids ''`.
-3. If it isn't there, or `sent` exits non-zero, stop. The mod tries again after batch_minutes.
+3. If it isn't there, or `sent` exits non-zero (after one more try on exit 3), stop. The mod tries again after
+   batch_minutes.
 
 **"the batch record is failing"**: the batch is already posted, and the wake gives its ids and ts. Run
 `mother decide sent --ids <ids> --ts <ts>` with those, once. Exit 2 means it's already recorded or no batch is
