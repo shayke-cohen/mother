@@ -39,3 +39,40 @@ export function ago(iso: string | undefined | null, nowMs: number): string {
   const mins = Math.max(0, Math.floor((nowMs - ms) / 60_000))
   return mins < 1 ? 'now' : mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins / 60)}h` : `${Math.floor(mins / 1440)}d`
 }
+
+// ---- hub actions both panes offer (the Now panel's hub updates, the Chief pane's Inbox) ----
+
+export const SNOOZES = ['1h', 'tomorrow', 'next-week'] as const
+export const isUrl = (link: string | null | undefined): link is string => !!link && /^https?:\/\//.test(link)
+
+// Run one `mother <group> …` verb. A failure toasts the first line of stderr; `toastOut` toasts the first line of a
+// success. True when it exited 0. The caller re-reads what it draws.
+export async function motherVerb($: Dollar, bin: string, group: string, args: string[], toastOut = false): Promise<boolean> {
+  try {
+    const ran = await $.process.run(['python3', bin, group, ...args])
+    if (ran.exitCode === 0 && toastOut) {
+      const first = String(ran.stdout ?? '').split('\n').find(l => l.trim())
+      if (first) $.ui.toast(first.trim())
+    }
+    if (ran.exitCode !== 0) {
+      const line = String(ran.stderr ?? '').split('\n').find(l => l.trim()) ?? `mother ${group} ${args[0]} failed`
+      $.ui.toast(line.trim())
+    }
+    return ran.exitCode === 0
+  } catch (err) {
+    $.ui.toast(`mother ${group} ${args[0]} failed: ${(err as Error).message ?? String(err)}`)
+    return false
+  }
+}
+
+// The prompt an item's or a Top 3 entry's "Ask" button fills: the item in full, ready to send as is.
+export function askPrompt(title: string, why: string | null | undefined, link: string | null | undefined): string {
+  return `Help me close this out: "${title}"` + (why ? ` — ${why}` : '') + (link ? ` (${link})` : '')
+    + '. What is the fastest next step? Draft anything that reaches another person; don\'t send.'
+}
+
+// Open a session: fill the prompt (the way in on a surface that cannot open the link) and run `session seen`.
+export function openSession($: Dollar, goHub: (args: string[], rowId?: string | null) => Promise<boolean>, key: string, v: { title: string }) {
+  void $.prompt.fill({ text: `Open my "${v.title}" session`, mode: 'replace' })
+  void goHub(['session', 'seen', key])
+}

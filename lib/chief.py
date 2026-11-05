@@ -730,14 +730,37 @@ def _landing(raw: List[dict], order: dict, start: int, l: dict) -> int:
     return far
 
 
-def tick(ws: Path, cfg: dict, at: datetime) -> dict:
+def _beat(at: datetime, session: Optional[str]) -> str:
+    doc = {"at": hub._iso(at), "pid": os.getpid()}
+    if session:
+        doc["session_id"] = session  # a leading console's own session id; the chief's own tick writes none
+    return json.dumps(doc) + "\n"
+
+
+def lead(ws: Path, at: datetime, session: str) -> Optional[str]:
+    """The leader rule for `tick --as <session>`: None when this session leads (the heartbeat is then written under
+    its id), else why it does not: the heartbeat is fresh (ALIVE_SECONDS) and another session wrote it. A leader
+    that stops ticking is replaced once its heartbeat is stale. Check and write happen under the hub lock."""
+    ws = Path(ws)
+    path = chief_dir(ws) / "heartbeat.json"
+    with hub.locked(ws):
+        last = _read_obj(path)
+        beat = hub._parse_at(last.get("at"))
+        if beat is not None and abs((at - beat).total_seconds()) < ALIVE_SECONDS and last.get("session_id") != session:
+            return "another session leads" if last.get("session_id") else "the chief session is alive"
+        _write_atomic(path, _beat(at, session))
+    return None
+
+
+def tick(ws: Path, cfg: dict, at: datetime, session: Optional[str] = None) -> dict:
     """One chief pass. Not atomic as a whole (hub.locked is not re-entrant); every step is safe to re-run. `batch` is
-    true when `mother decide batch` has a message for the manager's DM."""
+    true when `mother decide batch` has a message for the manager's DM. `session` is the leading console's id
+    (`tick --as`), kept in the heartbeat; the chief's own tick passes none."""
     import decisions
     ws = Path(ws)
     cfgs = settings(cfg)
     cdir = chief_dir(ws)
-    _write_atomic(cdir / "heartbeat.json", json.dumps({"at": hub._iso(at), "pid": os.getpid()}) + "\n")
+    _write_atomic(cdir / "heartbeat.json", _beat(at, session))
     out = {"paused": False, "decided": [], "wake": None, "judge": [], "dispatched": [], "reconciled": [],
            "batch": False, "batch_key": None}
     if paused(ws):
@@ -920,6 +943,75 @@ def triage_apply(ws: Path, cfg: dict, at: datetime, verdicts: List[dict]) -> dic
             rows.append("- %s %s: %s" % (l["id"], _one_line(str(l["key"]), TITLE_MAX), what))
         out["wake"] = "\n".join([WAKE_TEXT % (len(kept), PLUGIN_ROOT / "routines" / "chief.md"), TRIAGE_NOTE] + rows)
     return out
+
+
+def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts: List[dict]) -> dict:
+    """Decide every `judge` line in code, for a leading console (no chief session, no model turn).
+
+    A line is logged on the rule `triage_apply` logs by (a well-formed verdict for its key that says is_work false or
+    needs_attention false; never a `manual` or `error` line, one whose key has a live session, or an update that
+    folds others), and a `sweep` line is logged too: it asks a hub session to look again, and there is none. Every
+    other line, so every line with no verdict (a failed model call, no budget), is recorded as `now`: title and why
+    from the verdict's title and tldr, else from the line, with the line's link. hub.decide stores a `now` whose key
+    has a live session as a route to it. Returns {paused, logged, now}: the line ids."""
+    import decisions
+    ws = Path(ws)
+    out = {"paused": False, "logged": [], "now": []}
+    if paused(ws):
+        out["paused"] = True
+        return out
+    sessions = hub._sessions_doc(ws)
+    pending = _pending_lines(ws)
+    raw = hub.read_inbox(ws)
+    order = {l["id"]: i for i, l in enumerate(raw)}
+    cursor = hub._hub_doc(ws).get("inbox_cursor")
+    start = order[cursor] + 1 if cursor in order else 0
+    keys = {l["id"]: l["key"] for l in pending}
+    by_id = {v["line_id"]: v for v in (verdicts or [])
+             if _verdict_ok(v) and keys.get(v["line_id"]) == v["key"]}
+    wanted = set(judge or [])
+    items = []
+    for l in decisions.for_chief(ws, pending):
+        if l["id"] not in wanted:
+            continue
+        v = by_id.get(l["id"])
+        if l.get("kind") == "sweep":
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "log", "why": "sweep: no hub session"})
+        elif (v is not None and l.get("kind") not in TRIAGE_NEVER_LOG and _session_kind(sessions, l) is None
+                and not _folds_others(raw, start, l) and (not v["is_work"] or not v["needs_attention"])):
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "log",
+                          "why": "triage: " + _one_line(v["title"], TITLE_MAX)})
+        else:
+            title = _one_line(v["title"] if v else str(l.get("title") or ""), TITLE_MAX) or _one_line(str(l["key"]), TITLE_MAX)
+            why = _one_line(v["tldr"] if v else str(l.get("summary") or ""), TLDR_MAX)
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "now", "title": title, "why": why,
+                          "link": l.get("link") or ""})
+    if items:
+        hub.decide(ws, cfg, at, items)
+    out["logged"] = [it["line_id"] for it in items if it["decision"] == "log"]
+    out["now"] = [it["line_id"] for it in items if it["decision"] == "now"]
+    return out
+
+
+INBOX_MAX = 10
+
+
+def inbox_items(ws: Path) -> List[dict]:
+    """The hub's open updates (what a `now` decision makes), newest first, for the Chief pane's Inbox section. The
+    text is line- or model-written, so each field is one safe line. `session` is the live hub session for the key."""
+    h, sessions = hub._hub_doc(ws), hub._sessions_doc(ws)
+    rows = []
+    for u in h["updates"]:
+        if not isinstance(u, dict) or u.get("state") != "open" or not isinstance(u.get("id"), str):
+            continue
+        hit = hub.find_session(sessions, [u.get("key")])
+        rows.append({"id": u["id"], "key": safe_line(u.get("key"), PROGRESS_MAX),
+                     "title": safe_line(u.get("title"), TITLE_MAX), "why": safe_line(u.get("why"), TLDR_MAX),
+                     "link": u.get("link") if isinstance(u.get("link"), str) else "", "at": u.get("at"),
+                     "session": ({"key": hit[0], "title": safe_line(hit[1].get("title") or hit[0], TITLE_MAX)}
+                                 if hit and not _is_cli(hit[1]) else None)})
+    rows.sort(key=lambda r: str(r["at"] or ""), reverse=True)
+    return rows
 
 
 # ---- pinned desktop sessions: a snapshot the console writes from list_sessions, read back for the pane ----------
@@ -1457,10 +1549,16 @@ USAGE = """usage: mother chief <verb> ...
   install [--force]     write ~/Library/LaunchAgents/com.mother.chief.plist and load it (home machine only;
                         refuses while a desktop hub session is active unless --force)
   uninstall             unload the job and remove the plist
-  tick [--json]         one chief pass: apply the manager's DM replies, settle decisions, route, wake the chief,
-                        dispatch queued workers; `batch` says a message is due (`mother decide batch`)
+  tick [--json] [--as <session_id>]
+                        one chief pass: apply the manager's DM replies, settle decisions, route, wake the chief,
+                        dispatch queued workers; `batch` says a message is due (`mother decide batch`).
+                        --as: a console's pass. It leads only when no other session wrote a heartbeat in the
+                        last 120 s; otherwise nothing runs and it prints {"skipped": "<why>"}
   triage --stdin        log the lines a triage verdict list (JSON array on stdin) finds need no judgment;
                         prints {paused, logged, kept, wake} as JSON
+  triage --stdin --decide
+                        a leading console's: stdin is {judge: [line ids], verdicts: [...]}; every judge line is
+                        decided in code, `log` as above and `now` for the rest; prints {paused, logged, now}
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}
   tail --json           each worker's and pinned session's recent tail (at most 6000 characters) for the Chief
@@ -1480,10 +1578,10 @@ A valued option takes --opt=V or --opt V. A key may not start with -."""
 VERBS = {
     "run": (1, ("--detach",), ("--title", "--prompt")),
     "say": (1, (), ()), "hold": (1, (), ()), "release": (1, (), ()),
-    "lines": (0, ("--json",), ()), "status": (0, ("--json",), ()), "tick": (0, ("--json",), ()),
+    "lines": (0, ("--json",), ()), "status": (0, ("--json",), ()), "tick": (0, ("--json",), ("--as",)),
     "keep": (0, (), ()), "install": (0, ("--force",), ()), "uninstall": (0, (), ()),
     "pause": (0, (), ()), "resume": (0, (), ()), "role": (0, (), ()),
-    "triage": (0, ("--stdin",), ()), "pinned": (0, ("--stdin",), ()),
+    "triage": (0, ("--stdin", "--decide"), ()), "pinned": (0, ("--stdin",), ()),
     "tail": (0, ("--json",), ()), "tldr": (0, ("--stdin",), ()), "spend": (0, ("--stdin",), ()),
     "post-log": (0, ("--stdin",), ()),
 }
@@ -1501,8 +1599,10 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     import decisions
     ws = Path(ws)
     cdir = chief_dir(ws)
-    beat = _read_obj(cdir / "heartbeat.json").get("at")
+    beat_doc = _read_obj(cdir / "heartbeat.json")
+    beat = beat_doc.get("at")
     beat_at = hub._parse_at(beat)
+    inbox = inbox_items(ws)
     sid = _read_obj(cdir / "chief.json").get("session_id")
     tz = nowmod.Schedule.from_config(cfg or {}).tz
     live, q = set(running(ws)), queued(ws)
@@ -1540,6 +1640,10 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "decisions": open_,
         "to_decide": len(open_),
         "reply_problem": decisions.reply_channel(ws, cfg or {})[1] if open_ else None,
+        # who wrote the heartbeat: a console session leading with `tick --as`, else the chief's own session
+        "led_by": None if beat_at is None else ("console" if beat_doc.get("session_id") else "chief"),
+        "inbox": inbox[:INBOX_MAX],
+        "inbox_count": len(inbox),
     }
 
 
@@ -1596,7 +1700,10 @@ def _say(ws: Path, cfg: dict, at: datetime, key: str, text: str) -> int:
 
 def _print_status(doc: dict) -> None:
     c = doc["chief"]
-    print("chief: %s%s (heartbeat %s)" % ("alive" if c["alive"] else "not running",
+    state = "alive" if c["alive"] else "not running"
+    if c["alive"] and doc.get("led_by") == "console":
+        state = "led by a desktop session"
+    print("chief: %s%s (heartbeat %s)" % (state,
                                           ", paused" if doc["paused"] else "", c["heartbeat_at"] or "never"))
     b = doc["budget"]
     print("budget: %s" % ("spend file unreadable: no run starts" if b.get("unreadable") else
@@ -1683,6 +1790,13 @@ def main(args, ws, cfg, at) -> int:
             verdicts = json.loads(sys.stdin.read())
         except ValueError as e:
             return _usage("triage: stdin is not JSON (%s)" % e)
+        if opts.get("decide"):
+            if not (isinstance(verdicts, dict) and isinstance(verdicts.get("judge"), list)
+                    and isinstance(verdicts.get("verdicts"), list)):
+                return _usage("triage --decide: stdin must be a JSON object {judge: [...], verdicts: [...]}")
+            judge = [j for j in verdicts["judge"] if isinstance(j, str)]
+            print(json.dumps(triage_decide(ws, cfg, at, judge, verdicts["verdicts"]), indent=2, ensure_ascii=False))
+            return EXIT_OK
         if not isinstance(verdicts, list):
             return _usage("triage: stdin must be a JSON array of verdicts")
         print(json.dumps(triage_apply(ws, cfg, at, verdicts), indent=2, ensure_ascii=False))
@@ -1750,7 +1864,15 @@ def main(args, ws, cfg, at) -> int:
         else:
             _print_status(doc)
         return EXIT_OK
-    r = tick(ws, cfg, at)  # the only verb left
+    who = opts.get("as")  # the only verb left: tick
+    if who is not None:
+        if not who.strip():
+            return _usage("tick --as needs a session id")
+        why = lead(ws, at, who)
+        if why:
+            print(json.dumps({"skipped": why}))
+            return EXIT_OK
+    r = tick(ws, cfg, at, session=who)
     if as_json:
         print(json.dumps(r, indent=2, ensure_ascii=False))
     elif r["paused"]:

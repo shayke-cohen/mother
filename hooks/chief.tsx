@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import { ago, motherBin } from './shared'
+import { SNOOZES, ago, askPrompt, isUrl, motherBin, motherVerb, openSession } from './shared'
 import type { Dollar } from './shared'
-import type { ChiefBatchState, ChiefChip, ChiefDecision, ChiefDesktop, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
+import type { ChiefBatchState, ChiefChip, ChiefDecision, ChiefDesktop, ChiefInboxItem, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
 
 // The Chief pane: the chief's health, one card per headless worker with a chat box and take-over. Every write goes
 // through `mother chief …`; the pane never edits a chief file itself.
@@ -35,7 +35,13 @@ export function chiefStatusText(s: ChiefStatus | null, _role: Role | null): stri
   const toDecide = typeof s.to_decide === 'number' ? s.to_decide : 0
   if (!s.chief?.heartbeat_at && workers.length === 0 && toDecide === 0) return ''
   const working = workers.filter(w => w.status === 'working').length
-  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working` + (toDecide > 0 ? ` · ${toDecide} to decide` : '')
+  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working` + (toDecide > 0 ? ` · ${toDecide} to decide` : '') + inboxStatusText(s)
+}
+
+// ` · N in inbox` for the status line when the hub holds open `now` items; '' otherwise.
+export function inboxStatusText(s: ChiefStatus | null): string {
+  const n = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
+  return n > 0 ? ` · ${n} in inbox` : ''
 }
 
 // Attention order: failed, held, working, idle, then the rest (done); newest last run first within a group.
@@ -756,6 +762,43 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
   await reloadStatus($, bin)
 }
 
+// ---- a leading console: with no chief session alive, one desktop console does the chief's pass in code ----
+// `tick --as <this session>` leads only when no other session wrote a fresh heartbeat (lib/chief.py `lead`); a skipped
+// tick does nothing else. When it led, every judge line gets a decision from `triage --stdin --decide`: logged when its
+// verdict says it needs no attention, a `now` item otherwise, so also when the model call failed or the budget is spent
+// (then no call is made). Never a prompt: no wake, no batch post (`settleBatch` is the chief's).
+async function leadOnce($: Dollar, bin: string): Promise<void> {
+  let sid = ''
+  try { sid = String((await $.session.id()) ?? '').trim() } catch { sid = '' }
+  if (!sid) return
+  const ran = await cli($, bin, ['tick', '--json', '--as', sid])
+  if (!ran.ok) {
+    passError = `mother chief tick failed: ${firstLine(ran.stderr) || 'non-zero exit'}`
+    return
+  }
+  passError = null
+  let r: any = null
+  try { r = JSON.parse(ran.stdout) } catch { return }
+  if (!r || typeof r !== 'object' || typeof r.skipped === 'string' || r.paused === true) return
+  const judge: string[] = Array.isArray(r.judge) ? r.judge.filter((j: unknown): j is string => typeof j === 'string') : []
+  if (!judge.length) return
+  let verdicts: Verdict[] = []
+  if (!overBudget(lastStatus)) {
+    const listed = await cli($, bin, ['lines', '--json'])
+    let all: unknown = null
+    try { all = listed.ok ? JSON.parse(listed.stdout) : null } catch { all = null }
+    if (Array.isArray(all)) {
+      const wanted = new Set(judge)
+      const todo = all.filter((l): l is ChiefLine => !!l && typeof l === 'object' && typeof l.id === 'string' &&
+        typeof l.key === 'string' && wanted.has(l.id))
+      const model = await triageModel($, bin)
+      verdicts = (await Promise.all(todo.map(l => verdictFor($, bin, model, l)))).filter((v): v is Verdict => v !== null)
+    }
+  }
+  const done = await cli($, bin, ['triage', '--stdin', '--decide'], JSON.stringify({ judge, verdicts }))
+  if (!done.ok) passError = `mother chief triage failed: ${firstLine(done.stderr) || 'non-zero exit'}`   // the lines stay pending
+}
+
 // A pane verb: run it, toast a failure's first stderr line, then reload.
 async function act($: Dollar, bin: string, args: string[]): Promise<void> {
   const ran = await cli($, bin, args)
@@ -1198,6 +1241,56 @@ function chipActs($: Dollar, bin: string, chips: ChiefChip[], card: { w?: ChiefW
 
 type Ui = ReturnType<Dollar['ui']['resolve']>
 
+// The Inbox section: the hub's open `now` items (status `inbox`, newest first, at most INBOX_SHOWN), with the Now
+// panel's own actions: `mother hub done|snooze`, and Open session (the key's live session, else the item as a prompt
+// to fill, never to submit). The text is line- or model-written: plain text only.
+const INBOX_SHOWN = 10
+async function inboxVerb($: Dollar, bin: string, args: string[]): Promise<boolean> {
+  const ok = await motherVerb($, bin, 'hub', args)
+  await reloadStatus($, bin)
+  return ok
+}
+function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: number, drafts: Record<string, string> | null) {
+  const { Box, Text, Button, Select, Link } = ui
+  const items: ChiefInboxItem[] = (Array.isArray(s.inbox) ? s.inbox : []).filter(u => !!u && typeof u.id === 'string')
+    .sort((a, b) => (Date.parse(b.at ?? '') || 0) - (Date.parse(a.at ?? '') || 0)).slice(0, INBOX_SHOWN)
+  if (!items.length) return null
+  const total = typeof s.inbox_count === 'number' ? s.inbox_count : items.length
+  const goHub = (args: string[]) => inboxVerb($, bin, args)
+  return (
+    <Box key="inbox" flexDirection="column">
+      <Box marginTop={1}><Text weight="semibold" size="heading">{`Inbox ${total}`}</Text></Box>
+      {items.map(u => {
+        const pickKey = 'inbox-snooze:' + u.id
+        const title = oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)
+        const why = oneLine(u.why, TLDR_MAX)
+        return (
+          <Box key={'inbox-' + u.id} flexDirection="column" marginTop={1}>
+            <Text weight="semibold" wrap="wrap">{title}</Text>
+            {why ? <Text wrap="wrap">{why}</Text> : null}
+            <Box>
+              <Text dimColor>{`${oneLine(u.key, TITLE_MAX)} · ${ago(u.at, nowMs)} `}</Text>
+              {isUrl(u.link) ? <Link href={u.link}>source ↗</Link> : null}
+            </Box>
+            <Box flexWrap="wrap" gap="xs">
+              <Button key={'inbox-open:' + u.id} onPress={() => {
+                if (u.session) openSession($, goHub, u.session.key, { title: oneLine(u.session.title, TITLE_MAX) })
+                else void $.prompt.fill({ text: askPrompt(title, why, isUrl(u.link) ? u.link : null), mode: 'replace' })
+              }}>Open session</Button>
+              <Button key={'inbox-done:' + u.id} onPress={() => goHub(['done', u.id])}>Done</Button>
+              <Button key={pickKey} onPress={() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey) : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [pickKey]: '1' }))}>Snooze</Button>
+            </Box>
+            {drafts?.[pickKey] !== undefined
+              ? <Select key={'inbox-snooze-pick:' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
+                  onSelect={(value: string) => clearDraft($, pickKey).then(() => goHub(['snooze', u.id, value]))} />
+              : null}
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
                   sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
                   drafts: Record<string, string> | null, answers: Record<string, { message: string }> | null) {
@@ -1359,6 +1452,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       {decisions.length || answered.length ? heading(`To decide ${decisions.length}`) : null}
       {decisions.map(decisionCard)}
       {answered.map(([id, a]) => <Text key={'answered:' + id} wrap="wrap">{a.message}</Text>)}
+      {inboxSection($, ui, bin, s, nowMs, drafts)}
       {heading(`Workers ${workers.length}`)}
       {workers.length === 0 ? <Text dimColor>No workers yet.</Text> : null}
       {workers.map(card)}
@@ -1411,7 +1505,8 @@ async function periodFor($: Dollar, bin: string, r: Role | null): Promise<number
 }
 
 // One timer pass, never two at once (a slow tick makes the next period a no-op). Role `chief`: tick, maybe wake,
-// reload. Role `console`: reload only, never tick or submit. Role unknown (its read failed): read it again and
+// reload. Role `console`: reload, and on the desktop surface `tick --as` (leadOnce), which leads only when no chief or
+// other console does; it never submits. Role unknown (its read failed): read it again and
 // reload; nothing ticks until it answers `chief`. Returns the new period when the role just settled, else null.
 export async function chiefPass($: Dollar, configured: string): Promise<number | null> {
   if (busy) return null
@@ -1426,6 +1521,7 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
     }
     if (role === 'console') {
       await snapshotPinned($, bin)
+      if (await onDesktop($)) await leadOnce($, bin)   // a terminal console only reads
       await reloadStatus($, bin)
       void refreshTldrs($, bin).catch(() => undefined)   // detached; refreshTldrs runs one batch at a time
       return null

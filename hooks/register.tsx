@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register, Timer } from 'claude-code'
 
 import { chiefPass, chiefStatusText, registerChief, startChief } from './chief'
-import { ago, clock, motherBin } from './shared'
+import { SNOOZES, ago, askPrompt, clock, isUrl, motherBin, motherVerb, openSession } from './shared'
 import type { Dollar } from './shared'
 import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, HubWatch, InspectRef, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
 
@@ -22,14 +22,13 @@ const chiefRoleAtom = atom({ plugin: 'mother', key: 'chiefRole' } as const, null
 
 const PANE = 'mother-now'
 const FOCUS = 'mother-focus'
-const SNOOZES = ['1h', 'tomorrow', 'next-week'] as const
 const TOP_MAX = 3
 
 export const POLL_MS = 60_000
 export const TOASTED_CAP = 500
 
 // Moved to ./shared (the Chief pane uses them too); re-exported so existing imports keep working.
-export { ago, clock, motherBin }
+export { ago, askPrompt, clock, motherBin }
 export type { Dollar }
 
 // What `load` remembers between polls: the mtime it last read, so an unchanged file is not re-read.
@@ -285,21 +284,7 @@ export function age(since: string, nowMs: number): string {
 // Run one `mother now …` verb (or `hub`, `inbox`), then re-read now.json at once. A failure toasts the first
 // line of stderr. True when it exited 0.
 async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId: string | null = null, group = 'now', toastOut = false): Promise<boolean> {
-  let ok = false
-  try {
-    const ran = await $.process.run(['python3', bin, group, ...args])
-    ok = ran.exitCode === 0
-    if (ran.exitCode === 0 && toastOut) {
-      const first = String(ran.stdout ?? '').split('\n').find(l => l.trim())
-      if (first) $.ui.toast(first.trim())
-    }
-    if (ran.exitCode !== 0) {
-      const line = String(ran.stderr ?? '').split('\n').find(l => l.trim()) ?? `mother ${group} ${args[0]} failed`
-      $.ui.toast(line.trim())
-    }
-  } catch (err) {
-    $.ui.toast(`mother ${group} ${args[0]} failed: ${(err as Error).message ?? String(err)}`)
-  }
+  const ok = await motherVerb($, bin, group, args, toastOut)
   await load($, bin, loader).catch(() => undefined)
   if (rowId) await update($, snoozingAtom, cur => (cur === rowId ? null : cur))
   return ok
@@ -381,12 +366,6 @@ export function suggestedPrompts(doc: NowDoc, top: NowTop[], nowMs: number): Sug
   return out.slice(0, PROMPTS_MAX)
 }
 
-// The prompt an item's or a Top 3 entry's "Ask" button fills: the item in full, ready to send as is.
-export function askPrompt(title: string, why: string | null | undefined, link: string | null | undefined): string {
-  return `Help me close this out: "${title}"` + (why ? ` — ${why}` : '') + (link ? ` (${link})` : '')
-    + '. What is the fastest next step? Draft anything that reaches another person; don\'t send.'
-}
-
 // ---- quick actions ---------------------------------------------------------------------------------
 
 // What the panel offers to do about an item, from its kind (the id's first part) and signal alone: no model
@@ -435,7 +414,6 @@ export function quickActions(i: NowItem): Quick[] {
 type Ui = ReturnType<Dollar['ui']['resolve']>
 
 // A link the surface can open; a workspace path (`teams/x/intake.md#1`) stays in the Ask prompt instead.
-const isUrl = (link: string | null | undefined): link is string => !!link && /^https?:\/\//.test(link)
 
 export type Chip = { label: string; url: string }
 
@@ -1296,12 +1274,6 @@ export function sessionForItem(sessions: HubSessions | null, i: NowItem): [strin
     if (theirs.some(t => mine.has(t))) return [key, v]
   }
   return null
-}
-
-// Open a session: fill the prompt (the way in on a surface that cannot open the link) and run `session seen`.
-function openSession($: Dollar, goHub: (args: string[], rowId?: string | null) => Promise<boolean>, key: string, v: HubSession) {
-  void $.prompt.fill({ text: `Open my "${v.title}" session`, mode: 'replace' })
-  void goHub(['session', 'seen', key])
 }
 
 // `mother hub refresh`: restart the watcher, reconnect every source and poll it now. It can take a minute, so the
