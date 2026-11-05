@@ -1051,8 +1051,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await ui.unmount()
   })
 
-  test(`a chief worker is not listed as a hub session, on ${surface}`, () => {
-    // kind "cli": a worker the Chief pane owns, kept in sessions.json by `mother chief`
+  test(`a leftover worker row (kind cli) is not listed as a hub session, on ${surface}`, () => {
+    // kind "cli": a headless worker's row from before 0.18.0, still in sessions.json
     const ss = sessionsDoc({ 'PLAT-2': session({ unseen: 2 }), 'PLAT-5': session({ session_id: 'w-1', unseen: 3, kind: 'cli' }) })
     expect(liveSessions(ss as any).map(([k]) => k)).toEqual(['PLAT-2'])
     expect(waitingCount(bundle(watcher(), hubDoc(), ss) as any)).toBe(1)

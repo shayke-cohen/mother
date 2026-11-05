@@ -32,14 +32,13 @@ holds code a later session would run.
 | `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
 | `hooks/hooks.json` | Wires the hooks | `modules` → `hooks/register.tsx` (the Now panel); PreToolUse → guard (every tool it has a rule for; tests/test_packaging.py checks); Stop and SessionEnd → `mother sync --quiet`. The command hooks run even if the panel module fails to load |
 | `hooks/register.tsx`, `types/index.d.ts` | The Now panel, a hooks module (mod API, early access) in the same plugin: `/now-panel` opens Home, a row opens the Inspector pane (one page per item, update, session, proposal, decision queue, team, Mother), status line, toasts | Reads `.mother/now.json` and the hub's files; writes only through `mother now …` / `mother hub …`. `mother_bin` userConfig, empty = `${plugin root}/bin/mother`. Tests: `claude plugin test .` (`hooks/register.test.tsx`) |
-| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. `hooks/guard_outcome.py` writes what a decision's call answered onto its ledger use, so `✓` means a seen success. `hooks/guard_fast.py` takes every tool the main matcher doesn't and escalates to the guard for channel roles, MOTHER's sub-agents, hub and hub-fed sessions and the grant key; otherwise it passes without loading the guard. Reads `stamps` from `capabilities.json` to block writes to others through a connector that adds its own attribution. CONTRACT §5 |
+| `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call | Recognises tools by capability, not server name. Fails closed. |
 | `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, register, runs watchdog, speak/tts | Dispatches `channels`, `items`, `eval`, `health` to `lib/` |
 | `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
 | `lib/channels.py` | Reply-mode engine behind `mother:channels` | The skill does chat I/O; this decides who, when, and what. CONTRACT §5b |
 | `lib/whatsapp.py` | `mother whatsapp`: chats and read from the local WhatsApp database, send through the bridge, setup and link | Home machine only; the guard asks before each send to someone else. CONTRACT §5d |
 | `bridge/whatsapp/` | Send-only WhatsApp bridge (Node, Baileys linked device) on a 0600 Unix socket | Optional; `checks.mjs` = pure send rules (cap, gap), `bridge.mjs` = socket + WhatsApp. CONTRACT §5d |
 | `lib/grants.py` | `mother grant add\|remove\|list`: the one writer of `.mother/grants.json` for unattended runs | Checks each grant with the guard's own `valid_grant` before writing; the guard asks for any other write. CONTRACT §5 |
-| `lib/decisions.py` | `mother decide propose\|answer\|batch\|sent`: the decision queue in `.mother/chief/decisions.json` | A worker files the exact call it wants to make, bound by `guard.draft_sha`; only code writes the matching grant. `tick` applies self-DM replies and closes approved decisions from the ledger. Output shapes are held to `tests/fixtures/chief_cli.ts` by `tests/test_cli_contract.py`, and the mod's test reads the same file. Changed under `decisions.locked` |
 | `lib/floor.py` | `mother floor card\|list`: one card per session in `.mother/floor/` | Each pinned session's mod (`hooks/floor.ts`) writes whether its last turn stopped on a question for the manager; the Chief pane draws them as Needs you (CONTRACT §5g). |
 | `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
 | `lib/now.py` | Deterministic core of the hourly tick and Now panel (working hours, signal thresholds, merge into `now.json`, the `mother now` verbs) | Python 3.9 stdlib only |
@@ -47,7 +46,7 @@ holds code a later session would run.
 | `lib/hub_mcp.py` | Minimal MCP stdio client plus the read-only wrapper the watcher uses | Allow-list enforced before send. CONTRACT §5e |
 | `lib/inbox.py` | `mother inbox archive\|read`: the Now panel's mail triage over the hub's mail connection, no model | Asks `guard.classify_mcp` before each write, stops while PAUSED, logs to guard.log; the triage tools live in `hub_sources.MailGmail.TRIAGE`. CONTRACT §5f |
 | `lib/hub_sources.py` | Per-capability poll adapters and the deterministic prefilter | Product-specific tool names live only here. The `whatsapp` adapter reads through `LocalWhatsApp` (the reader functions of `lib/whatsapp.py` only: no bridge, no send). CONTRACT §5e |
-| `lib/chief.py` | Chief workers: headless Claude sessions registered in the hub's `sessions.json`, the say queue, daily spend, pause, `run`, and the tmux keeper + launchd job that keep the chief's own session alive | One writer per worker (flock); every state write under `hub.locked`. Python 3.9 stdlib only |
+| `lib/chief.py` | `mother chief tick\|triage\|lines\|status\|pinned\|tail\|tldr\|spend\|pause\|resume`: the leading desktop session's pass (heartbeat and leader rule, muted lines logged, judge lines decided in code from a triage model's verdicts), the Chief pane's status, pinned desktop sessions, TL;DRs and the daily model spend under `.mother/chief/` | Until 0.18.0 also the chief session, its keeper and headless workers; what they left on disk is ignored. |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
 | `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |
@@ -63,8 +62,7 @@ Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `d
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
-`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`, `chief` (not scheduled: the chief's
-standing instructions, read by its own CLI session).
+`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
 
 ## How a scheduled run flows
 
@@ -117,7 +115,7 @@ pinned desktop session (/mother:hub): Monitor on `tail --follow` wakes it on eac
   ├─ session map: .mother/hub/sessions.json (thing → session; DMs keyed per conversation)
   ├─ overflow proposals wait in `pending`, raised on later wakes (`mother hub pending raised`); pending and unseen expire after update_ttl_hours working hours
   └─ in-app session tools pass the guard only inside what the hub manages (messages into live sessions.json sessions, own_initiative cards); anything else asks; sub-agents and channel sessions are denied
-chief (optional, replaces the pinned hub session): launchd keeper → tmux `mother-chief` → the chief's own CLI session, woken by `mother chief tick` (heartbeat, route what needs no judgment, model triage in the mod (`chief.triage_model`), wake); decides with `mother hub decide`, starts headless workers with `mother chief run` (flock per worker, state in sessions.json `kind: "cli"`, spend and queue under `.mother/chief/`); the Chief pane shows it and the pinned desktop sessions; workers file decisions the manager answers in the self-DM or the pane, and code writes a one-use grant bound to that exact call (`mother decide`). CONTRACT §5g
+chief pane (desktop app): one desktop session leads → `mother chief tick --as` every minute (heartbeat, muted lines logged, the rest triaged by a cheap model and recorded in code as Inbox items or logs) → the Chief pane shows Needs you (`hooks/floor.ts`), Inbox, pinned sessions with TL;DRs, Health
 Now panel: Home's Sessions group (news first, proposals, View all) and an Inspector page per session (routed lines, what it watches); Open session fills the prompt to open it and marks it seen; the manager sends it (desktop draws only https links)
 ```
 

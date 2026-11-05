@@ -23,16 +23,13 @@ Commands:
                                the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e)
   hub add|follow|unfollow|mute|unmute|watching
                                the manager's steering: hand the hub a link or note, and the watch and mute lists
-  chief run|say|hold|release|lines|status|tick|pause|resume|role|triage|pinned|tail|tldr|spend|post-log
-                               headless workers and the chief that routes to them (`mother chief help`)
+  chief tick|triage|lines|status|pause|resume|pinned|tail|tldr|spend
+                               the leading session's pass and the Chief pane's reads (`mother chief help`)
   inbox archive|read <mail:ID | mail link>...
                                the Now panel's mail triage, no model: archive or mark read through the hub's mail
                                connection, checked against the guard first (docs/CONTRACT.md §5f)
   floor card --stdin | floor list --json
                                each session's card: did it stop on a question for the manager (`mother floor help`)
-  decide propose <key> --tool T --recommend R [--why W] [--urgent] --stdin
-  decide batch [--json] | decide sent --ts TS [--ids D7,D8|'']
-                               a worker files the exact call it wants to make, for the manager's decision
   grant add <scope> <target> --by <user-id> --cites <link|ts> [--uses N] [--hours H] [--run ID] | remove --run ID | list
                                the only writer of .mother/grants.json for unattended runs (checked like the guard)
   memory index <memory-file> [--title T] [--hook H] | check
@@ -62,7 +59,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.17.1"
+VERSION = "0.18.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -468,11 +465,12 @@ def validate_hub(h) -> list:
     return errs
 
 
-# config.json -> chief (CONTRACT §5g; lib/chief.py DEFAULTS, which a test holds equal): "count" a whole number from 1,
-# "positive" a number above 0, "money" a number from 0, "text" any string, "model" a TL;DR or triage model.
-CHIEF_FIELDS = {"max_workers": "count", "run_minutes": "positive", "daily_budget_usd": "money", "chief_model": "text",
-                "worker_model": "text", "tick_seconds": "positive", "tldr_model": "model", "triage_model": "model",
-                "batch_minutes": "positive", "decision_hours": "positive"}
+# config.json -> chief (CONTRACT §5g; lib/chief.py DEFAULTS, which a test holds equal): "money" a number from 0,
+# "model" a TL;DR or triage model.
+CHIEF_FIELDS = {"daily_budget_usd": "money", "tldr_model": "model", "triage_model": "model"}
+# the chief session's and its workers' keys (before 0.18.0): accepted, ignored
+CHIEF_LEGACY_KEYS = {"max_workers", "run_minutes", "chief_model", "worker_model", "tick_seconds", "batch_minutes",
+                     "decision_hours"}
 CHIEF_MODELS = ("sonnet", "opus")
 
 
@@ -483,16 +481,12 @@ def validate_chief(c) -> list:
     for k, v in c.items():
         kind = CHIEF_FIELDS.get(k)
         number = isinstance(v, (int, float)) and not isinstance(v, bool)
+        if k in CHIEF_LEGACY_KEYS:
+            continue
         if kind is None:
             errs.append(f"unknown key chief.{k}")
-        elif kind == "count" and not (isinstance(v, int) and not isinstance(v, bool) and v >= 1):
-            errs.append(f"chief.{k} must be a whole number of 1 or more")
-        elif kind == "positive" and not (number and v > 0):
-            errs.append(f"chief.{k} must be a number above 0")
         elif kind == "money" and not (number and v >= 0):
             errs.append(f"chief.{k} must be a number of 0 or more")
-        elif kind == "text" and not isinstance(v, str):
-            errs.append(f"chief.{k} must be a string")
         elif kind == "model" and v not in CHIEF_MODELS:
             errs.append(f"chief.{k} must be one of {', '.join(CHIEF_MODELS)}")
     return errs
@@ -1333,8 +1327,8 @@ def cmd_hub(args):
 def cmd_chief(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import chief
-    if args[:1] in ([], ["help"], ["-h"], ["--help"], ["role"]) or (args and args[0] not in chief.VERBS):
-        sys.exit(chief.main(args, None, {}, _now()))  # no workspace needed: help, usage errors, role
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]) or (args and args[0] not in chief.VERBS):
+        sys.exit(chief.main(args, None, {}, _now()))  # no workspace needed: help, usage errors
     ws = workspace()
     sys.exit(chief.main(args, ws, load_config(ws), _now()))
 
@@ -1346,15 +1340,6 @@ def cmd_inbox(args):
         sys.exit(inbox.main(args, None, {}))
     ws = workspace()
     sys.exit(inbox.main(args, ws, load_config(ws)))
-
-
-def cmd_decide(args):
-    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
-    import decisions
-    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
-        sys.exit(decisions.main(args, None, {}))
-    ws = workspace()
-    sys.exit(decisions.main(args, ws, load_config(ws)))
 
 
 def cmd_floor(args):
@@ -1528,7 +1513,7 @@ def cmd_guard(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"guard": cmd_guard, "init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "chief": cmd_chief, "inbox": cmd_inbox, "grant": cmd_grant, "decide": cmd_decide, "floor": cmd_floor, "memory": cmd_memory, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "chief": cmd_chief, "inbox": cmd_inbox, "grant": cmd_grant, "floor": cmd_floor, "memory": cmd_memory, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

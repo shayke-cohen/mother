@@ -44,7 +44,7 @@ export function ago(iso: string | undefined | null, nowMs: number): string {
 const UNSAFE_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g
 export const safe = (text: string): string => text.replace(/\t/g, ' ').replace(UNSAFE_RE, '')
 
-// One line of untrusted text (worker-written, model-written) for a toast, a list or a card.
+// One line of untrusted text (line-written, model-written) for a toast, a list or a card.
 export const oneLine = (text: unknown, cap = 200): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ').slice(0, cap)
 // ---- hub actions both panes offer (the Now panel's hub updates, the Chief pane's Inbox) ----
 

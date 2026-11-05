@@ -1,5 +1,7 @@
 {
-  "modules": ["./register.tsx"],
+  "modules": [
+    "./register.tsx"
+  ],
   "hooks": {
     "PreToolUse": [
       {
@@ -19,30 +21,6 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_fast.py\"",
             "timeout": 60
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "^mcp__",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_outcome.py\"",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "^mcp__",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_outcome.py\"",
-            "timeout": 10
           }
         ]
       }

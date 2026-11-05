@@ -118,7 +118,7 @@ export type HubSession = {
   opened_at?: string; last_routed_at?: string | null
   unseen?: number
   state: 'live' | 'dropped'
-  kind?: 'cli'            // a chief worker (`mother chief`); the hub and its panel leave it alone
+  kind?: 'cli'            // a row left over from before 0.18.0 (a headless worker); the hub panel leaves it alone
 }
 
 export type HubSessions = { version: 1; sessions: Record<string, HubSession> }
@@ -137,32 +137,15 @@ export type InspectRef = {
 // What the panel holds of the hub files; null = the file is missing (or never read).
 export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watcher: WatcherDoc | null; watch: HubWatch | null }
 
-// `mother chief status --json` (lib/chief.py status_doc, version 1). Workers: running first, then newest last run.
-export type ChiefWorker = {
-  key: string
-  title: string
-  status: 'working' | 'idle' | 'done' | 'failed' | string
-  held: boolean
-  running: boolean        // holds the run lock now: a turn is in flight
-  progress: string
-  cost: number
-  runs: number
-  last_run_at: string | null
-  session_id: string | null
-  queued: number          // say/route lines waiting for this worker
-  resume: string          // `claude --resume <session_id>`
-  unseen?: number         // routed updates not yet seen (sessions.json); absent from an older CLI
-}
-
 // One recommended action on a Chief pane card. Only these kinds exist; the pane drops anything else.
 export type ChiefChip =
   | { kind: 'reply'; text: string }
-  | { kind: 'take_over' | 'hand_back' | 'hold' | 'release' | 'open' | 'mark_seen' }
+  | { kind: 'open' }
 
 // A card's TL;DR (at most 2 short lines) and up to 3 chips, from one model call over the session's recent tail.
 export type ChiefTldr = { tldr: string; chips: ChiefChip[] }
 
-// A pinned desktop session (lib/chief.py desktop_status), from the snapshot the desktop console writes.
+// A pinned desktop session (lib/chief.py desktop_status), from the snapshot a desktop session writes.
 export type ChiefDesktop = {
   session_id: string                 // local_…
   cli_session_id: string             // what $.session.send reaches it by
@@ -187,58 +170,17 @@ export type FloorCard = {
 }
 export type FloorState = { cards: FloorCard[]; self: string | null; answered: string[] }
 
-// A decision a worker filed (lib/decisions.py). The pane draws the pending ones; `text` is the draft's first 400
-// characters, `full_text` all of it; `target` is where the call goes. The last two are absent from an older CLI.
-export type ChiefDecision = {
-  id: string                         // D<n>
-  key: string
-  kind: string
-  tool?: string | null               // the full tool name, mcp__<server>__<tool>; absent from an older CLI
-  recommendation: string
-  why: string
-  text: string
-  full_text?: string
-  target?: string | null
-  edit_refusal?: string | null       // why Edit can't be used on this call; absent from an older CLI
-  edit_text?: string | null          // the one field an edit replaces: Edit's prefill
-  urgent: boolean
-  status: 'pending' | 'approved' | 'rejected' | 'redirected' | 'expired' | 'sent' | 'failed' | 'unconfirmed' | 'manual' | string
-  created: string
-  expires: string
-}
-
-// The batch post's state (hooks/chief.tsx settleBatch), in session state so a reload of the mod can't post twice.
-export type ChiefBatchState = {
-  sentOwed: { ids: string; ts: string } | null   // posted; `decide sent` hasn't recorded it yet
-  holdUntil: number        // epoch ms: no post before this
-  failures: number         // posts that surely did not land, in a row
-  wokenFor: string | null  // the batch that already got its one wake line
-  lineDue: boolean         // the wake line goes out with the next wake
-  note: string | null      // why the last attempt failed, for the pane
-  urgentSeen: string[]     // urgent decisions known at the last attempt; any other ends a hold
-  holdEnds: number[]       // epoch ms of holds an urgent decision ended, the last hour's; outlives a batch
-  lastAttemptAt: number | null   // epoch ms of the last post attempt; outlives a batch
-  sentFailures: number     // `decide sent` failures in a row for what's owed
-  sentRetryAt: number      // epoch ms: no `sent` before this, once it has failed 3 times
-  recordLineDue: boolean   // the "batch record is failing" line goes out with the next wake
-  recordWoken: boolean     // that line already went out for this debt
-  checkLine?: string | null   // the may-have-landed line (look for the batch, record it, never post) for the next wake
-}
-
+// `mother chief status --json` (lib/chief.py status_doc, version 1).
 export type ChiefStatus = {
   version: 1
   at: string
   paused: boolean
-  chief: { alive: boolean; heartbeat_at: string | null; session_id: string | null }
-  // spent reads 0.0 when spend.json is unreadable; unreadable and over (spent >= limit, or unreadable) mean no run
-  // starts; both are absent from an older CLI
+  chief: { alive: boolean; heartbeat_at: string | null }   // the heartbeat a leading session's `tick --as` writes
+  // spent reads 0.0 when spend.json is unreadable; unreadable and over (spent >= limit, or unreadable) mean no model
+  // call is made
   budget: { spent: number; limit: number; unreadable?: boolean; over?: boolean }
-  workers: ChiefWorker[]
-  desktop?: ChiefDesktop[]           // pinned desktop sessions; absent from an older CLI
-  decisions?: ChiefDecision[]        // absent from an older CLI
-  to_decide?: number                 // pending decisions; absent from an older CLI
-  reply_problem?: string | null      // what stops self-DM replies from working, while decisions are open
-  led_by?: 'chief' | 'console' | null  // who wrote the heartbeat: the chief session, or a console leading (`tick --as`)
+  desktop?: ChiefDesktop[]           // pinned desktop sessions
+  led_by?: string | null             // the session id that wrote the heartbeat while it is fresh (under 120 s), else null
   inbox?: ChiefInboxItem[]           // the hub's open updates (`now` decisions), newest first, at most 10
   inbox_count?: number               // all of them
 }
@@ -261,14 +203,10 @@ declare module 'claude-code' {
       hub: HubBundle | null     // watcher.json, hub.json, sessions.json and watch.json as last read
       inspect: InspectRef[] | null // the Inspector's back stack; the last ref is the page shown
       chief: ChiefStatus | null    // `mother chief status --json` as last read; null until it answers
-      chiefRole: 'chief' | 'console' | null   // `mother chief role` at session start: only `chief` ticks and wakes
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
       chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
-      chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by session id (a worker's session_id, a pinned cli_session_id)
-      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<key>`, `say:<cli id>`), a decision being edited (`decide-text:<id>`); `decide-all:<id>` is set while a card shows its whole draft
-      chiefAnswers: Record<string, { message: string }> | null   // the last answers' messages, by decision id
-      chiefBatch: ChiefBatchState | null            // the batch post's state; null until the first post
-      chiefToasted: string[] | null                 // urgent decision ids already toasted this session
+      chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by a pinned session's cli_session_id
+      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<cli id>`); `inbox-snooze:<id>` is set while an Inbox item's snooze picker is open
       chiefFloor: FloorState | null                 // `mother floor list --json` as last read, this session's id, and the cards answered from the pane since
     }
   }

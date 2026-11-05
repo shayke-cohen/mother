@@ -18,7 +18,6 @@ export const inspectAtom = atom({ plugin: 'mother', key: 'inspect' } as const, n
 // The Chief pane's (hooks/chief.tsx writes them); the status line reads them. The state scan wants each read's atom
 // declared in the reading file, so these repeat chief.tsx's refs.
 const chiefAtom = atom({ plugin: 'mother', key: 'chief' } as const, null)
-const chiefRoleAtom = atom({ plugin: 'mother', key: 'chiefRole' } as const, null)
 const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)
 
 const PANE = 'mother-now'
@@ -59,7 +58,7 @@ const NO_HUB: HubBundle = { hub: null, sessions: null, watcher: null, watch: nul
 const WATCHER_DOWN_MS = 10 * 60_000
 const ROUTED_SHOWN = 10
 
-// A chief worker (kind 'cli') is the Chief pane's, not a hub session: it is never listed or counted here.
+// A row of kind 'cli' is left over from before 0.18.0 (a headless worker): it is never listed or counted here.
 export const liveSessions = (s: HubSessions | null | undefined): [string, HubSession][] =>
   Object.entries(s?.sessions ?? {}).filter(([, v]) => v && v.state === 'live' && v.kind !== 'cli')
 
@@ -157,7 +156,7 @@ export async function load($: Dollar, bin: string, loader: Loader): Promise<void
 async function drawStatus($: Dollar): Promise<void> {
   const nowMs = await $.clock.now()
   $.ui.status(statusText(await read($, docAtom), nowMs) + hubStatus((await read($, hubAtom)) ?? NO_HUB, nowMs)
-    + chiefStatusText(await read($, chiefAtom), await read($, chiefRoleAtom), await read($, floorAtom)))
+    + chiefStatusText(await read($, chiefAtom), await read($, floorAtom)))
 }
 
 // Only a missing file means "no tick here"; any other failure keeps the previous doc and sets `error`.
@@ -1323,7 +1322,7 @@ export const register: Register = (on, options) => {
     // The Chief pane's timer lives here, so each pass can redraw the status line (chief.tsx cannot call drawStatus).
     // A failure never stops the Now panel.
     const armChief = (ms: number) => {
-      chiefTimer?.cancel()   // a repeated session.start, or a role that just settled, must not stack a second timer
+      chiefTimer?.cancel()   // a repeated session.start must not stack a second timer
       chiefTimer = $.clock.every(ms, async () => {
         const changed = await chiefPass($, configured).catch(() => null)
         await drawStatus($).catch(() => undefined)
@@ -1332,7 +1331,7 @@ export const register: Register = (on, options) => {
     }
     const chiefMs = await startChief($, configured).catch(() => null)
     if (chiefMs) armChief(chiefMs); else chiefTimer?.cancel()
-    await drawStatus($).catch(() => undefined)               // now with the chief's state, without re-reading files
+    await drawStatus($).catch(() => undefined)               // now with the Chief pane's state, without re-reading files
     return next(e)
   })
 
