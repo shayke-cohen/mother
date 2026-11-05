@@ -2,6 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import { chiefStatusText, cleanTldr, ledByText, sessionOrder, parseVerdict, triagePrompt, ASK_EMPTY, CONTEXT_MAX, TRIAGE_PROMPT_MAX, TRIAGE_SYSTEM } from './chief'
 import { caseBrief, parseCase, relayText } from './cos'
 import { bannerSvg, budgetBar, cardState, clip, humanLabel, inboxOrder, isOpen, itemSource, linksOf, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
+import { Card, ICONS, PALETTE, Pill, barSvg, labelOf, pillFills, skinFor, skinUi, themeOf } from './skin'
 import { CLI } from '../tests/fixtures/chief_cli'
 import { decisionLabel, dotsId, guardState, healthProblems, isWatcherError, sourceRows, teamGroups } from './pane_tabs'
 import { promptHabits, quietedOf } from './habits'
@@ -26,11 +27,16 @@ type Cli = { exitCode: number; stdout?: string; stderr?: string }
 const ON_GET = '__test_on_get'
 let submitFate: ((e: any) => 'ok' | 'drop' | 'throw') | null = null
 let actLogFate: 'ok' | 'fail' | 'throw' = 'ok'   // what `mother chief act-log --stdin` does; a test may have it fail
+// The skin the store hands a booted session (`/chief skin`): `plain` is the app's own look, which most tests read on
+// both surfaces; the dark skin's tests set `dark` (the desktop app's default when the store holds nothing).
+let bootSkin: 'plain' | 'dark' | null = 'plain'
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
                     surface: 'terminal' | 'desktop' = 'terminal', sessionId = 'sess-1', files: Record<string, string> = {}, env: Record<string, string> = {},
                     store: Record<string, unknown> | 'broken' = {}, expand = true) {
+  const skin = bootSkin   // this boot's skin; the next boot is plain again unless its test says otherwise
+  bootSkin = 'plain'
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m', ...env })
   const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[], acts: [] as any[] }
@@ -38,7 +44,7 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
   // per key, as the host merges each write into the file under its lock; `ON_GET` lets a test act as another process
   on('store.get', (_: any, e: any) => {
     if (store === 'broken') return { deny: 'unreadable' }
-    const v = store[e.key]
+    const v = e.key === 'chiefSkin' && !(e.key in store) ? skin ?? undefined : store[e.key]
     if (typeof store[ON_GET] === 'function') (store[ON_GET] as (k: string) => void)(e.key)
     return { value: v }
   })
@@ -327,7 +333,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | skin dark|plain|status | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -2935,4 +2941,318 @@ test('test_chief_habits_command_runs_the_switch', async ($, on) => {
   expect(await run('habits on')).toBe('habits on: 3 quieted in 7 days')
   expect(chiefCalls(out, 'habits').map(a => a.slice(4))).toEqual([['status'], ['off'], ['status'], ['on']])
   expect(await run('habits maybe')).toMatch(/^Usage: \/chief /)
+})
+
+// ---- the skin: a dark panel, cards, pills and badges on the desktop app; the app's own look anywhere else ----
+// A session with something on every tab: a session that asks, two pinned sessions, two Inbox items (one with a
+// verdict), a watcher error, an undelivered report, a quieted line, and a now.json with a Top 3, on-you, neglected and
+// suggested items. `skin` is what the store holds (null = nothing: the default); `theme` the app's `theme` row.
+const SKIN_INBOX = [
+  { ...INBOX[0], kind: 'decide', on: 'manager', urgency: 'now', actions: [{ label: 'Propose an owner', prompt: 'Read the thread, then recommend an owner; draft the reply.' },
+                                                                         { label: 'Draft reply', prompt: 'Draft a reply.' }, { label: 'Summarise', prompt: 'Summarise it.' }] },
+  INBOX[1],
+  { id: 'U5', key: 'mail:abc', title: 'Vendor contract renewal: reply by Friday', why: 'the vendor asked twice', link: 'https://example.com/m', at: '2026-11-02T08:00:00Z', session: null },
+]
+const RICH_DOC = () => NOW_DOC({ coverage: COVERAGE, items: [
+  NOW_ITEM('pr:1', 'on_you', 'Review the release PR', { actions: [{ id: 'S1', label: 'Review it', prompt: 'mother now do S1', task: 'x' }] }),
+  NOW_ITEM('chat:2', 'on_you', 'Answer the design question'), NOW_ITEM('ticket:3', 'neglected', 'A neglected ticket'),
+  NOW_ITEM('mail:4', 'suggestion', 'Clear the vendor thread')] })
+async function bootRich($: any, on: any, o: { skin?: 'dark' | 'plain' | null; theme?: unknown; surface?: 'terminal' | 'desktop'; store?: Record<string, unknown> } = {}) {
+  bootSkin = o.skin === undefined ? null : o.skin
+  const fills: string[] = []
+  const sends: any[] = []
+  {
+    on('ui.panes', () => ({ value: SHOWN }))
+    on('model.complete', () => answered(TLDR))
+    on('session.surfaces', () => ({ value: [o.surface ?? 'desktop'] }))
+    on('mcp.call', (_: any, e: any) => (e.tool === 'list_sessions' ? { value: { content: [{ type: 'text', text: '[]' }], isError: false } } : { deny: 'no connected MCP tool' }))
+    on('session.send', (_: any, e: any) => { sends.push(e); return { isDelivered: true } })
+    on('prompt.fill', (_: any, e: any) => { fills.push(e.text); return { isFilled: true } })
+    if (o.theme !== undefined) on('config.list', () => ({ value: o.theme === null ? [] : [{ key: 'theme', label: 'Theme', kind: 'choice', value: o.theme }] }))
+    const booted = await boot($, on, argv => {
+      if (argv[0] === 'status') {
+        return { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2, PINNED], inbox: [...SKIN_INBOX, WATCH_ERR('U7', 'mail', '2026-11-02T09:00:00Z')], inbox_count: 3, led_by: 'sess-1',
+          quieted: { on: true, count_7d: 1, recent: [{ id: 'L7', key: 'mail:q', bucket: 'mail|who|Sam', title: 'Newsletter', label: 'mail thread', why: 'never opened', at: '2026-11-02T09:00:00Z' }] },
+          health: HEALTH({ guard: 'off', watcher: { at: '2026-11-02T09:59:00Z', stale: false, active: true, sources: { chat: { status: 'ok' }, mail: { status: 'couldnt_check', reason: 'sign-in expired' } } },
+                           watcher_errors: [WATCH_ERR('U7', 'mail', '2026-11-02T09:00:00Z')], watcher_error_count: 1,
+                           undelivered: [{ name: 'digest-unsent-2026-11-01.md', routine: 'digest', date: '2026-11-01', bytes: 3000 }] }) })) }
+      }
+      if (argv[0] === 'tail') return { exitCode: 0, stdout: JSON.stringify({ version: 1, model: 'sonnet', sessions: [TAIL_2, TAIL_P] }) }
+      if (argv[0] === 'tldr') return { exitCode: 0, stdout: '{"stored": 1}\n' }
+      if (argv[0] === 'floor') return { exitCode: 0, stdout: JSON.stringify({ version: 1, cards: [asking()] }) }
+      return undefined
+    }, o.surface ?? 'desktop', 'sess-1', nowFile(RICH_DOC()), {}, o.store ?? {})
+    await booted.clock.advance(60_000)   // one pass: the floor's cards and the session cards are read
+    return { ...booted, fills, sends }
+  }
+}
+
+type Node = { type?: string; key?: string; props?: Record<string, any>; children?: unknown[] }
+const nodeKey = (n: Node): string | undefined => n.key ?? n.props?.key
+// Every element of a drawn tree, each with whether it sits inside the dark panel and inside a Button.
+function nodes(el: unknown, inPanel = false, inButton = false, out: { n: Node; inPanel: boolean; inButton: boolean }[] = []) {
+  if (Array.isArray(el)) { for (const c of el) nodes(c, inPanel, inButton, out); return out }
+  if (!el || typeof el !== 'object') return out
+  const n = el as Node
+  const panel = inPanel || (n.type === 'Box' && n.props?.backgroundColor === PALETTE.panel)
+  if (typeof n.type === 'string') out.push({ n, inPanel, inButton })
+  nodes(n.children, panel, inButton || n.type === 'Button', out)
+  return out
+}
+const trimmed = (t: unknown) => String(t ?? '').replace(/\u00a0/g, ' ').trim()
+// The Box a pill's Button sits in.
+const pillBox = async (ui: any, key: string) => (await ui.find({ key: 'pill:' + key }))?.props ?? null
+const HEX = /^#[0-9a-f]{6}$/
+
+test('test_dark_skin_every_tab_has_coloured_text_plain_buttons_and_keyed_hovers', async ($, on) => {
+  await bootRich($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  for (const tab of ['all', 'needs', 'inbox', 'sessions', 'today', 'team', 'health']) {
+    await ui.press({ key: 'tab:' + tab })
+    const all = nodes(await ui.drawn())
+    const panels = all.filter(x => x.n.type === 'Box' && x.n.props?.backgroundColor === PALETTE.panel)
+    expect([tab, panels.length, nodeKey(panels[0].n), panels[0].n.props?.borderColor]).toEqual([tab, 1, 'panel', PALETTE.line])   // one dark rounded panel
+    const inside = all.filter(x => x.inPanel)
+    expect(inside.length).toBeGreaterThan(20)
+    // every Text in the panel (a Button's label aside: the surface gives it no colour) has an explicit hex colour
+    const bare = inside.filter(x => x.n.type === 'Text' && !x.inButton && !HEX.test(String(x.n.props?.color ?? ''))).map(x => JSON.stringify(x.n).slice(0, 120))
+    expect([tab, bare]).toEqual([tab, []])
+    // no native chrome: every Button in the panel is `plain`, with no variant of the app's
+    const buttons = inside.filter(x => x.n.type === 'Button')
+    expect(buttons.length).toBeGreaterThan(7)
+    expect([tab, buttons.filter(x => x.n.props?.plain !== true || x.n.props?.variant !== undefined).map(x => nodeKey(x.n))]).toEqual([tab, []])
+    // no Box key is taken twice (a key a sibling took names no hover scope); the hover Boxes themselves are checked
+    // in test_every_hover_box_the_skin_draws_is_keyed: a drawn tree does not carry `hover`
+    const boxKeys = all.filter(x => x.n.type === 'Box').map(x => nodeKey(x.n)).filter(Boolean)
+    expect([tab, boxKeys.filter((k, i) => boxKeys.indexOf(k) !== i)]).toEqual([tab, []])
+    // no fill or border is a theme key: the palette only
+    const offPalette = inside.flatMap(x => [x.n.props?.backgroundColor, x.n.props?.borderColor]).filter(c => c !== undefined && !HEX.test(String(c)))
+    expect([tab, offPalette]).toEqual([tab, []])
+  }
+  await ui.unmount()
+})
+
+test('test_dark_skin_keeps_every_button_and_field_key_of_the_plain_one', async ($, on) => {
+  const keysOf = async (skin: 'dark' | 'plain') => {
+    await $.command.run({ command: 'chief', args: 'skin ' + skin } as any)
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const out: string[] = []
+    for (const tab of ['all', 'health']) {
+      await ui.press({ key: 'tab:' + tab })
+      for (const type of ['Button', 'Input', 'Select', 'Link']) out.push(...(await ui.findAll({ type })).map((b: any) => `${type} ${b.key ?? b.props?.key ?? b.props?.href}`))
+    }
+    await ui.unmount()
+    return [...new Set(out)].sort()
+  }
+  await bootRich($, on)
+  const plain = await keysOf('plain')
+  const dark = await keysOf('dark')
+  expect(plain.length).toBeGreaterThan(40)
+  expect(plain.filter(k => !dark.includes(k))).toEqual([])                              // nothing lost
+  // added: the pill beside the Ask box, and the Send pill beside each open session card's chat box
+  expect(dark.filter(k => !plain.includes(k))).toEqual(['Button ask-start', 'Button say-send:' + CLI_A, 'Button say-send:' + CLI_2])
+})
+
+test('test_dark_skin_tabs_are_pills_and_the_shown_one_is_primary', async ($, on) => {
+  await bootRich($, on, { theme: 'light' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const fills = pillFills(skinFor('desktop', null, 'light'))
+  const look = async (id: string) => { const b = await pillBox(ui, 'tab:' + id); return [trimmed((await ui.find({ key: 'tab:' + id }))?.text), b?.backgroundColor, b?.borderStyle, b?.height] }
+  expect(await look('all')).toEqual(['All', fills.primary.fill, 'round', 1])           // `tab all` at boot: the shown tab is the coral pill
+  expect(await look('inbox')).toEqual(['Inbox 3', fills.secondary.fill, 'round', 1])   // the count inside the label
+  expect(await look('needs')).toEqual(['Needs you 1', fills.secondary.fill, 'round', 1])
+  expect((await ui.find({ key: 'tab:inbox' }))?.text).toBe('\u00a0Inbox 3\u00a0')       // padded: the label is the click target
+  await ui.press({ key: 'tab:inbox' })
+  expect([(await look('inbox'))[1], (await look('all'))[1]]).toEqual([fills.primary.fill, fills.secondary.fill])
+  const row = await ui.find({ key: 'tabs' })
+  expect(rowKeys(row)).toEqual(['needs', 'inbox', 'sessions', 'today', 'team', 'health', 'all'].map(t => 'tab-cell:' + t))
+  // Health's alert is a red dot after its pill, outside the Button
+  const health = nodes(await ui.find({ key: 'tab-cell:health' })).filter(x => x.n.type === 'Text' && !x.inButton).map(x => [x.n.children, x.n.props?.color])
+  expect(health).toEqual([[['●'], PALETTE.red]])
+  expect(trimmed((await ui.find({ key: 'tab:health' }))?.text)).toBe('Health')
+  await ui.unmount()
+})
+
+test('test_dark_skin_cards_pills_badges_and_the_header', async ($, on) => {
+  const { fills: filled } = await bootRich($, on, { theme: 'light' })
+  await $.command.run({ command: 'chief', args: 'collapse' } as any)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const fills = pillFills(skinFor('desktop', null, 'light'))
+  await ui.press({ key: 'tab:inbox' })
+  // a compact card: a filled card with its source's border; the recommended action is the coral pill, the rest quiet
+  expect([(await card(ui, 'inbox:U2')).backgroundColor, (await card(ui, 'inbox:U2')).borderColor, (await card(ui, 'inbox:U2')).borderStyle]).toEqual([PALETTE.card, PALETTE.blue, 'round'])
+  expect((await card(ui, 'inbox:U5')).borderColor).toBe(PALETTE.purple)
+  expect([(await pillBox(ui, 'inbox-act:U2:0'))?.backgroundColor, (await pillBox(ui, 'inbox-act:U2:1'))?.backgroundColor, (await pillBox(ui, 'inbox-done:U2'))?.backgroundColor])
+    .toEqual([fills.primary.fill, fills.secondary.fill, fills.secondary.fill])
+  expect(trimmed((await ui.find({ key: 'inbox-act:U2:0' }))?.text)).toBe('Propose an owner')
+  // the first row holds the title and the recommended pill; the pills that do not fit move to a second row
+  expect(rowKeys(await ui.find({ key: 'title-acts:inbox:U2' }))).toEqual(['pill:inbox-act:U2:0'])
+  expect(rowKeys(await ui.find({ key: 'title-more:inbox:U2' }))).toEqual(['pill:inbox-act:U2:1', 'pill:inbox-act:U2:2', 'pill:inbox-done:U2'])
+  expect(rowKeys(await ui.find({ key: 'title-acts:inbox:U5' }))).toEqual(['pill:inbox-act:U5:0', 'pill:inbox-act:U5:1', 'pill:inbox-done:U5'])   // short labels: one row
+  // the title is ink text beside the caret, which alone is the toggle
+  const title = nodes(await ui.find({ key: 'title-text:inbox:U2' })).filter(x => x.n.type === 'Text' && !x.inButton).map(x => [x.n.children, x.n.props?.color, x.n.props?.wrap])
+  expect(title).toEqual([[['Review due'], PALETTE.ink, 'truncate-end']])
+  expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('▸')
+  // badges: rounded, in the palette, dark text on a bright fill
+  const badges = nodes(await ui.find({ key: 'meta:inbox:U2' })).filter(x => x.n.type === 'Box' && x.n.props?.borderStyle === 'round')
+    .map(x => [labelOf(x.n.children), x.n.props?.backgroundColor])
+  expect(badges).toEqual([['tracker', PALETTE.blue], ['decide', PALETTE.amber], ['urgent', PALETTE.red]])
+  // pressing the caret selects and opens the card: a bold coral border, the why in ink, the secondary actions as pills
+  await ui.press({ key: 'toggle:inbox:U2' })
+  expect([(await card(ui, 'inbox:U2')).borderStyle, (await card(ui, 'inbox:U2')).borderColor]).toEqual(['bold', PALETTE.coral])
+  expect((await ui.find({ type: 'Text', text: 'needs a look today' }))?.props.color).toBe(PALETTE.ink)
+  expect((await ui.find({ type: 'Text', text: 'decide · on manager · now' }))?.props.color).toBe(PALETTE.dim)
+  for (const k of ['inbox-open:U2', 'inbox-done:U2', 'inbox-follow:U2', 'inbox-ignore:U2', 'inbox-snooze:U2']) expect([k, (await pillBox(ui, k))?.backgroundColor]).toEqual([k, fills.secondary.fill])
+  // a picker's own label is dark on dark: none on the Select, an ink Text before it
+  await ui.press({ key: 'inbox-snooze:U2' })
+  expect((await ui.find({ key: 'inbox-snooze-pick:U2' }))?.props.label).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: 'Snooze for' }))?.props.color).toBe(PALETTE.ink)
+  // the header: the budget's figures in ink and an Svg bar, who leads as a green badge, the guard in red, the beat dim
+  const strip = await ui.find({ key: 'strip-line' })
+  expect((strip?.children ?? []).map((c: any) => c.type)).toEqual(['Text', 'Svg', 'Box', 'Box', 'Text'])
+  expect(strip.children[1].props.source).toBe(barSvg(1.5 / 20))
+  expect([strip.children[0].props.color, strip.children[2].props.backgroundColor, strip.children[3].props.backgroundColor, strip.children[4].props.color])
+    .toEqual([PALETTE.ink, PALETTE.green, PALETTE.red, PALETTE.dim])
+  // a pill still runs its action: a Today card's recommended one fills the prompt
+  await ui.press({ key: 'tab:today' })
+  await ui.press({ key: 'today-doit:1' })
+  expect(filled).toEqual(['mother now do S1'])
+  await ui.unmount()
+})
+
+test('test_dark_skin_ask_box_and_session_box_have_their_own_pills', async ($, on) => {
+  const asks: string[] = []
+  bootSkin = 'dark'
+  on('session.surfaces', () => ({ value: ['desktop'] }))
+  on('prompt.fill', () => ({ isFilled: true }))
+  const sent: string[] = []
+  on('session.send', (_: any, e: any) => { sent.push(e.text); return { isDelivered: true } })
+  const { out } = await boot($, on, (argv, stdin) => {
+    if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED] })) }
+    if (argv[0] !== 'ask') return undefined
+    asks.push(JSON.parse(String(stdin)).text)
+    return { exitCode: 0, stdout: JSON.stringify({ ok: true, key: 'manual:0123456789', line_id: 'L9', link: null, update_id: null, owned_by: null }) }
+  }, 'desktop', 'sess-1', {}, {}, {})
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'ask-input' }))?.props.submitLabel).toBeUndefined()         // the field's own button is dark on dark
+  expect((await pillBox(ui, 'ask-start'))?.backgroundColor).toBe(PALETTE.coral)
+  await ui.press({ key: 'ask-start' })                                                     // nothing typed: the inline error, in red
+  expect((await ui.find({ type: 'Text', text: ASK_EMPTY }))?.props.color).toBe(PALETTE.red)
+  await ui.input({ key: 'ask-input', text: 'chase the vendor', kind: 'change' })           // typed, not submitted
+  expect((await ui.find({ key: 'ask-input' }))?.props.value).toBeUndefined()               // the field keeps what is typed: no draw replaces it
+  await ui.press({ key: 'ask-start' })
+  expect(asks).toEqual(['chase the vendor'])
+  expect(await ui.find({ type: 'Text', text: ASK_EMPTY })).toBeUndefined()
+  await ui.press({ key: 'ask-start' })                                                     // started: what was typed went with it
+  expect(asks).toEqual(['chase the vendor'])
+  await ui.input({ key: 'ask-input', text: 'by Enter' })                                   // Enter still starts it
+  expect(asks).toEqual(['chase the vendor', 'by Enter'])
+  // a session card's chat box: no native `send`, a Send pill that sends what was typed
+  expect((await ui.find({ key: 'say:' + CLI_A }))?.props.submitLabel).toBeUndefined()
+  await ui.press({ key: 'say-send:' + CLI_A })                                             // nothing typed: nothing sent
+  expect(sent).toEqual([])
+  await ui.input({ key: 'say:' + CLI_A, text: 'ship it', kind: 'change' })
+  await ui.press({ key: 'say-send:' + CLI_A })
+  expect(sent.map(t => t.replace(/^From the manager via the Chief pane: /, ''))).toEqual(['ship it'])
+  await ui.press({ key: 'say-send:' + CLI_A })
+  expect(sent.length).toBe(1)
+  expect(out.submits).toEqual([])
+  await ui.unmount()
+})
+
+test('test_plain_skin_draws_native_buttons_and_the_terminal_draws_no_panel', async ($, on) => {
+  await bootRich($, on, { skin: 'plain' })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const all = nodes(await ui.drawn())
+    expect([surface, all.filter(x => x.n.props?.backgroundColor === PALETTE.panel || nodeKey(x.n) === 'panel').length]).toEqual([surface, 0])
+    expect([(await ui.find({ key: 'tab:all' }))?.props.variant, (await ui.find({ key: 'tab:all' }))?.text]).toEqual(['primary', 'All'])
+    expect([(await ui.find({ key: 'inbox-act:U2:0' }))?.props.variant, (await ui.find({ key: 'inbox-act:U2:0' }))?.props.plain]).toEqual(['primary', undefined])
+    expect((await ui.find({ key: 'inbox-act:U2:0' }))?.text).toBe('Propose an owner')
+    expect((await ui.find({ key: 'ask-input' }))?.props.submitLabel).toBe('Start')
+    expect((await card(ui, 'inbox:U2')).borderColor).toBe('permission')                 // theme keys, the app's colours
+    expect(all.filter(x => HEX.test(String(x.n.props?.color ?? '')) || HEX.test(String(x.n.props?.backgroundColor ?? ''))).length).toBe(0)
+    await ui.unmount()
+  }
+})
+
+test('test_terminal_keeps_its_look_whatever_the_skin', async ($, on) => {
+  await bootRich($, on, { skin: 'dark', surface: 'terminal' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const all = nodes(await ui.drawn())
+  expect(all.filter(x => x.n.props?.backgroundColor === PALETTE.panel || nodeKey(x.n) === 'panel').length).toBe(0)
+  expect((await ui.find({ key: 'tab:all' }))?.props.variant).toBe('primary')
+  expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('▾ Review due')
+  expect(await ui.find({ key: 'ask-start' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('test_chief_skin_command_switches_and_is_kept_in_the_store', async ($, on) => {
+  const store: Record<string, unknown> = {}
+  await bootRich($, on, { skin: null, theme: 'dark', store })
+  const run = async (args: string) => ((await $.command.run({ command: 'chief', args } as any)) as any).text
+  const panel = async () => { const ui = await $.ui.mount({ ...PANE, surface: 'desktop' }); const n = await ui.find({ key: 'panel' }); await ui.unmount(); return n !== undefined }
+  expect(await run('skin')).toBe('Chief pane skin: dark (the default) on the desktop app, plain in a terminal; app theme: dark.')
+  expect(await panel()).toBe(true)                                                      // nothing stored: dark on the desktop app
+  expect(await run('skin plain')).toBe('Chief pane skin: plain.')
+  expect([store.chiefSkin, await panel()]).toEqual(['plain', false])
+  expect(await run('skin status')).toBe('Chief pane skin: plain on the desktop app, plain in a terminal; app theme: dark.')
+  expect(await run('skin dark')).toBe('Chief pane skin: dark.')
+  expect([store.chiefSkin, await panel()]).toEqual(['dark', true])
+  expect(await run('skin neon')).toMatch(/^Usage: \/chief /)
+})
+
+test('test_pill_fills_follow_the_app_theme', async ($, on) => {
+  expect([themeOf([{ key: 'theme', value: 'dark' }]), themeOf([{ key: 'theme', value: 'dark-daltonized' }]), themeOf([{ key: 'theme', value: 'light' }]),
+          themeOf([{ key: 'theme', value: 'auto' }]), themeOf([{ key: 'verbose', value: true }]), themeOf(null)]).toEqual(['dark', 'dark', 'light', 'light', 'unknown', 'unknown'])
+  expect(skinFor('desktop', null, 'dark')).toEqual({ dark: true, theme: 'dark' })
+  expect([skinFor('desktop', 'plain', 'dark').dark, skinFor('terminal', 'dark', 'dark').dark, skinFor('vscode', null, null).dark]).toEqual([false, false, false])
+  expect([pillFills({ dark: true, theme: 'unknown' }).primary.fill, pillFills({ dark: true, theme: 'light' }).secondary.fill]).toEqual(['#e8704f', '#e9e6df'])
+  expect([pillFills({ dark: true, theme: 'dark' }).primary.fill, pillFills({ dark: true, theme: 'dark' }).secondary.fill]).toEqual(['#c9553a', '#3a4060'])
+  for (const [name, source] of Object.entries(ICONS)) expect([name, source.length < 300, source.startsWith('<svg ')]).toEqual([name, true, true])
+  // the app's theme row decides a drawn pill's fill: read at session start, and again when /chief opens the pane
+  let theme = 'dark'
+  on('config.list', () => ({ value: [{ key: 'theme', label: 'Theme', kind: 'choice', value: theme }] }))
+  await bootRich($, on)
+  const fill = async () => { const ui = await $.ui.mount({ ...PANE, surface: 'desktop' }); const b = await pillBox(ui, 'tab:inbox'); await ui.unmount(); return b?.backgroundColor }
+  expect(await fill()).toBe('#3a4060')
+  theme = 'light'
+  await $.command.run({ command: 'chief', args: 'open' } as any)
+  expect(await fill()).toBe('#e9e6df')
+})
+
+// The engine's drawn tree does not carry `hover`, so the skin's own elements are read through a stand-in table whose
+// constructors hand back their props: every Box the dark skin gives a `hover` has a key, and one with no key has none.
+test('test_every_hover_box_the_skin_draws_is_keyed', async () => {
+  const table: Record<string, (props: any) => any> = {}
+  for (const type of ['Box', 'Text', 'Button', 'Link', 'Input', 'Select', 'Svg', 'Image', 'Markdown']) table[type] = (props: any) => ({ type, props })
+  const ui = skinUi(table as any, { dark: true, theme: 'light' }) as any
+  const noop = () => undefined
+  const drawn = [
+    Card(ui, { id: 'inbox:U1', color: 'error', selected: false }, ui.Text({ children: 'x' })),
+    Card(ui, { id: 'sess:a', color: 'ide', selected: true, active: true, scope: 'mother-sess:a' }, ui.Text({ children: 'x' })),
+    Pill(ui, { key: 'go', variant: 'primary', label: 'Go', onPress: noop }),
+    Pill(ui, { label: 'no key', onPress: noop }),
+    ui.Button({ key: 'done', children: 'Done', onPress: noop }),
+    ui.Button({ children: 'no key', onPress: noop }),
+  ]
+  const boxes: any[] = []
+  const walk = (el: any) => {
+    if (Array.isArray(el)) return el.forEach(walk)
+    if (!el || typeof el !== 'object') return
+    if (el.type === 'Box') boxes.push(el.props)
+    walk(el.props?.children ?? el.children)
+  }
+  walk(drawn)
+  const hovers = boxes.filter(b => b.hover)
+  expect(hovers.map(b => b.key)).toEqual(['card:inbox:U1', 'card:sess:a', 'pill:go', 'pill:done'])
+  expect(boxes.filter(b => !b.key).map(b => b.hover)).toEqual([undefined, undefined])   // the two keyless pills: no hover at all
+  expect(hovers[0].hover).toEqual({ backgroundColor: PALETTE.cardHover, borderColor: PALETTE.red })
+  expect(hovers[1].hover).toEqual({ backgroundColor: PALETTE.cardHover, borderColor: PALETTE.coral, scope: 'mother-sess:a' })
+  expect([hovers[1].borderStyle, hovers[1].borderColor, hovers[0].borderStyle]).toEqual(['bold', PALETTE.coral, 'round'])
+  // a pill: a filled rounded Box one row tall around a plain Button whose label is padded (the label is the click target)
+  const pill = boxes.find(b => b.key === 'pill:go')
+  expect([pill.borderStyle, pill.backgroundColor, pill.borderColor, pill.height, pill.paddingX]).toEqual(['round', PALETTE.coral, PALETTE.coral, 1, 2])
+  const button = Array.isArray(pill.children) ? pill.children[0] : pill.children
+  expect([button.type, button.props.plain, button.props.variant, labelOf(button.props.children)]).toEqual(['Button', true, undefined, '\u00a0Go\u00a0'])
 })

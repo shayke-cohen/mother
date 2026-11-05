@@ -64,7 +64,7 @@ Pick the module that covers what you touched:
 |---|---|---|
 | A doc, or added or moved a file | `tests.test_docs`, `tests.test_packaging` | seconds |
 | `lib/chief.py`, `lib/floor.py` | `tests.test_chief`, `tests.test_floor` | seconds |
-| `hooks/chief.tsx`, `hooks/pane_ui.tsx`, `hooks/pane_tabs.tsx`, `hooks/cos.ts`, `hooks/floor.ts`, `hooks/register.tsx` | `claude plugin test .` | under a minute |
+| `hooks/chief.tsx`, `hooks/pane_ui.tsx`, `hooks/pane_tabs.tsx`, `hooks/skin.tsx`, `hooks/cos.ts`, `hooks/floor.ts`, `hooks/register.tsx` | `claude plugin test .` | under a minute |
 | `lib/hub_sources.py`, `lib/hub_mcp.py` | `tests.test_hub_sources` | ~10 s |
 | `lib/hub.py` | `tests.test_hub`, `tests.test_hub_e2e` | slow |
 | `lib/now.py` | `tests.test_now` | ~15 s |
