@@ -2,81 +2,172 @@
 
 **M**anager's **O**perations, **T**asks, **H**andoffs, **E**xecution & **R**eporting.
 
-A chief of staff for people managers, built on [Claude Code](https://claude.com/claude-code).
+A chief of staff for people managers, built as a [Claude Code](https://claude.com/claude-code) plugin.
+It reads your chat, tracker, code host, mail and calendar, shows you only what needs a decision, and does the
+rest in sessions you can watch. Anything another person would see waits for your yes.
+
+![MOTHER: a chief of staff for people managers, on Claude Code](docs/assets/hero.svg)
+
+> **Status: pre-alpha, one pilot.** One manager's workspace has run on it since 2026-10-23; nobody else has
+> yet. The Chief pane and the Now panel use Claude Code's hooks-module API, which is early access. Expect rough
+> edges, and please report them.
 
 > Yes, it's named after the ship's computer in *Alien*. Unlike that one, this Mother never treats the crew as
 > expendable: it works for the manager, in the open, and anything another person sees carries its signature.
 
-> **Status: pre-alpha, one pilot.** All the pieces exist: CLI, sync, approval guard, setup, doctor,
-> routines, the meeting deck, the sprint plan and WhatsApp, covered by 910 automated tests. One manager's workspace has
-> run on it since 2026-10-23; nobody else has yet. Expect rough edges, and please report them. See
-> [docs/CONTRACT.md](docs/CONTRACT.md), [docs/DESIGN.md](docs/DESIGN.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+**Contents:** [A day with it](#a-day-with-it) · [The Chief pane](#the-chief-pane) · [How it works](#how-it-works) ·
+[Install and first run](#install-and-first-run) · [Skills](#skills) · [Routines](#routines) · [Safety](#safety) ·
+[Configuration](#configuration) · [FAQ](#faq) · [Development](#development)
 
-## What it is
+## A day with it
 
-MOTHER gives a manager of any kind (engineering, product, operations, support) **their own named agent**, for
-example "Agnes (AI) · on behalf of Dana". The agent:
+Sam manages two teams. Sam's agent is called Agnes, and signs what it writes `✨ Agnes (AI) · on behalf of Sam`.
 
-- **Knows your world.** A setup interview *discovers* your people, teams, projects, channels, trackers, repos
-  and recurring meetings from your connectors, then shows you a draft to confirm. You don't have to type it in.
-- **Proves its tools work.** A connector *doctor* makes live read and (opt-in) write calls, then records what
-  actually works, per server. When one breaks it retries, reconnects or switches to a backup server, and
-  walks you through a sign-in when only you can fix it. Routines check that record before they run, so a broken
-  Slack connection shows up as "couldn't check", never as "all quiet".
-- **Runs your routines.** A daily brief, a team digest that opens with a short *decision queue* you answer
-  in one line, a weekly team-meeting deck with a **meeting mode** (owners, decisions, tickets from the room)
-  that writes outcomes back to your tracker, a recap, and a daily *connect-the-dots* pass that suggests
-  actions for you and for itself.
-- **Remembers.** People, commitments, decisions and open loops live as plain files in a private workspace,
-  and a nightly reflection keeps that memory current.
+1. **08:45, the brief.** A message lands in Sam's own DM: today's calendar, the mail and chat that need an
+   answer, the review queue, overdue open loops, and a numbered list Sam hands back with "go 1 3".
+2. **09:00, the digest.** One post per team. Each opens with a short decision queue. Sam answers in the thread:
+   "12 ticket, 13 drop, 14 mine".
+3. **10:20, an Inbox card.** Dana asks in a team channel who owns a migration. A card appears in the Chief pane
+   with `decide` and `urgent` badges and three buttons. Sam presses the first, **Propose an owner**. A new
+   session opens with a brief already typed; Sam reads it and presses Enter.
+4. **10:26, one question.** That session read the thread and the ticket, drafted a reply, and stopped. The
+   pane's **Needs you** tab shows its question with three answers as buttons. Sam presses **Send it**, confirms
+   the send, and the reply goes out, signed.
+5. **14:00, a follow-up.** Dana answers in the thread. No new card appears: the reply is delivered into the
+   session that owns the case. It reads the answer, marks the item done and reports the outcome in three lines.
 
-## Principles
+At 21:30 a nightly pass turns the day into memory and sweeps the open loops, so tomorrow's brief knows what
+today decided.
 
-1. **Plugin = code, workspace = data.** The plugin is shared and versioned. Each manager's workspace is
-   private, local by default, with an optional git remote.
-2. **Disclosure, always.** The agent acts through the manager's own accounts, so every outbound message,
-   comment or ticket is signed: `✨ Agnes (AI) · on behalf of Dana`.
-3. **Approvals live in code, not just in the prompt.** A pre-tool hook decides what may go out without
-   asking (your own DM, drafts), what needs your yes (anything another person sees), and what never happens
-   (credentials, deletions, payments). It also provides a kill switch.
-4. **Evidence or silence.** Answers cite a source. With no source, it asks you instead of guessing.
-5. **Earned autonomy.** Channels start at `draft`. The agent can *propose* more autonomy after a track record,
-   but only the manager can grant it.
-6. **People, not scores.** It reports work items, never assessments, never mood. The team should know the
-   agent exists and what it reads.
+## The Chief pane
 
-## Before you install
+`/chief` opens a pane beside the chat (Claude Code desktop app). The images below are mocks with invented items.
 
-- **Claude Code** (the desktop app if you want scheduled routines: they run only while the app is open,
-  and a missed run fires on the next launch).
+| Inbox | Needs you |
+|---|---|
+| ![Mock of the Chief pane's Inbox tab: a banner, tabs, one expanded card with action buttons and two compact cards](docs/assets/pane-inbox.svg) | ![Mock of the Needs you tab: a session's question with one button per answer](docs/assets/pane-needs-you.svg) |
+
+- **Header.** A picture (the bundled portrait, or your own `<workspace>/.mother/portrait.png`), today's model
+  spend against the daily budget, which session leads, the heartbeat's age, and a red pill while the guard is
+  off or paused.
+- **Tabs.** `Needs you`, `Inbox`, `Sessions`, `Today`, `Team`, `Health`, `All`. Each shows its count; Health
+  shows a red dot when something is wrong. `/chief tab inbox` picks one from the prompt.
+- **Cards.** Two rows when closed: the title with up to three action buttons, then badges (source; `decide`,
+  `reply` or `act`; `urgent`; `case`), a human label, age and a link to the source. The first button is the
+  recommended one. Click the title to expand: the full reason, what each button would send, Open session,
+  Done, Follow, Ignore and Snooze. `/chief expand` and `/chief collapse` do it for every card.
+- **Needs you.** Sessions that stopped on a question, with one button per answer. The message a button sends is
+  shown beside it.
+- **Sessions.** Your pinned desktop sessions and the case sessions, each with a two-line summary, a chat box and
+  Open.
+- **Today, Team.** Your Top 3 and what is on you; what each team is neglecting, by team. No per-person counts.
+- **Health.** Each source, the watcher's last poll, routine reports that could not be delivered, budget and
+  lead, and the guard's state.
+
+<img src="docs/assets/pane-health.svg" alt="Mock of the Health tab: sources, the watcher, undelivered reports, budget and guard" width="480">
+
+Nothing in the pane sends anything to another person by itself. A button either fills a prompt for you to
+submit, or sends a message into one of your own sessions, which the guard asks you to confirm.
+
+## How it works
+
+One background process, and it has no model: a watcher polls your sources into a local inbox file. The
+thinking happens in Claude Code sessions you can see. (Two opt-in features still start a short headless run:
+the team-channel reply loop, whose answers are written by a read-only session, and `mother eval`.)
+
+```mermaid
+flowchart TD
+  subgraph SRC["Your sources, read-only"]
+    S1["chat"]
+    S2["tracker"]
+    S3["code host"]
+    S4["mail"]
+    S5["calendar"]
+    S6["WhatsApp"]
+  end
+  W["Watcher: a launchd job, no model"]
+  I[("inbox.jsonl in the workspace")]
+  L["Leading desktop session: ticks every minute, triages each line with one short model call, records the decision in code"]
+  P["Chief pane: Needs you, Inbox, Sessions, Today, Team, Health"]
+  C["Case session: owns one item, follows the cos skill"]
+  M(["The manager"])
+  G{"Approval guard"}
+  O["Other people: chat, mail, tracker, code host"]
+
+  SRC --> W --> I --> L
+  L -->|"needs attention"| P
+  L -->|"FYI: logged"| X["hub log"]
+  M -->|"presses an action"| P
+  P -->|"Mother case: brief"| C
+  I -.->|"later activity on a claimed thread"| C
+  C -->|"stops on a question"| P
+  M -->|"answers with one click"| C
+  C --> G
+  G -->|"allowed, or the manager said yes"| O
+```
+
+- **The watcher** (`mother hub watch`, installed with `mother hub install`) is a plain Python process under
+  launchd. It reads through a read-only allow-list and appends one line per changed thing to
+  `<workspace>/.mother/hub/inbox.jsonl`. It never calls a model and never writes to a source.
+- **One desktop session leads.** Every open desktop session runs the plugin's module; the first to tick leads,
+  and another takes over when its heartbeat goes stale (120 s). Each minute the leader logs muted lines and
+  asks a small model about the rest: is it work, does it need attention, what kind (`decide`, `reply`, `act`,
+  `fyi`), who it is on, how urgent, and two or three actions. The decision itself is recorded by code
+  (`mother chief triage`), never by the model.
+- **Case sessions.** An action button opens a new session with a `Mother case:` brief. Its first prompt claims
+  the thread, so later activity on it is delivered into that session as a `Mother relay:` message instead of a
+  new card. The session follows the [`cos` skill](skills/cos/SKILL.md): investigate, do the next step, ask one
+  question with a recommendation, close with an outcome.
+- **Routines** (brief, digest, dots and the rest) are desktop scheduled tasks that run the same skills you can
+  call by hand.
+- **State is files.** Config, memory, todos, people, teams and the journal live in your private workspace and
+  sync to your own git remote if you set one. Machine-local state lives under `.mother/` and never syncs.
+
+### The life of one item
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant S as Source
+  participant W as Watcher
+  participant L as Leading session
+  participant P as Chief pane
+  actor M as Manager
+  participant C as Case session
+  S->>W: a new message in a thread
+  W->>L: one line in the inbox file
+  L->>L: triage with one short model call
+  L->>P: Inbox card with badges and actions
+  M->>P: presses the first action
+  P->>C: new session, the case brief typed
+  M->>C: reads the brief, presses Enter
+  C->>C: claims the thread, investigates, drafts
+  C->>P: stops on one question
+  P->>M: Needs you card with answers as buttons
+  M->>C: one click, confirmed at the guard
+  C->>S: sends the signed reply
+  S->>W: the other person answers
+  W->>C: relayed into the same session
+  C->>P: closes the case, the card is gone
+```
+
+More detail, file by file: [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Install and first run
+
+**You need**
+
+- **Claude Code.** The desktop app for the Chief pane, case sessions and scheduled routines (routines run only
+  while the app is open; a missed run fires on the next launch). The terminal alone gets the skills, the guard
+  and the CLI.
+- **macOS** for the watcher (launchd), the spoken brief and WhatsApp. The skills, guard and CLI are plain Python.
 - **Python 3.9+** and **git** on your PATH. `gh` if you want GitHub in the brief.
-- **Connectors** for whatever you use: chat (Slack or Teams), mail, calendar, a tracker (Jira, Linear,
-  Monday, or none) and a code host (optional). MOTHER doesn't ship connectors. Setup finds the ones you have,
-  and the doctor tests them.
-- A **private** git repo for your workspace if you want backup or a second machine. Never a public one:
-  the workspace holds your notes about people and open loops.
+- **Connectors** for what you use: chat, mail, calendar, a tracker and a code host, all optional. MOTHER ships
+  none. Setup finds the ones you have, and the doctor tests them.
+- A **private** git repo for the workspace if you want backup or a second machine. Never a public one: the
+  workspace holds your notes about people.
 
-## What installing changes
-
-The approval guard is a hook, so it runs in **every** Claude Code session, not only in the workspace:
-
-- Any call that reaches another person (a chat post, an email send, a tracker write, a `gh` write) asks for
-  your confirmation, even in an unrelated repo. Outside the workspace's green list nothing is pre-approved.
-- Credential entry, payments and deletions are refused outright, including `gh … delete` and
-  `gh api -X DELETE` in any repo. Run those yourself in a terminal.
-- Calls that aren't outbound are untouched; your normal permission rules apply. (A second hook on reads exists
-  only for channel reply sessions and exits immediately everywhere else.)
-- The guard is a Python process started on every tool call, so each call costs about a tenth of a second more.
-- Edits to `~/.claude/settings.json`, `settings.local.json`, `~/.claude.json` or anything under
-  `~/.claude/plugins/` ask in **every** session, since they could switch the guard off.
-- A session that ran `mother hub tail` is treated as a hub: it stays fenced to hub work (see below) even after
-  a newer hub starts (the guard remembers the last five), so use a fresh session for anything else.
-
-The Stop hook runs `mother sync`, which only acts on your workspace. Before you have one, it does nothing.
-
-## Install
-
-In Claude Code:
+**1. Install the plugin and run setup.** In Claude Code:
 
 ```
 /plugin marketplace add shayke-cohen/mother
@@ -84,252 +175,231 @@ In Claude Code:
 /mother:setup
 ```
 
-Setup asks where to put the workspace, discovers your people, teams, channels and meetings, shows you a
-draft config, and writes nothing until you confirm. Then it runs the doctor, sets this machine as the home
-machine, registers the routines, and runs `mother link` so the `mother` command works in your own terminal.
-To do that step by hand:
+Setup asks where to put the workspace, discovers your people, teams, channels and meetings from your
+connectors, shows you a draft config, and writes nothing until you confirm. Then it runs the doctor, sets this
+machine as the home machine, registers the routines as scheduled tasks, and runs `mother link` so the `mother`
+command works in your own terminal. To do that last step by hand:
 
 ```
 python3 ~/.claude/plugins/marketplaces/mother/bin/mother link
 ```
 
-It symlinks `mother` into `~/.local/bin`. Pass another directory if that one isn't on your PATH.
-
-**The Now panel.** The tick's list can sit beside the chat, with a status line
-(`◆ 2 on you · 1 neglected`) and Done, Snooze, Make top 3 and Do it buttons. It ships inside the `mother` plugin
-(a hooks module beside the guard), so there is nothing more to install. Open it with `/now-panel` (`/now` is
-MOTHER's chat skill, which prints the same list in the conversation). It reads `.mother/now.json` on the machine
-the tick runs on and makes no network calls.
-It is two panes. **Home** ranks and routes: Top 3 today, the suggested asks, then one line per item grouped by
-what it asks of you (**Decide**, folded into one row that opens the decision queue; **Reply**; **Review**; **On
-you**), **From the hub** (hub updates), **Sessions** (the hub-fed sessions, news first, proposed ones dashed, View
-all), **Suggestions**, and **Neglected by teams** (one row per team with what kind of work is stuck). A group of
-several rows gets **Done all**, and **Archive N mail** when two or more are mail. The foot of Home opens the Mother
-page.
-Click any row and the **Inspector** pane shows that one thing with everything about it and every action. An item:
-why it is on the list and its timeline, one primary next move (the tick's action, else the best quick action for
-its kind: Draft a reply for chat and mail, Review brief for a PR, Find the owner for a ticket) plus three more and
-the rest behind a toggle, Open session or Ask Mother, a chip for each source, links to its session and team, related
-items, and Done (`d`), Snooze (`s`), Ignore…, Make top 3 (`t`) and Tell Mother… at the foot; mail also gets
-**Archive** and **Mark read**, done straight through the hub's mail connection with no model (`mother inbox`, still
-checked by the guard). The other pages: a hub update; a session (where it stands, what was routed into it, what it
-watches, Open, Send a note, Follow, Ignore, Stop routing); all sessions; a proposed session (what Mother read, what
-it would do, Dismiss); the decision queue (one card at a time, options on `1`–`9`, Skip on `n`, filter by team); a
-team (what needs you and its neglected work by kind: stuck work only, no per-person counts); and Mother (sources,
-routines, the hub's health with Refresh and Restart hub, the last routed lines, and what you ignored). A link inside
-a page pushes the next page and **← Back** returns. Every action only fills the prompt; you press Enter, and anything
-that reaches another person comes back as a draft.
-Its one setting, `mother_bin` (userConfig), is the path to the `mother` script it calls for `mother path` and
-the `mother now` edits. Left empty (the default) it runs this plugin's own `bin/mother`, the same version the
-hooks run; set it only to point the panel at another copy (a leading `~` is your home folder).
-
-If you installed the panel before it moved into `mother` (the separate `mother-now` plugin), remove that one
-once, so the panel isn't loaded twice:
+**2. Turn on the watcher (optional, home machine).** Add a `hub` block to `config.json` with `enabled: true` and
+one connection per source ([the block and its options](docs/GUIDE.md#the-watcher)), then:
 
 ```
-/plugin uninstall mother-now@mother
+mother hub smoke      # reads each source twice in a throwaway copy; prints status and counts, never content
+mother hub install    # runs the watcher under launchd
+mother hub status     # is it keeping up
 ```
 
-**Turn on the hub (optional).** The hub watches your sources and routes updates into your sessions (see "The hub"
-below). On the home machine, add a `hub` block to `config.json` with `enabled: true` and one connection per source
-you want watched:
+**3. Open the pane.** In a desktop session in your workspace, type `/chief`. Keep one desktop session open: it
+leads, and the Inbox fills as lines arrive. Pin the sessions you want on the Sessions tab.
 
-```json
-"hub": {
-  "enabled": true,
-  "connections": {
-    "chat":     {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/chat/mcp"]},
-    "mail":     {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/mail/mcp"]},
-    "tracker":  {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/tracker/mcp"]},
-    "calendar": {"command": "npx", "args": ["-y", "mcp-remote", "https://gateway.example.com/calendar/mcp"]},
-    "code":     {"cli": "gh"},
-    "whatsapp": {"local": "whatsapp"}
-  }
-}
-```
+**Another computer, same workspace:** install the plugin, run `mother link`, then
+`mother join <your-private-repo-url>` and `/mother:doctor`. Only the home machine runs routines and the watcher
+(`mother home show`).
 
-The first four are MCP servers the watcher starts itself (here through a gateway proxy; use whatever command
-starts yours), `gh` is the code host's command line, and `whatsapp` reads the local WhatsApp database (it needs
-`whatsapp.enabled` and `whatsapp.read`). Leave out any you don't want. Then:
+**Uninstall:** disable the `Mother:` tasks in the scheduled tasks list, `mother hub uninstall`, then
+`/plugin uninstall mother@mother` and `rm ~/.local/bin/mother`. Your workspace folder is untouched.
 
-```
-mother hub smoke      # reads each source twice, 20 s apart, in a throwaway copy; prints status and counts, never content
-mother hub install    # runs the watcher under launchd on this machine
-mother hub refresh    # reconnect now: restarts the watcher and polls every source at once (the panel's Refresh button)
-```
+The day-to-day operating detail (watch intervals, DMs, WhatsApp, disk access, team-channel replies, the Now
+panel, every command) is in [docs/GUIDE.md](docs/GUIDE.md).
 
-**Disk access for the watcher.** The launchd watcher is a bare `python3` process, not your terminal, so reading the
-WhatsApp database needs its own Full Disk Access grant (System Settings > Privacy & Security > Full Disk Access >
-`+`). macOS charges the access to the **app that contains** the Python the job runs, not to the binary in the plist.
-With Xcode's Python (`/Applications/Xcode.app/Contents/Developer/usr/bin/python3`, the stock `python3` on a Mac with
-Xcode) that app is **Xcode** itself: add `Xcode.app`. Adding its `Python.app` or the `python3` launcher does nothing
-(seen on macOS 26: the privacy log names `subject=com.apple.dt.Xcode`). A python.org Python re-launches itself as its
-own `Python.app`, and that is the one to add. To see who macOS checks, run the watcher and then
-`log show --last 2m --predicate 'process == "tccd"' | grep -A2 python3` and read the `AUTHREQ_SUBJECT` line. Then
-run `mother hub refresh`. A passing `mother hub smoke` run from your terminal does not prove the watcher has this
-grant, because the terminal has its own.
-Without it the Now panel shows `whatsapp ✗` and `mother hub status` says the source is `couldnt_check (denied)`.
+## Skills
 
-Finally run `/mother:hub` once in a pinned session, in normal permission mode (not bypass), and leave it open: it
-wakes on each update and routes it. `mother hub status` shows whether the watcher and hub are keeping up.
+Call one by asking in plain words, or as `/mother:<name>`.
 
-**The Chief pane (desktop app).** `/chief` opens a pane beside the chat with what needs you: **Needs you** (a pinned
-session that stopped on a question, with its options as buttons), the hub's **Inbox** (what the inbox lines came
-to, with Done, Snooze and Open session), your **pinned desktop sessions** (a two-line TL;DR, a chat box, a
-recommended reply as a chip you still press Send on, Open), under a header strip with the counts, today's budget
-and who leads. Tabs pick one group at a time (`/chief tab needs|inbox|sessions|today|team|health|all`; **Today** is your Top 3 and what is on
-you from the Now list), each item is a card you can expand (`/chief expand` / `collapse` for all), and
-`<workspace>/.mother/portrait.png` (plus a small `portrait.jpg` for the desktop app) replaces the picture at the top. One desktop session at a time leads: it
-reads the hub's inbox lines every minute, asks a cheap model whether each one needs attention, and records the
-answer in code, so nothing that reaches another person happens from here without your hand. Every message into a
-pinned session is asked by the guard, whoever sends it. `mother chief status` shows who leads and today's model
-spend against `daily_budget_usd` (an optional `chief` block of `config.json`, with `tldr_model` and `triage_model`);
-`mother chief pause` / `resume` is its own switch (it never touches `.mother/PAUSED`). Until 0.18.0 this layer also
-ran a long-lived chief session and headless workers that filed decisions to your DM; those are gone, and their old
-keys in `config.json` are ignored.
+| Skill | Ask for it like | What it does |
+|---|---|---|
+| `setup` | "set up mother", "add a team" | Creates or edits the workspace config from what it discovers; writes nothing until you confirm |
+| `doctor` | "check my connectors" | Live-tests every connector with one real read each and records what works |
+| `brief` | "brief me", "what did I miss" | One picture of the day: calendar, mail and chat needing action, review queue, overdue todos. Read-only |
+| `digest` | "the standup", "what's blocked" | Per-team digest that opens with a decision queue you answer in one line |
+| `dots` | "connect the dots" | Links across mail, chat, tracker, code and calendar; two short action lists |
+| `commitments` | "what did I promise" | Promises you made, promises made to you, asks with no reply; offers nudge drafts |
+| `one-on-one` | "prep my 1:1 with Sam" | Per-report prep, a shareable agenda kept apart from private notes, cadence drift |
+| `meeting` | "prep the weekly" | Sprint plan page, meeting deck with meeting mode, results written back to the tracker, recap |
+| `now` | "what's on me now" | The tick's current list; runs one suggested action when you ask |
+| `cos` | starts from a `Mother case:` brief | The contract for a session that owns one item until it is closed |
+| `todo` | "add a todo", "what's open" | Open loops: add, close, adopt, sweep |
+| `remember` | "remember that …" | Writes one durable fact to memory |
+| `project` | "start a project for X" | A container for work that spans sessions |
+| `team` | "update the roadmap" | A team's files: people, roadmap, intake, sprints |
+| `reflect` | "review today" | Nightly: distil the day into memory, expire stale todos, write the journal |
+| `channels` | `/loop /mother:channels` | Replies in team channels by per-channel mode (`off`, `watch`, `mention`, `draft`, `auto`) |
+| `whatsapp` | "what did Sam say on WhatsApp" | Reads chats from the local WhatsApp database; each send to someone else asks first |
+| `hub` | `/mother:hub` | Decides the inbox from a terminal session when no desktop session leads |
+| `routine` | (scheduled tasks only) | The dispatcher every scheduled run enters through |
 
-**Another computer, same workspace:** install the plugin, run `mother link` as above, then
-`mother join <your-private-repo-url>` and `/mother:doctor`. Only the *home* machine runs routines
-(`mother home show`), so don't register them on the second one.
+Two read-only sub-agents back them: `reader` (one source, cited items) and `critic` (checks a draft before you
+see it).
 
-## Using it
+## Routines
 
-Day to day you mostly read what it sends you and answer in one line. The default schedule is set in
-`config.json` → `routines`, in your timezone:
+Scheduled tasks in the desktop app, in your timezone. Defaults; change them in `config.json` → `routines`.
 
 | Routine | When (default) | What you get |
 |---|---|---|
-| brief | 08:45 workdays | Today's calendar, mail sorted into to-respond / FYI / noise, overdue open loops, and a numbered triage (`me` / `prep` / `you`) you hand back with "go 1 3". With `"draft_replies": true` it also leaves reply drafts in your mail |
-| digest | 09:00 workdays | Per team, opening with the decision queue |
-| dots | 13:00 workdays | Connections across threads, and suggested actions for you and for the agent |
-| brief, spoken | with the brief, if `routines.brief.audio` is on | A 60–90 second audio version (macOS voices, or the Kokoro neural voice with `"engine": "kokoro"` after `mother tts setup`; `"language": "he"` for Hebrew) |
-| commitments | 16:30 workdays | What you promised, what you're waiting on, and asks with no reply after 3 days; answer `nudge 3` for a draft follow-up |
-| one-on-one | 07:30 workdays | Prep for each of today's 1:1s (a shareable agenda kept apart from private prep) and a note when a report's 1:1s have lapsed |
-| reflect | 21:30 daily | Updates memory and open loops from the day; flags stale items |
-| doctor | daily | Re-tests every connector, heals what it can (retry, reconnect, switch to a backup server) and alerts once per broken connector |
-| tick | hourly 06:05-21:05 workdays | A short Now list, kept quiet: what is blocked on you, what the team is neglecting, suggestions waiting for a yes, and your Top 3 today. Read it with `/mother:now` or the Now panel (`/now-panel`, see Install); it sends nothing unless `routines.tick.notify` is `dm` |
-| meeting prep / recap | around each team's weekly meeting | The deck, then a recap draft |
+| `brief` | 08:45 workdays | The day in one message to your own DM; a spoken version if you turn audio on |
+| `digest` | 09:00 workdays | Per team, opening with the decision queue |
+| `dots` | 13:00 workdays | Connections across threads, and suggested actions for you and for the agent |
+| `commitments` | 16:30 workdays | What you promised, what you are waiting on, asks with no reply after 3 days |
+| `one-on-one` | 07:30 workdays | Prep for each of today's 1:1s, and a note when a report's 1:1s have lapsed |
+| `tick` | hourly, 06:00-22:00 workdays | The Now list: what is blocked on you, what teams are neglecting, your Top 3. Sends nothing unless you ask it to |
+| `reflect` | 21:30 daily | Memory and open loops updated from the day |
+| `doctor` | daily | Re-tests every connector, heals what it can, alerts once per broken one |
+| `meeting-prep`, `meeting-recap` | around each team's weekly meeting | The deck, then a recap draft |
+| `weekly-snapshot` | 16:00 workdays | After a sprint rolls over: a snapshot and a metrics row. Silent |
+| `monthly-refresh` | 1st of the month, 10:00 | Refreshes per-repo notes, flags roadmap drift |
+| `brief-ab` | off by default | A/B test of how the brief gathers its sources |
 
-You can also just ask: "brief me", "what's open", "remember that …", "add a todo …", "take notes on the
-design review", "prep my 1:1 with Sam", "what did I promise", "set up a new project", "what's on me now" (`/mother:now`: the tick's list; say "mother now do S3" to run one suggestion, or "snooze that"). Each one routes to a
-skill: `brief`, `now`, `todo`, `remember`, `one-on-one`, `commitments`,
-`meeting`, `project`, `team` and so on. With WhatsApp set up (`mother whatsapp setup`), "what did Sam say on
-WhatsApp" or "WhatsApp Dana that I'm late" go to the `whatsapp` skill: it reads any chat, and each message to
-someone else waits for your yes in the permission prompt. "Open session" on a Chief pane Inbox card starts a
-session on the `cos` skill: it owns that one item until it is closed, and later activity on the thread is delivered
-into it (`/chief relay off` holds that back).
+Routines report to your own DM. The few that act beyond it (a ticket you answered "ticket" to in the digest, an
+agent action you approved in dots) do so through a bounded grant. `mother runs` shows which ones missed their
+last slot.
 
-The hub is optional and runs on your home machine. Set the `hub` block in `config.json` (with `enabled: true`), install the watcher with
-`mother hub install` (it polls your sources read-only and appends what changed to a local inbox), then run
-`/mother:hub` once in a pinned session. That session wakes when a line arrives (or, without a Monitor, checks every 3 minutes and stops at once when nothing is new): it sends an update into the
-session already working on that thing, or raises a New task card for you to start. It never messages anyone else.
+## Safety
 
-Each wake is a model turn, and the Monitor that wakes the hub lasts at most 30 minutes, so the hub re-arms it every
-30 minutes inside your active hours even on a quiet day. Set `hub.model` to a small, fast model
-so those turns cost little. Outside active hours it doesn't re-arm: it schedules one `/mother:hub` run for the
-start of your next active window and goes quiet until then.
+### The approval guard
 
-**DMs and your self-DM.** The watcher's Slack server can't list your DMs, so it reads a DM only when you map it. To
-fill the DM map, list your DMs with your chat connector's DM listing (types im) in a normal MOTHER
-session, match the user ids to the people in `config.json`, then run `mother hub dms set …`, for example
-`mother hub dms set U00000001=D00000001 U00000002=D00000002` (only people in config are accepted, not your own id; `mother hub dms
-show` lists the map, `mother hub dms drop U00000001` removes one). A message from that person reaches the hub; your
-own reply in the DM clears it. To use your self-DM (the DM with yourself) as an inbox, run `mother hub dms inbox
-<its D… id>`: every note you type there becomes a thing the hub routes or proposes, like `mother hub add` (posts made by apps,
-MOTHER's included, are skipped).
+`hooks/guard.py` is a hook that runs before tool calls and decides in code, not in the prompt. Once the plugin
+is installed it runs in **every** Claude Code session, not only in the workspace.
 
-Each source can be checked at its own pace. The watcher wakes on the shortest interval and polls a source only when its own is due; set `every_seconds` (working hours, 30-86400) and `idle_every_seconds` (outside them; `0` means only during working hours) under `hub.watch.<source>`, and leave a source out to keep the global `hub.every_seconds` / `hub.idle_every_seconds`:
-
-```json
-"watch": {
-  "mail":     {"every_seconds": 3600},
-  "calendar": {"every_seconds": 900, "lead_minutes": 15},
-  "tracker":  {"every_seconds": 600, "projects": ["PLAT"]},
-  "code":     {"every_seconds": 600}
-}
+```mermaid
+flowchart LR
+  A["A tool call"] --> Q{"Does it reach another person, or change the guard?"}
+  Q -->|"no"| R["Not the guard's business: your normal permission rules apply"]
+  Q -->|"yes"| N{"On the never list?"}
+  N -->|"yes"| D["Denied: credentials, payments, deletions"]
+  N -->|"no"| S{"Only you see it?"}
+  S -->|"yes"| OK["Allowed: your own DM, a mail draft, a calendar event without guests"]
+  S -->|"no"| F{"Routine work on something that exists?"}
+  F -->|"yes"| P["Runs unasked by default: comment on, move or update an existing ticket; code-host comments. Asks instead in a case session"]
+  F -->|"no"| ASK["Asks you: a message, a mail, an invite, a new ticket, a merge, an approval"]
 ```
 
-Here chat and WhatsApp stay on the default. `mother hub status` shows each source's interval and marks one STALE when its own last poll is more than twice its interval old; `mother hub check` warns when the calendar is checked less often than `lead_minutes`, because starting-soon alerts would arrive late.
+The diagram is simplified. The guard also asks before unusual shell commands inside the workspace and before
+edits to its own files, the config and the persona files, because those are how injected text would persist.
+Full rules: [docs/CONTRACT.md §5](docs/CONTRACT.md#5-approval-guard-hooksguardpy).
 
-WhatsApp can be one of its sources: with `whatsapp.enabled` and `whatsapp.read` on, add `"whatsapp": {"local": "whatsapp"}` under `hub.connections`. The watcher then reads the local WhatsApp database (no bridge, nothing sent) for new direct messages to you, for groups you list in `hub.watch.whatsapp.groups` or follow with `mother hub follow --whatsapp <jid>`, and for any group that @-mentions you; your own reply in the chat clears it. `mother hub mute <jid>` silences a chat. It needs the same Full Disk Access as reading WhatsApp chats does.
+| Level | Examples | Who decides |
+|---|---|---|
+| Free | Reading anything; drafts; workspace files; posts to your own DM | Nobody: it just happens |
+| Routine work | Comment on, transition or update an existing ticket; code-host comments | Runs unasked under `policy.autonomy: "functional"` (the default), except in case sessions, where it asks. Set `"strict"` and it asks everywhere |
+| Reaches a person | Chat post, mail send, invite with guests, new ticket, merge, approve, WhatsApp to someone else | You, each time, in the permission prompt |
+| Never | Entering credentials, payments, permanent deletions (`gh … delete` included) | Refused. Do those yourself |
 
-You can steer it by typing to it ("follow PLAT", "mute that channel", "what are you watching", "open a session for this"; a session you ask for still needs your yes) or from the Now panel's Inspector: **Run in a session** on any item with a link, **Follow** on a hub session or hub update, and **Ignore…** on those and on any Now item with a link: just this, this for a week, a chat thread's whole channel, everything from the sender, or messages like it (the tick proposes a few words such messages always contain, you see them before choosing, and from then on they are matched without a model). Ignored things drop out of the hub and the Now list; the **Ignored** list at the foot of the panel shows them and undoes each one. It can't fetch the web or edit files; for those it proposes a session.
+Switches:
 
-### Replying in team channels
+- `mother guard off|on|status`. **Off means off:** no guard rule runs in any session, the model alone decides,
+  and text it reads in a mail or a chat can steer it into sending. The pane shows a red `guard off` pill.
+- `touch "$(mother path)/.mother/PAUSED"` blocks every outbound call until you delete the file. It wins over
+  `guard off`. Routines still read and still write to the workspace.
+- `mother chief pause` / `resume` stops only the leading session's tick and triage.
+- `mother grant add …` gives an unattended run a bounded, signed grant; the guard asks you before each `add`.
 
-Each channel in `config.json` has a reply mode: `off`, `watch` (read for digests only), `mention` (answers in
-the thread when someone addresses it by name, e.g. "Agnes, is the deploy green?"), `draft` (drafts replies to
-your DM; you answer `send`, `send: <edit>` or `no`) or `auto` (answers the topics you list in `auto_topics`
-itself and drafts the rest). Who may trigger a `mention` channel is its `trigger`: `manager`, `team` or
-`anyone`. Start the loop in a Claude Code session, on a cheap model:
+A session that receives other people's words from the watcher (a case session, or the terminal hub session)
+gets stricter rules: the routine-work shortcut is off there, so every outbound action asks. Use a fresh session
+for anything unrelated.
 
-```
-/loop /mother:channels
-```
+Costs: the guard is a Python process on every tool call, about a tenth of a second each. Edits to
+`~/.claude/settings.json`, `~/.claude.json` or anything under `~/.claude/plugins/` ask in every session, since
+they could switch the guard off.
 
-Every reply is signed, stays in its thread, and is checked by the guard. When a teammate asks, the answer is
-written by a read-only session that can't see your mail, calendar, DMs or private notes. People in the channel
-can say `Agnes, mute` (this thread), `Agnes, stop` (this channel) or `Agnes, pause` (every channel), or 👎 a
-reply. Only you turn it back on. After 10 unedited drafts on one topic it proposes answering that topic itself;
-you decide by editing the config.
+### What leaves the machine
 
-Useful commands in your terminal:
+MOTHER has no server and sends no telemetry. What goes where:
 
-| Command | What |
+| What | Goes to | When |
+|---|---|---|
+| Whatever a session reads and writes | The model API, as in any Claude Code session | Whenever a session works |
+| One inbox line (its key, title, up to 1000 characters of summary, who wrote it, link) plus the **names** of you, your teams and their people, and the tracker projects and repos you follow. No ids, no email addresses | The model API | Triage, once per line that needs judging |
+| The recent tail of each pinned session (at most 6000 characters, tool output left out) | The model API | The Sessions tab's two-line summaries, only while the pane is shown |
+| The last 3000 characters of a pinned or case session's final message | The model API | When its turn ends, to tell whether it stopped on a question |
+| Your workspace files | Your own private git remote, if you set one | `mother sync`, at the end of each turn. A secret scan runs first and stops the commit on a hit |
+| Connector reads | The connectors you configured | The watcher and the sessions |
+
+The watcher itself calls no model. WhatsApp chats are read from the local database and copied nowhere. Model
+calls made by the pane count against `chief.daily_budget_usd` (default $20); over budget none are made, and
+lines show up untriaged.
+
+### What it won't do
+
+No performance assessments, scores, sentiment or mood reads of a person, and no per-person delivery metrics.
+It reports work items. Tell your team the agent exists and what it reads.
+
+## Configuration
+
+Everything is in `<workspace>/config.json`; `mother status` validates it. Full schema:
+[docs/CONTRACT.md §3](docs/CONTRACT.md#3-configjson-schema-v1). A filled example:
+[templates/workspace/config.example.json](templates/workspace/config.example.json).
+
+| Block | What it holds |
 |---|---|
-| `mother status` | Validate `config.json` and show workspace, doctor and home-machine state |
-| `mother home show` | Which machine runs the routines |
-| `mother sync` | Commit and push the workspace now (also runs automatically at the end of each turn) |
-| `mother register` | Print the scheduled-task definitions for the enabled routines |
-| `mother health` | Connector health: which server serves each capability, the failure log and a 7-day summary (`mother health help`) |
-| `mother grant add` | Add a guard grant for an unattended run, checked exactly as the guard will (`remove --run ID`, `list`); the only writer of `.mother/grants.json`; the guard asks you before each `add`; grants are signed with `~/.mother/grant.key` |
-| `mother memory index <file>` | Add one index line for `memory/<file>.md` to `memory/MEMORY.md` (idempotent); the only unprompted writer of the index. `memory check` lists drift |
-| `mother runs` | Watchdog: which routines missed their last slot or failed (the brief and doctor flag these too) |
-| `mother now show` | The Now list from the last tick (`--json` for the raw file); `mother now done <id>`, `snooze <id> 1h\|tomorrow\|next-week`, `top set\|swap\|done` edit your view of it |
-| `mother inbox archive\|read <mail:ID \| link>...` | Archive or mark read whole mail threads with no model in the loop, through the hub's mail connection; the guard's classifier is asked first, nothing changes while paused, and each thread is logged to `.mother/guard.log`. The Now panel's Archive, Mark read and Archive N mail buttons run it |
-| `mother hub install` | Home machine: run the hub watcher under launchd (`uninstall` removes it); `check` makes one read per connection, `status` shows the watcher and hub heartbeats (exit 2 if stale), `smoke` runs `check` and two polling passes 20 s apart into a throwaway copy of the state and prints per-source status and line counts (never content; exit 2 if a source cannot be read), `watch` runs it in the foreground; `add <link-or-text>` hands the hub something by hand, `follow`/`unfollow`/`mute`/`unmute` edit its machine-local watch list, `watching` prints it; `dms set|drop|show|inbox` maps DMs with people in config and the self-DM inbox |
-| `mother tts setup` | Install the optional Kokoro neural voice for the spoken brief (~330 MB in `~/.mother/tts`, English only) |
-| `mother channels status` | Reply loop: paused or stopped channels, pending drafts, streaks |
-| `mother channels pause` / `resume` | Stop or restart replies in every channel |
-| `mother whatsapp setup` | One guided WhatsApp setup, in your own terminal: installs and links the bridge (a QR, or a code typed on your phone), turns WhatsApp on for your account and checks database access. Safe to re-run |
-| `mother whatsapp chats` / `read` | Your recent chats (`--query` to find one), and the messages of one chat or of the last day. Read from WhatsApp desktop's local database; nothing is copied anywhere |
-| `mother whatsapp send --to WHO --text …` | Send one message from your number to a chat you've already used. MOTHER runs it; the guard asks you first, showing who and the text, except for `--to me` |
-| `mother whatsapp install` | Install the optional WhatsApp bridge into `~/.mother/whatsapp/app` (Node 20+, runs `npm ci`; repeat after a plugin update when `status` says `reinstall_needed`) |
-| `mother whatsapp link` / `unlink` | Pair the bridge again, in your own terminal / log it out and delete its keys; both stop a running bridge first (`mother whatsapp stop`) |
-| `mother whatsapp status` | Is the bridge linked, and is the local WhatsApp database readable (no messages shown) |
+| `agent`, `manager` | The agent's name and signature; your timezone, workdays, quiet hours, own DM |
+| `teams` | People, channels and their reply modes, tracker projects, repos, the weekly meeting |
+| `routines` | Which routines run, and when |
+| `policy` | `autonomy` (`functional` or `strict`) and other guard settings. Policy can only tighten the defaults |
+| `hub` | The watcher: `enabled`, one connection per source, per-source intervals |
+| `chief` | `daily_budget_usd`, `triage_model` and `tldr_model` (`sonnet` or `opus`) |
+| `whatsapp` | Off unless you set it up with `mother whatsapp setup` |
 
-### Pausing, stopping, uninstalling
+Your own portrait for the pane: `<workspace>/.mother/portrait.png` (plus a small `portrait.jpg` for the desktop
+app).
 
-- **Kill switch:** `touch "$(mother path)/.mother/PAUSED"` blocks every outbound call until you delete the
-  file. Routines still read and still write to the workspace.
-- **Stop one routine:** remove it from `config.json` → `routines`, then ask `/mother:setup` to update the
-  scheduled tasks (it disables the task rather than deleting it).
-- **Uninstall:** disable the `Mother:` tasks in the scheduled tasks list, then
-  `/plugin uninstall mother@mother` and `rm ~/.local/bin/mother`. Your workspace folder is untouched.
+## FAQ
 
-## What's inside
+**Does it send messages as me?** It acts through your own accounts, so yes, and every message, comment or
+ticket it writes is signed `✨ <agent> (AI) · on behalf of <you>`. Anything another person would see asks you
+first, except routine tracker and code-host work under the default `functional` autonomy (see Safety).
 
-| Path | What |
-|---|---|
-| `bin/mother` | CLI: `init`, `join`, `sync`, `scan`, `home`, `status`, `register`, `runs`, `path`, `link`, `speak`, `tts`, `channels`, `items`, `eval`, `health`, `now` (Python 3.9 stdlib) |
-| `hooks/guard.py` | Approval guard: allow / ask / deny per policy, kill switch, grants for unattended runs |
-| `skills/` | `setup`, `doctor`, `routine`, `brief`, `now`, `digest`, `dots`, `commitments`, `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `cos` |
-| `agents/` | Read-only sub-agents: `reader` (one source) and `critic` (one draft) |
-| `lib/` | `channels.py` (reply-mode engine), `now.py` (the Now list), `health.py` (per-server connector health, the only writer of `capabilities.json`), `items.py` (reader evidence check), `evals.py` (A/B harness) |
-| `routines/` | What each scheduled run does |
-| `assets/deck/`, `assets/plan/` | Weekly meeting deck with meeting mode; sprint plan page |
-| `rules/` | Default policies: outbound, privacy, memory, todos, projects, teams |
-| `templates/workspace/` | A new workspace's skeleton |
+**Which chat, tracker and mail does it work with?** Whatever your Claude Code connectors reach. Skills speak in
+capabilities (`chat.read`, `tracker.create`); the doctor records which server provides each. The watcher's
+adapters are narrower: today they cover Slack, Gmail, Jira, Google Calendar, GitHub (through `gh`) and the
+local WhatsApp database ([docs/CONTRACT.md §5e](docs/CONTRACT.md#5e-hub-libhubpy-mother-hub)).
+
+**Does it run when my laptop is closed?** No. The watcher and the scheduled tasks run on your home machine
+while it is awake and the desktop app is open. A missed routine fires on the next launch.
+
+**What does it cost?** Routines and case sessions are ordinary Claude Code sessions on your plan. The pane's
+own model calls (triage, summaries, question detection) are capped by `chief.daily_budget_usd`.
+
+**Can it work without the desktop app?** Partly. Skills, the guard, the CLI and sync work in the terminal. The
+Chief pane's leading session, case sessions and scheduled routines need the desktop app. `/mother:hub` can
+decide the inbox from a terminal session instead.
+
+**Where is my data?** In your workspace folder, as Markdown and JSON you can read and edit. The plugin repo
+holds code only.
+
+**What happened to the chief session and the workers?** Until 0.18.0 a long-lived background session and
+headless workers did the work and posted decisions to your DM. They were removed: work now happens only in
+sessions you can see. Old config keys for that layer are accepted and ignored.
+
+**Is it safe to try on a real team?** It is pre-alpha with one pilot. Start with channels on `off` or `watch`,
+keep `policy.autonomy` on `strict` until you trust it, and read `.mother/guard.log` to see every decision.
 
 ## Development
 
 ```
-python3 -m unittest discover tests
+claude plugin validate . && claude plugin test .     # manifests and the pane's module tests
+python3 -m unittest tests.test_docs tests.test_packaging   # fast checks
+python3 -m unittest discover tests                    # everything; several minutes
 ```
 
-Start with [AGENTS.md](AGENTS.md) (rules, commands, release steps) and [ARCHITECTURE.md](ARCHITECTURE.md)
-(code map and how a run flows). Both are written for coding agents and humans alike.
+Start with [AGENTS.md](AGENTS.md) (rules, commands, checklists, release steps) and
+[ARCHITECTURE.md](ARCHITECTURE.md) (code map and flows). Both are written for coding agents and humans alike;
+[llms.txt](llms.txt) indexes the docs. The spec is [docs/CONTRACT.md](docs/CONTRACT.md), the reasoning
+[docs/DESIGN.md](docs/DESIGN.md), the plan [docs/ROADMAP.md](docs/ROADMAP.md).
+
+| Path | What |
+|---|---|
+| `bin/mother` | The CLI (Python 3.9 stdlib): workspace, sync, guard switch, routines, hub, chief, floor, now, health |
+| `hooks/` | The approval guard (`guard.py`) and the hooks module that draws the Chief pane and the Now panel |
+| `lib/` | Small engines behind the CLI: hub, chief, floor, now, health, channels, WhatsApp |
+| `skills/`, `routines/`, `agents/`, `rules/` | Markdown the model follows |
+| `assets/`, `templates/` | The meeting deck, the sprint plan page, the portrait; a new workspace's skeleton |
+| `tests/` | stdlib `unittest`, plus `hooks/*.test.tsx` for the module |
 
 ## License
 
-MIT
+[MIT](LICENSE)
