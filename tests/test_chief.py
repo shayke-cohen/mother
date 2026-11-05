@@ -1,6 +1,7 @@
 """Tests for lib/chief.py — the tick and leader rule, triage decisions, status, pinned sessions, TL;DRs, spend.
 Run: python3 -m unittest tests.test_chief -v
 """
+import base64
 import contextlib
 import fcntl
 import io
@@ -789,6 +790,43 @@ class TestModelSpendAndText(Base):
     def test_safe_tab_to_space(self):
         self.assertEqual(chief._safe("a\tb"), "a b")
         self.assertEqual(chief.clean_tldr("a\tb", [])["tldr"], "a b")
+
+
+class PortraitTest(Base):
+    """`mother chief portrait --json`: the workspace's own picture when it is a small PNG, else the bundled one."""
+
+    @staticmethod
+    def png(width, height, pad=0):
+        return (chief.PNG_MAGIC + (13).to_bytes(4, "big") + b"IHDR" + width.to_bytes(4, "big") + height.to_bytes(4, "big")
+                + b"\x08\x06\x00\x00\x00" + b"\x00" * (4 + pad))
+
+    def custom(self, data):
+        (self.ws / ".mother").mkdir(exist_ok=True)
+        (self.ws / ".mother" / "portrait.png").write_bytes(data)
+
+    def run_verb(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = chief.main(["portrait", "--json"], self.ws, {}, AT)
+        return code, (json.loads(out.getvalue()) if out.getvalue().strip() else None)
+
+    def test_portrait_custom_bundled_oversized_and_not_a_png(self):
+        code, doc = self.run_verb()                              # no custom file: the bundled picture
+        self.assertEqual((code, doc["version"], doc["source"], doc["width"], doc["height"]), (0, 1, "bundled", 256, 256))
+        self.assertEqual(base64.b64decode(doc["png"]), chief.BUNDLED_PORTRAIT.read_bytes())
+        wide = self.png(800, 450)
+        self.custom(wide)
+        code, doc = self.run_verb()
+        self.assertEqual((code, doc["source"], doc["width"], doc["height"]), (0, "custom", 800, 450))
+        self.assertEqual(base64.b64decode(doc["png"]), wide)
+        self.custom(self.png(800, 450, pad=chief.PORTRAIT_MAX))  # past 2 MiB: the bundled one
+        self.assertEqual(self.run_verb()[1]["source"], "bundled")
+        self.custom(b"GIF89a" + b"\x00" * 64)                    # not a PNG: the bundled one
+        self.assertEqual(self.run_verb()[1]["source"], "bundled")
+        self.assertIsNone(chief.portrait_doc(self.ws, self.ws / "missing.png"))   # neither reads
+        with mock.patch.object(chief, "BUNDLED_PORTRAIT", self.ws / "missing.png"), \
+                mock.patch.object(chief.portrait_doc, "__defaults__", (self.ws / "missing.png",)):
+            self.assertEqual(self.run_verb(), (1, None))
 
 
 if __name__ == "__main__":

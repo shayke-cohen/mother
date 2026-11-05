@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { chiefStatusText, cleanTldr, ledByText } from './chief'
+import { budgetBar, isOpen, portraitLayout, sourceOf, suggestedBrief, suggestionsFor } from './pane_ui'
 import { CLI } from '../tests/fixtures/chief_cli'
 
 const WS = '/work/ws'
@@ -24,7 +25,7 @@ const ON_GET = '__test_on_get'
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
                     surface: 'terminal' | 'desktop' = 'terminal', sessionId = 'sess-1', files: Record<string, string> = {}, env: Record<string, string> = {},
-                    store: Record<string, unknown> | 'broken' = {}) {
+                    store: Record<string, unknown> | 'broken' = {}, expand = true) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m', ...env })
   const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
@@ -72,6 +73,8 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
   })
   await $.session.start({ cwd: '/', surface, isInteractive: true })
   await clock.settle()
+  // the cards' own defaults (Needs you open, the rest closed) have their tests; every other test reads a card in full
+  if (expand) await $.command.run({ command: 'chief', args: 'expand' } as any)
   return { clock, out }
 }
 
@@ -257,7 +260,8 @@ test('test_pinned_chat_sends_to_cli_id', async ($, on) => {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await hasText(ui, /^Pinned 1$/)).toBe(true)
     expect(await hasText(ui, /Fix the login bug/)).toBe(true)
-    expect(await hasText(ui, /example-api · active 10m ago/)).toBe(true)
+    expect(await hasText(ui, /^example-api$/)).toBe(true)
+    expect(await hasText(ui, /^ active 10m $/)).toBe(true)
     expect(await hasText(ui, /Merged the fix, CI green/)).toBe(true)
     await ui.input({ key: 'say:' + CLI_A, text: '--help "x"\ny' })
     expect(p.sends.length).toBe(1)
@@ -305,7 +309,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | expand | collapse]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -338,7 +342,7 @@ const SHOWN = [{ id: 'mother-chief', title: 'Chief', isShown: true, isFocused: f
 
 type TlOpts = {
   reply?: (e: any, h: any) => any, tail?: () => any, shown?: () => boolean, mcp?: (e: any, h: any) => any,
-  surface?: 'terminal' | 'desktop', sessionId?: string,
+  surface?: 'terminal' | 'desktop', sessionId?: string, expand?: boolean,
   cli?: (argv: string[], stdin?: string) => Cli | undefined,   // answers first; undefined falls through
 }
 type Tl = { asks: any[]; mcp: any[]; stdins: string[]; sends: any[]; fills: string[]; order: string[] }
@@ -365,7 +369,7 @@ async function bootTldr($: any, on: any, o: TlOpts = {}) {
     if (argv[0] === 'tldr') { t.stdins.push(String(stdin ?? '')); return { exitCode: 0, stdout: '{"stored": 1}\n' } }
     if (argv[0] === 'pinned') return { exitCode: 0, stdout: '{"pinned": 1}\n' }
     return undefined
-  }, surface, o.sessionId)
+  }, surface, o.sessionId, undefined, undefined, undefined, o.expand ?? true)
   return { ...booted, t }
 }
 
@@ -815,9 +819,9 @@ const CLI_B = '22222222-2222-4222-8222-222222222222'
 const isFloorAsk = (e: any) => String(e.system).includes('final message')
 
 // The session is `sessionId` (CLI_A is the pinned one); a floor model call answers `reply`; `floor list` hands `cards`.
-async function bootFloor($: any, on: any, o: { sessionId?: string; reply?: () => any; cards?: () => unknown[]; cli?: TlOpts['cli'] } = {}) {
+async function bootFloor($: any, on: any, o: { sessionId?: string; reply?: () => any; cards?: () => unknown[]; cli?: TlOpts['cli']; expand?: boolean } = {}) {
   const f = { cards: [] as any[], floorAsks: [] as any[] }
-  const booted = await bootTldr($, on, { sessionId: o.sessionId,
+  const booted = await bootTldr($, on, { sessionId: o.sessionId, expand: o.expand,
     reply: e => { if (!isFloorAsk(e)) return answered(TLDR); f.floorAsks.push(e); return (o.reply ?? (() => answered(JSON.stringify(ASK))))() },
     cli: (argv, stdin) => {
       const over = o.cli?.(argv, stdin)
@@ -919,7 +923,9 @@ test('test_pane_draws_needs_you_and_an_option_sends_and_hides_the_card', async (
     t.sends.length = 0
     const ui = await shown($, clock, surface)
     const all = await texts(ui)
-    expect(all[0]).toBe('Needs you 1')                                           // above every other section
+    expect(all.slice(0, 3)).toEqual(['Mother', 'Chief of Stuff', ' 1 need you '])   // the header strip
+    expect(all.indexOf('Needs you 1')).toBeGreaterThan(0)
+    expect(all.indexOf('Needs you 1')).toBeLessThan(all.indexOf('Pinned 2'))     // above every other section
     expect(all).toContain('Ship now or wait for review?')
     expect(await hasText(ui, /^waiting on the manager · asked 1\dm ago$/)).toBe(true)
     expect(all).toContain('Ship: "Ship it now."')                                // what the button would send, in view
@@ -933,6 +939,7 @@ test('test_pane_draws_needs_you_and_an_option_sends_and_hides_the_card', async (
     expect(t.sends[0].text).toBe('From the manager via the Chief pane: Wait for review.')
     expect(JSON.stringify(t.sends[0].to)).toContain(CLI_A)
     expect(await hasText(ui, /^Needs you/)).toBe(false)                          // answered: hidden
+    expect(await hasText(ui, /^Nothing needs you$/)).toBe(true)
     expect(await ui.find({ key: `need:${CLI_A}:0` })).toBeUndefined()
     expect(await hasText(ui, /^Sent: delivered$/)).toBe(true)                    // on the pinned card, as for its chat box
     await clock.advance(60_000)                                                  // the next list read: it still asks, so it shows again
@@ -977,7 +984,7 @@ const INBOX = [
 
 // A session whose tick answers `tick`; `reply` answers each model call by line id.
 async function bootLead($: any, on: any, o: { surface?: 'terminal' | 'desktop'; tick?: unknown; reply?: (id: string) => any; lines?: Cli;
-                                              over?: Record<string, unknown> } = {}) {
+                                              over?: Record<string, unknown>; expand?: boolean } = {}) {
   const surface = o.surface ?? 'desktop'
   const l: Lead = { asks: [], decides: [], fills: [], hub: [] }
   on('session.surfaces', () => ({ value: [surface] }))
@@ -993,7 +1000,7 @@ async function bootLead($: any, on: any, o: { surface?: 'terminal' | 'desktop'; 
     if (argv[0] === 'triage') { l.decides.push(JSON.parse(String(stdin ?? 'null'))); return { exitCode: 0, stdout: '{"paused": false, "logged": [], "now": []}' } }
     if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ led_by: 'desk-7', inbox: INBOX, inbox_count: 2, ...(o.over ?? {}) })) }
     return undefined
-  }, surface, 'desk-7')
+  }, surface, 'desk-7', undefined, undefined, undefined, o.expand ?? true)
   l.hub = booted.out.argv.filter(a => a[2] === 'hub')
   return { ...booted, l }
 }
@@ -1059,8 +1066,8 @@ test('test_inbox_section_draws_and_its_buttons_run_the_hub_verbs', async ($, on)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const seen = await texts(ui)
   expect(seen).toContain('Inbox 2')
-  expect(seen.indexOf('Inbox 2')).toBeLessThan(seen.indexOf('Health'))
-  expect(seen.indexOf('Review due')).toBeLessThan(seen.indexOf('Build broke'))     // newest first
+  expect(seen.indexOf('Inbox 2')).toBeLessThan(seen.indexOf('No pinned sessions'))
+  expect(seen.indexOf('▾ Review due')).toBeLessThan(seen.indexOf('▾ Build broke'))     // newest first
   expect(seen).toContain('needs a look today')
   expect(await hasText(ui, /^PLAT-9 · 2m $/)).toBe(true)
   expect((await ui.findAll({ type: 'Link' })).map((x: any) => x.props.href)).toEqual(['https://example.com/9', 'https://example.com/8'])
@@ -1099,26 +1106,26 @@ test('test_status_line_shows_only_the_counts_above_zero', async ($, on) => {
   expect(last).not.toMatch(/chief|working|to decide/)
 })
 
-// ---- Health: who leads ----
+// ---- the header strip: who leads ----
 test('test_led_by_text_has_three_wordings', () => {
-  expect(ledByText(status({ led_by: 'desk-7' }) as any, 'desk-7')).toBe('Led by this session')
-  expect(ledByText(status({ led_by: 'desk-8' }) as any, 'desk-7')).toBe('Led by another desktop session')
-  expect(ledByText(status({ led_by: 'desk-8' }) as any, null)).toBe('Led by another desktop session')
-  expect(ledByText(status({ led_by: null }) as any, 'desk-7')).toBe('No session is leading')
-  expect(ledByText(status({ led_by: '' }) as any, 'desk-7')).toBe('No session is leading')
+  expect(ledByText(status({ led_by: 'desk-7' }) as any, 'desk-7')).toBe('led here')
+  expect(ledByText(status({ led_by: 'desk-8' }) as any, 'desk-7')).toBe('led by another session')
+  expect(ledByText(status({ led_by: 'desk-8' }) as any, null)).toBe('led by another session')
+  expect(ledByText(status({ led_by: null }) as any, 'desk-7')).toBe('nobody leading')
+  expect(ledByText(status({ led_by: '' }) as any, 'desk-7')).toBe('nobody leading')
   const { led_by: _gone, ...older } = status()
-  expect(ledByText(older as any, 'desk-7')).toBe('No session is leading')
+  expect(ledByText(older as any, 'desk-7')).toBe('nobody leading')
 })
 
-for (const [led, line] of [['desk-7', 'Led by this session · heartbeat now'], ['desk-8', 'Led by another desktop session · heartbeat now'],
-                           [null, 'No session is leading · heartbeat now']] as const) {
-  test(`test_health_line: ${line}`, async ($, on) => {
+for (const [led, pill, color] of [['desk-7', 'led here', 'success'], ['desk-8', 'led by another session', 'warning'],
+                                  [null, 'nobody leading', 'error']] as const) {
+  test(`test_header_lead_pill: ${pill}`, async ($, on) => {
     await bootLead($, on, { over: { led_by: led } })
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
-      const all = await texts(ui)
-      expect(all).toContain(line)
-      expect(all.some((t: string) => /Chief [●○]|Workers|To decide/.test(t))).toBe(false)
+      expect((await ui.find({ type: 'Text', text: ` ${pill} ` }))?.props.backgroundColor).toBe(color)
+      expect(await hasText(ui, /^heartbeat now$/)).toBe(true)
+      expect((await texts(ui)).some((t: string) => /Chief [●○]|Workers|To decide|^Health$/.test(t))).toBe(false)
       await ui.unmount()
     }
   })
@@ -1128,19 +1135,19 @@ test('test_health_line_without_a_heartbeat_and_paused', async ($, on) => {
   await bootLead($, on, { over: { led_by: null, paused: true, chief: { alive: false, heartbeat_at: null } } })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const all = await texts(ui)
-  expect(all).toContain('No session is leading · no heartbeat')
+  expect(all).toContain(' nobody leading ')
+  expect(all).toContain('no heartbeat')
   expect(all).toContain('PAUSED: nothing is triaged or decided until /chief resume.')
   await ui.unmount()
 })
 
 // ---- the real CLI's output (tests/fixtures/chief_cli.ts, written by tests/test_cli_contract.py) ----
-test('test_real_idle_status_draws_health_and_nothing_else', async ($, on) => {
+test('test_real_idle_status_draws_the_strip_and_empty_states', async ($, on) => {
   const { out } = await boot($, on, argv => argv[0] === 'status' ? CLI.status_idle : undefined)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const all = await texts(ui)
-  expect(all[0]).toBe('Health')
-  expect(all.some((t: string) => /^(Led by|No session is leading)/.test(t))).toBe(true)
-  expect(all.some((t: string) => /^Budget \$/.test(t))).toBe(true)
+  expect(all).toEqual(['Mother', 'Chief of Stuff', ' 0 need you ', ' 0 inbox ', ' 0 sessions ', '$0.00 / $20', '▱▱▱▱▱▱▱▱', ' nobody leading ', 'heartbeat 1h ago',
+                       'Nothing needs you', 'Inbox clear', 'No pinned sessions'])   // never a blank section
   expect(String(out.status[out.status.length - 1] ?? '')).not.toMatch(/need you|in inbox|chief/)
   await ui.unmount()
 })
@@ -1151,4 +1158,240 @@ test('test_real_tick_with_nothing_to_do_asks_no_model', async ($, on) => {
   expect(chiefCalls(out, 'tick').length).toBe(1)
   expect(l.asks).toEqual([])
   expect(chiefCalls(out, 'triage')).toEqual([])
+})
+
+// ---- the pane's look: the header strip, cards, badges, collapse / expand, the selected card, suggested prompts ----
+const card = async (ui: any, id: string) => (await ui.find({ key: 'card:' + id }))?.props ?? {}
+
+test('test_header_strip_counts_budget_and_colours', async ($, on) => {
+  const { clock } = await bootFloor($, on, { cards: () => [asking()], cli: argv => argv[0] === 'status'
+    ? { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2, PINNED], inbox: INBOX, inbox_count: 7, budget: { spent: 12, limit: 20 } })) } : undefined })
+  for (const surface of SURFACES) {
+    const ui = await shown($, clock, surface)
+    const pill = async (text: string) => { const f = await ui.find({ type: 'Text', text }); return f && (f.props.backgroundColor ?? f.props.color ?? 'plain') }
+    expect(await pill(' 1 need you ')).toBe('warning')
+    expect(await pill(' 7 inbox ')).toBe('permission')
+    expect(await pill(' 2 sessions ')).toBe('ide')
+    expect(await pill('$12.00 / $20')).toBe('plain')
+    expect(await pill('▰▰▰▰▰▱▱▱')).toBe('warning')
+    await ui.unmount()
+  }
+  expect(budgetBar(0, 20)).toEqual({ text: '▱▱▱▱▱▱▱▱', color: 'success' })
+  expect(budgetBar(19, 20)).toEqual({ text: '▰▰▰▰▰▰▰▰', color: 'error' })
+  expect(budgetBar(1, 0).color).toBe('error')                                      // no limit reads as spent
+})
+
+test('test_source_is_read_from_the_key_shape', () => {
+  expect(['C0123ABC/1699999999.000100', 'D0123ABC/dm', 'wa:1234@g.us', 'mail:abc', 'PLAT-9', 'example/api#45', 'cal:evt1', 'manual:x',
+          'watcher:chat', 'watcher:tracker:PLAT', 'something else', ''].map(sourceOf))
+    .toEqual(['chat', 'chat', 'chat', 'mail', 'tracker', 'code', 'calendar', 'manual', 'error', 'error', 'other', 'other'])
+  expect(suggestionsFor('chat')[0]).toBe('Draft a reply in the thread')
+  expect(suggestionsFor('mail')[0]).toBe('Draft a reply')
+  expect(suggestionsFor('tracker')[0]).toBe('Summarise the ticket and propose a next step')
+  expect(suggestionsFor('code')[0]).toBe('Review the PR')
+  expect(suggestionsFor('calendar')[0]).toBe('Decide whether to accept')
+  expect(suggestedBrief('Review the PR', 'Fix login', '', null)).toBe('Review the PR for "Fix login". Draft anything that reaches another person; don\'t send.')
+})
+
+test('test_inbox_cards_wear_a_badge_and_a_border_colour_per_source', async ($, on) => {
+  const rows = [['U1', 'C0123ABC/1699999999.000100', 'chat', 'planMode'], ['U2', 'mail:abc', 'mail', 'merged'], ['U3', 'PLAT-9', 'tracker', 'permission'],
+                ['U4', 'example/api#45', 'code', 'success'], ['U5', 'cal:evt1', 'calendar', 'autoAccept'], ['U6', 'manual:x', 'manual', 'suggestion'],
+                ['U7', 'watcher:chat', 'error', 'error']] as const
+  const inbox = rows.map(([id, key], i) => ({ id, key, title: 'Item ' + id, why: '', link: '', at: `2026-11-02T09:5${i}:00Z`, session: null }))
+  await bootLead($, on, { over: { inbox, inbox_count: inbox.length } })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    for (const [id, , source, color] of rows) {
+      const b = await ui.find({ type: 'Text', text: ` ${source} ` })
+      expect([id, b?.props.backgroundColor]).toEqual([id, color])
+      const c = await card(ui, 'inbox:' + id)
+      expect([id, c.borderColor, c.borderStyle]).toEqual([id, color, 'round'])
+    }
+    await ui.unmount()
+  }
+})
+
+test('test_cards_start_compact_and_the_title_row_toggles', async ($, on) => {
+  await bootLead($, on, { expand: false })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    // compact: the title row, the badge, key, age and the primary button; no why, no Done, no suggestions
+    expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('▸ Review due')
+    expect((await ui.find({ key: 'inbox-open:U2' }))?.props.variant).toBe('primary')
+    expect(await hasText(ui, /^PLAT-9 · 2m $/)).toBe(true)
+    expect(await hasText(ui, /needs a look today/)).toBe(false)
+    expect(await ui.find({ key: 'inbox-done:U2' })).toBeUndefined()
+    expect(await ui.find({ key: 'inbox-sug:U2:0' })).toBeUndefined()
+    await ui.press({ key: 'toggle:inbox:U2' })
+    expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('▾ Review due')
+    expect(await hasText(ui, /^needs a look today$/)).toBe(true)
+    expect((await ui.find({ key: 'inbox-done:U2' }))?.text).toBe('Done')
+    expect((await ui.find({ key: 'inbox-sug:U2:0' }))?.text).toBe('Summarise the ticket and propose a next step')
+    expect(await ui.find({ key: 'inbox-done:U1' })).toBeUndefined()                // the other card is untouched
+    await ui.press({ key: 'toggle:inbox:U2' })                                     // closed again, though it is the selected card
+    expect(await ui.find({ key: 'inbox-done:U2' })).toBeUndefined()
+    await ui.unmount()
+  }
+  expect(isOpen(null, 'need:x', 'need', null)).toBe(true)
+  expect(isOpen(null, 'sess:x', 'sess', null)).toBe(false)
+  expect(isOpen(null, 'sess:x', 'sess', 'sess:x')).toBe(true)
+  expect(isOpen({ all: false, cards: { 'sess:x': true } }, 'sess:x', 'sess', null)).toBe(true)
+  expect(isOpen({ all: true, cards: {} }, 'inbox:U1', 'inbox', null)).toBe(true)
+})
+
+test('test_a_pressed_card_is_selected_bold_and_open_until_another_is_picked', async ($, on) => {
+  const { out } = await bootLead($, on, { expand: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const look = async (id: string) => { const c = await card(ui, id); return [c.borderStyle, c.borderDimColor] }
+  expect(await look('inbox:U1')).toEqual(['round', true])
+  expect(await look('inbox:U2')).toEqual(['round', true])
+  await ui.press({ key: 'inbox-open:U2' })                                         // any button on the card selects it
+  expect(out.argv.some(a => a[0] === 'open')).toBe(true)                           // and still runs
+  expect(await look('inbox:U2')).toEqual(['bold', false])
+  expect(await look('inbox:U1')).toEqual(['round', true])
+  expect((await ui.find({ key: 'inbox-done:U2' }))?.text).toBe('Done')             // the selected card is drawn in full
+  await ui.press({ key: 'toggle:inbox:U1' })
+  expect(await look('inbox:U1')).toEqual(['bold', false])
+  expect(await look('inbox:U2')).toEqual(['round', true])
+  expect(await ui.find({ key: 'inbox-done:U2' })).toBeUndefined()                  // no longer selected: compact again
+  await ui.unmount()
+})
+
+test('test_suggested_prompt_becomes_the_open_session_brief', async ($, on) => {
+  const { out, l } = await bootLead($, on)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const briefs = () => out.argv.filter(a => a[0] === 'open').map(a => new URL(a[1]).searchParams.get('q'))
+  const variant = async (key: string) => (await ui.find({ key }))?.props.variant
+  await ui.press({ key: 'inbox-sug:U2:0' })
+  expect(await variant('inbox-sug:U2:0')).toBe('primary')                          // the chosen one is marked
+  expect(await variant('inbox-sug:U2:1')).toBe('secondary')
+  expect(briefs()).toEqual([])                                                     // choosing opens nothing
+  await ui.press({ key: 'inbox-open:U2' })
+  expect(briefs()).toEqual(['Summarise the ticket and propose a next step for "Review due" — needs a look today (https://example.com/9). ' +
+    "Draft anything that reaches another person; don't send."])
+  await ui.press({ key: 'inbox-sug:U1:1' })                                        // a live session, but a brief was chosen: a new session
+  await ui.press({ key: 'inbox-open:U1' })
+  expect(briefs()[1]).toContain('Find the owner and draft a DM for "Build broke" — red since noon')
+  expect(l.fills).toEqual([])
+  await ui.press({ key: 'inbox-sug:U2:0' })                                        // pressed again: unchosen, back to the plain ask
+  expect(await variant('inbox-sug:U2:0')).toBe('secondary')
+  await ui.press({ key: 'inbox-open:U2' })
+  expect(briefs()[2]).toContain('Help me close this out: "Review due"')
+  expect(out.submits).toEqual([])                                                  // typed, never sent
+  await ui.unmount()
+})
+
+test('test_chief_expand_and_collapse_set_every_card', async ($, on) => {
+  const { clock } = await bootFloor($, on, { expand: false, cards: () => [asking()] })
+  const run = async (args: string) => ((await $.command.run({ command: 'chief', args } as any)) as any).text
+  {
+    const ui = await shown($, clock, 'terminal')
+    const has = async (key: string) => (await ui.find({ key })) !== undefined
+    // the defaults: Needs you in full, the sessions compact
+    expect([await has('need-open:' + CLI_A), await has('say:' + CLI_A), await has('open:' + CLI_A)]).toEqual([true, false, true])
+    expect(await hasText(ui, /^Handler patched; tests next\.$/)).toBe(false)
+    expect(await run('expand')).toBe('Chief pane: every card expanded.')
+    expect([await has('need-open:' + CLI_A), await has('say:' + CLI_A), await has('say:' + CLI_2)]).toEqual([true, true, true])
+    expect(await hasText(ui, /^Handler patched; tests next\.$/)).toBe(true)
+    expect(await run('collapse')).toBe('Chief pane: every card collapsed.')
+    expect([await has('need-open:' + CLI_A), await has('say:' + CLI_A), await has('open:' + CLI_A)]).toEqual([false, false, true])
+    expect(await hasText(ui, /^Ship now or wait for review\?$/)).toBe(true)        // a compact Needs you card keeps its question
+    expect([await has(`need:${CLI_A}:0`), await has(`need:${CLI_A}:1`)]).toEqual([true, false])   // and its first option
+    await ui.press({ key: 'toggle:sess:' + CLI_2 })                                // a toggle after it stands above it
+    expect([await has('say:' + CLI_2), await has('say:' + CLI_A)]).toEqual([true, false])
+    await $.command.run({ command: 'chief', args: 'collapse' } as any)             // and the next collapse clears the toggle
+    expect(await has('say:' + CLI_2)).toBe(false)
+    await ui.unmount()
+  }
+})
+
+test('test_this_session_is_marked_and_an_answer_selects_the_session', async ($, on) => {
+  const { clock } = await bootFloor($, on, { sessionId: CLI_2, cards: () => [asking()] })
+  for (const surface of SURFACES) {
+    const ui = await shown($, clock, surface)
+    const badges = async (re: RegExp) => (await ui.findAll({ type: 'Text', text: re })).map((b: any) => [b.text, b.props.backgroundColor])
+    expect(await badges(/^ this session $/)).toEqual([[' this session ', 'claude']])   // one card only: this session's
+    const mine = await card(ui, 'sess:' + CLI_2), other = await card(ui, 'sess:' + CLI_A), need = await card(ui, 'need:' + CLI_A)
+    expect([mine.borderColor, mine.borderDimColor]).toEqual(['claude', false])     // the accent, lit
+    expect([other.borderColor, other.borderDimColor]).toEqual(['ide', true])
+    expect(need.borderColor).toBe('warning')
+    expect(await badges(/^ asks $/)).toEqual([[' asks ', 'warning'], [' asks ', 'warning']])   // the Needs you card and its pinned card
+    expect(await badges(/^ active 1\dm $/)).toHaveLength(1)
+    await ui.press({ key: `need:${CLI_A}:0` })                                     // an answer selects the session: its pinned card is bold
+    expect((await card(ui, 'sess:' + CLI_A)).borderStyle).toBe('bold')
+    await clock.advance(60_000)                                                    // it asks again on the next read: both cards are the selected session's
+    expect((await card(ui, 'need:' + CLI_A)).borderStyle).toBe('bold')
+    await ui.press({ key: 'open:' + CLI_2 })
+    expect((await card(ui, 'sess:' + CLI_A)).borderStyle).toBe('round')
+    await ui.unmount()
+  }
+})
+
+// A real 1x1 PNG: the surface checks the bytes; the verb's width and height (the picture's own) choose the layout.
+const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+const portraitCli = (width: number, height: number, png = PNG_1PX) => (argv: string[]) => argv[0] === 'portrait'
+  ? { exitCode: 0, stdout: JSON.stringify({ version: 1, source: 'bundled', width, height, png }) } : undefined
+const pictures = async (ui: any, type: string) => (await ui.findAll({ type })).map((i: any) => i.props)
+
+test('test_a_square_picture_is_a_small_spot_in_the_header_strip', async ($, on) => {
+  const { out } = await boot($, on, portraitCli(256, 256))
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const [img, ...more] = await pictures(term, 'Image')
+  expect(more).toEqual([])
+  expect([img.alt, img.columns, img.rows, img.source]).toEqual(['Mother, Chief of Stuff', 10, 5, { png: PNG_1PX }])
+  expect(await term.find({ key: 'banner' })).toBeUndefined()
+  expect((await texts(term)).slice(0, 2)).toEqual(['Mother', 'Chief of Stuff'])
+  await term.unmount()
+  await $.ui.mount({ ...PANE, surface: 'terminal' }).then((u: any) => u.unmount())
+  expect(chiefCalls(out, 'portrait').length).toBe(1)                  // loaded once per session, never per draw
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })      // no Image on the desktop app: an Svg wraps the PNG
+  expect(await pictures(desk, 'Image')).toEqual([])
+  const [svg] = await pictures(desk, 'Svg')
+  expect([svg.alt, svg.width, svg.height]).toEqual(['Mother, Chief of Stuff', 64, 64])
+  expect(svg.source).toContain('data:image/png;base64,' + PNG_1PX)
+  await desk.unmount()
+})
+
+test('test_a_wide_picture_is_a_banner_above_the_header_strip', async ($, on) => {
+  await boot($, on, portraitCli(800, 450))
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const banner = await term.find({ key: 'banner' })
+  expect(banner).toBeDefined()
+  const [img] = await pictures(term, 'Image')
+  expect([img.alt, img.columns, img.rows]).toEqual(['Mother, Chief of Stuff', 44, 12])   // round(44 * 450 / 800 / 2)
+  expect((await texts(term)).slice(0, 2)).toEqual(['Mother', 'Chief of Stuff'])            // the title stays in the strip
+  await term.unmount()
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const [svg] = await pictures(desk, 'Svg')
+  expect([svg.width, svg.height]).toEqual([352, 198])
+  await desk.unmount()
+  expect(portraitLayout({ png: '', width: 2000, height: 100 })).toEqual({ banner: true, columns: 44, rows: 6 })    // clamped
+  expect(portraitLayout({ png: '', width: 140, height: 100 })).toEqual({ banner: true, columns: 44, rows: 14 })
+  expect(portraitLayout({ png: '', width: 139, height: 100 }).banner).toBe(false)
+})
+
+test('test_a_picture_too_big_for_an_svg_is_not_drawn_on_the_desktop', async ($, on) => {
+  await boot($, on, portraitCli(800, 450, PNG_1PX.slice(0, -4) + 'A'.repeat(140_000) + PNG_1PX.slice(-4)))
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await pictures(desk, 'Svg')).toEqual([])
+  expect((await texts(desk)).slice(0, 2)).toEqual(['Mother', 'Chief of Stuff'])
+  await desk.unmount()
+})
+
+test('test_header_draws_no_picture_when_the_verb_fails', async ($, on) => {
+  let mode: 'fails' | 'junk' = 'fails'
+  const answer = (argv: string[]) => argv[0] !== 'portrait' ? undefined
+    : mode === 'fails' ? { exitCode: 1, stderr: 'mother chief portrait: no readable PNG\n' } : { exitCode: 0, stdout: '{"version": 1, "png": 7}' }
+  await boot($, on, answer)
+  for (const m of ['fails', 'junk'] as const) {
+    mode = m
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      expect(await pictures(ui, 'Image')).toEqual([])
+      expect(await pictures(ui, 'Svg')).toEqual([])
+      expect((await texts(ui)).slice(0, 2)).toEqual(['Mother', 'Chief of Stuff'])   // the strip shows just the text
+      await ui.unmount()
+    }
+  }
 })

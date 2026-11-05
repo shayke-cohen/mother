@@ -6,6 +6,7 @@ spend.json, desktop.json and tldr.json are written inside hub.locked(ws). Until 
 session and headless workers; what they left on disk (worker rows in sessions.json, queue.jsonl, decisions.json,
 chief.json, wake.json) is ignored. Stdlib only.
 """
+import base64
 import hashlib
 import json
 import os
@@ -685,6 +686,8 @@ USAGE = """usage: mother chief <verb> ...
                         prints {stored: N}
   spend --stdin         add one pane model call ({model, input_tokens, output_tokens} on stdin) to today's spend;
                         prints {added: usd}
+  portrait --json       the Chief pane's picture: .mother/portrait.png when it is a PNG of at most 2 MiB, else the
+                        bundled one; prints {version, source, width, height, png (base64)}
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
 
 A valued option takes --opt=V or --opt V."""
@@ -695,7 +698,39 @@ VERBS = {
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
+    "portrait": (("--json",), ()),
 }
+
+# ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
+
+PORTRAIT_MAX = 2 * 1024 * 1024
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+BUNDLED_PORTRAIT = Path(__file__).resolve().parent.parent / "assets" / "art" / "mother-cos.png"
+
+
+def _read_png(path: Path) -> Optional[Tuple[bytes, int, int]]:
+    """(bytes, width, height) of a PNG of at most 2 MiB, read from its IHDR; None for anything else."""
+    try:
+        if not path.is_file() or path.stat().st_size > PORTRAIT_MAX:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 24 or len(data) > PORTRAIT_MAX or data[:8] != PNG_MAGIC or data[12:16] != b"IHDR":
+        return None
+    width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    return (data, width, height) if width > 0 and height > 0 else None
+
+
+def portrait_doc(ws: Path, bundled: Path = BUNDLED_PORTRAIT) -> Optional[dict]:
+    """<workspace>/.mother/portrait.png (machine-local, never synced) when it is a PNG of at most 2 MiB, else the
+    bundled picture; None when neither reads."""
+    for source, path in (("custom", Path(ws) / ".mother" / "portrait.png"), ("bundled", bundled)):
+        got = _read_png(path)
+        if got:
+            return {"version": 1, "source": source, "width": got[1], "height": got[2],
+                    "png": base64.b64encode(got[0]).decode("ascii")}
+    return None
 
 
 def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
@@ -818,6 +853,13 @@ def main(args, ws, cfg, at) -> int:
         if not isinstance(rows, list):
             return _usage("pinned: stdin must be a JSON array of list_sessions rows")
         print(json.dumps({"pinned": pinned_snapshot(ws, at, rows, default_app_dir())}))
+        return EXIT_OK
+    if verb == "portrait":
+        doc = portrait_doc(ws)
+        if doc is None:
+            print("mother chief portrait: no readable PNG", file=sys.stderr)
+            return 1
+        print(json.dumps(doc))
         return EXIT_OK
     if verb == "tail":
         print(json.dumps(session_tails(ws, cfg, Path.home(), default_app_dir()), indent=2, ensure_ascii=False))
