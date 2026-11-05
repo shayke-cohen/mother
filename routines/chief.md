@@ -6,7 +6,7 @@ config: chief                     # max_workers, run_minutes, daily_budget_usd, 
 default: {}
 needs: []
 writes: [.mother/hub.json, .mother/chief/]
-sends: the decision batch to the manager's own DM, and only when a wake says the mod couldn't post it
+sends: the decision batch to the manager's own DM, and only when a wake says it surely did not land
 sync: false
 ---
 
@@ -80,17 +80,30 @@ Workers file what needs the manager's yes as decisions, and the manager answers 
 `mother chief tick` applies those replies as plain code. A wake never decides reply lines: they aren't in
 `mother chief lines --json`, and you never answer a decision yourself.
 
-If a wake says a batch is due and the mod couldn't post it:
+The mod posts each batch itself. When it needs you, a wake line says which of three cases it is. A duplicate DM is
+the failure to avoid: you post a batch only in the first case. The guard lets you post to the manager's own DM only
+the exact text of the live offer.
+
+**"surely did not land"**: the post was refused before it went out. Post it by hand:
 
 1. Run `mother decide batch --json`. It prints `{"text", "ids"}`, or `null` when nothing is due: then stop.
-2. Post `text` to the manager's own DM, verbatim.
+2. Post `text` to the manager's own DM, verbatim: the exact `batch --json` text, with nothing added, cut or changed.
 3. Run `mother decide sent --ids <ids, comma-separated> --ts <the post's ts>`. When `ids` is empty, use `--ids ''`.
-   Without this the next wake posts it again.
+   Without this the next wake posts it again. `sent` re-reads the post and stamps it only if it is that text. If it
+   exits non-zero, stop: never post a second time.
 
-If a wake says the batch record is failing, the batch is already posted, and the wake gives its ids and ts. Run
-`mother decide sent --ids <ids> --ts <ts>` with those, once. Exit 2 means it's already recorded or no batch is waiting:
-stop there. Any other failure: post one line to the manager's own DM saying batch confirmations are failing.
-Never re-post the batch.
+**"may have landed"**: the post timed out, gave no ts, or `sent` couldn't find it. Never re-post it, and don't run
+`mother decide batch`: that makes a new offer, which the post you are looking for won't match.
+
+1. Read the manager's own DM history with the chat connector's history read, from the ts the wake gives.
+2. If an app-posted message there is the batch (it lists the ids the wake gives), run
+   `mother decide sent --ids <those ids> --ts <its ts>` once. When the wake says it has no ids, use `--ids ''`.
+3. If it isn't there, or `sent` exits non-zero, stop. The mod tries again after batch_minutes.
+
+**"the batch record is failing"**: the batch is already posted, and the wake gives its ids and ts. Run
+`mother decide sent --ids <ids> --ts <ts>` with those, once. Exit 2 means it's already recorded or no batch is
+waiting: stop there. Any other failure: stop too; the mod keeps retrying and the Chief pane shows why. Never re-post
+the batch, and post nothing else to the manager's own DM: the guard refuses anything there but the offered batch.
 
 ## Rules
 

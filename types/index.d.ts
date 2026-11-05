@@ -180,6 +180,7 @@ export type ChiefDecision = {
   id: string                         // D<n>
   key: string
   kind: string
+  tool?: string | null               // the full tool name, mcp__<server>__<tool>; absent from an older CLI
   recommendation: string
   why: string
   text: string
@@ -208,6 +209,8 @@ export type ChiefBatchState = {
   sentRetryAt: number      // epoch ms: no `sent` before this, once it has failed 3 times
   recordLineDue: boolean   // the "batch record is failing" line goes out with the next wake
   recordWoken: boolean     // that line already went out for this debt
+  checkLine?: string | null   // the may-have-landed line (look for the batch, record it, never post) for the next wake
+  refusals?: number        // `decide sent` refusals (not the offer at that ts) in a row; 2 stop the posting until nothing is due
 }
 
 export type ChiefStatus = {
