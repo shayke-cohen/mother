@@ -1430,10 +1430,13 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     included, as it does for a bad `--ids` or a missing or bad `--ts`. So the order is `batch`, post, `sent`. A batch of
     confirmation lines alone uses `--ids ''`. The stamp is never earlier than the offer. A stamp must prove a post: `sent`
     re-reads the message at `--ts` in the manager's first `D…` channel, through the read `answer` uses, and stamps only
-    when it is app-posted, draws nothing but its text (no attachments, no blocks but `rich_text`) and its text equals the
-    offer's after Slack's escaping is undone. An earlier offer since the last `sent` counts, for a post that landed late,
+    when it is app-posted, draws nothing but its text (no attachments but a preview of its own link, no blocks but `rich_text`) and its text equals the
+    offer's in the one form both are compared in (`_norm`): auto-links and `<url|label>` as their text, entities undone,
+    every emoji spelling, Unicode or `:shortcode:`, as one placeholder, and no trailing spaces. A zero-width space stays,
+    and words, ids, numbers and targets must match. An earlier offer since the last `sent` counts, for a post that landed late,
     and then only that offer's ids can be stamped. Exits: no live offer, 2, with "no batch is waiting"; no such message, not
-    app-posted or other text, 2, with a message without that phrase, and the offer stays live; a read that failed, 3, which
+    app-posted, not plain (blocks other than rich_text, an attachment that isn't a preview of the message's own link, a
+    link labelled as anything but its address) or other text, 2, with a message without that phrase, and the offer stays live; a read that failed, 3, which
     is worth retrying and stamps nothing.
   - **The post.** The chief's mod posts the batch with `$.mcp.call`, which is not a tool call, so the guard doesn't see
     it. The mod does the guard's checks itself: nothing goes out under `MOTHER_DRY_RUN` or either PAUSED file, only the
@@ -1443,20 +1446,36 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     line per batch. One that surely failed backs off 2, 4, 8 … minutes up to `batch_minutes`, with one wake line at the
     cap, or on its first failure if the batch holds an urgent decision. A new urgent decision ends a hold, at most 3
     times in a rolling hour and never within 2 minutes of the last attempt; past that it waits, and its card and toast
-    still show it. A wake line tells the chief a batch is due and the mod couldn't post it: the chief runs `batch`,
-    posts the text and runs `sent` (`routines/chief.md`).
+    still show it. A wake line says one of three things (`routines/chief.md`): the post surely did not land, so the
+    chief runs `batch`, posts the text and runs `sent`; it may have landed, so the chief looks in the DM's history, runs
+    `sent` with the ts if it's there, and never posts; or the record is failing, as below. Every post, the mod's and the
+    chief's, passes `unfurl_links: false` and `unfurl_media: false`.
+  - **How many posts.** A post counts from before it goes out, kept with the mod's post state, which is session state:
+    a reload of the mod keeps the counts. A post that surely did not land gives its count back; the wake line asking
+    for a hand post takes one. An offer's content (`batch_key` in `mother chief tick --json`, a hash of its text, read
+    without making an offer) gets 2 posts unless one is recorded, whether they were refused by `sent` or unsure. Then
+    posting stops, and the Chief pane says so, until the content changes or 6 hours after the last post, whichever is
+    first. Across all contents, batch posts stop at 4 in any rolling hour, and an urgent decision waits like the rest.
+    The worst case is therefore 2 DMs per 6 hours while the batch's content doesn't change, and 4 DMs in any hour, up to
+    96 a day, only if the content changes each time and the posts go on landing. With the default `batch_minutes` of 30
+    an unrecorded post holds the next for 30 minutes, so the 4 needs urgent decisions or recorded posts. Not counted:
+    a post that returned a clear error but landed anyway; a chief that posts the live offer against its routine (the
+    guard lets the exact text through until `sent`); a green post to the DM from a normal session; and a new chief
+    session starts its counts at zero, so `mother chief install` can add up to 4 more.
   - **A `sent` that fails.** No new batch goes out while one is owed. After 3 failures in a row the chief gets one wake
     line, "The batch record is failing", with the ids and ts to run `sent` with once, and the mod retries once per
-    `batch_minutes`. If `sent` exits 2 the mod drops the debt without counting a failure, because it can never succeed
-    (already recorded, by a `sent` whose answer got lost or by the chief's, or a later batch replaced the offer), and
-    logs `mod post: record dropped`. Nothing is re-posted for `batch_minutes`; after that, what wasn't stamped is listed
-    in the next batch, so a second DM is possible there.
+    `batch_minutes`. A `sent` that exits 2 drops the debt, isn't a record failure and logs `mod post: record dropped`.
+    With "no batch is waiting" there's no live offer: it was already recorded, by a `sent` whose answer got lost or by
+    the chief's, or a later batch replaced it. Any other exit 2 means the re-read didn't find the offer at that ts, but
+    the post may have landed: the chief gets one wake line to look for it, unless this was the content's second post,
+    which stops the posting as above. Either way nothing is re-posted for `batch_minutes`; after that, what wasn't
+    stamped is listed in the next batch, so a second DM is possible there.
   - **To decide cards.** The Chief pane shows pending decisions with Approve, Edit and Reject. A card shows the first 400
     characters and says so when a draft is cut; `full_text` in the status carries the rest, every field labelled when
     there are several. A call `edit` can't take has no Edit button, and its card shows `edit_refusal` from the status.
   - **Answering.** Two routes, and only these. A reply in the manager's own DM: a `manual` inbox line whose id, channel
     and timestamp are re-read from Slack (`get_channel_history`) and the text parsed from the message as fetched, not
-    from the watcher's summary: `7 ok`, `7 no`, `7 edit: <text>`, `7: <words>` for the worker, `ok all`, several on separate lines. A number followed
+    from the watcher's summary: `7 ok`, `7 no`, `7 edit: <text>`, `7: <words>` for the worker (a colon and then whitespace, and the words run to the end of the line: "10:30 call with Dana" is a note), `ok all`, several on separate lines. A number followed
     by other words isn't a reply: "2 things for tomorrow" keeps its normal path to the chief. A reply counts
     only for a decision filed and announced before the reply was typed. Or a button in the Chief pane
     (`mother decide answer <n> ok|no|edit --via pane`). A line that can't be verified or read applies nothing and the

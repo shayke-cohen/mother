@@ -322,8 +322,12 @@ async function triageWake($: Dollar, bin: string, judge: string[], wake: string)
 // - "no batch is waiting": no live offer. It was already recorded (a `sent` whose answer got lost, or the chief's), or a
 //   later batch replaced the offer.
 // - anything else: the re-read didn't find the offered text at that ts (final ruling I1). The post may have landed
-//   all the same, so it is handled as one that may have: one check line for the chief. A second refusal in a row stops
-//   the posting until nothing is due, so a check that never passes can't become a DM every batch_minutes.
+//   all the same, so it is handled as one that may have: one check line for the chief.
+// Posts are bounded whatever the outcomes. Each is counted before it goes out, so a reload during one keeps it; a post
+// that surely did not land gives its count back, and the one hand-post line takes one. An offer's content (`batch_key`
+// from the tick, which makes no offer) gets 2 posts unless one is recorded; then posting stops until the content changes
+// or 6 hours after its last post. All batch posts together: 4 in any rolling hour, urgent ones too. docs/CONTRACT.md has
+// the worst case.
 // A `sent` that fails otherwise (a Slack read that failed, a lock) keeps the debt and is retried as above.
 // The state is in session state, so a reload of the mod can't cause a second post: a hold is set before each post, for a
 // reload during one, whose answer is lost with the process.
@@ -340,13 +344,18 @@ export const checkWakeLine = (ids: string[], sinceMs: number, why: string): stri
 const UNSURE_WHY = "the post timed out or gave no ts"
 const REFUSED_WHY = "`mother decide sent` couldn't find it at the ts the post gave"
 const NO_OFFER_RE = /no batch is waiting/i
-const REFUSALS_TO_STOP = 2
+const POSTS_PER_OFFER = 2
+const POSTS_PER_HOUR = 4
+const STOPPED = 'batch posting stopped: '
+const stoppedNote = (why: string): string =>
+  `${STOPPED}${POSTS_PER_OFFER} posts of this batch couldn't be confirmed (${why}). Answer here; it starts again when the batch changes, or 6 hours after its last post.`
 const recordWakeLine = (owed: { ids: string; ts: string }): string =>
   `The batch record is failing: the batch is already posted, but \`mother decide sent\` keeps failing, so no new batch goes out. Its ids are ${owed.ids || 'empty'} and its ts is ${owed.ts}: run \`mother decide sent --ids ${owed.ids || "''"} --ts ${owed.ts}\` once, as routines/chief.md says. Never re-post the batch.`
 const SENT_REFUSED_EXIT = 2
 const SENT_FAILURES_TO_SLOW = 3
 const HOLD_ENDS_PER_HOUR = 3
 const HOUR_MS = 60 * 60_000
+const COOL_OFF_MS = 6 * HOUR_MS
 const HOLD_END_GAP_MS = 2 * 60_000
 const SLACK_TS_RE = /^\d+\.\d+$/
 const DEFAULT_BATCH_MINUTES = 30
@@ -354,12 +363,23 @@ const FIRST_BACKOFF_MINUTES = 2
 const REFUSED_CALL_RE = /no connected|not connected|denied|refus|forbidden|unauthori[sz]ed|not allowed|permission|unknown tool|no such tool|not found|invalid|missing/i
 const TIMED_OUT_RE = /time[d\s-]*out/i
 const IDLE_BATCH: ChiefBatchState = { sentOwed: null, holdUntil: 0, failures: 0, wokenFor: null, lineDue: false, note: null, urgentSeen: [],
-  holdEnds: [], lastAttemptAt: null, sentFailures: 0, sentRetryAt: 0, recordLineDue: false, recordWoken: false, checkLine: null, refusals: 0 }
-// Back to idle; the urgent rate limit outlives any one batch, or a landed post would reset it. So do refused records
-// in a row: only a recorded batch or nothing due clears them (`cleared`).
+  holdEnds: [], lastAttemptAt: null, sentFailures: 0, sentRetryAt: 0, recordLineDue: false, recordWoken: false, checkLine: null, offerKey: null, offerPosts: 0, offerLastAt: null, postsAt: [] }
+// Back to idle; the urgent rate limit outlives any one batch, or a landed post would reset it. So do the post counts:
+// only a recorded batch clears an offer's (`cleared`), and nothing clears the hour's but the hour.
 const idleAfter = (prev: ChiefBatchState | null): ChiefBatchState =>
-  ({ ...IDLE_BATCH, holdEnds: prev?.holdEnds ?? [], lastAttemptAt: prev?.lastAttemptAt ?? null, refusals: prev?.refusals ?? 0 })
-const cleared = (prev: ChiefBatchState | null): ChiefBatchState => ({ ...idleAfter(prev), refusals: 0 })
+  ({ ...IDLE_BATCH, holdEnds: prev?.holdEnds ?? [], lastAttemptAt: prev?.lastAttemptAt ?? null, offerKey: prev?.offerKey ?? null,
+    offerPosts: prev?.offerPosts ?? 0, offerLastAt: prev?.offerLastAt ?? null, postsAt: prev?.postsAt ?? [] })
+const cleared = (prev: ChiefBatchState | null): ChiefBatchState => ({ ...idleAfter(prev), offerKey: null, offerPosts: 0, offerLastAt: null })
+const lastHour = (st: ChiefBatchState, nowMs: number): number[] => (st.postsAt ?? []).filter(t => nowMs - t < HOUR_MS)
+const counted = (prev: ChiefBatchState | null, key: string, at: number): ChiefBatchState => {
+  const p = prev ?? IDLE_BATCH
+  return { ...p, offerKey: key, offerPosts: (p.offerKey === key ? p.offerPosts ?? 0 : 0) + 1, offerLastAt: at, postsAt: [...lastHour(p, at), at] }
+}
+const uncounted = (prev: ChiefBatchState | null, at: number): ChiefBatchState => {
+  const p = prev ?? IDLE_BATCH
+  const i = (p.postsAt ?? []).lastIndexOf(at)
+  return { ...p, offerPosts: Math.max(0, (p.offerPosts ?? 0) - 1), postsAt: (p.postsAt ?? []).filter((_, n) => n !== i) }
+}
 
 const urgentIds = (s: ChiefStatus | null): string[] => pendingDecisions(s).filter(d => d.urgent).map(d => d.id)
 
@@ -445,7 +465,7 @@ const UNREAD_BATCH = '?'   // a batch that couldn't be read: its ids aren't know
 type Attempt = { end: 'nothing' } | { end: 'posted'; ids: string; ts: string } | { end: 'unsure' | 'failed'; why: string; batch: string; ids: string[] }
 
 // One attempt. `batch` names the batch for its one wake line: its ids, or its text when it has none.
-async function postBatch($: Dollar, bin: string): Promise<Attempt> {
+async function postBatch($: Dollar, bin: string, key: string): Promise<Attempt> {
   const unread = { end: 'failed', batch: UNREAD_BATCH, ids: [] as string[] } as const
   const ran = await cli($, bin, ['batch', '--json'], undefined, 'decide')
   if (!ran.ok) return { ...unread, why: firstLine(ran.stderr) || 'mother decide batch failed' }
@@ -464,11 +484,14 @@ async function postBatch($: Dollar, bin: string): Promise<Attempt> {
   if (typeof target === 'string') return { end: 'failed', why: target, batch, ids: list }
   if (!(await logPost($, bin, target.tool, target.channel, 'attempt'))) return { end: 'failed', why: "the post log can't be written", batch, ids: list }
 
+  const countedAt = await $.clock.now()
+  await update($, chiefBatchAtom, prev => counted(prev, key, countedAt))
   const stop = new AbortController()
   let out: PostEnd | 'timeout'
   let call: Promise<PostResult> | null = null
   try {
-    call = $.mcp.call(target.server, target.tool, { channel_id: target.channel, text: doc.text })
+    // a preview would add to what the batch draws: the post is what was offered, and nothing else
+    call = $.mcp.call(target.server, target.tool, { channel_id: target.channel, text: doc.text, unfurl_links: false, unfurl_media: false })
     // a hung call must not hold the pass's busy flag: it loses to the timer, and a late answer is dealt with below
     const timedOut = $.clock.sleep(MCP_TIMEOUT_MS, { signal: stop.signal }).then(() => 'timeout' as const, () => 'timeout' as const)
     const first = await Promise.race([call, timedOut])
@@ -488,6 +511,7 @@ async function postBatch($: Dollar, bin: string): Promise<Attempt> {
     }).catch(() => undefined)
     out = { end: 'unsure', why: `no answer from the post in ${MCP_TIMEOUT_MS / 1000} s` }
   }
+  if (out.end === 'failed') await update($, chiefBatchAtom, prev => uncounted(prev, countedAt))
   await logPost($, bin, target.tool, target.channel, out.end, out.end === 'posted' ? '' : out.why)
   return out.end === 'posted' ? { end: 'posted', ids, ts: out.ts } : { end: out.end, why: out.why, batch, ids: list }
 }
@@ -513,17 +537,14 @@ async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: strin
       await update($, chiefBatchAtom, prev => ({ ...idleAfter(prev), holdUntil }))
       return
     }
-    // refused: handled as a post that may have landed. One check line, on the first refusal in a row only.
-    const refusals = (st.refusals ?? 0) + 1
-    const stopped = refusals >= REFUSALS_TO_STOP
+    // refused: handled as a post that may have landed. One check line, unless this was the offer's last post.
+    const stopped = (st.offerPosts ?? 0) >= POSTS_PER_OFFER
     const ids = owed.ids ? owed.ids.split(',') : []
-    const note = safe(stopped
-      ? `batch posting stopped: \`mother decide sent\` refused ${refusals} posts in a row (${why || 'exit 2'}). Answer here; it starts again once nothing is due.`
-      : `the batch post couldn't be confirmed: ${why || 'exit 2'}`)
+    const note = safe(stopped ? stoppedNote(why || 'exit 2') : `the batch post couldn't be confirmed: ${why || 'exit 2'}`)
     passError = note
     await update($, chiefBatchAtom, prev => ({
-      ...idleAfter(prev), holdUntil, refusals, note,
-      checkLine: refusals === 1 ? checkWakeLine(ids, st.lastAttemptAt ?? nowMs, REFUSED_WHY) : null,
+      ...idleAfter(prev), holdUntil, note,
+      checkLine: stopped ? null : checkWakeLine(ids, st.lastAttemptAt ?? nowMs, REFUSED_WHY),
     }))
     return
   }
@@ -541,18 +562,23 @@ async function recordSent($: Dollar, bin: string, owed: { ids: string; ts: strin
 
 // The tick's batch step: a `sent` still owed first; else a post, when the tick says one is due and nothing holds it.
 // A paused tick leaves the state alone; a tick with nothing due clears it. Not reached by a console.
-async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boolean): Promise<void> {
-  const st = await batchState($)
+async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boolean, key: string): Promise<void> {
+  let st = await batchState($)
   if (st.sentOwed) return recordSent($, bin, st.sentOwed)
   if (!due) {
-    if (!tickPaused && (st.holdUntil || st.failures || st.wokenFor || st.lineDue || st.note || st.refusals || st.checkLine)) await update($, chiefBatchAtom, prev => cleared(prev))
-    return
-  }
-  if ((st.refusals ?? 0) >= REFUSALS_TO_STOP) {
-    if (st.note) passError = st.note
+    if (!tickPaused && (st.holdUntil || st.failures || st.wokenFor || st.lineDue || st.note || st.checkLine)) await update($, chiefBatchAtom, prev => idleAfter(prev))
     return
   }
   const nowMs = await $.clock.now()
+  if ((st.offerPosts ?? 0) >= POSTS_PER_OFFER) {
+    if (st.offerKey === key && nowMs - (st.offerLastAt ?? 0) < COOL_OFF_MS) {
+      passError = st.note?.startsWith(STOPPED) ? st.note : safe(stoppedNote('neither was recorded'))
+      return
+    }
+    const fresh = { offerKey: key, offerPosts: 0, offerLastAt: null, note: null, wokenFor: null }  // new content, or the 6 hours are up
+    st = { ...st, ...fresh }
+    await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), ...fresh }))
+  }
   const seen = st.urgentSeen ?? []
   const holdEnds = (st.holdEnds ?? []).filter(t => nowMs - t < HOUR_MS)
   const holding = nowMs < st.holdUntil
@@ -562,6 +588,10 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     if (st.note) passError = st.note
     return
   }
+  if (lastHour(st, nowMs).length >= POSTS_PER_HOUR) {
+    passError = `batch not posted: ${POSTS_PER_HOUR} posts in the last hour is the limit, so it waits. Answer here meanwhile.`
+    return
+  }
   const held = await postHeld($, bin)
   if (held) {
     passError = `batch not posted: ${held}`
@@ -569,9 +599,9 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
   }
   const inFlightHold = nowMs + (await batchMinutes($, bin)) * 60_000
   await update($, chiefBatchAtom, prev => ({ ...(prev ?? IDLE_BATCH), lastAttemptAt: nowMs, holdUntil: inFlightHold, holdEnds: endsHold ? [...holdEnds, nowMs] : holdEnds }))
-  const got = await postBatch($, bin)
+  const got = await postBatch($, bin, key)
   if (got.end === 'nothing') {
-    await update($, chiefBatchAtom, prev => cleared(prev))
+    await update($, chiefBatchAtom, prev => idleAfter(prev))
   } else if (got.end === 'posted') {
     const owed = { ids: got.ids, ts: got.ts }
     await update($, chiefBatchAtom, prev => ({ ...idleAfter(prev), sentOwed: owed }))
@@ -586,11 +616,15 @@ async function settleBatch($: Dollar, bin: string, due: boolean, tickPaused: boo
     // one wake line per batch. Only a post that surely did not land asks for a hand post; one that may have landed
     // asks the chief to look for it and record it, never to post it again.
     const unsure = got.end === 'unsure'
-    const wake = (minutes >= cap || (got.end === 'failed' && hasUrgent)) && st.wokenFor !== got.batch
-    const note = safe(`couldn't post the batch: ${got.why}`)
+    const after = await batchState($)
+    const sameOffer = after.offerKey === key ? after.offerPosts ?? 0 : 0
+    // a hand post is a post: it takes a count now, and with none left the line waits and the mod keeps trying
+    const handRoom = sameOffer < POSTS_PER_OFFER && lastHour(after, nowMs).length < POSTS_PER_HOUR
+    const wake = (minutes >= cap || (got.end === 'failed' && hasUrgent)) && st.wokenFor !== got.batch && (unsure || handRoom)
+    const note = safe(unsure && sameOffer >= POSTS_PER_OFFER ? stoppedNote(got.why) : `couldn't post the batch: ${got.why}`)
     passError = note
     await update($, chiefBatchAtom, prev => ({
-      ...(prev ?? IDLE_BATCH), failures, note, holdUntil: nowMs + minutes * 60_000,
+      ...(wake && !unsure ? counted(prev, key, nowMs) : prev ?? IDLE_BATCH), failures, note, holdUntil: nowMs + minutes * 60_000,
       wokenFor: wake ? got.batch : st.wokenFor, lineDue: (wake && !unsure) || st.lineDue,
       checkLine: wake && unsure ? checkWakeLine(got.ids, nowMs, UNSURE_WHY) : (st.checkLine ?? null),
       urgentSeen: [...new Set([...urgent, ...got.ids])],
@@ -622,14 +656,16 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
     let judge: string[] = []
     let batch = false
     let tickPaused = false
+    let batchKey = ''
     try {
       const r = JSON.parse(ran.stdout)
       wake = r?.wake
       tickPaused = r?.paused === true
       batch = r?.batch === true && !tickPaused
+      if (typeof r?.batch_key === 'string') batchKey = r.batch_key
       if (Array.isArray(r?.judge)) judge = r.judge.filter((j: unknown): j is string => typeof j === 'string')
     } catch { wake = null }
-    await settleBatch($, bin, batch, tickPaused)
+    await settleBatch($, bin, batch, tickPaused, batchKey)
     if (typeof wake === 'string' && wake.trim()) {
       // newest wins, a held one included
       pendingWake = judge.length && !overBudget(lastStatus) ? await triageWake($, bin, judge, wake) : wake

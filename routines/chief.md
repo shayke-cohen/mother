@@ -87,7 +87,8 @@ the exact text of the live offer.
 **"surely did not land"**: the post was refused before it went out. Post it by hand:
 
 1. Run `mother decide batch --json`. It prints `{"text", "ids"}`, or `null` when nothing is due: then stop.
-2. Post `text` to the manager's own DM, verbatim: the exact `batch --json` text, with nothing added, cut or changed.
+2. Post `text` to the manager's own DM, verbatim: the exact `batch --json` text, with nothing added, cut or changed,
+   and with `unfurl_links: false` and `unfurl_media: false`, so no link preview is drawn under it.
 3. Run `mother decide sent --ids <ids, comma-separated> --ts <the post's ts>`. When `ids` is empty, use `--ids ''`.
    Without this the next wake posts it again. `sent` re-reads the post and stamps it only if it is that text. Exit 3
    means the read failed, not the post: run the same `sent` once more. Any other non-zero exit, or a second 3: stop,
