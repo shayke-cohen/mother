@@ -4200,6 +4200,162 @@ class UnattendedShellList(UnattendedBase):
         self.expect("none", "Bash", {"command": "echo x >> notes/a.md"}, cwd=self.ws)
 
 
+class UnattendedShellPaths(UnattendedBase):
+    """Fix round 4: `grep -r DUMMYMARKER ..` printed the grant key, because a path that holds ~/.mother passed. A
+    worker's and the chief's shell reads stay inside the workspace. The workspace sits directly under HOME here, the
+    real layout."""
+
+    OUT = ("grep -r x ..", "grep -r x /", "grep -r x ~", "grep -r x ~/", "rg x ..", "cat ../../.mother/x", "ls -R ..",
+           "head /etc/hosts", "cat ../.mother/grant.key", "grep -r x ../.mother", "ls ../", "ls ./..", "ls notes/../..",
+           "cat ~/x", "cat $HOME/x", 'cat "$HOME/x"', "cat ${HOME}/x", "ls ~/", "wc -l ../x", "tail -n 1 ../x",
+           "cat < ../x", "cat < ~/x", "wc -l < /etc/hosts", "rg --files ..", "rg -e x ..", "grep -e x ..",
+           "grep -f ../x notes/a.md", "grep -f/etc/hosts notes/a.md", "grep -rl x ..",
+           "grep -r --include=grant.key x ..", "git diff ../x notes/a.md", "git diff /etc/hosts notes/a.md",
+           "git log -- ../x", "git log -- /etc", "git diff -- ~/x", "git show $HOME", "gh pr view 3 | grep x ..")
+    GUARDED = ("cat .mother/x", "ls .mother", "grep -r x .mother", "ls .git", "cat .git/config", "cat notes/.git/config",
+               "git log -- .git/config", "cat config.json", "rg x .claude")
+    LINKS = ("cat notes/link/secret", "cat notes/flink", "grep -r x notes/link", "grep -r x notes/flink", "ls notes/link",
+             "rg x notes/link", "head notes/flink", "git diff notes/flink notes/a.md")
+    FOLLOWS = ("grep -R x .", "grep -R x notes", "grep -rR x notes", "grep -nR x notes", "grep --dereference-recursive x .",
+               "grep --dereference-rec x .", "grep --deref x .", "grep -S x notes", "grep -O x notes", "grep -d recurse x .",
+               "grep --directories=recurse x .", "grep --recursive x .", "rg -L x .", "rg --follow x .", "rg -nL x notes",
+               "ls -L notes", "ls -LR notes", "ls -H notes", "ls --dereference notes",
+               "cat --show-all notes/a.md")
+    NO_OPERAND = ("grep x", "grep -r x", "rg x", "rg --files", "ls", "ls -la", "git status")
+    STAYS = ("grep -r x .", "grep -r x", "grep -r x notes", "grep -rn x notes", "grep -rl x notes",
+             "grep -r --include=a.md x notes", "grep x notes/a.md", "grep -e x notes/a.md", "grep -f notes/a.md notes/a.md",
+             "rg x", "rg x .", "rg x notes", "rg --files", "rg --files notes", "rg -e x notes", "ls", "ls .", "ls -la",
+             "ls -R notes", "ls -la notes", "cat notes/a.md", "cat -n notes/a.md", "cat notes/../notes/a.md",
+             "cat notes/inner", "cat < notes/a.md", "cat notes/a.md 2>/dev/null", "head -5 notes/a.md", "tail -n 5 notes/a.md",
+             "wc -l notes/a.md", "cat notes/a.md | grep x", "cat notes/a.md | wc -l", "gh pr view 3 | grep x",
+             "git status", "git log --oneline -5", "git log -n 5 -- notes", "git diff -- notes/a.md", "git show HEAD~1 --stat",
+             "git log origin/main..HEAD", "git diff --cached -- notes", "mother path")
+
+    def setUp(self):
+        super().setUp()
+        moved = os.path.join(self.home, "ws")
+        os.rename(self.ws, moved)
+        self.ws = moved
+        os.makedirs(os.path.join(self.home, ".mother"))
+        with open(os.path.join(self.home, ".mother", "grant.key"), "w") as f:
+            f.write("DUMMYMARKER\n")
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "secret"), "w") as f:
+            f.write("OUTSIDEMARKER\n")
+        os.makedirs(os.path.join(self.ws, "notes"))
+        with open(os.path.join(self.ws, "notes", "a.md"), "w") as f:
+            f.write("x\n")
+        os.symlink(outside, os.path.join(self.ws, "notes", "link"))
+        os.symlink(os.path.join(outside, "secret"), os.path.join(self.ws, "notes", "flink"))
+        os.symlink(os.path.join(self.ws, "notes", "a.md"), os.path.join(self.ws, "notes", "inner"))
+
+    def kinds(self):
+        return self.unattended()[0], self.unattended()[3]  # a worker's first turn, and the chief
+
+    def verdicts(self, want, cmds, kinds=None):
+        for name, kw in kinds or self.kinds():
+            for cmd in cmds:
+                got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, **kw)
+                self.assertEqual(got, want, "%s: %s -> %s %s" % (name, cmd, got, why))
+
+    def test_the_fixture_really_leaks(self):
+        """Not vacuous: `grep -r` over this layout really prints the key, and the workspace itself holds no copy."""
+        p = subprocess.run(["grep", "-r", "DUMMYMARKER", ".."], cwd=self.ws, capture_output=True, text=True)
+        self.assertIn("DUMMYMARKER", p.stdout)
+
+    def test_every_session_kind_stays_in(self):
+        self.verdicts("deny", ("grep -r x ..", "cat ../.mother/grant.key", "ls -R ..", "head /etc/hosts", "grep -R x .",
+                               "cat notes/flink"), self.unattended())
+
+    def test_paths_outside(self):
+        self.verdicts("deny", self.OUT)
+
+    def test_reason_says_what_to_do(self):
+        for name, kw in self.kinds():
+            for cmd in ("grep -r x ..", "cat ~/x", "grep -R x .", "cat notes/flink"):
+                why = self.expect("deny", "Bash", {"command": cmd}, mode=self.BY, **kw)
+                self.assertIn("Read tool", why, cmd)
+                self.assertIn("PROGRESS" if name.startswith("worker") else "propose it as a decision", why, cmd)
+
+    def test_guarded_inside(self):
+        self.verdicts("deny", self.GUARDED)
+
+    def test_symlink_pointing_out(self):
+        self.verdicts("deny", self.LINKS)
+
+    def test_symlink_following_options(self):
+        self.verdicts("deny", self.FOLLOWS)
+
+    def test_no_operand_needs_a_cwd_inside(self):
+        worker = dict(self.WORKER_ENV)
+        for cwd in (self.tmp, self.home, "/"):
+            for cmd in self.NO_OPERAND + ("cat notes/a.md",):
+                got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, env=worker, cwd=cwd)
+                self.assertEqual(got, "deny", "%s from %s -> %s %s" % (cmd, cwd, got, why))
+        for cmd in ("cat %s" % os.path.join(self.ws, "notes", "a.md"), "grep x %s" % os.path.join(self.ws, "notes", "a.md")):
+            self.expect("none", "Bash", {"command": cmd}, mode=self.BY, env=worker, cwd=self.tmp)
+        os.makedirs(os.path.join(self.ws, ".git"))
+        self.expect("deny", "Bash", {"command": "ls"}, mode=self.BY, env=worker, cwd=os.path.join(self.ws, ".git"))
+
+    def test_a_tool_with_its_own_cwd_gives_absolute_paths(self):
+        """The terminal tool runs wherever its tab is, which the payload doesn't say."""
+        tool = "mcp__terminal__run_in_terminal"
+        for name, kw in self.kinds():
+            for cmd in ("cat notes/a.md", "ls", "grep x", "cat ./grant.key"):
+                self.expect("deny", tool, {"command": cmd}, mode=self.BY, **kw)
+            self.expect("none", tool, {"command": "cat %s" % os.path.join(self.ws, "notes", "a.md")}, mode=self.BY, **kw)
+        self.expect("none", "Monitor", {"command": "tail -f notes/a.md"}, env=self.WORKER_ENV, cwd=self.ws, mode=self.BY)
+
+    def test_state_folder_inside_the_workspace(self):
+        """A path that holds the key is refused even where the workspace would otherwise take it."""
+        state = os.path.join(self.ws, "state")
+        os.makedirs(state)
+        env = dict(self.WORKER_ENV, MOTHER_STATE_DIR=state)
+        for cmd in ("grep -r x .", "grep -r x", "rg x", "ls", "cat state/grant.key", "ls state"):
+            self.expect("deny", "Bash", {"command": cmd}, mode=self.BY, env=env, cwd=self.ws)
+        self.expect("none", "Bash", {"command": "grep -r x notes"}, mode=self.BY, env=env, cwd=self.ws)
+
+    def test_workspace_at_home(self):
+        """A home folder used as the workspace: the root holds ~/.mother and ~/.claude, so a search of it is off."""
+        env = dict(self.WORKER_ENV, MOTHER_WORKSPACE=self.home)
+        shutil.copy(os.path.join(self.ws, "config.json"), os.path.join(self.home, "config.json"))
+        for cmd in ("grep -r x .", "grep -r x", "ls", "cat .mother/grant.key"):
+            got, why = self.run_guard("Bash", {"command": cmd}, mode=self.BY, env=env, cwd=self.home, env_ws=False)
+            self.assertEqual(got, "deny", "%s -> %s %s" % (cmd, got, why))
+
+    def test_plain_reads_stay(self):
+        self.verdicts("none", self.STAYS)
+
+    def test_a_recursive_search_inside_does_not_leave(self):
+        """What `grep -r` really does with the link the verdicts above let stay in the tree."""
+        self.verdicts("none", ("grep -r OUTSIDEMARKER .", "grep -r OUTSIDEMARKER notes"))
+        for target in (".", "notes"):
+            p = subprocess.run(["grep", "-r", "OUTSIDEMARKER", target], cwd=self.ws, capture_output=True, text=True)
+            self.assertEqual(p.stdout, "", target)
+
+    def test_documented_flows_stay(self):
+        chief = dict(self.kinds()[1][1], mode=self.BY)
+        for cmd in ("mother chief lines --json", "mother chief status --json", "mother decide batch --json",
+                    "mother chief run PLAT-1 --detach '--title=T x' '--prompt=see ~/x and ../y'",
+                    "mother chief say PLAT-1 -- 'look at ../y'", "mother decide sent --ids D1 --ts 1700000000.000100",
+                    "mother hub decide <<'HUBEOF'\n[{\"line_id\": \"1\", \"key\": \"k\", \"decision\": \"log\"}]\nHUBEOF"):
+            self.expect("none", "Bash", {"command": cmd}, **chief)
+        worker = dict(self.kinds()[0][1], mode=self.BY)
+        self.expect("none", "Bash", {"command": "mother decide propose PLAT-1 --tool T --recommend send --why 'see ../y' "
+                                                "--stdin <<'EOF'\n{\"text\": \"~/x and ../y\"}\nEOF"}, **worker)
+        for cmd in ("mother hub status", "mother hub show", "mother path", "mother hub session for PLAT-1"):
+            self.expect("none", "Bash", {"command": cmd}, **worker)
+        self.expect("none", "Read", {"file_path": os.path.join(self.tmp, "outside", "secret")}, **worker)
+
+    def test_normal_sessions_unchanged(self):
+        """The verdicts of 841711b, on the commands this round refuses to a worker."""
+        for kw in ({"cwd": self.ws}, {"cwd": self.ws, "mode": self.BY}, {"cwd": self.tmp}, {"cwd": self.tmp, "mode": self.BY}):
+            for cmd in ("cat notes/flink", "grep -r x ..", "ls -R ..", "rg x ..", "grep -r x", "ls", "grep -R x .",
+                        "cat %s" % os.path.join(self.tmp, "outside", "secret")):
+                self.expect("none", "Bash", {"command": cmd}, **kw)
+
+
 class GitAbbreviations(GuardCase):
     """Fix round 3, every session: git accepts a unique prefix of a long option, so it meets the rule of its full name."""
 
@@ -4282,6 +4438,52 @@ class HookDeadline(GuardCase):
         for env in ({"MOTHER_CHIEF_WORKER": "PLAT-1"}, {"MOTHER_CHIEF_ROLE": "chief"}):
             p, _ = self.slow(env)
             self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "deny", p.stdout)
+
+    def guard_log(self):
+        try:
+            with open(self.state("guard.log")) as f:
+                return [json.loads(x) for x in f]
+        except FileNotFoundError:
+            return []
+
+    def test_the_alarm_leaves_a_trace_and_says_a_retry_may_work(self):
+        for env, want in (({}, "ask"), ({"MOTHER_CHIEF_WORKER": "PLAT-1"}, "deny")):
+            p, _ = self.slow(env)
+            out = json.loads(p.stdout)["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], want)
+            self.assertRegex(out["permissionDecisionReason"], r"(?i)one retry")
+            rec = self.guard_log()[-1]
+            self.assertEqual((rec["kind"], rec["decision"]), ("deadline", want))
+            self.assertEqual(rec["reason"], out["permissionDecisionReason"].replace("[mother guard] ", ""))
+
+    def test_fast_path_alarm_leaves_the_same_trace(self):
+        sys_in = json.dumps({"tool_name": "Read", "tool_input": {"file_path": os.path.join(self.home, ".mother", "grant.key")},
+                             "session_id": "t", "cwd": "/"})
+        code = ("import importlib.util, io, sys, time\n"
+                "sys.path.insert(0, %r)\n"
+                "import guard\nguard.run = lambda raw: time.sleep(30)\n"
+                "spec = importlib.util.spec_from_file_location('f', %r)\n"
+                "f = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(f)\n"
+                "f.arm_deadline.__defaults__ = (1,)\n"
+                "sys.stdin = io.StringIO(%r)\nf.main()\n" % (os.path.join(ROOT, "hooks"), GUARD_FAST, sys_in))
+        e = dict(os.environ, HOME=self.home, MOTHER_WORKSPACE=self.ws, MOTHER_CHIEF_WORKER="PLAT-1")
+        p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=e, timeout=60)
+        out = json.loads(p.stdout)["hookSpecificOutput"]
+        self.assertRegex(out["permissionDecisionReason"], r"(?i)one retry")
+        rec = self.guard_log()[-1]
+        self.assertEqual((rec["kind"], rec["decision"]), ("deadline", "deny"))
+        sys.path.insert(0, os.path.join(ROOT, "hooks"))
+        import guard
+        import guard_fast
+        self.assertEqual(guard.DEADLINE_REASON, guard_fast.DEADLINE_REASON)
+
+    def test_the_alarm_answers_with_nowhere_to_log(self):
+        """The trace never costs the answer: no workspace, or a log that can't be written."""
+        os.makedirs(self.state("guard.log"))  # a folder: open() fails
+        p, _ = self.slow({"MOTHER_CHIEF_WORKER": "PLAT-1"})
+        self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "deny", p.stdout)
+        p, _ = self.slow({"MOTHER_WORKSPACE": ""})
+        self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["permissionDecision"], "ask", p.stdout)
 
     def test_a_decision_in_time_disarms(self):
         sys_in = json.dumps({"tool_name": "Bash", "tool_input": {"command": "curl https://example.com"},

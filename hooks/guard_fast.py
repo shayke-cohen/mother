@@ -15,18 +15,39 @@ import json
 import os
 import signal
 import sys
+import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 DEADLINE_SECONDS = 8  # as guard.py's; hooks.json allows 60, and a killed hook lets the call run unguarded
+DEADLINE_REASON = "The guard ran out of time reading this call, so it can't vouch for it. If the machine is just busy, " \
+                  "one retry is fine."  # as guard.py's
+
+
+def _log_deadline(decision):
+    """As guard.log_deadline: this file doesn't load guard.py just to say it ran out of time."""
+    try:
+        ws = os.environ.get("MOTHER_WORKSPACE", "").strip()
+        if not ws:
+            with open(os.path.join(os.path.expanduser("~"), ".mother", "workspace")) as f:
+                ws = f.readline().strip()
+        with open(os.path.join(os.path.expanduser(ws), ".mother", "guard.log"), "a") as f:
+            f.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tool": None, "kind": "deadline",
+                                "category": "guard", "target": None, "decision": decision,
+                                "reason": DEADLINE_REASON}) + "\n")
+    except Exception:
+        pass
 
 
 def _expired(_signum, _frame):
     """Out of time, maybe inside guard.py: a question (a deny where nobody watches) rather than no decision."""
     alone = os.environ.get("MOTHER_CHIEF_WORKER", "").strip() or os.environ.get("MOTHER_CHIEF_ROLE") == "chief"
+    decision = "deny" if alone else "ask"
     os.write(1, (json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse", "permissionDecision": "deny" if alone else "ask",
-        "permissionDecisionReason": "[mother guard] The guard ran out of time reading this call, so it can't vouch "
-                                    "for it."}}) + "\n").encode("utf-8"))
+        "hookEventName": "PreToolUse", "permissionDecision": decision,
+        "permissionDecisionReason": "[mother guard] " + DEADLINE_REASON}}) + "\n").encode("utf-8"))
+    signal.signal(signal.SIGALRM, lambda *_: os._exit(0))  # the answer is out: a stalled disk can't hold the hook
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    _log_deadline(decision)
     os._exit(0)
 
 

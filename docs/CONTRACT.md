@@ -1543,7 +1543,7 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     its `mother chief lines|status|run|say`, `mother decide batch|sent` and `mother hub decide` heredoc. Nothing else runs:
     no interpreter, `find`, `sed`, `awk`, `xargs`, `sort`, `make`, `tar`, `env`, `nohup`, `less`, `man`, `vim`, `echo`,
     `cp`, `mv`, `rm`, `cd`, `mother sync`, and no redirect that writes. The list passes through the allow-list's own path and
-    option checks as well. A refusal tells the session to file a decision, say it in PROGRESS or record the line as `now`.
+    option checks as well. Every path a listed read or a git read names (a `<` source too) must resolve inside the workspace, out of what's guarded there and neither in nor above a folder holding the grant key or `~/.claude`, `grep`, `rg`, `ls` and git with none need a cwd inside it, and `grep -R`, `rg -L`, `ls -L` and any other option off a short table are refused; a recursive read of the workspace root is still on and walks its `.mother/` and `.git/`. A refusal tells the session to file a decision, say it in PROGRESS or record the line as `now`.
     In other sessions git's abbreviated long options are read as their full names first, so `git commit --amen` and `git
     push --exe=` meet the rule of `--amend` and `--exec`.
   - **The hook's deadline.** A shell command over 64 KB gets an immediate ask (deny in a worker or the chief), before any
