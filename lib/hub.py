@@ -1296,7 +1296,7 @@ USAGE = """mother hub <verb>
   done        <U-id>  mark an update done
   snooze      <U-id> 1h|tomorrow|next-week
   show        [--json]  pending proposals, updates and sessions
-  add         <link-or-text> [--key K]  hand the hub a thing by hand (a `manual` line it always routes or proposes)
+  add         <link-or-text> [--key K] [--json]  hand the hub a thing by hand (a `manual` line it always routes or proposes)
   follow      [--project|--channel|--thread|--repo|--whatsapp] <PROJECT | channel id | channel/ts | owner/repo | WhatsApp JID>  watch it too (`unfollow` stops)
   mute        [--for Nd|Nw] [--scope item|channel] <key | link | U-id | email | channel id | WhatsApp JID>
               drop its watcher lines and its Now items (`unmute` undoes); --scope channel mutes a thread's channel
@@ -2216,21 +2216,9 @@ def manual_key(text: str) -> str:
 _KEY_TOKEN = re.compile(r"[A-Za-z0-9_.:/@=,+-][A-Za-z0-9_.:/@=,+#-]{0,199}")  # the hub role's plain token
 
 
-def add_cmd(ws: Path, at: datetime, args, out) -> int:
-    try:
-        pos, opts = _parse_flags(args, {"key"})
-    except ValueError as e:
-        print("mother hub add: %s" % e, file=sys.stderr)
-        return 2
-    text = " ".join(pos).strip()
-    if not text:
-        print("usage: mother hub add <link-or-text> [--key K]", file=sys.stderr)
-        return 2
-    text = plain(text)
-    key = plain(opts.get("key")).strip() if isinstance(opts.get("key"), str) else ""
-    if key and not _KEY_TOKEN.fullmatch(key):  # the hub can only name a key in a plain command token
-        print("mother hub add: --key takes letters, digits and _.:/@=,+-# only (no space or quote)", file=sys.stderr)
-        return 2
+def add_line(ws: Path, at: datetime, text: str, key: str = "") -> dict:
+    """Append one `manual` line for `text` (already plain, non-empty) and return it. `key` (a plain hub token) wins;
+    else `manual_key` names the thing the text is about."""
     key = key or manual_key(text)
     stamp = _iso(at)
     url = _URL.search(text)
@@ -2239,7 +2227,29 @@ def add_cmd(ws: Path, at: datetime, args, out) -> int:
                    summary=text, also=[a for a in extract_also(text) if a != key],
                    uid="%s-%s" % (stamp, os.urandom(3).hex()))
     append_inbox(ws, [ln])
-    print("added %s" % key, file=out)
+    return ln
+
+
+def add_cmd(ws: Path, at: datetime, args, out, as_json: bool = False) -> int:
+    try:
+        pos, opts = _parse_flags(args, {"key"})
+    except ValueError as e:
+        print("mother hub add: %s" % e, file=sys.stderr)
+        return 2
+    text = " ".join(pos).strip()
+    if not text:
+        print("usage: mother hub add <link-or-text> [--key K] [--json]", file=sys.stderr)
+        return 2
+    text = plain(text)
+    key = plain(opts.get("key")).strip() if isinstance(opts.get("key"), str) else ""
+    if key and not _KEY_TOKEN.fullmatch(key):  # the hub can only name a key in a plain command token
+        print("mother hub add: --key takes letters, digits and _.:/@=,+-# only (no space or quote)", file=sys.stderr)
+        return 2
+    ln = add_line(ws, at, text, key)
+    if as_json:
+        print(json.dumps({"ok": True, "key": ln["key"], "line_id": ln["id"], "link": ln["link"]}), file=out)
+    else:
+        print("added %s" % ln["key"], file=out)
     return 0
 
 
@@ -2556,7 +2566,7 @@ def main(args, ws, cfg, at) -> int:
     if verb == "show":
         return show(ws, as_json, sys.stdout)
     if verb == "add":
-        return add_cmd(ws, at, rest, sys.stdout)
+        return add_cmd(ws, at, rest, sys.stdout, as_json)
     if verb == "dms":
         return dms_cmd(ws, cfg, rest, as_json, sys.stdout)
     if verb in ("follow", "unfollow", "mute", "unmute", "watching"):

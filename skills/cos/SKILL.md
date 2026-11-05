@@ -95,6 +95,10 @@ The case's thread is claimed for this session. New activity on it arrives here a
 On a relay: read the new activity at the source, then carry on from step 1 — do the next step or bring one
 decision. A relay that changes nothing gets one line saying so.
 
+A case can own more than one thread. When you find a related thread, ticket or PR, add it to your case with
+`mother chief watch-key <key> --for <your session id>` (a key is `PLAT-123`, `owner/repo#45` or
+`<channel>/<thread ts>`), so its activity is relayed here too.
+
 When you are waiting on someone else:
 - Say when you will check again (a time, not "later").
 - If the harness offers a scheduler or wake-up tool, set one for that time.
@@ -116,7 +120,8 @@ When you are waiting on someone else:
 When nothing is left to do:
 
 1. A three-line outcome: what happened; what was sent or changed; what is left, and with whom.
-2. Mark the inbox item done with the command the brief names (`mother hub done <item id>`). After that, new
+2. Mark the inbox item done with the command the brief names (`mother hub done <item id>`, or
+   `mother chief close-case <key>` for a case the manager started from the ask box). After that, new
    activity on the thread comes back to the manager as a new item, not to this session.
 3. Capture what should outlive the session where the workspace keeps such things: a durable fact as a memory,
    an open loop as a todo.

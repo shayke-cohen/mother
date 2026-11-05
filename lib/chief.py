@@ -16,10 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import floor as floormod
+import habits
 import hub
 import now as nowmod
 
-DEFAULTS = {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet"}
+DEFAULTS = {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5}
+REFRESH_MINUTES = (1, 60)   # chief.refresh_minutes: how often the leading session re-reads each session for its card
 TLDR_MODELS = ("sonnet", "opus")   # the Chief pane's TL;DR model; anything else reads as the default
 SPEND_KEEP_DAYS = 14
 
@@ -35,6 +38,9 @@ def settings(cfg: dict) -> dict:
     out = {k: given.get(k, v) for k, v in DEFAULTS.items()}
     if out["triage_model"] not in TLDR_MODELS:
         out["triage_model"] = DEFAULTS["triage_model"]
+    r = out["refresh_minutes"]
+    if not (isinstance(r, int) and not isinstance(r, bool) and REFRESH_MINUTES[0] <= r <= REFRESH_MINUTES[1]):
+        out["refresh_minutes"] = DEFAULTS["refresh_minutes"]
     return out
 
 
@@ -198,6 +204,7 @@ def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
     ws = Path(ws)
     sessions = hub._sessions_doc(ws)
     channels = _channel_names(cfg or {})
+    hab = habits.habits(ws, datetime.now(timezone.utc)) if habits.is_on(ws) else None
     out = []
     for l in _pending_lines(ws):
         d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
@@ -208,6 +215,7 @@ def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
         name = channels.get(key.split("/", 1)[0]) if d["source"] == "chat" and "/" in key else None
         d["channel"] = safe_line(name, LABEL_MAX) if name else None
         d["to_manager"] = _to_manager(cfg or {}, l)
+        d["habits"] = habits.for_line(hab, d["source"], key, l.get("who"))   # the manager's past handling of its own buckets
         out.append(d)
     return out
 
@@ -453,29 +461,46 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
     by_id = {v["line_id"]: v for v in (verdicts or [])
              if _verdict_ok(v) and keys.get(v["line_id"]) == v["key"]}
     wanted = set(judge or [])
-    items = []
+    hab = habits.habits(ws, at) if habits.is_on(ws) else None
+    channels = _channel_names(cfg or {})
+    items, quieted, lines_by_id = [], {}, {l["id"]: l for l in pending}
     for l in pending:
         if l["id"] not in wanted:
             continue
         v = by_id.get(l["id"])
         if l.get("kind") == "sweep":
             items.append({"line_id": l["id"], "key": l["key"], "decision": "log", "why": "sweep: no hub session"})
-        elif (v is not None and l.get("kind") not in TRIAGE_NEVER_LOG and _session_kind(sessions, l) is None
+            continue
+        if (v is not None and l.get("kind") not in TRIAGE_NEVER_LOG and _session_kind(sessions, l) is None
                 and not _folds_others(raw, start, l) and (not v["is_work"] or not v["needs_attention"])):
             items.append({"line_id": l["id"], "key": l["key"], "decision": "log",
                           "why": "triage: " + _one_line(v["title"], TITLE_MAX)})
+            continue
+        # the quiet rule (lib/habits.py `quiet`): the manager never engaged with this line's channel, project, repo or person
+        q = habits.quiet(hab, l, v, _to_manager(cfg or {}, l), _session_kind(sessions, l), _folds_others(raw, start, l), channels)
+        if q:
+            items.append({"line_id": l["id"], "key": l["key"], "decision": "log", "why": q["why"]})
+            quieted[l["id"]] = {"line": l, "verdict": v, "bucket": q["bucket"], "why": q["why"],
+                                "label": item_label(l["key"], habits.who_name(l.get("who")), channels)}
         else:
             title = _one_line(v["title"] if v else str(l.get("title") or ""), TITLE_MAX) or _one_line(str(l["key"]), TITLE_MAX)
             why = _one_line(v["tldr"] if v else str(l.get("summary") or ""), WHY_MAX)
             items.append({"line_id": l["id"], "key": l["key"], "decision": "now", "title": title, "why": why,
                           "link": l.get("link") or ""})
     if items:
-        extras = {}
+        extras, shown, hushed = {}, [], []
         for res in hub.decide(ws, cfg, at, items):
+            v = by_id.get(res["line_id"])
             if res.get("decision") == "now" and res.get("update_id"):
-                extras[res["update_id"]] = verdict_extra(by_id.get(res["line_id"]))
+                extra, note = verdict_extra(v), habits.habit_note(v)
+                extras[res["update_id"]] = dict(extra, habit_note=note) if extra and note else extra
+                shown.append(habits.shown_row(at, res["update_id"], lines_by_id[res["line_id"]], v))
+            elif res.get("decision") == "log" and res["line_id"] in quieted:
+                hushed.append(quieted[res["line_id"]])
         if extras:
             _store_extras(ws, extras)
+        habits.append_actions(ws, at, shown)     # what was shown: the denominator of every habit
+        habits.record_quieted(ws, at, hushed)
         sync_relays(ws)   # a line routed to a case session waits in relays.json for that session to deliver
     out["logged"] = [it["line_id"] for it in items if it["decision"] == "log"]
     out["now"] = [it["line_id"] for it in items if it["decision"] == "now"]
@@ -545,6 +570,160 @@ def _who_by_key(ws: Path) -> dict:
     return out
 
 
+# ---- where an item came from: one link builder for the Inbox, the cases and the pane ----
+LINKS_MAX = 8
+LINK_LABEL_MAX = 24
+LINK_KIND = {"chat": "thread", "tracker": "issue", "code": "PR", "mail": "mail", "calendar": "event"}
+_HTTP = re.compile(r"^https?://\S+$")
+_CHAT_BASE = re.compile(r"^(https://[\w.-]+)/archives/[A-Z0-9]+(?:/|$)")
+_TRACKER_BASE = re.compile(r"^(https?://[\w.:-]+(?:/[\w.-]+)*?)/browse/[A-Z][A-Z0-9_]*-\d+")
+_CODE_HOST = "https://github.com"
+_CHAT_TS = re.compile(r"^\d{9,11}\.\d{6}$")
+
+
+def link_bases(ws: Path, cfg: Optional[dict], lines: Optional[List[dict]] = None) -> dict:
+    """{chat, tracker, code}: the URL base of each source, or None when nothing reveals it. Never a guess: the chat
+    base is the host of a stored chat message link, the tracker base a team's `tracker.url` in the config else the
+    part before `/browse/` in a stored issue link, the code host only when the config's code connector is GitHub
+    (`connectors.code`, or `hub.connections.code.cli: gh`) or a stored link is already on it."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    bases = {"chat": None, "tracker": None, "code": None}
+    for t in cfg.get("teams") or []:
+        tr = t.get("tracker") if isinstance(t, dict) else None
+        url = tr.get("url") if isinstance(tr, dict) else None
+        if isinstance(url, str) and _HTTP.match(url) and not bases["tracker"]:
+            bases["tracker"] = re.sub(r"/browse(/.*)?$", "", url.rstrip("/"))
+    conn = ((cfg.get("hub") or {}).get("connections") or {}).get("code") if isinstance(cfg.get("hub"), dict) else None
+    if (cfg.get("connectors") or {}).get("code") == "github" or (isinstance(conn, dict) and conn.get("cli") == "gh"):
+        bases["code"] = _CODE_HOST
+    stored = [l.get("link") for l in (hub.read_inbox(ws) if lines is None else lines)]
+    stored += [u.get("link") for u in hub._hub_doc(ws)["updates"] if isinstance(u, dict)]
+    for link in stored:
+        if not isinstance(link, str):
+            continue
+        m = _CHAT_BASE.match(link)
+        if m and not bases["chat"]:
+            bases["chat"] = m.group(1)
+        m = _TRACKER_BASE.match(link)
+        if m and not bases["tracker"]:
+            bases["tracker"] = m.group(1)
+        if link.startswith(_CODE_HOST + "/") and not bases["code"]:
+            bases["code"] = _CODE_HOST
+    return bases
+
+
+def source_link(key, bases: dict) -> str:
+    """The URL of the thing a key names, built from a known base; '' when the base is not known or the key has no
+    address (mail, calendar, a note, a WhatsApp chat: those keep the watcher's own link)."""
+    k, src = str(key or "").strip(), source_of(key)
+    if src == "chat" and bases.get("chat") and "/" in k and not k.startswith("wa:"):
+        ch, ts = k.split("/", 1)
+        if ts == "dm":
+            return "%s/archives/%s" % (bases["chat"], ch)
+        if _CHAT_TS.match(ts):
+            return "%s/archives/%s/p%s" % (bases["chat"], ch, ts.replace(".", ""))
+    if src == "tracker" and bases.get("tracker"):
+        return "%s/browse/%s" % (bases["tracker"], k)
+    if src == "code" and bases.get("code"):
+        repo, n = k.rsplit("#", 1)
+        return "%s/%s/pull/%s" % (bases["code"], repo, n)
+    return ""
+
+
+def _url_label(url: str) -> str:
+    m = re.search(r"/browse/([A-Z][A-Z0-9_]*-\d+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"/([\w.-]+)/(pull|issues)/(\d+)", url)
+    if m:
+        return "%s #%s" % ("PR" if m.group(2) == "pull" else "issue", m.group(3))
+    if "/archives/" in url:
+        return "thread"
+    host = re.match(r"https?://([^/?#]+)", url)
+    return host.group(1) if host else "link"
+
+
+def item_links(key, link, also, text, bases: dict) -> Tuple[str, List[dict]]:
+    """(link, links) for one item: `link` is its own stored link when that is a URL, else the one built from its key
+    (`source_link`), else ''. `links` is [{label, url}], the source first (labelled by kind: thread, issue, PR, mail,
+    event, else source), then the things its `also` keys name and the URLs in `text`; no URL twice, at most 8."""
+    own = link if isinstance(link, str) and _HTTP.match(link) else source_link(key, bases)
+    out, seen = [], set()
+
+    def add(label, url):
+        if url and _HTTP.match(url) and url not in seen and len(out) < LINKS_MAX:
+            seen.add(url)
+            out.append({"label": safe_line(label, LINK_LABEL_MAX) or "link", "url": url})
+
+    add(LINK_KIND.get(source_of(key), "source"), own)
+    for a in also if isinstance(also, list) else []:
+        if isinstance(a, str):
+            add(a, source_link(a, bases))
+    for m in hub._URL.finditer(text if isinstance(text, str) else ""):
+        url = m.group(0).rstrip(".,;:!?)>]\"'")
+        add(_url_label(url), url)
+    return own, out
+
+
+# ---- the ask box: a case started from the manager's own words (hooks/chief.tsx startAsk) ----
+# `ask` appends the manual line and holds its key in chief/asks.json. While the hold is fresh and unclaimed the
+# item it makes is not an Inbox card; the session that starts from the brief claims the key (a hold stands in for
+# the open item a claim needs), which closes that item, and the line itself is never relayed back into the case.
+ASK_HOLD_MINUTES = 10
+ASK_KEEP_DAYS = 7
+ASK_TEXT_MAX = 2000
+
+
+def _asks(ws: Path) -> dict:
+    d = _read_obj(chief_dir(ws) / "asks.json").get("asks")
+    return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+
+
+def _save_asks(ws: Path, asks: dict, at: datetime) -> None:
+    def fresh(v):
+        t = hub._parse_at(v.get("at"))
+        return t is not None and (at - t).total_seconds() < ASK_KEEP_DAYS * 86400
+    kept = {k: v for k, v in asks.items() if fresh(v)}
+    _write_atomic(chief_dir(ws) / "asks.json", json.dumps({"version": 1, "asks": kept}, ensure_ascii=False) + "\n")
+
+
+def _ask_held(asks: dict, key, at: Optional[datetime]) -> bool:
+    """Is `key` held by an ask that no session claimed yet and that is under ASK_HOLD_MINUTES old?"""
+    a = asks.get(key)
+    if a is None or at is None or a.get("claimed"):
+        return False
+    t = hub._parse_at(a.get("at"))
+    return t is not None and (at - t).total_seconds() < ASK_HOLD_MINUTES * 60
+
+
+def ask(ws: Path, cfg: dict, at: datetime, text) -> dict:
+    """The ask box: append the manager's text as a `manual` line (`hub.add_line`, as `mother hub add`) and say what
+    the pane needs to start a case: {ok, key, line_id, link, update_id, owned_by}. `owned_by` is the session id of
+    the live case that already holds the key (the hub routes the line there; no new case); `update_id` the open
+    inbox item the key already has (the new session claims that one). With neither, the key is held."""
+    text = hub.plain(text if isinstance(text, str) else "").strip()[:ASK_TEXT_MAX]
+    if not text:
+        raise ValueError("no text")
+    ws = Path(ws)
+    ln = hub.add_line(ws, at, text)
+    key = ln["key"]
+    out = {"ok": True, "key": key, "line_id": ln["id"], "link": ln["link"], "update_id": None, "owned_by": None}
+    with hub.locked(ws):
+        hit = hub.find_session(hub._sessions_doc(ws), [key] + list(ln.get("also") or []))
+        if hit is not None and not _is_cli(hit[1]):
+            out["owned_by"] = hit[1].get("cli_session_id") or hit[1].get("session_id")
+            return out
+        upd = next((u for u in hub._hub_doc(ws)["updates"] if isinstance(u, dict) and u.get("key") == key
+                    and u.get("state") != "done"), None)
+        if upd is not None:
+            out["update_id"] = upd.get("id")
+            return out
+        asks = _asks(ws)
+        asks[key] = {"at": hub._iso(at), "line_id": ln["id"], "claimed": None}
+        _save_asks(ws, asks, at)
+    return out
+
+
 def _item_session(hit) -> dict:
     """An inbox item's live session: {key, title}, plus kind and cli_session_id when it is a case."""
     d = {"key": hit[0], "title": safe_line(hit[1].get("title") or hit[0], TITLE_MAX)}
@@ -553,28 +732,39 @@ def _item_session(hit) -> dict:
     return d
 
 
-def inbox_items(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
+def inbox_items(ws: Path, cfg: Optional[dict] = None, at: Optional[datetime] = None) -> List[dict]:
     """The hub's open updates (what a `now` decision makes), by urgency (`now`, `today`, `later`; none reads
     `today`) then newest first, each with its triage `kind`, `on`, `urgency` and `actions` when it has them, for the Chief pane's Inbox section. The
     text is line- or model-written, so each field is one safe line. `session` is the live hub session for the key.
     `source` is the key's kind, `who` the person its newest inbox line names ('' when none) and `label` what a card
-    shows in place of the raw key (`item_label`)."""
+    shows in place of the raw key (`item_label`). `link` is the item's own link, else one built from its key
+    (`item_links`; '' when no base is known), and `links` every labelled source, that one first. With `at`, an item
+    whose key the ask box holds (`_ask_held`) is left out."""
     h, sessions = hub._hub_doc(ws), hub._sessions_doc(ws)
     whos, channels, extras = _who_by_key(ws), _channel_names(cfg or {}), _triage_items(ws)
+    raw = hub.read_inbox(ws)
+    newest = {l["key"]: l for l in raw}
+    bases, asks = link_bases(ws, cfg, raw), _asks(ws)
     rows = []
     for u in h["updates"]:
         if not isinstance(u, dict) or u.get("state") != "open" or not isinstance(u.get("id"), str):
             continue
+        if _ask_held(asks, u.get("key"), at):
+            continue
+        line = newest.get(u.get("key")) or {}
+        link, links = item_links(u.get("key"), u.get("link"), line.get("also"), line.get("summary"), bases)
         hit = hub.find_session(sessions, [u.get("key")])
         who = safe_line(whos.get(u.get("key")) or "", LABEL_MAX)
         rows.append({"id": u["id"], "key": safe_line(u.get("key"), PROGRESS_MAX),
                      "title": safe_line(u.get("title"), TITLE_MAX), "why": safe_line(u.get("why"), WHY_MAX),
-                     "link": u.get("link") if isinstance(u.get("link"), str) else "", "at": u.get("at"),
+                     "link": link or (u.get("link") if isinstance(u.get("link"), str) else ""), "links": links,
+                     "at": u.get("at"),
                      "source": source_of(u.get("key")), "who": who, "label": item_label(u.get("key"), who, channels),
                      "session": (_item_session(hit) if hit and not _is_cli(hit[1]) else None)})
         # the triage verdict's extras, cleaned again on the way out (the file is only data); None / [] when none
         x = verdict_extra(extras.get(u["id"])) or {"kind": None, "on": None, "urgency": None, "actions": []}
         rows[-1].update(x)
+        rows[-1]["habit_note"] = habits.habit_note(extras.get(u["id"]))   # set when habits changed the verdict
     rows.sort(key=lambda r: str(r["at"] or ""), reverse=True)
     rows.sort(key=lambda r: URGENCIES.index(r["urgency"] or URGENCY_DEFAULT))   # stable: newest first inside one urgency
     return rows
@@ -632,10 +822,13 @@ def _row_age_days(row: dict, at: datetime) -> float:
 
 
 def claim(ws: Path, cfg: dict, at: datetime, doc) -> dict:
-    """A session claims a key (`claim --stdin` {key, session_id, title, link}): its sessions.json row becomes a live
-    case of that session, and the key's open update is linked to it. ValueError when refused: an off-shape key or
-    session id, no open inbox item for the key (a claim never makes a route for a key the hub did not raise), or a
-    key live in another session whose row is younger than CASE_STALE_DAYS."""
+    """A session claims a key (`claim --stdin` {key, session_id, title, link, also?}): its sessions.json row becomes
+    a live case of that session, and the key's open update is linked to it. `also` is more keys (threads, tickets,
+    PRs) the same case owns, so their lines route to it too. ValueError when refused: an off-shape key or session
+    id, no open inbox item for the key and no ask-box hold on it (a claim never makes a route for a key nobody
+    raised), or a key (the main one or one of `also`) live in another session whose row is younger than
+    CASE_STALE_DAYS. A key the ask box holds: its item, if the leader already made one, is closed here (the case
+    replaces the card), and the hold is marked claimed."""
     if not isinstance(doc, dict):
         raise ValueError("stdin must be a JSON object {key, session_id, title, link}")
     key, cli = doc.get("key"), doc.get("session_id")
@@ -645,9 +838,14 @@ def claim(ws: Path, cfg: dict, at: datetime, doc) -> dict:
         raise ValueError("session_id is not a session id")
     link = doc.get("link")
     link = link if isinstance(link, str) and re.match(r"https?://\S+$", link) else None
+    extra = doc.get("also") if doc.get("also") is not None else []
+    if not (isinstance(extra, list) and all(isinstance(a, str) and hub._KEY_TOKEN.fullmatch(a) for a in extra)):
+        raise ValueError("also must be a list of hub keys")
     stamp = hub._iso(at)
     with hub.locked(ws):
         sess, h = hub._sessions_doc(ws), hub._hub_doc(ws)
+        asks = _asks(ws)
+        held = asks.get(key)
         items = sess["sessions"]
         upd = next((u for u in h["updates"] if isinstance(u, dict) and u.get("key") == key
                     and u.get("state") != "done"), None)
@@ -660,23 +858,99 @@ def claim(ws: Path, cfg: dict, at: datetime, doc) -> dict:
                 raise ValueError("%s is live in another session; refusing to repoint it" % key)
             else:
                 hit[1]["state"] = "dropped"   # a stale owner: the key moves to the claiming session
-        if mine is None and upd is None:
+        if mine is None and upd is None and held is None:
             raise ValueError("%s has no open inbox item; nothing to claim" % key)
+        for a in extra:
+            _refuse_owned(sess, a, cli, at)
         sk = mine[0] if mine else key
         prev = mine[1] if mine else {}
         title = safe_line(doc.get("title") or (upd or {}).get("title") or prev.get("title") or key, TITLE_MAX)
         items[sk] = {"session_id": cli, "cli_session_id": cli, "kind": "case",
                      "name": prev.get("name") or "case-" + re.sub(r"[^A-Za-z0-9]+", "-", key).strip("-")[:40],
                      "title": title, "link": link or (upd or {}).get("link") or prev.get("link") or None,
-                     "also": [a for a in (prev.get("also") or []) if isinstance(a, str)],
+                     "also": _merged_also(prev.get("also"), [a for a in extra if a != sk]),
                      "opened_at": prev.get("opened_at") or stamp, "last_routed_at": prev.get("last_routed_at"),
                      "unseen": int(prev.get("unseen") or 0), "state": "live"}
-        if upd is not None:
+        if held is not None:
+            if upd is not None:
+                upd["state"] = "done"       # the ask's own item: the case stands in its place
+                upd.pop("snooze_until", None)
+            held["claimed"] = cli
+            _save_asks(ws, asks, at)
+        elif upd is not None:
             upd["session_id"] = cli
+        h["pending"] = [p for p in h["pending"] if p.get("key") not in [key] + extra]
+        hub.save_json(ws, "sessions.json", sess)
+        hub._save_hub(ws, h, sess, cfg, at)
+    return {"ok": True, "key": sk, "session_id": cli, "update_id": upd.get("id") if upd else None,
+            "also": items[sk]["also"]}
+
+
+def _refuse_owned(sess: dict, key: str, cli: str, at: datetime) -> None:
+    """ValueError when `key` is live in another session whose row is younger than CASE_STALE_DAYS."""
+    hit = hub.find_session(sess, [key])
+    if hit is not None and not _is_cli(hit[1]) and str(hit[1].get("session_id")) != cli \
+            and _row_age_days(hit[1], at) <= CASE_STALE_DAYS:
+        raise ValueError("%s is live in another session; refusing to repoint it" % key)
+
+
+def _merged_also(prev, more) -> List[str]:
+    keep = [a for a in (prev or []) if isinstance(a, str)]
+    for a in more:
+        if a not in keep:
+            keep.append(a)
+    return keep[-hub.ALSO_MAX:]
+
+
+def watch_key(ws: Path, cfg: dict, at: datetime, key, cli) -> dict:
+    """`watch-key <key> --for <session id>`: add one more key (a related thread, ticket or PR) to a live case that
+    session holds, so its lines route there too. Refused as a claim is: an off-shape key or session id, a key live
+    in another session whose row is under CASE_STALE_DAYS old; and when that session holds no live case (a key is
+    only ever added to a case that an inbox item or an ask opened)."""
+    if not (isinstance(key, str) and hub._KEY_TOKEN.fullmatch(key)):
+        raise ValueError("key is not a hub key")
+    if not (isinstance(cli, str) and CLI_ID_RE.fullmatch(cli)):
+        raise ValueError("--for is not a session id")
+    with hub.locked(ws):
+        sess, h = hub._sessions_doc(ws), hub._hub_doc(ws)
+        mine = sorted(((sk, r) for sk, r in sess["sessions"].items() if _is_case(r) and r.get("cli_session_id") == cli),
+                      key=lambda x: str(x[1].get("opened_at") or ""))
+        if not mine:
+            raise ValueError("that session holds no live case; nothing to add %s to" % key)
+        _refuse_owned(sess, key, cli, at)
+        hit = hub.find_session(sess, [key])
+        sk, row = hit if hit is not None and str(hit[1].get("session_id")) == cli else mine[0]
+        if key != sk:
+            row["also"] = _merged_also(row.get("also"), [key])
+        for u in h["updates"]:
+            if isinstance(u, dict) and u.get("key") == key and u.get("state") != "done":
+                u["session_id"] = cli
         h["pending"] = [p for p in h["pending"] if p.get("key") != key]
         hub.save_json(ws, "sessions.json", sess)
         hub._save_hub(ws, h, sess, cfg, at)
-    return {"ok": True, "key": sk, "session_id": cli, "update_id": upd.get("id") if upd else None}
+    return {"ok": True, "key": sk, "session_id": cli, "also": [a for a in row.get("also") or [] if isinstance(a, str)]}
+
+
+def close_case(ws: Path, cfg: dict, at: datetime, key) -> dict:
+    """`close-case <key>`: the live case that holds `key` is done, and so is every open inbox item of its keys; later
+    activity on them raises a new item. ValueError when no live case holds the key."""
+    with hub.locked(ws):
+        sess, h = hub._sessions_doc(ws), hub._hub_doc(ws)
+        hit = hub.find_session(sess, [key]) if isinstance(key, str) else None
+        if hit is None or not _is_case(hit[1]):
+            raise ValueError("no live case holds %s" % key)
+        sk, row = hit
+        row["state"] = "done"
+        keys = [sk] + [a for a in row.get("also") or [] if isinstance(a, str)]
+        closed = []
+        for u in h["updates"]:
+            if isinstance(u, dict) and u.get("key") in keys and u.get("state") != "done":
+                u["state"] = "done"
+                u.pop("snooze_until", None)
+                closed.append(u.get("id"))
+        hub.save_json(ws, "sessions.json", sess)
+        hub._save_hub(ws, h, sess, cfg, at)
+    return {"ok": True, "key": sk, "session_id": row.get("cli_session_id"), "updates": closed}
 
 
 def _relays_doc(ws: Path) -> dict:
@@ -686,17 +960,18 @@ def _relays_doc(ws: Path) -> dict:
     return d
 
 
-def _merge_routed(doc: dict, h: dict, sess: dict, inbox: Optional[dict]) -> bool:
+def _merge_routed(doc: dict, h: dict, sess: dict, inbox: Optional[dict], skip=()) -> bool:
     """Copy hub.json's routes to live case sessions into `doc` (relays.json) as waiting lines, once each; forget the
-    keys that are no longer a live case. `inbox` is {line id: line} (None = counts only, no text). True when `doc`
-    changed."""
+    keys that are no longer a live case. `inbox` is {line id: line} (None = counts only, no text). `skip` is line
+    ids never relayed: the ask box's own lines, which the case already started from. True when `doc` changed."""
     rows = {sk: r for sk, r in sess["sessions"].items() if _is_case(r)}
     changed = False
     for sk in [k for k in doc["keys"] if k not in rows]:
         del doc["keys"][sk]
         changed = True
     for e in h["routed"]:
-        if not isinstance(e, dict) or e.get("decision") != "route" or not isinstance(e.get("line_id"), str):
+        if not isinstance(e, dict) or e.get("decision") != "route" or not isinstance(e.get("line_id"), str) \
+                or e["line_id"] in skip:
             continue
         hit = hub.find_session({"sessions": rows}, [e.get("key")])
         if hit is None or hit[1].get("session_id") != e.get("session_id"):
@@ -716,13 +991,17 @@ def _merge_routed(doc: dict, h: dict, sess: dict, inbox: Optional[dict]) -> bool
     return changed
 
 
+def _ask_lines(ws: Path) -> set:
+    return {a.get("line_id") for a in _asks(ws).values() if isinstance(a.get("line_id"), str)}
+
+
 def sync_relays(ws: Path) -> None:
     """Move new routes to case sessions from hub.json (which keeps only its last 50 decisions) into relays.json."""
     ws = Path(ws)
     inbox = {l["id"]: l for l in hub.read_inbox(ws)}
     with hub.locked(ws):
         doc = _relays_doc(ws)
-        if _merge_routed(doc, hub._hub_doc(ws), hub._sessions_doc(ws), inbox):
+        if _merge_routed(doc, hub._hub_doc(ws), hub._sessions_doc(ws), inbox, _ask_lines(ws)):
             _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
 
 
@@ -735,7 +1014,7 @@ def relays(ws: Path, at: datetime, cli: str) -> List[dict]:
     with hub.locked(ws):
         sess = hub._sessions_doc(ws)
         doc = _relays_doc(ws)
-        if _merge_routed(doc, hub._hub_doc(ws), sess, inbox):
+        if _merge_routed(doc, hub._hub_doc(ws), sess, inbox, _ask_lines(ws)):
             _write_atomic(chief_dir(ws) / "relays.json", json.dumps(doc, ensure_ascii=False) + "\n")
         mine = [sk for sk, r in sess["sessions"].items() if _is_case(r) and r.get("cli_session_id") == cli]
         rows = sorted((w for sk in mine for w in (doc["keys"].get(sk) or {}).get("waiting", [])),
@@ -777,21 +1056,23 @@ def relay_ack(ws: Path, at: datetime, cli: str, ids) -> int:
 
 
 def cases(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
-    """The live case rows for the pane and for each session's own mod: [{key, cli_session_id, title, link, label,
+    """The live case rows for the pane and for each session's own mod: [{key, cli_session_id, title, link, links, also, label,
     unseen, last_routed_at, opened_at, deliver_now}], oldest first. `unseen` is how many routed lines wait to be
     delivered. Reads only."""
     sess, doc = hub._sessions_doc(ws), _relays_doc(ws)
-    _merge_routed(doc, hub._hub_doc(ws), sess, None)
+    _merge_routed(doc, hub._hub_doc(ws), sess, None, _ask_lines(ws))
     whos, channels = _who_by_key(ws), _channel_names(cfg or {})
+    bases = link_bases(ws, cfg)
     out = []
     for sk, r in sess["sessions"].items():
         cli = r.get("cli_session_id") if _is_case(r) else None
         if not (isinstance(cli, str) and CLI_ID_RE.fullmatch(cli)):
             continue
-        link = r.get("link")
+        also = [a for a in r.get("also") or [] if isinstance(a, str)]
+        link, links = item_links(sk, r.get("link"), also, "", bases)
         out.append({"key": safe_line(sk, PROGRESS_MAX), "cli_session_id": cli,
                     "title": safe_line(r.get("title") or sk, TITLE_MAX),
-                    "link": link if isinstance(link, str) else None,
+                    "link": link or None, "links": links, "also": [safe_line(a, PROGRESS_MAX) for a in also],
                     "label": item_label(sk, safe_line(whos.get(sk) or "", LABEL_MAX), channels),
                     "unseen": len((doc["keys"].get(sk) or {}).get("waiting", [])),
                     "last_routed_at": r.get("last_routed_at"), "opened_at": r.get("opened_at"),
@@ -962,10 +1243,41 @@ def _block_text(content) -> str:
     return " ".join(p.strip() for p in parts if p.strip())
 
 
-def _transcript_tail(path: Path) -> Optional[Tuple[str, str]]:
-    """(fingerprint, text) from the end of a session transcript: the last TAIL_MESSAGES main-thread user and
-    assistant messages, `role: text` per line, each capped, the whole cut to TAIL_MAX keeping the newest. The
-    fingerprint is `t:<size>:<mtime_ns>`. None when the file is missing or holds no such message."""
+RUNNING_SECONDS = 120          # a transcript that moved this recently is running
+STUCK_SECONDS = 30 * 60        # an open turn, or a card that said `working` twice, with no movement for this long
+STATES = ("working", "waiting_manager", "waiting_other", "done", "stuck", "idle")
+PROGRESS_MAX_CHARS = 160
+_WAITING_RE = re.compile(r"^\W{0,3}Waiting on:\s*(.+?)\s*(?:—|–|--|-)\s*(.*?)\W{0,3}$", re.IGNORECASE)
+_ERROR_END_RE = re.compile(r"\b(api error|rate limit|usage limit|limit reached|overloaded|credit balance is too low|"
+                           r"request timed out|connection error|prompt is too long)\b", re.IGNORECASE)
+ERROR_END_MAX = 400
+
+
+def waiting_line(text) -> Optional[dict]:
+    """The cos skill's last line (`Waiting on: <who> — <what>`) of a message, read in code: {state, on, what} with
+    state `waiting_manager` (the manager), `done` (nothing) or `waiting_other` (anyone else, named in `on`). None
+    when the message's last non-empty line is not one."""
+    rows = [l.strip() for l in str(text or "").splitlines() if l.strip()]
+    m = _WAITING_RE.match(rows[-1]) if rows else None
+    if not m:
+        return None
+    who, what = safe_line(m.group(1), 80), safe_line(m.group(2), 200)
+    low = who.lower()
+    if low in ("nothing", "nobody", "no one"):
+        return {"state": "done", "on": None, "what": what}
+    if low in ("the manager", "manager", "you"):
+        return {"state": "waiting_manager", "on": None, "what": what}
+    return {"state": "waiting_other", "on": who, "what": what}
+
+
+def _transcript_read(path: Path) -> Optional[dict]:
+    """The end of a session transcript: {fingerprint, text, mtime, last_from, open_turn, waiting, error_end}. `text`
+    is the last TAIL_MESSAGES main-thread user and assistant messages, `role: text` per line, each capped, the
+    whole cut to TAIL_MAX keeping the newest; the fingerprint is `t:<size>:<mtime_ns>`. `last_from` is who wrote
+    the last message with text; `open_turn` whether the last main-thread entry is a prompt, a tool result or a tool
+    call (a turn that has not ended); `waiting` the last assistant message's `Waiting on:` line (`waiting_line`),
+    only when that message is the last one; `error_end` whether the tail ends in an API error or limit message.
+    None when the file is missing or holds no such message."""
     try:
         st = path.stat()
         with open(str(path), "rb") as f:
@@ -975,7 +1287,7 @@ def _transcript_tail(path: Path) -> Optional[Tuple[str, str]]:
             raw = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    msgs = []
+    msgs, last, last_text = [], None, ""
     for line in raw.splitlines():
         try:
             d = json.loads(line)
@@ -985,41 +1297,83 @@ def _transcript_tail(path: Path) -> Optional[Tuple[str, str]]:
                 or d.get("isMeta"):
             continue
         m = d.get("message")
-        text = _block_text(m.get("content")) if isinstance(m, dict) else ""
-        text = " ".join(text.split())
+        content = m.get("content") if isinstance(m, dict) else None
+        full = _block_text(content) if isinstance(content, list) else (content if isinstance(content, str) else "")
+        if isinstance(content, list):   # keep the line breaks of the text blocks: the last line matters
+            full = "\n".join(b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text"
+                             and isinstance(b.get("text"), str)) or full
+        calls = isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+        last = {"role": d["type"], "calls": calls, "api_error": d.get("isApiErrorMessage") is True}
+        text = " ".join(_block_text(content).split())
         if text:
             msgs.append("%s: %s" % (d["type"], text[:TAIL_MESSAGE_MAX]))
+            last_text = full
+            last["said"] = True
     if not msgs:
         return None
     out = "\n".join(msgs[-TAIL_MESSAGES:])
     if len(out) > TAIL_MAX:
         out = out[-TAIL_MAX:]
-    return "t:%d:%d" % (st.st_size, st.st_mtime_ns), out
+    role = msgs[-1].split(":", 1)[0]
+    ended_on_text = bool(last.get("said")) and last["role"] == "assistant" and not last["calls"]
+    return {"fingerprint": "t:%d:%d" % (st.st_size, st.st_mtime_ns), "text": out, "mtime": st.st_mtime,
+            "last_from": "assistant" if role == "assistant" else "manager",
+            "open_turn": last["role"] == "user" or last["calls"],
+            "waiting": waiting_line(last_text) if ended_on_text else None,
+            "error_end": last["api_error"] or (ended_on_text and len(last_text) <= ERROR_END_MAX
+                                               and bool(_ERROR_END_RE.search(last_text)))}
+
+
+def _transcript_tail(path: Path) -> Optional[Tuple[str, str]]:
+    """(fingerprint, text) of `_transcript_read`, or None."""
+    got = _transcript_read(path)
+    return (got["fingerprint"], got["text"]) if got else None
 
 
 def _short_fp(prefix: str, text: str) -> str:
     return "%s:%s" % (prefix, hashlib.sha1(text.encode("utf-8")).hexdigest()[:16])
 
 
-def _tail_for(home: Path, cwds: List[str], sid: str) -> Optional[Tuple[str, str]]:
+def _tail_for(home: Path, cwds: List[str], sid: str) -> Optional[dict]:
     for cwd in cwds:
         if cwd:
-            got = _transcript_tail(home / ".claude" / "projects" / project_slug(cwd) / (sid + ".jsonl"))
+            got = _transcript_read(home / ".claude" / "projects" / project_slug(cwd) / (sid + ".jsonl"))
             if got:
                 return got
     return None
 
 
-def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path]) -> List[dict]:
-    """Every session the pane draws a TL;DR for, with its tail: the pinned desktop sessions (by CLI id). One with
-    neither a transcript nor a last report has nothing to summarise."""
-    out = []
+def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path], at: Optional[datetime] = None) -> List[dict]:
+    """Every session the pane draws a card for, with its tail: the pinned desktop sessions, then the live case
+    sessions that are not pinned (their transcript is looked for under the workspace folder, where a case starts),
+    asleep or not. One with neither a transcript nor a last report has nothing to summarise. Each row is {id, kind
+    (pinned | case), fingerprint, text} plus what the transcript says without a model: `running` (it moved in the
+    last 2 minutes, or its turn is open and it moved in the last 30), `idle_for` (seconds since it last moved;
+    None without a transcript), `last_from` (assistant | manager), `waiting` (`waiting_line`) and `error_end`."""
+    out, seen = [], set()
+    now_s = at.timestamp() if at is not None else None
+
+    def row(sid, kind, got):
+        idle = max(0, int(now_s - got["mtime"])) if now_s is not None and got.get("mtime") is not None else None
+        open_turn = bool(got.get("open_turn"))
+        seen.add(sid)
+        out.append({"id": sid, "kind": kind, "fingerprint": got["fingerprint"], "text": got["text"],
+                    "running": idle is not None and (idle < RUNNING_SECONDS or (open_turn and idle < STUCK_SECONDS)),
+                    "idle_for": idle, "last_from": got.get("last_from"), "open_turn": open_turn,
+                    "waiting": got.get("waiting"), "error_end": bool(got.get("error_end"))})
+
     for d in desktop_status(ws, app_dir):
         got = _tail_for(home, [d["cwd"]], d["cli_session_id"])
         if not got and d["last_report"].strip():
-            got = (_short_fp("r", d["last_report"]), d["last_report"])
+            got = {"fingerprint": _short_fp("r", d["last_report"]), "text": d["last_report"]}
         if got:
-            out.append({"id": d["cli_session_id"], "kind": "pinned", "fingerprint": got[0], "text": got[1]})
+            row(d["cli_session_id"], "pinned", got)
+    for r in hub._sessions_doc(ws)["sessions"].values():
+        cli = r.get("cli_session_id") if _is_case(r) else None
+        if isinstance(cli, str) and CLI_ID_RE.fullmatch(cli) and cli not in seen:
+            got = _tail_for(home, [str(ws)], cli)
+            if got:
+                row(cli, "case", got)
     return out
 
 
@@ -1071,30 +1425,93 @@ def clean_tldr(tldr, chips) -> Optional[dict]:
     return {"tldr": "\n".join(lines), "chips": out}
 
 
-def session_tails(ws: Path, cfg: dict, home: Optional[Path] = None, app_dir: Optional[Path] = None) -> dict:
-    """`tail --json`: {version, model, sessions: [{id, kind, fingerprint, text, cached?}]}. `cached` is the
-    stored {tldr, chips} when tldr.json holds one for the same id, fingerprint and model."""
+def clean_card(r) -> Optional[dict]:
+    """A session card as the pane may show it, or None: `clean_tldr`'s {tldr, chips}, and, when the row carries a
+    `state`, {state (STATES; anything else reads `idle`), progress (one line, 160), asks, question, options,
+    waiting_on} with the floor card's own caps (lib/floor.py)."""
+    if not isinstance(r, dict):
+        return None
+    c = clean_tldr(r.get("tldr"), r.get("chips"))
+    if not c or "state" not in r:
+        return c
+    f = floormod.clean({"session_id": "0" * 36, "asks": r.get("asks"), "question": r.get("question"),
+                        "options": r.get("options"), "waiting_on": None}) or {}
+    c.update({"state": r["state"] if r.get("state") in STATES else "idle",
+              "progress": safe_line(r.get("progress") if isinstance(r.get("progress"), str) else "", PROGRESS_MAX_CHARS),
+              "asks": bool(f.get("asks")), "question": _safe(f.get("question") or ""),
+              "options": [{"label": _safe(o["label"]), "message": _safe(o["message"])} for o in f.get("options") or []],
+              "waiting_on": safe_line(r.get("waiting_on") if isinstance(r.get("waiting_on"), str) else "", 80) or None})
+    return c
+
+
+def _stored_card(hit) -> Optional[dict]:
+    c = clean_card(hit) if isinstance(hit, dict) else None
+    if c is not None:
+        c["at"] = hit.get("at") if isinstance(hit.get("at"), str) else None
+        if "state" in c:
+            c["prev_state"] = hit.get("prev_state") if hit.get("prev_state") in STATES else None
+    return c
+
+
+def _is_stuck(row: dict, card: Optional[dict]) -> bool:
+    """The code rule: the tail ends in an error or limit message; or nothing moved for STUCK_SECONDS while the turn
+    is open or the card said `working` at its last two refreshes."""
+    idle = row.get("idle_for")
+    still = isinstance(idle, int) and idle >= STUCK_SECONDS
+    twice = bool(card) and card.get("state") == "working" and card.get("prev_state") == "working"
+    return bool(row.get("error_end")) or (still and (bool(row.get("open_turn")) or twice))
+
+
+def session_tails(ws: Path, cfg: dict, home: Optional[Path] = None, app_dir: Optional[Path] = None,
+                  at: Optional[datetime] = None) -> dict:
+    """`tail --json`: {version, model, refresh_minutes, sessions: [{id, kind, fingerprint, text, running, idle_for,
+    last_from, open_turn, waiting, error_end, stuck, cached?, prev?}]}. `cached` is the stored card when tldr.json
+    holds one for the same id, fingerprint and model; `prev` the stored card whatever it was made from (its tldr,
+    state and `at`, for the next card's delta and the refresh interval). `stuck` is `_is_stuck`."""
     home = Path(home or Path.home())
-    model = settings(cfg).get("tldr_model")
+    conf = settings(cfg)
+    model = conf.get("tldr_model")
     model = model if model in TLDR_MODELS else DEFAULTS["tldr_model"]
     store = _read_obj(chief_dir(ws) / "tldr.json")
-    sessions = _live_sessions(Path(ws), home, app_dir if app_dir is not None else default_app_dir())
+    sessions = _live_sessions(Path(ws), home, app_dir if app_dir is not None else default_app_dir(), at)
     for s in sessions:
         hit = store.get(s["id"])
-        if isinstance(hit, dict) and hit.get("fingerprint") == s["fingerprint"] and hit.get("model") == model:
-            c = clean_tldr(hit.get("tldr"), hit.get("chips"))
-            if c:
-                s["cached"] = c
-    return {"version": 1, "model": model, "sessions": sessions}
+        card = _stored_card(hit)
+        if card:
+            s["prev"] = dict(card, fingerprint=hit.get("fingerprint"))
+            if hit.get("fingerprint") == s["fingerprint"] and hit.get("model") == model:
+                s["cached"] = {k: v for k, v in card.items() if k != "at"}
+        s["stuck"] = _is_stuck(s, card)
+    return {"version": 1, "model": model, "refresh_minutes": conf["refresh_minutes"], "sessions": sessions}
+
+
+def _fill_floor(ws: Path, at: datetime, sid: str, card: dict, row: dict) -> None:
+    """A refreshed card's ask, as the session's floor card (lib/floor.py), so Needs you covers a session whose own
+    mod is not running. A floor card written since the transcript last moved is that session's own word on its
+    final message and wins: it is left alone. Otherwise the refresh's ask is written, or a stale ask cleared."""
+    path = floormod.floor_dir(ws) / (sid + ".json")
+    cur = _read_obj(path)
+    cur_at = floormod._parse(cur.get("at")) if cur else None
+    moved = row.get("idle_for")
+    if cur_at is not None and (moved is None or (at - cur_at).total_seconds() <= moved + 1):
+        return
+    if not card.get("asks") and not cur.get("asks"):
+        return
+    floormod.write_card(ws, at, {"session_id": sid, "asks": card.get("asks"), "question": card.get("question"),
+                                 "options": card.get("options"), "waiting_on": card.get("waiting_on") or "the manager"})
 
 
 def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = None,
-               app_dir: Optional[Path] = None) -> int:
-    """`tldr --stdin`: merge [{id, fingerprint, model, tldr, chips}] into .mother/chief/tldr.json, for live sessions only
-    and cleaned as clean_tldr; entries for sessions no longer live are pruned. Returns how many were stored."""
+               app_dir: Optional[Path] = None, cards: Optional[dict] = None) -> int:
+    """`tldr --stdin`: merge [{id, fingerprint, model, tldr, chips, state?, progress?, asks?, question?, options?,
+    waiting_on?}] into .mother/chief/tldr.json, for live sessions only and cleaned as `clean_card`; entries for
+    sessions no longer live are pruned. For a card with a `state`, what the transcript says in code wins over the
+    model: a `Waiting on:` last line sets the state and `waiting_on`, and a running session is `working`; the
+    card it replaces gives `prev_state`; its ask fills the session's floor card (`_fill_floor`). Returns how many
+    were stored; `cards`, when given, receives {id: the stored card}."""
     ws = Path(ws)
-    live = {s["id"] for s in _live_sessions(ws, Path(home or Path.home()),
-                                             app_dir if app_dir is not None else default_app_dir())}
+    live = {s["id"]: s for s in _live_sessions(ws, Path(home or Path.home()),
+                                               app_dir if app_dir is not None else default_app_dir(), at)}
     n = 0
     with hub.locked(ws):
         path = chief_dir(ws) / "tldr.json"
@@ -1102,16 +1519,124 @@ def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = 
         for r in rows or []:
             if not isinstance(r, dict) or r.get("id") not in live or not isinstance(r.get("fingerprint"), str):
                 continue
-            c = clean_tldr(r.get("tldr"), r.get("chips"))
+            c = clean_card(r)
             if not c:
                 continue
-            doc[r["id"]] = {"fingerprint": r["fingerprint"], "model": r.get("model") if r.get("model") in TLDR_MODELS else None,
-                            "tldr": c["tldr"], "chips": c["chips"], "at": hub._iso(at)}
+            row = live[r["id"]]
+            if "state" in c:
+                w = row.get("waiting")
+                if w:
+                    c["state"], c["waiting_on"] = w["state"], w["on"]
+                    if w["state"] != "waiting_manager":
+                        c.update({"asks": False, "question": "", "options": []})
+                elif row.get("running"):
+                    c["state"] = "working"
+                old = doc.get(r["id"])
+                c["prev_state"] = old.get("state") if isinstance(old, dict) and old.get("state") in STATES else None
+                try:
+                    _fill_floor(ws, at, r["id"], c, row)
+                except OSError:
+                    pass   # the card is stored all the same; Needs you misses this ask until the next refresh
+            doc[r["id"]] = dict(c, fingerprint=r["fingerprint"], at=hub._iso(at),
+                                model=r.get("model") if r.get("model") in TLDR_MODELS else None)
+            if cards is not None:
+                cards[r["id"]] = dict(c, at=hub._iso(at))
             n += 1
         _write_atomic(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
     return n
 
 
+# ---- what a dots action would do: its own text, from the newest dots output on disk -----------------------------
+DOTS_ID_RE = re.compile(r"^[AM]\d{1,3}$")
+DOTS_TEXT_MAX = 1500
+DOTS_FILE_MAX = 256 * 1024
+DOTS_FILES = 7
+DOTS_LABEL_MAX = 40
+_DOTS_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})\.md$")
+
+
+def _dots_files(ws: Path) -> List[Tuple[str, Path]]:
+    """(date, path) of the dots outputs on disk, newest date first; inside one date the machine-local full copy
+    (.mother/reports/dots-<date>.md), then the journal file the routine always writes (journal/dots/<date>.md),
+    then the undelivered copy (.mother/dots-unsent-<date>.md)."""
+    found = []
+    for order, (folder, pattern) in enumerate(((Path(ws) / ".mother" / "reports", r"^dots-\d{4}-\d{2}-\d{2}\.md$"),
+                                               (Path(ws) / "journal" / "dots", r"^\d{4}-\d{2}-\d{2}\.md$"),
+                                               (Path(ws) / ".mother", r"^dots-unsent-\d{4}-\d{2}-\d{2}\.md$"))):
+        try:
+            names = os.listdir(str(folder))
+        except OSError:
+            continue
+        for name in names:
+            path = folder / name
+            if re.match(pattern, name) and not path.is_symlink() and path.is_file():
+                found.append((_DOTS_DATE.search(name).group(1), order, path))
+    found.sort(key=lambda f: f[1])
+    found.sort(key=lambda f: f[0], reverse=True)
+    return [(d, p) for d, _o, p in found[:DOTS_FILES]]
+
+
+def _dots_block(lines: List[str], ident: str) -> Optional[List[str]]:
+    """The action's own block in a dots file: the line that starts with its id (after a list marker), or for `M<n>`
+    with no such line the `<n>.` entry under the "For you" heading, with the indented lines under it."""
+    start = None
+    own = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)?[*_`]{0,2}%s[*_`]{0,2}(?=[\s:.)—-]|$)" % re.escape(ident))
+    for i, l in enumerate(lines):
+        if own.match(l):
+            start = i
+            break
+    if start is None and ident.startswith("M"):
+        in_you = False
+        for i, l in enumerate(lines):
+            if l.startswith("#"):
+                in_you = bool(re.search(r"for you", l, re.IGNORECASE))
+            elif in_you and re.match(r"^%s[.)]\s" % ident[1:], l):
+                start = i
+                break
+    if start is None:
+        return None
+    block = [lines[start]]
+    for l in lines[start + 1:]:
+        if not l.strip() or not l[:1].isspace():
+            break
+        block.append(l)
+    return block
+
+
+def dots_label(line: str, ident: str) -> Optional[str]:
+    """A short verb phrase for the action's button ("Annotate 7 todos"), from its own line: the first clause after
+    the id, when it is 2 or more words and at most 40 characters. None otherwise."""
+    text = re.sub(r"^\s*(?:[-*]\s+|\d+[.)]\s+)?[*_`]{0,2}(?:%s)?[*_`]{0,2}[\s:.)—-]*" % re.escape(ident), "", line)
+    clause = re.split(r"\s+[—–]\s+|\s+--?\s+|\s+because\s+|[(:;]", text, 1)[0].strip(" .*`_")
+    clause = safe_line(clause, 200)
+    if not clause or len(clause) > DOTS_LABEL_MAX or len(clause.split()) < 2 or not clause[0].isalpha():
+        return None
+    return clause[0].upper() + clause[1:]
+
+
+def dots_detail(ws: Path, ident) -> Optional[dict]:
+    """`dots-detail <id>`: {id, text, date, source_file, label} for a dots action (`A<n>`) or manager item (`M<n>`),
+    from the newest dots output on disk that has it (`_dots_files`): its own line or paragraph, then the other
+    lines of that file that name it, at most 1500 characters. `source_file` is relative to the workspace; `label`
+    is `dots_label`. None when the id is off-shape or no file has it."""
+    if not isinstance(ident, str) or not DOTS_ID_RE.match(ident):
+        return None
+    for date, path in _dots_files(ws):
+        try:
+            if path.stat().st_size > DOTS_FILE_MAX:
+                continue
+            lines = path.read_bytes().decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        block = _dots_block(lines, ident)
+        if block is None:
+            continue
+        named = re.compile(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(ident))
+        more = [l for l in lines if l not in block and named.search(l) and not l.startswith("#")]
+        text = "\n".join(_safe(l.rstrip()) for l in block + more).strip()[:DOTS_TEXT_MAX]
+        return {"id": ident, "text": text, "date": date, "source_file": str(path.relative_to(Path(ws))),
+                "label": dots_label(block[0], ident)}
+    return None
 
 
 # ---- health: what the Chief pane's Health tab reads, so the mod opens no more files -----------------------------
@@ -1226,10 +1751,12 @@ USAGE = """usage: mother chief <verb> ...
   status [--json]       paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}
-  tail --json           each pinned session's recent tail (at most 6000 characters) for the Chief pane's TL;DR,
-                        with the cached TL;DR when the session has not moved; prints {version, model, sessions}
-  tldr --stdin          store the pane's TL;DRs and chips (JSON array on stdin) in .mother/chief/tldr.json;
-                        prints {stored: N}
+  tail --json           each pinned or case session's recent tail (at most 6000 characters) for its card, what
+                        its transcript says in code (running, idle_for, last_from, waiting, error_end, stuck), the
+                        cached card when the session has not moved and the previous one; prints {version, model,
+                        refresh_minutes, sessions}
+  tldr --stdin          store session cards (JSON array on stdin: tldr and chips, plus state, progress and the ask)
+                        in .mother/chief/tldr.json; prints {stored: N, cards: {id: card}}
   spend --stdin         add one pane model call ({model, input_tokens, output_tokens} on stdin) to today's spend;
                         prints {added: usd}
   portrait --json       the Chief pane's picture: .mother/portrait.png when it is a PNG of at most 2 MiB, else the
@@ -1237,10 +1764,20 @@ USAGE = """usage: mother chief <verb> ...
                         jpeg_height for a small .mother/portrait.jpg, and svg (the bundled vector)
   report <name>         print one undelivered routine report (.mother/<routine>-unsent-<YYYY-MM-DD>.md, at most
                         64 KB); exit 2 for any other name or file
-  claim --stdin         a session claims an inbox item's key ({key, session_id, title, link} on stdin): its row in
-                        the hub's sessions.json becomes a live case of that session, so later lines of the key
-                        route to it. Refused (exit 1) with no open inbox item for the key, or when the key is
-                        live in another session whose row is under 7 days old
+  claim --stdin         a session claims an inbox item's key ({key, session_id, title, link, also?} on stdin): its
+                        row in the hub's sessions.json becomes a live case of that session, so later lines of the
+                        key (and of each key in `also`) route to it. Refused (exit 1) with no open inbox item and
+                        no ask-box hold for the key, or when a key is live in another session whose row is under
+                        7 days old
+  watch-key <key> --for <session_id>
+                        add one more key (a related thread, ticket or PR) to a live case that session holds;
+                        refused (exit 1) as a claim is, and when that session holds no live case
+  close-case <key>      the live case that holds the key is done, with every open inbox item of its keys
+  ask --stdin           the ask box: {text} on stdin becomes a `manual` inbox line (as `mother hub add`) whose key
+                        is held for the case the pane starts; prints {ok, key, line_id, link, update_id, owned_by}
+  dots-detail <id> --json
+                        what a dots action (A<n>) or manager item (M<n>) says, from the newest dots output on disk:
+                        {id, text, date, source_file, label}, or null
   relays --for <session_id> [--ack --stdin]
                         the routed lines not yet delivered into that session, for the cases it holds: a JSON
                         array of {id, key, at, who, title, summary, link}; nothing is removed. --ack --stdin: the
@@ -1249,18 +1786,28 @@ USAGE = """usage: mother chief <verb> ...
   relay on | off | status | deliver --for <session_id>
                         the machine-local relay switch (.mother/chief/RELAY_OFF); deliver: that session delivers
                         what waits once, on its next pass, though relay is off
+  act-log --stdin | --json [--days N]
+                        --stdin: append one action the manager took on a card ({verb, item_id, key, who, kind,
+                        urgency, on, title, action_label, action_index}; any other field is dropped) to
+                        .mother/chief/actions.jsonl (90 days, at most 5000 lines); --json prints the log
+  habits [--json] | on | off | status | show <line id> | except <bucket>
+                        --json: the log counted per bucket over 30 days; on | off: the machine-local switch
+                        (.mother/chief/HABITS_OFF); show: a line quieted by habit becomes an Inbox item;
+                        except: never quiet that bucket again
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
 
 A valued option takes --opt=V or --opt V."""
 
-# verb: (boolean flags, valued options); only `report` and `relay` take a positional
+# verb: (boolean flags, valued options); only `report`, `relay`, `habits`, `watch-key`, `close-case` and `dots-detail` take a positional
 VERBS = {
     "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
     "portrait": (("--json",), ()), "report": ((), ()),
+    "act-log": (("--stdin", "--json"), ("--days",)), "habits": (("--json",), ()),
     "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
+    "watch-key": ((), ("--for",)), "close-case": ((), ()), "ask": (("--stdin",), ()), "dots-detail": (("--json",), ()),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -1362,7 +1909,7 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     beat_at = hub._parse_at(beat)
     alive = beat_at is not None and (at - beat_at).total_seconds() < ALIVE_SECONDS
     leader = beat_doc.get("session_id")
-    errors, inbox = split_watcher_errors(inbox_items(ws, cfg))   # a `watcher:` item is not work: it goes to health
+    errors, inbox = split_watcher_errors(inbox_items(ws, cfg, at))   # a `watcher:` item is not work: it goes to health
     tz = nowmod.Schedule.from_config(cfg or {}).tz
     spent, limit = round(spent_today(ws, at, tz), 6), float(settings(cfg)["daily_budget_usd"])
     unreadable = _spend_unreadable(ws)
@@ -1378,6 +1925,8 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "relay": {"on": relay_on(ws)},
         "guard": guard_state(ws),
         "health": health_doc(ws, at, errors),
+        "habits": {"on": habits.is_on(ws)},
+        "quieted": habits.quieted_doc(ws, at),
     }
 
 
@@ -1471,6 +2020,51 @@ def _case_verb(ws: Path, cfg: dict, at: datetime, verb: str, opts: dict, pos: Li
     return EXIT_OK
 
 
+def _habit_verb(ws: Path, cfg: dict, at: datetime, verb: str, opts: dict, pos: List[str]) -> int:
+    """`act-log --stdin | --json [--days N]`, `habits [--json] | on | off | status | show <id> | except <bucket>`."""
+    if verb == "act-log":
+        if opts.get("stdin"):
+            try:
+                row = habits.clean_action(json.loads(sys.stdin.read()), at)
+            except ValueError as e:
+                return _usage("act-log: stdin is not JSON (%s)" % e)
+            if row is None:
+                return _usage("act-log: stdin must be a JSON object whose verb is one of %s" % ", ".join(habits.VERBS))
+            print(json.dumps({"logged": habits.append_actions(ws, at, [row])}))
+            return EXIT_OK
+        if not opts.get("json"):
+            return _usage("act-log takes --stdin or --json")
+        try:
+            days = int(opts.get("days", habits.KEEP_DAYS))
+        except ValueError:
+            return _usage("act-log --days needs a number")
+        print(json.dumps(habits.actions(ws, at, max(0, days)), indent=2, ensure_ascii=False))
+        return EXIT_OK
+    sub = pos[0] if pos else ""
+    if sub in ("show", "except") and len(pos) == 2:
+        if sub == "show":
+            uid = habits.show_quieted(ws, cfg, at, pos[1])
+            if uid is None:
+                print("mother chief habits show: no quieted line %s" % pos[1], file=sys.stderr)
+                return EXIT_FAILED
+            print("Shown in the Inbox as %s" % uid)
+        elif not habits.add_exception(ws, pos[1]):
+            print("mother chief habits except: not a bucket (source|label|value or source|who|value)", file=sys.stderr)
+            return EXIT_FAILED
+        else:
+            print("Never quieted again: %s" % safe_line(pos[1].replace("|label|", " ").replace("|who|", " "), 80))
+        return EXIT_OK
+    if len(pos) > 1 or sub not in ("", "on", "off", "status"):
+        return _usage("habits takes --json, on, off, status, show <line id> or except <bucket>")
+    if sub in ("on", "off"):
+        habits.set_on(ws, sub == "on")
+    if opts.get("json") and not sub:
+        print(json.dumps(habits.habits(ws, at), indent=2, ensure_ascii=False))
+        return EXIT_OK
+    print("habits %s: %d quieted in 7 days" % ("on" if habits.is_on(ws) else "off", habits.quieted_doc(ws, at)["count_7d"]))
+    return EXIT_OK
+
+
 def main(args, ws, cfg, at) -> int:
     """`mother chief <verb>`."""
     args = list(args)
@@ -1486,7 +2080,7 @@ def main(args, ws, cfg, at) -> int:
         opts, pos = _parse(rest, flags, valued)
     except ValueError as e:
         return _usage(str(e))
-    if pos and verb not in ("report", "relay"):
+    if pos and verb not in ("report", "relay", "habits", "watch-key", "close-case", "dots-detail"):
         return _usage("%s takes no arguments" % verb)
     ws = Path(ws)
     if verb == "report":
@@ -1500,6 +2094,36 @@ def main(args, ws, cfg, at) -> int:
     as_json = bool(opts.get("json"))
     if verb in ("claim", "relays", "relay"):
         return _case_verb(ws, cfg, at, verb, opts, pos)
+    if verb in ("watch-key", "close-case"):
+        if len(pos) != 1:
+            return _usage("%s takes one key" % verb)
+        try:
+            print(json.dumps(watch_key(ws, cfg, at, pos[0], opts.get("for")) if verb == "watch-key"
+                             else close_case(ws, cfg, at, pos[0])))
+        except ValueError as e:
+            print("mother chief %s: %s" % (verb, e), file=sys.stderr)
+            return EXIT_FAILED
+        return EXIT_OK
+    if verb == "ask":
+        if not opts.get("stdin"):
+            return _usage("ask reads {text} from stdin: pass --stdin")
+        try:
+            doc = json.loads(sys.stdin.read())
+        except ValueError as e:
+            return _usage("ask: stdin is not JSON (%s)" % e)
+        try:
+            print(json.dumps(ask(ws, cfg, at, doc.get("text") if isinstance(doc, dict) else None), ensure_ascii=False))
+        except ValueError as e:
+            print("mother chief ask: %s" % e, file=sys.stderr)
+            return EXIT_FAILED
+        return EXIT_OK
+    if verb == "dots-detail":
+        if len(pos) != 1:
+            return _usage("dots-detail takes one id (A<n> or M<n>)")
+        print(json.dumps(dots_detail(ws, pos[0]), ensure_ascii=False))
+        return EXIT_OK
+    if verb in ("act-log", "habits"):
+        return _habit_verb(ws, cfg, at, verb, opts, pos)
     if verb in ("pause", "resume"):
         (pause if verb == "pause" else resume)(ws)
         print("chief %s" % ("paused" if verb == "pause" else "resumed"))
@@ -1547,7 +2171,7 @@ def main(args, ws, cfg, at) -> int:
         print(json.dumps(doc))
         return EXIT_OK
     if verb == "tail":
-        print(json.dumps(session_tails(ws, cfg, Path.home(), default_app_dir()), indent=2, ensure_ascii=False))
+        print(json.dumps(session_tails(ws, cfg, Path.home(), default_app_dir(), at), indent=2, ensure_ascii=False))
         return EXIT_OK
     if verb == "tldr":
         if not opts.get("stdin"):
@@ -1558,7 +2182,9 @@ def main(args, ws, cfg, at) -> int:
             return _usage("tldr: stdin is not JSON (%s)" % e)
         if not isinstance(rows, list):
             return _usage("tldr: stdin must be a JSON array of {id, fingerprint, tldr, chips}")
-        print(json.dumps({"stored": tldr_store(ws, at, rows, Path.home(), default_app_dir())}))
+        cards = {}
+        n = tldr_store(ws, at, rows, Path.home(), default_app_dir(), cards)
+        print(json.dumps({"stored": n, "cards": cards}, ensure_ascii=False))
         return EXIT_OK
     if verb == "spend":
         if not opts.get("stdin"):

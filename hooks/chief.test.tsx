@@ -1,9 +1,10 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { chiefStatusText, cleanTldr, ledByText, sessionOrder, parseVerdict, triagePrompt, CONTEXT_MAX, TRIAGE_PROMPT_MAX, TRIAGE_SYSTEM } from './chief'
+import { chiefStatusText, cleanTldr, ledByText, sessionOrder, parseVerdict, triagePrompt, ASK_EMPTY, CONTEXT_MAX, TRIAGE_PROMPT_MAX, TRIAGE_SYSTEM } from './chief'
 import { caseBrief, parseCase, relayText } from './cos'
-import { bannerSvg, budgetBar, clip, humanLabel, inboxOrder, isOpen, itemSource, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
+import { bannerSvg, budgetBar, cardState, clip, humanLabel, inboxOrder, isOpen, itemSource, linksOf, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
 import { CLI } from '../tests/fixtures/chief_cli'
-import { guardState, healthProblems, isWatcherError, sourceRows, teamGroups } from './pane_tabs'
+import { decisionLabel, dotsId, guardState, healthProblems, isWatcherError, sourceRows, teamGroups } from './pane_tabs'
+import { promptHabits, quietedOf } from './habits'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-11-02T10:00:00Z')
@@ -24,6 +25,7 @@ function status(over: Record<string, unknown> = {}) {
 type Cli = { exitCode: number; stdout?: string; stderr?: string }
 const ON_GET = '__test_on_get'
 let submitFate: ((e: any) => 'ok' | 'drop' | 'throw') | null = null
+let actLogFate: 'ok' | 'fail' | 'throw' = 'ok'   // what `mother chief act-log --stdin` does; a test may have it fail
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
@@ -31,7 +33,7 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
                     store: Record<string, unknown> | 'broken' = {}, expand = true) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m', ...env })
-  const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
+  const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[], acts: [] as any[] }
   // $.store, from memory: what a test seeds is what an earlier process left behind
   // per key, as the host merges each write into the file under its lock; `ON_GET` lets a test act as another process
   on('store.get', (_: any, e: any) => {
@@ -67,6 +69,11 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
     out.argv.push(argv)
     const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[2] === 'path') return ok(WS + '\n')
+    if (argv[2] === 'chief' && argv[3] === 'act-log') {   // the actions log: every row the pane wrote, in order
+      out.acts.push(JSON.parse(String(e.init?.stdin ?? 'null')))
+      if (actLogFate === 'throw') throw new Error('spawn failed')
+      return actLogFate === 'fail' ? { value: { exitCode: 1, stdout: '', stderr: 'act-log: disk full\n', isStdoutTruncated: false, isStderrTruncated: false } } : ok('{"logged": 1}')
+    }
     if (argv[2] === 'floor') {    // `mother floor <verb>`: the same callback, as ['floor', <verb>, ...]
       const r = await chief(['floor', ...argv.slice(3)], e.init?.stdin)
       if (r) return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -320,7 +327,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | expand | collapse | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -468,7 +475,8 @@ test('test_tldr_model_failure_falls_back_to_the_last_report', async ($, on) => {
 
 test('test_tldr_never_called_while_the_pane_is_hidden', async ($, on) => {
   let up = false
-  const { clock, out, t } = await bootTldr($, on, { shown: () => up })
+  // another session leads: this one refreshes only while its pane is shown
+  const { clock, out, t } = await bootTldr($, on, { shown: () => up, cli: argv => (argv[0] === 'tick' ? { exitCode: 0, stdout: '{"skipped": "led by another session"}' } : undefined) })
   await clock.advance(60_000)
   await clock.advance(60_000)
   expect(t.asks).toEqual([])
@@ -2381,7 +2389,7 @@ test('test_now_cards_show_up_to_three_actions_first_primary', async ($, on) => {
   expect(await variants(['team-doit:chat:m1', 'team-act:chat:m1:1', 'team-act:chat:m1:2'])).toEqual(['primary', 'secondary', 'secondary'])
   await ui.press({ key: 'team-act:chat:m1:1' })
   expect(fills).toEqual(['mother now do S2'])                                        // the Now panel's runner: filled, never submitted
-  expect(await hasText(ui, /^Act 2: task 2$/)).toBe(true)                            // the pressed card opened: what each button does, dim
+  expect(await hasText(ui, /^Act 2: task 2 · fills: mother now do S2$/)).toBe(true)                            // the pressed card opened: what each button does, dim
   await ui.press({ key: 'tab:today' })
   expect(rowKeys(await ui.find({ key: 'title-acts:sug:todo:s1' }))).toEqual(['sug-doit:todo:s1', 'sug-act:todo:s1:1', 'sug-done:todo:s1'])
   expect(rowKeys(await ui.find({ key: 'title-acts:today:ticket:o1' }))).toEqual(['today-act:ticket:o1:0', 'today-act:ticket:o1:1', 'today-open:ticket:o1'])
@@ -2407,4 +2415,524 @@ test('test_an_action_on_an_item_with_a_live_case_goes_to_that_session', async ($
   expect(sends.length).toBe(2)
   expect(briefs()).toEqual([caseBrief(owned, RICH.actions[1].prompt)])
   await ui.unmount()
+})
+
+// ---- 0. no code comment is ever drawn ----
+const strings = (el: any, out: string[] = []): string[] => {
+  if (typeof el === 'string') out.push(el)
+  else if (Array.isArray(el)) for (const c of el) strings(c, out)
+  else if (el && typeof el === 'object') for (const v of Object.values(el)) strings(v, out)
+  return out
+}
+
+test('test_no_drawn_string_starts_as_a_code_comment', async ($, on) => {
+  const { clock } = await bootTldr($, on, { cli: argv => (argv[0] === 'status'
+    ? { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2, PINNED], inbox: INBOX, inbox_count: 2 })) } : undefined) })
+  for (const surface of SURFACES) {
+    const ui = await shown($, clock, surface)
+    const all = strings(await ui.drawn())
+    expect(all.some(t => t.includes('Review due'))).toBe(true)                           // the walk reaches the cards' strings
+    expect(all.filter(t => /^\s*(\/\/|\/\*)/.test(t))).toEqual([])
+    expect((await texts(ui)).filter((t: string) => /^\s*\/\//.test(t))).toEqual([])
+    await ui.unmount()
+  }
+})
+
+const linkText = (l: any) => String(l.text).replace(String(l.props.href), '')   // a Link's shown text carries its href first
+// ---- 1. every card links to where it came from ----
+test('test_links_of_source_first_labelled_by_kind', () => {
+  expect(linksOf('', [], 'chat')).toEqual([])
+  expect(linksOf(null, null, 'tracker')).toEqual([])
+  expect(linksOf('javascript:alert(1)', [{ label: 'x', url: 'file:///etc/passwd' }], 'mail')).toEqual([])
+  expect(linksOf('https://example.com/t', [{ label: 'thread', url: 'https://example.com/t' }, { label: 'PLAT-7', url: 'https://example.com/browse/PLAT-7' }], 'chat'))
+    .toEqual([{ label: 'thread', url: 'https://example.com/t' }, { label: 'PLAT-7', url: 'https://example.com/browse/PLAT-7' }])
+  expect(['chat', 'tracker', 'code', 'mail', 'calendar', 'manual'].map(k => linksOf('https://example.com/x', [], k as any)[0].label))
+    .toEqual(['thread', 'issue', 'PR', 'mail', 'event', 'source'])
+  expect(linksOf('', Array.from({ length: 12 }, (_, n) => ({ label: 'l', url: 'https://example.com/' + n })), 'other').length).toBe(8)
+})
+
+test('test_inbox_card_links_one_when_compact_all_when_open_none_when_there_is_none', async ($, on) => {
+  const thread = 'https://chat.example.com/archives/C0AAAAAAA/p1700000000000100'
+  const inbox = [
+    { id: 'U1', key: 'C0AAAAAAA/1700000000.000100', title: 'Pick an owner', why: 'w', link: thread, at: '2026-11-02T09:59:00Z', session: null,
+      links: [{ label: 'thread', url: thread }, { label: 'PLAT-7', url: 'https://tracker.example.com/browse/PLAT-7' }] },
+    { id: 'U2', key: 'manual:abc', title: 'A note', why: 'w', link: '', links: [], at: '2026-11-02T09:58:00Z', session: null },
+    { id: 'U3', key: 'acme/api#12', title: 'Old shape', why: 'w', link: 'https://example.com/pr/12', at: '2026-11-02T09:57:00Z', session: null },
+  ]
+  await bootLead($, on, { expand: false, over: { inbox, inbox_count: 3 } })
+  await $.command.run({ command: 'chief', args: 'tab inbox' } as any)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const links = async () => (await ui.findAll({ type: 'Link' })).map((l: any) => [linkText(l), l.props.href])
+  expect(await links()).toEqual([['thread ↗', thread], ['PR ↗', 'https://example.com/pr/12']])          // compact: one each, by kind; none for the note
+  await ui.press({ key: 'toggle:inbox:U1' })
+  expect(await links()).toEqual([['thread ↗', thread], ['PLAT-7 ↗', 'https://tracker.example.com/browse/PLAT-7'], ['PR ↗', 'https://example.com/pr/12']])
+  expect(await hasText(ui, /^no source link$/)).toBe(false)
+  await ui.press({ key: 'toggle:inbox:U2' })
+  expect(await hasText(ui, /^no source link$/)).toBe(true)                                              // said once, dim, never a dead link
+  expect((await links()).length).toBe(3)
+  await ui.unmount()
+})
+
+// ---- 2. the ask box ----
+async function bootAsk($: any, on: any, reply: (text: string) => Cli) {
+  const a = { fills: [] as string[], asks: [] as string[] }
+  on('session.surfaces', () => ({ value: ['desktop'] }))
+  on('mcp.call', () => ({ deny: 'not connected' }))
+  on('prompt.fill', (_: any, e: any) => { a.fills.push(e.text); return { isFilled: true } })
+  const booted = await boot($, on, (argv, stdin) => {
+    if (argv[0] !== 'ask') return undefined
+    const text = JSON.parse(String(stdin)).text
+    a.asks.push(text)
+    return reply(text)
+  }, 'desktop', 'sess-1', {}, {}, {}, false)
+  return { ...booted, a }
+}
+const briefsOf = (out: { argv: string[][] }) => out.argv.filter(x => x[0] === 'open').map(x => new URL(x[1]).searchParams.get('q'))
+
+test('test_ask_box_starts_a_case_from_the_managers_words', async ($, on) => {
+  const said = 'Chase the vendor about invoice 12 and tell me what they need from us: https://example.com/inv/12 today'
+  const { out, a } = await bootAsk($, on, () => ({ exitCode: 0, stdout: JSON.stringify({ ok: true, key: 'manual:0123456789', line_id: 'L9', link: 'https://example.com/inv/12', update_id: null, owned_by: null }) }))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'ask-input' }))?.props.placeholder).toBe('Ask Mother…')
+  expect((await ui.find({ key: 'ask-input' }))?.props.submitLabel).toBe('Start')
+  expect(rowKeys(await ui.drawn()).indexOf('ask')).toBeLessThan(rowKeys(await ui.drawn()).indexOf('tabs'))   // under the strip, above the tabs
+  await ui.input({ key: 'ask-input', text: '   ' })
+  expect(await hasText(ui, new RegExp('^' + ASK_EMPTY + '$'))).toBe(true)                    // empty: an inline error, nothing runs
+  expect([a.asks, briefsOf(out)]).toEqual([[], []])
+  await ui.input({ key: 'ask-input', text: said })
+  expect(a.asks).toEqual([said])
+  expect(chiefCalls(out, 'act-log').length).toBe(1)                                          // logged for habits, as verb `ask`
+  const [brief] = briefsOf(out)
+  expect(brief).toBe(caseBrief({ key: 'manual:0123456789', title: clip(said, 60), why: 'the manager asked for it in the Chief pane',
+                                 link: 'https://example.com/inv/12', ask: true }, said))
+  expect(brief).toContain('\nKey: manual:0123456789\nSource: https://example.com/inv/12\n')
+  expect(brief).toContain(`Use the mother:cos skill for how to act. ${said}\nWhen this is finished, run: mother chief close-case manual:0123456789`)
+  expect(parseCase(brief)).toEqual({ key: 'manual:0123456789', title: clip(said, 60), link: 'https://example.com/inv/12' })   // so its first prompt claims the key
+  expect(await hasText(ui, new RegExp('^' + ASK_EMPTY + '$'))).toBe(false)
+  expect((await ui.find({ key: 'ask-input' }))?.props.value).toBeUndefined()               // the draft is cleared once it started
+  await ui.unmount()
+})
+
+test('test_ask_box_never_opens_a_second_case_and_keeps_the_draft_on_a_failure', async ($, on) => {
+  let mode: 'owned' | 'fail' = 'owned'
+  const { out, a } = await bootAsk($, on, () => (mode === 'fail' ? { exitCode: 1, stderr: 'mother chief ask: the inbox is locked\n' }
+    : { exitCode: 0, stdout: JSON.stringify({ ok: true, key: 'PLAT-7', line_id: 'L1', link: '', update_id: null, owned_by: CLI_B }) }))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.input({ key: 'ask-input', text: 'what about PLAT-7?' })
+  expect([a.asks.length, briefsOf(out), a.fills]).toEqual([1, [], []])                       // the hub routes the note to the case that holds the key
+  expect(out.toasts).toContain('That is already a case: your note goes to its session')
+  mode = 'fail'
+  await ui.input({ key: 'ask-input', text: 'try again' })
+  expect(out.toasts).toContain('mother chief ask: the inbox is locked')
+  expect(briefsOf(out)).toEqual([])
+  expect((await ui.find({ key: 'ask-input' }))?.props.value).toBe('try again')
+  await ui.unmount()
+})
+
+// ---- 3. Today, Suggested and dots cards carry their context ----
+const DOTS_ACT = { id: 'S1', label: 'Run dots action A23', prompt: 'mother now do S1', task: 'dots do A23' }
+const DOTS_DETAIL = { id: 'A23', text: '- A23 Annotate 7 todos — because none moved in 14 days\n   - adds `stale since` to each line', date: '2026-11-01',
+  source_file: 'journal/dots/2026-11-01.md', label: 'Annotate 7 todos' }
+
+test('test_dots_id_and_the_decision_label', () => {
+  expect(dotsId({ title: 'x', actions: [DOTS_ACT] })).toBe('A23')
+  expect(dotsId({ title: 'Dots m4: decide the cutoff', actions: [] })).toBe('M4')
+  expect(dotsId({ title: 'Connect the dots', actions: [{ label: 'Review it', prompt: 'mother now do S2', task: 'review the PR' }] })).toBeNull()
+  expect(dotsId(null)).toBeNull()
+  expect(decisionLabel(DOTS_ACT, 0, DOTS_DETAIL, 40)).toBe('Annotate 7 todos')
+  expect(decisionLabel(DOTS_ACT, 1, DOTS_DETAIL, 24)).toBe('Run dots action A23')            // only the primary button
+  expect(decisionLabel(DOTS_ACT, 0, { ...DOTS_DETAIL, label: null }, 40)).toBe('Run dots action A23')
+  expect(decisionLabel({ label: 'Review it' }, 0, DOTS_DETAIL, 40)).toBe('Review it')       // not a yes/no decision
+  expect(decisionLabel(DOTS_ACT, 0, undefined, 40)).toBe('Run dots action A23')
+})
+
+test('test_expanded_suggested_card_shows_everything_and_loads_the_dots_detail_on_expand', async ($, on) => {
+  const calls: string[][] = []
+  const items = [
+    NOW_ITEM('todo:s1', 'suggestion', 'Dots A23: annotate stale todo and intake lines (no closes)', {
+      signal: 'suggestion_waiting', from: 'U0DDDDDDD', also: ['PLAT-7'], similar: { words: ['alert', 'digest'], channel: 'C0AAAAAAA' },
+      links: [{ label: 'dots file', url: 'https://example.com/dots' }], actions: [DOTS_ACT] }),
+    NOW_ITEM('todo:s2', 'suggestion', 'Dots A99: something gone', { link: '', actions: [{ ...DOTS_ACT, id: 'S2', label: 'Run dots action A99', prompt: 'mother now do S2', task: 'dots do A99' }] }),
+    NOW_ITEM('ticket:o1', 'on_you', 'On me', { actions: [{ id: 'S3', label: 'Review it', prompt: 'mother now do S3', task: 'review the release PR and say what blocks it' }] })]
+  on('prompt.fill', () => ({ isFilled: true }))
+  await boot($, on, argv => {
+    if (argv[0] !== 'dots-detail') return undefined
+    calls.push(argv)
+    return { exitCode: 0, stdout: argv[1] === 'A23' ? JSON.stringify(DOTS_DETAIL) : 'null\n' }
+  }, 'desktop', 'sess-1', nowFile(NOW_DOC({ top: [], items })), {}, {}, false)
+  await $.command.run({ command: 'chief', args: 'tab today' } as any)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const links = async () => (await ui.findAll({ type: 'Link' })).map(linkText)
+  expect(calls).toEqual([])                                                                  // a draw loads nothing
+  expect((await ui.find({ key: 'sug-doit:todo:s1' }))?.text).toBe('Run dots action A23')
+  expect(await links()).toEqual(['source ↗', 'issue ↗'])                                     // compact: one link each; none where there is none
+  await ui.press({ key: 'toggle:sug:todo:s1' })
+  expect(calls).toEqual([['dots-detail', 'A23', '--json']])
+  const shownTexts = await texts(ui)
+  expect(shownTexts).toContain('What this does')
+  expect(shownTexts).toContain('- A23 Annotate 7 todos — because none moved in 14 days')
+  expect(shownTexts).toContain('A23 · journal/dots/2026-11-01.md · 2026-11-01')
+  expect(shownTexts).toContain('signal suggestion_waiting · from U0DDDDDDD · team PLAT · raised 3h ago · first seen 3h ago')
+  expect(shownTexts).toContain('also: PLAT-7')
+  expect(shownTexts).toContain('similar: alert, digest in C0AAAAAAA')
+  expect(shownTexts).toContain('why todo:s1')                                                // the why, in full
+  expect(shownTexts).toContain('Annotate 7 todos: dots do A23 · fills: mother now do S1')    // under the buttons: the whole instruction, dim
+  expect((await ui.find({ key: 'sug-doit:todo:s1' }))?.text).toBe('Annotate 7 todos')        // the decision says what a yes does
+  expect((await links()).slice(0, 2)).toEqual(['source ↗', 'dots file ↗'])                   // expanded: every labelled link
+  await ui.press({ key: 'toggle:sug:todo:s1' })
+  await ui.press({ key: 'toggle:sug:todo:s1' })
+  expect(calls.length).toBe(1)                                                               // loaded once
+  await ui.press({ key: 'toggle:sug:todo:s2' })
+  expect(calls[1]).toEqual(['dots-detail', 'A99', '--json'])
+  expect(await texts(ui)).toContain('What this does: no dots output on disk has A99')
+  expect(await texts(ui)).toContain('no source link')
+  expect((await ui.find({ key: 'sug-doit:todo:s2' }))?.text).toBe('Run dots action A99')
+  await ui.press({ key: 'toggle:today:ticket:o1' })                                          // an On you card: the same detail, no dots call
+  expect(await texts(ui)).toContain('Review it: review the release PR and say what blocks it · fills: mother now do S3')
+  expect(calls.length).toBe(2)
+  await ui.unmount()
+})
+
+// ---- 5. session refresh: one merged card per session that moved ----
+const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
+const CARD = { state: 'waiting_manager', tldr: 'Reply drafted.', progress: 'Drafted the reply to Dana.', asks: true, question: 'Send it?',
+  options: [{ label: 'Send it', message: 'Yes, send it' }], waiting_on: 'the manager', chips: [] }
+const PREV = { tldr: 'Reading the thread.', chips: [], state: 'working', progress: '', asks: false, question: '', options: [], waiting_on: null,
+  prev_state: null, at: iso(NOW - 120_000), fingerprint: 't:9:0' }
+const moved = (over: Record<string, unknown> = {}) => ({ ...TAIL_2, fingerprint: 't:20:2', running: false, idle_for: 600, last_from: 'assistant', stuck: false, prev: PREV, ...over })
+const tailOf = (sessions: unknown[], minutes = 5) => () => ({ version: 1, model: 'sonnet', refresh_minutes: minutes, sessions })
+const HIDDEN = { shown: () => false, reply: () => answered(JSON.stringify(CARD)) }
+
+test('test_refresh_a_changed_session_gets_one_call_with_the_previous_card', async ($, on) => {
+  const { clock, t } = await bootTldr($, on, { reply: () => answered(JSON.stringify(CARD)), tail: tailOf([moved()]) })
+  const ui = await shown($, clock)
+  expect(t.asks.length).toBe(1)
+  const sent = JSON.parse(t.asks[0].prompt.split('\n')[1])
+  expect(sent.previous).toEqual({ tldr: 'Reading the thread.', state: 'working' })          // so `progress` is a real delta
+  expect(sent.now).toEqual({ running: false, last_message_from: 'assistant' })
+  expect(JSON.parse(t.stdins[0])).toEqual([{ id: CLI_2, fingerprint: 't:20:2', model: 'sonnet', ...CARD }])
+  await clock.advance(60_000)
+  expect(t.asks.length).toBe(1)                                                              // the fingerprint has not moved: no second call
+  const all = await texts(ui)
+  expect(all).toContain(' waiting on you ')
+  expect(all).toContain('Since the last card: Drafted the reply to Dana.')
+  expect(all.some((x: string) => /^updated (now|\dm ago)$/.test(x))).toBe(true)
+  expect((await ui.find({ key: 'refresh:' + CLI_2 }))?.text).toBe('Refresh')
+  await ui.unmount()
+})
+
+test('test_refresh_shows_the_card_the_cli_stored_where_the_waiting_on_line_wins', async ($, on) => {
+  const stored = { ...CARD, state: 'waiting_other', waiting_on: 'Dana', asks: false, question: '', options: [], prev_state: 'working', at: iso(NOW) }
+  const { clock, t } = await bootTldr($, on, { reply: () => answered(JSON.stringify(CARD)), tail: tailOf([moved()]),
+    cli: (argv, stdin) => (argv[0] === 'tldr' ? { exitCode: 0, stdout: JSON.stringify({ stored: 1, cards: { [CLI_2]: stored } }) } : undefined) })
+  const ui = await shown($, clock)
+  expect(t.asks.length).toBe(1)
+  expect(await texts(ui)).toContain(' waiting on Dana ')                                     // the transcript's `Waiting on:` line, not the model's word
+  expect(await texts(ui)).not.toContain(' waiting on you ')
+  await ui.unmount()
+})
+
+test('test_refresh_a_failed_call_keeps_the_previous_card', async ($, on) => {
+  const { clock, t } = await bootTldr($, on, { reply: () => failed, tail: tailOf([moved()]) })
+  const ui = await shown($, clock)
+  expect(t.asks.length).toBe(1)
+  expect(await texts(ui)).toContain('Reading the thread.')
+  expect((await texts(ui)).some((x: string) => / · it moved since$/.test(x))).toBe(true)
+  await ui.unmount()
+})
+
+test('test_the_leading_session_refreshes_with_no_pane_shown_once_per_interval', async ($, on) => {
+  const { clock, t } = await bootTldr($, on, { ...HIDDEN, tail: tailOf([moved()]) })       // its card is 2 minutes old; refresh_minutes 5
+  await clock.advance(60_000)
+  await clock.advance(60_000)
+  expect(t.asks.length).toBe(0)
+  await clock.advance(60_000)                                                                // 5 minutes after its last card
+  expect(t.asks.length).toBe(1)
+  expect(JSON.parse(t.stdins[0])[0].state).toBe('waiting_manager')
+})
+
+test('test_a_session_with_no_card_yet_is_refreshed_at_once_by_the_leader', async ($, on) => {
+  const { clock, t } = await bootTldr($, on, { ...HIDDEN, tail: tailOf([moved({ prev: undefined, kind: 'case' })]) })   // a case session, asleep or not
+  await clock.advance(60_000)
+  expect(t.asks.length).toBe(1)
+})
+
+test('test_a_running_session_is_refreshed_at_most_every_two_intervals', async ($, on) => {
+  let n = 0
+  const { clock, t } = await bootTldr($, on, { reply: () => answered(JSON.stringify({ ...CARD, state: 'working', asks: false })),
+    tail: () => tailOf([moved({ running: true, fingerprint: 't:20:' + ++n })])() })          // it moves on every read
+  const ui = await shown($, clock)                                                            // the pane is shown: only the running bound holds it
+  for (let i = 0; i < 6; i++) await clock.advance(60_000)
+  expect(t.asks.length).toBe(0)                                                              // its card is under 10 minutes old
+  await clock.advance(60_000)
+  await clock.advance(60_000)
+  expect(t.asks.length).toBe(1)
+  for (let i = 0; i < 5; i++) await clock.advance(60_000)
+  expect(t.asks.length).toBe(1)
+  expect(await texts(ui)).toContain(' working ')                                             // `working` from code, card or no card
+  await ui.unmount()
+})
+
+test('test_manual_refresh_bypasses_the_interval_but_not_the_per_minute_cap', async ($, on) => {
+  const many = Array.from({ length: 8 }, (_, i) => moved({ id: `4444444${i}-4444-4444-8444-444444444444`, prev: { ...PREV, at: iso(NOW) } }))
+  const { clock, t } = await bootTldr($, on, { ...HIDDEN, tail: tailOf(many, 60) })
+  await clock.advance(60_000)
+  await clock.advance(60_000)
+  expect(t.asks.length).toBe(0)                                                              // inside the interval, no pane: nothing
+  const said = await $.command.run({ command: 'chief', args: 'refresh' } as any)
+  expect(t.asks.length).toBe(6)
+  expect((said as any).text).toBe('Chief pane: Refreshed 6 of 8 session cards; the rest wait for the per-minute cap.')
+  await $.command.run({ command: 'chief', args: 'refresh' } as any)
+  expect(t.asks.length).toBe(6)                                                              // the cap of 6 a minute stands
+  await clock.advance(60_000)
+  await $.command.run({ command: 'chief', args: 'refresh' } as any)
+  expect(t.asks.length).toBe(8)
+})
+
+test('test_refresh_button_asks_for_that_session_only', async ($, on) => {
+  const other = moved({ id: CLI_A, prev: { ...PREV, at: iso(NOW) }, running: true })
+  const { clock, t } = await bootTldr($, on, { reply: () => answered(JSON.stringify(CARD)), tail: tailOf([moved({ prev: { ...PREV, at: iso(NOW) }, running: true }), other]) })
+  const ui = await shown($, clock)
+  expect(t.asks.length).toBe(0)                                                              // both run, and their cards are fresh
+  await ui.press({ key: 'refresh:' + CLI_2 })
+  expect(t.asks.map((e: any) => JSON.parse(e.prompt.split('\n')[1]).title)).toEqual(['Review the docs'])
+  await ui.unmount()
+})
+
+test('test_an_asleep_sessions_ask_reaches_needs_you', async ($, on) => {
+  let stored = false
+  const { clock, t } = await bootTldr($, on, { reply: () => answered(JSON.stringify(CARD)), tail: tailOf([moved()]), cli: (argv) => {
+    if (argv[0] === 'tldr') { stored = true; return undefined }
+    if (argv[0] === 'floor' && argv[1] === 'list') return { exitCode: 0, stdout: JSON.stringify({ version: 1, cards: stored
+      ? [{ session_id: CLI_2, asks: true, question: 'Send it?', options: CARD.options, waiting_on: 'the manager', at: iso(NOW) }] : [] }) }
+    return undefined
+  } })
+  const ui = await shown($, clock)
+  expect(t.asks.length).toBe(1)
+  expect((await ui.find({ key: `need:${CLI_2}:0` }))?.text).toBe('Send it')                  // the floor is re-read right after the store
+  expect(await texts(ui)).toContain('Send it?')
+  await ui.unmount()
+})
+
+test('test_card_state_rules', () => {
+  const t = (over: Record<string, unknown>) => ({ tldr: 'x', chips: [], state: 'idle', ...over }) as any
+  expect(cardState(null, true)).toBeNull()
+  expect(cardState({ tldr: 'x', chips: [] }, true)).toBeNull()                               // an older TL;DR: the older pill
+  expect(cardState(t({ state: 'done', stuck: true, running: true }), true)).toBe('stuck')
+  expect(cardState(t({ state: 'done', running: true }), true)).toBe('working')
+  expect(cardState(t({ state: 'waiting_other' }), true)).toBe('waiting_manager')
+  expect(cardState(t({ state: 'waiting_other' }), false)).toBe('waiting_other')
+  expect(cardState(t({ state: 'working' }), false)).toBe('idle')                             // it said working and no longer runs
+  expect(cleanTldr({ tldr: 'x', chips: [], state: 'bogus', asks: true, question: '', options: 'no', progress: 'a\nb', waiting_on: 7 }))
+    .toEqual({ tldr: 'x', chips: [], state: 'idle', progress: 'a b', asks: false, question: '', options: [], waiting_on: null })
+})
+
+const SIX = ['done', 'idle', 'waiting_other', 'working', 'stuck', 'waiting_manager'].map((state, i) => ({
+  d: { ...PINNED, session_id: 'local_' + i, cli_session_id: `5555555${i}-5555-4555-8555-555555555555`, title: 'S ' + state, last_activity_at: iso(NOW - 3_600_000) },
+  row: { id: `5555555${i}-5555-4555-8555-555555555555`, kind: 'pinned', fingerprint: 't:1:' + i, text: 'assistant: x', running: state === 'working', stuck: state === 'stuck',
+         cached: { tldr: 'T ' + state, chips: [], state: state === 'stuck' ? 'working' : state, progress: '', asks: false, question: '', options: [],
+                   waiting_on: state === 'waiting_other' ? 'Dana' : null } } }))
+
+test('test_session_cards_wear_their_state_and_sort_by_it', async ($, on) => {
+  const { clock } = await bootTldr($, on, { tail: tailOf(SIX.map(x => x.row)), cli: argv => (argv[0] === 'status'
+    ? { exitCode: 0, stdout: JSON.stringify(status({ desktop: SIX.map(x => x.d) })) } : undefined) })
+  const ui = await shown($, clock)
+  const keys = (await ui.findAll({ type: 'Box' })).map((b: any) => String(b.key)).filter((k: string) => k.startsWith('card:sess:'))
+  const order = keys.map((k: string) => SIX.find(x => k.endsWith(x.d.cli_session_id))!.d.title)
+  expect(order).toEqual(['S waiting_manager', 'S stuck', 'S working', 'S waiting_other', 'S idle', 'S done'])
+  const pill = async (text: string) => { const f = await ui.find({ type: 'Text', text }); return f && (f.props.backgroundColor ?? (f.props.dimColor ? 'dim' : 'plain')) }
+  expect(await Promise.all([' waiting on you ', ' stuck ', ' working ', ' waiting on Dana ', 'idle 1h', ' done '].map(pill)))
+    .toEqual(['warning', 'error', 'claude', 'subtle', 'dim', 'success'])
+  await ui.unmount()
+})
+
+test('test_a_done_case_offers_close_case_and_a_state_change_marks_the_sessions_tab', async ($, on) => {
+  let state = 'working'
+  const closes: string[][] = []
+  const row = () => ({ id: CLI_2, kind: 'pinned', fingerprint: 't:1:' + state, text: 'assistant: x', running: state === 'working', stuck: false,
+    cached: { tldr: 'T', chips: [], state, progress: '', asks: false, question: '', options: [], waiting_on: null } })
+  const { clock, out } = await bootTldr($, on, { expand: false, tail: () => tailOf([row()])(), cli: argv => {
+    if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2], cases: [{ ...CASE, cli_session_id: CLI_2 }] })) }
+    if (argv[0] === 'close-case') { closes.push(argv); return { exitCode: 0, stdout: '{"ok": true}' } }
+    return undefined
+  } })
+  const ui = await shown($, clock)
+  await ui.press({ key: 'tab:sessions' })                                                    // seen while it works
+  expect((await ui.findAll({ type: 'Link' })).map((l: any) => [linkText(l), l.props.href])).toEqual([['issue ↗', 'https://example.com/9']])   // a case card links to its source
+  await ui.press({ key: 'tab:inbox' })
+  expect((await ui.find({ key: 'tab:sessions' }))?.text).toBe('Sessions 1')
+  state = 'done'
+  await clock.advance(60_000)
+  expect((await ui.find({ key: 'tab:sessions' }))?.text).toBe('Sessions 1 •')                // its state changed since the tab was last open
+  await ui.press({ key: 'tab:sessions' })
+  expect(await ui.find({ key: 'close-case:' + CLI_2 })).toBeUndefined()                      // compact
+  await ui.press({ key: 'toggle:sess:' + CLI_2 })
+  expect(await texts(ui)).toContain('Done: close the case, then this session can be archived')
+  await ui.press({ key: 'close-case:' + CLI_2 })
+  expect(closes).toEqual([['close-case', 'PLAT-9']])
+  expect(chiefCalls(out, 'act-log').length).toBe(1)                                          // Close case is logged; Refresh and expand are not
+  expect(out.toasts).toContain('Case closed: the session can be archived')
+  await ui.unmount()
+})
+
+test('test_session_order_with_states', () => {
+  const rows = ['a', 'b', 'c'].map(id => ({ ...PINNED, cli_session_id: id, last_activity_at: iso(NOW - 3_600_000) }))
+  expect(sessionOrder(rows as any, new Set(), NOW, { a: 'done', b: 'idle', c: 'stuck' }).map(r => r.cli_session_id)).toEqual(['c', 'b', 'a'])
+  expect(sessionOrder(rows as any, new Set(['b']), NOW, { a: 'working' }).map(r => r.cli_session_id)).toEqual(['b', 'a', 'c'])   // no card: the older rule
+})
+
+// ---- habits: the actions log, habits in the triage prompt, Quieted on Health, /chief habits (hooks/habits.ts) ----
+const HABIT_INBOX = [
+  { id: 'U1', key: 'PLAT-8', title: 'Build broke', why: 'a long body nobody logs', link: 'https://example.com/8', at: '2026-11-02T09:50:00Z', session: null,
+    who: 'Sam', kind: 'act', on: 'team', urgency: 'today', habit_note: 'usually ignored‮, but it names a deadline',
+    actions: [{ label: 'Open ticket', prompt: 'Open the ticket' }, { label: 'Draft reply', prompt: 'Draft a reply; don\'t send' }] },
+  { id: 'U2', key: 'C0123ABC/1699999999.000100', title: 'A thread', why: '', link: '', at: '2026-11-02T09:55:00Z', session: null, who: 'Lee' },
+]
+const ROW_KEYS = ['action_index', 'action_label', 'item_id', 'key', 'kind', 'on', 'source', 'title', 'urgency', 'verb', 'who']
+
+test('test_inbox_handlers_log_each_action_and_a_failed_log_is_silent', async ($, on) => {
+  const { out } = await bootLead($, on, { over: { inbox: HABIT_INBOX, inbox_count: 2 } })
+  const hub = () => out.argv.filter(a => a[2] === 'hub').map(a => a.slice(3))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /^habit: usually ignored, but it names a deadline$/)).toBe(true)   // the verdict's habit_note, cleaned, on the open card
+  expect(out.acts).toEqual([])                                                       // drawing logs nothing
+  await ui.press({ key: 'inbox-act:U1:1' })
+  expect(out.acts).toEqual([{ item_id: 'U1', key: 'PLAT-8', who: 'Sam', kind: 'act', urgency: 'today', on: 'team', title: 'Build broke',
+                              action_label: 'Draft reply', action_index: 1, verb: 'action' }])   // which button, and that it was not the first
+  await ui.press({ key: 'inbox-open:U1' })
+  await ui.press({ key: 'inbox-follow:U1' })
+  await ui.press({ key: 'inbox-snooze:U1' })
+  expect(out.acts.length).toBe(3)                                                    // opening a picker is not an action
+  await ui.select({ key: 'inbox-snooze-pick:U1', value: 'tomorrow' })
+  await ui.press({ key: 'inbox-ignore:U2' })
+  await ui.select({ key: 'inbox-ignore-pick:U2', value: 'channel' })
+  for (const fate of ['fail', 'throw'] as const) {                                   // a log that fails never blocks the verb and never toasts
+    actLogFate = fate
+    const toasts = out.toasts.length
+    await ui.press({ key: 'inbox-done:U1' })
+    expect(hub().at(-1)).toEqual(['done', 'U1'])
+    expect(out.toasts.length).toBe(toasts)
+  }
+  actLogFate = 'ok'
+  expect(out.acts.map(a => [a.verb, a.item_id, a.action_index ?? null])).toEqual([
+    ['action', 'U1', 1], ['open_case', 'U1', null], ['follow', 'U1', null], ['snooze', 'U1', null], ['ignore', 'U2', null],
+    ['done', 'U1', null], ['done', 'U1', null]])                                     // Ignore's own `hub done` is not a second action
+  for (const a of out.acts) expect(Object.keys(a).filter(k => !ROW_KEYS.includes(k))).toEqual([])   // never a why, a link or a summary
+  expect(chiefCalls(out, 'act-log').every(a => a.slice(4).join(' ') === '--stdin')).toBe(true)
+  await ui.unmount()
+})
+
+test('test_needs_today_team_and_health_handlers_log_their_verbs', async ($, on) => {
+  on('prompt.fill', () => ({ isFilled: true }))
+  const items = [NOW_ITEM('pr:1', 'on_you', 'Review the release PR', { actions: [{ id: 'S1', label: 'Review it', prompt: 'mother now do S1', task: 'x' }] }),
+                 NOW_ITEM('chat:2', 'on_you', 'Answer the design question'), NOW_ITEM('ticket:3', 'neglected', 'A neglected ticket')]
+  const report = { name: 'brief-unsent-2026-11-02.md', routine: 'brief', date: '2026-11-02', bytes: 2048 }
+  const { out } = await bootHealth($, on, () => HEALTH({ undelivered: [report] }), { doc: NOW_DOC({ items }) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab:all' })
+  await ui.press({ key: 'today-doit:1' })
+  await ui.press({ key: 'today-ask:top:1' })
+  await ui.press({ key: 'today-done:top:1' })
+  await ui.press({ key: 'toggle:today:chat:2' })
+  await ui.press({ key: 'today-ask:chat:2' })
+  await ui.press({ key: 'today-done:chat:2' })
+  await ui.press({ key: 'team-done:ticket:3' })
+  await ui.press({ key: 'team-ask:ticket:3' })
+  await ui.press({ key: 'team-snooze:ticket:3' })
+  await ui.select({ key: 'team-snooze-pick:ticket:3', value: '1h' })
+  await ui.press({ key: 'team-ignore:ticket:3' })
+  await ui.select({ key: 'team-ignore-pick:ticket:3', value: 'item' })
+  await ui.press({ key: 'toggle:health:report:brief-unsent-2026-11-02.md' })
+  await ui.press({ key: 'health-dismiss:brief-unsent-2026-11-02.md' })
+  expect(out.acts.map(a => [a.verb, a.item_id, a.source, a.title])).toEqual([
+    ['action', 'pr:1', 'code', 'Ship the release'], ['ask', 'pr:1', 'code', 'Ship the release'], ['done', 'pr:1', 'code', 'Ship the release'],
+    ['ask', 'chat:2', 'chat', 'Answer the design question'], ['done', 'chat:2', 'chat', 'Answer the design question'],
+    ['done', 'ticket:3', 'tracker', 'A neglected ticket'], ['ask', 'ticket:3', 'tracker', 'A neglected ticket'],
+    ['snooze', 'ticket:3', 'tracker', 'A neglected ticket'], ['ignore', 'ticket:3', 'tracker', 'A neglected ticket'],
+    ['dismiss', 'brief-unsent-2026-11-02.md', 'report', 'brief']])
+  expect([out.acts[0].action_label, out.acts[0].action_index]).toEqual(['Review it', 0])   // the recommended one
+  await ui.unmount()
+})
+
+test('test_a_needs_you_answer_is_logged', async ($, on) => {
+  const { clock, out } = await bootFloor($, on, { cards: () => [asking()] })
+  const ui = await shown($, clock)
+  await ui.press({ key: `need:${CLI_A}:1` })
+  expect(out.acts).toEqual([{ item_id: 'sess:' + CLI_A, source: 'session', title: 'Fix the login bug', action_label: 'Wait', action_index: 1, verb: 'answer' }])
+  await ui.unmount()
+})
+
+test('test_triage_prompt_carries_only_the_lines_own_habits_and_the_note_reaches_decide', async ($, on) => {
+  const mine = { this_channel: { shown: 9, engaged: 1, ignored: 6, closed_unread: 1, snoozed: 4, text: 'a body' }, this_person: { shown: 3, engaged: 0, ignored: -1 },
+                 that_channel: { shown: 50 }, prefers: { act: 'Draft reply', decide: 7, bogus: 'x' }, summary: 'a body' }
+  const want = { this_channel: { shown: 9, engaged: 1, ignored: 6, closed_unread: 1 }, this_person: { shown: 3, engaged: 0 }, prefers: { act: 'Draft reply' } }
+  expect(promptHabits(mine)).toEqual(want)                                           // known buckets, counts only
+  expect([promptHabits(null), promptHabits({}), promptHabits({ this_channel: {} }), promptHabits('x')]).toEqual([null, null, null, null])
+  expect(TRIAGE_SYSTEM).toContain('never a reason to hide something addressed to the manager, a decision only they can make, or anything urgent')
+  expect(TRIAGE_SYSTEM).toContain('"habit_note"')
+  const noted = JSON.stringify({ is_work: true, needs_attention: true, title: 'Build failed', tldr: 'CI is red', kind: 'act', on: 'team', urgency: 'today',
+                                 actions: [], habit_note: 'n'.repeat(120) })
+  const lines = [{ ...LINES[0], habits: mine }, { ...LINES[1], habits: null }]
+  const { t } = await bootTriage($, on, id => answered(id === 'L1' ? noted : WORK), noVerdict, lines)
+  const sent = (id: string) => JSON.parse(t.asks.find(a => a.prompt.includes(`"id":"${id}"`)).prompt.split('\n')[1])
+  expect(sent('L1').habits).toEqual(want)
+  expect('habits' in sent('L2')).toBe(false)                                         // a line with none carries none, never another line's
+  expect(Object.keys(sent('L1').line).includes('habits')).toBe(false)
+  const { verdicts } = JSON.parse(t.stdins[0])
+  expect(verdicts.map((v: any) => [v.line_id, v.habit_note?.length])).toEqual([['L1', 80], ['L2', undefined]])
+  expect(parseVerdict(JSON.stringify({ is_work: true, needs_attention: true, title: 't', tldr: 'd', habit_note: 5 }))).toEqual({ is_work: true, needs_attention: true, title: 't', tldr: 'd' })
+})
+
+const QUIETED = { count_7d: 12, recent: [
+  { id: 'L7', key: 'C0123ABC/1699999999.000100', title: 'Standup notes', label: '#platform', bucket: 'chat|label|C0123ABC', at: '2026-11-02T09:58:00Z', why: 'habit: chat #platform ignored 5 of 6' },
+  { id: 'L6', key: 'C0123ABC/1699999998.000100', title: 'Lunch‮ plans', label: '#platform', bucket: 'chat|label|C0123ABC', at: '2026-11-02T09:00:00Z', why: 'habit: chat #platform ignored 5 of 6' },
+  { id: 'L5', key: 'mail:abc', title: 'Newsletter', label: 'mail thread', bucket: 'mail|who|Sam', at: '2026-11-01T09:00:00Z', why: 'habit: mail Sam ignored 4 of 5' },
+  { title: 'no id' }] }
+
+test('test_health_draws_quieted_with_show_and_stop_quieting', async ($, on) => {
+  let quieted: unknown = QUIETED
+  const { out } = await bootHealth($, on, () => HEALTH(), { over: new Proxy({}, { ownKeys: () => ['quieted', 'habits'],
+    getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }), get: (_, k) => (k === 'quieted' ? quieted : k === 'habits' ? { on: true } : undefined) }) })
+  expect(quietedOf({ quieted: QUIETED }).recent.map(r => r.id)).toEqual(['L7', 'L6', 'L5'])
+  expect(quietedOf(null)).toEqual({ count: 0, recent: [], on: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await tabText(ui, 'health')).toBe('Health')                                  // quieting is not a problem: no red dot
+  await ui.press({ key: 'tab:health' })
+  const all = await texts(ui)
+  expect(all.some((t: string) => /^Quieted by habit 12$/.test(t.replace(/\s+/g, ' ')))).toBe(true)
+  expect(all).toContain('Standup notes')
+  expect(all).toContain('Lunch plans')                                               // cleaned
+  expect(all).toContain('#platform · 2m')
+  expect(all).toContain('habit: mail Sam ignored 4 of 5')
+  expect(await buttonKeys(ui, 'quieted-show:')).toEqual(['quieted-show:L7', 'quieted-show:L6', 'quieted-show:L5'])
+  expect(await buttonKeys(ui, 'quieted-stop:')).toEqual(['quieted-stop:chat|label|C0123ABC', 'quieted-stop:mail|who|Sam'])   // once per bucket
+  expect((await ui.find({ key: 'quieted-stop:mail|who|Sam' }))?.text).toBe('Stop quieting this')
+  const statusReads = chiefCalls(out, 'status').length
+  quieted = { count_7d: 11, recent: QUIETED.recent.slice(1) }
+  await ui.press({ key: 'quieted-show:L7' })
+  expect(chiefCalls(out, 'habits').map(a => a.slice(4))).toEqual([['show', 'L7']])
+  expect(chiefCalls(out, 'status').length).toBe(statusReads + 1)                     // the status is read again: the row is gone, the Inbox has it
+  expect(await ui.find({ key: 'quieted-show:L7' })).toBeUndefined()
+  await ui.press({ key: 'quieted-stop:mail|who|Sam' })
+  expect(chiefCalls(out, 'habits').map(a => a.slice(4))[1]).toEqual(['except', 'mail|who|Sam'])
+  quieted = { count_7d: 0, recent: [] }
+  await ui.press({ key: 'quieted-show:L6' })
+  expect((await texts(ui)).some((t: string) => /Quieted by habit/.test(t))).toBe(false)   // nothing quieted: nothing drawn
+  await ui.unmount()
+})
+
+test('test_chief_habits_command_runs_the_switch', async ($, on) => {
+  let isOn = true
+  const { out } = await boot($, on, argv => {
+    if (argv[0] !== 'habits') return undefined
+    if (argv[1] === 'on' || argv[1] === 'off') isOn = argv[1] === 'on'
+    return { exitCode: 0, stdout: `habits ${isOn ? 'on' : 'off'}: 3 quieted in 7 days\n` }
+  })
+  const run = async (args: string) => ((await $.command.run({ command: 'chief', args } as any)) as any).text
+  expect(await run('habits')).toBe('habits on: 3 quieted in 7 days')
+  expect(await run('habits off')).toBe('habits off: 3 quieted in 7 days')
+  expect(await run('habits status')).toBe('habits off: 3 quieted in 7 days')
+  expect(await run('habits on')).toBe('habits on: 3 quieted in 7 days')
+  expect(chiefCalls(out, 'habits').map(a => a.slice(4))).toEqual([['status'], ['off'], ['status'], ['on']])
+  expect(await run('habits maybe')).toMatch(/^Usage: \/chief /)
 })

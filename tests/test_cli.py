@@ -371,7 +371,7 @@ class CliTest(unittest.TestCase):
         cfg = self.write_config()
         cfg["chief"] = {"max_workers": 2, "run_minutes": 15, "daily_budget_usd": 8, "chief_model": "sonnet", "worker_model": "",
                         "tick_seconds": 30, "tldr_model": "opus", "triage_model": "sonnet", "batch_minutes": 30,
-                        "decision_hours": 48.5}
+                        "decision_hours": 48.5, "refresh_minutes": 10}
         (self.ws / "config.json").write_text(json.dumps(cfg))
         r = run(["status"], self.env)
         self.assertEqual(r.returncode, 0, r.stdout)
@@ -392,7 +392,9 @@ class CliTest(unittest.TestCase):
         for chief_block, frag in (("x", "chief must be an object"), ({"bogus": 1}, "unknown key chief.bogus"),
                                   ({"daily_budget_usd": -1}, "chief.daily_budget_usd"),
                                   ({"daily_budget_usd": True}, "chief.daily_budget_usd"),
-                                  ({"tldr_model": "gpt"}, "chief.tldr_model"), ({"triage_model": "gpt"}, "chief.triage_model")):
+                                  ({"tldr_model": "gpt"}, "chief.tldr_model"), ({"triage_model": "gpt"}, "chief.triage_model"),
+                                  ({"refresh_minutes": 0}, "chief.refresh_minutes"), ({"refresh_minutes": 61}, "chief.refresh_minutes"),
+                                  ({"refresh_minutes": 2.5}, "chief.refresh_minutes")):
             cfg = self.write_config()
             cfg["chief"] = chief_block
             (self.ws / "config.json").write_text(json.dumps(cfg))
