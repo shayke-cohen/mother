@@ -873,6 +873,22 @@ class TestChat(unittest.TestCase):
         self.assertFalse(hs.hub.is_muted(out["lines"][1], {"keys": [out["lines"][1]["key"]], "people": ["U00000000"],
                                                            "channels": ["D00000009"]}))
 
+    def test_typed_by_matches_note_rules(self):
+        cases = [
+            (msg(NOW, user="U00000000", text="call the venue", client_msg_id="c-1"), True),
+            (msg(NOW, user="U00000000", text="typed by an app", app_id="A1", client_msg_id="c-2"), False),
+            (msg(NOW, user="U00000000", text="via a bot", bot_id="B1", client_msg_id="c-3"), False),
+            (msg(NOW, user="U00000000", text="bot profile", bot_profile={"name": "x"}, client_msg_id="c-4"), False),
+            (msg(NOW, user="U00000000", text="no client id"), False),
+            (msg(NOW, user="U00000000", text="joined", subtype="channel_join", client_msg_id="c-5"), False),
+            (msg(NOW, user="U00000007", text="not the manager", client_msg_id="c-6"), False),
+            (msg(NOW, user="U00000000", text="  \n", client_msg_id="c-7"), False),
+            (msg(NOW, user="U00000000", text=":sparkles: *Agnes (AI)*\nbrief", app_id="A1"), False)]
+        for m, want in cases:
+            self.assertEqual(hs.typed_by(m, "U00000000"), want, m)
+        self.assertFalse(hs.typed_by(cases[0][0], ""))
+        self.assertFalse(hs.typed_by(cases[0][0], None))
+
     def test_search_never_touches_an_inbox_note(self):
         note = msg(NOW - 100, user="U00000000", text="call the venue", client_msg_id="c-1")
         hit = dict(note, channel={"id": "D00000009"})

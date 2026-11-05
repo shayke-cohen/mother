@@ -115,6 +115,16 @@ class HookRegistrationTest(unittest.TestCase):
                 out.append((e.get("matcher", ""), cmd))
         return out
 
+    def test_every_mcp_result_reaches_the_outcome_hook(self):
+        """A grant covers only `mcp__` calls (decisions.kind_of), and a tool's error isn't a PostToolUse."""
+        import json
+        doc = json.loads((ROOT / "hooks" / "hooks.json").read_text())
+        for event in ("PostToolUse", "PostToolUseFailure"):
+            entries = doc["hooks"][event]
+            self.assertEqual([e["matcher"] for e in entries], ["^mcp__"])
+            self.assertEqual([h["command"] for h in entries[0]["hooks"]],
+                             ['python3 "${CLAUDE_PLUGIN_ROOT}/hooks/guard_outcome.py"'])
+
     def test_every_tool_reaches_the_guard_exactly_once(self):
         entries = self.entries()
         g = load_guard()

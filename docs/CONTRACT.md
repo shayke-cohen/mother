@@ -11,7 +11,7 @@ Every part of v0 is built against this file. Change it first, then the code.
                            `mother_bin` (empty default = `${plugin root}/bin/mother`; a leading `~` is $HOME)
 bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now
 hooks/hooks.json           `modules: ["./register.tsx"]` (the Now panel); PreToolUse → hooks/guard.py (every other tool
-                           via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`. A panel module that fails to
+                           via hooks/guard_fast.py); PostToolUse + PostToolUseFailure on `mcp__…` → hooks/guard_outcome.py (what a decision's call answered, §5g); Stop + SessionEnd → `mother sync --quiet`. A panel module that fails to
                            load leaves the command hooks running
 hooks/guard.py             approval guard (see §5)
 hooks/guard_fast.py        the guard's fast path: every tool the main matcher doesn't take; escalates to guard.py for
@@ -622,7 +622,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   (config, ledger, log, PAUSED, hooks) ask.
 - A shell command asks as a self-edit only when it can write (a redirect other than `/dev/null` or `2>&1`,
   `rm`/`mv`/`cp`/`sed -i`/…, or a script that opens a file for writing) **and** it reaches the running copy:
-  it names `guard.py`/`guard_fast.py`/`hooks.json` together with the installed plugin's path (`${CLAUDE_PLUGIN_ROOT}`,
+  it names `guard.py`/`guard_fast.py`/`guard_outcome.py`/`hooks.json` together with the installed plugin's path (`${CLAUDE_PLUGIN_ROOT}`,
   `.claude/plugins/`), or `config.json`/`PAUSED`/`ledger.json`/`guard.log` together with the workspace's
   path (`$MOTHER_WORKSPACE`, `$(cat ~/.mother/workspace)`, the path itself), or it runs from inside either
   without a `cd`; or it writes `~/.mother/workspace`. The same names in a checkout of this repo, another
@@ -1271,8 +1271,8 @@ An optional layer over the hub. The **chief** is one long-lived Claude Code CLI 
 launchd job (`mother chief install`), that decides the hub's inbox lines and starts **workers**: headless
 `claude -p` sessions, one per followed thing. Config: the optional `chief` block (§3), keys `max_workers` (3),
 `run_minutes` (20), `daily_budget_usd` (20), `chief_model` (`sonnet`), `worker_model` (empty: claude's default),
-`tick_seconds` (30) and `tldr_model` (`sonnet`; `opus` is the one other value, anything else reads as `sonnet`);
-unknown keys are dropped. Home machine only. The chief replaces a desktop `/mother:hub`
+`tick_seconds` (30), `tldr_model` and `triage_model` (both `sonnet`; `opus` is the one other value, anything else reads
+as `sonnet`), `batch_minutes` (30) and `decision_hours` (48); unknown keys are dropped. Home machine only. The chief replaces a desktop `/mother:hub`
 session: there is one `inbox_cursor`, so `install` refuses while a hub wake (`hub.json` `last_wake`) is under 10
 minutes old unless `--force`. A wake no later than 120 s after the chief's own heartbeat is the chief's own decide
 (the hub skill refuses to start while that heartbeat is fresh), so a re-install while the chief runs proceeds.
@@ -1312,16 +1312,36 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   at or before a worker's `inbox_mark` is left to the chief (it was pending when the chief started that worker, so
   it is the worker's prompt): the chief records it as `route` after `run --detach`, and it is delivered once. It
   then starts queued, unheld, non-failed workers within `max_workers`, unless today's budget is spent or
-  `spend.json` is unreadable (then nothing starts until the day rolls or the file reads again). The mod (`hooks/chief.tsx`) calls it every
+  `spend.json` is unreadable (then nothing starts until the day rolls or the file reads again). A failed worker stays
+  failed, with what's queued kept for its next run (a run that stopped on a limit or never started puts back what it took,
+  below), until it gets new input: a `say`, `run` or `release`, or the
+  manager's yes or words on one of its decisions. A note about a failure (a closed decision, an expiry) or a routed line
+  is not new input, and a filing doesn't clear a failure. The exception to the manager's answer: a run stopped by a
+  limit (below) would only stop again, so it stays failed, the approval line says why, and the approval rides with the
+  next `say` or `run` if that comes before the grant runs out. The mod (`hooks/chief.tsx`) calls it every
   `tick_seconds` and sends the wake into the chief session when no turn is running.
-- **Triage.** Before a wake, the mod asks Haiku (`$.model.complete`, 20 s timeout, 300 tokens) for a verdict
+- **A run that failed.** `progress` holds the real reason: the result event's `result` (claude writes `subtype: "success"`
+  with `is_error: true` on a run that stopped on a spend limit), else `api_error`, `errors`, a subtype other than
+  `success`, or stderr when the stream had no words for it. `status` and `chief status` print it, and the pane's card
+  shows it in place of the TL;DR while the worker is failed. A **limit** is a usage, spend or rate limit, or a login
+  that's gone (`chief.stopped_by_limit`, on the text of that reason). It reaches the DM only through a decision: the lines
+  for an approval it stopped carry the reason. A failed worker with no decision open shows on its card and nowhere else.
+  Detecting one, pausing the workers and sending one DM is the design's Phase 3 and isn't built. A run that stopped on a
+  limit or never started did nothing with its words, so they go back to the head of the queue for its next run, and the
+  worker stays failed: the write is direct, because a `say` through `enqueue` would reset the failure and every tick would
+  run it again. A `<D> approved by` entry stays out, since `settle` closes that row. A run that crashed after it started
+  keeps what it took: it may have acted on it. Manager's words on a decision for a worker that can't run say they are
+  waiting, and why, not that they went to it.
+- **Triage.** Before a wake, the mod asks the model (`chief.triage_model`, `$.model.complete`, 20 s timeout, 300 tokens) for a verdict
   `{is_work, needs_attention, title, tldr}` per judge line (never for a `manual` line or one whose key has a live
   session) and passes them to `mother chief triage --stdin`, which logs the leading lines that need no judgment
   (`why: "triage: <title>"`; never `manual` or `error` lines, nor an update whose decide would also settle older
   same-key updates) and rebuilds the wake with each kept line's title and tldr, marked as a model's summary of
   untrusted text. Triage **fails toward waking**: a model error, a timeout, an unreadable reply or a failing CLI step
-  keeps the line and sends the original wake. Triage cost is **not** counted in `daily_budget_usd` (that covers
-  workers only; the mod's model call is not metered by the CLI).
+  keeps the line and sends the original wake. The mod reports the cost of triage and TL;DR calls through
+  `mother chief spend --stdin` (`{model, input_tokens?, output_tokens?}`), so they count in `daily_budget_usd` with the
+  workers. A missing usage counts as 1024 output tokens and an unknown model at the dearest price. Over budget, those
+  model calls are skipped: lines wake the chief untriaged and stored TL;DRs stay on the cards.
 - **Pinned desktop sessions.** `mother chief pinned --stdin` takes `list_sessions` rows (JSON array) and writes
   `desktop.json` from those with `pinned: true`; the CLI session id is read from the app's own `local_<id>.json`,
   never from the row, and archived or unreadable sessions are dropped. A pinned session is shown, never driven by
@@ -1332,7 +1352,7 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   last_activity_at, last_report, open_link}]}`; a worker row also carries `unseen` (0 when absent). Workers: running first, then newest run. `desktop` is the snapshot
   rows still live in the app (`last_report` is the first 200 characters of the last turn report); an older CLI omits
   it. `spent` reads 0 when `spend.json` is unreadable; `unreadable` is then true, and `over` (spent at the limit, or
-  unreadable) says no run starts; the pane shows both. `resume` is `""` for an entry with no session id.
+  unreadable) says no run starts; the pane shows both. `resume` is `""` for an entry with no session id. A worker's `status` can also be `waiting_decision`. Phase 2 adds `to_decide` (the pending count) and `decisions: [{id, key, kind, target, recommendation, why, text, full_text, edit_refusal, edit_text, urgent, status, created, expires}]`, oldest first. `target` is one line and can be composite. `edit_refusal` says why Edit can't take this call, else null; `edit_text` is the one field an edit replaces (Edit's prefill), else null. `reply_problem`, while decisions are open, says what stops self-DM replies from working, else null: an inbox line names no channel, so replies are re-read in `follow.inbox` from watch.json, which must be the D id in `manager.chat_dm`, where the batch goes. If it isn't, or is unset, every reply fails closed or never arrives, and the pane says so.
 - **TL;DR, chips and Open on the Chief pane.** `mother chief tail --json` prints `{version: 1, model, sessions:
   [{id, kind, key?, fingerprint, text, cached?}]}`: one row per worker (`id` its session id, `kind: "worker"`, `key`)
   and pinned session (`id` its CLI id, `kind: "pinned"`) with something to summarise. `text` is the transcript's last
@@ -1401,7 +1421,232 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   (`decide`, `mute`, `unmute`, `follow`, `unfollow`, `session add|drop|seen`, `pending`, `add`, `done`, `snooze`,
   `dms set|drop`, the job verbs) is denied, and the reads (`status`, `check`, `show`, `watching`, `tail`,
   `session for`, `dms show`) stay.
-- **Phase 1 sends nothing.** A worker that needs a send reports it in `progress` and the chief records a `now` line.
+- **Decisions (Phase 2).** A worker never sends. It files the exact call it wants to make, with `mother decide propose
+  <key> --tool T --recommend R [--why W] [--urgent] --stdin` (stdin is the tool's input JSON), and ends its turn. `T`
+  must be the tool's name as this worker has it, because the grant binds the name with the input: a `-p` worker's Slack
+  tool can carry another server prefix than a desktop session's (`mcp__slack__…`, not the one a desktop session lists),
+  the guard classifies both alike so `propose` can't tell, and a call under any other name is refused after the yes. The
+  worker header says so. A
+  chat post, reply or tracker comment must carry the agent's signature or the filing is refused. The decision lands in
+  `.mother/chief/decisions.json` (changed under `decisions.lock`, atomically) as `D<n>`: `{id, key, kind, tool, input,
+  target, thread, text, draft_sha, recommendation, why, urgent, status, created, expires, answer}`. `kind` is
+  `chat-post`, `chat-reply`, `tracker-create`, `tracker-comment` or `tracker-transition`; any other call is `manual`
+  (approving it hands the manager the text to do by hand, and no grant is written). `status` is `pending`, `approved`,
+  `rejected`, `redirected`, `expired`, `sent`, `failed`, `unconfirmed` or `manual`. `expires` is `decision_hours` after the filing. The
+  worker's status becomes `waiting_decision` while one of its decisions is pending; `tick` starts it again only when
+  an answer is queued for it (queue source `decision`, or a `say`).
+  - **The batch.** `tick --json` gains `"batch": bool`. A batch is due when a pending decision hasn't been announced and
+    `batch_minutes` have passed since the last batch, or one of those is `urgent`, or confirmation lines wait.
+    `mother decide batch --json` prints `{text, ids}`, or `null` when nothing is due, and records what it offered. The
+    text is a header (`<P> to decide · <M> done without you`), one line per pending decision, announced before or not
+    (`ok all` reaches them all, so the manager sees them all), then the confirmation lines and the footer
+    (`Reply in this DM, not in a thread: 7 ok · 7 no · 7 edit: your text · ok all`, left out when nothing is pending).
+    A decision's line is `D7 · <key> · <kind> on <target>: "<first 200 chars of the draft>" · why: <why> · recommend:
+    <recommendation>`. The `why` part is left out when empty. `<target>` can be composite (`C00000001, thread_ts 1700…`).
+    Everything a worker or a service wrote is one line, capped, with `& < >` escaped and `@` broken, so it can't draw a
+    mention or a relabelled link. A bare domain in it may still become a link to itself (Slack auto-links it, label equal
+    to address), and Slack renders the signature's bold. Replies typed in the batch's thread are ignored.
+  - **`sent`.** `mother decide sent --ids D7,D8|'' --ts <the post's ts>` records the batch time, stamps each id as
+    announced at that ts (a decision keeps its first stamp) and clears the confirmation lines the batch offered; a line
+    that arrived during the post stays. It needs a live offer from `batch`, each offer is used once, and the ids must
+    be ones that offer named: otherwise it exits 2 and writes nothing, `--ids ''` and a repeat of a successful `sent`
+    included, as it does for a bad `--ids` or a missing or bad `--ts`. So the order is `batch`, post, `sent`. A batch of
+    confirmation lines alone uses `--ids ''`. The stamp is never earlier than the offer. A stamp must prove a post: `sent`
+    re-reads the message at `--ts` in the manager's first `D…` channel, through the read `answer` uses, and stamps only
+    when it is app-posted, draws nothing but its text (no attachments at all, a preview included, since every batch is posted with previews
+    off; no blocks but `rich_text`) and its text says what the offer's does (`_same_text`). Both are compared in one form
+    (`_norm`): the links in the raw text, and only those, as their text (`<url|label>` its label, `<url>` the url), then
+    entities undone, so escaped link markup in a draft keeps its address; a run of Unicode emoji as one placeholder; no
+    trailing spaces. A `:shortcode:` and a zero-width space stay as written, since Slack keeps both. A shortcode in the
+    stored text stands for an emoji only where the offer has a Unicode emoji (Slack stores ✅ as `:white_check_mark:`);
+    anywhere else it is words. Words, ids, numbers and targets must match. An earlier offer since the last `sent` counts, for a post that landed late,
+    and then only that offer's ids can be stamped. Exits: no live offer, 2, with "no batch is waiting"; no such message, not
+    app-posted, not plain (blocks other than rich_text, any attachment, a link labelled as anything but its address) or other text, 2, with a message without that phrase, and the offer stays live; a read that failed, 3, which
+    is worth retrying and stamps nothing.
+  - **The post.** The chief's mod posts the batch with `$.mcp.call`, which is not a tool call, so the guard doesn't see
+    it. The mod does the guard's checks itself: nothing goes out under `MOTHER_DRY_RUN` or either PAUSED file, only the
+    manager's `D…` channel is posted to, and `mother chief post-log --stdin` writes each attempt and its outcome to
+    `guard.log` as `decision: "mod post: attempt|posted|unsure|failed|record dropped"`, with target and reason, never the text. A
+    post that may have landed (a timeout, no readable ts) is never re-posted before `batch_minutes` while the chief's process runs (the hold is session state: after a
+    restart the 2 posts per content are the bound), and gets one wake
+    line per batch. One that surely failed backs off 2, 4, 8 … minutes up to `batch_minutes`, with one wake line at the
+    cap, or on its first failure if the batch holds an urgent decision. A new urgent decision ends a hold, at most 3
+    times in a rolling hour and never within 2 minutes of the last attempt; past that it waits, and its card and toast
+    still show it. A wake line says one of three things (`routines/chief.md`): the post surely did not land, so the
+    chief runs `batch`, posts the text and runs `sent`; it may have landed, so the chief looks in the DM's history, runs
+    `sent` with the ts if it's there, and never posts; or the record is failing, as below. Every post, the mod's and the
+    chief's, passes `unfurl_links: false` and `unfurl_media: false`; the guard refuses the chief's post without both.
+  - **How many posts.** The mod counts a post just before `$.mcp.call`, so a reload of the mod or a restart of the
+    chief's process in the middle of one keeps it; if the count can't be written, nothing is posted. A post that surely did not land (a clear error before or from the call) gives its count back. The wake line
+    asking the chief for a hand post takes one, and isn't sent when none is left. An offer's content is its rows and
+    confirm lines: `batch_key` in `mother chief tick --json`, a hash of the batch text without its header line (whose
+    "done without you" count moves with every worker run), read without making an offer.
+    - Per content: at most 2 counted posts, refused by `sent` or unsure alike. A recorded post clears the count. After
+      the second, nothing for that content until 6 hours after its last post; then 2 more. A changed content starts at 0.
+    - Across all contents: at most 4 counted posts in any rolling 60 minutes, urgent hold-ends included.
+    - So, exactly, by when a post is counted: while the rows and confirm lines don't change, at most 2 posts in any window
+      that ends 6 hours after the second; and at most 4 counted in any hour whatever changes, which is 96 a day only if the
+      content changes before every post.
+    - By when a DM lands, one more: a hand post is counted when its line is queued, and can land up to the 30 minutes a
+      busy chief turn holds that line (`STUCK_TURN_MS`). With changing content and urgent hold-ends, 5 DMs can land inside
+      one rolling hour: line counted at 0, mod posts at 35, 38 and 41, the hand post at 45, the next post at 61 once 0 has
+      left the list. Each hand post whose count fell out of that hour before it landed adds one in the same way.
+    - Between counted posts that weren't recorded the hold applies (`batch_minutes`, default 30; ended early by an
+      urgent decision at most 3 times an hour, never within 2 minutes of an attempt). A recorded post clears the hold,
+      so a confirm-only batch can follow it at the next tick, inside the hourly 4.
+    - The counts live in the mod's `$.store`, one key per workspace (`chiefPostCounts:<workspace path>`), which the host
+      keeps between sessions: a reload of the mod, a restart of the chief's Claude process by `mother chief install`, the
+      keeper restarting it (in a loop too) or the machine, all keep the hour's posts and the stop. Each write prunes:
+      a post list keeps its last hour, and a workspace with no post for 7 hours (the cool-off and an hour) leaves the
+      store (`keys` and `delete`), as it then holds nothing. Counts that can't be read or written post nothing, and the
+      Chief pane says so.
+    - The rest of the post state (holds, wake lines, a `sent` owed) stays in session state, so a restart drops it. No
+      hold means the next post can go at the next tick, and a dropped `sent` leaves a landed post unrecorded, so its
+      content can be posted once more. The counts still hold: 2 per content, 4 an hour.
+    - Outside the counts: a post that returned a clear error but landed anyway; a chief that posts the live offer
+      against its routine (the guard lets that exact text through, previews off, until `sent`); green posts to the DM
+      from normal sessions. A decision filed between the tick and `decide batch` is posted under the tick's key, so its
+      content can get one post more than 2; the hourly cap still holds. Two processes on one workspace, when an old and a
+      new chief overlap in a restart: `$.store` locks each write, not a read and the write that follows, so one can lose
+      the other's count, which allows one more post per collision. A prune that reads a quiet workspace's key just as its
+      chief writes can delete that write. The store is per plugin source, so running Mother from another source (a dev
+      directory instead of the marketplace) starts from empty counts.
+  - **A `sent` that fails.** No new batch goes out while one is owed. After 3 failures in a row the chief gets one wake
+    line, "The batch record is failing", with the ids and ts to run `sent` with once, and the mod retries once per
+    `batch_minutes`. A `sent` that exits 2 drops the debt, isn't a record failure and logs `mod post: record dropped`.
+    With "no batch is waiting" there's no live offer: it was already recorded, by a `sent` whose answer got lost or by
+    the chief's, or a later batch replaced it. Any other exit 2 means the re-read didn't find the offer at that ts, but
+    the post may have landed: the chief gets one wake line to look for it, unless this was the content's second post,
+    which stops the posting as above. Either way nothing is re-posted for `batch_minutes`; after that, what wasn't
+    stamped is listed in the next batch, so a second DM is possible there.
+  - **To decide cards.** The Chief pane shows pending decisions with Approve, Edit and Reject. A card shows the first 400
+    characters and says so when a draft is cut; `full_text` in the status carries the rest, every field labelled when
+    there are several. A call `edit` can't take has no Edit button, and its card shows `edit_refusal` from the status.
+  - **Answering.** Two routes, and only these. A reply in the manager's own DM: a `manual` inbox line whose id, channel
+    and timestamp are re-read from Slack (`get_channel_history`) and the text parsed from the message as fetched, not
+    from the watcher's summary: `7 ok`, `7 no`, `7 edit: <text>`, `7: <words>` for the worker (a colon and then whitespace, and the words run to the end of the line: "10:30 call with Dana" is a note), `ok all`, several on separate lines. A number followed
+    by other words isn't a reply: "2 things for tomorrow" keeps its normal path to the chief. A reply counts
+    only for a decision filed and announced before the reply was typed. Or a button in the Chief pane
+    (`mother decide answer <n> ok|no|edit --via pane`). A line that can't be verified or read applies nothing and the
+    decision stays open: it gets the help line and keeps its normal path, so a note that only looks like a reply isn't
+    lost. A failed Slack read isn't a bad reply: it holds the lines after it for 3 ticks, and then the manager is told
+    once, "Slack read failed; I'll apply your reply when I can read it", the chief's lines go on without it, and the read
+    backs off from 1 minute to 30 until no decision it could answer is open, when the manager is told it wasn't applied.
+    There are no typed `/chief` answer commands (`/chief decisions` only lists).
+  - **Counterfeit rows.** Before applying replies, the tick reads the DM from the last real batch before the earliest
+    reply (a read it can't finish, truncated included, holds the replies like a failed read). An app-posted message there
+    that looks like a decision batch (`D<n>` with `recommend`, or the Reply footer, in its text, blocks or attachments) and
+    isn't a text a real batch offered names rows: the open ids it gives, or every open row if it gives none. A reply typed
+    after it and before the next real batch that names one of them, `ok all` included, applies nothing and is logged. The
+    manager is told once per message in the next batch: a message that looked like a batch didn't come from Mother, and
+    what to answer again. Normal sessions keep their green post to this DM, which is why the reply side checks. It is a
+    pattern, so a row worded some other way gets past it. The pane always shows the real draft.
+    Code writes the result: `ok` and `edit` write a grant and queue the approved call for the worker; `no` and a
+    redirect queue the manager's words. `edit` replaces the draft's text (keeping the signature), so the grant binds
+    to the edited call. It refuses a call with several fields (a new ticket's summary and description, mail's subject
+    and body), blocks, or no text field: new text in one field would send the others unread, so the manager tells the
+    worker what to change instead (`7: <words>`). An answer made while `.mother/PAUSED` or `chief/PAUSED` exists writes no grant and the decision
+    stays pending, as does one the policy would refuse (scope off, a target that left `allowed_targets`, a reply older
+    than the grant age limit). `propose` refuses, up front, a call whose target `guard.allowed_targets` wouldn't let a grant
+    reach (a DM, an external or `off` channel, a channel or project outside the config's teams) or whose scope has no uses,
+    and it refuses a worker filing under another worker's key. `approved` says so when no run can start (held, over
+    budget, its last run stopped by a limit), rather than promising the call.
+  - **The bound grant.** One live grant per decision: `uses: 1`, `run: "chief:D<n>"`, `decision: D<n>`, `draft_sha`,
+    scope and target from the decision, expiring at the earliest of two hours, the decision's `expires` and the policy's
+    cited-message age limit. `draft_sha` is the sha256 of the tool name and input as sorted compact JSON, defined once in
+    `hooks/guard.py`. The worker is told to make that one call with the input unchanged; the guard allows it only if the
+    hash matches, and a mismatch costs no use. No other call of the worker is covered.
+  - **Closing the loop.** `tick` closes an approved decision once its outcome is known, and the next batch carries the
+    line. A use in the ledger (run `chief:D<n>`, with the grant's `draft_sha`) proves only that the guard let the call
+    through: Slack's `ok: false` comes back as a successful tool call. So `hooks/guard_outcome.py`, on PostToolUse and
+    PostToolUseFailure for `mcp__…`, writes onto that use what the tool answered: `outcome` `ok`, `failed` or `unclear`, and
+    `error`, a short code (`[A-Za-z][A-Za-z0-9_.-]{0,59}`, else `error` or `tool_error`). No other part of a response reaches
+    any file. `failed` is `ok: false`, `success: false`, an MCP `isError` result, a failure event or an `error` field,
+    bare or under `data`, `result` or MCP text, and a failure at a level beats a success in its wrappers. `ok` is `ok: true`,
+    or an answer carrying what it made (`ts`, `id`, an issue key such as `PLAT-12`) unless its `status` or `statusCode`
+    says it failed. `unclear` is anything else: words, an empty answer, a result event with no response, a timeout, an
+    interrupt or a connection dropped mid-call (`Connection closed`, `socket hang up`, `ECONNRESET`, `fetch failed`), after
+    which the send may have landed. A connection refused is `failed`: that call never left. A tracker transition answers
+    with empty text when it works, so an approved transition closes `unconfirmed`, never `sent`, until something reads
+    the status back. A second use of one call takes the answer on the newest.
+    It leaves in one small read when no use is waiting, never loads `guard.py`, always exits 0, prints nothing, and gives
+    up after 2 s on the lock. With the worker's run ended: a seen success is `sent`, `✓ D<n>: the call was made (<kind> on
+    <target>)`. A seen failure is `failed`, `✗ D<n>: the send failed: <code> (<kind> on <target>). The approval is spent,
+    so a retry needs a new decision.`, and the worker is told too. Nothing seen (a hook that didn't fire, a use an older
+    guard wrote) or `unclear` is `unconfirmed`, with no tick: `D<n>: the guard let the call through, but its result
+    wasn't seen, so it may not have gone out (<kind> on <target>). Check it before you count on it.` It doesn't say the
+    call was made, because another plugin's PreToolUse hook can still stop a call this guard passed. A grant stays spent
+    in all three. No use, and the grant ran out: `expired`, `D<n>: approved but not used in time; nothing went
+    out`, with `(its last run stopped: <reason>)` when a limit stopped the worker. No use, and the run ended: `failed`,
+    either `D<n>: the worker failed after your yes (<reason>); nothing went out, and it's back with the worker`
+    or `D<n>: the worker's turn ended without the call you approved; nothing went out, and it's back with the worker.`,
+    or, when the target is no longer one a grant can reach, `D<n>: the guard refused the call: target not allowed; nothing
+    went out, and it's back with the worker.`
+    The worker gets a note in each case but `sent` and `unconfirmed`. A pending decision past `expires` becomes `expired`, `D<n> expired
+    unanswered.`, and its grant is removed. A ledger that can't be read leaves the decision `approved` until it can.
+  - **What a worker can't do.** No shell command off the guard's allow-list, so no `npm test` and no `python3 -m
+    unittest`: a worker reads, drafts and files decisions. File tools write only inside the workspace and not to the
+    guarded paths below. A worker that can't do something says so in its `PROGRESS:` line. Everything outbound is a
+    decision.
+
+- **Decisions in the guard (Phase 2).** A grant carrying `draft_sha` or `decision` covers one exact call: it matches only
+  when `draft_sha(tool, input)` equals its `draft_sha`, checked before the ledger, so a mismatch costs no use. Its
+  ledger key includes the decision, so one reply can answer several. `source.channel: "pane"` counts only on such a
+  grant with both fields; the owner, age and expiry checks still apply.
+  - **Only the manager answers.** In every session, a shell command is denied when it names `mother decide
+    answer|approve|reject|edit` (by name or path, any flag order, `$'…'` decoded), holds `{ } * ? [ ] $` or a backtick in
+    the word after `mother` or `decide`, or imports `decisions`/`grants`. `lib/decisions` and `lib/grants` (`.py` or no
+    extension) by path count when that command or pipeline runs an interpreter or writes; a linter under `python3 -m`
+    and plain reads pass. Quoted text and heredoc bodies count, except in one plain `git commit`, `git log`, `grep`, `rg`
+    (no `--pre`, `--hostname-bin`), `echo` or `gh` read or PR body with no newline, pipe, redirect, `;`, `&`, `$(`, backtick,
+    unquoted `$` or unquoted `#`. `mother decide answer` itself also refuses in a process with `MOTHER_CHIEF_WORKER`. It does not refuse
+    on `MOTHER_CHIEF_ROLE`: the Chief pane's mod runs in the chief's session and inherits it.
+  - **The guard is not a sandbox.** A same-uid process that reaches code execution can reach the grant key, and with it
+    sign any grant. The guard closes the routes it knows about; a new route is a new fix. Text matching can't see a
+    string built at run time (`'ans'+'wer'`, `printf … | sh`) or a script on disk (`python3 /tmp/x.py`). In a worker and
+    the chief those commands are off the positive shell list below, and the write limits close the known ways to make a
+    listed command run planted code; that is a list of routes closed, not a proof there are no others. In a normal session they get that session's ordinary shell rules, which outside the
+    workspace or with the policy switches on means they run. A process that unsets `MOTHER_CHIEF_WORKER` gets past the
+    CLI's refusal.
+  - **Workers and the chief get no passes.** With `MOTHER_CHIEF_WORKER` set or `MOTHER_CHIEF_ROLE=chief`,
+    `policy.shell_unasked`, `shell_in_bypass`, `bypass_passes_asks`, functional autonomy and bypass mode outside the
+    workspace open nothing, and the shell allow-list applies wherever the command's cwd is. A worker counts as hub-fed
+    from its first turn, and a typed `mother approve` line doesn't count in it. Every ask from a worker is a deny that
+    tells it to file a decision or say what it needs in its PROGRESS line, as the chief's asks already are. What remains
+    open: reads, workspace edits, the allow-list, a live bound grant, a worker's exact `mother decide propose` (checked
+    before the text rule, so quoted third-party text can't stop a filing), and the chief's `mother chief …` and `mother
+    decide batch [--json]`, `sent --ids D7,D8|'' --ts TS`.
+  - **The self-DM is the approval surface.** A worker's chat call to the manager's own DM is a deny, whatever the policy
+    says. The chief's is allowed only for a plain post from the chief's own session whose `text` equals the live offer
+    (`batch.offered_text` in `decisions.json`, gone once `sent` uses it), with only the channel, the text and link and
+    format settings in the call; edits, reactions and threads are denied. A normal session keeps `own_dm`, and the tick's
+    counterfeit check covers that side.
+  - **A positive shell list.** With `MOTHER_CHIEF_WORKER` or `MOTHER_CHIEF_ROLE=chief`, every stage of a shell command must
+    be one of: `cat`, `ls`, `head`, `tail`, `wc`, `grep`, `rg` (no `--pre`, `--hostname-bin`); `git status|log|diff|show`
+    with an exact set of options, no prefixes (no `push`, `fetch`, `pull`, `commit`, `add`, `-c`, `-C`, `--output`,
+    `--ext-diff`, `--textconv`, `--exec-path`); `gh pr|issue|run` reads; `mother path|version|help|status` and `mother hub
+    status|check|show|watching|help|session for|dms show`. A worker also has its exact `mother decide propose`; the chief
+    its `mother chief lines|status|run|say`, `mother decide batch|sent` and `mother hub decide` heredoc. Nothing else runs:
+    no interpreter, `find`, `sed`, `awk`, `xargs`, `sort`, `make`, `tar`, `env`, `nohup`, `less`, `man`, `vim`, `echo`,
+    `cp`, `mv`, `rm`, `cd`, `mother sync`, and no redirect that writes. The list passes through the allow-list's own path and
+    option checks as well. Every path a listed read or a git read names (a `<` source too) must resolve inside the workspace, out of what's guarded there and neither in nor above a folder holding the grant key or `~/.claude`, `grep`, `rg`, `ls` and git with none need a cwd inside it, and `grep -R`, `rg -L`, `ls -L` and any other option off a short table are refused; a recursive read of the workspace root is still on and walks its `.mother/` and `.git/`. A refusal tells the session to file a decision, say it in PROGRESS or record the line as `now`.
+    In other sessions git's abbreviated long options are read as their full names first, so `git commit --amen` and `git
+    push --exe=` meet the rule of `--amend` and `--exec`.
+  - **The hook's deadline.** A shell command over 64 KB gets an immediate ask (deny in a worker or the chief), before any
+    regex. Each guard entry point (`guard.py`, and `guard_fast.py` before it reads its input) arms an 8 s `SIGALRM` at
+    startup that emits the same answer and exits. Claude Code lets a call run unguarded when it kills a hook at its
+    timeout, so `hooks.json` gives both entries 60 s, a margin a test keeps at 5 times the deadline or more. Where
+    `SIGALRM` isn't available there is no alarm.
+  - **Where they write.** With `MOTHER_CHIEF_WORKER` or `MOTHER_CHIEF_ROLE=chief`, Write, Edit, MultiEdit and NotebookEdit
+    write only inside the workspace, on real paths, and never to anything dotted at its root
+    (`.git`, `.claude`, `.githooks`, `.mother`, `.mcp.json`, `.env`), a `.git`, `.githooks` or `.claude` folder at any depth,
+    `scripts/` or `skills/`. Otherwise an allowed command runs what lands there: `git status` runs what `core.fsmonitor`
+    in `~/.gitconfig` or `.git/config` names, `zsh -c` sources `~/.zshenv`. The shell list writes nothing. `config.json`, `AGENTS.md`, `CLAUDE.md` and
+    `memory/MEMORY.md` keep their ask, which is a deny here. The chief's and workers' own state goes through `mother`
+    verbs, which are not file tools. Normal sessions and a `--resume` takeover with no worker env are not limited by this.
+  - **Stores.** Write, Edit, MultiEdit, NotebookEdit and shell writes to `.mother/chief/decisions.json` and
+    `.mother/hub/inbox.jsonl` ask in every session (denied under PAUSED and in the chief and workers), wherever they run
+    and through paths the guard can't resolve, since the folder and file are named.
 
 ## 6. Sync (`bin/mother sync`)
 

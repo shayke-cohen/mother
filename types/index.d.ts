@@ -174,6 +174,44 @@ export type ChiefDesktop = {
   open_link: string | null
 }
 
+// A decision a worker filed (lib/decisions.py). The pane draws the pending ones; `text` is the draft's first 400
+// characters, `full_text` all of it; `target` is where the call goes. The last two are absent from an older CLI.
+export type ChiefDecision = {
+  id: string                         // D<n>
+  key: string
+  kind: string
+  tool?: string | null               // the full tool name, mcp__<server>__<tool>; absent from an older CLI
+  recommendation: string
+  why: string
+  text: string
+  full_text?: string
+  target?: string | null
+  edit_refusal?: string | null       // why Edit can't be used on this call; absent from an older CLI
+  edit_text?: string | null          // the one field an edit replaces: Edit's prefill
+  urgent: boolean
+  status: 'pending' | 'approved' | 'rejected' | 'redirected' | 'expired' | 'sent' | 'failed' | 'unconfirmed' | 'manual' | string
+  created: string
+  expires: string
+}
+
+// The batch post's state (hooks/chief.tsx settleBatch), in session state so a reload of the mod can't post twice.
+export type ChiefBatchState = {
+  sentOwed: { ids: string; ts: string } | null   // posted; `decide sent` hasn't recorded it yet
+  holdUntil: number        // epoch ms: no post before this
+  failures: number         // posts that surely did not land, in a row
+  wokenFor: string | null  // the batch that already got its one wake line
+  lineDue: boolean         // the wake line goes out with the next wake
+  note: string | null      // why the last attempt failed, for the pane
+  urgentSeen: string[]     // urgent decisions known at the last attempt; any other ends a hold
+  holdEnds: number[]       // epoch ms of holds an urgent decision ended, the last hour's; outlives a batch
+  lastAttemptAt: number | null   // epoch ms of the last post attempt; outlives a batch
+  sentFailures: number     // `decide sent` failures in a row for what's owed
+  sentRetryAt: number      // epoch ms: no `sent` before this, once it has failed 3 times
+  recordLineDue: boolean   // the "batch record is failing" line goes out with the next wake
+  recordWoken: boolean     // that line already went out for this debt
+  checkLine?: string | null   // the may-have-landed line (look for the batch, record it, never post) for the next wake
+}
+
 export type ChiefStatus = {
   version: 1
   at: string
@@ -184,6 +222,9 @@ export type ChiefStatus = {
   budget: { spent: number; limit: number; unreadable?: boolean; over?: boolean }
   workers: ChiefWorker[]
   desktop?: ChiefDesktop[]           // pinned desktop sessions; absent from an older CLI
+  decisions?: ChiefDecision[]        // absent from an older CLI
+  to_decide?: number                 // pending decisions; absent from an older CLI
+  reply_problem?: string | null      // what stops self-DM replies from working, while decisions are open
 }
 
 declare module 'claude-code' {
@@ -202,7 +243,10 @@ declare module 'claude-code' {
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
       chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
       chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by session id (a worker's session_id, a pinned cli_session_id)
-      chiefDraft: Record<string, string> | null     // a card's chat-box text a reply chip put there, by Input key (`say:<key>`, `say:<cli id>`)
+      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<key>`, `say:<cli id>`), a decision being edited (`decide-text:<id>`); `decide-all:<id>` is set while a card shows its whole draft
+      chiefAnswers: Record<string, { message: string }> | null   // the last answers' messages, by decision id
+      chiefBatch: ChiefBatchState | null            // the batch post's state; null until the first post
+      chiefToasted: string[] | null                 // urgent decision ids already toasted this session
     }
   }
 }

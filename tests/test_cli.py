@@ -1,5 +1,7 @@
 """Tests for bin/mother. Stdlib only: python3 -m unittest tests.test_cli -v"""
+import ast
 import json
+import re
 import shutil
 import os
 import subprocess
@@ -352,6 +354,40 @@ class CliTest(unittest.TestCase):
         r = run(["status"], self.env)
         self.assertEqual(r.returncode, 1)
         for frag in ("unknown top-level key 'bogus'", "external channels are capped", "brief.at must be HH:MM"):
+            self.assertIn(frag, r.stdout)
+
+    def test_the_documented_chief_block_is_valid(self):
+        self.init()
+        cfg = self.write_config()
+        cfg["chief"] = {"max_workers": 2, "run_minutes": 15, "daily_budget_usd": 8, "chief_model": "sonnet", "worker_model": "",
+                        "tick_seconds": 30, "tldr_model": "opus", "triage_model": "sonnet", "batch_minutes": 30,
+                        "decision_hours": 48.5}
+        (self.ws / "config.json").write_text(json.dumps(cfg))
+        r = run(["status"], self.env)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("INVALID", r.stdout)
+
+    def test_the_validator_knows_every_chief_setting(self):
+        sys.path.insert(0, str(ROOT / "lib"))
+        import chief
+        code = (ROOT / "bin" / "mother").read_text()
+        fields = re.search(r"^CHIEF_FIELDS = (\{.*?\})$", code, re.M | re.S).group(1)
+        self.assertEqual(set(ast.literal_eval(fields)), set(chief.DEFAULTS))
+
+    def test_a_bad_chief_block_is_named(self):
+        self.init()
+        for chief_block, frag in (("x", "chief must be an object"), ({"bogus": 1}, "unknown key chief.bogus"),
+                                  ({"max_workers": 0}, "chief.max_workers"), ({"max_workers": 1.5}, "chief.max_workers"),
+                                  ({"max_workers": True}, "chief.max_workers"), ({"run_minutes": 0}, "chief.run_minutes"),
+                                  ({"daily_budget_usd": -1}, "chief.daily_budget_usd"), ({"tick_seconds": "30"}, "chief.tick_seconds"),
+                                  ({"batch_minutes": 0}, "chief.batch_minutes"), ({"decision_hours": -2}, "chief.decision_hours"),
+                                  ({"chief_model": 3}, "chief.chief_model"), ({"worker_model": None}, "chief.worker_model"),
+                                  ({"tldr_model": "gpt"}, "chief.tldr_model"), ({"triage_model": "gpt"}, "chief.triage_model")):
+            cfg = self.write_config()
+            cfg["chief"] = chief_block
+            (self.ws / "config.json").write_text(json.dumps(cfg))
+            r = run(["status"], self.env)
+            self.assertEqual(r.returncode, 1, chief_block)
             self.assertIn(frag, r.stdout)
 
     def test_bypass_passes_asks_validated(self):

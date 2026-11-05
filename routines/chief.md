@@ -6,7 +6,7 @@ config: chief                     # max_workers, run_minutes, daily_budget_usd, 
 default: {}
 needs: []
 writes: [.mother/hub.json, .mother/chief/]
-sends: nothing in Phase 1
+sends: the decision batch to the manager's own DM, and only when a wake says it surely did not land
 sync: false
 ---
 
@@ -21,12 +21,17 @@ this session: it gives the session a new id, and the guard then refuses every co
 ## Running mother
 
 The guard lets you run exactly these shapes, each as one plain command. Type `mother` exactly as written (it is on
-your PATH): no absolute path, no `python3`, no pipe, no `&&`, no redirect, no `$`.
+your PATH): no absolute path, no `python3`, no pipe, no `&&`, no redirect, no `$`. Beyond these and the
+`mother hub decide` heredoc below, the shell runs only reads (`cat`, `ls`, `head`, `tail`, `wc`, `grep`, `rg`,
+`git status|log|diff|show`, `gh` reads, `mother status`): no `cd`, `echo`, git writes or interpreters. Anything
+else you would need, record the line as `now` with a one-sentence why.
 
 - `mother chief lines --json`
 - `mother chief status --json`
 - `mother chief run <key> --detach '--title=<title>' '--prompt=<prompt>'`
 - `mother chief say <key> -- '<text>'`
+- `mother decide batch --json`
+- `mother decide sent --ids D7,D8 --ts 1700000000.000100`
 
 A valued flag is one token, `--flag=value`. Single-quote any value that has spaces or punctuation, with the
 quotes around the whole token, and leave apostrophes and `$` out of it. A separate `--title T` asks a question
@@ -69,13 +74,48 @@ that id and retry the rest.
    If `run` exits 3 (paused or over budget: the prompt is queued for later) or 2, record the line as `now` instead.
 4. Record every line in one `mother hub decide` call, after any `run`.
 
+## Decisions
+
+Workers file what needs the manager's yes as decisions, and the manager answers in the self-DM or the Chief pane.
+`mother chief tick` applies those replies as plain code. A wake never decides reply lines: they aren't in
+`mother chief lines --json`, and you never answer a decision yourself.
+
+The mod posts each batch itself. When it needs you, a wake line says which of three cases it is. A duplicate DM is
+the failure to avoid: you post a batch only in the first case. The guard lets you post to the manager's own DM only
+the exact text of the live offer.
+
+**"surely did not land"**: the post was refused before it went out. Post it by hand:
+
+1. Run `mother decide batch --json`. It prints `{"text", "ids"}`, or `null` when nothing is due: then stop.
+2. Post `text` to the manager's own DM, verbatim: the exact `batch --json` text, with nothing added, cut or changed,
+   and with `unfurl_links: false` and `unfurl_media: false`, so no link preview is drawn under it. The guard refuses
+   the post without both.
+3. Run `mother decide sent --ids <ids, comma-separated> --ts <the post's ts>`. When `ids` is empty, use `--ids ''`.
+   Without this the next wake posts it again. `sent` re-reads the post and stamps it only if it is that text. Exit 3
+   means the read failed, not the post: run the same `sent` once more. Any other non-zero exit, or a second 3: stop,
+   and never post a second time.
+
+**"may have landed"**: the post timed out, gave no ts, or `sent` couldn't find it. Never re-post it, and don't run
+`mother decide batch`: that makes a new offer, which the post you are looking for won't match.
+
+1. Read the manager's own DM history with the chat connector's history read, from the ts the wake gives.
+2. If an app-posted message there is the batch (it lists the ids the wake gives), run
+   `mother decide sent --ids <those ids> --ts <its ts>` once. When the wake says it has no ids, use `--ids ''`.
+3. If it isn't there, or `sent` exits non-zero (after one more try on exit 3), stop. The mod tries again after
+   batch_minutes.
+
+**"the batch record is failing"**: the batch is already posted, and the wake gives its ids and ts. Run
+`mother decide sent --ids <ids> --ts <ts>` with those, once. Exit 2 means it's already recorded or no batch is
+waiting: stop there. Any other failure: stop too; the mod keeps retrying and the Chief pane shows why. Never re-post
+the batch, and post nothing else to the manager's own DM: the guard refuses anything there but the offered batch.
+
 ## Rules
 
 - Never run `claude` yourself, and never resume a worker directly: its session has one writer. Use
   `mother chief say <key> -- <text>` to give a worker more to do; it starts a turn when the worker is idle and
   queues otherwise.
-- Phase 1: do not send anything to anyone. A worker that needs a send reports it in its progress line, and the
-  line becomes a `now` for the manager.
+- Do not send anything to anyone but the batch above. A worker that needs a send files a decision, and the manager
+  answers it.
 - A held worker belongs to the manager. `say` still queues; do not try to start it.
 - Keep your turn short, and end it when every line is decided. Do not wait for workers.
 - When the chief is paused, `mother chief tick` only writes the heartbeat and `run` refuses, so a wake you still see

@@ -13,9 +13,58 @@ Python 3.9 stdlib only.
 """
 import json
 import os
+import signal
 import sys
+import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
+DEADLINE_SECONDS = 8  # as guard.py's; hooks.json allows 60, and a killed hook lets the call run unguarded
+DEADLINE_REASON = "The guard ran out of time reading this call, so it can't vouch for it. If the machine is just busy, " \
+                  "one retry is fine."  # as guard.py's
+
+
+def _log_deadline(decision):
+    """As guard.log_deadline: this file doesn't load guard.py just to say it ran out of time."""
+    try:
+        ws = os.environ.get("MOTHER_WORKSPACE", "").strip()
+        if not ws:
+            with open(os.path.join(os.path.expanduser("~"), ".mother", "workspace")) as f:
+                ws = f.readline().strip()
+        with open(os.path.join(os.path.expanduser(ws), ".mother", "guard.log"), "a") as f:
+            f.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tool": None, "kind": "deadline",
+                                "category": "guard", "target": None, "decision": decision,
+                                "reason": DEADLINE_REASON}) + "\n")
+    except Exception:
+        pass
+
+
+def _expired(_signum, _frame):
+    """Out of time, maybe inside guard.py: a question (a deny where nobody watches) rather than no decision."""
+    alone = os.environ.get("MOTHER_CHIEF_WORKER", "").strip() or os.environ.get("MOTHER_CHIEF_ROLE") == "chief"
+    decision = "deny" if alone else "ask"
+    os.write(1, (json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": decision,
+        "permissionDecisionReason": "[mother guard] " + DEADLINE_REASON}}) + "\n").encode("utf-8"))
+    signal.signal(signal.SIGALRM, lambda *_: os._exit(0))  # the answer is out: a stalled disk can't hold the hook
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    _log_deadline(decision)
+    os._exit(0)
+
+
+def arm_deadline(seconds=DEADLINE_SECONDS):
+    if not (hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")):
+        return False
+    try:
+        signal.signal(signal.SIGALRM, _expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def disarm_deadline():
+    if hasattr(signal, "setitimer"):
+        signal.setitimer(signal.ITIMER_REAL, 0)
 KEY_TOOLS = ("Read", "Grep", "Glob", "LS")
 SUBAGENTS = ("reader", "critic")  # guard.SUBAGENT_TOOLS (tests check the two agree)
 HUB_FILES = ("hub-session.json", "sessions.json", "fed-sessions.json")  # the hub session and hub-fed sessions
@@ -86,15 +135,18 @@ def needs_guard(raw):
 
 
 def main():
+    arm_deadline()  # one deadline for the whole run, guard.py's import and checks included
     try:
         raw = sys.stdin.read()
     except Exception:
         raw = ""
     if not needs_guard(raw):
+        disarm_deadline()
         sys.exit(0)
     sys.path.insert(0, HERE)
-    import guard
+    import guard  # not as __main__, so it arms nothing of its own; this file's alarm covers it
     r = guard.run(raw)
+    disarm_deadline()
     if r:
         guard.out(*r)
     sys.exit(0)
