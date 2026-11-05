@@ -2198,6 +2198,105 @@ def verdict(l, is_work=True, needs_attention=True, title="T", tldr="D"):
             "title": title, "tldr": tldr}
 
 
+class TestLeader(Base):
+    """`tick --as <session>`: one console leads when no chief session is alive, and code decides the judge lines."""
+    inbox = TestTick.inbox
+
+    def main(self, *args, at=AT, stdin=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
+            code = chief.main(list(args), self.ws, {}, at)
+        return code, out.getvalue(), err.getvalue()
+
+    def beat(self):
+        return json.loads((chief.chief_dir(self.ws) / "heartbeat.json").read_text())
+
+    def test_as_leads_when_no_heartbeat(self):
+        a = line(key="PLAT-7")
+        self.inbox(a)
+        code, out, _ = self.main("tick", "--json", "--as", "s-1")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["judge"], [a["id"]])
+        self.assertEqual(self.beat(), {"at": hub._iso(AT), "pid": os.getpid(), "session_id": "s-1"})
+
+    def test_as_skips_under_another_sessions_fresh_heartbeat(self):
+        self.inbox(line(key="PLAT-7"))
+        self.main("tick", "--json", "--as", "s-1")
+        code, out, _ = self.main("tick", "--json", "--as", "s-2", at=AT + timedelta(seconds=60))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"skipped": "another session leads"})
+        self.assertEqual(self.beat()["session_id"], "s-1")
+        self.assertEqual(self.beat()["at"], hub._iso(AT))  # a skipped pass writes nothing
+
+    def test_as_skips_under_the_chiefs_own_fresh_heartbeat(self):
+        chief.tick(self.ws, {}, AT)  # the chief's tick: no session id in its heartbeat
+        code, out, _ = self.main("tick", "--json", "--as", "s-1", at=AT + timedelta(seconds=30))
+        self.assertEqual(json.loads(out), {"skipped": "the chief session is alive"})
+        self.assertNotIn("session_id", self.beat())
+
+    def test_as_takes_over_a_stale_heartbeat(self):
+        self.main("tick", "--json", "--as", "s-1")
+        later = AT + timedelta(seconds=chief.ALIVE_SECONDS)
+        code, out, _ = self.main("tick", "--json", "--as", "s-2", at=later)
+        self.assertNotIn("skipped", json.loads(out))
+        self.assertEqual(self.beat(), {"at": hub._iso(later), "pid": os.getpid(), "session_id": "s-2"})
+
+    def test_as_same_session_keeps_leading(self):
+        self.main("tick", "--json", "--as", "s-1")
+        later = AT + timedelta(seconds=60)
+        code, out, _ = self.main("tick", "--json", "--as", "s-1", at=later)
+        self.assertNotIn("skipped", json.loads(out))
+        self.assertEqual(self.beat()["at"], hub._iso(later))
+
+    def test_tick_without_as_is_unchanged(self):
+        self.main("tick", "--json", "--as", "s-1")
+        code, out, _ = self.main("tick", "--json", at=AT + timedelta(seconds=10))  # the chief never skips
+        self.assertNotIn("skipped", json.loads(out))
+        self.assertEqual(self.beat(), {"at": hub._iso(AT + timedelta(seconds=10)), "pid": os.getpid()})
+
+    def test_status_says_who_leads(self):
+        self.main("tick", "--json", "--as", "s-1")
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["led_by"], "console")
+        self.assertIn("chief: led by a desktop session (heartbeat", self.main("status")[1])
+        chief.tick(self.ws, {}, AT + timedelta(seconds=200))
+        self.assertEqual(chief.status_doc(self.ws, {}, AT + timedelta(seconds=200))["led_by"], "chief")
+        self.assertIn("chief: alive (heartbeat", self.main("status", at=AT + timedelta(seconds=200))[1])
+
+    def test_decide_logs_fyi_and_makes_the_rest_now(self):
+        a, b = line(key="PLAT-7"), line(key="PLAT-8", title="Build broke", summary="red since noon")
+        c, m = line(key="PLAT-9"), line(source="manual", kind="manual", key="PLAT-3", title="look at this")
+        self.inbox(a, b, c, m)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        self.assertEqual(judge, [a["id"], b["id"], c["id"], m["id"]])
+        body = {"judge": judge, "verdicts": [verdict(a, needs_attention=False, title="Thanks"),
+                                             verdict(c, title="Review due", tldr="needs a look today"),
+                                             verdict(m, needs_attention=False)]}  # a manual line is never logged
+        code, out, _ = self.main("triage", "--stdin", "--decide", stdin=json.dumps(body))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"paused": False, "logged": [a["id"]], "now": [b["id"], c["id"], m["id"]]})
+        h = hub._hub_doc(self.ws)
+        self.assertEqual(h["inbox_cursor"], m["id"])
+        self.assertEqual([(u["key"], u["title"], u["why"], u["link"]) for u in h["updates"]], [
+            ("PLAT-8", "Build broke", "red since noon", "https://example.com/PLAT-1"),
+            ("PLAT-9", "Review due", "needs a look today", "https://example.com/PLAT-1"),
+            ("PLAT-3", "T", "D", "https://example.com/PLAT-1")])
+        self.assertEqual(chief.tick(self.ws, {}, AT, session="s-1")["judge"], [])
+        doc = chief.status_doc(self.ws, {}, AT)
+        self.assertEqual(doc["inbox_count"], 3)
+        self.assertEqual({r["key"] for r in doc["inbox"]}, {"PLAT-8", "PLAT-9", "PLAT-3"})
+
+    def test_decide_with_no_verdicts_keeps_every_line_as_now(self):
+        a, b = line(key="PLAT-7"), line(key="PLAT-8")
+        self.inbox(a, b)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        r = chief.triage_decide(self.ws, {}, AT, judge, [])
+        self.assertEqual((r["logged"], r["now"]), ([], [a["id"], b["id"]]))
+
+    def test_decide_needs_the_object_shape(self):
+        self.assertEqual(self.main("triage", "--stdin", "--decide", stdin="[]")[0], 2)
+
+
 class TestTriage(Base):
     inbox, mute, cursor = TestTick.inbox, TestTick.mute, TestTick.cursor
 
@@ -2458,7 +2557,8 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "workers", "desktop", "decisions",
-                                    "to_decide", "reply_problem"})
+                                    "to_decide", "reply_problem", "led_by", "inbox", "inbox_count"})
+        self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
         self.assertEqual(doc["version"], 1)
         self.assertEqual(doc["at"], hub._iso(AT))

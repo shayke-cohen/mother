@@ -1,9 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import { ago, motherBin } from './shared'
+import { SNOOZES, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe } from './shared'
+import { askFloor, isPinned, markAnswered, needsYou, reloadFloor, storeCard, FLOOR_TAIL_MAX, NO_ASK } from './floor'
+import type { FloorState } from './floor'
 import type { Dollar } from './shared'
-import type { ChiefBatchState, ChiefChip, ChiefDecision, ChiefDesktop, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
+import type { ChiefBatchState, ChiefChip, ChiefDecision, ChiefDesktop, ChiefInboxItem, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
 
 // The Chief pane: the chief's health, one card per headless worker with a chat box and take-over. Every write goes
 // through `mother chief …`; the pane never edits a chief file itself.
@@ -16,6 +18,7 @@ export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as co
 export const chiefAnswersAtom = atom({ plugin: 'mother', key: 'chiefAnswers' } as const, null)
 export const chiefToastedAtom = atom({ plugin: 'mother', key: 'chiefToasted' } as const, null)
 export const chiefBatchAtom = atom({ plugin: 'mother', key: 'chiefBatch' } as const, null)
+const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)   // written in hooks/floor.ts; a read names a const of this file
 
 export const CHIEF_PANE = 'mother-chief'
 export const CHIEF_COMMAND = 'chief'
@@ -29,13 +32,21 @@ type Role = 'chief' | 'console'
 
 // ` · chief ● N working · M to decide` for the status line, the last part only when M > 0; ○ while the chief's heartbeat
 // is old; '' with no status, and '' when no chief is installed here (no heartbeat ever, no workers, nothing to decide).
-export function chiefStatusText(s: ChiefStatus | null, _role: Role | null): string {
+export function chiefStatusText(s: ChiefStatus | null, _role: Role | null, floor: FloorState | null = null): string {
   if (!s) return ''
   const workers = s.workers ?? []
   const toDecide = typeof s.to_decide === 'number' ? s.to_decide : 0
-  if (!s.chief?.heartbeat_at && workers.length === 0 && toDecide === 0) return ''
+  const needs = needsYou(s, floor).length   // pinned sessions stopped on a question (hooks/floor.ts)
+  if (!s.chief?.heartbeat_at && workers.length === 0 && toDecide === 0 && needs === 0) return ''
   const working = workers.filter(w => w.status === 'working').length
-  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working` + (toDecide > 0 ? ` · ${toDecide} to decide` : '')
+  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working` + (toDecide > 0 ? ` · ${toDecide} to decide` : '') +
+    (needs > 0 ? ` · ${needs} need you` : '') + inboxStatusText(s)
+}
+
+// ` · N in inbox` for the status line when the hub holds open `now` items; '' otherwise.
+export function inboxStatusText(s: ChiefStatus | null): string {
+  const n = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
+  return n > 0 ? ` · ${n} in inbox` : ''
 }
 
 // Attention order: failed, held, working, idle, then the rest (done); newest last run first within a group.
@@ -107,8 +118,7 @@ export function pendingDecisions(s: ChiefStatus | null): ChiefDecision[] {
     .sort((a, b) => Number(!!b.urgent) - Number(!!a.urgent) || createdAt(a) - createdAt(b))
 }
 
-// One line of worker-written text for a toast or a list; the worker's draft is untrusted, the same as a transcript.
-const oneLine = (text: unknown, cap = 200): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ').slice(0, cap)
+// oneLine (shared.ts): one line of worker-written text for a toast or a list; the worker's draft is untrusted, the same as a transcript.
 const WHY_MAX = 200
 const TARGET_MAX = 200
 const EDIT_REFUSAL_MAX = 300
@@ -756,6 +766,43 @@ async function tickOnce($: Dollar, bin: string): Promise<void> {
   await reloadStatus($, bin)
 }
 
+// ---- a leading console: with no chief session alive, one desktop console does the chief's pass in code ----
+// `tick --as <this session>` leads only when no other session wrote a fresh heartbeat (lib/chief.py `lead`); a skipped
+// tick does nothing else. When it led, every judge line gets a decision from `triage --stdin --decide`: logged when its
+// verdict says it needs no attention, a `now` item otherwise, so also when the model call failed or the budget is spent
+// (then no call is made). Never a prompt: no wake, no batch post (`settleBatch` is the chief's).
+async function leadOnce($: Dollar, bin: string): Promise<void> {
+  let sid = ''
+  try { sid = String((await $.session.id()) ?? '').trim() } catch { sid = '' }
+  if (!sid) return
+  const ran = await cli($, bin, ['tick', '--json', '--as', sid])
+  if (!ran.ok) {
+    passError = `mother chief tick failed: ${firstLine(ran.stderr) || 'non-zero exit'}`
+    return
+  }
+  passError = null
+  let r: any = null
+  try { r = JSON.parse(ran.stdout) } catch { return }
+  if (!r || typeof r !== 'object' || typeof r.skipped === 'string' || r.paused === true) return
+  const judge: string[] = Array.isArray(r.judge) ? r.judge.filter((j: unknown): j is string => typeof j === 'string') : []
+  if (!judge.length) return
+  let verdicts: Verdict[] = []
+  if (!overBudget(lastStatus)) {
+    const listed = await cli($, bin, ['lines', '--json'])
+    let all: unknown = null
+    try { all = listed.ok ? JSON.parse(listed.stdout) : null } catch { all = null }
+    if (Array.isArray(all)) {
+      const wanted = new Set(judge)
+      const todo = all.filter((l): l is ChiefLine => !!l && typeof l === 'object' && typeof l.id === 'string' &&
+        typeof l.key === 'string' && wanted.has(l.id))
+      const model = await triageModel($, bin)
+      verdicts = (await Promise.all(todo.map(l => verdictFor($, bin, model, l)))).filter((v): v is Verdict => v !== null)
+    }
+  }
+  const done = await cli($, bin, ['triage', '--stdin', '--decide'], JSON.stringify({ judge, verdicts }))
+  if (!done.ok) passError = `mother chief triage failed: ${firstLine(done.stderr) || 'non-zero exit'}`   // the lines stay pending
+}
+
 // A pane verb: run it, toast a failure's first stderr line, then reload.
 async function act($: Dollar, bin: string, args: string[]): Promise<void> {
   const ran = await cli($, bin, args)
@@ -857,9 +904,7 @@ type TailRow = { id: string; kind: 'worker' | 'pinned'; key?: string; fingerprin
 // characters; at most 6 kept, of which a card draws the first 3 that apply to it now. Anything else is dropped.
 // C0 controls but newline and tab, DEL, C1 controls, the line and paragraph separators, and the bidi marks, embeddings, overrides and isolates: what a model could
 // copy from a transcript to make a card misread, and what a surface refuses to draw (a whole pane would go blank).
-// A tab isn't dropped but becomes a space, so it can't join two words.
-const UNSAFE_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g
-const safe = (text: string): string => text.replace(/\t/g, ' ').replace(UNSAFE_RE, '')
+// A tab isn't dropped but becomes a space, so it can't join two words. (`safe`, in shared.ts.)
 
 export function cleanTldr(v: any): ChiefTldr | null {
   if (!v || typeof v !== 'object' || Array.isArray(v) || typeof v.tldr !== 'string') return null
@@ -1198,9 +1243,60 @@ function chipActs($: Dollar, bin: string, chips: ChiefChip[], card: { w?: ChiefW
 
 type Ui = ReturnType<Dollar['ui']['resolve']>
 
+// The Inbox section: the hub's open `now` items (status `inbox`, newest first, at most INBOX_SHOWN), with the Now
+// panel's own actions: `mother hub done|snooze`, and Open session (the key's live session, else the item as a prompt
+// to fill, never to submit). The text is line- or model-written: plain text only.
+const INBOX_SHOWN = 10
+async function inboxVerb($: Dollar, bin: string, args: string[]): Promise<boolean> {
+  const ok = await motherVerb($, bin, 'hub', args)
+  await reloadStatus($, bin)
+  return ok
+}
+function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: number, drafts: Record<string, string> | null) {
+  const { Box, Text, Button, Select, Link } = ui
+  const items: ChiefInboxItem[] = (Array.isArray(s.inbox) ? s.inbox : []).filter(u => !!u && typeof u.id === 'string')
+    .sort((a, b) => (Date.parse(b.at ?? '') || 0) - (Date.parse(a.at ?? '') || 0)).slice(0, INBOX_SHOWN)
+  if (!items.length) return null
+  const total = typeof s.inbox_count === 'number' ? s.inbox_count : items.length
+  const goHub = (args: string[]) => inboxVerb($, bin, args)
+  return (
+    <Box key="inbox" flexDirection="column">
+      <Box marginTop={1}><Text weight="semibold" size="heading">{`Inbox ${total}`}</Text></Box>
+      {items.map(u => {
+        const pickKey = 'inbox-snooze:' + u.id
+        const title = oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)
+        const why = oneLine(u.why, TLDR_MAX)
+        return (
+          <Box key={'inbox-' + u.id} flexDirection="column" marginTop={1}>
+            <Text weight="semibold" wrap="wrap">{title}</Text>
+            {why ? <Text wrap="wrap">{why}</Text> : null}
+            <Box>
+              <Text dimColor>{`${oneLine(u.key, TITLE_MAX)} · ${ago(u.at, nowMs)} `}</Text>
+              {isUrl(u.link) ? <Link href={u.link}>source ↗</Link> : null}
+            </Box>
+            <Box flexWrap="wrap" gap="xs">
+              <Button key={'inbox-open:' + u.id} onPress={() => {
+                if (u.session) openSession($, goHub, u.session.key, { title: oneLine(u.session.title, TITLE_MAX) })
+                else void $.prompt.fill({ text: askPrompt(title, why, isUrl(u.link) ? u.link : null), mode: 'replace' })
+              }}>Open session</Button>
+              <Button key={'inbox-done:' + u.id} onPress={() => goHub(['done', u.id])}>Done</Button>
+              <Button key={pickKey} onPress={() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey) : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [pickKey]: '1' }))}>Snooze</Button>
+            </Box>
+            {drafts?.[pickKey] !== undefined
+              ? <Select key={'inbox-snooze-pick:' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
+                  onSelect={(value: string) => clearDraft($, pickKey).then(() => goHub(['snooze', u.id, value]))} />
+              : null}
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
                   sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
-                  drafts: Record<string, string> | null, answers: Record<string, { message: string }> | null) {
+                  drafts: Record<string, string> | null, answers: Record<string, { message: string }> | null,
+                  floor: FloorState | null = null) {
   const { Box, Text, Button, Input } = ui
   const heading = (text: string) => (
     <Box marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
@@ -1340,6 +1436,30 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       </Box>
     )
   }
+  // Needs you: a pinned session whose last turn stopped on a question. The question and options are model-written from
+  // that session's last message: plain text, cleaned, and each option's message is shown beside its button.
+  const needs = needsYou(s, floor)
+  const needCard = ({ card: c, d }: (typeof needs)[number]) => {
+    const said = sent?.[d.cli_session_id]
+    const meta = [c.waiting_on ? `waiting on ${oneLine(c.waiting_on, 80)}` : '', `asked ${ago(c.at, nowMs)} ago`].filter(Boolean).join(' · ')
+    const options = c.options.map(o => ({ label: oneLine(o.label, 24), message: oneLine(o.message, 200) })).filter(o => o.label && o.message)
+    return (
+      <Box key={'need-' + d.cli_session_id} flexDirection="column" marginTop={1}>
+        <Text weight="semibold">{oneLine(d.title, 200)}</Text>
+        <Text wrap="wrap">{oneLine(c.question, 200)}</Text>
+        <Text dimColor>{meta}</Text>
+        {options.map((o, i) => <Text key={`need-says:${d.cli_session_id}:${i}`} dimColor wrap="wrap">{`${o.label}: "${o.message}"`}</Text>)}
+        {said ? <Text color={said === 'delivered' ? undefined : 'warning'}>{said === 'delivered' ? 'Sent: delivered' : `Sent: ${said}`}</Text> : null}
+        <Box flexWrap="wrap" gap="xs">
+          {options.map((o, i) => (
+            <Button key={`need:${d.cli_session_id}:${i}`}
+              onPress={() => sendPinned($, d.cli_session_id, o.message).then(() => markAnswered($, d.cli_session_id))}>{o.label}</Button>
+          ))}
+          <Button key={'need-open:' + d.cli_session_id} onPress={() => openPinned($, d)}>Open</Button>
+        </Box>
+      </Box>
+    )
+  }
   const decisions = pendingDecisions(s)
   const open = new Set(decisions.map(d => d.id))
   // Answers whose card has gone: the message stays until newer answers push it out.
@@ -1348,6 +1468,8 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   const pinned = Array.isArray(s.desktop) ? s.desktop : []
   return (
     <Box flexDirection="column">
+      {needs.length ? heading(`Needs you ${needs.length}`) : null}
+      {needs.map(needCard)}
       {heading('Health')}
       <Text color={s.chief?.alive ? undefined : 'warning'}>{`Chief ${s.chief?.alive ? '● alive' : '○ down'} · ${beat}`}</Text>
       {s.budget?.unreadable
@@ -1359,6 +1481,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       {decisions.length || answered.length ? heading(`To decide ${decisions.length}`) : null}
       {decisions.map(decisionCard)}
       {answered.map(([id, a]) => <Text key={'answered:' + id} wrap="wrap">{a.message}</Text>)}
+      {inboxSection($, ui, bin, s, nowMs, drafts)}
       {heading(`Workers ${workers.length}`)}
       {workers.length === 0 ? <Text dimColor>No workers yet.</Text> : null}
       {workers.map(card)}
@@ -1366,6 +1489,21 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       {pinned.map(pinnedCard)}
     </Box>
   )
+}
+
+// This session's own card (hooks/floor.ts), written when its turn ends on an answer and cleared (`answer` null) when a
+// prompt is submitted here. Pinned sessions only, never the chief. Over budget nothing is asked or written.
+async function floorCard($: Dollar, configured: string, answer: string | null): Promise<void> {
+  if (role === 'chief') return
+  const id = await $.session.id()
+  if (!isPinned(lastStatus, id)) return
+  const bin = await motherBin($, configured)
+  if (answer === null) { await storeCard($, bin, id, NO_ASK); return }
+  if (overBudget(lastStatus)) return
+  const model = await triageModel($, bin)
+  const got = await askFloor($, model, String(answer ?? '').slice(-FLOOR_TAIL_MAX))
+  await recordSpend($, bin, model, got.usage)
+  await storeCard($, bin, id, got.reply)
 }
 
 // The pass state; a reload of the mod starts it over. register.tsx owns the timer: the engine's scan lets `$` reach
@@ -1411,7 +1549,8 @@ async function periodFor($: Dollar, bin: string, r: Role | null): Promise<number
 }
 
 // One timer pass, never two at once (a slow tick makes the next period a no-op). Role `chief`: tick, maybe wake,
-// reload. Role `console`: reload only, never tick or submit. Role unknown (its read failed): read it again and
+// reload. Role `console`: reload, and on the desktop surface `tick --as` (leadOnce), which leads only when no chief or
+// other console does; it never submits. Role unknown (its read failed): read it again and
 // reload; nothing ticks until it answers `chief`. Returns the new period when the role just settled, else null.
 export async function chiefPass($: Dollar, configured: string): Promise<number | null> {
   if (busy) return null
@@ -1426,7 +1565,9 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
     }
     if (role === 'console') {
       await snapshotPinned($, bin)
+      if (await onDesktop($)) await leadOnce($, bin)   // a terminal console only reads
       await reloadStatus($, bin)
+      await reloadFloor($, bin)                          // each session's card, for the pane's Needs you
       void refreshTldrs($, bin).catch(() => undefined)   // detached; refreshTldrs runs one batch at a time
       return null
     }
@@ -1447,8 +1588,17 @@ export function registerChief(on: On, configured: string): void {
     if (!e.agentId) turnStartedAt = await $.clock.now()
     return next(e)
   })
-  on('turn.complete', async (_$, e, next) => {
-    if (!e.agentId) turnStartedAt = null
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) {
+      turnStartedAt = null
+      // detached: the card's model call never delays the turn's end
+      if (e.reason === 'answer') void floorCard($, configured, e.answer).catch(() => undefined)
+    }
+    return next(e)
+  })
+  // The manager typed here: this session's question, if it had one, is answered. Detached as well.
+  on('prompt.submit', async ($, e, next) => {
+    void floorCard($, configured, null).catch(() => undefined)
     return next(e)
   })
 
@@ -1495,5 +1645,5 @@ export function registerChief(on: On, configured: string): void {
   on('ui.render', { component: 'Pane', requestId: CHIEF_PANE }, async ($, e) =>
     paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
       await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
-      await read($, chiefAnswersAtom)))
+      await read($, chiefAnswersAtom), await read($, floorAtom)))
 }
