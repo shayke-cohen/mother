@@ -679,9 +679,12 @@ class TestTickDecisions(Base):
     def cursor(self):
         return hub._hub_doc(self.ws).get("inbox_cursor")
 
-    def ledger(self, *runs):
+    def ledger(self, *runs, **seen):
+        """The uses, each with what the tool answered: a seen success unless `outcome` says otherwise (None: nothing seen)."""
+        seen = {"outcome": "ok", **seen}
         (self.ws / ".mother" / "ledger.json").write_text(json.dumps(
-            {"version": 1, "uses": [{"run": r, "scope": "chat-reply", "source": "x", "n": 1} for r in runs]}))
+            {"version": 1, "uses": [dict({"run": r, "scope": "chat-reply", "source": "x", "n": 1},
+                                         **{k: v for k, v in seen.items() if v}) for r in runs]}))
 
     def approve(self):
         decisions.answer(self.ws, self.CFG, AT, 1, "ok", "", {"via": "pane"})
@@ -1040,6 +1043,32 @@ class TestTickDecisions(Base):
         self.assertEqual(self.doc()["confirm"], ["✓ D1: the call was made (chat-reply on C00000001, thread_ts "
                                                  "1700000000.000100)"])
         self.assertEqual(self.delivered(), [])
+
+    def test_tick_never_ticks_a_call_whose_result_it_didnt_see(self):
+        self.file()
+        self.approve()
+        self.delivered()
+        self.ledger("chief:D1", outcome=None)  # a hook that didn't fire, or a use an older guard wrote
+        self.tick()
+        self.assertEqual(self.status(), "unconfirmed")
+        line = self.doc()["confirm"][0]
+        self.assertNotIn("✓", line)
+        self.assertIn("result wasn't seen", line)
+        self.assertEqual(self.delivered(), [])
+
+    def test_tick_closes_a_failed_send_and_tells_both(self):
+        self.file()
+        self.approve()
+        self.delivered()
+        self.ledger("chief:D1", outcome="failed", error="channel_not_found")
+        self.tick()
+        self.assertEqual(self.status(), "failed")
+        self.assertEqual(self.doc()["confirm"], [
+            "✗ D1: the send failed: channel_not_found (chat-reply on C00000001, thread_ts 1700000000.000100). The "
+            "approval is spent, so a retry needs a new decision."])
+        self.assertEqual([(e["source"], "channel_not_found" in e["text"], "new decision" in e["text"])
+                          for e in self.delivered()], [("decision", True, True)])
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")  # so it hears it
 
     def test_tick_flags_unused_grant(self):
         self.file()

@@ -541,8 +541,8 @@ def act(kind, category, what, **kw):
 
 
 def protected_paths(ctx):
-    ps = {os.path.join(HERE, "guard.py"), os.path.join(HERE, "guard_fast.py"), os.path.join(HERE, "hooks.json"),
-          os.path.join(os.path.expanduser("~"), ".mother", "workspace")}
+    ps = {os.path.join(HERE, "guard.py"), os.path.join(HERE, "guard_fast.py"), os.path.join(HERE, "guard_outcome.py"),
+          os.path.join(HERE, "hooks.json"), os.path.join(os.path.expanduser("~"), ".mother", "workspace")}
     if ctx.ws:
         m = os.path.join(ctx.ws, ".mother")
         ps |= {os.path.join(ctx.ws, "config.json"), os.path.join(m, "PAUSED"), os.path.join(m, "ledger.json"),
@@ -2036,8 +2036,8 @@ def shell_self_edit(cmd, run, cwd, ctx):
             or here.startswith(projects + os.sep) or here == sessions or here.startswith(sessions + os.sep) \
             or any(f and f in low for f in tforms):
         return "home_settings"
-    homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"], ["guard.py", "guard_fast.py", "hooks.json"],
-              "config")]
+    homes = [(os.path.dirname(HERE), [r"\$\{?claude_plugin_root\b", r"\.claude/plugins/"],
+              ["guard.py", "guard_fast.py", "guard_outcome.py", "hooks.json"], "config")]
     if ctx.ws:
         # a command that sets its own MOTHER_WORKSPACE / MOTHER_STATE_DIR is working on a test workspace
         test_ws = re.search(r"\b(?:mother_workspace|mother_state_dir)=", shell)
@@ -4127,8 +4127,10 @@ def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
                     used += r.get("n", 1) if isinstance(r.get("n", 1), int) else 1
             if used + n > cap:
                 continue
-            book["uses"].append({"at": now_iso(), "scope": scope, "target": target, "source": key, "n": n,
-                                 "run": g.get("run")})
+            use = {"at": now_iso(), "scope": scope, "target": target, "source": key, "n": n, "run": g.get("run")}
+            if g.get("draft_sha"):  # hooks/guard_outcome.py finds the use by it, and writes what the tool answered
+                use["draft_sha"] = g["draft_sha"]
+            book["uses"].append(use)
             led.write(book)
             whose = "the message" if scope == "answer" else \
                 "the manager's answer" if str(key).startswith("pane|") else "the manager's message"

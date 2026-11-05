@@ -2937,6 +2937,12 @@ class FastPath(GuardCase):
         self.expect("ask", "Bash", {"command": "sed -i '' 1d \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_fast.py\""},
                     mode="bypassPermissions")
 
+    def test_the_outcome_hook_is_one_of_the_guards_own_files(self):
+        self.expect("ask", "Write", {"file_path": os.path.join(ROOT, "hooks", "guard_outcome.py"), "content": ""},
+                    mode="bypassPermissions")
+        self.expect("ask", "Bash", {"command": "sed -i '' 1d \"${CLAUDE_PLUGIN_ROOT}/hooks/guard_outcome.py\""},
+                    mode="bypassPermissions")
+
     def test_odd_cwd_and_a_casefolded_key_folder(self):
         key = os.path.join(self.home, ".mother", "grant.key")
         os.makedirs(os.path.dirname(key))

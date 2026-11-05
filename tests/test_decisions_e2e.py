@@ -4,6 +4,7 @@ source, owner or signature handling drifts between them.
 Run: python3 -m unittest tests.test_decisions_e2e -v
 """
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -26,6 +27,7 @@ import grants  # noqa: E402
 import hub_sources  # noqa: E402
 
 GUARD = os.path.join(ROOT, "hooks", "guard.py")
+OUTCOME = os.path.join(ROOT, "hooks", "guard_outcome.py")
 MOTHER = os.path.join(ROOT, "bin", "mother")
 SIG = ":sparkles: *Agnes (AI)* · on behalf of Dana"
 POST = "mcp__chat__slack__post_message"
@@ -43,6 +45,13 @@ CONFIG = {"version": 1, "agent": {"name": "Agnes", "emoji": ":sparkles:", "manag
           "policy": {"autonomy": "functional", "shell_unasked": True, "shell_in_bypass": True, "bypass_passes_asks": True,
                      "auto_without_asking": ["own_dm", "drafts"], "needs_yes": ["any_message_to_others"],
                      "never": ["credentials"]}}
+
+# What a live post answered on 2026-11-05 (the channel doesn't exist), as a successful tool call, in the two forms a connector
+# hands it over; and what Slack answers a good post with (hooks/chief.test.tsx's postedOk, plus the message Slack echoes).
+PLAIN_REFUSAL = {"ok": False, "error": "channel_not_found", "warning": "missing_charset"}
+RECORDED_REFUSAL = {"data": {"ok": False, "error": "channel_not_found"}}
+BODY = "the-message-body-must-not-reach-a-file"
+SUCCESS = {"ok": True, "channel": TEAM, "ts": "1700000001.000200", "message": {"type": "message", "text": BODY}}
 
 # What a live self-DM stored, read back on 2026-11-05 (ids here are placeholders). Longest first: a family is one name.
 SLACK_EMOJI = (("\U0001F468\u200D\U0001F469\u200D\U0001F467", ":man-woman-girl:"), ("\U0001F44D\U0001F3FD", ":+1::skin-tone-4:"),
@@ -219,11 +228,155 @@ class Flow(unittest.TestCase):
         self.assertEqual([u["run"] for u in self.ledger()], ["chief:D1"])
         self.assertEqual(self.worker_call(REPLY), "deny")                       # a second use
 
+        self.tool_result(SUCCESS)
         self.settle()
         self.assertEqual(self.decision()["status"], "sent")
         doc = decisions.load(self.path)
         self.assertIn("✓ D1: the call was made", doc["confirm"][-1])
         self.assertIn(TEAM, doc["confirm"][-1])
+
+    # what the tool answered ---------------------------------------------------------------------------------------
+
+    def tool_result(self, response, inp=None, tool=POST, event="PostToolUse", raw=None):
+        """The real hook on a synthetic payload. Whatever it is fed, it must exit 0 and say nothing."""
+        payload = {"hook_event_name": event, "tool_name": tool, "tool_input": REPLY if inp is None else inp,
+                   "session_id": WORKER_SID, "cwd": self.ws, "tool_use_id": "toolu_0000"}
+        payload.update({"error": response, "is_interrupt": False} if event == "PostToolUseFailure"
+                       else {"tool_response": response})
+        p = subprocess.run([sys.executable, OUTCOME], input=json.dumps(payload) if raw is None else raw,
+                           capture_output=True, text=True, env=self.worker_env)
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "", ""))
+
+    def approved_call_made(self):
+        self.assertEqual(self.propose()[0], 0)
+        self.post_batch()
+        self.assertEqual(self.mother("decide", "answer", "1", "ok", "--via", "pane", env=self.chief_env)[0], 0)
+        self.assertIn(self.worker_call(REPLY), ("allow", "none"))
+
+    def closes_as_failed(self, response, code="channel_not_found", **kw):
+        self.approved_call_made()
+        self.tool_result(response, **kw)
+        self.settle()
+        self.assertEqual(self.decision()["status"], "failed")
+        line = decisions.load(self.path)["confirm"][-1]
+        self.assertTrue(line.startswith("✗ D1: the send failed: %s" % code), line)
+        self.assertIn(TEAM, line)
+        self.assertIn("new decision", line)
+        self.assertNotIn("✓", line)
+        notes = [e["text"] for e in chief._read_queue(self.path) if e["key"] == "PLAT-1"]
+        self.assertTrue(any(code in n and "new decision" in n for n in notes), notes)
+        self.assertEqual(self.worker_call(REPLY), "deny")  # a failure doesn't hand the use back
+
+    def test_a_refused_send_in_the_recorded_shape_closes_as_failed(self):
+        self.closes_as_failed(RECORDED_REFUSAL)
+
+    def test_a_refused_send_in_the_plain_shape_closes_as_failed(self):
+        self.closes_as_failed(PLAIN_REFUSAL)
+
+    def test_a_refused_send_as_mcp_text_closes_as_failed(self):
+        self.closes_as_failed([{"type": "text", "text": json.dumps(PLAIN_REFUSAL)}])
+
+    def test_an_mcp_error_result_closes_as_failed(self):
+        self.closes_as_failed({"content": [{"type": "text", "text": "Slack said no: " + BODY}], "isError": True},
+                              code="tool_error")
+
+    def test_a_tool_failure_event_closes_as_failed(self):
+        self.closes_as_failed("MCP error -32000: " + BODY, code="tool_error", event="PostToolUseFailure")
+
+    def test_a_seen_success_closes_as_sent(self):
+        for wrap in (lambda r: r, lambda r: {"data": r}, lambda r: [{"type": "text", "text": json.dumps(r)}]):
+            with self.subTest(shape=wrap(SUCCESS)):
+                self.setUp()
+                self.approved_call_made()
+                self.tool_result(wrap(SUCCESS))
+                self.settle()
+                self.assertEqual(self.decision()["status"], "sent")
+                self.assertTrue(decisions.load(self.path)["confirm"][-1].startswith("✓ D1: the call was made"))
+
+    def test_no_result_seen_is_never_a_tick(self):
+        """A hook that didn't fire, an older guard: the row says what's known."""
+        self.approved_call_made()
+        self.settle()
+        self.assertEqual(self.decision()["status"], "unconfirmed")
+        line = decisions.load(self.path)["confirm"][-1]
+        self.assertNotIn("✓", line)
+        self.assertIn("result wasn't seen", line)
+        self.assertIn(TEAM, line)
+        self.assertEqual(self.worker_call(REPLY), "deny")
+
+    def test_a_timeout_says_nothing_about_the_send(self):
+        self.approved_call_made()
+        self.tool_result("the MCP call timed out after 60s", event="PostToolUseFailure")
+        self.settle()
+        self.assertEqual(self.decision()["status"], "unconfirmed")
+        self.assertNotIn("✓", decisions.load(self.path)["confirm"][-1])
+
+    def test_an_answer_with_no_verdict_in_it_is_not_a_success(self):
+        for response in ("Done", "", {}, None, {"text": "message posted"}, [{"type": "text", "text": "posted"}]):
+            with self.subTest(response=response):
+                self.setUp()
+                self.approved_call_made()
+                self.tool_result(response)
+                self.settle()
+                self.assertEqual(self.decision()["status"], "unconfirmed")
+
+    def test_only_a_short_code_of_the_response_reaches_a_file(self):
+        for kw in ({"response": {"ok": True, "ts": "1700000001.000200", "message": {"text": BODY}}},
+                   {"response": {"ok": False, "error": BODY + " with several words"}},
+                   {"response": {"ok": False, "error": "x" * 500}},
+                   {"response": {"content": [{"type": "text", "text": BODY}], "isError": True}},
+                   {"response": BODY, "event": "PostToolUseFailure"}):
+            with self.subTest(**kw):
+                self.setUp()
+                self.approved_call_made()
+                self.tool_result(**kw)
+                self.settle()
+                self.assertTrue(self.ledger()[-1]["outcome"])
+                for folder, _, names in os.walk(self.ws):
+                    for name in names:
+                        with open(os.path.join(folder, name), errors="replace") as f:
+                            text = f.read()
+                        self.assertNotIn(BODY, text, name)
+                        self.assertNotIn("x" * 100, text, name)
+
+    def test_a_refusal_with_no_code_still_reads_as_a_failure(self):
+        self.closes_as_failed({"ok": False}, code="error")
+
+    def test_the_hook_binds_to_the_exact_call(self):
+        self.approved_call_made()
+        self.tool_result(PLAIN_REFUSAL, inp=dict(REPLY, text="another call"))
+        self.assertNotIn("outcome", self.ledger()[-1])
+        self.tool_result(PLAIN_REFUSAL, tool="mcp__other__slack__post_message")
+        self.assertNotIn("outcome", self.ledger()[-1])
+        self.tool_result(PLAIN_REFUSAL)
+        self.assertEqual((self.ledger()[-1]["outcome"], self.ledger()[-1]["error"]), ("failed", "channel_not_found"))
+        self.tool_result(SUCCESS)  # the first answer stands
+        self.assertEqual(self.ledger()[-1]["outcome"], "failed")
+
+    def test_the_hook_never_fails_a_tool(self):
+        self.tool_result(PLAIN_REFUSAL)  # no ledger at all
+        self.assertFalse(os.path.exists(os.path.join(self.ws, ".mother", "ledger.json")))
+        for raw in ("", "not json", "[]", "{}", '{"tool_name": 7}', '{"tool_name": "mcp__x__y", "tool_input": 3}'):
+            self.tool_result(None, raw=raw)
+        self.approved_call_made()
+        self.tool_result(None, raw='{"tool_name": "%s", "tool_input": {"text": 1}}' % POST)
+        self.assertNotIn("outcome", self.ledger()[-1])
+        path = os.path.join(self.ws, ".mother", "ledger.json")
+        with open(path, "w") as f:
+            f.write("{broken")
+        self.tool_result(PLAIN_REFUSAL)
+        with open(path) as f:
+            self.assertEqual(f.read(), "{broken")
+
+    def test_the_hook_computes_the_guards_hash(self):
+        spec = importlib.util.spec_from_file_location("guard_outcome_e2e", OUTCOME)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for inp in (REPLY, {"text": "שלום ✅", "n": 1, "a": [1, {"b": None}]}):
+            self.assertEqual(mod.draft_sha(POST, inp), decisions.guard.draft_sha(POST, inp))
+        # hub_sources.refused is the same rule on the plain form; the hook only also opens the wrappers
+        for shape in (PLAIN_REFUSAL, {"ok": False}, {"ok": True}):
+            self.assertEqual(mod.outcome_of(shape)[0] == "failed", bool(hub_sources.refused(shape)))
 
     def test_a_slack_reply_is_read_back_and_binds_the_same_call(self):
         self.propose()

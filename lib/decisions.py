@@ -32,7 +32,7 @@ _spec.loader.exec_module(guard)
 
 USAGE = __doc__.split("\n\n")[1].rstrip()
 KINDS = ("chat-post", "chat-reply", "tracker-create", "tracker-comment", "tracker-transition")
-STATUSES = ("pending", "approved", "rejected", "redirected", "expired", "sent", "failed", "manual")
+STATUSES = ("pending", "approved", "rejected", "redirected", "expired", "sent", "failed", "unconfirmed", "manual")
 SIGNED_KINDS = ("chat-post", "chat-reply", "tracker-comment")  # the kinds run_grant_scope wants a signature on
 TOP_TEXT_KEYS = ("text", "message", "body", "comment", "markdown", "content")
 NESTED_TEXT_KEYS = ("text", "body", "comment", "commentBody", "content")
@@ -807,24 +807,49 @@ def _log(ws: Path, msg: str) -> None:
         pass
 
 
-def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: set, live: dict, busy: set, queue: list,
+def _close_made(ws: Path, doc: dict, d: dict, at: datetime, use: dict, w: Optional[dict]) -> None:
+    """Close a decision whose call the guard let through, by what the tool answered (`hooks/guard_outcome.py`). Only a
+    seen success is `sent` and gets a tick. A failure says so to the manager and the worker. No answer, or one that says
+    neither, is `unconfirmed`: a use proves the guard passed the call, and another plugin's hook could still have
+    stopped it, so the line doesn't say it went out. In every case the grant stays spent."""
+    did, key = d.get("id"), d.get("key")
+    call = "%s on %s" % (d.get("kind"), plain_target(d))
+    if use.get("outcome") == "ok":
+        d["status"] = "sent"
+        doc["confirm"].append("✓ %s: the call was made (%s)" % (did, call))
+        save(ws, doc)
+    elif use.get("outcome") == "failed":
+        code = chief.safe_line(use.get("error") or "error", 60)
+        d.update(status="failed", error=code)
+        doc["confirm"].append("✗ %s: the send failed: %s (%s). The approval is spent, so a retry needs a new decision."
+                              % (did, code, call))
+        save(ws, doc)
+        if w is not None:
+            chief.enqueue(ws, at, key, "%s: the call you made failed: %s, so nothing went out. That approval is spent: "
+                                       "to try again, file a new decision." % (did, code), "decision")
+            _resume(ws, key)
+    else:
+        d["status"] = "unconfirmed"
+        doc["confirm"].append("%s: the guard let the call through, but its result wasn't seen, so it may not have gone "
+                              "out (%s). Check it before you count on it." % (did, call))
+        save(ws, doc)
+
+
+def _close_one(ws: Path, doc: dict, d: dict, at: datetime, used: dict, live: dict, busy: set, queue: list,
                cfg: Optional[dict] = None) -> None:
-    """Close one approved decision when what happened to it is known. The ledger proves the guard let the call through,
-    not that the service accepted it, so the wording says only that."""
+    """Close one approved decision when what happened to it is known. `used`: the ledger's uses, by run."""
     did, key = d.get("id"), d.get("key")
     w = live.get(key)
     waiting = any(e.get("key") == key and e.get("source") == "decision"
                   and str(e.get("text")).startswith("%s approved by" % did) for e in queue)
-    made = "chief:%s" % did in used
-    if made and waiting:  # the grant is spent, so "make this call" can only be refused: it mustn't hold this open
+    use = used.get("chief:%s" % did)
+    if use is not None and waiting:  # the grant is spent, so "make this call" can only be refused: it mustn't hold this open
         chief.drop_queued(ws, key, "%s approved by" % did)
         waiting = False
     ended = w is None or not (key in busy or w.get("status") == "working" or waiting)
-    if made:
+    if use is not None:
         if ended:
-            d["status"] = "sent"
-            doc["confirm"].append("✓ %s: the call was made (%s on %s)" % (did, d.get("kind"), plain_target(d)))
-            save(ws, doc)
+            _close_made(ws, doc, d, at, use, w)
         return
     ends = guard.parse_time(d.get("grant_expires"))
     if ends is None:
@@ -890,7 +915,7 @@ def settle(ws: Path, at: datetime, cfg: Optional[dict] = None) -> None:
             book = led.read()
         if book is None:
             return
-        used = {r.get("run") for r in book["uses"] if isinstance(r, dict) and isinstance(r.get("run"), str)}
+        used = {r["run"]: r for r in book["uses"] if isinstance(r, dict) and isinstance(r.get("run"), str)}
         # the queue first: a run that claims an approval between the reads then shows as running, never as ended
         queue = chief._read_queue(ws)
         live, busy = chief.workers(ws), set(chief.running(ws))
