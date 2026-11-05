@@ -709,7 +709,7 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
         if after_no and d.get("status") == "rejected":
             chief.enqueue(ws, at, key, "The manager's words about %s, their instruction to you: %s" % (did, payload),
                           "decision")
-            return True, "%s: your words went to %s." % (did, key)
+            return True, _words_line(ws, cfg, at, did, key)
         if d.get("status") == "pending":
             exp = guard.parse_time(d.get("expires"))
             if exp is not None and at.timestamp() >= exp:
@@ -767,11 +767,11 @@ def _answer(ws: Path, cfg: dict, at: datetime, n: int, verb: str, payload: str, 
         else:
             d.update(status="redirected", answer=rec)
             text = "The manager's words about %s, their instruction to you: %s" % (did, payload)
-            result = "%s: your words went to %s." % (did, key)
+            result = None
         save(ws, doc)
         chief.enqueue(ws, at, key, text, "decision")
         _resume(ws, key, answered=verb == "say")
-        return True, result
+        return True, result or _words_line(ws, cfg, at, did, key)
 
 
 def _reason(w: dict) -> str:
@@ -779,15 +779,27 @@ def _reason(w: dict) -> str:
     return chief.safe_line(w.get("progress"), chief.PROGRESS_MAX)
 
 
-def _approved_line(ws: Path, cfg: dict, at: datetime, did: str, key: str) -> str:
-    """An approval's result, which promises the call only when a run can start. Saying so can't undo the approval."""
+def _cant_run(ws: Path, cfg: dict, at: datetime, did: str, key: str) -> Optional[str]:
+    """Why no run can start for `key` now, or None. Saying so can't undo the answer it's said about."""
     try:
         w = chief.workers(ws).get(key) or {}
-        why = "it's held" if w.get("held") else "its last run stopped: %s" % _reason(w) if chief.stopped_by_limit(w) \
+        return "it's held" if w.get("held") else "its last run stopped: %s" % _reason(w) if chief.stopped_by_limit(w) \
             else chief.refusal(ws, cfg, at)
     except Exception as e:
-        _log(ws, "approved %s: %r" % (did, e))
-        why = None
+        _log(ws, "answered %s: %r" % (did, e))
+        return None
+
+
+def _words_line(ws: Path, cfg: dict, at: datetime, did: str, key: str) -> str:
+    why = _cant_run(ws, cfg, at, did, key)
+    if why:
+        return "%s: your words are waiting for %s, which can't run yet (%s)." % (did, key, why)
+    return "%s: your words went to %s." % (did, key)
+
+
+def _approved_line(ws: Path, cfg: dict, at: datetime, did: str, key: str) -> str:
+    """An approval's result, which promises the call only when a run can start."""
+    why = _cant_run(ws, cfg, at, did, key)
     if why:
         return "%s approved, but %s can't run yet (%s). If that outlasts the approval, nothing goes out, and a later " \
                "batch says so." % (did, key, why)

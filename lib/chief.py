@@ -351,11 +351,15 @@ def rest_status(ws: Path, key: str) -> str:
 
 
 NO_RESULT = "no result from claude"
+NO_WORDS = "claude reported an error"
 # A run these stopped would only stop again: a usage or spend limit, an expired login. Read from a failed worker's
 # `progress`, which then holds the error and nothing a model wrote.
 LIMIT_STOP = re.compile(r"(?:spend|usage|rate|credit|session|weekly|daily|monthly|overage)[ _-]limit"
                         r"|hit your (?:\w+ ){0,2}limit|credit balance"
                         r"|/login|not logged in|authenticat|invalid api key|\b40[13]\b", re.I)
+
+
+APPROVAL_NOTE = re.compile(r"^D\d+ approved by ")
 
 
 def stopped_by_limit(w: dict) -> bool:
@@ -372,7 +376,7 @@ def _error_of(e: dict) -> str:
     if errs:
         return "; ".join(errs)
     sub = e.get("subtype")
-    return sub if isinstance(sub, str) and sub and sub != "success" else "claude reported an error"
+    return sub if isinstance(sub, str) and sub and sub != "success" else NO_WORDS
 
 
 def parse_stream(stdout: str) -> Tuple[str, float, Optional[str]]:
@@ -475,7 +479,7 @@ def _exec(ws: Path, w: dict, key: str, prompt: str, first: bool, model: str, tim
     result, cost, error = parse_stream(out)
     if p.returncode != 0 and error is None:
         error = (err or "").strip()[-300:] or "claude exited %d" % p.returncode
-    elif error and p.returncode != 0 and (err or "").strip() and (error == NO_RESULT or error.startswith("error_")):
+    elif error and p.returncode != 0 and (err or "").strip() and (error in (NO_RESULT, NO_WORDS) or error.startswith("error_")):
         error = (err or "").strip()[-300:]  # the stream had no words for it; a message it had beats stderr's noise
     return result, cost, error, session_seen(out)
 
@@ -557,7 +561,7 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
         claim = _claim(ws, key, prompt)
         if claim is None:
             return busy("held")
-        w, pending = claim
+        w, pending, taken = claim
         if not pending:
             print("nothing to run for %s" % key)
             return EXIT_USAGE
@@ -578,6 +582,8 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
             if cost:
                 add_spend(ws, at, tz, cost)
             if error:
+                if not started or LIMIT_STOP.search(error):
+                    _put_back(ws, taken or [{"key": key, "text": pending, "source": "say", "at": hub._iso(at)}])
                 print("%s failed: %s" % (key, error))
                 return EXIT_FAILED
             first = False
@@ -590,7 +596,7 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
             claim = _claim(ws, key, "")
             if claim is None:
                 break
-            w, pending = claim
+            w, pending, taken = claim
         return EXIT_OK
     except KeyError:
         print("%s was dropped while running" % key)
@@ -599,15 +605,26 @@ def run(ws: Path, cfg: dict, at: datetime, key: str, prompt: str = "", title: st
         lock.close()
 
 
+def _put_back(ws: Path, entries: List[dict]) -> None:
+    """A run that stopped on a limit, or never started, did nothing with the words it took: back to the head of the queue,
+    for the worker's next run. An approval stays out, because `settle` closes its row. Written directly: `enqueue(...,
+    "say")` would reset the failure, and every tick would then run the worker again. A run that crashed after it started
+    keeps what it took, since it may have acted on it."""
+    back = [e for e in entries if not (e.get("source") == "decision" and APPROVAL_NOTE.match(str(e.get("text"))))]
+    if back:
+        with hub.locked(ws):
+            _write_queue(ws, back + _read_queue(ws))
+
+
 def _claim(ws: Path, key: str, prompt: str):
-    """One atomic step before a turn: None if the worker is held, else (worker, text). The text is `prompt`, or
-    the queued entries (taken) when there is none. status becomes "working" only when there is text to run."""
+    """One atomic step before a turn: None if the worker is held, else (worker, text, the entries taken). The text is
+    `prompt`, or the queued entries (taken) when there is none. status becomes "working" only when there is text to run."""
     with hub.locked(ws):
         doc = hub._sessions_doc(ws)
         w = _live_cli(doc, key)
         if w.get("held"):
             return None
-        text = prompt
+        text, mine = prompt, []
         if not text:
             q = _read_queue(ws)
             mine = [e for e in q if e.get("key") == key]
@@ -617,7 +634,7 @@ def _claim(ws: Path, key: str, prompt: str):
         if text:
             w["status"] = "working"
             hub.save_json(ws, "sessions.json", doc)
-        return w, text
+        return w, text, mine
 
 
 def _join(entries: List[dict]) -> str:

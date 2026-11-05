@@ -339,6 +339,51 @@ class Flow(unittest.TestCase):
                         self.assertNotIn(BODY, text, name)
                         self.assertNotIn("x" * 100, text, name)
 
+    def test_a_result_event_with_no_response_says_nothing(self):
+        """JSON drops an undefined response: nothing is known, so no ✗ either."""
+        self.approved_call_made()
+        self.tool_result(None, raw=json.dumps({"hook_event_name": "PostToolUse", "tool_name": POST, "tool_input": REPLY}))
+        self.assertEqual(self.ledger()[-1]["outcome"], "unclear")
+        self.settle()
+        self.assertEqual(self.decision()["status"], "unconfirmed")
+
+    def test_a_dropped_connection_never_says_nothing_went_out(self):
+        for text in ("Connection closed", "MCP error -32000: Connection closed", "socket hang up", "read ECONNRESET",
+                     "TypeError: fetch failed", "connection reset by peer", "write EPIPE", "stream closed"):
+            with self.subTest(text=text):
+                self.setUp()
+                self.approved_call_made()
+                self.tool_result(text, event="PostToolUseFailure")
+                self.settle()
+                self.assertEqual(self.decision()["status"], "unconfirmed")
+                self.assertEqual([e for e in chief._read_queue(self.path) if "nothing went out" in e["text"]], [])
+                self.assertNotIn("nothing went out", decisions.load(self.path)["confirm"][-1])
+
+    def test_a_call_that_never_connected_is_a_failure(self):
+        self.closes_as_failed("connect ECONNREFUSED 127.0.0.1:1", code="tool_error", event="PostToolUseFailure")
+
+    def test_the_answer_goes_on_the_newest_use_of_that_call(self):
+        """A worker files the same call again after an unconfirmed: the old row has had its say."""
+        self.approved_call_made()
+        self.settle()
+        self.assertEqual(self.decision()["status"], "unconfirmed")
+        self.assertEqual(self.propose()[0], 0)
+        self.post_batch()
+        self.assertEqual(self.mother("decide", "answer", "2", "ok", "--via", "pane", env=self.chief_env)[0], 0)
+        self.assertIn(self.worker_call(REPLY), ("allow", "none"))
+        self.tool_result(SUCCESS)
+        self.assertEqual([(u["run"], u.get("outcome")) for u in self.ledger()], [("chief:D1", None), ("chief:D2", "ok")])
+        self.settle()
+        self.assertEqual(self.decision("D2")["status"], "sent")
+
+    def test_the_hook_takes_the_guards_own_ledger_lock(self):
+        self.approved_call_made()
+        with decisions.guard.Ledger(self.ws):  # held: it gives up, and no outcome is the honest record
+            self.tool_result(PLAIN_REFUSAL)
+            self.assertNotIn("outcome", self.ledger()[-1])
+        self.tool_result(PLAIN_REFUSAL)
+        self.assertEqual(self.ledger()[-1]["outcome"], "failed")
+
     def test_a_refusal_with_no_code_still_reads_as_a_failure(self):
         self.closes_as_failed({"ok": False}, code="error")
 
@@ -377,6 +422,22 @@ class Flow(unittest.TestCase):
         # hub_sources.refused is the same rule on the plain form; the hook only also opens the wrappers
         for shape in (PLAIN_REFUSAL, {"ok": False}, {"ok": True}):
             self.assertEqual(mod.outcome_of(shape)[0] == "failed", bool(hub_sources.refused(shape)))
+        # an error beside a wrapper is an error, whatever the wrapper says: a tool can echo a draft into `content`
+        self.assertEqual(mod.outcome_of({"error": "denied", "data": {"ok": True}}), ("failed", "denied"))
+        self.assertEqual(mod.outcome_of({"error": "bad", "content": '{"ok":true}'}), ("failed", "bad"))
+        self.assertEqual(mod.outcome_of({"ok": True, "success": False}), ("failed", "error"))
+        # what it made says nothing when the answer says it failed, or isn't what a write makes
+        for shape in ({"id": "r1", "status": "failed"}, {"id": "r1", "status": "ERROR"}, {"id": "r1", "statusCode": 400},
+                      {"id": "r1", "status": 500}, {"id": "r1", "statusCode": "403"},
+                      {"key": "validation.required", "message": "needed"}, {"issueKey": "not a key"}):
+            self.assertEqual(mod.outcome_of(shape), ("unclear", None), shape)
+        # real answers still read as what they are (a live replay: Jira comment, Jira create, Slack)
+        for shape in ({"id": "10001", "body": "x"}, {"id": "10001", "key": "PLAT-12", "self": "https://x/1"},
+                      {"id": "r1", "status": "done", "statusCode": 201}, {"ok": True, "ts": "1.2"},
+                      {"id": "10001", "errors": {}, "errorMessages": []}):
+            self.assertEqual(mod.outcome_of(shape), ("ok", None), shape)
+        # a transition answers with empty text on success, and stays unconfirmed until something reads the status back
+        self.assertEqual(mod.outcome_of([{"type": "text", "text": ""}]), ("unclear", None))
 
     def test_a_slack_reply_is_read_back_and_binds_the_same_call(self):
         self.propose()

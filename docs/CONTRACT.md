@@ -1313,7 +1313,8 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   it is the worker's prompt): the chief records it as `route` after `run --detach`, and it is delivered once. It
   then starts queued, unheld, non-failed workers within `max_workers`, unless today's budget is spent or
   `spend.json` is unreadable (then nothing starts until the day rolls or the file reads again). A failed worker stays
-  failed, with what's queued kept for its next run, until it gets new input: a `say`, `run` or `release`, or the
+  failed, with what's queued kept for its next run (a run that stopped on a limit or never started puts back what it took,
+  below), until it gets new input: a `say`, `run` or `release`, or the
   manager's yes or words on one of its decisions. A note about a failure (a closed decision, an expiry) or a routed line
   is not new input, and a filing doesn't clear a failure. The exception to the manager's answer: a run stopped by a
   limit (below) would only stop again, so it stays failed, the approval line says why, and the approval rides with the
@@ -1325,7 +1326,12 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
   shows it in place of the TL;DR while the worker is failed. A **limit** is a usage, spend or rate limit, or a login
   that's gone (`chief.stopped_by_limit`, on the text of that reason). It reaches the DM only through a decision: the lines
   for an approval it stopped carry the reason. A failed worker with no decision open shows on its card and nowhere else.
-  Detecting one, pausing the workers and sending one DM is the design's Phase 3 and isn't built.
+  Detecting one, pausing the workers and sending one DM is the design's Phase 3 and isn't built. A run that stopped on a
+  limit or never started did nothing with its words, so they go back to the head of the queue for its next run, and the
+  worker stays failed: the write is direct, because a `say` through `enqueue` would reset the failure and every tick would
+  run it again. A `<D> approved by` entry stays out, since `settle` closes that row. A run that crashed after it started
+  keeps what it took: it may have acted on it. Manager's words on a decision for a worker that can't run say they are
+  waiting, and why, not that they went to it.
 - **Triage.** Before a wake, the mod asks the model (`chief.triage_model`, `$.model.complete`, 20 s timeout, 300 tokens) for a verdict
   `{is_work, needs_attention, title, tldr}` per judge line (never for a `manual` line or one whose key has a live
   session) and passes them to `mother chief triage --stdin`, which logs the leading lines that need no judgment
@@ -1556,8 +1562,13 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     PostToolUseFailure for `mcp__…`, writes onto that use what the tool answered: `outcome` `ok`, `failed` or `unclear`, and
     `error`, a short code (`[A-Za-z][A-Za-z0-9_.-]{0,59}`, else `error` or `tool_error`). No other part of a response reaches
     any file. `failed` is `ok: false`, `success: false`, an MCP `isError` result, a failure event or an `error` field,
-    bare or under `data`, `result` or MCP text. `ok` is `ok: true` or an answer carrying what it made (`ts`, `id`, `key`).
-    `unclear` is anything else: words, an empty answer, a timeout or an interrupt, after which the send may have landed.
+    bare or under `data`, `result` or MCP text, and a failure at a level beats a success in its wrappers. `ok` is `ok: true`,
+    or an answer carrying what it made (`ts`, `id`, an issue key such as `PLAT-12`) unless its `status` or `statusCode`
+    says it failed. `unclear` is anything else: words, an empty answer, a result event with no response, a timeout, an
+    interrupt or a connection dropped mid-call (`Connection closed`, `socket hang up`, `ECONNRESET`, `fetch failed`), after
+    which the send may have landed. A connection refused is `failed`: that call never left. A tracker transition answers
+    with empty text when it works, so an approved transition closes `unconfirmed`, never `sent`, until something reads
+    the status back. A second use of one call takes the answer on the newest.
     It leaves in one small read when no use is waiting, never loads `guard.py`, always exits 0, prints nothing, and gives
     up after 2 s on the lock. With the worker's run ended: a seen success is `sent`, `✓ D<n>: the call was made (<kind> on
     <target>)`. A seen failure is `failed`, `✗ D<n>: the send failed: <code> (<kind> on <target>). The approval is spent,

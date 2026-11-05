@@ -29,10 +29,17 @@ DEADLINE_SECONDS = 5  # hooks.json allows 10
 LOCK_SECONDS = 2      # the ledger's lock is held for one read and write: past this, no outcome is the honest record
 DEPTH = 4
 ERROR_CODE = re.compile(r"^[A-Za-z][A-Za-z0-9_.\-]{0,59}$")
-UNSURE = re.compile(r"time[ -]?d? ?out|interrupt|abort|cancel", re.I)  # the send may still have landed
+# The call may have reached the service and the answer been lost, so the send may have landed. Not a refused connection:
+# that call never left.
+UNSURE = re.compile(r"time[ -]?d? ?out|interrupt|abort|cancel|connection (?:closed|reset|lost|dropped|terminated)"
+                    r"|socket hang ?up|econnreset|epipe|broken pipe|fetch failed|(?:stream|socket) (?:closed|ended)"
+                    r"|premature close", re.I)
 WRAPPERS = ("data", "result", "structuredContent", "structured_content", "response", "content")
 ERROR_KEYS = ("error", "errors", "errorMessages", "error_message")
-FOUND_KEYS = ("ts", "id", "key", "issueKey", "issue_key")  # a write answered with what it made
+FOUND_KEYS = ("ts", "id")  # a write answered with what it made
+TRACKER_KEYS = ("key", "issueKey", "issue_key")
+TRACKER_KEY = re.compile(r"^[A-Z][A-Z0-9_]*-\d+$")  # `key` alone can be a validation error's name
+BAD_STATUS = {"fail", "failed", "failure", "error", "errored", "rejected", "denied", "refused", "invalid"}
 
 
 def draft_sha(tool, inp):
@@ -55,9 +62,30 @@ def _tool_error(text):
     return ("unclear", None) if UNSURE.search(blob) else ("failed", "tool_error")
 
 
+def _bad_status(resp):
+    """`status` or `statusCode` says this answer failed."""
+    for v in (resp.get("status"), resp.get("statusCode")):
+        if isinstance(v, str) and v.strip().isdigit():
+            v = int(v)
+        if isinstance(v, str) and v.strip().lower() in BAD_STATUS:
+            return True
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 400:
+            return True
+    return False
+
+
+def _found(resp):
+    """The answer carries what a write made, and nothing says it failed."""
+    if _bad_status(resp):
+        return False
+    return any(resp.get(k) for k in FOUND_KEYS) \
+        or any(isinstance(resp.get(k), str) and TRACKER_KEY.match(resp[k]) for k in TRACKER_KEYS)
+
+
 def outcome_of(resp, depth=0):
     """("ok" | "failed" | "unclear", short code or None). Success is only what says so: `ok: true`, or a write's answer
-    carrying what it made. Words or an empty answer are "unclear"."""
+    carrying what it made. Words or an empty answer are "unclear". A failure anywhere at this level beats a success in
+    a wrapper: a tool can echo a draft into `content`."""
     if depth > DEPTH:
         return "unclear", None
     if isinstance(resp, str):
@@ -73,20 +101,19 @@ def outcome_of(resp, depth=0):
         return "unclear", None
     if resp.get("isError") is True or resp.get("is_error") is True:
         return _tool_error(resp.get("content", resp.get("error", "")))
-    for flag in ("ok", "success"):
-        if resp.get(flag) is False:
-            return "failed", _code(resp.get("error"))
-        if resp.get(flag) is True:
-            return "ok", None
+    if resp.get("ok") is False or resp.get("success") is False:
+        return "failed", _code(resp.get("error"))
+    for k in ERROR_KEYS:
+        if resp.get(k):
+            return "failed", _code(resp[k])
+    if resp.get("ok") is True or resp.get("success") is True:
+        return "ok", None
     for k in WRAPPERS:
         if isinstance(resp.get(k), (dict, list, str)):
             found = outcome_of(resp[k], depth + 1)
             if found[0] != "unclear":
                 return found
-    for k in ERROR_KEYS:
-        if resp.get(k):
-            return "failed", _code(resp[k])
-    return ("ok", None) if any(resp.get(k) for k in FOUND_KEYS) else ("unclear", None)
+    return ("ok", None) if _found(resp) else ("unclear", None)
 
 
 def _workspace():
@@ -98,7 +125,7 @@ def _workspace():
 
 
 def _waiting(uses, sha=None):
-    """The uses still waiting for a result, the guard's order (oldest first), of one call when `sha` is given."""
+    """The uses still waiting for a result, the guard's order (newest last), of one call when `sha` is given."""
     return [r for r in uses if isinstance(r, dict) and r.get("draft_sha") and "outcome" not in r
             and (sha is None or r["draft_sha"] == sha)]
 
@@ -136,10 +163,12 @@ def record(raw):
     if not _waiting(_read_uses(path)[1]):
         return
     sha = draft_sha(tool, inp)
-    if p.get("hook_event_name") == "PostToolUseFailure" or "tool_response" not in p:
+    if p.get("hook_event_name") == "PostToolUseFailure":
         seen, code = ("unclear", None) if p.get("is_interrupt") else _tool_error(p.get("error", ""))
-    else:
+    elif "tool_response" in p:
         seen, code = outcome_of(p["tool_response"])
+    else:  # JSON drops an undefined response: nothing is known
+        seen, code = "unclear", None
     lock = _lock(folder)
     if lock is None:
         return
@@ -147,9 +176,10 @@ def record(raw):
         doc, uses = _read_uses(path)
         mine = _waiting(uses, sha)
         if mine:
-            mine[0]["outcome"] = seen
+            # the newest: an older one still waiting is a call that was never answered, and has already closed
+            mine[-1]["outcome"] = seen
             if code:
-                mine[0]["error"] = code
+                mine[-1]["error"] = code
             tmp = path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(doc, f, indent=1)

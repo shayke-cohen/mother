@@ -506,6 +506,13 @@ class TestRunFailure(Base):
             self.run_()
         self.assertEqual(chief.workers(self.ws)["PLAT-1"]["progress"], SPEND_LIMIT)
 
+    def test_stderr_beats_the_generic_line_on_a_non_zero_exit(self):
+        (self.ws / "bare.json").write_text(json.dumps({"type": "result", "subtype": "success", "is_error": True}))
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_EVENT_FILE": str(self.ws / "bare.json"),
+                                          "FAKE_CLAUDE_STDERR": "the real reason\n"}):
+            self.run_()
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["progress"], "the real reason")
+
     def test_stderr_still_explains_a_run_with_no_message(self):
         with mock.patch.dict(os.environ, {"FAKE_CLAUDE_STDERR": "the real reason\n"}):
             os.environ.pop("FAKE_CLAUDE_EVENT_FILE")
@@ -521,6 +528,97 @@ class TestRunFailure(Base):
                       "the limit of the file was hit"):
             self.assertFalse(chief.stopped_by_limit({"status": "failed", "progress": other}), other)
         self.assertFalse(chief.stopped_by_limit({"status": "idle", "progress": SPEND_LIMIT}))
+
+
+class TestWordsSurviveALimit(Base):
+    """A run that stopped on a limit, or never started, took its words from the queue: they go back, and that restarts
+    nothing. `enqueue(..., "say")` would have reset the failure, and every tick would have run it again."""
+
+    def setUp(self):
+        super().setUp()
+        self.log = self.ws / "claude.log"
+        p = mock.patch.dict(os.environ, {"MOTHER_CLAUDE_BIN": FAKE, "FAKE_CLAUDE_LOG": str(self.log),
+                                         "FAKE_CLAUDE_EVENT_FILE": SPEND_FIXTURE, "FAKE_CLAUDE_EXIT": "1"})
+        p.start()
+        self.addCleanup(p.stop)
+        chief.register_worker(self.ws, AT, "PLAT-1", "t")
+
+    def run_(self, prompt=""):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return chief.run(self.ws, {}, AT, "PLAT-1", prompt=prompt)
+
+    def queue(self):
+        return [(e["source"], e["text"]) for e in chief._read_queue(self.ws)]
+
+    def test_a_say_after_a_limit_survives_and_the_worker_stays_failed(self):
+        chief.enqueue(self.ws, AT, "PLAT-1", "the words", "say")
+        self.assertEqual(self.run_(), chief.EXIT_FAILED)
+        self.assertEqual(self.queue(), [("say", "the words")])
+        w = chief.workers(self.ws)["PLAT-1"]
+        self.assertEqual((w["status"], w["progress"]), ("failed", SPEND_LIMIT))
+
+    def test_no_restart_loop(self):
+        chief.enqueue(self.ws, AT, "PLAT-1", "the words", "say")
+        self.run_()
+        with mock.patch.object(chief, "run", return_value=0) as run:
+            for i in range(3):
+                self.assertEqual(chief.tick(self.ws, {}, AT + timedelta(minutes=i))["dispatched"], [])
+        run.assert_not_called()
+        self.assertEqual(chief.queued(self.ws).get("PLAT-1"), 1)
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+
+    def test_the_next_say_carries_the_kept_words_first(self):
+        chief.enqueue(self.ws, AT, "PLAT-1", "the first words", "say")
+        self.run_()
+        chief.enqueue(self.ws, AT, "PLAT-1", "the second words", "say")
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "idle")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("FAKE_CLAUDE_EVENT_FILE")
+            os.environ.pop("FAKE_CLAUDE_EXIT")
+            self.assertEqual(self.run_(), chief.EXIT_OK)
+        said = json.loads(self.log.read_text().splitlines()[-1])["stdin"]
+        self.assertLess(said.index("the first words"), said.index("the second words"))
+        self.assertEqual(self.queue(), [])
+
+    def test_a_direct_prompt_survives_too(self):
+        self.run_("do the thing")
+        self.assertEqual(self.queue(), [("say", "do the thing")])
+
+    def test_they_go_back_at_the_head(self):
+        chief.enqueue(self.ws, AT, "PLAT-1", "the words", "say")
+        real = chief._exec
+
+        def later_say(*a):
+            got = real(*a)
+            chief.enqueue(self.ws, AT, "PLAT-1", "typed during the run", "route")
+            return got
+        with mock.patch.object(chief, "_exec", later_say):
+            self.run_()
+        self.assertEqual(self.queue(), [("say", "the words"), ("route", "typed during the run")])
+
+    def test_an_approval_stays_out_so_its_row_can_close(self):
+        chief.enqueue(self.ws, AT, "PLAT-1", "D7 approved by the manager. Make exactly this one call now", "decision")
+        chief.enqueue(self.ws, AT, "PLAT-1", "D8 was rejected by the manager. Don't make that call.", "decision")
+        chief.enqueue(self.ws, AT, "PLAT-1", "the words", "say")
+        self.run_()
+        self.assertEqual(self.queue(), [("decision", "D8 was rejected by the manager. Don't make that call."),
+                                        ("say", "the words")])
+
+    def test_a_run_that_never_started_keeps_them(self):
+        with mock.patch.dict(os.environ, {"MOTHER_CLAUDE_BIN": str(self.ws / "no-such-claude")}):
+            chief.enqueue(self.ws, AT, "PLAT-1", "the words", "say")
+            self.run_()
+        self.assertEqual(self.queue(), [("say", "the words")])
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["status"], "failed")
+
+    def test_a_crash_after_it_started_doesnt_put_them_back(self):
+        """It may have acted on them already."""
+        (self.ws / "crash.json").write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                                        "is_error": True, "session_id": "s", "errors": ["boom"]}))
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_EVENT_FILE": str(self.ws / "crash.json")}):
+            chief.enqueue(self.ws, AT, "PLAT-1", "the words", "say")
+            self.run_()
+        self.assertEqual(self.queue(), [])
 
 
 class TestHeader(unittest.TestCase):
@@ -1220,6 +1318,15 @@ class TestTickDecisions(Base):
         decisions.answer(self.ws, self.CFG, AT, 1, "say", "make it shorter", {"via": "pane"})
         self.tick()
         self.assertEqual([c.args[3] for c in chief.run.call_args_list], ["PLAT-1"])
+
+    def test_words_for_a_worker_stopped_by_a_limit_say_they_wait(self):
+        self.file()
+        chief.update_worker(self.ws, "PLAT-1", status="failed", progress=SPEND_LIMIT)
+        msg = decisions.answer(self.ws, self.CFG, AT, 1, "say", "make it shorter", {"via": "pane"})
+        self.assertNotIn("went to", msg)
+        self.assertIn("waiting", msg)
+        self.assertIn("spend limit", msg)
+        self.assertEqual(chief.queued(self.ws).get("PLAT-1"), 1)
 
     def test_a_no_for_a_failed_worker_doesnt_restart_it(self):
         self.file()
@@ -2917,7 +3024,9 @@ class TestFinalReviewFixes(Base):
         argv = self.calls()[0]["argv"]
         self.assertIn("--session-id", argv)
         self.assertTrue(self.calls()[0]["stdin"].startswith("You are a MOTHER worker for PLAT-1"))
-        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["runs"], 1)
+        # the words of the run that never started were kept, and ride as its next turn
+        self.assertIn("go", self.calls()[1]["stdin"])
+        self.assertEqual(chief.workers(self.ws)["PLAT-1"]["runs"], 2)
 
     # minor 12: two keys with one slug never share a run lock or a log
     def test_run_names_differ_for_keys_with_one_slug(self):
