@@ -177,7 +177,7 @@ wakes on each update and routes it. `mother hub status` shows whether the watche
 session that stopped on a question, with its options as buttons), the hub's **Inbox** (what the inbox lines came
 to, with Done, Snooze and Open session), your **pinned desktop sessions** (a two-line TL;DR, a chat box, a
 recommended reply as a chip you still press Send on, Open), under a header strip with the counts, today's budget
-and who leads. Tabs pick one group at a time (`/chief tab needs|inbox|sessions|today|all`; **Today** is your Top 3 and what is on
+and who leads. Tabs pick one group at a time (`/chief tab needs|inbox|sessions|today|team|health|all`; **Today** is your Top 3 and what is on
 you from the Now list), each item is a card you can expand (`/chief expand` / `collapse` for all), and
 `<workspace>/.mother/portrait.png` (plus a small `portrait.jpg` for the desktop app) replaces the picture at the top. One desktop session at a time leads: it
 reads the hub's inbox lines every minute, asks a cheap model whether each one needs attention, and records the

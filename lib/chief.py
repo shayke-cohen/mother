@@ -663,6 +663,98 @@ def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = 
 
 
 
+# ---- health: what the Chief pane's Health tab reads, so the mod opens no more files -----------------------------
+
+WATCHER_KEY_PREFIX = "watcher:"          # an Inbox item about a source the watcher could not read: not work
+WATCHER_ERRORS_MAX = 20
+UNSENT_RE = re.compile(r"^([a-z0-9-]+)-unsent-(\d{4}-\d{2}-\d{2})\.md$")
+UNSENT_MAX_BYTES = 64 * 1024
+UNDELIVERED_MAX = 20
+REASON_MAX = 300
+
+
+def split_watcher_errors(rows: List[dict]) -> Tuple[List[dict], List[dict]]:
+    """(watcher errors, the rest) of inbox_items rows, each in its given order."""
+    errors = [r for r in rows if str(r.get("key") or "").startswith(WATCHER_KEY_PREFIX)]
+    return errors, [r for r in rows if r not in errors]
+
+
+def guard_state(ws: Path) -> str:
+    """`paused` (.mother/PAUSED, which wins), `off` (.mother/GUARD_OFF) or `on`."""
+    state = Path(ws) / ".mother"
+    return "paused" if (state / "PAUSED").exists() else "off" if (state / "GUARD_OFF").exists() else "on"
+
+
+def undelivered(ws: Path) -> List[dict]:
+    """Routine reports that could not be delivered to the manager's DM: <ws>/.mother/<routine>-unsent-<date>.md,
+    newest first, at most UNDELIVERED_MAX. Names only; `mother chief report <name>` prints one."""
+    rows = []
+    try:
+        names = sorted(os.listdir(str(Path(ws) / ".mother")))
+    except OSError:
+        return rows
+    for name in names:
+        m = UNSENT_RE.fullmatch(name)
+        path = Path(ws) / ".mother" / name
+        if not m or path.is_symlink() or not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        rows.append({"name": name, "routine": m.group(1), "date": m.group(2), "bytes": size})
+    rows.sort(key=lambda r: (r["date"], r["name"]), reverse=True)
+    return rows[:UNDELIVERED_MAX]
+
+
+def report_text(ws: Path, name: str) -> Optional[str]:
+    """One undelivered report's text, or None: a name off the pattern, a file that is missing, a link, outside
+    .mother/ or past 64 KB."""
+    if not isinstance(name, str) or not UNSENT_RE.fullmatch(name):
+        return None
+    base = Path(ws) / ".mother"
+    path = base / name
+    try:
+        if path.is_symlink() or not path.is_file() or path.resolve().parent != base.resolve():
+            return None
+        if path.stat().st_size > UNSENT_MAX_BYTES:
+            return None
+        return path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def watcher_health(ws: Path, at: datetime) -> Optional[dict]:
+    """The watcher's heartbeat (.mother/hub/watcher.json) as the pane draws it, or None when it never ran. `stale`
+    as `mother hub status` judges it: inside active hours and older than twice its interval."""
+    w = hub.load_json(ws, "watcher.json", {})
+    w = w if isinstance(w, dict) else {}
+    if not isinstance(w.get("at"), str) or not w["at"]:
+        return None
+    try:
+        every = int(w.get("every_seconds") or hub.DEFAULTS["every_seconds"])
+    except (TypeError, ValueError):
+        every = hub.DEFAULTS["every_seconds"]
+    active, age = bool(w.get("active")), hub._age(w.get("at"), at)
+    sources = {}
+    for cap, ent in sorted((w.get("sources") or {}).items() if isinstance(w.get("sources"), dict) else []):
+        if not isinstance(ent, dict):
+            continue
+        sources[safe_line(cap, 40)] = {
+            "status": safe_line(ent.get("status"), 40) or "unknown", "reason": safe_line(ent.get("reason"), REASON_MAX),
+            "since": ent.get("since") if isinstance(ent.get("since"), str) else None,
+            "at": ent.get("at") if isinstance(ent.get("at"), str) else None}
+    return {"at": w["at"], "every_seconds": every, "active": active,
+            "stale": active and (age is None or age > 2 * every), "sources": sources}
+
+
+def health_doc(ws: Path, at: datetime, errors: List[dict]) -> dict:
+    """ChiefStatus.health: the watcher, its errors (Inbox items keyed `watcher:`), undelivered reports, the guard."""
+    return {"guard": guard_state(ws), "watcher": watcher_health(ws, at),
+            "watcher_errors": errors[:WATCHER_ERRORS_MAX], "watcher_error_count": len(errors),
+            "undelivered": undelivered(ws)}
+
+
 # ---- status and the `mother chief` CLI ----------------------------------------------------------------
 
 ALIVE_SECONDS = 120
@@ -689,17 +781,19 @@ USAGE = """usage: mother chief <verb> ...
   portrait --json       the Chief pane's picture: .mother/portrait.png when it is a PNG of at most 2 MiB, else the
                         bundled one; prints {version, source, width, height, png (base64)}, plus jpeg, jpeg_width and
                         jpeg_height for a small .mother/portrait.jpg, and svg (the bundled vector)
+  report <name>         print one undelivered routine report (.mother/<routine>-unsent-<YYYY-MM-DD>.md, at most
+                        64 KB); exit 2 for any other name or file
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
 
 A valued option takes --opt=V or --opt V."""
 
-# verb: (boolean flags, valued options); no verb takes a positional
+# verb: (boolean flags, valued options); only `report` takes a positional
 VERBS = {
     "lines": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
-    "portrait": (("--json",), ()),
+    "portrait": (("--json",), ()), "report": ((), ()),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -801,7 +895,7 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     beat_at = hub._parse_at(beat)
     alive = beat_at is not None and (at - beat_at).total_seconds() < ALIVE_SECONDS
     leader = beat_doc.get("session_id")
-    inbox = inbox_items(ws)
+    errors, inbox = split_watcher_errors(inbox_items(ws))   # a `watcher:` item is not work: it goes to health
     tz = nowmod.Schedule.from_config(cfg or {}).tz
     spent, limit = round(spent_today(ws, at, tz), 6), float(settings(cfg)["daily_budget_usd"])
     unreadable = _spend_unreadable(ws)
@@ -813,6 +907,7 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "led_by": leader if alive and isinstance(leader, str) and leader else None,
         "inbox": inbox[:INBOX_MAX],
         "inbox_count": len(inbox),
+        "health": health_doc(ws, at, errors),
     }
 
 
@@ -873,9 +968,17 @@ def main(args, ws, cfg, at) -> int:
         opts, pos = _parse(rest, flags, valued)
     except ValueError as e:
         return _usage(str(e))
-    if pos:
+    if pos and verb != "report":
         return _usage("%s takes no arguments" % verb)
     ws = Path(ws)
+    if verb == "report":
+        text = report_text(ws, pos[0]) if len(pos) == 1 else None
+        if text is None:
+            print("mother chief report: not an undelivered report (a name like brief-unsent-2026-01-31.md, in "
+                  ".mother/, at most 64 KB)", file=sys.stderr)
+            return EXIT_USAGE
+        sys.stdout.write(text)
+        return EXIT_OK
     as_json = bool(opts.get("json"))
     if verb in ("pause", "resume"):
         (pause if verb == "pause" else resume)(ws)

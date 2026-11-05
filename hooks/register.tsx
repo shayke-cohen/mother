@@ -417,7 +417,7 @@ export function chipLabel(url: string, fallback: string): string {
 
 // The Ignore picker: just this, this for a week, and (for a chat thread key or link) its whole channel.
 // `x` is what `mother hub mute` is given: a hub key or an item's link.
-const THREAD_KEY = /^[CG][A-Z0-9]+\/\d+\.\d+$/
+export const THREAD_KEY = /^[CG][A-Z0-9]+\/\d+\.\d+$/
 // A Now item adds its sender (`from`) and the tick's "similar messages" rule (`similar`) when it has them.
 export type Similar = { words: string[]; channel?: string }
 const orWords = (words: string[]) => words.map(w => `"${w}"`).join(' or ')

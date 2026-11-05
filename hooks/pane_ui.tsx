@@ -65,10 +65,11 @@ export function suggestedBrief(suggestion: string, title: string, why: string | 
 export type CardKind = 'need' | 'inbox' | 'sess' | 'today'
 
 // ---- tabs: one section at a time, or `all` stacked ----
-export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'all'
-export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'all']
+export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'team' | 'health' | 'all'
+export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'team', 'health', 'all']
 // A tab is data: an id, a label, how many items it holds and what draws them. `all` has no section of its own.
-export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown }
+// `text` replaces `<label> <count>` on the button (Health wears no count); `alert` adds a red dot.
+export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown; text?: string; alert?: boolean }
 
 // The tab shown: the manager's pick, else the first tab that holds something, else `all` (every empty line).
 export function shownTab(picked: string | null | undefined, tabs: readonly { id: TabId; count: number }[]): TabId {
@@ -82,12 +83,12 @@ export const tabIsNew = (t: { id: TabId; count: number }, seen: Record<string, n
 
 // The tab row: a Button per tab with its count, the shown one primary; ` •` marks a tab with something new.
 export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<string, number> | null | undefined, onPick: (id: TabId) => unknown) {
-  const { Box, Button } = ui
+  const { Box, Button, Text } = ui
   return (
     <Box key="tabs" flexWrap="wrap" gap="xs" marginTop={1}>
-      {[...tabs.map(t => ({ id: t.id, text: `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, text: 'All' }].map(t => (
+      {[...tabs.map(t => ({ id: t.id, alert: !!t.alert, text: t.text ?? `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, alert: false, text: 'All' }].map(t => (
         <Button key={'tab:' + t.id} variant={t.id === shown ? 'primary' : 'secondary'} dimColor={t.id === 'all' && shown !== 'all'}
-          onPress={() => onPick(t.id)}>{t.text}</Button>
+          onPress={() => onPick(t.id)}>{t.alert ? <Text>{t.text}<Text color="error">{' ●'}</Text></Text> : t.text}</Button>
       ))}
     </Box>
   )
