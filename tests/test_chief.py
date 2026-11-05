@@ -1,6 +1,7 @@
 """Tests for lib/chief.py — the tick and leader rule, triage decisions, status, pinned sessions, TL;DRs, spend.
 Run: python3 -m unittest tests.test_chief -v
 """
+import base64
 import contextlib
 import fcntl
 import io
@@ -789,6 +790,70 @@ class TestModelSpendAndText(Base):
     def test_safe_tab_to_space(self):
         self.assertEqual(chief._safe("a\tb"), "a b")
         self.assertEqual(chief.clean_tldr("a\tb", [])["tldr"], "a b")
+
+
+class PortraitTest(Base):
+    """`mother chief portrait --json`: the workspace's own picture when it is a small PNG, else the bundled one."""
+
+    @staticmethod
+    def png(width, height, pad=0):
+        return (chief.PNG_MAGIC + (13).to_bytes(4, "big") + b"IHDR" + width.to_bytes(4, "big") + height.to_bytes(4, "big")
+                + b"\x08\x06\x00\x00\x00" + b"\x00" * (4 + pad))
+
+    def custom(self, data):
+        (self.ws / ".mother").mkdir(exist_ok=True)
+        (self.ws / ".mother" / "portrait.png").write_bytes(data)
+
+    def run_verb(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = chief.main(["portrait", "--json"], self.ws, {}, AT)
+        return code, (json.loads(out.getvalue()) if out.getvalue().strip() else None)
+
+    def test_portrait_custom_bundled_oversized_and_not_a_png(self):
+        code, doc = self.run_verb()                              # no custom file: the bundled picture
+        self.assertEqual((code, doc["version"], doc["source"], doc["width"], doc["height"]), (0, 1, "bundled", 256, 256))
+        self.assertEqual(base64.b64decode(doc["png"]), chief.BUNDLED_PORTRAIT.read_bytes())
+        wide = self.png(800, 450)
+        self.custom(wide)
+        code, doc = self.run_verb()
+        self.assertEqual((code, doc["source"], doc["width"], doc["height"]), (0, "custom", 800, 450))
+        self.assertEqual(base64.b64decode(doc["png"]), wide)
+        self.custom(self.png(800, 450, pad=chief.PORTRAIT_MAX))  # past 2 MiB: the bundled one
+        self.assertEqual(self.run_verb()[1]["source"], "bundled")
+        self.custom(b"GIF89a" + b"\x00" * 64)                    # not a PNG: the bundled one
+        self.assertEqual(self.run_verb()[1]["source"], "bundled")
+        self.assertIsNone(chief.portrait_doc(self.ws, self.ws / "missing.png"))   # neither reads
+        with mock.patch.object(chief, "BUNDLED_PORTRAIT", self.ws / "missing.png"), \
+                mock.patch.object(chief.portrait_doc, "__defaults__", (self.ws / "missing.png", chief.BUNDLED_SVG)):
+            self.assertEqual(self.run_verb(), (1, None))
+
+    @staticmethod
+    def jpeg(width, height, pad=0, sof=0xC2):
+        app0 = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\x00" + b"\x00" * 9
+        frame = bytes([0xFF, sof]) + (11).to_bytes(2, "big") + b"\x08" + height.to_bytes(2, "big") + width.to_bytes(2, "big") + b"\x01\x01\x11\x00"
+        return b"\xff\xd8" + app0 + frame + b"\x00" * pad + b"\xff\xd9"
+
+    def test_portrait_jpeg_and_the_bundled_svg(self):
+        _, doc = self.run_verb()                                 # bundled: the vector's own markup, no jpeg
+        self.assertEqual(doc["svg"], chief.BUNDLED_SVG.read_text(encoding="utf-8"))
+        self.assertTrue(doc["svg"].lstrip().startswith("<svg"))
+        self.assertNotIn("jpeg", doc)
+        (self.ws / ".mother").mkdir(exist_ok=True)
+        small = self.jpeg(800, 450)
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(small)
+        _, doc = self.run_verb()                                 # a custom jpeg alone: custom, over the bundled png
+        self.assertEqual((doc["source"], doc["jpeg_width"], doc["jpeg_height"], doc["width"]), ("custom", 800, 450, 256))
+        self.assertEqual(base64.b64decode(doc["jpeg"]), small)
+        self.assertIn("svg", doc)                                # still there
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(self.jpeg(640, 480, sof=0xC0))
+        self.assertEqual(self.run_verb()[1]["jpeg_height"], 480)  # a baseline frame reads too
+        self.custom(self.png(800, 450))
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(self.jpeg(800, 450, pad=100_000))   # past 120000 base64 characters
+        _, doc = self.run_verb()
+        self.assertEqual((doc["source"], doc["width"], "jpeg" in doc, "svg" in doc), ("custom", 800, False, True))
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(b"not a jpeg at all")
+        self.assertNotIn("jpeg", self.run_verb()[1])
 
 
 if __name__ == "__main__":

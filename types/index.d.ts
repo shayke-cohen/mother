@@ -191,6 +191,15 @@ export type ChiefInboxItem = {
   session: { key: string; title: string } | null   // the live hub session for the key
 }
 
+// Which Chief pane cards are drawn in full. `cards` holds the manager's toggles by card id (`need:<cli id>`,
+// `inbox:<U-id>`, `sess:<cli id>`); `all` is `/chief expand` (true) or `collapse` (false), beneath a later toggle and
+// above the defaults (Needs you open; Inbox and sessions closed, the selected card open).
+export type ChiefOpen = { all: boolean | null; cards: Record<string, boolean> }
+
+// The Chief pane's tab: `picked` is the manager's choice (`needs`, `inbox`, `sessions`, `today`, `all`; null = the
+// first tab that holds something); `seen` is each tab's count when it was last opened or left, for its "new" mark.
+export type ChiefTabs = { picked: string | null; seen: Record<string, number> }
+
 declare module 'claude-code' {
   interface PluginState {
     mother: {
@@ -208,6 +217,9 @@ declare module 'claude-code' {
       chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by a pinned session's cli_session_id
       chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<cli id>`); `inbox-snooze:<id>` is set while an Inbox item's snooze picker is open
       chiefFloor: FloorState | null                 // `mother floor list --json` as last read, this session's id, and the cards answered from the pane since
+      chiefOpen: ChiefOpen | null                   // which Chief pane cards are expanded; null = the defaults
+      chiefTab: ChiefTabs | null                    // the Chief pane's tab and the counts last seen on each
+      chiefSelected: string | null                  // the card id (`sess:<cli id>`, `inbox:<U-id>`) a button was last pressed on; drawn with a bold border
     }
   }
 }

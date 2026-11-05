@@ -1361,13 +1361,42 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   `open_session_in` with the `local_…` id and `target: "focus"`, and counts it opened only when the answer says so:
   an error, a timeout, an empty answer or a refusal without an error ("only…", "cannot…", "changes nothing";
   "already" counts as shown) fills the prompt with a request to open it instead and says why.
-- **The pane** (`/chief [open | status | pause | resume]`; the mod polls once a minute): **Needs you** (the floor,
-  below), **Inbox** (title, why, key, age, source link, and Open session (the key's live session, else the item
-  filled into the prompt, never sent), Done (`mother hub done`) and Snooze (`mother hub snooze`), the Now panel's
-  actions from `hooks/shared.ts`), **Pinned** (one card per pinned session: TL;DR or last report, chat box, chips,
-  Open) and **Health**: `Led by this session`, `Led by another desktop session` or `No session is leading` from
-  `led_by` and this session's id, the heartbeat's age, the budget, and the pause. The status line adds ` · N need
-  you` and ` · N in inbox`, each only when N > 0; nothing else.
+- **The pane** (`/chief [open | status | pause | resume | expand | collapse | tab <name>]`; the mod polls once a minute; drawn
+  by `hooks/chief.tsx` with the frames, badges and strip of `hooks/pane_ui.tsx`). A **header strip**: the picture,
+  "Mother" / "Chief of Stuff", the counts as pills (`N need you`, `N inbox`, `N sessions`), the budget (`$1.50 /
+  $20` and a bar), who leads (`led here`, `led by another session` or `nobody leading`, from `led_by` and this
+  session's id) and the heartbeat's age; an unreadable spend file, a spent budget and the pause are red lines under
+  it. Then bordered **cards**, coloured by kind: **Needs you** (the floor, below), **Inbox** (coloured and badged
+  by source, read from the key's shape: chat, mail, tracker, code, calendar, manual, error) and **Pinned** (a state
+  badge `asks` / `active Nm` / `idle Nh`; this session's own card says `this session`). A card is compact (title
+  row, badge, key or repo, age, its primary button) or expanded: Inbox adds the why, two suggested prompts fixed per
+  source (a chosen one becomes the brief Open session types into a new session; with none, Open session is the
+  key's live session, else the item filled into a new session's prompt, never sent), Done (`mother hub done`) and
+  Snooze (`mother hub snooze`); Pinned adds the TL;DR or last report, the chat box and the chips. The title row
+  toggles a card (`chiefOpen`); Needs you starts expanded, the rest compact, `/chief expand | collapse` sets all.
+  The card a button was last pressed on is the selected one (`chiefSelected`): a bold border, and open. An empty
+  section is one dim line. The status line adds ` · N need you` and ` · N in inbox`, each only when N > 0.
+- **Tabs.** Under the strip, a row of buttons with counts: `Needs you`, `Inbox`, `Sessions`, `Today`, then `All`.
+  Only the shown tab's section is drawn (no heading: the tab is it); `All` stacks every section under its heading.
+  The shown tab is the manager's pick (`chiefTab.picked`, by a press or `/chief tab needs|inbox|sessions|today|all`),
+  else the first tab that holds something, else `All`. A tab whose count is above the count it had when last opened
+  or left (`chiefTab.seen`) ends ` •`. The list is data (`{id, label, count, section}`), so a later group is one row.
+  **Today** is the Now list as `hooks/register.tsx` read it (its poll, its `doc` atom; nothing is read again): today's
+  open Top 3 entries (badge `top`; the tick's first action for the entry's item, Ask Mother, Done = `mother now top
+  done <rank>`), then the on-you items no entry names, at most 10 (Open = the item's Inspector page, Ask Mother,
+  Done = `mother now done <id>`), through the Now panel's own verb and loader. No now.json, or one past
+  `stale_after`, is said in one dim line.
+- **The picture.** `mother chief portrait --json` prints `{version: 1, source: "custom" | "bundled", width, height,
+  png, jpeg?, jpeg_width?, jpeg_height?, svg?}`. `png` (base64, with `width` and `height` from its IHDR) is
+  `<workspace>/.mother/portrait.png` when it is a PNG of at most 2 MiB, else the plugin's
+  `assets/art/mother-cos.png`; exit 1 when neither reads. `jpeg` is `<workspace>/.mother/portrait.jpg` when it is a
+  JPEG of at most 120000 base64 characters (its size from the SOF0/SOF2 frame header), and `svg` the markup of
+  `assets/art/mother-cos.svg`. `source` is `custom` when either workspace file is used; both are machine-local and
+  never synced. The mod runs the verb once per session. A wide picture (width / height >= 1.4) is a banner above the
+  strip (44 columns, rows by its shape, 6 to 14), a squarer one a 10 by 5 spot at the strip's left. The terminal
+  draws `png` in an `Image`. The desktop app has no `Image`: it draws `jpeg` wrapped in an `Svg` (`<image
+  href="data:image/jpeg;base64,…">`), else `svg` as a spot, so a custom PNG with no usable JPEG shows the bundled
+  vector there.
 - **Guard** (§5). A tool write under `.mother/chief/` asks, and so does a write under `~/.claude/sessions/` (the
   peer-socket registry). **Every message into a pinned desktop session asks**, naming the session, whoever sends it
   (the pane's chat, a Needs-you button, a model's `SendMessage`, any session): nothing a session can write can vouch

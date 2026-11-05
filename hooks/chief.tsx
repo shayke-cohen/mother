@@ -1,11 +1,16 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import { SNOOZES, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe } from './shared'
+import { SNOOZES, age, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe, todaysTop } from './shared'
 import { askFloor, isPinned, markAnswered, needsYou, reloadFloor, storeCard, FLOOR_TAIL_MAX, NO_ASK } from './floor'
+import { nowVerb, openInspector } from './register'
 import type { FloorState } from './floor'
 import type { Dollar } from './shared'
-import type { ChiefChip, ChiefDesktop, ChiefInboxItem, ChiefStatus, ChiefTldr } from '../types'
+import { SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, TAB_IDS, TOP_COLOR, allCards, badge, card, emptyLine, headerStrip, isOpen,
+         itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabRow, titleRow,
+         toggled } from './pane_ui'
+import type { Portrait, Tab, TabId, Ui } from './pane_ui'
+import type { ChiefChip, ChiefDesktop, ChiefInboxItem, ChiefOpen, ChiefStatus, ChiefTabs, ChiefTldr, NowDoc, NowItem, NowTop } from '../types'
 
 // The Chief pane: which session leads, Needs you, the Inbox, and one card per pinned desktop session with a chat box.
 // Every write goes through `mother chief …`; the pane never edits a chief file itself.
@@ -14,6 +19,10 @@ export const chiefErrorAtom = atom({ plugin: 'mother', key: 'chiefError' } as co
 export const chiefSentAtom = atom({ plugin: 'mother', key: 'chiefSent' } as const, null)
 export const chiefTldrAtom = atom({ plugin: 'mother', key: 'chiefTldr' } as const, null)
 export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as const, null)
+export const chiefOpenAtom = atom({ plugin: 'mother', key: 'chiefOpen' } as const, null)
+export const chiefSelectedAtom = atom({ plugin: 'mother', key: 'chiefSelected' } as const, null)
+export const chiefTabAtom = atom({ plugin: 'mother', key: 'chiefTab' } as const, null)
+const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)   // now.json as register.tsx last read it; only read here
 const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)   // written in hooks/floor.ts; a read names a const of this file
 
 export const CHIEF_PANE = 'mother-chief'
@@ -587,53 +596,207 @@ function chipActs($: Dollar, chips: ChiefChip[], d: ChiefDesktop): ChipAct[] {
   return out
 }
 
-type Ui = ReturnType<Dollar['ui']['resolve']>
+// ---- the pane: a header strip, then cards (hooks/pane_ui.tsx draws the frames, badges and strip) ----
+// The last card a button was pressed on; `sess:<cli id>` for a Needs you card and the pinned card of one session,
+// `inbox:<U-id>` for an Inbox item. It is drawn with a bold border and open.
+async function select($: Dollar, id: string): Promise<void> {
+  await update($, chiefSelectedAtom, () => id)
+}
 
-// The Inbox section: the hub's open `now` items (status `inbox`, newest first, at most INBOX_SHOWN), with the Now
-// panel's own actions: `mother hub done|snooze`, and Open session (the key's live session, else the item as a prompt
-// to fill, never to submit). The text is line- or model-written: plain text only.
+async function toggleCard($: Dollar, id: string, nowOpen: boolean): Promise<void> {
+  await update($, chiefOpenAtom, prev => toggled(prev, id, nowOpen))
+}
+
+// The header's picture: `mother chief portrait --json`, once at session start, never in a draw. A verb that fails or
+// prints anything off-shape leaves it null, and the strip then shows just the text.
+let portrait: Portrait | null = null
+async function loadPortrait($: Dollar, bin: string): Promise<void> {
+  portrait = null
+  const ran = await cli($, bin, ['portrait', '--json'])
+  if (!ran.ok) return
+  try {
+    const d = JSON.parse(ran.stdout)
+    if (d && d.version === 1 && typeof d.png === 'string' && d.png && Number.isInteger(d.width) && Number.isInteger(d.height) &&
+        d.width > 0 && d.height > 0) {
+      const jpeg = typeof d.jpeg === 'string' && d.jpeg && Number.isInteger(d.jpeg_width) && Number.isInteger(d.jpeg_height) &&
+        d.jpeg_width > 0 && d.jpeg_height > 0 ? { base64: d.jpeg as string, width: d.jpeg_width as number, height: d.jpeg_height as number } : null
+      const svg = typeof d.svg === 'string' && d.svg.trimStart().startsWith('<svg') ? d.svg as string : null
+      portrait = { png: d.png, width: d.width, height: d.height, jpeg, svg }
+    }
+  } catch { /* no picture */ }
+}
+
+// What each card's buttons share: a press selects the card first, then runs.
+type CardCtx = { open: ChiefOpen | null; selected: string | null; portrait?: Portrait | null; surface?: string
+                 tabs?: ChiefTabs | null; doc?: NowDoc | null }
+
+// ---- Today: the tick's Top 3 and the on-you items of now.json, as register.tsx read it (its poll, its atom) ----
+// Its buttons are the Now panel's own, from register.tsx: `nowVerb` runs `mother now …` and re-reads now.json at once
+// through the panel's loader; `openInspector` opens an item's page. (The two files import each other's functions; each
+// is called only from a hook, never while a module loads.)
+const TODAY_ITEMS_SHOWN = 10
+
+// Today's rows: the open Top 3 entries first, then the on-you items no Top 3 entry names.
+export function todayRows(doc: NowDoc | null | undefined, nowMs: number): { top: NowTop[]; items: NowItem[] } {
+  if (!doc) return { top: [], items: [] }
+  const top = todaysTop(doc, nowMs).filter(e => e && e.state !== 'done')
+  const named = new Set(top.map(e => e.item_id).filter(Boolean))
+  return { top, items: (doc.items ?? []).filter(i => i && i.section === 'on_you' && !named.has(i.id)) }
+}
+
+// Each tab's count, for the tab row, the default tab and the "new" mark.
+export function tabCounts(s: ChiefStatus | null, floor: FloorState | null, doc: NowDoc | null | undefined, nowMs: number): Record<TabId, number> {
+  const today = todayRows(doc, nowMs)
+  const inbox = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
+  return { needs: needsYou(s, floor).length, inbox, sessions: Array.isArray(s?.desktop) ? s!.desktop!.length : 0,
+           today: today.top.length + today.items.length, all: 0 }
+}
+
+// The manager picked a tab: it stays, and the tab left and the tab opened are both seen at their counts of now.
+async function pickTab($: Dollar, id: TabId, counts: Record<TabId, number>): Promise<void> {
+  await update($, chiefTabAtom, prev => {
+    const order = TAB_IDS.filter(t => t !== 'all').map(t => ({ id: t, count: counts[t] }))
+    const left = shownTab(prev?.picked, order)
+    return { picked: id, seen: { ...(prev?.seen ?? {}), [left]: counts[left], [id]: counts[id] } }
+  })
+}
+
+function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undefined, nowMs: number, ctx: CardCtx, heading: boolean) {
+  const { Box, Text, Button, Link } = ui
+  const { top, items } = todayRows(doc, nowMs)
+  const count = top.length + items.length
+  const out: unknown[] = []
+  if (heading && count) out.push(sectionHeading(ui, 'today-heading', `Today ${count}`))
+  if (!doc) return [emptyLine(ui, 'today-empty', 'No Today list yet: the tick has not written now.json')]
+  if (nowMs > Date.parse(doc.stale_after)) out.push(emptyLine(ui, 'today-stale', 'This list is stale: the tick has not run since it was written'))
+  if (!count) out.push(emptyLine(ui, 'today-none', 'Nothing on you today'))
+  const fill = (text: string) => $.prompt.fill({ text, mode: 'replace' }).catch(() => undefined)
+  const go = (args: string[]) => nowVerb($, bin, args)
+  const byId = new Map((doc.items ?? []).map(i => [i.id, i]))
+  for (const e of top) {
+    const id = 'today:top:' + e.rank
+    const open = isOpen(ctx.open, id, 'today', ctx.selected)
+    const press = (run: () => unknown) => pressing($, id, run)
+    const title = oneLine(e.title, 200)
+    const why = oneLine(e.why, TLDR_MAX)
+    const action = e.item_id ? byId.get(e.item_id)?.actions?.[0] : undefined
+    out.push(card(ui, { id, color: TOP_COLOR, selected: ctx.selected === id }, [
+      titleRow(ui, id, `${e.rank}. ${title}`, open, press(() => toggleCard($, id, !open))),
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+        {badge(ui, 'top', TOP_COLOR, 'badge:' + id)}
+        <Text dimColor>{`set by ${e.set_by === 'manager' ? 'you' : 'the agent'} `}</Text>
+        {isUrl(e.link) ? <Link href={e.link}>source ↗</Link> : null}
+      </Box>,
+      open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
+      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        {action
+          ? <Button key={'today-doit:' + e.rank} variant="primary" onPress={press(() => fill(action.prompt || `mother now do ${action.id}`))}>{oneLine(action.label, 40) || 'Do it'}</Button>
+          : null}
+        {open || !action
+          ? <Button key={'today-ask:top:' + e.rank} variant={action ? 'secondary' : 'primary'} onPress={press(() => fill(askPrompt(title, why, e.link)))}>Ask Mother</Button>
+          : null}
+        {open ? <Button key={'today-done:top:' + e.rank} onPress={press(() => go(['top', 'done', String(e.rank)]))}>Done</Button> : null}
+      </Box>,
+    ]))
+  }
+  for (const i of items.slice(0, TODAY_ITEMS_SHOWN)) {
+    const id = 'today:' + i.id
+    const open = isOpen(ctx.open, id, 'today', ctx.selected)
+    const press = (run: () => unknown) => pressing($, id, run)
+    const source = itemSource(i.id)
+    const title = oneLine(i.title, 200)
+    const why = oneLine(i.why, TLDR_MAX)
+    const meta = [oneLine(i.team, 40), age(i.since, nowMs)].filter(Boolean).join(' · ')
+    out.push(card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
+      titleRow(ui, id, title, open, press(() => toggleCard($, id, !open))),
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+        {badge(ui, source === 'other' ? 'on you' : source, SOURCE_COLOR[source], 'badge:' + id)}
+        <Text dimColor>{meta + ' '}</Text>
+        {isUrl(i.link) ? <Link href={i.link}>source ↗</Link> : null}
+      </Box>,
+      open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
+      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        <Button key={'today-open:' + i.id} variant="primary" onPress={press(() => openInspector($, { kind: 'item', id: i.id }, 'reset'))}>Open</Button>
+        {open ? <Button key={'today-ask:' + i.id} onPress={press(() => fill(askPrompt(title, why, i.link)))}>Ask Mother</Button> : null}
+        {open ? <Button key={'today-done:' + i.id} onPress={press(() => go(['done', i.id]))}>Done</Button> : null}
+      </Box>,
+    ]))
+  }
+  if (items.length > TODAY_ITEMS_SHOWN) out.push(emptyLine(ui, 'today-more', `${items.length - TODAY_ITEMS_SHOWN} more in the Now panel`))
+  return out
+}
+const pressing = ($: Dollar, sel: string, run: () => unknown) => async () => { await select($, sel); await run() }
+
+// The Inbox section: the hub's open `now` items (status `inbox`, newest first, at most INBOX_SHOWN), each a card
+// coloured by its source. Compact: the title row, the source badge, key, age, source link, Open session. Expanded: the
+// why, two suggested prompts (a chosen one becomes the brief Open session types into a new session), Done and Snooze
+// (`mother hub done|snooze`). Open session with no suggestion is the Now panel's: the key's live session, else the
+// item as a prompt to fill, never to submit. The text is line- or model-written: plain text only.
 const INBOX_SHOWN = 10
 async function inboxVerb($: Dollar, bin: string, args: string[]): Promise<boolean> {
   const ok = await motherVerb($, bin, 'hub', args)
   await reloadStatus($, bin)
   return ok
 }
-function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: number, drafts: Record<string, string> | null) {
+function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: number, drafts: Record<string, string> | null, ctx: CardCtx, heading = true) {
   const { Box, Text, Button, Select, Link } = ui
   const items: ChiefInboxItem[] = (Array.isArray(s.inbox) ? s.inbox : []).filter(u => !!u && typeof u.id === 'string')
     .sort((a, b) => (Date.parse(b.at ?? '') || 0) - (Date.parse(a.at ?? '') || 0)).slice(0, INBOX_SHOWN)
-  if (!items.length) return null
+  if (!items.length) return emptyLine(ui, 'inbox-empty', 'Inbox clear')
   const total = typeof s.inbox_count === 'number' ? s.inbox_count : items.length
   const goHub = (args: string[]) => inboxVerb($, bin, args)
   return (
     <Box key="inbox" flexDirection="column">
-      <Box marginTop={1}><Text weight="semibold" size="heading">{`Inbox ${total}`}</Text></Box>
+      {heading ? sectionHeading(ui, 'inbox-heading', `Inbox ${total}`) : null}
       {items.map(u => {
+        const id = 'inbox:' + u.id
         const pickKey = 'inbox-snooze:' + u.id
+        const sugKey = 'inbox-pick:' + u.id
         const title = oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)
         const why = oneLine(u.why, TLDR_MAX)
-        return (
-          <Box key={'inbox-' + u.id} flexDirection="column" marginTop={1}>
-            <Text weight="semibold" wrap="wrap">{title}</Text>
-            {why ? <Text wrap="wrap">{why}</Text> : null}
-            <Box>
-              <Text dimColor>{`${oneLine(u.key, TITLE_MAX)} · ${ago(u.at, nowMs)} `}</Text>
-              {isUrl(u.link) ? <Link href={u.link}>source ↗</Link> : null}
-            </Box>
-            <Box flexWrap="wrap" gap="xs">
-              <Button key={'inbox-open:' + u.id} onPress={() => {
-                if (u.session) openSession($, goHub, u.session.key, { title: oneLine(u.session.title, TITLE_MAX) })
-                else void openNew($, bin, askPrompt(title, why, isUrl(u.link) ? u.link : null))
-              }}>Open session</Button>
-              <Button key={'inbox-done:' + u.id} onPress={() => goHub(['done', u.id])}>Done</Button>
-              <Button key={pickKey} onPress={() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey) : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [pickKey]: '1' }))}>Snooze</Button>
-            </Box>
-            {drafts?.[pickKey] !== undefined
-              ? <Select key={'inbox-snooze-pick:' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
-                  onSelect={(value: string) => clearDraft($, pickKey).then(() => goHub(['snooze', u.id, value]))} />
+        const link = isUrl(u.link) ? u.link : null
+        const source = sourceOf(u.key)
+        const open = isOpen(ctx.open, id, 'inbox', ctx.selected)
+        const chosen = drafts?.[sugKey]
+        const press = (run: () => unknown) => pressing($, id, run)
+        const openIt = () => {
+          if (chosen) return openNew($, bin, suggestedBrief(chosen, title, why, link))
+          if (u.session) return openSession($, goHub, u.session.key, { title: oneLine(u.session.title, TITLE_MAX) })
+          return openNew($, bin, askPrompt(title, why, link))
+        }
+        return card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
+          titleRow(ui, id, title, open, press(() => toggleCard($, id, !open))),
+          <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+            {badge(ui, source, SOURCE_COLOR[source], 'badge:' + id)}
+            <Text dimColor>{`${oneLine(u.key, TITLE_MAX)} · ${ago(u.at, nowMs)} `}</Text>
+            {link ? <Link href={link}>source ↗</Link> : null}
+          </Box>,
+          open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
+          open
+            ? <Box key={'sug:' + id} flexWrap="wrap" gap="xs">
+                {suggestionsFor(source).map((text, i) => (
+                  <Button key={`inbox-sug:${u.id}:${i}`} variant={chosen === text ? 'primary' : 'secondary'}
+                    onPress={press(() => update($, chiefDraftAtom, prev => {
+                      const next = { ...(prev ?? {}) }
+                      if (next[sugKey] === text) delete next[sugKey]; else next[sugKey] = text
+                      return next
+                    }))}>{text}</Button>
+                ))}
+              </Box>
+            : null,
+          <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+            <Button key={'inbox-open:' + u.id} variant="primary" onPress={press(openIt)}>Open session</Button>
+            {open ? <Button key={'inbox-done:' + u.id} onPress={press(() => goHub(['done', u.id]))}>Done</Button> : null}
+            {open
+              ? <Button key={pickKey} onPress={press(() => drafts?.[pickKey] !== undefined ? clearDraft($, pickKey)
+                  : update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [pickKey]: '1' })))}>Snooze</Button>
               : null}
-          </Box>
-        )
+          </Box>,
+          open && drafts?.[pickKey] !== undefined
+            ? <Select key={'inbox-snooze-pick:' + u.id} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
+                onSelect={(value: string) => clearDraft($, pickKey).then(() => goHub(['snooze', u.id, value]))} />
+            : null,
+        ])
       })}
     </Box>
   )
@@ -641,17 +804,14 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
 
 // Who leads, from the status' `led_by` (the session id behind a fresh heartbeat) and this session's own id.
 export function ledByText(s: ChiefStatus, self: string | null): string {
-  const by = typeof s.led_by === 'string' && s.led_by ? s.led_by : null
-  return !by ? 'No session is leading' : by === self ? 'Led by this session' : 'Led by another desktop session'
+  return leadPill(s, self).text
 }
 
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
                   sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
-                  drafts: Record<string, string> | null, floor: FloorState | null = null, self: string | null = null) {
+                  drafts: Record<string, string> | null, floor: FloorState | null = null, self: string | null = null,
+                  ctx: CardCtx = { open: null, selected: null }) {
   const { Box, Text, Button, Input } = ui
-  const heading = (text: string) => (
-    <Box marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
-  )
   if (!s) {
     return (
       <Box flexDirection="column">
@@ -661,8 +821,11 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   }
   const since = s.chief?.heartbeat_at ? ago(s.chief.heartbeat_at, nowMs) : ''
   const beat = !since ? 'no heartbeat' : since === 'now' ? 'heartbeat now' : `heartbeat ${since} ago`
-  const led = ledByText(s, self)
-  const money = (n: number | undefined) => `$${(n ?? 0).toFixed(2)}`
+  const sentLine = (id: string) => {
+    const said = sent?.[id]
+    if (!said) return null
+    return <Text key={'sent:' + id} color={said === 'delivered' ? 'success' : 'warning'}>{said === 'delivered' ? 'Sent: delivered' : `Sent: ${said}`}</Text>
+  }
   // The TL;DR's lines in place of the last report, or the last report when there is none (or it failed).
   const summary = (id: string, fallback: string) => {
     const t = tldrs?.[id]
@@ -675,73 +838,105 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     const acts = t ? chipActs($, t.chips, d) : []
     if (!acts.length) return null
     return (
-      <Box flexWrap="wrap" gap="xs">
-        {acts.map((a, i) => <Button key={`chip:${id}:${i}`} onPress={() => a.run()}>{a.label}</Button>)}
+      <Box key={'chips:' + id} flexWrap="wrap" gap="xs">
+        {acts.map((a, i) => <Button key={`chip:${id}:${i}`} onPress={pressing($, 'sess:' + id, () => a.run())}>{a.label}</Button>)}
       </Box>
     )
   }
+  const needs = needsYou(s, floor)
+  const asking = new Set(needs.map(n => n.d.cli_session_id))
+  const scopeOf = (cli: string) => 'mother-sess:' + cli
   // A pinned desktop session: chat goes straight to it; Open asks the app to show it. It has its own person at its
-  // own keyboard.
+  // own keyboard. The session whose pane this is wears `this session` and the accent colour.
   const pinnedCard = (d: ChiefDesktop) => {
-    const meta = [d.repo, d.last_activity_at ? `active ${ago(d.last_activity_at, nowMs)} ago` : ''].filter(Boolean).join(' · ')
-    const said = sent?.[d.cli_session_id]
-    return (
-      <Box key={'p-' + d.cli_session_id} flexDirection="column" marginTop={1}>
-        <Text weight="semibold">{d.title}</Text>
+    const cli = d.cli_session_id
+    const id = 'sess:' + cli
+    const active = self !== null && cli === self
+    const open = isOpen(ctx.open, id, 'sess', ctx.selected)
+    const state = sessionPill(d, asking.has(cli), nowMs, ago)
+    const meta = oneLine(d.repo, 80)
+    const press = (run: () => unknown) => pressing($, id, run)
+    return card(ui, { id, color: SESSION_COLOR, selected: ctx.selected === id, active, scope: scopeOf(cli) }, [
+      titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open)),
+               active ? badge(ui, 'this session', SELF_COLOR, 'badge:self:' + cli) : null),
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+        {badge(ui, state.text, state.color, 'badge:' + id)}
         {meta ? <Text dimColor>{meta}</Text> : null}
-        {summary(d.cli_session_id, d.last_report)}
-        {said ? <Text color={said === 'delivered' ? undefined : 'warning'}>{said === 'delivered' ? 'Sent: delivered' : `Sent: ${said}`}</Text> : null}
-        <Box flexWrap="wrap" gap="xs">
-          <Input key={'say:' + d.cli_session_id} placeholder="Tell this session…" submitLabel="send"
-            value={drafts?.['say:' + d.cli_session_id]}
-            onSubmit={(value: string) => {
-              if (value.trim()) void clearDraft($, 'say:' + d.cli_session_id).then(() => sendPinned($, d.cli_session_id, value))
-            }} />
-          <Button key={'open:' + d.cli_session_id} onPress={() => openPinned($, d)}>Open</Button>
-        </Box>
-        {chipRow(d)}
-      </Box>
-    )
+      </Box>,
+      ...(open ? summary(cli, d.last_report) : []),
+      open ? sentLine(cli) : null,
+      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        {open
+          ? <Input key={'say:' + cli} placeholder="Tell this session…" submitLabel="send"
+              value={drafts?.['say:' + cli]}
+              onSubmit={(value: string) => {
+                if (value.trim()) void select($, id).then(() => clearDraft($, 'say:' + cli)).then(() => sendPinned($, cli, value))
+              }} />
+          : null}
+        <Button key={'open:' + cli} variant="primary" onPress={press(() => openPinned($, d))}>Open</Button>
+      </Box>,
+      open ? chipRow(d) : null,
+    ])
   }
   // Needs you: a pinned session whose last turn stopped on a question. The question and options are model-written from
   // that session's last message: plain text, cleaned, and each option's message is shown beside its button.
-  const needs = needsYou(s, floor)
   const needCard = ({ card: c, d }: (typeof needs)[number]) => {
-    const said = sent?.[d.cli_session_id]
+    const cli = d.cli_session_id
+    const id = 'need:' + cli
+    const sel = 'sess:' + cli
+    const open = isOpen(ctx.open, id, 'need', ctx.selected === sel ? id : null)
     const meta = [c.waiting_on ? `waiting on ${oneLine(c.waiting_on, 80)}` : '', `asked ${ago(c.at, nowMs)} ago`].filter(Boolean).join(' · ')
     const options = c.options.map(o => ({ label: oneLine(o.label, 24), message: oneLine(o.message, 200) })).filter(o => o.label && o.message)
-    return (
-      <Box key={'need-' + d.cli_session_id} flexDirection="column" marginTop={1}>
-        <Text weight="semibold">{oneLine(d.title, 200)}</Text>
-        <Text wrap="wrap">{oneLine(c.question, 200)}</Text>
+    const press = (run: () => unknown) => pressing($, sel, run)
+    const shownOptions = open ? options : options.slice(0, 1)
+    return card(ui, { id, color: NEED_COLOR, selected: ctx.selected === sel, scope: scopeOf(cli) }, [
+      titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open))),
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+        {badge(ui, 'asks', NEED_COLOR, 'badge:' + id)}
         <Text dimColor>{meta}</Text>
-        {options.map((o, i) => <Text key={`need-says:${d.cli_session_id}:${i}`} dimColor wrap="wrap">{`${o.label}: "${o.message}"`}</Text>)}
-        {said ? <Text color={said === 'delivered' ? undefined : 'warning'}>{said === 'delivered' ? 'Sent: delivered' : `Sent: ${said}`}</Text> : null}
-        <Box flexWrap="wrap" gap="xs">
-          {options.map((o, i) => (
-            <Button key={`need:${d.cli_session_id}:${i}`}
-              onPress={() => sendPinned($, d.cli_session_id, o.message).then(() => markAnswered($, d.cli_session_id))}>{o.label}</Button>
-          ))}
-          <Button key={'need-open:' + d.cli_session_id} onPress={() => openPinned($, d)}>Open</Button>
-        </Box>
-      </Box>
-    )
+      </Box>,
+      <Text key={'q:' + id} wrap="wrap">{oneLine(c.question, 200)}</Text>,
+      ...(open ? options.map((o, i) => <Text key={`need-says:${cli}:${i}`} dimColor wrap="wrap">{`${o.label}: "${o.message}"`}</Text>) : []),
+      open ? sentLine(cli) : null,
+      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        {shownOptions.map((o, i) => (
+          <Button key={`need:${cli}:${i}`} variant={i === 0 ? 'primary' : 'secondary'}
+            onPress={press(() => sendPinned($, cli, o.message).then(() => markAnswered($, cli)))}>{o.label}</Button>
+        ))}
+        {open ? <Button key={'need-open:' + cli} onPress={press(() => openPinned($, d))}>Open</Button> : null}
+      </Box>,
+    ])
   }
   const pinned = Array.isArray(s.desktop) ? s.desktop : []
+  // The tabs, as data: a later group (decisions, dots) is one more row here once it has a source.
+  const counts = tabCounts(s, floor, ctx.doc, nowMs)
+  const tabs: Tab[] = [
+    { id: 'needs', label: 'Needs you', count: counts.needs, section: h => [
+      needs.length ? (h ? sectionHeading(ui, 'needs-heading', `Needs you ${needs.length}`) : null) : emptyLine(ui, 'needs-empty', 'Nothing needs you'),
+      ...needs.map(needCard)] },
+    { id: 'inbox', label: 'Inbox', count: counts.inbox, section: h => [inboxSection($, ui, bin, s, nowMs, drafts, ctx, h)] },
+    { id: 'sessions', label: 'Sessions', count: counts.sessions, section: h => [
+      pinned.length ? (h ? sectionHeading(ui, 'pinned-heading', `Pinned ${pinned.length}`) : null) : emptyLine(ui, 'pinned-empty', 'No pinned sessions'),
+      ...pinned.map(pinnedCard)] },
+    { id: 'today', label: 'Today', count: counts.today, section: h => todaySection($, ui, bin, ctx.doc, nowMs, ctx, h) },
+  ]
+  const shown = shownTab(ctx.tabs?.picked, tabs)
+  const drawn = shown === 'all' ? tabs : tabs.filter(t => t.id === shown)
   return (
     <Box flexDirection="column">
-      {needs.length ? heading(`Needs you ${needs.length}`) : null}
-      {needs.map(needCard)}
-      {inboxSection($, ui, bin, s, nowMs, drafts)}
-      {pinned.length ? heading(`Pinned ${pinned.length}`) : null}
-      {pinned.map(pinnedCard)}
-      {heading('Health')}
-      <Text color={led === 'No session is leading' ? 'warning' : undefined}>{`${led} · ${beat}`}</Text>
+      {headerStrip(ui, { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
+                         sessions: pinned.length, spent: s.budget?.spent, limit: s.budget?.limit,
+                         overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self), beat,
+                         portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal' })}
       {s.budget?.unreadable
-        ? <Text color="warning">Budget: spend file unreadable — no model call is made until it reads again.</Text>
-        : <Text color={s.budget?.over ? 'warning' : undefined}>{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today${s.budget?.over ? ' · spent: no model call is made' : ''}`}</Text>}
-      {s.paused ? <Text color="warning">PAUSED: nothing is triaged or decided until /chief resume.</Text> : null}
+        ? <Text color="error">Budget: spend file unreadable — no model call is made until it reads again.</Text>
+        : s.budget?.over
+          ? <Text color="error">{`Budget ${money(s.budget?.spent)} of ${money(s.budget?.limit)} today · spent: no model call is made`}</Text>
+          : null}
+      {s.paused ? <Text color="error">PAUSED: nothing is triaged or decided until /chief resume.</Text> : null}
       {error ? <Text color="warning">{error}</Text> : null}
+      {tabRow(ui, tabs, shown, ctx.tabs?.seen, id => pickTab($, id, counts))}
+      {drawn.map(t => <Box key={'sec:' + t.id} flexDirection="column">{t.section(shown === 'all') as any}</Box>)}
     </Box>
   )
 }
@@ -770,7 +965,7 @@ let busy = false
 export async function startChief($: Dollar, configured: string): Promise<number> {
   const bin = await motherBin($, configured)
   try {
-    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions' })
+    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | status | pause | resume)' })
   } catch {
     // carry on without the command
   }
@@ -785,6 +980,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   opening.clear()
   spendOwed.length = 0
   spendFlushing = false
+  await loadPortrait($, bin)
   await reloadStatus($, bin)
   // not awaited: a slow list_sessions (up to its 10 s timeout) must not hold up the session's start
   void snapshotPinned($, bin).then(() => reloadStatus($, bin)).catch(() => undefined)
@@ -823,8 +1019,8 @@ export function registerChief(on: On, configured: string): void {
     return next(e)
   })
 
-  // /chief [open] opens the pane; /chief status says `mother chief status`; /chief pause|resume run the chief-only
-  // pause (.mother/chief/PAUSED, which the CLI writes and removes; the guard's .mother/PAUSED is never touched).
+  // /chief [open] opens the pane; /chief status says `mother chief status`; /chief expand|collapse open or close every
+  // card; /chief pause|resume run the chief-only pause (.mother/chief/PAUSED, which the CLI writes and removes; the guard's .mother/PAUSED is never touched).
   on('command.run', { command: CHIEF_COMMAND }, async ($, e) => {
     const bin = await motherBin($, configured)
     const verb = String(e.args ?? '').trim()
@@ -847,7 +1043,16 @@ export function registerChief(on: On, configured: string): void {
       await reloadStatus($, bin)
       return { text }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume]' }
+    if (verb === 'expand' || verb === 'collapse') {
+      await update($, chiefOpenAtom, () => allCards(verb === 'expand'))
+      return { text: `Chief pane: every card ${verb === 'expand' ? 'expanded' : 'collapsed'}.` }
+    }
+    const tab = /^tab\s+(\S+)$/.exec(verb)?.[1]
+    if (tab && (TAB_IDS as readonly string[]).includes(tab)) {
+      await pickTab($, tab as TabId, tabCounts(lastStatus, await read($, floorAtom), await read($, docAtom), await $.clock.now()))
+      return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
+    }
+    return { text: 'Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|all]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
@@ -857,6 +1062,7 @@ export function registerChief(on: On, configured: string): void {
     try { self = String((await $.session.id()) ?? '') || null } catch { self = null }
     return paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
       await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
-      await read($, floorAtom), self)
+      await read($, floorAtom), self, { open: await read($, chiefOpenAtom), selected: await read($, chiefSelectedAtom), portrait,
+        surface: String(e.surface), tabs: await read($, chiefTabAtom), doc: await read($, docAtom) })
   })
 }

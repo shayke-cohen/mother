@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register, Timer } from 'claude-code'
 
 import { chiefPass, chiefStatusText, registerChief, startChief } from './chief'
-import { SNOOZES, ago, askPrompt, clock, isUrl, motherBin, motherVerb, openSession } from './shared'
+import { SNOOZES, age, ago, askPrompt, clock, isUrl, localDate, motherBin, motherVerb, openSession, todaysTop } from './shared'
 import type { Dollar } from './shared'
 import type { HubBundle, HubDoc, HubPending, HubSession, HubSessions, HubUpdate, HubWatch, InspectRef, NowCoverage, NowDoc, NowItem, NowTop, WatcherDoc } from '../types'
 
@@ -28,7 +28,7 @@ export const POLL_MS = 60_000
 export const TOASTED_CAP = 500
 
 // Moved to ./shared (the Chief pane uses them too); re-exported so existing imports keep working.
-export { ago, askPrompt, clock, motherBin }
+export { age, ago, askPrompt, clock, localDate, motherBin }
 export type { Dollar }
 
 // What `load` remembers between polls: the mtime it last read, so an unchanged file is not re-read.
@@ -258,26 +258,7 @@ const pendingKey = (p: HubPending): string => `${p.key}@${p.proposed_at}`
 
 // ---- time ------------------------------------------------------------------------------------------
 
-// YYYY-MM-DD of an instant in the doc's timezone (the manager's local date); UTC when the zone is unknown.
-export function localDate(nowMs: number, tz: string | null | undefined): string {
-  if (tz) {
-    try {
-      const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(nowMs)
-      const part = (t: string) => parts.find(p => p.type === t)?.value
-      const y = part('year'), m = part('month'), d = part('day')
-      if (y && m && d) return `${y}-${m}-${d}`
-    } catch {
-      // fall through to UTC
-    }
-  }
-  return new Date(nowMs).toISOString().slice(0, 10)
-}
-
-// How long an item has waited: from `since`, when it was raised, not from when the tick first saw it.
-export function age(since: string, nowMs: number): string {
-  const hours = Math.max(0, Math.floor((nowMs - Date.parse(since)) / 3_600_000))
-  return Number.isNaN(hours) ? '' : hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`
-}
+// localDate and age live in hooks/shared.ts: the Chief pane's Today tab reads the same list.
 
 // ---- writes ----------------------------------------------------------------------------------------
 
@@ -288,6 +269,12 @@ async function run($: Dollar, bin: string, loader: Loader, args: string[], rowId
   await load($, bin, loader).catch(() => undefined)
   if (rowId) await update($, snoozingAtom, cur => (cur === rowId ? null : cur))
   return ok
+}
+
+// The same verb for the Chief pane's Today tab, through the panel's own loader: one reader, so both panes re-read at once.
+let panelLoader: Loader | null = null
+export async function nowVerb($: Dollar, bin: string, args: string[]): Promise<boolean> {
+  return run($, bin, panelLoader ?? newLoader(), args)
 }
 
 // The rank a new Top 3 entry takes: the next free one, else the highest rank not done; null = none.
@@ -556,8 +543,6 @@ type Ctx = {
   go: Go; goHub: Go; goInbox: Go
 }
 
-const todaysTop = (doc: NowDoc | null, nowMs: number): NowTop[] =>
-  doc && doc.top_date === localDate(nowMs, doc.timezone) ? doc.top ?? [] : []
 
 function toggler($: Dollar) {
   return (name: string) => update($, expandedAtom, cur => {
@@ -1303,6 +1288,7 @@ export const COMMAND = 'now-panel'
 export const register: Register = (on, options) => {
   const configured = String(options.mother_bin ?? '').trim()
   const loader = newLoader()
+  panelLoader = loader
   let timer: Timer | undefined
   let chiefTimer: Timer | undefined
 
