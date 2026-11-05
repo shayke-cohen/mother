@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import { ago, motherBin } from './shared'
+import { ago, motherBin, oneLine, safe } from './shared'
+import { askFloor, isPinned, markAnswered, needsYou, reloadFloor, storeCard, FLOOR_TAIL_MAX, NO_ASK } from './floor'
+import type { FloorState } from './floor'
 import type { Dollar } from './shared'
 import type { ChiefBatchState, ChiefChip, ChiefDecision, ChiefDesktop, ChiefStatus, ChiefTldr, ChiefWorker } from '../types'
 
@@ -16,6 +18,7 @@ export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as co
 export const chiefAnswersAtom = atom({ plugin: 'mother', key: 'chiefAnswers' } as const, null)
 export const chiefToastedAtom = atom({ plugin: 'mother', key: 'chiefToasted' } as const, null)
 export const chiefBatchAtom = atom({ plugin: 'mother', key: 'chiefBatch' } as const, null)
+const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)   // written in hooks/floor.ts; a read names a const of this file
 
 export const CHIEF_PANE = 'mother-chief'
 export const CHIEF_COMMAND = 'chief'
@@ -29,13 +32,15 @@ type Role = 'chief' | 'console'
 
 // ` · chief ● N working · M to decide` for the status line, the last part only when M > 0; ○ while the chief's heartbeat
 // is old; '' with no status, and '' when no chief is installed here (no heartbeat ever, no workers, nothing to decide).
-export function chiefStatusText(s: ChiefStatus | null, _role: Role | null): string {
+export function chiefStatusText(s: ChiefStatus | null, _role: Role | null, floor: FloorState | null = null): string {
   if (!s) return ''
   const workers = s.workers ?? []
   const toDecide = typeof s.to_decide === 'number' ? s.to_decide : 0
-  if (!s.chief?.heartbeat_at && workers.length === 0 && toDecide === 0) return ''
+  const needs = needsYou(s, floor).length   // pinned sessions stopped on a question (hooks/floor.ts)
+  if (!s.chief?.heartbeat_at && workers.length === 0 && toDecide === 0 && needs === 0) return ''
   const working = workers.filter(w => w.status === 'working').length
-  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working` + (toDecide > 0 ? ` · ${toDecide} to decide` : '')
+  return ` · chief ${s.chief?.alive ? '●' : '○'} ${working} working` + (toDecide > 0 ? ` · ${toDecide} to decide` : '') +
+    (needs > 0 ? ` · ${needs} need you` : '')
 }
 
 // Attention order: failed, held, working, idle, then the rest (done); newest last run first within a group.
@@ -107,8 +112,7 @@ export function pendingDecisions(s: ChiefStatus | null): ChiefDecision[] {
     .sort((a, b) => Number(!!b.urgent) - Number(!!a.urgent) || createdAt(a) - createdAt(b))
 }
 
-// One line of worker-written text for a toast or a list; the worker's draft is untrusted, the same as a transcript.
-const oneLine = (text: unknown, cap = 200): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ').slice(0, cap)
+// oneLine (shared.ts): one line of worker-written text for a toast or a list; the worker's draft is untrusted, the same as a transcript.
 const WHY_MAX = 200
 const TARGET_MAX = 200
 const EDIT_REFUSAL_MAX = 300
@@ -857,9 +861,7 @@ type TailRow = { id: string; kind: 'worker' | 'pinned'; key?: string; fingerprin
 // characters; at most 6 kept, of which a card draws the first 3 that apply to it now. Anything else is dropped.
 // C0 controls but newline and tab, DEL, C1 controls, the line and paragraph separators, and the bidi marks, embeddings, overrides and isolates: what a model could
 // copy from a transcript to make a card misread, and what a surface refuses to draw (a whole pane would go blank).
-// A tab isn't dropped but becomes a space, so it can't join two words.
-const UNSAFE_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g
-const safe = (text: string): string => text.replace(/\t/g, ' ').replace(UNSAFE_RE, '')
+// A tab isn't dropped but becomes a space, so it can't join two words. (`safe`, in shared.ts.)
 
 export function cleanTldr(v: any): ChiefTldr | null {
   if (!v || typeof v !== 'object' || Array.isArray(v) || typeof v.tldr !== 'string') return null
@@ -1200,7 +1202,8 @@ type Ui = ReturnType<Dollar['ui']['resolve']>
 
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
                   sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
-                  drafts: Record<string, string> | null, answers: Record<string, { message: string }> | null) {
+                  drafts: Record<string, string> | null, answers: Record<string, { message: string }> | null,
+                  floor: FloorState | null = null) {
   const { Box, Text, Button, Input } = ui
   const heading = (text: string) => (
     <Box marginTop={1}><Text weight="semibold" size="heading">{text}</Text></Box>
@@ -1340,6 +1343,30 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       </Box>
     )
   }
+  // Needs you: a pinned session whose last turn stopped on a question. The question and options are model-written from
+  // that session's last message: plain text, cleaned, and each option's message is shown beside its button.
+  const needs = needsYou(s, floor)
+  const needCard = ({ card: c, d }: (typeof needs)[number]) => {
+    const said = sent?.[d.cli_session_id]
+    const meta = [c.waiting_on ? `waiting on ${oneLine(c.waiting_on, 80)}` : '', `asked ${ago(c.at, nowMs)} ago`].filter(Boolean).join(' · ')
+    const options = c.options.map(o => ({ label: oneLine(o.label, 24), message: oneLine(o.message, 200) })).filter(o => o.label && o.message)
+    return (
+      <Box key={'need-' + d.cli_session_id} flexDirection="column" marginTop={1}>
+        <Text weight="semibold">{oneLine(d.title, 200)}</Text>
+        <Text wrap="wrap">{oneLine(c.question, 200)}</Text>
+        <Text dimColor>{meta}</Text>
+        {options.map((o, i) => <Text key={`need-says:${d.cli_session_id}:${i}`} dimColor wrap="wrap">{`${o.label}: "${o.message}"`}</Text>)}
+        {said ? <Text color={said === 'delivered' ? undefined : 'warning'}>{said === 'delivered' ? 'Sent: delivered' : `Sent: ${said}`}</Text> : null}
+        <Box flexWrap="wrap" gap="xs">
+          {options.map((o, i) => (
+            <Button key={`need:${d.cli_session_id}:${i}`}
+              onPress={() => sendPinned($, d.cli_session_id, o.message).then(() => markAnswered($, d.cli_session_id))}>{o.label}</Button>
+          ))}
+          <Button key={'need-open:' + d.cli_session_id} onPress={() => openPinned($, d)}>Open</Button>
+        </Box>
+      </Box>
+    )
+  }
   const decisions = pendingDecisions(s)
   const open = new Set(decisions.map(d => d.id))
   // Answers whose card has gone: the message stays until newer answers push it out.
@@ -1348,6 +1375,8 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   const pinned = Array.isArray(s.desktop) ? s.desktop : []
   return (
     <Box flexDirection="column">
+      {needs.length ? heading(`Needs you ${needs.length}`) : null}
+      {needs.map(needCard)}
       {heading('Health')}
       <Text color={s.chief?.alive ? undefined : 'warning'}>{`Chief ${s.chief?.alive ? '● alive' : '○ down'} · ${beat}`}</Text>
       {s.budget?.unreadable
@@ -1366,6 +1395,21 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       {pinned.map(pinnedCard)}
     </Box>
   )
+}
+
+// This session's own card (hooks/floor.ts), written when its turn ends on an answer and cleared (`answer` null) when a
+// prompt is submitted here. Pinned sessions only, never the chief. Over budget nothing is asked or written.
+async function floorCard($: Dollar, configured: string, answer: string | null): Promise<void> {
+  if (role === 'chief') return
+  const id = await $.session.id()
+  if (!isPinned(lastStatus, id)) return
+  const bin = await motherBin($, configured)
+  if (answer === null) { await storeCard($, bin, id, NO_ASK); return }
+  if (overBudget(lastStatus)) return
+  const model = await triageModel($, bin)
+  const got = await askFloor($, model, String(answer ?? '').slice(-FLOOR_TAIL_MAX))
+  await recordSpend($, bin, model, got.usage)
+  await storeCard($, bin, id, got.reply)
 }
 
 // The pass state; a reload of the mod starts it over. register.tsx owns the timer: the engine's scan lets `$` reach
@@ -1427,6 +1471,7 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
     if (role === 'console') {
       await snapshotPinned($, bin)
       await reloadStatus($, bin)
+      await reloadFloor($, bin)                          // each session's card, for the pane's Needs you
       void refreshTldrs($, bin).catch(() => undefined)   // detached; refreshTldrs runs one batch at a time
       return null
     }
@@ -1447,8 +1492,17 @@ export function registerChief(on: On, configured: string): void {
     if (!e.agentId) turnStartedAt = await $.clock.now()
     return next(e)
   })
-  on('turn.complete', async (_$, e, next) => {
-    if (!e.agentId) turnStartedAt = null
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) {
+      turnStartedAt = null
+      // detached: the card's model call never delays the turn's end
+      if (e.reason === 'answer') void floorCard($, configured, e.answer).catch(() => undefined)
+    }
+    return next(e)
+  })
+  // The manager typed here: this session's question, if it had one, is answered. Detached as well.
+  on('prompt.submit', async ($, e, next) => {
+    void floorCard($, configured, null).catch(() => undefined)
     return next(e)
   })
 
@@ -1495,5 +1549,5 @@ export function registerChief(on: On, configured: string): void {
   on('ui.render', { component: 'Pane', requestId: CHIEF_PANE }, async ($, e) =>
     paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
       await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
-      await read($, chiefAnswersAtom)))
+      await read($, chiefAnswersAtom), await read($, floorAtom)))
 }

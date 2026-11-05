@@ -19,6 +19,7 @@ export const inspectAtom = atom({ plugin: 'mother', key: 'inspect' } as const, n
 // declared in the reading file, so these repeat chief.tsx's refs.
 const chiefAtom = atom({ plugin: 'mother', key: 'chief' } as const, null)
 const chiefRoleAtom = atom({ plugin: 'mother', key: 'chiefRole' } as const, null)
+const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)
 
 const PANE = 'mother-now'
 const FOCUS = 'mother-focus'
@@ -157,7 +158,7 @@ export async function load($: Dollar, bin: string, loader: Loader): Promise<void
 async function drawStatus($: Dollar): Promise<void> {
   const nowMs = await $.clock.now()
   $.ui.status(statusText(await read($, docAtom), nowMs) + hubStatus((await read($, hubAtom)) ?? NO_HUB, nowMs)
-    + chiefStatusText(await read($, chiefAtom), await read($, chiefRoleAtom)))
+    + chiefStatusText(await read($, chiefAtom), await read($, chiefRoleAtom), await read($, floorAtom)))
 }
 
 // Only a missing file means "no tick here"; any other failure keeps the previous doc and sets `error`.

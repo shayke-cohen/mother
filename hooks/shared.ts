@@ -39,3 +39,10 @@ export function ago(iso: string | undefined | null, nowMs: number): string {
   const mins = Math.max(0, Math.floor((nowMs - ms) / 60_000))
   return mins < 1 ? 'now' : mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins / 60)}h` : `${Math.floor(mins / 1440)}d`
 }
+
+// Control and bidi characters never reach the pane: a tab becomes a space, the rest are dropped.
+const UNSAFE_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g
+export const safe = (text: string): string => text.replace(/\t/g, ' ').replace(UNSAFE_RE, '')
+
+// One line of untrusted text (worker-written, model-written) for a toast, a list or a card.
+export const oneLine = (text: unknown, cap = 200): string => safe(String(text ?? '')).split(/\s+/).filter(Boolean).join(' ').slice(0, cap)

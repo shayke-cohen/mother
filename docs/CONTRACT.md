@@ -1654,6 +1654,30 @@ minutes old unless `--force`. A wake no later than 120 s after the chief's own h
     `.mother/hub/inbox.jsonl` ask in every session (denied under PAUSED and in the chief and workers), wherever they run
     and through paths the guard can't resolve, since the folder and file are named.
 
+### The floor: session cards and "Needs you" (`lib/floor.py`, `mother floor`, `hooks/floor.ts`)
+
+Every session runs its own copy of the mod, so each pinned session reports on itself.
+- **The card.** `<workspace>/.mother/floor/<session_id>.json`: `{session_id, asks, question, options, waiting_on, at}`.
+  `question` is one line of at most 200 characters, `options` 0 to 4 of `{label (24), message (200)}`, `waiting_on` at
+  most 80 characters or null, `at` when it was written. Machine-local, never synced.
+- **Verbs.** `mother floor card --stdin` takes `{session_id, asks, question, options, waiting_on}`, cuts each text to
+  its cap and writes the card atomically; a `session_id` that isn't `^[0-9a-f-]{36}$` exits 2 and writes nothing.
+  `mother floor list --json` prints `{version: 1, cards: [...]}` oldest first, skips unreadable files and deletes
+  cards older than 7 days.
+- **Written.** When a main-loop turn ends with an answer (not a subagent's turn, an interrupt, a refusal or an error)
+  in a session whose CLI id is a `cli_session_id` in the last status's `desktop` rows, and never in the chief. The mod
+  asks the model once (`triage_model`, counted against `daily_budget_usd`; nothing is asked or written over budget)
+  and stores the reply. A failed, timed-out or off-shape reply stores `asks: false`. The call is detached from the turn.
+- **Cleared.** A prompt submitted in that session rewrites its card with `asks: false`, with no model call.
+- **What leaves the machine.** The last 3000 characters of a pinned session's final message go to the model API, as
+  JSON data under a fixed system note. Nothing else does.
+- **Needs you.** Each console pass reads the list. The Chief pane draws, above Health, one card per pinned session
+  other than its own whose card asks, oldest first: title, question, `waiting_on`, how long ago, one button per option
+  with the message it sends shown beside it, and Open. A button sends its `message` to that session as the pinned
+  chat box does (same prefix, same guard question) and hides the card until the next list read. A card with no
+  pinned row is not drawn. The status line adds `· N need you`. All of it is model-written from session text:
+  cleaned of control and bidi characters, drawn as plain Text and Buttons.
+
 ## 6. Sync (`bin/mother sync`)
 
 - `--quiet` (the hook path) with nothing changed but appended `tick` lines in `runs.md` → no commit, no push,

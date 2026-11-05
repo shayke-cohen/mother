@@ -174,6 +174,19 @@ export type ChiefDesktop = {
   open_link: string | null
 }
 
+// One session's card (lib/floor.py): did its last turn stop on a question for the manager. Written by that session's
+// own mod at turn end from one model call over its final message; all of it is untrusted text.
+export type FloorOption = { label: string; message: string }     // the button, and what it sends as the manager
+export type FloorCard = {
+  session_id: string                 // the session's CLI id (a pinned row's cli_session_id)
+  asks: boolean
+  question: string
+  options: FloorOption[]             // 0-4
+  waiting_on: string | null
+  at: string                         // when the card was written
+}
+export type FloorState = { cards: FloorCard[]; self: string | null; answered: string[] }
+
 // A decision a worker filed (lib/decisions.py). The pane draws the pending ones; `text` is the draft's first 400
 // characters, `full_text` all of it; `target` is where the call goes. The last two are absent from an older CLI.
 export type ChiefDecision = {
@@ -247,6 +260,7 @@ declare module 'claude-code' {
       chiefAnswers: Record<string, { message: string }> | null   // the last answers' messages, by decision id
       chiefBatch: ChiefBatchState | null            // the batch post's state; null until the first post
       chiefToasted: string[] | null                 // urgent decision ids already toasted this session
+      chiefFloor: FloorState | null                 // `mother floor list --json` as last read, this session's id, and the cards answered from the pane since
     }
   }
 }
