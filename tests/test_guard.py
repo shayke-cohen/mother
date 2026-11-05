@@ -21,6 +21,11 @@ GUARD_FAST = os.path.join(ROOT, "hooks", "guard_fast.py")
 DM, ME, TEAM, SUPPORT, ANNOUNCE, EXT = "U00000000", "U00000000", "C00000001", "C00000002", "C00000003", "C00000009"
 NOW = time.time()
 
+
+def read_file(path):
+    with open(path) as f:
+        return f.read()
+
 # Example MCP prefixes: product words in the tool or server name, opaque ids, and no hint at all.
 CHAT = "mcp__chat__slack__"           # mcp__<server>__slack__post_message
 CHAT2 = "mcp__0a1b2c3d__"             # opaque server, product word in the tool: slack_send_message
@@ -67,6 +72,9 @@ SIG = ":sparkles: *Agnes (AI)* · on behalf of Dana"
 
 class GuardCase(unittest.TestCase):
     def setUp(self):
+        # Fixtures are dated from NOW: taken once at import, a long run ages them past their limits.
+        global NOW
+        NOW = time.time()
         self.tmp = tempfile.mkdtemp(prefix="mother-guard-")
         self.ws = os.path.join(self.tmp, "ws")
         self.home = os.path.join(self.tmp, "home")
@@ -3458,7 +3466,7 @@ class ChiefAllowance(GuardCase):
 
     def test_chief_may_run_the_routines_hub_decide_unasked(self):
         """The exact heredoc routines/chief.md tells the chief to run, placeholders filled in."""
-        text = open(os.path.join(ROOT, "routines", "chief.md")).read()
+        text = read_file(os.path.join(ROOT, "routines", "chief.md"))
         m = re.search(r"```\n(mother hub decide <<'HUBEOF'\n.*?\nHUBEOF)\n```", text, re.S)
         self.assertIsNotNone(m)
         cmd = re.sub(r"<[a-z ]+>", "x", m.group(1))
@@ -4498,10 +4506,10 @@ class HookDeadline(GuardCase):
         self.assertEqual(p.stdout.split(), ["False", "ok"], p.stderr)
 
     def test_script_arms_itself_and_fast_path_too(self):
-        src = open(GUARD).read()
+        src = read_file(GUARD)
         self.assertRegex(src, r'if __name__ == "__main__":\n    arm_deadline\(\)')
         self.assertLess(src.index("arm_deadline()"), src.index("TAG = "), "armed before the module's regexes compile")
-        fast = open(GUARD_FAST).read()
+        fast = read_file(GUARD_FAST)
         main = fast[fast.index("def main():"):]
         self.assertLess(main.index("arm_deadline()"), main.index("sys.stdin.read()"), "armed before any work")
         self.assertLess(main.index("arm_deadline()"), main.index("import guard"))
