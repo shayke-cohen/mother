@@ -30,7 +30,10 @@ export const RELAY_LINES_MAX = 10            // lines per submit; the rest wait
 const RELAY_WHO_MAX = 80
 const RELAY_SUMMARY_MAX = 300
 
-export type CaseItem = { id?: string | null; key?: string | null; title?: string | null; why?: string | null; link?: string | null }
+// `ask` marks a case started from the ask box: the manager's own words go in whole (up to ASK_PROMPT_MAX), and with
+// no inbox item to close, the brief names `mother chief close-case <key>` instead.
+export type CaseItem = { id?: string | null; key?: string | null; title?: string | null; why?: string | null; link?: string | null; ask?: boolean }
+export const ASK_PROMPT_MAX = 2000
 export type RelayLine = { id: string; key: string; at: string | null; who: string; title: string; summary: string; link: string }
 
 // The brief a new session starts from. Every item text is one cleaned line; a key off the hub's grammar gets no `Key:`
@@ -39,7 +42,7 @@ export function caseBrief(item: CaseItem, prompt?: string | null): string {
   const key = String(item.key ?? '').trim()
   const id = String(item.id ?? '').trim()
   const link = String(item.link ?? '').trim()
-  const ask = oneLine(prompt ?? '', PROMPT_MAX) || DEFAULT_CASE_PROMPT
+  const ask = oneLine(prompt ?? '', item.ask ? ASK_PROMPT_MAX : PROMPT_MAX) || DEFAULT_CASE_PROMPT
   return [
     `${CASE_PREFIX} ${oneLine(item.title, TITLE_MAX) || (KEY_RE.test(key) ? key : 'an inbox item')}`,
     ...(KEY_RE.test(key) ? [`Key: ${key}`] : []),
@@ -47,7 +50,8 @@ export function caseBrief(item: CaseItem, prompt?: string | null): string {
     `Why it reached the manager: ${oneLine(item.why, WHY_MAX) || 'not said'}`,
     '',
     `Use the mother:cos skill for how to act. ${ask}`,
-    ...(UPDATE_ID_RE.test(id) ? [`When this is finished, run: mother hub done ${id}`] : []),
+    ...(UPDATE_ID_RE.test(id) ? [`When this is finished, run: mother hub done ${id}`]
+      : item.ask && KEY_RE.test(key) ? [`When this is finished, run: mother chief close-case ${key}`] : []),
   ].join('\n')
 }
 

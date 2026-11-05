@@ -1793,6 +1793,14 @@ class Direct(unittest.TestCase):
         self.run_verb("add", "look at this", "--key", "mine")
         self.assertEqual(self.inbox()[-1]["key"], "mine")
 
+    def test_add_json_prints_the_key_and_the_line(self):
+        rc, out = self.run_verb("add", "ask the vendor about PLAT-7", "see", "https://example.com/x", "--json")
+        got = json.loads(out)
+        (l,) = self.inbox()
+        self.assertEqual((rc, got), (0, {"ok": True, "key": "PLAT-7", "line_id": l["id"], "link": "https://example.com/x"}))
+        rc, out = self.run_verb("add", "a plain note", "--json")
+        self.assertTrue(json.loads(out)["key"].startswith("manual:"))
+
     def test_add_key_takes_only_the_hub_token_charset(self):
         for bad in ("PLAT 1", "it's", '"x"', "a;b", "x?y", "#1"):
             rc, _ = self.run_verb("add", "a note", "--key", bad)

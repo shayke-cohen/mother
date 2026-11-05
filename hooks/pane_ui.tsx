@@ -2,7 +2,7 @@ import type { Color } from 'claude-code'
 
 import { oneLine } from './shared'
 import type { Dollar } from './shared'
-import type { ChiefDesktop, ChiefOpen, ChiefStatus } from '../types'
+import type { ChiefCardState, ChiefDesktop, ChiefOpen, ChiefStatus, ChiefTldr } from '../types'
 
 // The Chief pane's drawing kit: the header strip, a card frame with a kind colour, badges, the source colour map and
 // the suggested prompts an Inbox card offers. Nothing here reads state or runs an action: chief.tsx's sections pass
@@ -39,6 +39,46 @@ export function itemSource(id: string | null | undefined): Source {
     : kind === 'pr' || kind === 'repo' || kind === 'build' ? 'code'
     : kind === 'ticket' ? 'tracker' : kind === 'event' ? 'calendar' : 'other'
 }
+// ---- where an item came from: one `<kind> ↗` link on a compact card, every labelled link on an expanded one ----
+export type LabelledLink = { label: string; url: string }
+export const LINKS_SHOWN = 8
+const LINK_LABEL_MAX = 24
+const HTTP_RE = /^https?:\/\/\S+$/
+// The word a source link wears, by the item's kind.
+export const KIND_LINK: Record<Source, string> = {
+  chat: 'thread', tracker: 'issue', code: 'PR', mail: 'mail', calendar: 'event', manual: 'source', error: 'source', other: 'source',
+}
+
+// An item's links: its own `link` first, labelled by its kind, then its `links` as they are labelled; http(s) only,
+// no URL twice, at most 8. [] when there is truly none: the card then draws no link at all.
+export function linksOf(link: unknown, links: unknown, source: Source): LabelledLink[] {
+  const out: LabelledLink[] = []
+  const add = (label: unknown, url: unknown) => {
+    if (typeof url !== 'string' || !HTTP_RE.test(url) || out.length >= LINKS_SHOWN || out.some(l => l.url === url)) return
+    out.push({ label: oneLine(label, LINK_LABEL_MAX) || 'link', url })
+  }
+  add(KIND_LINK[source], link)
+  for (const l of Array.isArray(links) ? links : []) if (l && typeof l === 'object') add((l as any).label, (l as any).url)
+  return out
+}
+
+// The compact card's one link, or null.
+export function sourceLink(ui: Ui, id: string, list: readonly LabelledLink[]) {
+  const { Link } = ui
+  return list.length ? <Link key={'src:' + id} href={list[0].url}>{`${list[0].label} ↗`}</Link> : null
+}
+
+// The expanded card's links, each labelled; `no source link`, dim, when there is none.
+export function linkRows(ui: Ui, id: string, list: readonly LabelledLink[]) {
+  const { Box, Link, Text } = ui
+  if (!list.length) return <Text key={'nolink:' + id} dimColor>no source link</Text>
+  return (
+    <Box key={'links:' + id} flexWrap="wrap" gap="xs">
+      {list.map((l, n) => <Link key={`link:${id}:${n}`} href={l.url}>{`${l.label} ↗`}</Link>)}
+    </Box>
+  )
+}
+
 export const NEED_COLOR: Color = 'warning'      // a session stopped on a question
 export const SESSION_COLOR: Color = 'ide'       // a pinned session
 export const SELF_COLOR: Color = 'claude'       // the session whose pane this is
@@ -153,7 +193,8 @@ export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'team' | 'health'
 export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'team', 'health', 'all']
 // A tab is data: an id, a label, how many items it holds and what draws them. `all` has no section of its own.
 // `text` replaces `<label> <count>` on the button (Health wears no count); `alert` adds a red dot.
-export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown; text?: string; alert?: boolean }
+// `fresh` marks the tab as holding something new though its count did not grow (a session whose state changed).
+export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown; text?: string; alert?: boolean; fresh?: boolean }
 
 // The tab shown: the manager's pick, else the first tab that holds something, else `all` (every empty line).
 export function shownTab(picked: string | null | undefined, tabs: readonly { id: TabId; count: number }[]): TabId {
@@ -173,7 +214,7 @@ export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<
   const { Box, Button, Text } = ui
   return (
     <Box key="tabs" flexWrap="wrap" gap="xs" marginTop={1}>
-      {[...tabs.map(t => ({ id: t.id, alert: !!t.alert, text: t.text ?? `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, alert: false, text: 'All' }].map(t => (
+      {[...tabs.map(t => ({ id: t.id, alert: !!t.alert, text: t.text ?? `${t.label} ${t.count}${t.id !== shown && (tabIsNew(t, seen) || t.fresh) ? ' •' : ''}` })), { id: 'all' as TabId, alert: false, text: 'All' }].map(t => (
         <Button key={'tab:' + t.id} variant={t.id === shown ? 'primary' : 'secondary'} dimColor={t.id === 'all' && shown !== 'all'}
           {...(t.id === shown ? {} : { hover: tabHover(t.id) })}
           onPress={() => onPick(t.id)}>{t.alert ? <Text>{t.text}<Text color="error">{' ●'}</Text></Text> : t.text}</Button>
@@ -227,6 +268,34 @@ export function sessionPill(d: ChiefDesktop, asks: boolean, nowMs: number, ago: 
   return { text: age ? `idle ${age}` : 'idle', color: 'subtle' }
 }
 
+// ---- a refreshed session card's state (CONTRACT §5g "Session refresh") ----
+export const CARD_STATES: readonly ChiefCardState[] = ['working', 'waiting_manager', 'waiting_other', 'done', 'stuck', 'idle']
+// The Sessions tab's order: waiting on you, stuck, working, waiting on others, idle, done.
+export const STATE_RANK: Record<ChiefCardState, number> = { waiting_manager: 0, stuck: 1, working: 2, waiting_other: 3, idle: 4, done: 5 }
+
+// The state a card shows now, or null for a session with no refreshed card: stuck (the code rule) first, then
+// `working` while its transcript runs, then `waiting_manager` while its floor card asks, else what the card says.
+export function cardState(t: ChiefTldr | null | undefined, asks: boolean): ChiefCardState | null {
+  if (!t || !t.state) return null
+  if (t.stuck) return 'stuck'
+  if (t.running) return 'working'
+  if (asks) return 'waiting_manager'
+  return t.state === 'working' ? 'idle' : t.state   // it said working, and it no longer runs: idle until its next card
+}
+
+// The state as a badge: working in the accent colour, waiting on you amber, waiting on someone neutral with the
+// name, done green, stuck red, idle dim.
+export function statePill(state: ChiefCardState, waitingOn: string | null | undefined, idle: string): Pill & { dim?: boolean } {
+  switch (state) {
+    case 'working': return { text: 'working', color: SELF_COLOR }
+    case 'waiting_manager': return { text: 'waiting on you', color: 'warning' }
+    case 'waiting_other': return { text: `waiting on ${oneLine(waitingOn, 40) || 'someone'}`, color: 'subtle' }
+    case 'done': return { text: 'done', color: 'success' }
+    case 'stuck': return { text: 'stuck', color: 'error' }
+    default: return { text: idle || 'idle', color: 'subtle', dim: true }
+  }
+}
+
 // ---- text: never cut mid-word ----
 // `text` on one line of at most `cap` characters: a longer one is cut at the last word boundary that fits and ends
 // with `…` (a single word longer than the cap is cut where the cap falls).
@@ -263,8 +332,9 @@ export function humanLabel(u: { key?: string | null; label?: string | null; who?
 
 // ---- elements ----
 // A small filled pill: the source or state of a card, the counts of the header strip.
-export function badge(ui: Ui, text: string, color: Color, key?: string) {
+export function badge(ui: Ui, text: string, color: Color, key?: string, dim = false) {
   const { Text } = ui
+  if (dim) return <Text key={key} dimColor>{text}</Text>
   return <Text key={key} backgroundColor={color} color="inverseText" weight="semibold">{` ${text} `}</Text>
 }
 

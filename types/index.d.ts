@@ -143,7 +143,25 @@ export type ChiefChip =
   | { kind: 'open' }
 
 // A card's TL;DR (at most 2 short lines) and up to 3 chips, from one model call over the session's recent tail.
-export type ChiefTldr = { tldr: string; chips: ChiefChip[] }
+// A session's card. `tldr` and `chips` alone are the older TL;DR; a refreshed card (CONTRACT §5g "Session refresh")
+// also carries its state, what changed since the card before, and the question it stopped on. `at`, `running`, `stuck`
+// and `moved` are what the last `mother chief tail --json` read said of the session, joined on by the mod.
+export type ChiefCardState = 'working' | 'waiting_manager' | 'waiting_other' | 'done' | 'stuck' | 'idle'
+export type ChiefTldr = {
+  tldr: string; chips: ChiefChip[]
+  state?: ChiefCardState
+  progress?: string                  // one line: what changed since the previous card; '' when nothing did
+  asks?: boolean; question?: string; options?: FloorOption[]
+  waiting_on?: string | null
+  prev_state?: ChiefCardState | null // the state of the card this one replaced
+  at?: string | null                 // when the card was stored
+  running?: boolean                  // its transcript moved in the last 2 minutes, or its turn is open
+  stuck?: boolean                    // the code rule (lib/chief.py _is_stuck)
+  moved?: boolean                    // the session moved since this card was made; a new one is due
+}
+
+// What a dots action or manager item says, from `mother chief dots-detail <id> --json`; null = nothing on disk has it.
+export type ChiefDetail = { id: string; text: string; date: string; source_file: string; label?: string | null }
 
 // A pinned desktop session (lib/chief.py desktop_status), from the snapshot a desktop session writes.
 export type ChiefDesktop = {
@@ -174,6 +192,8 @@ export type FloorState = { cards: FloorCard[]; self: string | null; answered: st
 // hub's sessions.json. `unseen` is how many routed lines wait to be delivered into it.
 export type ChiefCase = {
   key: string; cli_session_id: string; title: string; link: string | null
+  links?: { label: string; url: string }[]   // the case's sources, its own first (lib/chief.py item_links)
+  also?: string[]                    // the other keys the case owns (claim `also`, `mother chief watch-key`)
   label?: string                     // what a card shows in place of the raw key
   unseen: number
   last_routed_at: string | null; opened_at: string | null
@@ -218,6 +238,7 @@ export type ChiefHealthState = { dismissed: string[]; reports: Record<string, st
 export type ChiefInboxItem = {
   id: string   // U<n>
   key: string; title: string; why: string; link: string; at: string | null
+  links?: { label: string; url: string }[]   // every labelled source, the item's own first; [] when none is known
   source?: string                    // the key's kind: chat, mail, tracker, code, calendar, manual, error, other
   who?: string                       // the person its newest inbox line names; '' when none
   label?: string                     // what a card shows in place of the raw key: a channel's name, a person, `mail thread`…
@@ -236,7 +257,8 @@ export type ChiefOpen = { all: boolean | null; cards: Record<string, boolean> }
 
 // The Chief pane's tab: `picked` is the manager's choice (`needs`, `inbox`, `sessions`, `today`, `all`; null = the
 // first tab that holds something); `seen` is each tab's count when it was last opened or left, for its "new" mark.
-export type ChiefTabs = { picked: string | null; seen: Record<string, number> }
+// `states` is each session's card state when the Sessions tab was last opened or left: a change since marks the tab.
+export type ChiefTabs = { picked: string | null; seen: Record<string, number>; states?: Record<string, string> }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -258,6 +280,7 @@ declare module 'claude-code' {
       chiefOpen: ChiefOpen | null                   // which Chief pane cards are expanded; null = the defaults
       chiefTab: ChiefTabs | null                    // the Chief pane's tab and the counts last seen on each
       chiefHealth: ChiefHealthState | null          // the Health tab: dismissed undelivered reports, loaded report texts
+      chiefDetail: Record<string, ChiefDetail | null> | null   // what each dots item does, by Now item id, once its card was pressed (null = nothing on disk)
       chiefSelected: string | null                  // the card id (`sess:<cli id>`, `inbox:<U-id>`) a button was last pressed on; drawn with a bold border
     }
   }

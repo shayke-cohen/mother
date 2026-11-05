@@ -944,6 +944,8 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `mute <x>` / `unmute <x>` take a chat user id (`U…`) or an email (person), a channel id, a WhatsApp JID (`…@s.whatsapp.net`, `…@g.us` or `…@lid`; stored as the key `wa:<jid>`; any `wa:`-prefixed value is a key), or anything else as a
   key. A `mute` or `unmute` value that is an http(s) link is first turned into the key it is about (a chat message
   link's thread key, else its first tracker or PR key), and stored as the link itself when it names none.
+  `mother hub add <link-or-text> --json` prints `{ok, key, line_id, link}` in place of `added <key>` (the Chief pane's
+  ask box reads the key through `mother chief ask`, §5g).
   `mute --for Nd|Nw` (at most 90 days) records `until: {<value>: <ISO UTC>}` and prints `until <ISO>`; the mute
   stops at that time (`live_mute`, applied by the watcher and by `mother now merge`), and a plain `mute` or an
   `unmute` of the value drops its `until`. `mute --scope channel -- <thread key or chat link>` mutes the channel
@@ -1278,7 +1280,8 @@ with a cheap model's triage), and the **Chief pane** shows what needs the manage
 long-lived chief session kept alive by launchd and tmux, headless `claude -p` workers and a decision queue posted to
 the manager's self-DM; all of that is gone. Work happens in visible desktop sessions. Config: the optional `chief`
 block (§3), keys `daily_budget_usd` (20), `tldr_model` and `triage_model` (both `sonnet`; `opus` is the one other
-value, anything else reads as `sonnet`). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
+value, anything else reads as `sonnet`) and `refresh_minutes` (5; a whole number 1-60: how often the leading session
+re-reads each session for its card, "Session refresh" below). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
 `worker_model`, `tick_seconds`, `batch_minutes`, `decision_hours`) are accepted and ignored, so an older
 `config.json` still loads; any other unknown key is a validation error, as before.
 
@@ -1465,6 +1468,75 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   nothing. The rules that existed only for the chief session and its workers (the `MOTHER_CHIEF_ROLE` and
   `MOTHER_CHIEF_WORKER` identities, the chief's command allowance, the positive shell list, the write limits, the
   self-DM offer rule, the deny-instead-of-ask) are gone with them; a session is a session.
+
+### Source links, the ask box, item detail, session refresh
+
+- **Source links.** `status --json` inbox items and `cases` rows carry `link` and `links: [{label, url}]`
+  (`lib/chief.py item_links`): the item's own stored link when it is an http(s) URL, else one built from its key, then
+  the things its line's `also` keys name and the URLs in its summary; no URL twice, at most 8. The first is labelled by
+  kind (`thread`, `issue`, `PR`, `mail`, `event`, else `source`). A link is built only from a base something reveals
+  (`link_bases`), never a guessed host: chat from the host of a stored message link (`<base>/archives/<channel>/p<ts>`);
+  tracker from a team's `tracker.url` when the config has one, else the part before `/browse/` of a stored issue link;
+  the code host only when `connectors.code` is `github`, `hub.connections.code.cli` is `gh`, or a stored link is on it
+  (`owner/repo#N` becomes `/pull/N`). Mail, calendar, notes and WhatsApp keep the watcher's link. No base: `link` is
+  `""` and `links` is `[]`. The pane draws one `<kind> ↗` link on a compact card and every labelled link on an expanded
+  one (Inbox, Today, Team, Suggested, a case session's card and its Needs you card, a watcher error); with none it
+  draws no link, and the expanded card says `no source link`.
+- **Ask box.** Under the header strip, an Input "Ask Mother…" (`Start`, or Enter). Submitting runs
+  `mother chief ask --stdin` with `{text}`: the text becomes a `manual` inbox line exactly as `mother hub add` makes
+  one (`hub.add_line`; `mother hub add --json` prints `{ok, key, line_id, link}`), and the verb prints `{ok, key,
+  line_id, link, update_id, owned_by}`. The pane then opens a new session on the case brief (title: the first 60
+  characters; `Key:` the line's key; `Source:` the first URL in the text; the manager's text whole, up to 2000
+  characters, as what to do; closing command `mother chief close-case <key>` when the key has no inbox item), and that
+  session claims the key on its first prompt. So the ask is not also an Inbox card, the key is **held** in
+  `.mother/chief/asks.json` (`{version, asks: {<key>: {at, line_id, claimed}}}`, entries kept 7 days): while a hold is
+  unclaimed and under 10 minutes old, `status --json` leaves that key's item out of `inbox`; a claim accepts a held
+  key though it has no open item, closes the item if the leader already made one, and marks the hold claimed; the
+  ask's own line is never relayed into the case. A session that never starts leaves a normal `manual` item in the
+  Inbox after 10 minutes. A key that already has an open item is not held (`update_id` names it: its card stays and
+  the new session claims it as any case); a key a live case holds gets no second session (`owned_by`: the hub routes
+  the line there). Empty input runs nothing and shows "Type what you need first".
+- **More than one key per case.** `claim --stdin` takes `also: [keys]`, kept in the row's `also`, so lines of those
+  keys route to the same session. `mother chief watch-key <key> --for <session id>` adds one key to a live case that
+  session holds; both refuse an off-shape key and a key live in another session whose row is under 7 days old, and
+  `watch-key` refuses a session that holds no live case (exit 1). `mother chief close-case <key>` marks the live case
+  that holds the key done, with every open inbox item of its keys. `cases` rows carry `also`.
+- **Item detail.** An expanded Today, Team or Suggested card shows what the item carries: the whole `why`, `signal`,
+  `from`, `team`, `since` and `first_seen` as ages, every labelled link, `also`, the `similar` rule, and under the
+  buttons each action's whole instruction (`task`, then the prompt the button fills). For a dots action or manager
+  item (an action whose task is `dots do A<n>`, or a title `Dots A<n>: …`), pressing the card (never a draw) runs
+  `mother chief dots-detail <id> --json` once: `{id, text, date, source_file, label}` or `null`, from the newest of
+  `.mother/reports/dots-<date>.md`, `journal/dots/<date>.md` (which the dots routine always writes) and
+  `.mother/dots-unsent-<date>.md` that has the id: its own line with the indented lines under it (for `M<n>` with no
+  such line, entry `<n>.` under "For you"), then the file's other lines that name it, at most 1500 characters. The
+  card shows it under "What this does". `label` is the action's first clause when it is 2 or more words and at most 40
+  characters; a primary button labelled `Run …` then wears it ("Annotate 7 todos").
+- **Session refresh.** One card per session, made by one model call when the session moved. `tail --json` rows are
+  the pinned sessions and the live case sessions that are not pinned (`kind: "case"`, their transcript looked for under
+  the workspace folder), asleep or not, each with what its transcript says in code: `running` (it moved in the last 2
+  minutes, or its turn is open and it moved in the last 30), `idle_for` (seconds), `last_from` (`assistant` or
+  `manager`), `open_turn`, `waiting` (the cos skill's last line `Waiting on: <who> — <what>`, as `{state, on, what}`),
+  `error_end`, `stuck` (the tail ends in an API error or limit message; or nothing moved for 30 minutes while the turn
+  is open or the stored card said `working` twice running), `cached` (the stored card for the same fingerprint and
+  model) and `prev` (the stored card whatever it was made from, with `at` and `fingerprint`); the document adds
+  `refresh_minutes`. A row whose fingerprint equals its card's gets no call. The call's reply is `{state: working |
+  waiting_manager | waiting_other | done | stuck | idle, tldr, progress, asks, question, options, waiting_on, chips}`;
+  the prompt carries the previous card's `tldr` and `state`, so `progress` is a delta. A reply with no `state` is the
+  older `{tldr, chips}`; a failed call keeps the previous card. `tldr --stdin` stores the card fields too and prints
+  `{stored, cards}`; there the code wins over the model: a `Waiting on:` last line sets `state` and `waiting_on`
+  (`the manager` = `waiting_manager`, `nothing` = `done`, anyone else = `waiting_other`), a running session is
+  `working`, and `prev_state` is the replaced card's state. A stored card's ask also fills the session's floor card
+  (`.mother/floor/<id>.json`) unless that card was written after the transcript last moved (then it is the session's
+  own and wins), so Needs you covers a session whose own mod is not running. **Who refreshes:** any session while
+  its Chief pane is shown, as before; and the leading desktop session on its pass with no pane shown, each session at
+  most once per `refresh_minutes`. A running session is refreshed at most every 2 x `refresh_minutes`, pane or not.
+  `Refresh` on a session's card and `/chief refresh` (all) skip those intervals and the failed-row back-off; nothing
+  skips the 6 calls a minute, one batch at a time, or the daily budget. **What leaves the machine** is unchanged in
+  kind (session tails go to the model API) but now also happens with no pane shown, and for sessions that are asleep.
+  The card draws a state badge (working, waiting on you, waiting on `<name>`, done, stuck, idle), `Since the last
+  card: <progress>`, `updated Nm ago`, and on a done case session `Close case` (`close-case` for each of its keys).
+  Sessions sort waiting on you, stuck, working, waiting on others, idle, done; a state that differs from the one a
+  session had when the Sessions tab was last opened or left marks that tab.
 
 ### Cases: a session that owns one Inbox item (`hooks/cos.ts`, `skills/cos`, `mother chief claim|relays|relay`)
 

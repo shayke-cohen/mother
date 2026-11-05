@@ -85,11 +85,13 @@ class TestPausedSettings(Base):
 
     def test_settings_defaults_and_overrides(self):
         s = chief.settings({})
-        self.assertEqual(s, {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet"})
+        self.assertEqual(s, {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5})
+        self.assertEqual([chief.settings({"chief": {"refresh_minutes": v}})["refresh_minutes"] for v in (1, 60, 0, 61, "5", True, 2.5)],
+                         [1, 60, 5, 5, 5, 5, 5])
         self.assertEqual(chief.settings({"chief": {"triage_model": "gpt"}})["triage_model"], "sonnet")
         self.assertEqual(chief.settings({"chief": {"triage_model": "opus"}})["triage_model"], "opus")
         s = chief.settings({"chief": {"daily_budget_usd": 5, "max_workers": 5, "batch_minutes": 30, "bogus": 1}})
-        self.assertEqual(s, {"daily_budget_usd": 5, "tldr_model": "sonnet", "triage_model": "sonnet"})
+        self.assertEqual(s, {"daily_budget_usd": 5, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5})
 
 
 def line(**kw):
@@ -620,7 +622,7 @@ class TestHealth(Base):
         self.assertEqual(([u["key"] for u in doc["inbox"]], doc["inbox_count"]), (["PLAT-1"], 1))
         h = doc["health"]
         self.assertEqual(([u["id"] for u in h["watcher_errors"]], h["watcher_error_count"]), (["U2", "U3"], 2))
-        self.assertEqual(set(h["watcher_errors"][0]), {"id", "key", "title", "why", "link", "at", "session",
+        self.assertEqual(set(h["watcher_errors"][0]), {"id", "key", "title", "why", "link", "links", "at", "session",
                                                         "source", "who", "label", "kind", "on", "urgency", "actions"})
 
     def test_watcher_heartbeat_and_sources(self):
@@ -927,7 +929,7 @@ class TestTldr(Base):
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 self.assertEqual(chief.main(["tldr", "--stdin"], self.ws, {}, AT), code, stdin)
             if code == 0:
-                self.assertEqual(json.loads(out.getvalue()), {"stored": 1})
+                self.assertEqual(json.loads(out.getvalue()), {"stored": 1, "cards": {CLI_A: {"tldr": "ok", "chips": [], "at": hub._iso(AT)}}})
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(chief.main(["tldr"], self.ws, {}, AT), 2)
         doc = json.loads((chief.chief_dir(self.ws) / "tldr.json").read_text())
@@ -1097,7 +1099,7 @@ class TestCases(Base):
     def test_claim_makes_a_live_case_and_links_the_update(self):
         uid = self.now_item("PLAT-7")["update_id"]
         got = self.claim("PLAT-7", self.A)
-        self.assertEqual(got, {"ok": True, "key": "PLAT-7", "session_id": self.A, "update_id": uid})
+        self.assertEqual(got, {"ok": True, "key": "PLAT-7", "session_id": self.A, "update_id": uid, "also": []})
         r = self.rows()["PLAT-7"]
         self.assertEqual((r["state"], r["kind"], r["cli_session_id"], r["session_id"], r["opened_at"], r["unseen"]),
                          ("live", "case", self.A, self.A, hub._iso(AT), 0))
@@ -1219,6 +1221,7 @@ class TestCases(Base):
         doc = chief.status_doc(self.ws, {}, AT)
         self.assertEqual(doc["relay"], {"on": True})
         self.assertEqual(doc["cases"], [{"key": "PLAT-7", "cli_session_id": self.A, "title": "Fix it", "link": "https://example.com/1",
+                                         "links": [{"label": "issue", "url": "https://example.com/1"}], "also": [],
                                          "label": "PLAT-7", "unseen": 1, "last_routed_at": hub._iso(AT + timedelta(seconds=10)),
                                          "opened_at": hub._iso(AT), "deliver_now": False}])
         self.assertEqual(run("relay", "off")[1], "relay off: 1 line(s) waiting\n")
@@ -1232,3 +1235,315 @@ class TestCases(Base):
         self.assertEqual(run("relay", "on")[1], "relay on\n")
         self.assertEqual(run("relay", "status")[1], "relay on\n")
         self.assertEqual([run("relay")[0], run("relay", "maybe")[0], run("relays")[0], run("relay", "deliver")[0]], [2, 2, 2, 2])
+
+
+class TestLinks(Base):
+    """Where an item came from: built from its key only when a base is known."""
+    def test_no_base_no_link(self):
+        bases = chief.link_bases(self.ws, {})
+        self.assertEqual(bases, {"chat": None, "tracker": None, "code": None})
+        for key in ("C00000001/1700000000.123456", "PLAT-7", "acme/api#12", "mail:abc", "cal:ev1", "manual:abc", "wa:1@g.us"):
+            self.assertEqual(chief.item_links(key, "", [], "", bases), ("", []), key)
+
+    def test_bases_from_config_and_stored_links(self):
+        cfg = {"connectors": {"code": "github"}, "teams": [{"tracker": {"project": "PLAT", "url": "https://tracker.example.com/browse/"}}]}
+        self.assertEqual(chief.link_bases(self.ws, cfg), {"chat": None, "tracker": "https://tracker.example.com", "code": "https://github.com"})
+        hub.append_inbox(self.ws, [line(key="C00000002/1700000001.000100", link="https://chat.example.com/archives/C00000002/p1700000001000100"),
+                                   line(key="OPS-1", link="https://jira.example.com/browse/OPS-1")])
+        self.assertEqual(chief.link_bases(self.ws, {}), {"chat": "https://chat.example.com", "tracker": "https://jira.example.com", "code": None})
+        self.assertEqual(chief.link_bases(self.ws, {"hub": {"connections": {"code": {"cli": "gh"}}}})["code"], "https://github.com")
+
+    def test_source_link_shapes(self):
+        b = {"chat": "https://chat.example.com", "tracker": "https://jira.example.com", "code": "https://github.com"}
+        self.assertEqual(chief.source_link("C00000001/1700000000.123456", b), "https://chat.example.com/archives/C00000001/p1700000000123456")
+        self.assertEqual(chief.source_link("D00000001/dm", b), "https://chat.example.com/archives/D00000001")
+        self.assertEqual(chief.source_link("C00000001/17.5", b), "")          # not a message stamp: no guess
+        self.assertEqual(chief.source_link("PLAT-7", b), "https://jira.example.com/browse/PLAT-7")
+        self.assertEqual(chief.source_link("acme/api#12", b), "https://github.com/acme/api/pull/12")
+        for key in ("mail:abc", "cal:ev1", "manual:abc", "wa:1@g.us", "watcher:chat"):
+            self.assertEqual(chief.source_link(key, b), "", key)
+
+    def test_item_links_source_first_then_also_and_text(self):
+        b = {"chat": "https://chat.example.com", "tracker": "https://jira.example.com", "code": None}
+        link, links = chief.item_links("C00000001/1700000000.123456", "", ["PLAT-7", "acme/api#12"],
+                                       "see https://docs.example.com/page, and https://jira.example.com/browse/PLAT-7.", b)
+        self.assertEqual(link, "https://chat.example.com/archives/C00000001/p1700000000123456")
+        self.assertEqual(links, [{"label": "thread", "url": link}, {"label": "PLAT-7", "url": "https://jira.example.com/browse/PLAT-7"},
+                                 {"label": "docs.example.com", "url": "https://docs.example.com/page"}])
+        # the watcher's own link wins over a built one; mail and calendar keep it
+        self.assertEqual(chief.item_links("mail:abc", "https://mail.example.com/#inbox/abc", [], "", b),
+                         ("https://mail.example.com/#inbox/abc", [{"label": "mail", "url": "https://mail.example.com/#inbox/abc"}]))
+        self.assertEqual(chief.item_links("PLAT-9", "javascript:alert(1)", [], "", {})[0], "")
+        many = " ".join("https://example.com/%d" % n for n in range(20))
+        self.assertEqual(len(chief.item_links("manual:x", "", [], many, b)[1]), chief.LINKS_MAX)
+
+    def test_status_inbox_items_carry_link_and_links(self):
+        a = line(key="C00000001/1700000000.123456", title="ping", summary="about PLAT-7", also=["PLAT-7"], link="")
+        seed = line(key="PLAT-1", link="https://jira.example.com/browse/PLAT-1")
+        chat = line(key="C00000009/1700000009.000001", link="https://chat.example.com/archives/C00000009/p1700000009000001")
+        hub.append_inbox(self.ws, [seed, chat, a])
+        hub.decide(self.ws, {}, AT, [{"line_id": a["id"], "key": a["key"], "decision": "now", "title": "ping", "why": "w"}])
+        [u] = chief.status_doc(self.ws, {}, AT)["inbox"]
+        self.assertEqual(u["link"], "https://chat.example.com/archives/C00000001/p1700000000123456")
+        self.assertEqual(u["links"], [{"label": "thread", "url": u["link"]}, {"label": "PLAT-7", "url": "https://jira.example.com/browse/PLAT-7"}])
+
+
+class TestAsk(TestCases):
+    """The ask box: a manual line whose item is held for the case the pane starts."""
+    main = TestLeader.main
+
+    def decide_pending(self, at):
+        ids = chief.tick(self.ws, {}, at)["judge"]
+        return chief.triage_decide(self.ws, {}, at, ids, [])
+
+    def test_hub_add_json_names_the_key(self):
+        out = io.StringIO()
+        self.assertEqual(hub.add_cmd(self.ws, AT, ["look", "at", "PLAT-7"], out, as_json=True), 0)
+        got = json.loads(out.getvalue())
+        self.assertEqual((got["ok"], got["key"], got["link"]), (True, "PLAT-7", ""))
+        self.assertEqual(got["line_id"], hub.read_inbox(self.ws)[-1]["id"])
+
+    def test_ask_holds_the_item_out_of_the_inbox_for_ten_minutes(self):
+        got = chief.ask(self.ws, {}, AT, "Who owns the billing migration?")
+        self.assertTrue(got["key"].startswith("manual:"))
+        self.assertEqual((got["update_id"], got["owned_by"]), (None, None))
+        self.decide_pending(AT + timedelta(seconds=30))                    # the leader makes it a `now` item
+        self.assertEqual(len([u for u in hub._hub_doc(self.ws)["updates"] if u["state"] == "open"]), 1)
+        self.assertEqual(chief.status_doc(self.ws, {}, AT + timedelta(minutes=9))["inbox"], [])
+        late = chief.status_doc(self.ws, {}, AT + timedelta(minutes=10, seconds=1))   # never started: a normal manual item
+        self.assertEqual([u["key"] for u in late["inbox"]], [got["key"]])
+
+    def test_claim_before_the_leader_decides_routes_nothing_back(self):
+        got = chief.ask(self.ws, {}, AT, "Chase the vendor about the invoice")
+        res = chief.claim(self.ws, {}, AT, {"key": got["key"], "session_id": self.A, "title": "Chase the vendor", "link": None})
+        self.assertEqual((res["ok"], res["update_id"]), (True, None))
+        self.decide_pending(AT + timedelta(seconds=30))                    # a live case: stored as a route, no item
+        self.assertEqual(hub._hub_doc(self.ws)["updates"], [])
+        self.assertEqual(chief.relays(self.ws, AT, self.A), [])            # the manager's own words are not relayed back
+        self.assertEqual(chief.status_doc(self.ws, {}, AT + timedelta(hours=1))["inbox"], [])
+        self.follow_up(got["key"], 60)                                     # later activity on the key is
+        self.assertEqual(len(chief.relays(self.ws, AT, self.A)), 1)
+
+    def test_claim_after_the_leader_decided_closes_the_item(self):
+        got = chief.ask(self.ws, {}, AT, "Chase the vendor about the invoice")
+        self.decide_pending(AT + timedelta(seconds=30))
+        chief.claim(self.ws, {}, AT + timedelta(minutes=1), {"key": got["key"], "session_id": self.A, "title": "t", "link": None})
+        self.assertEqual([u for u in hub._hub_doc(self.ws)["updates"] if u["state"] != "done"], [])
+        self.assertEqual(chief.status_doc(self.ws, {}, AT + timedelta(hours=1))["inbox"], [])
+        self.assertEqual([c["key"] for c in chief.cases(self.ws)], [got["key"]])
+
+    def test_ask_about_a_key_that_has_an_item_or_a_case(self):
+        uid = self.now_item("PLAT-7")["update_id"]
+        got = chief.ask(self.ws, {}, AT, "what about PLAT-7?")
+        self.assertEqual((got["key"], got["update_id"], got["owned_by"]), ("PLAT-7", uid, None))
+        self.assertEqual([u["id"] for u in chief.status_doc(self.ws, {}, AT)["inbox"]], [uid])   # its own card stays
+        self.claim("PLAT-7", self.A)
+        self.assertEqual(chief.ask(self.ws, {}, AT, "and PLAT-7 again")["owned_by"], self.A)
+
+    def test_ask_cli_and_empty_text(self):
+        code, out, _ = self.main("ask", "--stdin", stdin=json.dumps({"text": "Find the owner of acme/api#12"}))
+        self.assertEqual((code, json.loads(out)["key"]), (0, "acme/api#12"))
+        code, _, err = self.main("ask", "--stdin", stdin=json.dumps({"text": "   "}))
+        self.assertEqual((code, "no text" in err), (1, True))
+        self.assertEqual(self.main("ask")[0], 2)
+
+    def test_claim_with_also_and_watch_key(self):
+        self.now_item("PLAT-7")
+        got = self.claim("PLAT-7", self.A, also=["C00000001/1700000000.123456", "PLAT-7"])
+        self.assertEqual(got["also"], ["C00000001/1700000000.123456"])
+        self.follow_up("C00000001/1700000000.123456", 10)                 # a line of the second key reaches the case
+        self.assertEqual([r["key"] for r in chief.relays(self.ws, AT, self.A)], ["C00000001/1700000000.123456"])
+        got = chief.watch_key(self.ws, {}, AT, "acme/api#12", self.A)
+        self.assertEqual((got["key"], got["also"]), ("PLAT-7", ["C00000001/1700000000.123456", "acme/api#12"]))
+        self.assertEqual(chief.watch_key(self.ws, {}, AT, "acme/api#12", self.A)["also"], got["also"])   # twice: once
+        self.assertEqual(chief.cases(self.ws)[0]["also"], got["also"])
+        with self.assertRaisesRegex(ValueError, "holds no live case"):
+            chief.watch_key(self.ws, {}, AT, "PLAT-8", self.B)
+        with self.assertRaisesRegex(ValueError, "not a hub key"):
+            chief.watch_key(self.ws, {}, AT, "has space", self.A)
+        self.now_item("PLAT-9")
+        self.claim("PLAT-9", self.B)
+        with self.assertRaisesRegex(ValueError, "refusing to repoint"):
+            chief.watch_key(self.ws, {}, AT, "acme/api#12", self.B)
+        with self.assertRaisesRegex(ValueError, "refusing to repoint"):
+            self.claim("PLAT-9", self.B, also=["PLAT-7"])
+        with self.assertRaisesRegex(ValueError, "also must be"):
+            self.claim("PLAT-9", self.B, also="PLAT-1")
+        code, out, _ = self.main("watch-key", "OPS-3", "--for", self.B)
+        self.assertEqual((code, json.loads(out)["also"]), (0, ["OPS-3"]))
+        self.assertEqual(self.main("watch-key", "OPS-4", "--for", "nope")[0], 1)
+        self.assertEqual(self.main("watch-key")[0], 2)
+
+    def test_close_case_ends_the_case_and_its_items(self):
+        uid = self.now_item("PLAT-7")["update_id"]
+        self.claim("PLAT-7", self.A, also=["acme/api#12"])
+        code, out, _ = self.main("close-case", "acme/api#12")
+        self.assertEqual((code, json.loads(out)["updates"]), (0, [uid]))
+        self.assertEqual((self.rows()["PLAT-7"]["state"], chief.cases(self.ws)), ("done", []))
+        self.assertEqual(self.main("close-case", "PLAT-7")[0], 1)
+
+
+class TestDotsDetail(Base):
+    main = TestLeader.main
+    FILE = """# Dots — 2026-10-30   (window a → b)
+
+## For you
+1. Reply to the vendor — because two threads ask
+   - chat: thread — https://example.com/t
+2. Decide the cutoff — because the plan and the ticket disagree
+
+## For me (on your yes)
+- A1 Draft a nudge to the owner of PLAT-7 — because it is stale
+- A23 Annotate 7 stale todos and intake lines (no closes) — because none moved in 14 days — todos/open.md
+   - adds `stale since <date>` to each line
+- A3 x
+
+## Conflicts
+- cutoff: plan says Thursday · ticket says Friday (see A23)
+"""
+
+    def write(self, rel, text):
+        p = self.ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def test_found_in_the_newest_file_with_what_names_it(self):
+        self.write("journal/dots/2026-10-29.md", "## For me\n- A23 Old action — because old\n")
+        self.write("journal/dots/2026-10-30.md", self.FILE)
+        got = chief.dots_detail(self.ws, "A23")
+        self.assertEqual((got["id"], got["date"], got["source_file"]), ("A23", "2026-10-30", "journal/dots/2026-10-30.md"))
+        self.assertEqual(got["text"], "- A23 Annotate 7 stale todos and intake lines (no closes) — because none moved in 14 days — todos/open.md\n"
+                                      "   - adds `stale since <date>` to each line\n"
+                                      "- cutoff: plan says Thursday · ticket says Friday (see A23)")
+        self.assertEqual(got["label"], "Annotate 7 stale todos and intake lines")
+        self.assertEqual(chief.dots_detail(self.ws, "A3")["label"], None)          # one word: the button keeps its label
+        m = chief.dots_detail(self.ws, "M2")
+        self.assertEqual((m["text"], m["label"]), ("2. Decide the cutoff — because the plan and the ticket disagree", "Decide the cutoff"))
+
+    def test_reads_the_full_copy_first_then_the_undelivered_one(self):
+        self.write(".mother/dots-unsent-2026-10-31.md", "For me\nA5 Check the release build — because it is red\n")
+        self.assertEqual(chief.dots_detail(self.ws, "A5")["source_file"], ".mother/dots-unsent-2026-10-31.md")
+        self.write("journal/dots/2026-10-31.md", "- A5 From the journal — x\n")
+        self.write(".mother/reports/dots-2026-10-31.md", "- A5 From the full copy — x\n")
+        self.assertEqual(chief.dots_detail(self.ws, "A5")["text"], "- A5 From the full copy — x")
+
+    def test_not_found_and_capped(self):
+        self.assertIsNone(chief.dots_detail(self.ws, "A1"))
+        self.write("journal/dots/2026-10-30.md", self.FILE + "- A9 " + "word " * 600 + "\n")
+        for bad in ("A99", "S1", "../A1", "", None, "A1 x"):
+            self.assertIsNone(chief.dots_detail(self.ws, bad), bad)
+        self.assertEqual(len(chief.dots_detail(self.ws, "A9")["text"]), chief.DOTS_TEXT_MAX)
+        code, out, _ = self.main("dots-detail", "A99", "--json")
+        self.assertEqual((code, json.loads(out)), (0, None))
+        code, out, _ = self.main("dots-detail", "A1", "--json")
+        self.assertEqual((code, json.loads(out)["label"]), (0, "Draft a nudge to the owner of PLAT-7"))
+        self.assertEqual(self.main("dots-detail")[0], 2)
+
+
+class TestSessionCards(TestTldr):
+    """The refresh: what a transcript says in code, the merged card, and the floor card it fills."""
+    def aged(self, p, seconds):
+        t = AT.timestamp() - seconds
+        os.utime(str(p), (t, t))
+
+    def tails_at(self, cfg=None):
+        return chief.session_tails(self.ws, cfg or {}, home=self.home, app_dir=self.app, at=AT)
+
+    def store(self, rows, at=AT):
+        cards = {}
+        n = chief.tldr_store(self.ws, at, rows, home=self.home, app_dir=self.app, cards=cards)
+        return n, cards
+
+    def card(self, fp, **kw):
+        return dict({"id": CLI_A, "fingerprint": fp, "model": "sonnet", "tldr": "Fixing it.", "chips": [], "state": "idle",
+                     "progress": "", "asks": False, "question": "", "options": [], "waiting_on": None}, **kw)
+
+    def test_waiting_line(self):
+        self.assertEqual(chief.waiting_line("done\nWaiting on: the manager — pick 1 or 2"), {"state": "waiting_manager", "on": None, "what": "pick 1 or 2"})
+        self.assertEqual(chief.waiting_line("Waiting on: Dana — her reply, I look again at 15:00"),
+                         {"state": "waiting_other", "on": "Dana", "what": "her reply, I look again at 15:00"})
+        self.assertEqual(chief.waiting_line("x\n`Waiting on: nothing — done`\n\n")["state"], "done")
+        self.assertIsNone(chief.waiting_line("Waiting on: Dana — x\nand one more line"))
+        self.assertIsNone(chief.waiting_line(""))
+
+    def test_tail_rows_say_what_the_transcript_shows(self):
+        self.pin()
+        p = self.transcript("/work/api", CLI_A, [msg("user", "Fix it"), msg("assistant", [{"type": "text", "text": "On it.\nWaiting on: Dana — the key"}])])
+        self.aged(p, 600)
+        doc = self.tails_at({"chief": {"refresh_minutes": 7}})
+        [s] = doc["sessions"]
+        self.assertEqual(doc["refresh_minutes"], 7)
+        self.assertEqual((s["running"], s["idle_for"], s["last_from"], s["open_turn"], s["error_end"], s["stuck"]),
+                         (False, 600, "assistant", False, False, False))
+        self.assertEqual(s["waiting"], {"state": "waiting_other", "on": "Dana", "what": "the key"})
+        self.aged(p, 30)                                                    # it moved in the last 2 minutes
+        self.assertTrue(self.tails_at()["sessions"][0]["running"])
+        # a turn that has not ended: running while it moved in the last 30 minutes, stuck after
+        p = self.transcript("/work/api", CLI_A, [msg("user", "Fix it"), msg("assistant", [{"type": "tool_use", "name": "Bash", "input": {}}])])
+        self.aged(p, 600)
+        s = self.tails_at()["sessions"][0]
+        self.assertEqual((s["running"], s["open_turn"], s["last_from"], s["waiting"], s["stuck"]), (True, True, "assistant", None, False))
+        self.aged(p, 1801)
+        s = self.tails_at()["sessions"][0]
+        self.assertEqual((s["running"], s["stuck"]), (False, True))
+        p = self.transcript("/work/api", CLI_A, [msg("user", "go"), msg("assistant", [{"type": "text", "text": "API Error: rate limit reached"}])])
+        self.aged(p, 600)
+        self.assertEqual([self.tails_at()["sessions"][0][k] for k in ("error_end", "stuck")], [True, True])
+
+    def test_case_sessions_are_refreshed_too(self):
+        self.seed_sessions({"PLAT-7": {"session_id": CLI_B, "cli_session_id": CLI_B, "kind": "case", "state": "live", "title": "t"}})
+        self.transcript(self.ws, CLI_B, [msg("user", "Mother case: t"), msg("assistant", "Reading the thread.")])
+        [s] = self.tails_at()["sessions"]
+        self.assertEqual((s["id"], s["kind"]), (CLI_B, "case"))
+
+    def test_stored_card_fields_and_code_overrides(self):
+        self.pin()
+        p = self.transcript("/work/api", CLI_A, [msg("user", "Fix it"), msg("assistant", [{"type": "text", "text": "Sent.\nWaiting on: Dana — the key"}])])
+        self.aged(p, 600)
+        fp = self.tails_at()["sessions"][0]["fingerprint"]
+        n, cards = self.store([self.card(fp, state="waiting_manager", progress="Sent the mail.\nmore " + "x" * 300, asks=True,
+                                         question="Send it?", options=[{"label": "Yes", "message": "Send it"}], waiting_on="you")])
+        c = cards[CLI_A]
+        self.assertEqual(n, 1)
+        self.assertEqual((c["state"], c["waiting_on"], c["asks"], c["question"], c["options"], c["prev_state"]),
+                         ("waiting_other", "Dana", False, "", [], None))       # the `Waiting on:` line wins over the model
+        self.assertEqual(len(c["progress"]), 160)
+        s = self.tails_at()["sessions"][0]
+        self.assertEqual((s["cached"]["state"], s["prev"]["state"], s["prev"]["at"], s["prev"]["fingerprint"]), ("waiting_other", "waiting_other", hub._iso(AT), fp))
+        self.assertNotIn("at", s["cached"])
+        _, cards = self.store([self.card(fp, state="bogus")])
+        self.assertEqual((cards[CLI_A]["state"], cards[CLI_A]["prev_state"]), ("waiting_other", "waiting_other"))
+        # no such line, and running: `working` from code; an unknown state reads idle otherwise
+        p = self.transcript("/work/api", CLI_A, [msg("user", "Fix it"), msg("assistant", "Patching.")])
+        self.aged(p, 10)
+        fp = self.tails_at()["sessions"][0]["fingerprint"]
+        self.assertEqual(self.store([self.card(fp, state="idle")])[1][CLI_A]["state"], "working")
+        self.aged(p, 600)
+        self.assertEqual(self.store([self.card(fp, state="bogus")])[1][CLI_A]["state"], "idle")
+        # twice `working`, then nothing moves for 30 minutes: stuck
+        self.aged(p, 10)
+        self.store([self.card(fp)])
+        self.store([self.card(fp)])
+        self.aged(p, 1900)
+        self.assertTrue(self.tails_at()["sessions"][0]["stuck"])
+
+    def test_an_asleep_sessions_ask_fills_its_floor_card(self):
+        import floor
+        self.pin()
+        p = self.transcript("/work/api", CLI_A, [msg("user", "Fix it"), msg("assistant", "Should I send it?")])
+        self.aged(p, 600)
+        fp = self.tails_at()["sessions"][0]["fingerprint"]
+        ask = dict(state="waiting_manager", asks=True, question="Send it?", options=[{"label": "Yes", "message": "Send it"}])
+        self.store([self.card(fp, **ask)])
+        [c] = floor.list_cards(self.ws, AT)
+        self.assertEqual((c["session_id"], c["asks"], c["question"], c["options"], c["at"]),
+                         (CLI_A, True, "Send it?", [{"label": "Yes", "message": "Send it"}], hub._iso(AT)))
+        # the session's own card, written after its transcript last moved, wins
+        floor.write_card(self.ws, AT - timedelta(seconds=300), {"session_id": CLI_A, "asks": False, "question": "", "options": []})
+        self.store([self.card(fp, **ask)])
+        self.assertFalse(floor.list_cards(self.ws, AT)[0]["asks"])
+        # the session moved on since its own card: the refresh's word stands, and a stale ask is cleared
+        floor.write_card(self.ws, AT - timedelta(seconds=900), {"session_id": CLI_A, "asks": True, "question": "Old?", "options": []})
+        self.store([self.card(fp, state="idle")])
+        self.assertFalse(floor.list_cards(self.ws, AT)[0]["asks"])
+

@@ -4,10 +4,10 @@ import type { Color } from 'claude-code'
 import { SNOOZES, age, ago, askPrompt, isUrl, oneLine, safe } from './shared'
 import type { Dollar } from './shared'
 import { THREAD_KEY, followArgs, ignoreArgs, ignoreOptions, nowVerb, openInspector } from './register'
-import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, money, sectionHeading, subHeading, titleRow,
-         toggled, whyText } from './pane_ui'
+import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, linkRows, linksOf, money, sectionHeading,
+         sourceLink, subHeading, titleRow, toggled, whyText } from './pane_ui'
 import type { Ui } from './pane_ui'
-import type { ChiefHealth, ChiefHealthState, ChiefInboxItem, ChiefOpen, ChiefStatus, NowDoc, NowItem } from '../types'
+import type { ChiefDetail, ChiefHealth, ChiefHealthState, ChiefInboxItem, ChiefOpen, ChiefStatus, NowAction, NowDoc, NowItem } from '../types'
 
 // The Chief pane's later tabs: Team (the tick's neglected items by team), Health (is everything working), the
 // Suggested cards at the top of Today, and Follow / Ignore on an Inbox card. chief.tsx registers each with one row
@@ -18,9 +18,11 @@ const draftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as const, null)
 const openAtom = atom({ plugin: 'mother', key: 'chiefOpen' } as const, null)
 const selectedAtom = atom({ plugin: 'mother', key: 'chiefSelected' } as const, null)
 const healthAtom = atom({ plugin: 'mother', key: 'chiefHealth' } as const, null)
+const detailAtom = atom({ plugin: 'mother', key: 'chiefDetail' } as const, null)
 
 // What chief.tsx hands each section: the open and selected cards, the picker flags (`chiefDraft`), the Health state.
-export type TabCtx = { open: ChiefOpen | null; selected: string | null; health?: ChiefHealthState | null }
+export type Details = Record<string, ChiefDetail | null> | null   // by Now item id; null inside = nothing on disk has it
+export type TabCtx = { open: ChiefOpen | null; selected: string | null; health?: ChiefHealthState | null; details?: Details }
 type Drafts = Record<string, string> | null
 type GoHub = (args: string[]) => Promise<boolean>
 
@@ -45,21 +47,105 @@ function fill($: Dollar, text: string) {
   return $.prompt.fill({ text, mode: 'replace' }).catch(() => undefined)
 }
 
+// ---- what an expanded Today / Team / Suggested card adds: everything the item carries ----
+const DOTS_ID_RE = /^[AM]\d{1,3}$/
+const DETAIL_TIMEOUT_MS = 30_000
+const DETAIL_TEXT_MAX = 1500
+const DETAIL_LINES_MAX = 30
+export const TASK_SHOWN_MAX = 1500
+export const DECISION_LABEL_MAX = 40
+
+// The dots action (`A23`) or manager item (`M4`) a Now item stands for, from its actions' own words (the tick folds a
+// dots action in as `dots do A23`, labelled `Run dots action A23`) or its title (`Dots A23: …`); null for any other.
+export function dotsId(i: { title?: unknown; actions?: readonly Partial<NowAction>[] } | null | undefined): string | null {
+  for (const a of i?.actions ?? []) {
+    const m = /\bdots\s+(?:do\s+|action\s+)?([AM]\d{1,3})\b/i.exec(`${a?.task ?? ''} ${a?.prompt ?? ''} ${a?.label ?? ''}`)
+    if (m) return m[1].toUpperCase()
+  }
+  const t = /^\s*dots\s+([AM]\d{1,3})\b/i.exec(String(i?.title ?? ''))
+  return t ? t[1].toUpperCase() : null
+}
+
+// A pressed card loads what its dots action says, once (`mother chief dots-detail <id> --json`): never a draw. A
+// failed or empty answer is kept as null, which the card says.
+export async function loadDetail($: Dollar, bin: string, i: NowItem | null | undefined, loaded: Details | undefined): Promise<void> {
+  const id = dotsId(i)
+  if (!i || !id || !DOTS_ID_RE.test(id) || (loaded && i.id in loaded)) return
+  let got: ChiefDetail | null = null
+  try {
+    const ran = await $.process.run(['python3', bin, 'chief', 'dots-detail', id, '--json'], { timeoutMs: DETAIL_TIMEOUT_MS })
+    const d = ran.exitCode === 0 ? JSON.parse(String(ran.stdout ?? 'null')) : null
+    if (d && typeof d === 'object' && typeof d.text === 'string' && d.text.trim()) {
+      got = { id, text: safe(d.text).slice(0, DETAIL_TEXT_MAX), date: oneLine(d.date, 10), source_file: oneLine(d.source_file, 120),
+              label: typeof d.label === 'string' ? oneLine(d.label, DECISION_LABEL_MAX) || null : null }
+    }
+  } catch { /* said on the card */ }
+  await update($, detailAtom, prev => ({ ...(prev ?? {}), [i.id]: got }))
+}
+
+// A yes/no decision's primary button says what a yes does, once the detail gave a short verb phrase ("Annotate 7
+// todos" in place of "Run dots action A23"); any other button keeps its label.
+export function decisionLabel(a: Partial<NowAction>, n: number, detail: ChiefDetail | null | undefined, cap: number): string {
+  const label = oneLine(a.label, cap)
+  return n === 0 && detail?.label && /^run\b/i.test(label) ? oneLine(detail.label, DECISION_LABEL_MAX) : label
+}
+
+// Under an expanded card's buttons, one dim line per action: its label and the whole instruction it runs (the
+// routine's own words, then the prompt the button fills when that is something else).
+export function actionSays(ui: Ui, id: string, acts: readonly NowAction[], detail: ChiefDetail | null | undefined, cap: number) {
+  const { Text } = ui
+  return acts.map((a, n) => {
+    const task = oneLine(a.task || a.prompt, TASK_SHOWN_MAX)
+    const fills = oneLine(a.prompt, TASK_SHOWN_MAX)
+    return <Text key={`says:${id}:${n}`} dimColor wrap="wrap">{`${decisionLabel(a, n, detail, cap)}: ${task}${fills && fills !== task ? ` · fills: ${fills}` : ''}`}</Text>
+  })
+}
+
+// The rest an item carries, for an expanded card: its signal, sender and ages; every labelled link (or `no source
+// link`); its other keys; the "similar" rule; and for a dots item what the action does, as the dots file words it.
+export function itemDetail(ui: Ui, id: string, i: NowItem, nowMs: number, details: Details | undefined) {
+  const { Box, Text } = ui
+  const facts = [
+    i.signal ? `signal ${oneLine(i.signal, 40)}` : '', i.from ? `from ${oneLine(i.from, 80)}` : '', i.team ? `team ${oneLine(i.team, 40)}` : '',
+    age(i.since, nowMs) ? `raised ${age(i.since, nowMs)} ago` : '', i.first_seen && ago(i.first_seen, nowMs) ? `first seen ${ago(i.first_seen, nowMs)} ago` : '',
+  ].filter(Boolean).join(' · ')
+  const also = (Array.isArray(i.also) ? i.also : []).map(a => oneLine(a, 80)).filter(Boolean).slice(0, 8)
+  const words = Array.isArray(i.similar?.words) ? i.similar!.words.map(w => oneLine(w, 30)).filter(Boolean) : []
+  const dots = dotsId(i)
+  const detail = details?.[i.id]
+  return [
+    facts ? <Text key={'facts:' + id} dimColor wrap="wrap">{facts}</Text> : null,
+    linkRows(ui, id, linksOf(i.link, i.links, itemSource(i.id))),
+    also.length ? <Text key={'also:' + id} dimColor wrap="wrap">{`also: ${also.join(', ')}`}</Text> : null,
+    words.length ? <Text key={'similar:' + id} dimColor wrap="wrap">{`similar: ${words.join(', ')}${i.similar?.channel ? ` in ${oneLine(i.similar.channel, 40)}` : ''}`}</Text> : null,
+    dots && detail
+      ? <Box key={'detail:' + id} flexDirection="column">
+          <Text key={'detail-head:' + id} weight="semibold">What this does</Text>
+          {detail.text.split('\n').slice(0, DETAIL_LINES_MAX).map((line, n) => <Text key={`detail:${id}:${n}`} wrap="wrap">{line || ' '}</Text>)}
+          <Text key={'detail-from:' + id} dimColor size="caption">{`${dots} · ${detail.source_file}${detail.date ? ` · ${detail.date}` : ''}`}</Text>
+        </Box>
+      : null,
+    dots && detail === null ? <Text key={'detail-none:' + id} dimColor>{`What this does: no dots output on disk has ${dots}`}</Text> : null,
+  ]
+}
+
 // ---- a Now item as a card: Team's and Suggested's, with the actions the Now panel's item page offers ----
 // Compact, two rows as every Chief card: the title with its primary button (the tick's first action, else Ask Mother)
 // and Done at the right end; the badge, age, source link. Expanded adds the whole why, Ask Mother, Open (the item's
 // Inspector page), Snooze and Ignore… with the Now panel's own choices. The text is tick-written from
 // other people's words: one cleaned line each, drawn as plain Text.
 function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, drafts: Drafts, ctx: TabCtx, kind: 'team' | 'sug') {
-  const { Box, Text, Button, Select, Link } = ui
+  const { Box, Text, Button, Select } = ui
   const id = `${kind}:${i.id}`
   const open = isOpen(ctx.open, id, 'today', ctx.selected)
-  const press = (run: () => unknown) => pressing($, id, run)
+  // a press selects the card, which opens it: what its dots action does is loaded then, once
+  const press = (run: () => unknown) => pressing($, id, async () => { await run(); await loadDetail($, bin, i, ctx.details) })
   const go = (args: string[]) => nowVerb($, bin, args)
   const source = itemSource(i.id)
   const title = oneLine(i.title, TITLE_MAX)
   const why = whyText(i.why)
   const link = isUrl(i.link) ? i.link : null
+  const detail = ctx.details?.[i.id]
   const acts = (i.actions ?? []).slice(0, ACTIONS_SHOWN)   // the tick's actions, the first primary; run as the Now panel runs them
   const action = acts[0]
   const snoozeKey = `${kind}-snooze:${i.id}`
@@ -67,7 +153,7 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
   const label = kind === 'sug' ? 'suggested' : source === 'other' ? 'neglected' : source
   const doIt = action
     ? acts.map((a, n) => <Button key={n === 0 ? `${kind}-doit:${i.id}` : `${kind}-act:${i.id}:${n}`} variant={n === 0 ? 'primary' : 'secondary'}
-        onPress={press(() => fill($, a.prompt || `mother now do ${a.id}`))}>{oneLine(a.label, n === 0 ? 40 : ACTION_LABEL_MAX) || 'Do it'}</Button>)
+        onPress={press(() => fill($, a.prompt || `mother now do ${a.id}`))}>{decisionLabel(a, n, detail, n === 0 ? 40 : ACTION_LABEL_MAX) || 'Do it'}</Button>)
     : null
   const ask = <Button key={`${kind}-ask:${i.id}`} variant={action ? 'secondary' : 'primary'} onPress={press(() => fill($, askPrompt(title, why, i.link)))}>Ask Mother</Button>
   const done = <Button key={`${kind}-done:${i.id}`} onPress={press(() => go(['done', i.id]))}>Done</Button>
@@ -76,10 +162,11 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
     <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
       {badge(ui, label, SOURCE_COLOR[source], 'badge:' + id)}
       <Text dimColor>{age(i.since, nowMs) + ' '}</Text>
-      {link ? <Link href={link}>source ↗</Link> : null}
+      {open ? null : sourceLink(ui, id, linksOf(i.link, i.links, source))}
     </Box>,
     open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
-    ...(open ? acts.map((a, n) => <Text key={`says:${id}:${n}`} dimColor wrap="wrap">{`${oneLine(a.label, 40)}: ${oneLine(a.task || a.prompt, 300)}`}</Text>) : []),
+    ...(open ? itemDetail(ui, id, i, nowMs, ctx.details) : []),
+    ...(open ? actionSays(ui, id, acts, detail, 40) : []),
     open
       ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
           {doIt}
@@ -362,6 +449,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
           {badge(ui, 'error', 'error', 'badge:' + id)}
           <Text weight="semibold">{oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)}</Text>
           <Text dimColor>{`${oneLine(u.key, 60)} · ${ago(u.at, nowMs)}`}</Text>
+          {sourceLink(ui, id, linksOf(u.link, u.links, 'error'))}
           <Button key={'health-done:' + u.id} onPress={pressing($, id, () => goHub(['done', u.id]))}>Done</Button>
         </Box>,
         why ? <Text key={'why:' + id} dimColor wrap="wrap">{why}</Text> : null,
