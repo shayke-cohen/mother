@@ -6,6 +6,7 @@
   "homepage": "https://github.com/shayke-cohen/mother",
   "repository": "https://github.com/shayke-cohen/mother",
   "license": "MIT",
+  "icon": "./assets/art/mother-cos-512.png",
   "keywords": ["chief-of-staff", "manager", "team", "standup", "meetings", "jira", "slack", "calendar", "claude-code"],
   "types": "./types/index.d.ts",
   "userConfig": {
