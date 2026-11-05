@@ -108,12 +108,11 @@ def outcome_of(resp, depth=0):
             return "failed", _code(resp[k])
     if resp.get("ok") is True or resp.get("success") is True:
         return "ok", None
-    for k in WRAPPERS:
-        if isinstance(resp.get(k), (dict, list, str)):
-            found = outcome_of(resp[k], depth + 1)
-            if found[0] != "unclear":
-                return found
-    return ("ok", None) if _found(resp) else ("unclear", None)
+    # A bare string `content` may be the draft echoed back, so it proves nothing. A failure in any wrapper wins.
+    found = [outcome_of(resp[k], depth + 1) for k in WRAPPERS
+             if isinstance(resp.get(k), (dict, list)) or (k != "content" and isinstance(resp.get(k), str))]
+    hit = next((f for f in found if f[0] == "failed"), next((f for f in found if f[0] == "ok"), None))
+    return hit or (("ok", None) if _found(resp) else ("unclear", None))
 
 
 def _workspace():

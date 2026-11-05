@@ -425,6 +425,10 @@ class Flow(unittest.TestCase):
         # an error beside a wrapper is an error, whatever the wrapper says: a tool can echo a draft into `content`
         self.assertEqual(mod.outcome_of({"error": "denied", "data": {"ok": True}}), ("failed", "denied"))
         self.assertEqual(mod.outcome_of({"error": "bad", "content": '{"ok":true}'}), ("failed", "bad"))
+        # A bare string `content` may be the draft echoed back, so it proves nothing, and a failure in any wrapper wins.
+        self.assertEqual(mod.outcome_of({"content": '{"ok":true}'}), ("unclear", None))
+        self.assertEqual(mod.outcome_of({"data": {"ok": True}, "result": {"error": "x"}}), ("failed", "x"))
+        self.assertEqual(mod.outcome_of({"content": [{"type": "text", "text": '{"ok":true}'}]}), ("ok", None))
         self.assertEqual(mod.outcome_of({"ok": True, "success": False}), ("failed", "error"))
         # what it made says nothing when the answer says it failed, or isn't what a write makes
         for shape in ({"id": "r1", "status": "failed"}, {"id": "r1", "status": "ERROR"}, {"id": "r1", "statusCode": 400},
