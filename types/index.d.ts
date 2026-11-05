@@ -197,6 +197,9 @@ export type ChiefStatus = {
   relay?: { on: boolean }            // false while .mother/chief/RELAY_OFF exists: routed lines wait, nothing is submitted
   guard?: 'on' | 'off' | 'paused'    // the guard: `paused` while .mother/PAUSED exists (it wins), `off` while .mother/GUARD_OFF does
   health?: ChiefHealth               // the Health tab's reads; an Inbox item keyed `watcher:` is here, not in `inbox`
+  habits?: { on: boolean }           // false while .mother/chief/HABITS_OFF exists: nothing is quieted, no habit reaches a triage prompt
+  // lines the quiet rule logged instead of showing (lib/habits.py): how many in 7 days, and the last 10, newest first
+  quieted?: { count_7d: number; recent: { id: string; key: string; title: string; label: string; bucket: string; at: string; why: string }[] }
 }
 
 // `mother chief status --json` -> health (lib/chief.py health_doc): what the Chief pane's Health tab draws.
@@ -226,6 +229,7 @@ export type ChiefInboxItem = {
   on?: 'manager' | 'team' | 'other' | null
   urgency?: 'now' | 'today' | 'later' | null
   actions?: { label: string; prompt: string }[]   // at most 3, the first the recommended one
+  habit_note?: string | null         // set by triage when the manager's habits changed its verdict; at most 80 characters
   session: { key: string; title: string; kind?: 'case'; cli_session_id?: string } | null   // the live hub session for the key; a case names its session
 }
 

@@ -23,7 +23,7 @@ Commands:
                                the hub's watcher and its launchd job (`mother hub help`; docs/CONTRACT.md §5e)
   hub add|follow|unfollow|mute|unmute|watching
                                the manager's steering: hand the hub a link or note, and the watch and mute lists
-  chief tick|triage|lines|status|pause|resume|pinned|tail|tldr|spend|portrait|report
+  chief tick|triage|lines|status|pause|resume|pinned|tail|tldr|spend|portrait|report|act-log|habits
                                the leading session's pass and the Chief pane's reads (`mother chief help`)
   inbox archive|read <mail:ID | mail link>...
                                the Now panel's mail triage, no model: archive or mark read through the hub's mail

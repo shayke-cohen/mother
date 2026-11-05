@@ -4,6 +4,7 @@ import { caseBrief, parseCase, relayText } from './cos'
 import { bannerSvg, budgetBar, clip, humanLabel, inboxOrder, isOpen, itemSource, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
 import { CLI } from '../tests/fixtures/chief_cli'
 import { guardState, healthProblems, isWatcherError, sourceRows, teamGroups } from './pane_tabs'
+import { promptHabits, quietedOf } from './habits'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-11-02T10:00:00Z')
@@ -24,6 +25,7 @@ function status(over: Record<string, unknown> = {}) {
 type Cli = { exitCode: number; stdout?: string; stderr?: string }
 const ON_GET = '__test_on_get'
 let submitFate: ((e: any) => 'ok' | 'drop' | 'throw') | null = null
+let actLogFate: 'ok' | 'fail' | 'throw' = 'ok'   // what `mother chief act-log --stdin` does; a test may have it fail
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
@@ -31,7 +33,7 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
                     store: Record<string, unknown> | 'broken' = {}, expand = true) {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { HOME: '/home/m', ...env })
-  const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[] }
+  const out = { argv: [] as string[][], submits: [] as string[], toasts: [] as string[], status: [] as (string | undefined)[], opened: [] as string[], acts: [] as any[] }
   // $.store, from memory: what a test seeds is what an earlier process left behind
   // per key, as the host merges each write into the file under its lock; `ON_GET` lets a test act as another process
   on('store.get', (_: any, e: any) => {
@@ -67,6 +69,11 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
     out.argv.push(argv)
     const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[2] === 'path') return ok(WS + '\n')
+    if (argv[2] === 'chief' && argv[3] === 'act-log') {   // the actions log: every row the pane wrote, in order
+      out.acts.push(JSON.parse(String(e.init?.stdin ?? 'null')))
+      if (actLogFate === 'throw') throw new Error('spawn failed')
+      return actLogFate === 'fail' ? { value: { exitCode: 1, stdout: '', stderr: 'act-log: disk full\n', isStdoutTruncated: false, isStderrTruncated: false } } : ok('{"logged": 1}')
+    }
     if (argv[2] === 'floor') {    // `mother floor <verb>`: the same callback, as ['floor', <verb>, ...]
       const r = await chief(['floor', ...argv.slice(3)], e.init?.stdin)
       if (r) return { value: { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -320,7 +327,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | expand | collapse | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | expand | collapse | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -2407,4 +2414,160 @@ test('test_an_action_on_an_item_with_a_live_case_goes_to_that_session', async ($
   expect(sends.length).toBe(2)
   expect(briefs()).toEqual([caseBrief(owned, RICH.actions[1].prompt)])
   await ui.unmount()
+})
+
+// ---- habits: the actions log, habits in the triage prompt, Quieted on Health, /chief habits (hooks/habits.ts) ----
+const HABIT_INBOX = [
+  { id: 'U1', key: 'PLAT-8', title: 'Build broke', why: 'a long body nobody logs', link: 'https://example.com/8', at: '2026-11-02T09:50:00Z', session: null,
+    who: 'Sam', kind: 'act', on: 'team', urgency: 'today', habit_note: 'usually ignored‮, but it names a deadline',
+    actions: [{ label: 'Open ticket', prompt: 'Open the ticket' }, { label: 'Draft reply', prompt: 'Draft a reply; don\'t send' }] },
+  { id: 'U2', key: 'C0123ABC/1699999999.000100', title: 'A thread', why: '', link: '', at: '2026-11-02T09:55:00Z', session: null, who: 'Lee' },
+]
+const ROW_KEYS = ['action_index', 'action_label', 'item_id', 'key', 'kind', 'on', 'source', 'title', 'urgency', 'verb', 'who']
+
+test('test_inbox_handlers_log_each_action_and_a_failed_log_is_silent', async ($, on) => {
+  const { out } = await bootLead($, on, { over: { inbox: HABIT_INBOX, inbox_count: 2 } })
+  const hub = () => out.argv.filter(a => a[2] === 'hub').map(a => a.slice(3))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await hasText(ui, /^habit: usually ignored, but it names a deadline$/)).toBe(true)   // the verdict's habit_note, cleaned, on the open card
+  expect(out.acts).toEqual([])                                                       // drawing logs nothing
+  await ui.press({ key: 'inbox-act:U1:1' })
+  expect(out.acts).toEqual([{ item_id: 'U1', key: 'PLAT-8', who: 'Sam', kind: 'act', urgency: 'today', on: 'team', title: 'Build broke',
+                              action_label: 'Draft reply', action_index: 1, verb: 'action' }])   // which button, and that it was not the first
+  await ui.press({ key: 'inbox-open:U1' })
+  await ui.press({ key: 'inbox-follow:U1' })
+  await ui.press({ key: 'inbox-snooze:U1' })
+  expect(out.acts.length).toBe(3)                                                    // opening a picker is not an action
+  await ui.select({ key: 'inbox-snooze-pick:U1', value: 'tomorrow' })
+  await ui.press({ key: 'inbox-ignore:U2' })
+  await ui.select({ key: 'inbox-ignore-pick:U2', value: 'channel' })
+  for (const fate of ['fail', 'throw'] as const) {                                   // a log that fails never blocks the verb and never toasts
+    actLogFate = fate
+    const toasts = out.toasts.length
+    await ui.press({ key: 'inbox-done:U1' })
+    expect(hub().at(-1)).toEqual(['done', 'U1'])
+    expect(out.toasts.length).toBe(toasts)
+  }
+  actLogFate = 'ok'
+  expect(out.acts.map(a => [a.verb, a.item_id, a.action_index ?? null])).toEqual([
+    ['action', 'U1', 1], ['open_case', 'U1', null], ['follow', 'U1', null], ['snooze', 'U1', null], ['ignore', 'U2', null],
+    ['done', 'U1', null], ['done', 'U1', null]])                                     // Ignore's own `hub done` is not a second action
+  for (const a of out.acts) expect(Object.keys(a).filter(k => !ROW_KEYS.includes(k))).toEqual([])   // never a why, a link or a summary
+  expect(chiefCalls(out, 'act-log').every(a => a.slice(4).join(' ') === '--stdin')).toBe(true)
+  await ui.unmount()
+})
+
+test('test_needs_today_team_and_health_handlers_log_their_verbs', async ($, on) => {
+  on('prompt.fill', () => ({ isFilled: true }))
+  const items = [NOW_ITEM('pr:1', 'on_you', 'Review the release PR', { actions: [{ id: 'S1', label: 'Review it', prompt: 'mother now do S1', task: 'x' }] }),
+                 NOW_ITEM('chat:2', 'on_you', 'Answer the design question'), NOW_ITEM('ticket:3', 'neglected', 'A neglected ticket')]
+  const report = { name: 'brief-unsent-2026-11-02.md', routine: 'brief', date: '2026-11-02', bytes: 2048 }
+  const { out } = await bootHealth($, on, () => HEALTH({ undelivered: [report] }), { doc: NOW_DOC({ items }) })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab:all' })
+  await ui.press({ key: 'today-doit:1' })
+  await ui.press({ key: 'today-ask:top:1' })
+  await ui.press({ key: 'today-done:top:1' })
+  await ui.press({ key: 'toggle:today:chat:2' })
+  await ui.press({ key: 'today-ask:chat:2' })
+  await ui.press({ key: 'today-done:chat:2' })
+  await ui.press({ key: 'team-done:ticket:3' })
+  await ui.press({ key: 'team-ask:ticket:3' })
+  await ui.press({ key: 'team-snooze:ticket:3' })
+  await ui.select({ key: 'team-snooze-pick:ticket:3', value: '1h' })
+  await ui.press({ key: 'team-ignore:ticket:3' })
+  await ui.select({ key: 'team-ignore-pick:ticket:3', value: 'item' })
+  await ui.press({ key: 'toggle:health:report:brief-unsent-2026-11-02.md' })
+  await ui.press({ key: 'health-dismiss:brief-unsent-2026-11-02.md' })
+  expect(out.acts.map(a => [a.verb, a.item_id, a.source, a.title])).toEqual([
+    ['action', 'pr:1', 'code', 'Ship the release'], ['ask', 'pr:1', 'code', 'Ship the release'], ['done', 'pr:1', 'code', 'Ship the release'],
+    ['ask', 'chat:2', 'chat', 'Answer the design question'], ['done', 'chat:2', 'chat', 'Answer the design question'],
+    ['done', 'ticket:3', 'tracker', 'A neglected ticket'], ['ask', 'ticket:3', 'tracker', 'A neglected ticket'],
+    ['snooze', 'ticket:3', 'tracker', 'A neglected ticket'], ['ignore', 'ticket:3', 'tracker', 'A neglected ticket'],
+    ['dismiss', 'brief-unsent-2026-11-02.md', 'report', 'brief']])
+  expect([out.acts[0].action_label, out.acts[0].action_index]).toEqual(['Review it', 0])   // the recommended one
+  await ui.unmount()
+})
+
+test('test_a_needs_you_answer_is_logged', async ($, on) => {
+  const { clock, out } = await bootFloor($, on, { cards: () => [asking()] })
+  const ui = await shown($, clock)
+  await ui.press({ key: `need:${CLI_A}:1` })
+  expect(out.acts).toEqual([{ item_id: 'sess:' + CLI_A, source: 'session', title: 'Fix the login bug', action_label: 'Wait', action_index: 1, verb: 'answer' }])
+  await ui.unmount()
+})
+
+test('test_triage_prompt_carries_only_the_lines_own_habits_and_the_note_reaches_decide', async ($, on) => {
+  const mine = { this_channel: { shown: 9, engaged: 1, ignored: 6, closed_unread: 1, snoozed: 4, text: 'a body' }, this_person: { shown: 3, engaged: 0, ignored: -1 },
+                 that_channel: { shown: 50 }, prefers: { act: 'Draft reply', decide: 7, bogus: 'x' }, summary: 'a body' }
+  const want = { this_channel: { shown: 9, engaged: 1, ignored: 6, closed_unread: 1 }, this_person: { shown: 3, engaged: 0 }, prefers: { act: 'Draft reply' } }
+  expect(promptHabits(mine)).toEqual(want)                                           // known buckets, counts only
+  expect([promptHabits(null), promptHabits({}), promptHabits({ this_channel: {} }), promptHabits('x')]).toEqual([null, null, null, null])
+  expect(TRIAGE_SYSTEM).toContain('never a reason to hide something addressed to the manager, a decision only they can make, or anything urgent')
+  expect(TRIAGE_SYSTEM).toContain('"habit_note"')
+  const noted = JSON.stringify({ is_work: true, needs_attention: true, title: 'Build failed', tldr: 'CI is red', kind: 'act', on: 'team', urgency: 'today',
+                                 actions: [], habit_note: 'n'.repeat(120) })
+  const lines = [{ ...LINES[0], habits: mine }, { ...LINES[1], habits: null }]
+  const { t } = await bootTriage($, on, id => answered(id === 'L1' ? noted : WORK), noVerdict, lines)
+  const sent = (id: string) => JSON.parse(t.asks.find(a => a.prompt.includes(`"id":"${id}"`)).prompt.split('\n')[1])
+  expect(sent('L1').habits).toEqual(want)
+  expect('habits' in sent('L2')).toBe(false)                                         // a line with none carries none, never another line's
+  expect(Object.keys(sent('L1').line).includes('habits')).toBe(false)
+  const { verdicts } = JSON.parse(t.stdins[0])
+  expect(verdicts.map((v: any) => [v.line_id, v.habit_note?.length])).toEqual([['L1', 80], ['L2', undefined]])
+  expect(parseVerdict(JSON.stringify({ is_work: true, needs_attention: true, title: 't', tldr: 'd', habit_note: 5 }))).toEqual({ is_work: true, needs_attention: true, title: 't', tldr: 'd' })
+})
+
+const QUIETED = { count_7d: 12, recent: [
+  { id: 'L7', key: 'C0123ABC/1699999999.000100', title: 'Standup notes', label: '#platform', bucket: 'chat|label|C0123ABC', at: '2026-11-02T09:58:00Z', why: 'habit: chat #platform ignored 5 of 6' },
+  { id: 'L6', key: 'C0123ABC/1699999998.000100', title: 'Lunch‮ plans', label: '#platform', bucket: 'chat|label|C0123ABC', at: '2026-11-02T09:00:00Z', why: 'habit: chat #platform ignored 5 of 6' },
+  { id: 'L5', key: 'mail:abc', title: 'Newsletter', label: 'mail thread', bucket: 'mail|who|Sam', at: '2026-11-01T09:00:00Z', why: 'habit: mail Sam ignored 4 of 5' },
+  { title: 'no id' }] }
+
+test('test_health_draws_quieted_with_show_and_stop_quieting', async ($, on) => {
+  let quieted: unknown = QUIETED
+  const { out } = await bootHealth($, on, () => HEALTH(), { over: new Proxy({}, { ownKeys: () => ['quieted', 'habits'],
+    getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }), get: (_, k) => (k === 'quieted' ? quieted : k === 'habits' ? { on: true } : undefined) }) })
+  expect(quietedOf({ quieted: QUIETED }).recent.map(r => r.id)).toEqual(['L7', 'L6', 'L5'])
+  expect(quietedOf(null)).toEqual({ count: 0, recent: [], on: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await tabText(ui, 'health')).toBe('Health')                                  // quieting is not a problem: no red dot
+  await ui.press({ key: 'tab:health' })
+  const all = await texts(ui)
+  expect(all.some((t: string) => /^Quieted by habit 12$/.test(t.replace(/\s+/g, ' ')))).toBe(true)
+  expect(all).toContain('Standup notes')
+  expect(all).toContain('Lunch plans')                                               // cleaned
+  expect(all).toContain('#platform · 2m')
+  expect(all).toContain('habit: mail Sam ignored 4 of 5')
+  expect(await buttonKeys(ui, 'quieted-show:')).toEqual(['quieted-show:L7', 'quieted-show:L6', 'quieted-show:L5'])
+  expect(await buttonKeys(ui, 'quieted-stop:')).toEqual(['quieted-stop:chat|label|C0123ABC', 'quieted-stop:mail|who|Sam'])   // once per bucket
+  expect((await ui.find({ key: 'quieted-stop:mail|who|Sam' }))?.text).toBe('Stop quieting this')
+  const statusReads = chiefCalls(out, 'status').length
+  quieted = { count_7d: 11, recent: QUIETED.recent.slice(1) }
+  await ui.press({ key: 'quieted-show:L7' })
+  expect(chiefCalls(out, 'habits').map(a => a.slice(4))).toEqual([['show', 'L7']])
+  expect(chiefCalls(out, 'status').length).toBe(statusReads + 1)                     // the status is read again: the row is gone, the Inbox has it
+  expect(await ui.find({ key: 'quieted-show:L7' })).toBeUndefined()
+  await ui.press({ key: 'quieted-stop:mail|who|Sam' })
+  expect(chiefCalls(out, 'habits').map(a => a.slice(4))[1]).toEqual(['except', 'mail|who|Sam'])
+  quieted = { count_7d: 0, recent: [] }
+  await ui.press({ key: 'quieted-show:L6' })
+  expect((await texts(ui)).some((t: string) => /Quieted by habit/.test(t))).toBe(false)   // nothing quieted: nothing drawn
+  await ui.unmount()
+})
+
+test('test_chief_habits_command_runs_the_switch', async ($, on) => {
+  let isOn = true
+  const { out } = await boot($, on, argv => {
+    if (argv[0] !== 'habits') return undefined
+    if (argv[1] === 'on' || argv[1] === 'off') isOn = argv[1] === 'on'
+    return { exitCode: 0, stdout: `habits ${isOn ? 'on' : 'off'}: 3 quieted in 7 days\n` }
+  })
+  const run = async (args: string) => ((await $.command.run({ command: 'chief', args } as any)) as any).text
+  expect(await run('habits')).toBe('habits on: 3 quieted in 7 days')
+  expect(await run('habits off')).toBe('habits off: 3 quieted in 7 days')
+  expect(await run('habits status')).toBe('habits off: 3 quieted in 7 days')
+  expect(await run('habits on')).toBe('habits on: 3 quieted in 7 days')
+  expect(chiefCalls(out, 'habits').map(a => a.slice(4))).toEqual([['status'], ['off'], ['status'], ['on']])
+  expect(await run('habits maybe')).toMatch(/^Usage: \/chief /)
 })

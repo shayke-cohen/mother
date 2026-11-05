@@ -7,6 +7,8 @@ import { THREAD_KEY, followArgs, ignoreArgs, ignoreOptions, nowVerb, openInspect
 import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, money, sectionHeading, subHeading, titleRow,
          toggled, whyText } from './pane_ui'
 import type { Ui } from './pane_ui'
+import { inboxRow, logAct, nowRow, picked, quietedOf } from './habits'
+import type { ActVerb } from './habits'
 import type { ChiefHealth, ChiefHealthState, ChiefInboxItem, ChiefOpen, ChiefStatus, NowDoc, NowItem } from '../types'
 
 // The Chief pane's later tabs: Team (the tick's neglected items by team), Health (is everything working), the
@@ -65,12 +67,13 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
   const snoozeKey = `${kind}-snooze:${i.id}`
   const ignoreKey = `${kind}-ignore:${i.id}`
   const label = kind === 'sug' ? 'suggested' : source === 'other' ? 'neglected' : source
+  const note = (verb: ActVerb, more = {}) => logAct($, bin, verb, nowRow(i, source), more)   // what the manager did, for habits
   const doIt = action
     ? acts.map((a, n) => <Button key={n === 0 ? `${kind}-doit:${i.id}` : `${kind}-act:${i.id}:${n}`} variant={n === 0 ? 'primary' : 'secondary'}
-        onPress={press(() => fill($, a.prompt || `mother now do ${a.id}`))}>{oneLine(a.label, n === 0 ? 40 : ACTION_LABEL_MAX) || 'Do it'}</Button>)
+        onPress={press(() => { note('action', picked(a.label, n)); return fill($, a.prompt || `mother now do ${a.id}`) })}>{oneLine(a.label, n === 0 ? 40 : ACTION_LABEL_MAX) || 'Do it'}</Button>)
     : null
-  const ask = <Button key={`${kind}-ask:${i.id}`} variant={action ? 'secondary' : 'primary'} onPress={press(() => fill($, askPrompt(title, why, i.link)))}>Ask Mother</Button>
-  const done = <Button key={`${kind}-done:${i.id}`} onPress={press(() => go(['done', i.id]))}>Done</Button>
+  const ask = <Button key={`${kind}-ask:${i.id}`} variant={action ? 'secondary' : 'primary'} onPress={press(() => { note('ask'); return fill($, askPrompt(title, why, i.link)) })}>Ask Mother</Button>
+  const done = <Button key={`${kind}-done:${i.id}`} onPress={press(() => { note('done'); return go(['done', i.id]) })}>Done</Button>
   return card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
     titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [doIt ?? ask, done]),
     <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
@@ -92,14 +95,14 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
       : null,
     open && drafts?.[snoozeKey] !== undefined
       ? <Select key={`${kind}-snooze-pick:${i.id}`} label="Snooze for" options={SNOOZES.map(value => ({ value }))}
-          onSelect={(value: string) => flip($, snoozeKey).then(() => go(['snooze', i.id, value]))} />
+          onSelect={(value: string) => flip($, snoozeKey).then(() => { note('snooze'); return go(['snooze', i.id, value]) })} />
       : null,
     open && link && drafts?.[ignoreKey] !== undefined
       ? <Select key={`${kind}-ignore-pick:${i.id}`} label="Ignore" options={ignoreOptions(i.id.startsWith('chat:'), i.from, i.similar)}
           onSelect={async (value: string) => {
             await flip($, ignoreKey)
             // as the Now panel's item page: mute through the hub, then the item is done
-            if (await hubVerb($, bin, ignoreArgs(value, link, i.from, i.similar))) await go(['done', i.id])
+            if (await hubVerb($, bin, ignoreArgs(value, link, i.from, i.similar))) { note('ignore'); await go(['done', i.id]) }
           }} />
       : null,
   ])
@@ -177,23 +180,24 @@ export function suggestedSection($: Dollar, ui: Ui, bin: string, doc: NowDoc | n
 // Follow watches what the key belongs to (a tracker project, a repo, a chat thread, a group); a key with nothing to
 // follow draws no button. Ignore… opens the Now panel's picker (just this, for a week, a thread's whole channel):
 // `mother hub mute …`, then the item is done, so its card is gone on the next status read.
-export function inboxFollowIgnore($: Dollar, ui: Ui, u: ChiefInboxItem, goHub: GoHub, press: (run: () => unknown) => () => Promise<void>) {
+export function inboxFollowIgnore($: Dollar, ui: Ui, u: ChiefInboxItem, goHub: GoHub, press: (run: () => unknown) => () => Promise<void>,
+                                  note?: (verb: ActVerb) => void) {
   const { Button } = ui
   const follow = followArgs(u.key)
   return [
     follow
-      ? <Button key={'inbox-follow:' + u.id} onPress={press(async () => { if (await goHub(follow)) $.ui.toast(`Following ${follow[follow.length - 1]}`) })}>Follow</Button>
+      ? <Button key={'inbox-follow:' + u.id} onPress={press(async () => { if (await goHub(follow)) { note?.('follow'); $.ui.toast(`Following ${follow[follow.length - 1]}`) } })}>Follow</Button>
       : null,
     <Button key={'inbox-ignore:' + u.id} onPress={press(() => flip($, 'inbox-ignore:' + u.id))}>Ignore…</Button>,
   ]
 }
 
-export function inboxIgnorePick($: Dollar, ui: Ui, u: ChiefInboxItem, drafts: Drafts, goHub: GoHub) {
+export function inboxIgnorePick($: Dollar, ui: Ui, u: ChiefInboxItem, drafts: Drafts, goHub: GoHub, note?: (verb: ActVerb) => void) {
   const { Select } = ui
   const key = 'inbox-ignore:' + u.id
   if (drafts?.[key] === undefined) return null
   return <Select key={'inbox-ignore-pick:' + u.id} label="Ignore" options={ignoreOptions(THREAD_KEY.test(u.key))}
-    onSelect={async (value: string) => { await flip($, key); if (await goHub(ignoreArgs(value, u.key))) await goHub(['done', u.id]) }} />
+    onSelect={async (value: string) => { await flip($, key); if (await goHub(ignoreArgs(value, u.key))) { note?.('ignore'); await goHub(['done', u.id]) } }} />
 }
 
 // ---- Health: is everything working ----
@@ -298,7 +302,7 @@ const sub = (ui: Ui, key: string, text: string, count?: number) => {
 }
 
 export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, doc: NowDoc | null | undefined, nowMs: number,
-                              ctx: TabCtx, self: string | null, goHub: GoHub, heading: boolean) {
+                              ctx: TabCtx, self: string | null, goHub: GoHub, heading: boolean, goChief?: GoHub) {
   const { Box, Text, Button } = ui
   const hd = healthOf(s)
   const out: unknown[] = []
@@ -362,7 +366,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
           {badge(ui, 'error', 'error', 'badge:' + id)}
           <Text weight="semibold">{oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)}</Text>
           <Text dimColor>{`${oneLine(u.key, 60)} · ${ago(u.at, nowMs)}`}</Text>
-          <Button key={'health-done:' + u.id} onPress={pressing($, id, () => goHub(['done', u.id]))}>Done</Button>
+          <Button key={'health-done:' + u.id} onPress={pressing($, id, () => { logAct($, bin, 'done', inboxRow(u)); return goHub(['done', u.id]) })}>Done</Button>
         </Box>,
         why ? <Text key={'why:' + id} dimColor wrap="wrap">{why}</Text> : null,
       ]))
@@ -386,7 +390,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       open && lines.length > REPORT_LINES_MAX ? <Text key={'report-more:' + id} dimColor>{`${lines.length - REPORT_LINES_MAX} more lines in .mother/${r.name}`}</Text> : null,
       open
         ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
-            <Button key={'health-dismiss:' + r.name} onPress={pressing($, id, () => dismiss($, r.name))}>Dismiss</Button>
+            <Button key={'health-dismiss:' + r.name} onPress={pressing($, id, () => { logAct($, bin, 'dismiss', { item_id: r.name, source: 'report', title: oneLine(r.routine, 60) }); return dismiss($, r.name) })}>Dismiss</Button>
           </Box>
         : null,
     ]))
@@ -420,5 +424,36 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       {guard === 'off' ? <Text color="error">every guard rule is off: the model alone decides</Text> : null}
       {guard === 'paused' ? <Text color="error">outbound actions are paused</Text> : null}
     </Box>)
+  out.push(...quietedSection($, ui, s, nowMs, goChief))
+  return out
+}
+
+// ---- Health: Quieted by habit (status.quieted, lib/habits.py) ----
+// The lines the quiet rule logged instead of showing, newest first. Show makes one a normal Inbox item (`mother chief
+// habits show <id>`); Stop quieting this, once per bucket, puts its bucket on the exceptions list (`habits except`).
+// Nothing is drawn while habits are on and nothing was quieted. The text is model- or line-written: plain Text.
+export function quietedSection($: Dollar, ui: Ui, s: ChiefStatus, nowMs: number, goChief?: GoHub) {
+  const { Box, Text, Button } = ui
+  const q = quietedOf(s)
+  if (q.on && !q.count && !q.recent.length) return []
+  const out: unknown[] = [sub(ui, 'health-quieted', 'Quieted by habit', q.count)]
+  if (!q.on) out.push(<Text key="health-quieted-off" dimColor>Habits are off: nothing is quieted (/chief habits on)</Text>)
+  const seen = new Set<string>()
+  for (const r of q.recent) {
+    const first = !seen.has(r.bucket)
+    seen.add(r.bucket)
+    out.push(
+      <Box key={'quieted:' + r.id} flexDirection="column">
+        <Box flexWrap="wrap" gap="xs">
+          <Text weight="semibold">{oneLine(r.title, 60) || oneLine(r.key, 60)}</Text>
+          <Text dimColor>{`${oneLine(r.label, 40)} · ${ago(r.at, nowMs)}`}</Text>
+        </Box>
+        <Box flexWrap="wrap" gap="xs">
+          <Text key={'quieted-why:' + r.id} dimColor>{oneLine(r.why, 120)}</Text>
+          {goChief ? <Button key={'quieted-show:' + r.id} onPress={() => goChief(['habits', 'show', r.id])}>Show</Button> : null}
+          {goChief && first ? <Button key={'quieted-stop:' + r.bucket} plain dimColor onPress={() => goChief(['habits', 'except', r.bucket])}>Stop quieting this</Button> : null}
+        </Box>
+      </Box>)
+  }
   return out
 }
