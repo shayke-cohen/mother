@@ -11,7 +11,7 @@ import type { Dollar } from './shared'
 //   - the pane's body colour is the app's, so the panel is one Box with a fill;
 //   - a Text with no colour is the app's default (dark in light mode): every Text in the panel gets one;
 //   - a native Button wears the app's chrome and its label takes no colour: a pill is a filled rounded Box around a
-//     `plain` Button, its fill picked to read under the app's own label colour (so by the app's theme);
+//     `plain` Button, its fill picked to read under the app's own label colour (dark by default; `dark-app` for light);
 //   - a hover Box needs a `key`, or the whole pane fails to draw.
 // Nothing here reads state or runs an action.
 
@@ -24,24 +24,19 @@ export const PALETTE = {
 } as const
 const P = PALETTE
 
-export type Theme = 'light' | 'dark' | 'unknown'
-export type SkinMode = 'dark' | 'plain'
-export type Skin = { dark: boolean; theme: Theme }
-export const PLAIN_SKIN: Skin = { dark: false, theme: 'unknown' }
-export const SKIN_MODES: readonly SkinMode[] = ['dark', 'plain']
+// The three looks `/chief skin` names. `dark` and `dark-app` are the same dark panel; they differ in the pills, whose
+// label is the app's own text colour and takes none of ours: `dark` (the default) fills them for a dark label (the
+// app in light mode), `dark-app` for a light one (the app in dark mode). Nothing the mod can read says which the
+// desktop app is in (the `theme` config row is the CLI's), so the manager says it.
+export type SkinMode = 'dark' | 'dark-app' | 'plain'
+export type Skin = { dark: boolean; labels: 'dark' | 'light' }
+export const PLAIN_SKIN: Skin = { dark: false, labels: 'dark' }
+export const SKIN_MODES: readonly SkinMode[] = ['dark', 'dark-app', 'plain']
 export const SKIN_STORE_KEY = 'chiefSkin'      // the plugin's store: machine-local, outlasts the session
 
 // The skin a draw uses: dark on the desktop app unless the manager chose plain; plain everywhere else.
-export function skinFor(surface: string, mode: SkinMode | null | undefined, theme: Theme | null | undefined): Skin {
-  return { dark: surface === 'desktop' && mode !== 'plain', theme: theme ?? 'unknown' }
-}
-
-// The app's theme from `$.config.list()`: the row keyed `theme`. Only a value that clearly says dark is dark; any
-// other value is light; no row (or no list) is unknown, which draws as light.
-export function themeOf(rows: unknown): Theme {
-  const row = (Array.isArray(rows) ? rows : []).find(r => r && typeof r === 'object' && (r as { key?: unknown }).key === 'theme') as { value?: unknown } | undefined
-  if (!row) return 'unknown'
-  return typeof row.value === 'string' && /dark/i.test(row.value) ? 'dark' : 'light'
+export function skinFor(surface: string, mode: SkinMode | null | undefined): Skin {
+  return { dark: surface === 'desktop' && mode !== 'plain', labels: mode === 'dark-app' ? 'light' : 'dark' }
 }
 
 // ---- colours: the pane's theme keys as the dark skin draws them ----
@@ -57,11 +52,11 @@ export const inkOf = (c: Color | string | null | undefined): string => (c === 's
 const onFill = (fill: string): string => (fill === P.slate || fill === P.line || fill === P.card ? P.ink : P.panel)
 
 export type PillVariant = 'primary' | 'secondary' | 'danger'
-// A pill's label is the app's own text colour (dark in light mode, light in dark mode), so its fill follows the theme.
+// A pill's fill reads under its label: cream and coral under a dark label, slate and a darker coral under a light one.
 export function pillFills(s: Skin): Record<PillVariant, { fill: string; hover: string }> {
-  return s.theme === 'dark'
+  return s.labels === 'light'
     ? { primary: { fill: '#c9553a', hover: P.coral }, secondary: { fill: '#3a4060', hover: '#4a5278' }, danger: { fill: '#b23a3e', hover: P.red } }
-    : { primary: { fill: P.coral, hover: '#f08a6c' }, secondary: { fill: '#e9e6df', hover: '#ffffff' }, danger: { fill: P.red, hover: '#f0686c' } }
+    : { primary: { fill: P.coral, hover: '#f08a6c' }, secondary: { fill: '#e9e6df', hover: '#ffffff' }, danger: { fill: '#f08a8d', hover: '#f5a3a5' } }
 }
 
 // ---- the skinned element table ----
@@ -86,16 +81,19 @@ export function labelOf(children: unknown): string {
   return labelOf(el.children ?? el.props?.children)
 }
 
-// How many cells a drawn pill takes, by element: the title row uses it to keep a compact card's first row on one line.
-const PILL_CELLS = new WeakMap<object, number>()
-export const pillCells = (el: unknown): number => (el && typeof el === 'object' ? PILL_CELLS.get(el as object) ?? 0 : 0)
+// A drawn pill's label length, by element: the title row uses it to keep a compact card's first row on one line.
+const PILL_LABEL = new WeakMap<object, number>()
+export const pillLabel = (el: unknown): number => (el && typeof el === 'object' ? PILL_LABEL.get(el as object) ?? 0 : 0)
+export const PILL_EXTRA = 6     // what a pill takes beside its label, in cells: padding, the label's two spaces, the border
+export const pillCells = (el: unknown): number => (pillLabel(el) ? pillLabel(el) + PILL_EXTRA : 0)
 
-type PillOpts = { key?: string; variant?: PillVariant; label: string; onPress: () => unknown; compact?: boolean }
+// `tight` is a pill with no padding of its own (the label's two spaces are all of it): the tab row, seven on one line.
+type PillOpts = { key?: string; variant?: PillVariant; label: string; onPress: () => unknown; tight?: boolean }
 
 function darkPill(raw: any, skin: Skin, o: PillOpts) {
   const { Box, Button } = raw
   const c = pillFills(skin)[o.variant ?? 'secondary']
-  const pad = o.compact ? 1 : 2
+  const pad = o.tight ? 0 : 1
   // every hover Box is keyed: one without a key makes the whole pane fail to draw
   const hover = o.key ? { key: 'pill:' + o.key, hover: { backgroundColor: c.hover, borderColor: c.hover } } : {}
   const el = (
@@ -103,7 +101,7 @@ function darkPill(raw: any, skin: Skin, o: PillOpts) {
       <Button key={o.key} plain onPress={o.onPress}>{NB + o.label + NB}</Button>
     </Box>
   )
-  if (el && typeof el === 'object') PILL_CELLS.set(el as object, o.label.length + 2 * pad + 4)
+  if (el && typeof el === 'object') PILL_LABEL.set(el as object, o.label.length)
   return el
 }
 
@@ -181,6 +179,12 @@ export function Card(ui: Ui, f: CardFrame, children: unknown) {
       {children as any}
     </Box>
   )
+}
+
+// A row of pills (and the fields beside them): it wraps, and on the dark skin wrapped lines keep a gap so they
+// never touch.
+export function pillRow(ui: Ui): Record<string, unknown> {
+  return skinOf(ui).dark ? { flexWrap: 'wrap', gap: 1, rowGap: 1, alignItems: 'center' } : { flexWrap: 'wrap', gap: 'xs', alignItems: 'center' }
 }
 
 // A button: a filled rounded pill on the dark skin (coral for the recommended action and the shown tab, quieter for

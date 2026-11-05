@@ -6,7 +6,7 @@ import type { Dollar } from './shared'
 import { THREAD_KEY, followArgs, ignoreArgs, ignoreOptions, nowVerb, openInspector } from './register'
 import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, linkRows, linksOf, money, sectionHeading,
          sourceBadge, sourceLink, subHeading, titleRow, toggled, whyText } from './pane_ui'
-import { SectionHeading, Stat } from './skin'
+import { SectionHeading, Stat, pillRow } from './skin'
 import type { Ui } from './pane_ui'
 import { inboxRow, logAct, nowRow, picked, quietedOf } from './habits'
 import type { ActVerb } from './habits'
@@ -162,17 +162,17 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
   const ask = <Button key={`${kind}-ask:${i.id}`} variant={action ? 'secondary' : 'primary'} onPress={press(() => { note('ask'); return fill($, askPrompt(title, why, i.link)) })}>Ask Mother</Button>
   const done = <Button key={`${kind}-done:${i.id}`} onPress={press(() => { note('done'); return go(['done', i.id]) })}>Done</Button>
   return card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
-    titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [doIt ?? ask, done]),
-    <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
+    ...(titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [doIt ?? ask, done], (tail: unknown) => (
+    <Box key={'meta:' + id} {...pillRow(ui)}>
       {sourceBadge(ui, source, label, 'badge:' + id)}
       <Text dimColor>{age(i.since, nowMs) + ' '}</Text>
       {open ? null : sourceLink(ui, id, linksOf(i.link, i.links, source))}
-    </Box>,
+    {tail as any}</Box>)) as unknown[]),
     open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
     ...(open ? itemDetail(ui, id, i, nowMs, ctx.details) : []),
     ...(open ? actionSays(ui, id, acts, detail, 40) : []),
     open
-      ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
+      ? <Box key={'acts:' + id} {...pillRow(ui)}>
           {doIt}
           {ask}
           {done}
@@ -445,7 +445,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       const id = 'health:err:' + u.id
       const why = whyText(u.why)
       out.push(card(ui, { id, color: 'error', selected: ctx.selected === id }, [
-        <Box key={'meta:' + id} flexWrap="wrap" gap="xs" alignItems="center">
+        <Box key={'meta:' + id} {...pillRow(ui)}>
           {badge(ui, 'error', 'error', 'badge:' + id)}
           <Text weight="semibold">{oneLine(u.title, TITLE_MAX) || oneLine(u.key, TITLE_MAX)}</Text>
           <Text dimColor>{`${oneLine(u.key, 60)} · ${ago(u.at, nowMs)}`}</Text>
@@ -473,7 +473,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       ...(open ? lines.slice(0, REPORT_LINES_MAX).map((line, n) => <Text key={`report:${r.name}:${n}`} wrap="wrap">{line || ' '}</Text>) : []),
       open && lines.length > REPORT_LINES_MAX ? <Text key={'report-more:' + id} dimColor>{`${lines.length - REPORT_LINES_MAX} more lines in .mother/${r.name}`}</Text> : null,
       open
-        ? <Box key={'acts:' + id} flexWrap="wrap" gap="xs" alignItems="center">
+        ? <Box key={'acts:' + id} {...pillRow(ui)}>
             <Button key={'health-dismiss:' + r.name} onPress={pressing($, id, () => { logAct($, bin, 'dismiss', { item_id: r.name, source: 'report', title: oneLine(r.routine, 60) }); return dismiss($, r.name) })}>Dismiss</Button>
           </Box>
         : null,
@@ -489,13 +489,13 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
 
   // Budget and lead
   const b = s.budget
-  const lead = leadPill(s, self)
+  const lead = leadPill(s, self, nowMs)
   const beat = s.chief?.heartbeat_at ? ago(s.chief.heartbeat_at, nowMs) : ''
   out.push(sub(ui, 'health-budget', 'Budget and lead'))
   out.push(
     <Box key="health-budget-row" flexWrap="wrap" gap="xs" alignItems="center">
       {Stat(ui, { value: b?.unreadable ? 'spend file unreadable' : `${money(b?.spent)} of ${money(b?.limit)} today`, tone: b?.over || b?.unreadable ? 'error' : undefined })}
-      {badge(ui, lead.text, lead.color, 'health-lead')}
+      {badge(ui, lead.text, lead.color, 'health-lead', !!lead.dim)}
       <Text dimColor>{!beat ? 'no heartbeat' : beat === 'now' ? 'heartbeat now' : `heartbeat ${beat} ago`}</Text>
     </Box>)
 

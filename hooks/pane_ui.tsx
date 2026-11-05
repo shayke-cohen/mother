@@ -2,7 +2,7 @@ import type { Color } from 'claude-code'
 
 import { oneLine } from './shared'
 import type { Dollar } from './shared'
-import { Badge, Card, Empty, Icon, Pill, SectionHeading, barSvg, pillCells, pillFills, rawOf, skinOf, BAR_H, BAR_W } from './skin'
+import { Badge, Card, Empty, Icon, Pill, SectionHeading, barSvg, pillCells, pillLabel, skinOf, BAR_H, BAR_W } from './skin'
 import type { CardFrame } from './skin'
 import type { ChiefCardState, ChiefDesktop, ChiefOpen, ChiefStatus, ChiefTldr } from '../types'
 
@@ -213,7 +213,7 @@ export const tabIsNew = (t: { id: TabId; count: number }, seen: Record<string, n
 export const tabHover = (id: string) => ({ scope: 'mother-tab:' + id, color: SELF_COLOR, underline: true, dimColor: false })
 
 // The tab row: a Button per tab with its count, the shown one primary; ` •` marks a tab with something new.
-// Dark skin: one row of compact pills, the shown tab coral, the rest quiet; the mark is a coral dot (a red one for
+// Dark skin: one row of tight pills (seven fit a 560 px pane), the shown tab coral, the rest quiet; the mark is a coral dot (a red one for
 // Health's alert) after the pill, outside its Button, whose label takes no colour.
 export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<string, number> | null | undefined, onPick: (id: TabId) => unknown) {
   const { Box, Button, Text } = ui
@@ -224,7 +224,7 @@ export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<
       <Box key="tabs" flexWrap="wrap" gap={1} marginTop={1} alignItems="center">
         {rows.map(t => (
           <Box key={'tab-cell:' + t.id} gap={0} alignItems="center" flexShrink={0}>
-            {Pill(ui, { key: 'tab:' + t.id, variant: t.id === shown ? 'primary' : 'secondary', label: t.text, compact: true, onPress: () => onPick(t.id) })}
+            {Pill(ui, { key: 'tab:' + t.id, variant: t.id === shown ? 'primary' : 'secondary', label: t.text, tight: true, onPress: () => onPick(t.id) })}
             {t.alert ? <Text key={'tab-alert:' + t.id} color="error">{'●'}</Text> : t.isNew ? <Text key={'tab-dot:' + t.id} color="claude">{'•'}</Text> : null}
           </Box>
         ))}
@@ -258,11 +258,16 @@ export const allCards = (open: boolean): ChiefOpen => ({ all: open, cards: {} })
 // ---- who leads, the budget, a session's state: short words and a colour each ----
 export type Pill = { text: string; color: Color }
 
-// Led, here or by another session, is healthy: green. Only nobody leading is red.
-export function leadPill(s: ChiefStatus, self: string | null): Pill {
+// Led, here or by another session, is healthy: green. Nobody leading is red only once the heartbeat is older than
+// 3 minutes (or there never was one): a session takes the lead within a minute of a start or a reload, and until
+// then the badge is a dim `starting…`. Without `nowMs` the heartbeat's age is not read.
+export const LEAD_GRACE_MS = 3 * 60_000
+export function leadPill(s: ChiefStatus, self: string | null, nowMs?: number): Pill & { dim?: boolean } {
   const by = typeof s.led_by === 'string' && s.led_by ? s.led_by : null
-  return !by ? { text: 'nobody leading', color: 'error' }
-    : by === self ? { text: 'led here', color: 'success' } : { text: 'led by another session', color: 'success' }
+  if (by) return by === self ? { text: 'led here', color: 'success' } : { text: 'led by another session', color: 'success' }
+  const beat = s.chief?.heartbeat_at ? Date.parse(s.chief.heartbeat_at) : NaN
+  if (nowMs !== undefined && !Number.isNaN(beat) && nowMs - beat <= LEAD_GRACE_MS) return { text: 'starting…', color: 'subtle', dim: true }
+  return { text: 'nobody leading', color: 'error' }
 }
 
 export const BUDGET_CELLS = 8
@@ -384,50 +389,46 @@ export function card(ui: Ui, f: CardFrame, children: unknown) {
 export const COMPACT_TITLE_MAX = 56
 
 export const ROW_CELLS = 48       // the pills a compact card's first row holds beside its title, in cells
+export const PRIMARY_LABEL_MAX = 16   // a longer recommended label leaves the title its whole row
 
 // The title row: a plain Button whose press toggles the card; `▾` open, `▸` closed. `actions` (a compact card's
 // primary button, and a small second one) sit at the right end of the same row; the title is then one cut line.
-// Dark skin: a Button's label takes no colour, so the caret alone is the Button (on a small chip) and the title is
-// ink text beside it, cut with `…` before the pills; the recommended pill is pinned right, and when the pills do
-// not all fit the row the others move to a second one, right-aligned.
-export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPress: () => unknown, trailing?: unknown, actions?: unknown) {
+// `meta` builds the card's second row (badges, label, age, link) around what the title row hands it: with it the
+// answer is both rows, [title, meta].
+// Dark skin: a Button's label takes no colour, so the toggle is a small round pill holding the caret and the title
+// is ink text beside it, cut with `…` before the pills. The recommended pill is pinned right. Pills that do not all
+// fit the row leave only the recommended one there; a recommended label over 16 characters leaves the title the
+// whole row. The pills that left go to the end of the second row (`meta`'s argument).
+export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPress: () => unknown, trailing?: unknown, actions?: unknown,
+                         meta?: (tail: unknown) => unknown) {
   const { Box, Button, Text } = ui
   if (skinOf(ui).dark) {
-    const { Button: Raw } = rawOf(ui)
-    const chip = pillFills(skinOf(ui)).secondary.fill
-    const caret = (
-      <Box key={'caret:' + id} backgroundColor={chip} paddingX={1} flexShrink={0}>
-        <Raw key={'toggle:' + id} plain onPress={onPress}>{open ? '▾' : '▸'}</Raw>
-      </Box>
-    )
-    const words = <Text key={'title-ink:' + id} weight="semibold" wrap={actions ? 'truncate-end' : 'wrap'}>{actions ? clip(title, COMPACT_TITLE_MAX) : title}</Text>
-    if (!actions) {
-      return (
-        <Box key={'title:' + id} gap={1} alignItems="center">
+    const caret = Pill(ui, { key: 'toggle:' + id, variant: 'secondary', label: open ? '▾' : '▸', onPress })
+    const all = actions ? (Array.isArray(actions) ? actions.flat(3) : [actions]).filter(Boolean) : []
+    const below = all.length > 0 && pillLabel(all[0]) > PRIMARY_LABEL_MAX
+    const fits = all.reduce((n: number, a) => n + pillCells(a), 0) <= ROW_CELLS
+    const first = below ? [] : fits ? all : all.slice(0, 1)
+    const rest = all.slice(first.length)
+    const words = <Text key={'title-ink:' + id} weight="semibold" wrap={actions ? 'truncate-end' : 'wrap'}>{first.length ? clip(title, COMPACT_TITLE_MAX) : title}</Text>
+    const row = !actions
+      ? <Box key={'title:' + id} gap={1} alignItems="center">
           {caret}
           {words}
           {trailing as any}
         </Box>
-      )
-    }
-    const all = (Array.isArray(actions) ? actions.flat(3) : [actions]).filter(Boolean)
-    const fits = all.reduce((n: number, a) => n + pillCells(a), 0) <= ROW_CELLS
-    const first = fits ? all : all.slice(0, 1)
-    const rest = fits ? [] : all.slice(1)
-    return (
-      <Box key={'title:' + id} flexDirection="column">
-        <Box key={'title-row:' + id} gap={1} justifyContent="space-between" alignItems="center">
+      : <Box key={'title:' + id} gap={1} justifyContent="space-between" alignItems="center">
           <Box key={'title-text:' + id} gap={1} flexShrink={1} minWidth={0} alignItems="center">
             {caret}
             {words}
             {trailing as any}
           </Box>
-          <Box key={'title-acts:' + id} gap={1} flexShrink={0} alignItems="center">{first as any}</Box>
+          {first.length ? <Box key={'title-acts:' + id} gap={1} flexShrink={0} alignItems="center">{first as any}</Box> : null}
         </Box>
-        {rest.length ? <Box key={'title-more:' + id} gap={1} justifyContent="flex-end" alignItems="center">{rest as any}</Box> : null}
-      </Box>
-    )
+    const more = rest.length ? <Box key={'title-more:' + id} flexWrap="wrap" gap={1} rowGap={1} flexShrink={0} alignItems="center">{rest as any}</Box> : null
+    if (meta) return [row, meta(more)]
+    return more ? [row, more] : row
   }
+  const plain = () => {
   const toggle = (text: string) => (
     <Button key={'toggle:' + id} plain onPress={onPress}><Text weight="semibold">{`${open ? '▾' : '▸'} ${text}`}</Text></Button>
   )
@@ -448,6 +449,8 @@ export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPre
       <Box key={'title-acts:' + id} gap="xs" flexShrink={0}>{actions as any}</Box>
     </Box>
   )
+  }
+  return meta ? [plain(), meta(null)] : plain()
 }
 
 // The pane's picture, from `mother chief portrait --json`, loaded once per session by chief.tsx (a draw is pure).
@@ -497,6 +500,23 @@ export const bannerSvg = (j: { base64: string }, title = 'Mother', subtitle = 'C
   `<text x="16" y="${BANNER_H - 30}" font-family="sans-serif" font-size="26" font-weight="700" fill="#fff">${xml(title)}</text>` +
   `<text x="16" y="${BANNER_H - 12}" font-family="sans-serif" font-size="13" fill="#fff" fill-opacity="0.85">${xml(subtitle)}</text></svg>`
 
+export const WIDE_W = 1600         // wider than any likely pane: the box it sits in crops it on the right
+const BANNER_NAVY = '#1d2340'
+// The dark skin's banner, inside the panel: the same slim picture and title at the left of a 1600 px navy band. The
+// Box around it clips it to the panel's width; were the Svg shrunk instead, `slice` on the root keeps its left part
+// at full size. Either way the banner fills the width and the title stays at the left.
+export const wideBannerSvg = (j: { base64: string }, title = 'Mother', subtitle = 'Chief of Stuff'): string =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${WIDE_W} ${BANNER_H}" width="${WIDE_W}" height="${BANNER_H}" preserveAspectRatio="xMinYMid slice">` +
+  '<defs><linearGradient id="shade" x1="0" y1="0" x2="0" y2="1"><stop offset="0.2" stop-color="#000" stop-opacity="0"/>' +
+  '<stop offset="1" stop-color="#000" stop-opacity="0.8"/></linearGradient>' +
+  `<linearGradient id="edge" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="${BANNER_NAVY}" stop-opacity="0"/><stop offset="1" stop-color="${BANNER_NAVY}"/></linearGradient></defs>` +
+  `<rect width="${WIDE_W}" height="${BANNER_H}" fill="${BANNER_NAVY}"/>` +
+  `<image href="data:image/jpeg;base64,${j.base64}" x="0" y="0" width="${BANNER_W}" height="${BANNER_H}" preserveAspectRatio="xMidYMid slice"/>` +
+  `<rect x="${BANNER_W - 24}" y="0" width="24" height="${BANNER_H}" fill="url(#edge)"/>` +
+  `<rect x="0" y="0" width="${WIDE_W}" height="${BANNER_H}" fill="url(#shade)"/>` +
+  `<text x="16" y="${BANNER_H - 30}" font-family="sans-serif" font-size="26" font-weight="700" fill="#fff">${xml(title)}</text>` +
+  `<text x="16" y="${BANNER_H - 12}" font-family="sans-serif" font-size="13" fill="#fff" fill-opacity="0.85">${xml(subtitle)}</text></svg>`
+
 // The picture, whether it is a banner, and whether that banner carries the title, by the surface's name (a surface
 // without Image still resolves one, to an empty stand-in). Nothing where the surface has no element for it: the
 // title says it.
@@ -508,6 +528,16 @@ function portraitOf(ui: Ui, p: Portrait, surface: string): { el: unknown; banner
     return { banner, el: <Image key="portrait" source={{ png: p.png }} columns={columns} rows={rows} alt={PORTRAIT_ALT} /> }
   }
   if (!Svg) return null
+  if (p.jpeg && portraitLayout(p.jpeg).banner && skinOf(ui).dark) {
+    const { Box } = ui
+    const wide = wideBannerSvg(p.jpeg)
+    if (wide.length <= SVG_MAX) {
+      return { banner: true, titled: true, el: (
+        <Box key="banner-clip" flexShrink={1} minWidth={0} overflow="hidden">
+          <Svg source={wide} alt={PORTRAIT_ALT} width={WIDE_W} height={BANNER_H} />
+        </Box>) }
+    }
+  }
   if (p.jpeg && portraitLayout(p.jpeg).banner) {
     const slim = bannerSvg(p.jpeg)
     if (slim.length <= SVG_MAX) return { banner: true, titled: true, el: <Svg source={slim} alt={PORTRAIT_ALT} width={BANNER_W} height={BANNER_H} /> }
@@ -523,7 +553,7 @@ function portraitOf(ui: Ui, p: Portrait, surface: string): { el: unknown; banner
 export type Strip = {
   needs: number; inbox: number; sessions: number   // the tabs carry these counts; the strip no longer draws them
   spent: number | undefined; limit: number | undefined; overBudget: boolean
-  lead: Pill; beat: string
+  lead: Pill & { dim?: boolean }; beat: string
   portrait: Portrait | null
   surface: string       // `terminal` draws an Image; any other surface an Svg when it has one
   guard?: string | null // `off` and `paused` each draw a red pill; `on`, or absent, nothing
@@ -532,9 +562,9 @@ export type Strip = {
 // The header: the picture (a slim banner above, which carries the title on a surface with Svg, or a spot at the
 // left), "Mother" and "Chief of Stuff" unless the banner says them, then one line: the budget as `$1.50 / $20` with a
 // mini bar, who leads, the heartbeat's age, and a red pill while the guard is off or paused.
-// `headerParts` hands the banner apart from the strip: the dark skin draws the banner above the panel (it is as wide
-// as the pane) and the strip inside it, the budget's figures then an Svg bar (coral on slate).
-export function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
+// Dark skin: the banner is the panel's first row, clipped to its width; the strip under it carries the budget's
+// figures then an Svg bar (coral on slate).
+function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
   const { Box, Text } = ui
   const dark = skinOf(ui).dark
   const { Svg } = ui as { Svg?: any }
@@ -546,7 +576,9 @@ export function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown
   const picture = (drawn?.el ?? null) as any
   const lim = typeof s.limit === 'number' && s.limit > 0 ? s.limit : 0
   const ratio = lim ? (s.spent ?? 0) / lim : 1
-  const banner = isBanner && picture ? <Box key="banner" marginBottom={titled ? 0 : 1}>{picture}</Box> : null
+  const banner = !isBanner || !picture ? null
+    : dark ? <Box key="banner" width="100%" overflow="hidden" marginBottom={1}>{picture}</Box>
+      : <Box key="banner" marginBottom={titled ? 0 : 1}>{picture}</Box>
   const strip = (
     <Box key="strip" gap={1}>
       {isBanner ? null : picture}
@@ -558,14 +590,14 @@ export function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown
             <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
             {Svg ? <Svg key="pill:bar" source={barSvg(ratio)} alt={`budget ${Math.round(Math.min(1, Math.max(0, ratio)) * 100)}%`} width={BAR_W} height={BAR_H} />
               : <Text key="pill:bar" color={bar.color}>{bar.text}</Text>}
-            {badge(ui, s.lead.text, s.lead.color, 'pill:lead')}
+            {badge(ui, s.lead.text, s.lead.color, 'pill:lead', !!s.lead.dim)}
             {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}
             <Text key="pill:beat" dimColor size="footnote">{s.beat}</Text>
           </Box>
         : <Box key="strip-line" flexWrap="wrap" gap="xs">
             <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
             <Text key="pill:bar" color={bar.color}>{bar.text}</Text>
-            {badge(ui, s.lead.text, s.lead.color, 'pill:lead')}
+            {badge(ui, s.lead.text, s.lead.color, 'pill:lead', !!s.lead.dim)}
             {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}
             <Text key="pill:beat" dimColor>{s.beat}</Text>
           </Box>}

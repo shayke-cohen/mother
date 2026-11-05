@@ -1,8 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { chiefStatusText, cleanTldr, ledByText, sessionOrder, parseVerdict, triagePrompt, ASK_EMPTY, CONTEXT_MAX, TRIAGE_PROMPT_MAX, TRIAGE_SYSTEM } from './chief'
 import { caseBrief, parseCase, relayText } from './cos'
-import { bannerSvg, budgetBar, cardState, clip, humanLabel, inboxOrder, isOpen, itemSource, linksOf, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
-import { Card, ICONS, PALETTE, Pill, barSvg, labelOf, pillFills, skinFor, skinUi, themeOf } from './skin'
+import { bannerSvg, leadPill, wideBannerSvg, LEAD_GRACE_MS, WIDE_W, budgetBar, cardState, clip, humanLabel, inboxOrder, isOpen, itemSource, linksOf, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
+import { Card, ICONS, PALETTE, Pill, barSvg, labelOf, pillFills, skinFor, skinUi } from './skin'
 import { CLI } from '../tests/fixtures/chief_cli'
 import { decisionLabel, dotsId, guardState, healthProblems, isWatcherError, sourceRows, teamGroups } from './pane_tabs'
 import { promptHabits, quietedOf } from './habits'
@@ -29,7 +29,7 @@ let submitFate: ((e: any) => 'ok' | 'drop' | 'throw') | null = null
 let actLogFate: 'ok' | 'fail' | 'throw' = 'ok'   // what `mother chief act-log --stdin` does; a test may have it fail
 // The skin the store hands a booted session (`/chief skin`): `plain` is the app's own look, which most tests read on
 // both surfaces; the dark skin's tests set `dark` (the desktop app's default when the store holds nothing).
-let bootSkin: 'plain' | 'dark' | null = 'plain'
+let bootSkin: 'plain' | 'dark' | 'dark-app' | null = 'plain'
 
 // A fake host: `mother path` answers the workspace, `mother chief <verb>` what `chief` says, the rest exits 0.
 async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => Cli | undefined | Promise<Cli | undefined> = () => undefined,
@@ -333,7 +333,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | skin dark|plain|status | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -1141,16 +1141,24 @@ test('test_led_by_text_has_three_wordings', () => {
   expect(ledByText(status({ led_by: '' }) as any, 'desk-7')).toBe('nobody leading')
   const { led_by: _gone, ...older } = status()
   expect(ledByText(older as any, 'desk-7')).toBe('nobody leading')
+  // with the time: nobody leading is red only once the heartbeat is older than 3 minutes (or absent); a dim `starting…` before
+  const beat = Date.parse('2026-11-02T09:59:40Z')
+  const lead = (over: Record<string, unknown>, at: number) => { const l = leadPill(status(over) as any, 'desk-7', at); return [l.text, l.color, !!l.dim] }
+  expect(lead({ led_by: null }, NOW)).toEqual(['starting…', 'subtle', true])
+  expect(lead({ led_by: null }, beat + LEAD_GRACE_MS)).toEqual(['starting…', 'subtle', true])
+  expect(lead({ led_by: null }, beat + LEAD_GRACE_MS + 1)).toEqual(['nobody leading', 'error', false])
+  expect(lead({ led_by: null, chief: { alive: false, heartbeat_at: null } }, NOW)).toEqual(['nobody leading', 'error', false])
+  expect(lead({ led_by: 'desk-7' }, beat + 10 * LEAD_GRACE_MS)).toEqual(['led here', 'success', false])
 })
 
 for (const [led, pill, color] of [['desk-7', 'led here', 'success'], ['desk-8', 'led by another session', 'success'],
                                   [null, 'nobody leading', 'error']] as const) {
   test(`test_header_lead_pill: ${pill}`, async ($, on) => {
-    await bootLead($, on, { over: { led_by: led } })
+    await bootLead($, on, { over: { led_by: led, chief: { alive: true, heartbeat_at: '2026-11-02T09:50:00Z' } } })   // a heartbeat past the 3 minutes
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ ...PANE, surface })
       expect((await ui.find({ type: 'Text', text: ` ${pill} ` }))?.props.backgroundColor).toBe(color)
-      expect(await hasText(ui, /^heartbeat now$/)).toBe(true)
+      expect(await hasText(ui, /^heartbeat (now|\d+m ago)$/)).toBe(true)
       expect((await texts(ui)).some((t: string) => /Chief [●○]|Workers|To decide/.test(t))).toBe(false)
       await ui.unmount()
     }
@@ -1205,7 +1213,7 @@ test('test_header_strip_counts_budget_and_colours', async ($, on) => {
     expect((await texts(ui)).filter((t: string) => /^ \d+ (need you|inbox|sessions?) $/.test(t))).toEqual([])
     expect([await tabText(ui, 'needs'), await tabText(ui, 'inbox'), await tabText(ui, 'sessions')].map(t => String(t).replace(/ •$/, ''))).toEqual(['Needs you 1', 'Inbox 7', 'Sessions 2'])
     // budget, bar, lead and heartbeat share one line
-    expect(rowTexts(await ui.find({ key: 'strip-line' })).map(t => t.replace(/^heartbeat .*/, 'heartbeat'))).toEqual(['$12.00 / $20', '▰▰▰▰▰▱▱▱', ' nobody leading ', 'heartbeat'])
+    expect(rowTexts(await ui.find({ key: 'strip-line' })).map(t => t.replace(/^heartbeat .*/, 'heartbeat'))).toEqual(['$12.00 / $20', '▰▰▰▰▰▱▱▱', 'starting…', 'heartbeat'])   // nobody leads yet, the heartbeat is fresh: dim, not red
     expect(await pill('$12.00 / $20')).toBe('plain')
     expect(await pill('▰▰▰▰▰▱▱▱')).toBe('warning')
     await ui.unmount()
@@ -2952,12 +2960,14 @@ const SKIN_INBOX = [
                                                                          { label: 'Draft reply', prompt: 'Draft a reply.' }, { label: 'Summarise', prompt: 'Summarise it.' }] },
   INBOX[1],
   { id: 'U5', key: 'mail:abc', title: 'Vendor contract renewal: reply by Friday', why: 'the vendor asked twice', link: 'https://example.com/m', at: '2026-11-02T08:00:00Z', session: null },
+  { id: 'U6', key: 'PLAT-6', title: 'Dots A23: annotate the stale todos and say which of them can be closed today', why: 'seven are stale', link: 'https://example.com/6',
+    at: '2026-11-02T07:00:00Z', session: null, kind: 'act', on: 'manager', urgency: 'later', actions: [{ label: 'Run dots action A23', prompt: 'Run it.' }, { label: 'Ask', prompt: 'Ask.' }] },
 ]
 const RICH_DOC = () => NOW_DOC({ coverage: COVERAGE, items: [
   NOW_ITEM('pr:1', 'on_you', 'Review the release PR', { actions: [{ id: 'S1', label: 'Review it', prompt: 'mother now do S1', task: 'x' }] }),
   NOW_ITEM('chat:2', 'on_you', 'Answer the design question'), NOW_ITEM('ticket:3', 'neglected', 'A neglected ticket'),
   NOW_ITEM('mail:4', 'suggestion', 'Clear the vendor thread')] })
-async function bootRich($: any, on: any, o: { skin?: 'dark' | 'plain' | null; theme?: unknown; surface?: 'terminal' | 'desktop'; store?: Record<string, unknown> } = {}) {
+async function bootRich($: any, on: any, o: { skin?: 'dark' | 'dark-app' | 'plain' | null; portrait?: boolean; theme?: unknown; surface?: 'terminal' | 'desktop'; store?: Record<string, unknown> } = {}) {
   bootSkin = o.skin === undefined ? null : o.skin
   const fills: string[] = []
   const sends: any[] = []
@@ -2980,6 +2990,7 @@ async function bootRich($: any, on: any, o: { skin?: 'dark' | 'plain' | null; th
       if (argv[0] === 'tail') return { exitCode: 0, stdout: JSON.stringify({ version: 1, model: 'sonnet', sessions: [TAIL_2, TAIL_P] }) }
       if (argv[0] === 'tldr') return { exitCode: 0, stdout: '{"stored": 1}\n' }
       if (argv[0] === 'floor') return { exitCode: 0, stdout: JSON.stringify({ version: 1, cards: [asking()] }) }
+      if (argv[0] === 'portrait' && o.portrait) return portraitCli(800, 450, { source: 'custom', jpeg: '/9j/4AAQSkZJRg==', jpeg_width: 800, jpeg_height: 450 })(argv)
       return undefined
     }, o.surface ?? 'desktop', 'sess-1', nowFile(RICH_DOC()), {}, o.store ?? {})
     await booted.clock.advance(60_000)   // one pass: the floor's cards and the session cards are read
@@ -3054,10 +3065,16 @@ test('test_dark_skin_keeps_every_button_and_field_key_of_the_plain_one', async (
 })
 
 test('test_dark_skin_tabs_are_pills_and_the_shown_one_is_primary', async ($, on) => {
-  await bootRich($, on, { theme: 'light' })
+  await bootRich($, on, { theme: 'dark' })                                             // a `theme` config row says nothing about the desktop app: not read
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const fills = pillFills(skinFor('desktop', null, 'light'))
+  const fills = pillFills(skinFor('desktop', null))
+  expect([fills.primary.fill, fills.secondary.fill]).toEqual(['#e8704f', '#e9e6df'])
   const look = async (id: string) => { const b = await pillBox(ui, 'tab:' + id); return [trimmed((await ui.find({ key: 'tab:' + id }))?.text), b?.backgroundColor, b?.borderStyle, b?.height] }
+  // seven pills on one line at 560 px: no padding beyond the label's own two spaces, a gap of 1, and no wrap needed
+  const labels = await Promise.all(['needs', 'inbox', 'sessions', 'today', 'team', 'health', 'all'].map(async id => trimmed((await ui.find({ key: 'tab:' + id }))?.text)))
+  expect([(await pillBox(ui, 'tab:inbox'))?.paddingX, (await ui.find({ key: 'tabs' }))?.props.gap]).toEqual([0, 1])
+  // an estimate in px (a letter 7.5, a label's space 4, a border 2, a gap 8, the dot 8): the measured row needed 620 with a cell of padding each side
+  expect(labels.join('').length * 7.5 + 14 * 4 + 7 * 2 + 6 * 8 + 8).toBeLessThanOrEqual(540)
   expect(await look('all')).toEqual(['All', fills.primary.fill, 'round', 1])           // `tab all` at boot: the shown tab is the coral pill
   expect(await look('inbox')).toEqual(['Inbox 3', fills.secondary.fill, 'round', 1])   // the count inside the label
   expect(await look('needs')).toEqual(['Needs you 1', fills.secondary.fill, 'round', 1])
@@ -3074,10 +3091,10 @@ test('test_dark_skin_tabs_are_pills_and_the_shown_one_is_primary', async ($, on)
 })
 
 test('test_dark_skin_cards_pills_badges_and_the_header', async ($, on) => {
-  const { fills: filled } = await bootRich($, on, { theme: 'light' })
+  const { fills: filled } = await bootRich($, on, { theme: 'dark' })
   await $.command.run({ command: 'chief', args: 'collapse' } as any)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const fills = pillFills(skinFor('desktop', null, 'light'))
+  const fills = pillFills(skinFor('desktop', null))
   await ui.press({ key: 'tab:inbox' })
   // a compact card: a filled card with its source's border; the recommended action is the coral pill, the rest quiet
   expect([(await card(ui, 'inbox:U2')).backgroundColor, (await card(ui, 'inbox:U2')).borderColor, (await card(ui, 'inbox:U2')).borderStyle]).toEqual([PALETTE.card, PALETTE.blue, 'round'])
@@ -3088,13 +3105,34 @@ test('test_dark_skin_cards_pills_badges_and_the_header', async ($, on) => {
   // the first row holds the title and the recommended pill; the pills that do not fit move to a second row
   expect(rowKeys(await ui.find({ key: 'title-acts:inbox:U2' }))).toEqual(['pill:inbox-act:U2:0'])
   expect(rowKeys(await ui.find({ key: 'title-more:inbox:U2' }))).toEqual(['pill:inbox-act:U2:1', 'pill:inbox-act:U2:2', 'pill:inbox-done:U2'])
+  expect(rowKeys(await ui.find({ key: 'meta:inbox:U2' })).slice(-1)).toEqual(['title-more:inbox:U2'])   // at the end of the second row, with the badges
+  // a recommended label over 16 characters: the title has the whole row, uncut, and every pill is on the second row
+  expect(await ui.find({ key: 'title-acts:inbox:U6' })).toBeUndefined()
+  expect(rowKeys(await ui.find({ key: 'title-more:inbox:U6' }))).toEqual(['pill:inbox-act:U6:0', 'pill:inbox-act:U6:1', 'pill:inbox-done:U6'])
+  expect(rowKeys(await ui.find({ key: 'meta:inbox:U6' })).slice(-1)).toEqual(['title-more:inbox:U6'])
+  expect((await pillBox(ui, 'inbox-act:U6:0'))?.backgroundColor).toBe(fills.primary.fill)
+  expect(nodes(await ui.find({ key: 'title-text:inbox:U6' })).filter(x => x.n.type === 'Text' && !x.inButton).map(x => x.n.children))
+    .toEqual([['Dots A23: annotate the stale todos and say which of them can']])              // the Inbox's own 60, not the row's 56 with `…`
+  // every pill has one cell of padding, and a wrapping pill row keeps a gap between its lines
+  expect([(await pillBox(ui, 'inbox-act:U2:0'))?.paddingX, (await pillBox(ui, 'inbox-done:U2'))?.paddingX]).toEqual([1, 1])
+  expect([(await ui.find({ key: 'title-more:inbox:U6' }))?.props.rowGap, (await ui.find({ key: 'meta:inbox:U6' }))?.props.rowGap]).toEqual([1, 1])
   expect(rowKeys(await ui.find({ key: 'title-acts:inbox:U5' }))).toEqual(['pill:inbox-act:U5:0', 'pill:inbox-act:U5:1', 'pill:inbox-done:U5'])   // short labels: one row
-  // the title is ink text beside the caret, which alone is the toggle
+  // the title is ink text beside the toggle: a small round cream pill holding the caret
   const title = nodes(await ui.find({ key: 'title-text:inbox:U2' })).filter(x => x.n.type === 'Text' && !x.inButton).map(x => [x.n.children, x.n.props?.color, x.n.props?.wrap])
   expect(title).toEqual([[['Review due'], PALETTE.ink, 'truncate-end']])
-  expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('▸')
+  expect((await ui.find({ key: 'toggle:inbox:U2' }))?.text).toBe('\u00a0▸\u00a0')
+  const toggle = await pillBox(ui, 'toggle:inbox:U2')
+  expect([toggle?.borderStyle, toggle?.backgroundColor, toggle?.paddingX, toggle?.height]).toEqual(['round', '#e9e6df', 1, 1])
+  // an item with no actions of its own: opened, its first suggestion is the coral pill until another is chosen
+  await ui.press({ key: 'toggle:inbox:U5' })
+  const sug = async () => [(await pillBox(ui, 'inbox-sug:U5:0'))?.backgroundColor, (await pillBox(ui, 'inbox-sug:U5:1'))?.backgroundColor]
+  expect(await sug()).toEqual([fills.primary.fill, fills.secondary.fill])
+  await ui.press({ key: 'inbox-sug:U5:1' })
+  expect(await sug()).toEqual([fills.secondary.fill, fills.primary.fill])
+  for (const k of ['sug:inbox:U5', 'acts:inbox:U5']) expect([k, (await ui.find({ key: k }))?.props.gap, (await ui.find({ key: k }))?.props.rowGap, (await ui.find({ key: k }))?.props.flexWrap]).toEqual([k, 1, 1, 'wrap'])
+  await ui.press({ key: 'toggle:inbox:U5' })
   // badges: rounded, in the palette, dark text on a bright fill
-  const badges = nodes(await ui.find({ key: 'meta:inbox:U2' })).filter(x => x.n.type === 'Box' && x.n.props?.borderStyle === 'round')
+  const badges = nodes(await ui.find({ key: 'meta:inbox:U2' })).filter(x => x.n.type === 'Box' && x.n.props?.borderStyle === 'round' && !nodeKey(x.n))
     .map(x => [labelOf(x.n.children), x.n.props?.backgroundColor])
   expect(badges).toEqual([['tracker', PALETTE.blue], ['decide', PALETTE.amber], ['urgent', PALETTE.red]])
   // pressing the caret selects and opens the card: a bold coral border, the why in ink, the secondary actions as pills
@@ -3111,6 +3149,7 @@ test('test_dark_skin_cards_pills_badges_and_the_header', async ($, on) => {
   const strip = await ui.find({ key: 'strip-line' })
   expect((strip?.children ?? []).map((c: any) => c.type)).toEqual(['Text', 'Svg', 'Box', 'Box', 'Text'])
   expect(strip.children[1].props.source).toBe(barSvg(1.5 / 20))
+  expect(strip.children[2].props.backgroundColor).toBe(PALETTE.green)                  // led here
   expect([strip.children[0].props.color, strip.children[2].props.backgroundColor, strip.children[3].props.backgroundColor, strip.children[4].props.color])
     .toEqual([PALETTE.ink, PALETTE.green, PALETTE.red, PALETTE.dim])
   // a pill still runs its action: a Today card's recommended one fills the prompt
@@ -3191,34 +3230,61 @@ test('test_chief_skin_command_switches_and_is_kept_in_the_store', async ($, on) 
   const store: Record<string, unknown> = {}
   await bootRich($, on, { skin: null, theme: 'dark', store })
   const run = async (args: string) => ((await $.command.run({ command: 'chief', args } as any)) as any).text
-  const panel = async () => { const ui = await $.ui.mount({ ...PANE, surface: 'desktop' }); const n = await ui.find({ key: 'panel' }); await ui.unmount(); return n !== undefined }
-  expect(await run('skin')).toBe('Chief pane skin: dark (the default) on the desktop app, plain in a terminal; app theme: dark.')
-  expect(await panel()).toBe(true)                                                      // nothing stored: dark on the desktop app
+  // [is the panel drawn, a secondary pill's fill]
+  const look = async () => { const ui = await $.ui.mount({ ...PANE, surface: 'desktop' }); const n = await ui.find({ key: 'panel' }); const b = await pillBox(ui, 'tab:inbox'); await ui.unmount(); return [n !== undefined, b?.backgroundColor] }
+  expect(await run('skin')).toMatch(/^Chief pane skin: dark \(the default\) on the desktop app, plain in a terminal\. /)
+  expect(await look()).toEqual([true, '#e9e6df'])                                       // nothing stored: dark, pills for dark labels, whatever the `theme` row says
   expect(await run('skin plain')).toBe('Chief pane skin: plain.')
-  expect([store.chiefSkin, await panel()]).toEqual(['plain', false])
-  expect(await run('skin status')).toBe('Chief pane skin: plain on the desktop app, plain in a terminal; app theme: dark.')
+  expect([store.chiefSkin, await look()]).toEqual(['plain', [false, undefined]])
+  expect(await run('skin status')).toMatch(/^Chief pane skin: plain on the desktop app/)
+  expect(await run('skin dark-app')).toBe('Chief pane skin: dark-app.')                 // the app in dark mode: the same panel, pills for light labels
+  expect([store.chiefSkin, await look()]).toEqual(['dark-app', [true, '#3a4060']])
   expect(await run('skin dark')).toBe('Chief pane skin: dark.')
-  expect([store.chiefSkin, await panel()]).toEqual(['dark', true])
+  expect([store.chiefSkin, await look()]).toEqual(['dark', [true, '#e9e6df']])
   expect(await run('skin neon')).toMatch(/^Usage: \/chief /)
 })
 
-test('test_pill_fills_follow_the_app_theme', async ($, on) => {
-  expect([themeOf([{ key: 'theme', value: 'dark' }]), themeOf([{ key: 'theme', value: 'dark-daltonized' }]), themeOf([{ key: 'theme', value: 'light' }]),
-          themeOf([{ key: 'theme', value: 'auto' }]), themeOf([{ key: 'verbose', value: true }]), themeOf(null)]).toEqual(['dark', 'dark', 'light', 'light', 'unknown', 'unknown'])
-  expect(skinFor('desktop', null, 'dark')).toEqual({ dark: true, theme: 'dark' })
-  expect([skinFor('desktop', 'plain', 'dark').dark, skinFor('terminal', 'dark', 'dark').dark, skinFor('vscode', null, null).dark]).toEqual([false, false, false])
-  expect([pillFills({ dark: true, theme: 'unknown' }).primary.fill, pillFills({ dark: true, theme: 'light' }).secondary.fill]).toEqual(['#e8704f', '#e9e6df'])
-  expect([pillFills({ dark: true, theme: 'dark' }).primary.fill, pillFills({ dark: true, theme: 'dark' }).secondary.fill]).toEqual(['#c9553a', '#3a4060'])
+test('test_pill_fills_are_the_light_app_palette_unless_dark_app_is_chosen', async ($, on) => {
+  expect(skinFor('desktop', null)).toEqual({ dark: true, labels: 'dark' })
+  expect(skinFor('desktop', 'dark-app')).toEqual({ dark: true, labels: 'light' })
+  expect([skinFor('desktop', 'plain').dark, skinFor('terminal', 'dark').dark, skinFor('terminal', 'dark-app').dark, skinFor('vscode', null).dark]).toEqual([false, false, false, false])
+  const light = pillFills(skinFor('desktop', 'dark'))
+  expect([light.primary.fill, light.secondary.fill, light.danger.fill]).toEqual(['#e8704f', '#e9e6df', '#f08a8d'])
+  const app = pillFills(skinFor('desktop', 'dark-app'))
+  expect([app.primary.fill, app.secondary.fill, app.danger.fill]).toEqual(['#c9553a', '#3a4060', '#b23a3e'])
   for (const [name, source] of Object.entries(ICONS)) expect([name, source.length < 300, source.startsWith('<svg ')]).toEqual([name, true, true])
-  // the app's theme row decides a drawn pill's fill: read at session start, and again when /chief opens the pane
-  let theme = 'dark'
-  on('config.list', () => ({ value: [{ key: 'theme', label: 'Theme', kind: 'choice', value: theme }] }))
-  await bootRich($, on)
-  const fill = async () => { const ui = await $.ui.mount({ ...PANE, surface: 'desktop' }); const b = await pillBox(ui, 'tab:inbox'); await ui.unmount(); return b?.backgroundColor }
-  expect(await fill()).toBe('#3a4060')
-  theme = 'light'
+  // a stored `dark-app` is what a new session draws; the config list is never asked for
+  let listed = 0
+  on('config.list', () => { listed++; return { value: [{ key: 'theme', label: 'Theme', kind: 'choice', value: 'dark' }] } })
+  await bootRich($, on, { skin: 'dark-app' })
   await $.command.run({ command: 'chief', args: 'open' } as any)
-  expect(await fill()).toBe('#e9e6df')
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect([(await pillBox(ui, 'tab:inbox'))?.backgroundColor, (await pillBox(ui, 'tab:all'))?.backgroundColor, listed]).toEqual(['#3a4060', '#c9553a', 0])
+  await ui.unmount()
+})
+
+test('test_dark_skin_banner_is_the_panels_first_row_and_fills_its_width', async ($, on) => {
+  await bootRich($, on, { portrait: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const panel = await ui.find({ key: 'panel' })
+  expect(rowKeys(panel)[0]).toBe('strip-all')
+  expect(rowKeys(await ui.find({ key: 'strip-all' }))).toEqual(['banner', 'strip'])       // inside the panel, above the strip
+  const banner = await ui.find({ key: 'banner' })
+  expect([banner.props.width, banner.props.overflow]).toEqual(['100%', 'hidden'])        // the box crops the picture to the panel's width
+  const clip = banner.children[0]
+  expect([clip.type, clip.props.flexShrink, clip.props.minWidth, clip.props.overflow]).toEqual(['Box', 1, 0, 'hidden'])
+  const [pic] = await pictures(ui, 'Svg').then((all: any[]) => all.filter(p => String(p.source).includes('data:image/jpeg')))
+  expect([pic.width, pic.height, pic.source]).toEqual([WIDE_W, 110, wideBannerSvg({ base64: '/9j/4AAQSkZJRg==' })])   // wider than any pane
+  expect(pic.source).toContain('preserveAspectRatio="xMinYMid slice"')                  // shrunk instead of clipped, its left part stays at full size
+  expect(pic.source).toContain('<text x="16"')                                          // the title at the left
+  expect(await hasText(ui, /^Mother$/)).toBe(false)                                     // the banner says it
+  await ui.unmount()
+  // the plain skin and a terminal keep the 590 px banner
+  await $.command.run({ command: 'chief', args: 'skin plain' } as any)
+  const plain = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await pictures(plain, 'Svg')).map((p: any) => p.width)).toContain(590)
+  expect(await plain.find({ key: 'banner-clip' })).toBeUndefined()
+  await plain.unmount()
 })
 
 // The engine's drawn tree does not carry `hover`, so the skin's own elements are read through a stand-in table whose
@@ -3226,7 +3292,7 @@ test('test_pill_fills_follow_the_app_theme', async ($, on) => {
 test('test_every_hover_box_the_skin_draws_is_keyed', async () => {
   const table: Record<string, (props: any) => any> = {}
   for (const type of ['Box', 'Text', 'Button', 'Link', 'Input', 'Select', 'Svg', 'Image', 'Markdown']) table[type] = (props: any) => ({ type, props })
-  const ui = skinUi(table as any, { dark: true, theme: 'light' }) as any
+  const ui = skinUi(table as any, skinFor('desktop', null)) as any
   const noop = () => undefined
   const drawn = [
     Card(ui, { id: 'inbox:U1', color: 'error', selected: false }, ui.Text({ children: 'x' })),
@@ -3252,7 +3318,7 @@ test('test_every_hover_box_the_skin_draws_is_keyed', async () => {
   expect([hovers[1].borderStyle, hovers[1].borderColor, hovers[0].borderStyle]).toEqual(['bold', PALETTE.coral, 'round'])
   // a pill: a filled rounded Box one row tall around a plain Button whose label is padded (the label is the click target)
   const pill = boxes.find(b => b.key === 'pill:go')
-  expect([pill.borderStyle, pill.backgroundColor, pill.borderColor, pill.height, pill.paddingX]).toEqual(['round', PALETTE.coral, PALETTE.coral, 1, 2])
+  expect([pill.borderStyle, pill.backgroundColor, pill.borderColor, pill.height, pill.paddingX]).toEqual(['round', PALETTE.coral, PALETTE.coral, 1, 1])
   const button = Array.isArray(pill.children) ? pill.children[0] : pill.children
   expect([button.type, button.props.plain, button.props.variant, labelOf(button.props.children)]).toEqual(['Button', true, undefined, '\u00a0Go\u00a0'])
 })
