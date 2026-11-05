@@ -55,6 +55,95 @@ const SUGGESTIONS: Record<Source, [string, string]> = {
   other: ["What's this about?", 'Propose a next step'],
 }
 export const suggestionsFor = (source: Source): readonly string[] => SUGGESTIONS[source]
+// The same two as short button labels, for a compact card whose item has no actions of its own.
+const SUGGESTION_LABELS: Record<Source, [string, string]> = {
+  chat: ['Draft reply', 'Summarise'],
+  mail: ['Draft reply', 'Summarise'],
+  tracker: ['Summarise', 'DM the owner'],
+  code: ['Review PR', 'Why is CI red?'],
+  calendar: ['Decide', 'Prep me'],
+  manual: ["What's this?", 'Make a todo'],
+  error: ['Diagnose', 'Check connector'],
+  other: ["What's this?", 'Next step'],
+}
+export const suggestionLabels = (source: Source): readonly string[] => SUGGESTION_LABELS[source]
+
+// ---- the triage verdict on an Inbox item: kind, who it is on, urgency, and up to 3 actions (first = recommended) ----
+export type ItemAction = { label: string; prompt: string }
+export const KINDS = ['decide', 'reply', 'act', 'fyi'] as const
+export const ONS = ['manager', 'team', 'other'] as const
+export const URGENCIES = ['now', 'today', 'later'] as const
+export type Kind = (typeof KINDS)[number]
+export type Urgency = (typeof URGENCIES)[number]
+export type Extra = { kind: Kind; on: (typeof ONS)[number]; urgency: Urgency; actions: ItemAction[] }
+export const ACTIONS_SHOWN = 3
+export const ACTION_LABEL_MAX = 24
+export const ACTION_PROMPT_MAX = 300
+
+// Model-written actions as a card may show them: at most 3 of {label, prompt}, each one safe line (24 and 300
+// characters), both non-empty. Anything off-shape is dropped.
+export function cleanActions(raw: unknown): ItemAction[] {
+  const out: ItemAction[] = []
+  for (const a of Array.isArray(raw) ? raw : []) {
+    if (!a || typeof a !== 'object' || typeof (a as any).label !== 'string' || typeof (a as any).prompt !== 'string') continue
+    const label = oneLine((a as any).label, ACTION_LABEL_MAX)
+    const prompt = oneLine((a as any).prompt, ACTION_PROMPT_MAX)
+    if (label && prompt) out.push({ label, prompt })
+    if (out.length === ACTIONS_SHOWN) break
+  }
+  return out
+}
+
+// {kind, on, urgency, actions} from a verdict or an Inbox item that carries any of them, else null (the older
+// four-field verdict, an item decided with none). An unknown kind reads `act`, `on` `manager`, urgency `today`.
+export function verdictExtra(v: unknown): Extra | null {
+  const o = v && typeof v === 'object' ? (v as Record<string, unknown>) : null
+  if (!o || (o.kind == null && o.on == null && o.urgency == null && !(Array.isArray(o.actions) && o.actions.length))) return null
+  const pick = <T extends string>(x: unknown, allowed: readonly T[], fallback: T): T => ((allowed as readonly unknown[]).includes(x) ? (x as T) : fallback)
+  return { kind: pick(o.kind, KINDS, 'act'), on: pick(o.on, ONS, 'manager'), urgency: pick(o.urgency, URGENCIES, 'today'), actions: cleanActions(o.actions) }
+}
+
+// The Inbox order: urgency (`now`, `today`, `later`; an item with none reads `today`), then newest first.
+const urgencyRank = (u: unknown): number => URGENCIES.indexOf(verdictExtra(u)?.urgency ?? 'today')
+export function inboxOrder<T extends { at?: string | null }>(items: readonly T[]): T[] {
+  return [...items].sort((a, b) => urgencyRank(a) - urgencyRank(b) || (Date.parse(b.at ?? '') || 0) - (Date.parse(a.at ?? '') || 0))
+}
+
+export const KIND_COLOR: Record<Exclude<Kind, 'fyi'>, Color> = { decide: 'warning', reply: 'suggestion', act: 'subtle' }
+export const URGENT_COLOR: Color = 'error'
+
+// The small badges after a card's source badge: its kind (`fyi` wears none), and `urgent` while its urgency is `now`.
+export function kindBadges(ui: Ui, x: Extra | null, id: string) {
+  if (!x) return []
+  return [
+    x.kind !== 'fyi' ? badge(ui, x.kind, KIND_COLOR[x.kind], 'kind:' + id) : null,
+    x.urgency === 'now' ? badge(ui, 'urgent', URGENT_COLOR, 'urgent:' + id) : null,
+  ]
+}
+// An expanded card's one dim line: `decide · on manager · now`.
+export const verdictLine = (x: Extra | null): string => (x ? `${x.kind} · on ${x.on} · ${x.urgency}` : '')
+
+// The brief a verdict's action makes for a new session: the action's instruction, then the item it is about.
+export function actionBrief(prompt: string, title: string, why: string | null | undefined, link: string | null | undefined): string {
+  return `${prompt} The item: "${title}"` + (why ? ` — ${why}` : '') + (link ? ` (${link})` : '')
+    + ". Draft anything that reaches another person; don't send."
+}
+
+// A card's action buttons: up to 3, short labels, the first (the recommended one) primary. `says` is what a press
+// sends, shown dim under the buttons of an expanded card. chief.tsx and pane_tabs.tsx pass each button's `run`.
+export type CardAct = { key: string; label: string; says?: string; run: () => unknown }
+export function actButtons(ui: Ui, acts: readonly CardAct[], press: (run: () => unknown) => () => unknown) {
+  const { Button } = ui
+  return acts.slice(0, ACTIONS_SHOWN).map((a, n) => (
+    <Button key={a.key} variant={n === 0 ? 'primary' : 'secondary'} onPress={press(a.run)}>{a.label}</Button>
+  ))
+}
+export function actSays(ui: Ui, id: string, acts: readonly CardAct[]) {
+  const { Text } = ui
+  return acts.slice(0, ACTIONS_SHOWN).filter(a => a.says).map((a, n) => (
+    <Text key={`says:${id}:${n}`} dimColor wrap="wrap">{`${a.label}: ${a.says}`}</Text>
+  ))
+}
 
 // The brief a chosen suggestion makes for a new session: the item in full, as hooks/shared.ts askPrompt words it.
 export function suggestedBrief(suggestion: string, title: string, why: string | null | undefined, link: string | null | undefined): string {

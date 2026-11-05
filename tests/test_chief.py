@@ -140,7 +140,7 @@ class TestTick(Base):
         self.assertEqual(got, {"PLAT-3": "desktop", "PLAT-4": None, "PLAT-9": None, "PLAT-5": None})  # a worker row is none
         first = chief.lines(self.ws)[0]
         self.assertEqual(sorted(first), sorted(["id", "key", "kind", "title", "who", "link", "summary", "also",
-                                                "session"]))
+                                                "session", "source", "channel", "to_manager"]))
 
     def test_tick_stops_at_first_judgment_line(self):
         self.mute("PLAT-1")
@@ -215,20 +215,20 @@ class TestTick(Base):
         self.assertIsNone(self.cursor())
 
 
-def verdict(l, is_work=True, needs_attention=True, title="T", tldr="D"):
-    return {"line_id": l["id"], "key": l["key"], "is_work": is_work, "needs_attention": needs_attention,
-            "title": title, "tldr": tldr}
+def verdict(l, is_work=True, needs_attention=True, title="T", tldr="D", **extra):
+    return dict({"line_id": l["id"], "key": l["key"], "is_work": is_work, "needs_attention": needs_attention,
+                 "title": title, "tldr": tldr}, **extra)
 
 
 class TestLeader(Base):
     """`tick --as <session>`: one desktop session leads, and code decides the judge lines."""
     inbox = TestTick.inbox
 
-    def main(self, *args, at=AT, stdin=None):
+    def main(self, *args, at=AT, stdin=None, cfg=None):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
                 mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
-            code = chief.main(list(args), self.ws, {}, at)
+            code = chief.main(list(args), self.ws, cfg or {}, at)
         return code, out.getvalue(), err.getvalue()
 
     def beat(self):
@@ -314,6 +314,78 @@ class TestLeader(Base):
         judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
         r = chief.triage_decide(self.ws, {}, AT, judge, [])
         self.assertEqual((r["logged"], r["now"]), ([], [a["id"], b["id"]]))
+
+    def test_decide_stores_the_richer_verdict_and_status_returns_it(self):
+        a, b, c = line(key="PLAT-7"), line(key="PLAT-8"), line(key="PLAT-9")
+        self.inbox(a, b, c)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        acts = [{"label": "Draft  reply\u202e", "prompt": "Read the thread,\nthen draft a reply; don't send"},
+                {"label": "x" * 40, "prompt": "p" * 400}, {"label": "", "prompt": "no label"}, "junk",
+                {"label": "Third", "prompt": "3"}, {"label": "Fourth", "prompt": "4"}]
+        body = {"judge": judge, "verdicts": [
+            verdict(a, kind="decide", on="manager", urgency="later", actions=acts),
+            verdict(b, kind="bogus", on=7, urgency="now"),            # bad enums fall back
+            verdict(c)]}                                              # the older four-field verdict
+        self.assertEqual(self.main("triage", "--stdin", "--decide", stdin=json.dumps(body))[0], 0)
+        code, out, _ = self.main("status", "--json")
+        rows = json.loads(out)["inbox"]
+        self.assertEqual([r["key"] for r in rows], ["PLAT-8", "PLAT-9", "PLAT-7"])   # now, today (none), later
+        got = {r["key"]: (r["kind"], r["on"], r["urgency"], r["actions"]) for r in rows}
+        self.assertEqual(got["PLAT-8"], ("act", "manager", "now", []))
+        self.assertEqual(got["PLAT-9"], (None, None, None, []))
+        self.assertEqual(got["PLAT-7"], ("decide", "manager", "later", [
+            {"label": "Draft reply", "prompt": "Read the thread, then draft a reply; don't send"},
+            {"label": "x" * 24, "prompt": "p" * 300}, {"label": "Third", "prompt": "3"}]))
+        stored = json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())
+        self.assertEqual(sorted(stored["items"]), ["U1", "U2"])       # by update id; nothing for the old shape
+        self.assertNotIn("kind", hub._hub_doc(self.ws)["updates"][0])  # the hub's own schema is untouched
+        # the same key decided again with no verdict drops what was stored for it
+        d = line(key="PLAT-7", at="2026-10-29T10:00:00Z")
+        self.inbox(d)
+        chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT, session="s-1")["judge"], [])
+        self.assertEqual(sorted(json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())["items"]), ["U2"])
+
+    def test_fyi_logs_and_manual_and_error_never_do(self):
+        a, m = line(key="PLAT-7"), line(source="manual", kind="manual", key="PLAT-3")
+        e = line(source="tracker", kind="error", key="watcher:tracker")
+        self.inbox(a, m, e)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        fyi = dict(needs_attention=False, kind="fyi", on="other", urgency="later", actions=[])
+        r = chief.triage_decide(self.ws, {}, AT, judge, [verdict(a, **fyi), verdict(m, **fyi), verdict(e, **fyi)])
+        self.assertEqual((r["logged"], r["now"]), ([a["id"]], [m["id"], e["id"]]))
+
+    def test_context_is_names_only_and_capped(self):
+        cfg = {"agent": {"manager": "Dana Levi", "manager_short": "Dana"},
+               "manager": {"email": "dana@example.com", "chat_dm": "U00000000"},
+               "teams": [{"slug": "platform", "name": "Platform team", "tracker": {"project": "PLAT"},
+                          "repos": ["example-org/platform-api"],
+                          "people": [{"name": "Sam Roe", "email": "sam@example.com", "chat": "U00000001"}, {"name": ""}]}],
+               "hub": {"watch": {"tracker": {"projects": ["OPS"]}, "code": {"repos": ["example-org/web"]}}}}
+        code, out, _ = self.main("context", "--json", cfg=cfg)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {
+            "version": 1, "manager": {"name": "Dana Levi", "short": "Dana"},
+            "teams": [{"name": "Platform team", "people": ["Sam Roe"]}],
+            "projects": ["PLAT", "OPS"], "repos": ["example-org/platform-api", "example-org/web"]})
+        for secret in ("example.com", "U0000"):
+            self.assertNotIn(secret, out)
+        self.assertEqual(chief.triage_context(self.ws, {}), {
+            "version": 1, "manager": {"name": "", "short": ""}, "teams": [], "projects": [], "repos": []})
+        big = {"teams": [{"name": "Team %d" % t, "people": [{"name": "Person %d-%d %s" % (t, i, "x" * 30)} for i in range(30)]}
+                         for t in range(12)]}
+        doc = chief.triage_context(self.ws, big)
+        self.assertLessEqual(len(json.dumps(doc, separators=(",", ":"))), chief.CONTEXT_MAX)
+        self.assertTrue(doc["teams"])
+
+    def test_lines_say_source_channel_and_whether_the_manager_is_named(self):
+        cfg = {"agent": {"manager": "Dana Levi", "manager_short": "Dana"}, "manager": {"chat_user": "U0DDDDDDD"},
+               "teams": [{"channels": [{"id": "C0AAAAAAA", "name": "platform"}]}]}
+        self.inbox(line(source="chat", key="C0AAAAAAA/1700000000.000100", summary="<@U0DDDDDDD> can you approve?"),
+                   line(source="chat", key="D0DDDDDDD/dm", summary="hi"),
+                   line(key="PLAT-4", summary="dana, please look"), line(key="PLAT-5", summary="Danas build"))
+        got = [(l["source"], l["channel"], l["to_manager"]) for l in chief.lines(self.ws, cfg)]
+        self.assertEqual(got, [("chat", "platform", "mentioned"), ("chat", None, "addressed"),
+                               ("tracker", None, "mentioned"), ("tracker", None, None)])
 
     def test_decide_needs_the_object_shape(self):
         self.assertEqual(self.main("triage", "--stdin", "--decide", stdin="[]")[0], 2)
@@ -549,7 +621,7 @@ class TestHealth(Base):
         h = doc["health"]
         self.assertEqual(([u["id"] for u in h["watcher_errors"]], h["watcher_error_count"]), (["U2", "U3"], 2))
         self.assertEqual(set(h["watcher_errors"][0]), {"id", "key", "title", "why", "link", "at", "session",
-                                                        "source", "who", "label"})
+                                                        "source", "who", "label", "kind", "on", "urgency", "actions"})
 
     def test_watcher_heartbeat_and_sources(self):
         with hub.locked(self.ws):
