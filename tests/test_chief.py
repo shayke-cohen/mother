@@ -825,8 +825,35 @@ class PortraitTest(Base):
         self.assertEqual(self.run_verb()[1]["source"], "bundled")
         self.assertIsNone(chief.portrait_doc(self.ws, self.ws / "missing.png"))   # neither reads
         with mock.patch.object(chief, "BUNDLED_PORTRAIT", self.ws / "missing.png"), \
-                mock.patch.object(chief.portrait_doc, "__defaults__", (self.ws / "missing.png",)):
+                mock.patch.object(chief.portrait_doc, "__defaults__", (self.ws / "missing.png", chief.BUNDLED_SVG)):
             self.assertEqual(self.run_verb(), (1, None))
+
+    @staticmethod
+    def jpeg(width, height, pad=0, sof=0xC2):
+        app0 = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\x00" + b"\x00" * 9
+        frame = bytes([0xFF, sof]) + (11).to_bytes(2, "big") + b"\x08" + height.to_bytes(2, "big") + width.to_bytes(2, "big") + b"\x01\x01\x11\x00"
+        return b"\xff\xd8" + app0 + frame + b"\x00" * pad + b"\xff\xd9"
+
+    def test_portrait_jpeg_and_the_bundled_svg(self):
+        _, doc = self.run_verb()                                 # bundled: the vector's own markup, no jpeg
+        self.assertEqual(doc["svg"], chief.BUNDLED_SVG.read_text(encoding="utf-8"))
+        self.assertTrue(doc["svg"].lstrip().startswith("<svg"))
+        self.assertNotIn("jpeg", doc)
+        (self.ws / ".mother").mkdir(exist_ok=True)
+        small = self.jpeg(800, 450)
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(small)
+        _, doc = self.run_verb()                                 # a custom jpeg alone: custom, over the bundled png
+        self.assertEqual((doc["source"], doc["jpeg_width"], doc["jpeg_height"], doc["width"]), ("custom", 800, 450, 256))
+        self.assertEqual(base64.b64decode(doc["jpeg"]), small)
+        self.assertIn("svg", doc)                                # still there
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(self.jpeg(640, 480, sof=0xC0))
+        self.assertEqual(self.run_verb()[1]["jpeg_height"], 480)  # a baseline frame reads too
+        self.custom(self.png(800, 450))
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(self.jpeg(800, 450, pad=100_000))   # past 120000 base64 characters
+        _, doc = self.run_verb()
+        self.assertEqual((doc["source"], doc["width"], "jpeg" in doc, "svg" in doc), ("custom", 800, False, True))
+        (self.ws / ".mother" / "portrait.jpg").write_bytes(b"not a jpeg at all")
+        self.assertNotIn("jpeg", self.run_verb()[1])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 import type { Hook } from 'claude-code'
 
+import type { NowDoc, NowTop } from '../types'
+
 // Helpers both panes use. register.tsx re-exports them, so its tests keep their imports; chief.tsx imports them from
 // here, which keeps chief.tsx and register.tsx free of an import cycle.
 
@@ -82,3 +84,30 @@ export function openSession($: Dollar, goHub: (args: string[], rowId?: string | 
   void $.prompt.fill({ text: `Open my "${v.title}" session`, mode: 'replace' })
   void goHub(['session', 'seen', key])
 }
+
+// ---- the Now list, as both panes read it (the Now panel's Home, the Chief pane's Today tab) ----
+
+// YYYY-MM-DD of an instant in the doc's timezone (the manager's local date); UTC when the zone is unknown.
+export function localDate(nowMs: number, tz: string | null | undefined): string {
+  if (tz) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(nowMs)
+      const part = (t: string) => parts.find(p => p.type === t)?.value
+      const y = part('year'), m = part('month'), d = part('day')
+      if (y && m && d) return `${y}-${m}-${d}`
+    } catch {
+      // fall through to UTC
+    }
+  }
+  return new Date(nowMs).toISOString().slice(0, 10)
+}
+
+// How long an item has waited: from `since`, when it was raised, not from when the tick first saw it.
+export function age(since: string, nowMs: number): string {
+  const hours = Math.max(0, Math.floor((nowMs - Date.parse(since)) / 3_600_000))
+  return Number.isNaN(hours) ? '' : hours < 24 ? `${hours}h` : `${Math.floor(hours / 24)}d`
+}
+
+// Today's Top 3: the list the tick or the manager set for the manager's local date; none once the date moved on.
+export const todaysTop = (doc: NowDoc | null, nowMs: number): NowTop[] =>
+  doc && doc.top_date === localDate(nowMs, doc.timezone) ? doc.top ?? [] : []

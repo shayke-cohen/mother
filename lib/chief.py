@@ -687,7 +687,8 @@ USAGE = """usage: mother chief <verb> ...
   spend --stdin         add one pane model call ({model, input_tokens, output_tokens} on stdin) to today's spend;
                         prints {added: usd}
   portrait --json       the Chief pane's picture: .mother/portrait.png when it is a PNG of at most 2 MiB, else the
-                        bundled one; prints {version, source, width, height, png (base64)}
+                        bundled one; prints {version, source, width, height, png (base64)}, plus jpeg, jpeg_width and
+                        jpeg_height for a small .mother/portrait.jpg, and svg (the bundled vector)
   pause | resume        the chief-only switch (.mother/chief/PAUSED); never the global one
 
 A valued option takes --opt=V or --opt V."""
@@ -722,15 +723,73 @@ def _read_png(path: Path) -> Optional[Tuple[bytes, int, int]]:
     return (data, width, height) if width > 0 and height > 0 else None
 
 
-def portrait_doc(ws: Path, bundled: Path = BUNDLED_PORTRAIT) -> Optional[dict]:
-    """<workspace>/.mother/portrait.png (machine-local, never synced) when it is a PNG of at most 2 MiB, else the
-    bundled picture; None when neither reads."""
-    for source, path in (("custom", Path(ws) / ".mother" / "portrait.png"), ("bundled", bundled)):
-        got = _read_png(path)
-        if got:
-            return {"version": 1, "source": source, "width": got[1], "height": got[2],
-                    "png": base64.b64encode(got[0]).decode("ascii")}
+JPEG_B64_MAX = 120_000      # what fits an Svg's 131072 characters with its wrapper
+BUNDLED_SVG = BUNDLED_PORTRAIT.with_suffix(".svg")
+SVG_MAX = 131_072
+_SOF = (0xC0, 0xC1, 0xC2)   # baseline, extended and progressive frames carry the size
+
+
+def _read_jpeg(path: Path) -> Optional[Tuple[bytes, int, int]]:
+    """(bytes, width, height) of a JPEG whose base64 is at most 120000 characters, the size read from its frame
+    header (SOF0/SOF2); None for anything else."""
+    try:
+        if not path.is_file() or path.stat().st_size > JPEG_B64_MAX:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if data[:2] != b"\xff\xd8" or len(base64.b64encode(data)) > JPEG_B64_MAX:
+        return None
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker == 0xFF:                       # fill byte
+            i += 1
+            continue
+        if marker in (0x01,) or 0xD0 <= marker <= 0xD8:   # no length
+            i += 2
+            continue
+        size = int.from_bytes(data[i + 2:i + 4], "big")
+        if marker in _SOF:
+            height, width = int.from_bytes(data[i + 5:i + 7], "big"), int.from_bytes(data[i + 7:i + 9], "big")
+            return (data, width, height) if width > 0 and height > 0 else None
+        if size < 2 or marker == 0xDA:           # malformed, or the scan began with no frame header
+            return None
+        i += 2 + size
     return None
+
+
+def _read_svg(path: Path) -> Optional[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return text if text.lstrip().startswith("<svg") and len(text) <= SVG_MAX else None
+
+
+def portrait_doc(ws: Path, bundled: Path = BUNDLED_PORTRAIT, bundled_svg: Path = BUNDLED_SVG) -> Optional[dict]:
+    """The Chief pane's picture. `png` (with `width`, `height`) is <workspace>/.mother/portrait.png when it is a PNG
+    of at most 2 MiB, else the bundled one: what a terminal draws. For a surface that draws SVG only: `jpeg` (with
+    `jpeg_width`, `jpeg_height`) is <workspace>/.mother/portrait.jpg when it is a JPEG of at most 120000 base64
+    characters, and `svg` is the bundled vector's markup, the fallback. `source` is `custom` when either workspace
+    file is used. Both workspace files are machine-local and never synced. None when no PNG reads."""
+    home = Path(ws) / ".mother"
+    custom, png = True, _read_png(home / "portrait.png")
+    if not png:
+        custom, png = False, _read_png(bundled)
+    if not png:
+        return None
+    jpeg = _read_jpeg(home / "portrait.jpg")
+    doc = {"version": 1, "source": "custom" if custom or jpeg else "bundled", "width": png[1], "height": png[2],
+           "png": base64.b64encode(png[0]).decode("ascii")}
+    if jpeg:
+        doc.update({"jpeg": base64.b64encode(jpeg[0]).decode("ascii"), "jpeg_width": jpeg[1], "jpeg_height": jpeg[2]})
+    svg = _read_svg(bundled_svg)
+    if svg:
+        doc["svg"] = svg
+    return doc
 
 
 def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:

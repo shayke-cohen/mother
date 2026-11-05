@@ -29,6 +29,15 @@ export const SOURCE_COLOR: Record<Source, Color> = {
   chat: 'planMode', mail: 'merged', tracker: 'permission', code: 'success', calendar: 'autoAccept',
   manual: 'suggestion', error: 'error', other: 'subtle',
 }
+export const TOP_COLOR: Color = 'claude'        // a Top 3 entry of the Today tab
+
+// A Now item's source, from its id's first part (the tick's kind), for the Today tab's badge and border.
+export function itemSource(id: string | null | undefined): Source {
+  const kind = String(id ?? '').split(':')[0]
+  return kind === 'chat' || kind === 'mail' ? kind
+    : kind === 'pr' || kind === 'repo' || kind === 'build' ? 'code'
+    : kind === 'ticket' ? 'tracker' : kind === 'event' ? 'calendar' : 'other'
+}
 export const NEED_COLOR: Color = 'warning'      // a session stopped on a question
 export const SESSION_COLOR: Color = 'ide'       // a pinned session
 export const SELF_COLOR: Color = 'claude'       // the session whose pane this is
@@ -53,7 +62,36 @@ export function suggestedBrief(suggestion: string, title: string, why: string | 
 }
 
 // ---- open / collapsed cards: explicit choices over a per-kind default; /chief expand|collapse sets `all` ----
-export type CardKind = 'need' | 'inbox' | 'sess'
+export type CardKind = 'need' | 'inbox' | 'sess' | 'today'
+
+// ---- tabs: one section at a time, or `all` stacked ----
+export type TabId = 'needs' | 'inbox' | 'sessions' | 'today' | 'all'
+export const TAB_IDS: readonly TabId[] = ['needs', 'inbox', 'sessions', 'today', 'all']
+// A tab is data: an id, a label, how many items it holds and what draws them. `all` has no section of its own.
+export type Tab = { id: TabId; label: string; count: number; section: (heading: boolean) => unknown }
+
+// The tab shown: the manager's pick, else the first tab that holds something, else `all` (every empty line).
+export function shownTab(picked: string | null | undefined, tabs: readonly { id: TabId; count: number }[]): TabId {
+  if (picked && (TAB_IDS as readonly string[]).includes(picked)) return picked as TabId
+  return tabs.find(t => t.id !== 'all' && t.count > 0)?.id ?? 'all'
+}
+
+// A tab holds something new when its count is above the count it had when it was last opened.
+export const tabIsNew = (t: { id: TabId; count: number }, seen: Record<string, number> | null | undefined): boolean =>
+  t.id !== 'all' && t.count > (seen?.[t.id] ?? 0)
+
+// The tab row: a Button per tab with its count, the shown one primary; ` •` marks a tab with something new.
+export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<string, number> | null | undefined, onPick: (id: TabId) => unknown) {
+  const { Box, Button } = ui
+  return (
+    <Box key="tabs" flexWrap="wrap" gap="xs" marginTop={1}>
+      {[...tabs.map(t => ({ id: t.id, text: `${t.label} ${t.count}${t.id !== shown && tabIsNew(t, seen) ? ' •' : ''}` })), { id: 'all' as TabId, text: 'All' }].map(t => (
+        <Button key={'tab:' + t.id} variant={t.id === shown ? 'primary' : 'secondary'} dimColor={t.id === 'all' && shown !== 'all'}
+          onPress={() => onPick(t.id)}>{t.text}</Button>
+      ))}
+    </Box>
+  )
+}
 
 // Needs you cards start open; Inbox and session cards closed, except the selected card. A card the manager toggled
 // keeps its choice; `all` (from /chief expand|collapse) stands above the defaults and below a later toggle.
@@ -151,9 +189,15 @@ export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPre
   )
 }
 
-// The pane's picture, from `mother chief portrait --json` (the workspace's own .mother/portrait.png, else the bundled
-// one), loaded once per session by chief.tsx (a draw is pure). null = not loaded, or the verb failed: no picture.
-export type Portrait = { png: string; width: number; height: number }
+// The pane's picture, from `mother chief portrait --json`, loaded once per session by chief.tsx (a draw is pure).
+// `png` (the workspace's own .mother/portrait.png, else the bundled one) is what the terminal's `Image` draws. A
+// surface with `Svg` only (the desktop app) draws `jpeg` (the workspace's small .mother/portrait.jpg) wrapped in an
+// SVG, else `svg`, the bundled vector's own markup. null = not loaded, or the verb failed: no picture.
+export type Portrait = {
+  png: string; width: number; height: number
+  jpeg?: { base64: string; width: number; height: number } | null
+  svg?: string | null
+}
 export const PORTRAIT_ALT = 'Mother, Chief of Stuff'
 export const WIDE_RATIO = 1.4
 const BANNER_COLUMNS = 44
@@ -167,25 +211,34 @@ const SVG_MAX = 131_072
 
 // A wide picture (width / height >= 1.4) is a banner across the top of the pane; a squarer one a small spot at the
 // left of the header strip. Rows follow the picture's shape: a terminal cell is about twice as tall as it is wide.
-export function portraitLayout(p: Portrait): { banner: boolean; columns: number; rows: number } {
+export function portraitLayout(p: { width: number; height: number }): { banner: boolean; columns: number; rows: number } {
   if (p.width / p.height < WIDE_RATIO) return { banner: false, columns: SPOT_COLUMNS, rows: SPOT_ROWS }
   const rows = Math.round(BANNER_COLUMNS * p.height / p.width / 2)
   return { banner: true, columns: BANNER_COLUMNS, rows: Math.min(BANNER_ROWS_MAX, Math.max(BANNER_ROWS_MIN, rows)) }
 }
 
-// The picture where the surface has an element for it: `Image` (the terminal) takes the PNG; `Svg` (the desktop app)
-// takes it wrapped as a data URI while that fits an Svg's 131072 characters. Else nothing: the title says it.
-function portraitOf(ui: Ui, p: Portrait, surface: string) {
+export const jpegSvg = (j: { base64: string; width: number; height: number }): string =>
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${j.width} ${j.height}">` +
+  `<image href="data:image/jpeg;base64,${j.base64}" width="${j.width}" height="${j.height}"/></svg>`
+
+// The picture and whether it is a banner, by the surface's name (a surface without Image still resolves one, to an
+// empty stand-in). Nothing where the surface has no element for it: the title says it.
+function portraitOf(ui: Ui, p: Portrait, surface: string): { el: unknown; banner: boolean } | null {
   const { Image, Svg } = ui as { Image?: any; Svg?: any }
-  const { banner, columns, rows } = portraitLayout(p)
-  // by the surface's name: a surface without Image still resolves one, to an empty stand-in
-  if (surface === 'terminal') return !Image ? null : <Image key="portrait" source={{ png: p.png }} columns={columns} rows={rows} alt={PORTRAIT_ALT} />
+  if (surface === 'terminal') {
+    if (!Image) return null
+    const { banner, columns, rows } = portraitLayout(p)
+    return { banner, el: <Image key="portrait" source={{ png: p.png }} columns={columns} rows={rows} alt={PORTRAIT_ALT} /> }
+  }
   if (!Svg) return null
-  const width = banner ? BANNER_PX : SPOT_PX
-  const height = Math.round(width * p.height / p.width)
-  const source = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${p.width} ${p.height}" width="${width}" height="${height}">` +
-    `<image href="data:image/png;base64,${p.png}" width="${p.width}" height="${p.height}"/></svg>`
-  return source.length <= SVG_MAX ? <Svg source={source} alt={PORTRAIT_ALT} width={width} height={height} /> : null
+  const wrapped = p.jpeg ? jpegSvg(p.jpeg) : ''
+  if (p.jpeg && wrapped.length <= SVG_MAX) {
+    const banner = portraitLayout(p.jpeg).banner
+    const width = banner ? BANNER_PX : SPOT_PX
+    return { banner, el: <Svg source={wrapped} alt={PORTRAIT_ALT} width={width} height={Math.round(width * p.jpeg.height / p.jpeg.width)} /> }
+  }
+  // no usable jpeg (a custom PNG alone cannot be drawn here): the bundled vector, as a spot
+  return p.svg ? { banner: false, el: <Svg source={p.svg} alt={PORTRAIT_ALT} width={SPOT_PX} height={SPOT_PX} /> } : null
 }
 
 export type Strip = {
@@ -202,8 +255,9 @@ export function headerStrip(ui: Ui, s: Strip) {
   const { Box, Text } = ui
   const bar = budgetBar(s.spent, s.limit)
   const limit = typeof s.limit === 'number' ? `$${Number.isInteger(s.limit) ? s.limit : s.limit.toFixed(2)}` : '$0'
-  const banner = s.portrait ? portraitLayout(s.portrait).banner : false
-  const picture = s.portrait ? portraitOf(ui, s.portrait, s.surface) : null
+  const drawn = s.portrait ? portraitOf(ui, s.portrait, s.surface) : null
+  const banner = !!drawn?.banner
+  const picture = (drawn?.el ?? null) as any
   return (
     <Box key="strip-all" flexDirection="column">
     {banner && picture ? <Box key="banner" marginBottom={1}>{picture}</Box> : null}

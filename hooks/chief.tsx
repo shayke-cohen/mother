@@ -1,14 +1,16 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import { SNOOZES, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe } from './shared'
+import { SNOOZES, age, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe, todaysTop } from './shared'
 import { askFloor, isPinned, markAnswered, needsYou, reloadFloor, storeCard, FLOOR_TAIL_MAX, NO_ASK } from './floor'
+import { nowVerb, openInspector } from './register'
 import type { FloorState } from './floor'
 import type { Dollar } from './shared'
-import { SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, allCards, badge, card, emptyLine, headerStrip, isOpen, leadPill, money,
-         sectionHeading, sessionPill, sourceOf, suggestedBrief, suggestionsFor, titleRow, toggled } from './pane_ui'
-import type { Portrait, Ui } from './pane_ui'
-import type { ChiefChip, ChiefDesktop, ChiefInboxItem, ChiefOpen, ChiefStatus, ChiefTldr } from '../types'
+import { SELF_COLOR, SESSION_COLOR, NEED_COLOR, SOURCE_COLOR, TAB_IDS, TOP_COLOR, allCards, badge, card, emptyLine, headerStrip, isOpen,
+         itemSource, leadPill, money, sectionHeading, sessionPill, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabRow, titleRow,
+         toggled } from './pane_ui'
+import type { Portrait, Tab, TabId, Ui } from './pane_ui'
+import type { ChiefChip, ChiefDesktop, ChiefInboxItem, ChiefOpen, ChiefStatus, ChiefTabs, ChiefTldr, NowDoc, NowItem, NowTop } from '../types'
 
 // The Chief pane: which session leads, Needs you, the Inbox, and one card per pinned desktop session with a chat box.
 // Every write goes through `mother chief …`; the pane never edits a chief file itself.
@@ -19,6 +21,8 @@ export const chiefTldrAtom = atom({ plugin: 'mother', key: 'chiefTldr' } as cons
 export const chiefDraftAtom = atom({ plugin: 'mother', key: 'chiefDraft' } as const, null)
 export const chiefOpenAtom = atom({ plugin: 'mother', key: 'chiefOpen' } as const, null)
 export const chiefSelectedAtom = atom({ plugin: 'mother', key: 'chiefSelected' } as const, null)
+export const chiefTabAtom = atom({ plugin: 'mother', key: 'chiefTab' } as const, null)
+const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)   // now.json as register.tsx last read it; only read here
 const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)   // written in hooks/floor.ts; a read names a const of this file
 
 export const CHIEF_PANE = 'mother-chief'
@@ -613,12 +617,114 @@ async function loadPortrait($: Dollar, bin: string): Promise<void> {
   try {
     const d = JSON.parse(ran.stdout)
     if (d && d.version === 1 && typeof d.png === 'string' && d.png && Number.isInteger(d.width) && Number.isInteger(d.height) &&
-        d.width > 0 && d.height > 0) portrait = { png: d.png, width: d.width, height: d.height }
+        d.width > 0 && d.height > 0) {
+      const jpeg = typeof d.jpeg === 'string' && d.jpeg && Number.isInteger(d.jpeg_width) && Number.isInteger(d.jpeg_height) &&
+        d.jpeg_width > 0 && d.jpeg_height > 0 ? { base64: d.jpeg as string, width: d.jpeg_width as number, height: d.jpeg_height as number } : null
+      const svg = typeof d.svg === 'string' && d.svg.trimStart().startsWith('<svg') ? d.svg as string : null
+      portrait = { png: d.png, width: d.width, height: d.height, jpeg, svg }
+    }
   } catch { /* no picture */ }
 }
 
 // What each card's buttons share: a press selects the card first, then runs.
-type CardCtx = { open: ChiefOpen | null; selected: string | null; portrait?: Portrait | null; surface?: string }
+type CardCtx = { open: ChiefOpen | null; selected: string | null; portrait?: Portrait | null; surface?: string
+                 tabs?: ChiefTabs | null; doc?: NowDoc | null }
+
+// ---- Today: the tick's Top 3 and the on-you items of now.json, as register.tsx read it (its poll, its atom) ----
+// Its buttons are the Now panel's own, from register.tsx: `nowVerb` runs `mother now …` and re-reads now.json at once
+// through the panel's loader; `openInspector` opens an item's page. (The two files import each other's functions; each
+// is called only from a hook, never while a module loads.)
+const TODAY_ITEMS_SHOWN = 10
+
+// Today's rows: the open Top 3 entries first, then the on-you items no Top 3 entry names.
+export function todayRows(doc: NowDoc | null | undefined, nowMs: number): { top: NowTop[]; items: NowItem[] } {
+  if (!doc) return { top: [], items: [] }
+  const top = todaysTop(doc, nowMs).filter(e => e && e.state !== 'done')
+  const named = new Set(top.map(e => e.item_id).filter(Boolean))
+  return { top, items: (doc.items ?? []).filter(i => i && i.section === 'on_you' && !named.has(i.id)) }
+}
+
+// Each tab's count, for the tab row, the default tab and the "new" mark.
+export function tabCounts(s: ChiefStatus | null, floor: FloorState | null, doc: NowDoc | null | undefined, nowMs: number): Record<TabId, number> {
+  const today = todayRows(doc, nowMs)
+  const inbox = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
+  return { needs: needsYou(s, floor).length, inbox, sessions: Array.isArray(s?.desktop) ? s!.desktop!.length : 0,
+           today: today.top.length + today.items.length, all: 0 }
+}
+
+// The manager picked a tab: it stays, and the tab left and the tab opened are both seen at their counts of now.
+async function pickTab($: Dollar, id: TabId, counts: Record<TabId, number>): Promise<void> {
+  await update($, chiefTabAtom, prev => {
+    const order = TAB_IDS.filter(t => t !== 'all').map(t => ({ id: t, count: counts[t] }))
+    const left = shownTab(prev?.picked, order)
+    return { picked: id, seen: { ...(prev?.seen ?? {}), [left]: counts[left], [id]: counts[id] } }
+  })
+}
+
+function todaySection($: Dollar, ui: Ui, bin: string, doc: NowDoc | null | undefined, nowMs: number, ctx: CardCtx, heading: boolean) {
+  const { Box, Text, Button, Link } = ui
+  const { top, items } = todayRows(doc, nowMs)
+  const count = top.length + items.length
+  const out: unknown[] = []
+  if (heading && count) out.push(sectionHeading(ui, 'today-heading', `Today ${count}`))
+  if (!doc) return [emptyLine(ui, 'today-empty', 'No Today list yet: the tick has not written now.json')]
+  if (nowMs > Date.parse(doc.stale_after)) out.push(emptyLine(ui, 'today-stale', 'This list is stale: the tick has not run since it was written'))
+  if (!count) out.push(emptyLine(ui, 'today-none', 'Nothing on you today'))
+  const fill = (text: string) => $.prompt.fill({ text, mode: 'replace' }).catch(() => undefined)
+  const go = (args: string[]) => nowVerb($, bin, args)
+  const byId = new Map((doc.items ?? []).map(i => [i.id, i]))
+  for (const e of top) {
+    const id = 'today:top:' + e.rank
+    const open = isOpen(ctx.open, id, 'today', ctx.selected)
+    const press = (run: () => unknown) => pressing($, id, run)
+    const title = oneLine(e.title, 200)
+    const why = oneLine(e.why, TLDR_MAX)
+    const action = e.item_id ? byId.get(e.item_id)?.actions?.[0] : undefined
+    out.push(card(ui, { id, color: TOP_COLOR, selected: ctx.selected === id }, [
+      titleRow(ui, id, `${e.rank}. ${title}`, open, press(() => toggleCard($, id, !open))),
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+        {badge(ui, 'top', TOP_COLOR, 'badge:' + id)}
+        <Text dimColor>{`set by ${e.set_by === 'manager' ? 'you' : 'the agent'} `}</Text>
+        {isUrl(e.link) ? <Link href={e.link}>source ↗</Link> : null}
+      </Box>,
+      open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
+      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        {action
+          ? <Button key={'today-doit:' + e.rank} variant="primary" onPress={press(() => fill(action.prompt || `mother now do ${action.id}`))}>{oneLine(action.label, 40) || 'Do it'}</Button>
+          : null}
+        {open || !action
+          ? <Button key={'today-ask:top:' + e.rank} variant={action ? 'secondary' : 'primary'} onPress={press(() => fill(askPrompt(title, why, e.link)))}>Ask Mother</Button>
+          : null}
+        {open ? <Button key={'today-done:top:' + e.rank} onPress={press(() => go(['top', 'done', String(e.rank)]))}>Done</Button> : null}
+      </Box>,
+    ]))
+  }
+  for (const i of items.slice(0, TODAY_ITEMS_SHOWN)) {
+    const id = 'today:' + i.id
+    const open = isOpen(ctx.open, id, 'today', ctx.selected)
+    const press = (run: () => unknown) => pressing($, id, run)
+    const source = itemSource(i.id)
+    const title = oneLine(i.title, 200)
+    const why = oneLine(i.why, TLDR_MAX)
+    const meta = [oneLine(i.team, 40), age(i.since, nowMs)].filter(Boolean).join(' · ')
+    out.push(card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
+      titleRow(ui, id, title, open, press(() => toggleCard($, id, !open))),
+      <Box key={'meta:' + id} flexWrap="wrap" gap="xs">
+        {badge(ui, source === 'other' ? 'on you' : source, SOURCE_COLOR[source], 'badge:' + id)}
+        <Text dimColor>{meta + ' '}</Text>
+        {isUrl(i.link) ? <Link href={i.link}>source ↗</Link> : null}
+      </Box>,
+      open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
+      <Box key={'acts:' + id} flexWrap="wrap" gap="xs">
+        <Button key={'today-open:' + i.id} variant="primary" onPress={press(() => openInspector($, { kind: 'item', id: i.id }, 'reset'))}>Open</Button>
+        {open ? <Button key={'today-ask:' + i.id} onPress={press(() => fill(askPrompt(title, why, i.link)))}>Ask Mother</Button> : null}
+        {open ? <Button key={'today-done:' + i.id} onPress={press(() => go(['done', i.id]))}>Done</Button> : null}
+      </Box>,
+    ]))
+  }
+  if (items.length > TODAY_ITEMS_SHOWN) out.push(emptyLine(ui, 'today-more', `${items.length - TODAY_ITEMS_SHOWN} more in the Now panel`))
+  return out
+}
 const pressing = ($: Dollar, sel: string, run: () => unknown) => async () => { await select($, sel); await run() }
 
 // The Inbox section: the hub's open `now` items (status `inbox`, newest first, at most INBOX_SHOWN), each a card
@@ -632,7 +738,7 @@ async function inboxVerb($: Dollar, bin: string, args: string[]): Promise<boolea
   await reloadStatus($, bin)
   return ok
 }
-function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: number, drafts: Record<string, string> | null, ctx: CardCtx) {
+function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: number, drafts: Record<string, string> | null, ctx: CardCtx, heading = true) {
   const { Box, Text, Button, Select, Link } = ui
   const items: ChiefInboxItem[] = (Array.isArray(s.inbox) ? s.inbox : []).filter(u => !!u && typeof u.id === 'string')
     .sort((a, b) => (Date.parse(b.at ?? '') || 0) - (Date.parse(a.at ?? '') || 0)).slice(0, INBOX_SHOWN)
@@ -641,7 +747,7 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
   const goHub = (args: string[]) => inboxVerb($, bin, args)
   return (
     <Box key="inbox" flexDirection="column">
-      {sectionHeading(ui, 'inbox-heading', `Inbox ${total}`)}
+      {heading ? sectionHeading(ui, 'inbox-heading', `Inbox ${total}`) : null}
       {items.map(u => {
         const id = 'inbox:' + u.id
         const pickKey = 'inbox-snooze:' + u.id
@@ -802,6 +908,20 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     ])
   }
   const pinned = Array.isArray(s.desktop) ? s.desktop : []
+  // The tabs, as data: a later group (decisions, dots) is one more row here once it has a source.
+  const counts = tabCounts(s, floor, ctx.doc, nowMs)
+  const tabs: Tab[] = [
+    { id: 'needs', label: 'Needs you', count: counts.needs, section: h => [
+      needs.length ? (h ? sectionHeading(ui, 'needs-heading', `Needs you ${needs.length}`) : null) : emptyLine(ui, 'needs-empty', 'Nothing needs you'),
+      ...needs.map(needCard)] },
+    { id: 'inbox', label: 'Inbox', count: counts.inbox, section: h => [inboxSection($, ui, bin, s, nowMs, drafts, ctx, h)] },
+    { id: 'sessions', label: 'Sessions', count: counts.sessions, section: h => [
+      pinned.length ? (h ? sectionHeading(ui, 'pinned-heading', `Pinned ${pinned.length}`) : null) : emptyLine(ui, 'pinned-empty', 'No pinned sessions'),
+      ...pinned.map(pinnedCard)] },
+    { id: 'today', label: 'Today', count: counts.today, section: h => todaySection($, ui, bin, ctx.doc, nowMs, ctx, h) },
+  ]
+  const shown = shownTab(ctx.tabs?.picked, tabs)
+  const drawn = shown === 'all' ? tabs : tabs.filter(t => t.id === shown)
   return (
     <Box flexDirection="column">
       {headerStrip(ui, { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
@@ -815,11 +935,8 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
           : null}
       {s.paused ? <Text color="error">PAUSED: nothing is triaged or decided until /chief resume.</Text> : null}
       {error ? <Text color="warning">{error}</Text> : null}
-      {needs.length ? sectionHeading(ui, 'needs-heading', `Needs you ${needs.length}`) : emptyLine(ui, 'needs-empty', 'Nothing needs you')}
-      {needs.map(needCard)}
-      {inboxSection($, ui, bin, s, nowMs, drafts, ctx)}
-      {pinned.length ? sectionHeading(ui, 'pinned-heading', `Pinned ${pinned.length}`) : emptyLine(ui, 'pinned-empty', 'No pinned sessions')}
-      {pinned.map(pinnedCard)}
+      {tabRow(ui, tabs, shown, ctx.tabs?.seen, id => pickTab($, id, counts))}
+      {drawn.map(t => <Box key={'sec:' + t.id} flexDirection="column">{t.section(shown === 'all') as any}</Box>)}
     </Box>
   )
 }
@@ -848,7 +965,7 @@ let busy = false
 export async function startChief($: Dollar, configured: string): Promise<number> {
   const bin = await motherBin($, configured)
   try {
-    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions (expand | collapse | status | pause | resume)' })
+    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | status | pause | resume)' })
   } catch {
     // carry on without the command
   }
@@ -930,7 +1047,12 @@ export function registerChief(on: On, configured: string): void {
       await update($, chiefOpenAtom, () => allCards(verb === 'expand'))
       return { text: `Chief pane: every card ${verb === 'expand' ? 'expanded' : 'collapsed'}.` }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume | expand | collapse]' }
+    const tab = /^tab\s+(\S+)$/.exec(verb)?.[1]
+    if (tab && (TAB_IDS as readonly string[]).includes(tab)) {
+      await pickTab($, tab as TabId, tabCounts(lastStatus, await read($, floorAtom), await read($, docAtom), await $.clock.now()))
+      return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
+    }
+    return { text: 'Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|all]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
@@ -941,6 +1063,6 @@ export function registerChief(on: On, configured: string): void {
     return paneTree($, $.ui.resolve(e), await motherBin($, configured), await read($, chiefAtom), await read($, chiefErrorAtom),
       await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
       await read($, floorAtom), self, { open: await read($, chiefOpenAtom), selected: await read($, chiefSelectedAtom), portrait,
-        surface: String(e.surface) })
+        surface: String(e.surface), tabs: await read($, chiefTabAtom), doc: await read($, docAtom) })
   })
 }

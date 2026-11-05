@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { chiefStatusText, cleanTldr, ledByText } from './chief'
-import { budgetBar, isOpen, portraitLayout, sourceOf, suggestedBrief, suggestionsFor } from './pane_ui'
+import { budgetBar, isOpen, itemSource, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabIsNew } from './pane_ui'
 import { CLI } from '../tests/fixtures/chief_cli'
 
 const WS = '/work/ws'
@@ -50,7 +50,7 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('session.id', () => ({ value: sessionId }))
-  on('fs.stat', () => ({ deny: 'ENOENT' }))
+  on('fs.stat', (_: any, e: any) => (e.path in files ? { value: { kind: 'file', size: files[e.path].length, mtimeMs: 1 } } : { deny: 'ENOENT' }))
   on('fs.exists', (_: any, e: any) => ({ value: e.path in files }))
   on('fs.read', (_: any, e: any) => (e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' }))
   on('process.run', async (_: any, e: any) => {
@@ -74,7 +74,9 @@ async function boot($: any, on: any, chief: (argv: string[], stdin?: string) => 
   await $.session.start({ cwd: '/', surface, isInteractive: true })
   await clock.settle()
   // the cards' own defaults (Needs you open, the rest closed) have their tests; every other test reads a card in full
+  // the same for the tabs: `all` stacks every section, which is what most tests read
   if (expand) await $.command.run({ command: 'chief', args: 'expand' } as any)
+  if (expand) await $.command.run({ command: 'chief', args: 'tab all' } as any)
   return { clock, out }
 }
 
@@ -309,7 +311,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | expand | collapse]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | expand | collapse | tab needs|inbox|sessions|today|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -1147,7 +1149,8 @@ test('test_real_idle_status_draws_the_strip_and_empty_states', async ($, on) => 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const all = await texts(ui)
   expect(all).toEqual(['Mother', 'Chief of Stuff', ' 0 need you ', ' 0 inbox ', ' 0 sessions ', '$0.00 / $20', '▱▱▱▱▱▱▱▱', ' nobody leading ', 'heartbeat 1h ago',
-                       'Nothing needs you', 'Inbox clear', 'No pinned sessions'])   // never a blank section
+                       'Nothing needs you', 'Inbox clear', 'No pinned sessions',
+                       'No Today list yet: the tick has not written now.json'])     // never a blank section
   expect(String(out.status[out.status.length - 1] ?? '')).not.toMatch(/need you|in inbox|chief/)
   await ui.unmount()
 })
@@ -1284,6 +1287,7 @@ test('test_suggested_prompt_becomes_the_open_session_brief', async ($, on) => {
 test('test_chief_expand_and_collapse_set_every_card', async ($, on) => {
   const { clock } = await bootFloor($, on, { expand: false, cards: () => [asking()] })
   const run = async (args: string) => ((await $.command.run({ command: 'chief', args } as any)) as any).text
+  await run('tab all')
   {
     const ui = await shown($, clock, 'terminal')
     const has = async (key: string) => (await ui.find({ key })) !== undefined
@@ -1329,8 +1333,9 @@ test('test_this_session_is_marked_and_an_answer_selects_the_session', async ($, 
 
 // A real 1x1 PNG: the surface checks the bytes; the verb's width and height (the picture's own) choose the layout.
 const PNG_1PX = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
-const portraitCli = (width: number, height: number, png = PNG_1PX) => (argv: string[]) => argv[0] === 'portrait'
-  ? { exitCode: 0, stdout: JSON.stringify({ version: 1, source: 'bundled', width, height, png }) } : undefined
+const SVG_ART = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><circle cx="256" cy="236" r="190"/></svg>'
+const portraitCli = (width: number, height: number, extra: Record<string, unknown> = {}) => (argv: string[]) => argv[0] === 'portrait'
+  ? { exitCode: 0, stdout: JSON.stringify({ version: 1, source: 'bundled', width, height, png: PNG_1PX, svg: SVG_ART, ...extra }) } : undefined
 const pictures = async (ui: any, type: string) => (await ui.findAll({ type })).map((i: any) => i.props)
 
 test('test_a_square_picture_is_a_small_spot_in_the_header_strip', async ($, on) => {
@@ -1344,38 +1349,45 @@ test('test_a_square_picture_is_a_small_spot_in_the_header_strip', async ($, on) 
   await term.unmount()
   await $.ui.mount({ ...PANE, surface: 'terminal' }).then((u: any) => u.unmount())
   expect(chiefCalls(out, 'portrait').length).toBe(1)                  // loaded once per session, never per draw
-  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })      // no Image on the desktop app: an Svg wraps the PNG
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })      // no Image on the desktop app: the bundled vector itself
   expect(await pictures(desk, 'Image')).toEqual([])
-  const [svg] = await pictures(desk, 'Svg')
-  expect([svg.alt, svg.width, svg.height]).toEqual(['Mother, Chief of Stuff', 64, 64])
-  expect(svg.source).toContain('data:image/png;base64,' + PNG_1PX)
+  const [svg, ...others] = await pictures(desk, 'Svg')
+  expect(others).toEqual([])
+  expect([svg.alt, svg.width, svg.height, svg.source]).toEqual(['Mother, Chief of Stuff', 64, 64, SVG_ART])
+  expect(await desk.find({ key: 'banner' })).toBeUndefined()
   await desk.unmount()
 })
 
 test('test_a_wide_picture_is_a_banner_above_the_header_strip', async ($, on) => {
-  await boot($, on, portraitCli(800, 450))
+  await boot($, on, portraitCli(800, 450, { source: 'custom', jpeg: '/9j/4AAQSkZJRg==', jpeg_width: 800, jpeg_height: 450 }))
   const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  const banner = await term.find({ key: 'banner' })
-  expect(banner).toBeDefined()
+  expect(await term.find({ key: 'banner' })).toBeDefined()
   const [img] = await pictures(term, 'Image')
-  expect([img.alt, img.columns, img.rows]).toEqual(['Mother, Chief of Stuff', 44, 12])   // round(44 * 450 / 800 / 2)
+  expect([img.alt, img.columns, img.rows, img.source]).toEqual(['Mother, Chief of Stuff', 44, 12, { png: PNG_1PX }])   // round(44 * 450 / 800 / 2)
   expect((await texts(term)).slice(0, 2)).toEqual(['Mother', 'Chief of Stuff'])            // the title stays in the strip
   await term.unmount()
-  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })      // the custom jpeg, wrapped in an SVG
+  expect(await desk.find({ key: 'banner' })).toBeDefined()
   const [svg] = await pictures(desk, 'Svg')
-  expect([svg.width, svg.height]).toEqual([352, 198])
+  expect([svg.alt, svg.width, svg.height]).toEqual(['Mother, Chief of Stuff', 352, 198])
+  expect(svg.source.startsWith('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450">')).toBe(true)
+  expect(svg.source).toContain('<image href="data:image/jpeg;base64,/9j/4AAQSkZJRg==" width="800" height="450"/>')
   await desk.unmount()
-  expect(portraitLayout({ png: '', width: 2000, height: 100 })).toEqual({ banner: true, columns: 44, rows: 6 })    // clamped
-  expect(portraitLayout({ png: '', width: 140, height: 100 })).toEqual({ banner: true, columns: 44, rows: 14 })
-  expect(portraitLayout({ png: '', width: 139, height: 100 }).banner).toBe(false)
+  expect(portraitLayout({ width: 2000, height: 100 })).toEqual({ banner: true, columns: 44, rows: 6 })    // clamped
+  expect(portraitLayout({ width: 140, height: 100 })).toEqual({ banner: true, columns: 44, rows: 14 })
+  expect(portraitLayout({ width: 139, height: 100 }).banner).toBe(false)
 })
 
-test('test_a_picture_too_big_for_an_svg_is_not_drawn_on_the_desktop', async ($, on) => {
-  await boot($, on, portraitCli(800, 450, PNG_1PX.slice(0, -4) + 'A'.repeat(140_000) + PNG_1PX.slice(-4)))
+test('test_a_custom_png_without_a_jpeg_draws_the_bundled_vector_on_the_desktop', async ($, on) => {
+  await boot($, on, portraitCli(800, 450, { source: 'custom' }))
   const desk = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await pictures(desk, 'Svg')).toEqual([])
-  expect((await texts(desk)).slice(0, 2)).toEqual(['Mother', 'Chief of Stuff'])
+  const [svg] = await pictures(desk, 'Svg')
+  expect([svg.source, svg.width, svg.height]).toEqual([SVG_ART, 64, 64])               // a spot, never nothing
+  expect(await desk.find({ key: 'banner' })).toBeUndefined()
   await desk.unmount()
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })                        // the terminal still has the banner
+  expect((await pictures(term, 'Image'))[0].columns).toBe(44)
+  await term.unmount()
 })
 
 test('test_header_draws_no_picture_when_the_verb_fails', async ($, on) => {
@@ -1394,4 +1406,127 @@ test('test_header_draws_no_picture_when_the_verb_fails', async ($, on) => {
       await ui.unmount()
     }
   }
+})
+
+// ---- tabs: one section at a time, `all` stacked; Today from now.json ----
+const tabText = async (ui: any, id: string) => (await ui.find({ key: 'tab:' + id }))?.text
+const tabVariant = async (ui: any, id: string) => (await ui.find({ key: 'tab:' + id }))?.props.variant
+
+test('test_default_tab_is_the_first_that_holds_something', async ($, on) => {
+  await bootLead($, on, { expand: false })                                          // an inbox of 2, nothing else
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await Promise.all(['needs', 'inbox', 'sessions', 'today', 'all'].map(t => tabText(ui, t))))
+      .toEqual(['Needs you 0', 'Inbox 2', 'Sessions 0', 'Today 0', 'All'])
+    expect(await Promise.all(['needs', 'inbox', 'all'].map(t => tabVariant(ui, t)))).toEqual(['secondary', 'primary', 'secondary'])
+    const all = await texts(ui)
+    expect(all).toContain('▸ Review due')                                           // only the Inbox section is drawn
+    expect(all.some((t: string) => /^(Nothing needs you|No pinned sessions|No Today list|Inbox 2)/.test(t))).toBe(false)   // the tab is the heading
+    await ui.unmount()
+  }
+  expect(shownTab(null, [{ id: 'needs', count: 0 }, { id: 'inbox', count: 0 }])).toBe('all')    // nothing anywhere: every empty line
+  expect(shownTab(null, [{ id: 'needs', count: 1 }, { id: 'inbox', count: 3 }])).toBe('needs')
+  expect(shownTab('today', [{ id: 'needs', count: 1 }])).toBe('today')              // a pick stays, empty or not
+  expect(shownTab('bogus', [{ id: 'inbox', count: 3 }])).toBe('inbox')
+})
+
+test('test_tabs_switch_by_press_and_by_command_and_all_stacks_every_section', async ($, on) => {
+  await bootLead($, on, { expand: false })
+  const run = async (args: string) => ((await $.command.run({ command: 'chief', args } as any)) as any).text
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab:sessions' })
+  expect(await tabVariant(ui, 'sessions')).toBe('primary')
+  expect(await texts(ui)).toContain('No pinned sessions')
+  expect(await ui.find({ key: 'card:inbox:U2' })).toBeUndefined()                   // the Inbox section is gone
+  expect(await run('tab today')).toBe('Chief pane: showing today.')
+  expect(await tabVariant(ui, 'today')).toBe('primary')
+  expect(await texts(ui)).toContain('No Today list yet: the tick has not written now.json')
+  expect(await hasText(ui, /No pinned sessions/)).toBe(false)
+  expect(await run('tab all')).toBe('Chief pane: showing every section.')
+  const all = await texts(ui)
+  for (const line of ['Nothing needs you', 'Inbox 2', 'No pinned sessions', 'No Today list yet: the tick has not written now.json']) expect(all).toContain(line)
+  expect(await ui.find({ key: 'card:inbox:U2' })).toBeDefined()
+  expect(await tabVariant(ui, 'all')).toBe('primary')
+  expect(await run('tab needs')).toBe('Chief pane: showing needs.')
+  expect(await texts(ui)).toContain('Nothing needs you')                            // it stays where the manager put it, empty or not
+  expect(await run('tab bogus')).toMatch(/^Usage: \/chief /)
+  expect(await tabVariant(ui, 'needs')).toBe('primary')
+  await ui.unmount()
+})
+
+test('test_a_tab_with_more_than_when_last_opened_is_marked', async ($, on) => {
+  let cards: unknown[] = []
+  const { clock } = await bootFloor($, on, { expand: false, cards: () => cards })
+  const ui = await shown($, clock)
+  expect(await tabVariant(ui, 'sessions')).toBe('primary')                          // two pinned sessions, nothing asks
+  expect([await tabText(ui, 'needs'), await tabText(ui, 'sessions')]).toEqual(['Needs you 0', 'Sessions 2'])   // the shown tab wears no mark
+  await ui.press({ key: 'tab:sessions' })
+  cards = [asking()]
+  await clock.advance(60_000)
+  expect(await tabText(ui, 'needs')).toBe('Needs you 1 •')                          // new since it was last seen
+  await ui.press({ key: 'tab:needs' })
+  expect([await tabText(ui, 'needs'), await tabText(ui, 'sessions')]).toEqual(['Needs you 1', 'Sessions 2'])
+  expect(await texts(ui)).toContain('Ship now or wait for review?')
+  expect(tabIsNew({ id: 'inbox', count: 2 }, { inbox: 2 })).toBe(false)
+  expect(tabIsNew({ id: 'inbox', count: 3 }, { inbox: 2 })).toBe(true)
+  expect(tabIsNew({ id: 'all', count: 3 }, {})).toBe(false)
+  await ui.unmount()
+})
+
+const NOW_ITEM = (id: string, section: string, title: string, over: Record<string, unknown> = {}) => ({
+  id, section, signal: 'x', title, why: 'why ' + id, link: 'https://example.com/' + id, also: [], team: 'PLAT', since: '2026-11-02T07:00:00Z',
+  first_seen: '2026-11-02T07:00:00Z', last_seen: '2026-11-02T09:00:00Z', state: 'open', snooze_until: null, actions: [], ...over })
+const NOW_DOC = (over: Record<string, unknown> = {}) => ({
+  version: 1, generated_at: '2026-11-02T09:05:00Z', timezone: 'UTC', quiet: false, next_at: '2026-11-02T10:05:00Z', stale_after: '2026-11-02T11:05:00Z',
+  status: 'ok', coverage: {}, routines: [], counts: { on_you: 2, neglected: 1, suggestion: 0 }, next_action: 1, dropped: 0, top_date: '2026-11-02', swap_hint: null,
+  top: [{ rank: 1, title: 'Ship the release', why: 'due today', link: 'https://example.com/r', item_id: 'pr:1', set_by: 'agent', state: 'open' },
+        { rank: 2, title: 'Old news', why: '', link: null, item_id: null, set_by: 'agent', state: 'done' }],
+  items: [NOW_ITEM('pr:1', 'on_you', 'Review the release PR', { actions: [{ id: 'S1', label: 'Review it', prompt: 'mother now do S1', task: 'x' }] }),
+          NOW_ITEM('chat:2', 'on_you', 'Answer the design question'), NOW_ITEM('ticket:3', 'neglected', 'A neglected ticket')],
+  ...over })
+
+test('test_today_tab_draws_the_top_3_and_on_you_items_from_now_json', async ($, on) => {
+  const fills: string[] = []
+  on('prompt.fill', (_: any, e: any) => { fills.push(e.text); return { isFilled: true } })
+  const { out } = await boot($, on, undefined, 'desktop', 'sess-1', { [WS + '/.mother/now.json']: JSON.stringify(NOW_DOC()) }, {}, {}, false)
+  const nowArgs = () => out.argv.filter(a => a[2] === 'now').map(a => a.slice(3))
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect([await tabText(ui, 'today'), await tabVariant(ui, 'today')]).toEqual(['Today 2', 'primary'])   // the only tab that holds something
+    const keys = (await ui.findAll({ type: 'Button' })).map((b: any) => b.key).filter((k: string) => k.startsWith('toggle:'))
+    expect(keys).toEqual(['toggle:today:top:1', 'toggle:today:chat:2'])              // Top 3 first; a done entry, the item a Top 3 entry names and a neglected one are left out
+    expect((await ui.find({ key: 'toggle:today:top:1' }))?.text).toBe('▸ 1. Ship the release')
+    expect((await ui.find({ type: 'Text', text: ' top ' }))?.props.backgroundColor).toBe('claude')
+    expect((await ui.find({ type: 'Text', text: ' chat ' }))?.props.backgroundColor).toBe('planMode')
+    expect((await ui.find({ key: 'card:today:top:1' }))?.props.borderColor).toBe('claude')
+    expect(await hasText(ui, /^PLAT · 3h $/)).toBe(true)
+    await ui.unmount()
+  }
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'today-doit:1' }))?.text).toBe('Review it')           // the tick's first action for the entry's item
+  await ui.press({ key: 'today-doit:1' })
+  expect(fills).toEqual(['mother now do S1'])                                        // filled, never submitted
+  expect(await hasText(ui, /^due today$/)).toBe(true)                                // pressed: selected, so drawn in full
+  await ui.press({ key: 'today-ask:top:1' })
+  expect(fills[1]).toContain('Help me close this out: "Ship the release" — due today (https://example.com/r)')
+  await ui.press({ key: 'today-done:top:1' })
+  expect(nowArgs()).toEqual([['top', 'done', '1']])                                  // the Now panel's own verb
+  await ui.press({ key: 'today-open:chat:2' })
+  expect(out.opened).toContain('mother-inspector')                                   // the item's page, as a Home row opens it
+  await ui.press({ key: 'today-done:chat:2' })
+  expect(nowArgs()[1]).toEqual(['done', 'chat:2'])
+  expect(out.submits).toEqual([])
+  await ui.unmount()
+  expect(['chat:1', 'mail:x', 'pr:9', 'build:main', 'ticket:PLAT-1', 'event:e', 'todo:t'].map(itemSource))
+    .toEqual(['chat', 'mail', 'code', 'code', 'tracker', 'calendar', 'other'])
+})
+
+test('test_today_tab_says_when_the_list_is_stale', async ($, on) => {
+  await boot($, on, undefined, 'terminal', 'sess-1', { [WS + '/.mother/now.json']: JSON.stringify(NOW_DOC({ stale_after: '2026-11-02T09:30:00Z', top: [], items: [] })) }, {}, {}, false)
+  await $.command.run({ command: 'chief', args: 'tab today' } as any)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const all = await texts(ui)
+  expect(all).toContain('This list is stale: the tick has not run since it was written')
+  expect(all).toContain('Nothing on you today')
+  await ui.unmount()
 })
