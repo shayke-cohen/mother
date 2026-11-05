@@ -9,6 +9,7 @@ Commands:
   home show|set [host]|check|move <host>
                                which machine runs routines (check: 0 = here, 2 = elsewhere, 3 = unset)
   status                       validate config.json and show workspace state; exit 1 if invalid
+  guard off|on|status          turn every guard rule off or back on; while off the model alone decides (PAUSED still wins)
   register                     print the scheduled-task pointers for enabled routines (JSON)
   runs [--json]                watchdog: did each scheduled routine log a run since its last slot? exit 2 if any missed/failed
   path                         print the active workspace path
@@ -59,7 +60,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.16.0"
+VERSION = "0.16.1"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -1495,9 +1496,27 @@ def cmd_health(args):
     import health
     sys.exit(health.main(args, None if args[:1] in ([], ["help"], ["-h"], ["--help"]) else workspace()))
 
+def cmd_guard(args):
+    """`mother guard off|on|status`: .mother/GUARD_OFF turns every guard rule off, so the model alone decides."""
+    verb = args[0] if args else "status"
+    if verb not in ("off", "on", "status") or len(args) > 1:
+        die("usage: mother guard off|on|status")
+    state = os.path.join(workspace(), ".mother")
+    flag = os.path.join(state, "GUARD_OFF")
+    if verb == "off":
+        os.makedirs(state, exist_ok=True)
+        with open(flag, "w") as f:
+            f.write(_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ\n"))
+    elif verb == "on" and os.path.exists(flag):
+        os.remove(flag)
+    off = os.path.exists(flag)
+    paused = os.path.exists(os.path.join(state, "PAUSED"))
+    print("guard: " + ("on (PAUSED wins over GUARD_OFF)" if off and paused else "OFF: the model alone decides" if off else "on"))
+
+
 # ---------------------------------------------------------------- main
 
-COMMANDS = {"init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
+COMMANDS = {"guard": cmd_guard, "init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
             "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "chief": cmd_chief, "inbox": cmd_inbox, "grant": cmd_grant, "decide": cmd_decide, "memory": cmd_memory, "eval": cmd_eval, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 

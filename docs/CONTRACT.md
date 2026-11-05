@@ -205,6 +205,12 @@ this first and names any capability it needs that isn't `ok` in its output — n
 
 ## 5. Approval guard (`hooks/guard.py`)
 
+**`mother guard off|on|status`** — while `.mother/GUARD_OFF` exists, no guard rule runs, in any session, workers and the
+chief included: the model alone decides, and text it reads (mail, chat) can steer it into sending. Every call is still
+logged to `guard.log` as `off`. `.mother/PAUSED` wins: with it present the guard runs as normal. There's no expiry, and
+grants, batches and decisions still work but no longer stop anything. With the guard on, the file is protected like
+`PAUSED`, so turning it off asks.
+
 Port of the reference deployment's `guard-outbound.py`, made config-driven:
 - **Hook registration** (`hooks/hooks.json`): the guard sees only the tools Claude Code hands it, so every tool
   reaches it, in every session, through exactly one of two PreToolUse entries. The tools it has a rule for in
