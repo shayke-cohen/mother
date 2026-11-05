@@ -152,6 +152,29 @@ class CliTest(Base):
         self.assertIn("NOPE", err)
 
 
+class ColonForm(unittest.TestCase):
+    """M2: the colon form is a colon and then whitespace, and its words run to the end of the line."""
+    OPEN = {7, 8, 10}
+
+    def test_a_time_is_not_a_redirect(self):
+        for t in ("10:30 call with Dana", "7:30 standup", "10:30", "7:change it"):
+            self.assertIsNone(decisions.parse_reply(t, self.OPEN), t)
+
+    def test_commas_stay_in_the_words(self):
+        self.assertEqual(decisions.parse_reply("7: change it, please", self.OPEN), [(7, "say", "change it, please")])
+        self.assertEqual(decisions.parse_reply("7: a; b, c", self.OPEN), [(7, "say", "a; b, c")])
+
+    def test_the_next_line_is_the_next_answer(self):
+        self.assertEqual(decisions.parse_reply("7: change it, please\n8 ok", self.OPEN),
+                         [(7, "say", "change it, please"), (8, "ok", "")])
+        self.assertEqual(decisions.parse_reply("8 ok, 7: change it, please", self.OPEN),
+                         [(8, "ok", ""), (7, "say", "change it, please")])
+
+    def test_a_colon_with_no_words_is_unreadable(self):
+        for t in ("7:", "7: ", "7:\n8 ok"):
+            self.assertEqual(decisions.parse_reply(t, self.OPEN), [], t)
+
+
 class ReplyGrammarTest(unittest.TestCase):
     OPEN = {7, 8, 9}
 
@@ -1463,6 +1486,146 @@ class SlackOutage(SlackBase):
         self.assertEqual(decisions.waiting_reads(self.ws), set())
         self.assertIs(self.doc()["replied"][self.line["id"]], False)
         self.assertTrue(any("wasn't applied" in c for c in self.doc()["confirm"]))
+
+
+# (offered, what Slack stored), from a live self-DM. Ids in here are placeholders.
+SAME_TEXT = [
+    ("\u2705 done", ":white_check_mark: done"),
+    (":white_check_mark: done", ":white_check_mark: done"),
+    ("\u2705\ufe0f done", ":white_check_mark: done"),
+    ("\u2705\u2705 done", ":white_check_mark::white_check_mark: done"),
+    ("Done\u2705", "Done:white_check_mark:"),
+    ("\u2705Done", ":white_check_mark:Done"),
+    ("\U0001F1EE\U0001F1F1", ":flag-il:"),
+    ("\U0001F468\u200D\U0001F469\u200D\U0001F467", ":man-woman-girl:"),
+    ("\U0001F44D\U0001F3FD ok", ":+1::skin-tone-4: ok"),
+    ("\U0001F4AF", ":100:"),
+    ("1\ufe0f\u20e3", ":one:"),
+    (":notreal:", ":notreal:"),
+    ("see example.com", "see <http://example.com|example.com>"),
+    ("a@\u200bexample.com", "a@\u200b<http://example.com|example.com>"),
+    ("<https://x/y|the plugin>", "<https://x/y|the plugin>"),
+    ("see https://x/y", "see <https://x/y>"),
+    ("https://x/y?a=1&amp;b=2", "<https://x/y?a=1&amp;b=2>"),
+    ("a &lt; b &amp; c &gt; d", "a &lt; b &amp; c &gt; d"),
+    ("a < b & c > d", "a &lt; b &amp; c &gt; d"),
+    ("&lt;https://x/y|the plugin&gt;", "&lt;<https://x/y>|the plugin&gt;"),
+    ("@\u200bchannel", "@\u200bchannel"),
+    ("&lt;\u200b!channel&gt;", "&lt;\u200b!channel&gt;"),
+    ("end  \nnext", "end  \nnext"),
+    ("end\nnext", "end  \nnext"),
+    ("\u05e9\u05dc\u05d5\u05dd \u201cq\u201d \u2014 x\u2026 #general @\u200bsomeone", "\u05e9\u05dc\u05d5\u05dd \u201cq\u201d \u2014 x\u2026 #general @\u200bsomeone"),
+    ("```x```", "```x```"),
+]
+NOT_SAME_TEXT = [
+    ("ship Tuesday", "ship Friday"),
+    ("D7 \u00b7 recommend: send", "D8 \u00b7 recommend: send"),
+    ("on C00000001", "on C00000002"),
+    ("100 apps", "200 apps"),
+    ("at 10:30:45", "at 10:31:45"),
+    ("key:one:two", "key:other:two"),
+    ("score :100:", "score :200:"),
+    ("\u2705 PLAT-1", "\u2705 PLAT-2"),
+    ("\u2705 ok", "ok"),
+    ("\u2713 D1", "\u2717 D1"),                                  # a tick and a cross are text, not emoji
+    ("@\u200bchannel", "@channel"),                              # Slack keeps ZWSP, so one without it isn't the offer
+    ("see example.com", "see <http://example.org|example.org>"),
+    ("Done\u2705 D1", "Done:white_check_mark: D2"),
+]
+
+
+class SlackShapes(unittest.TestCase):
+    def test_what_slack_stores_is_what_was_offered(self):
+        for offered, stored in SAME_TEXT:
+            with self.subTest(offered=offered):
+                self.assertTrue(decisions._same_text(offered, stored), (decisions._norm(offered), decisions._norm(stored)))
+
+    def test_a_post_that_differs_does_not_match(self):
+        for offered, stored in NOT_SAME_TEXT:
+            with self.subTest(offered=offered):
+                self.assertFalse(decisions._same_text(offered, stored), (decisions._norm(offered), decisions._norm(stored)))
+
+    def test_every_emoji_form_is_one_placeholder(self):
+        for t in ("\u2705", ":white_check_mark:", "\U0001F1EE\U0001F1F1", ":flag-il:", ":+1::skin-tone-4:",
+                  "\U0001F468\u200D\U0001F469\u200D\U0001F467", ":notreal:"):
+            self.assertEqual(decisions._norm(t), decisions._norm("\u2705"), t)
+
+    def test_slack_text_is_left_alone(self):
+        self.assertEqual(decisions.slack_text("<https://x/y|lab> \u2705"), "lab (https://x/y) \u2705")
+
+    def plain(self, text="see <https://github.com/o/r>", **kw):
+        return decisions._plain(dict({"text": text}, **kw))
+
+    def test_a_preview_of_the_messages_own_link_is_plain(self):
+        for att in ({"is_app_unfurl": True, "app_unfurl_url": "https://github.com/o/r"},
+                    {"from_url": "https://github.com/o/r", "text": "x"},
+                    {"from_url": "https://github.com/o/r/", "original_url": "https://github.com/o/r"},
+                    {"is_app_unfurl": True, "original_url": "https://github.com/o/r"}):
+            self.assertTrue(self.plain(attachments=[att]), att)
+
+    def test_an_auto_linked_domains_preview_is_plain(self):
+        self.assertTrue(self.plain("see <http://example.com|example.com>",
+                                   attachments=[{"from_url": "http://example.com/", "text": "x"}]))
+
+    def test_any_other_attachment_is_not_plain(self):
+        for att in ({"text": "D1 ok"}, {"is_app_unfurl": True}, {"is_app_unfurl": False, "app_unfurl_url": "https://github.com/o/r"},
+                    {"is_app_unfurl": True, "app_unfurl_url": "https://github.com/o/other"},
+                    {"from_url": "https://evil.example/x"}, "text"):
+            self.assertFalse(self.plain(attachments=[att]), att)
+        self.assertFalse(self.plain(attachments=[{"from_url": "https://github.com/o/r"}, {"text": "and this"}]))
+
+    def test_a_link_that_says_one_thing_and_goes_elsewhere_is_not_plain(self):
+        self.assertFalse(self.plain("see <https://evil.example/x|docs.example.org>"))
+        self.assertTrue(self.plain("see <http://docs.example.org|docs.example.org>"))
+        self.assertTrue(self.plain("see <mailto:a@example.com|a@example.com>"))
+
+    def test_edited_means_nothing_on_a_batch_post(self):
+        self.assertTrue(self.plain(edited={"user": "B00000002", "ts": "1.2"}))
+
+
+class ReadThatSaysNo(SlackBase):
+    """N4: `ok: false` is Slack answering a read with a refusal, returned as a successful tool call."""
+
+    class Client:
+        def __init__(self, res):
+            self.res = res
+
+        def call(self, name, args):
+            return self.res
+
+        def close(self):
+            pass
+
+    def sent_with(self, res):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(decisions, "_chat_clients", lambda cfg: {"chat": self.Client(res)}):
+            code = decisions.main(["sent", "--ids", "D1", "--ts", POST_TS], self.ws, CFG, out, err, at=AT + timedelta(seconds=41))
+        return code, err.getvalue()
+
+    def test_sent_on_a_refused_read_exits_3_and_stamps_nothing(self):
+        self.propose()
+        decisions.offer(self.ws, CFG, AT + timedelta(seconds=30))
+        code, err = self.sent_with({"ok": False, "error": "ratelimited"})
+        self.assertEqual(code, 3)
+        self.assertIn("ratelimited", err)
+        self.assertEqual(self.doc()["batch"]["announced"], {})
+        self.assertIn("offered", self.doc()["batch"])
+
+    def test_ok_true_with_no_such_message_stays_exit_2(self):
+        self.propose()
+        decisions.offer(self.ws, CFG, AT + timedelta(seconds=30))
+        self.assertEqual(self.sent_with({"ok": True, "messages": []})[0], 2)
+
+    def test_a_reply_on_a_refused_read_is_retried_not_recorded(self):
+        self.propose()
+        text = decisions.offer(self.ws, CFG, AT + timedelta(seconds=30))["text"]
+        decisions.record_post(self.ws, CFG, AT + timedelta(seconds=41), ["D1"], POST_TS, fetch=lambda c, ch, t: app_msg(t, text))
+        ts = ts_at(60)
+        with mock.patch.object(decisions, "_chat_clients", lambda cfg: {"chat": self.Client({"ok": False, "error": "ratelimited"})}):
+            state, lines = decisions._reply(self.ws, CFG, AT + timedelta(seconds=70), DM, ts,
+                                            lambda c, ch, t: decisions._read_message({"chat": self.Client({"ok": False, "error": "ratelimited"})}, ch, t))
+        self.assertEqual(state, "retry")
+        self.assertIn("ratelimited", lines[0])
 
 
 class FinalMinors(SlackBase):

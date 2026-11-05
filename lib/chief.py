@@ -696,7 +696,7 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
     cdir = chief_dir(ws)
     _write_atomic(cdir / "heartbeat.json", json.dumps({"at": hub._iso(at), "pid": os.getpid()}) + "\n")
     out = {"paused": False, "decided": [], "wake": None, "judge": [], "dispatched": [], "reconciled": [],
-           "batch": False}
+           "batch": False, "batch_key": None}
     if paused(ws):
         out["paused"] = True
         return out
@@ -768,7 +768,8 @@ def tick(ws: Path, cfg: dict, at: datetime) -> dict:
             out["wake"] = WAKE_TEXT % (len(judge), PLUGIN_ROOT / "routines" / "chief.md")
             _write_atomic(cdir / "wake.json", json.dumps({"line_ids": judge, "at": hub._iso(at)}) + "\n")
 
-    out["batch"] = decisions.batch(ws, cfg, at) is not None
+    due = decisions.batch(ws, cfg, at)
+    out["batch"], out["batch_key"] = due is not None, decisions.batch_key(due)
     if refusal(ws, cfg, at):
         return out  # over budget or an unreadable spend file: nothing is dispatched until that clears
     live = set(running(ws))

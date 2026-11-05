@@ -2,7 +2,7 @@
 export const CLI = {
  "tick_nothing": {
   "exitCode": 0,
-  "stdout": "{\n  \"paused\": false,\n  \"decided\": [],\n  \"wake\": null,\n  \"judge\": [],\n  \"dispatched\": [],\n  \"reconciled\": [],\n  \"batch\": false\n}\n",
+  "stdout": "{\n  \"paused\": false,\n  \"decided\": [],\n  \"wake\": null,\n  \"judge\": [],\n  \"dispatched\": [],\n  \"reconciled\": [],\n  \"batch\": false,\n  \"batch_key\": null\n}\n",
   "stderr": ""
  },
  "batch_nothing": {
@@ -32,7 +32,7 @@ export const CLI = {
  },
  "tick_due": {
   "exitCode": 0,
-  "stdout": "{\n  \"paused\": false,\n  \"decided\": [],\n  \"wake\": null,\n  \"judge\": [],\n  \"dispatched\": [],\n  \"reconciled\": [],\n  \"batch\": true\n}\n",
+  "stdout": "{\n  \"paused\": false,\n  \"decided\": [],\n  \"wake\": null,\n  \"judge\": [],\n  \"dispatched\": [],\n  \"reconciled\": [],\n  \"batch\": true,\n  \"batch_key\": \"4539f76eff74baea\"\n}\n",
   "stderr": ""
  },
  "status_pending": {

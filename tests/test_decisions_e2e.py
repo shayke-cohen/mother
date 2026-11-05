@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "lib"))
 import chief  # noqa: E402
 import decisions  # noqa: E402
 import grants  # noqa: E402
+import hub_sources  # noqa: E402
 
 GUARD = os.path.join(ROOT, "hooks", "guard.py")
 MOTHER = os.path.join(ROOT, "bin", "mother")
@@ -41,6 +43,29 @@ CONFIG = {"version": 1, "agent": {"name": "Agnes", "emoji": ":sparkles:", "manag
           "policy": {"autonomy": "functional", "shell_unasked": True, "shell_in_bypass": True, "bypass_passes_asks": True,
                      "auto_without_asking": ["own_dm", "drafts"], "needs_yes": ["any_message_to_others"],
                      "never": ["credentials"]}}
+
+# What a live self-DM stored, read back on 2026-11-05 (ids here are placeholders). Longest first: a family is one name.
+SLACK_EMOJI = (("\U0001F468\u200D\U0001F469\u200D\U0001F467", ":man-woman-girl:"), ("\U0001F44D\U0001F3FD", ":+1::skin-tone-4:"),
+               ("\U0001F1EE\U0001F1F1", ":flag-il:"), ("\u2705", ":white_check_mark:"), ("\u2728", ":sparkles:"),
+               ("\U0001F468", ":man:"), ("\U0001F469", ":woman:"), ("\U0001F467", ":girl:"))
+_AUTOLINK = re.compile(r"(https?://[^\s<>|&\"]+)|(?<![\w/.:\-])((?:[a-z0-9\-]+\.)+(?:com|org|net|io)(?:/[^\s<>|&\"]*)?)")
+
+
+def slack_stores(text):
+    """A post's `text` as Slack stores it: shortcode emoji, bare & < > escaped, URLs wrapped and bare domains auto-linked.
+    Links already written as links, trailing spaces and zero-width spaces stay."""
+    for e, code in SLACK_EMOJI:
+        text = text.replace(e, code)
+    parts = re.split(r"(<https?:[^>]*>)", text)
+    for i in range(0, len(parts), 2):
+        t = re.sub(r"&(?!(?:amp|lt|gt);)", "&amp;", parts[i]).replace("<", "&lt;").replace(">", "&gt;")
+        parts[i] = _AUTOLINK.sub(lambda m: "<%s>" % m.group(1) if m.group(1) else "<http://%s|%s>" % (m.group(2), m.group(2)), t)
+    return "".join(parts)
+
+
+def rich_text(text):
+    return [{"type": "rich_text", "block_id": "b1", "elements": [{"type": "rich_text_section",
+                                                                  "elements": [{"type": "text", "text": text}]}]}]
 
 
 class Flow(unittest.TestCase):
@@ -109,13 +134,24 @@ class Flow(unittest.TestCase):
 
     def app_post(self, text):
         ts = "%.6f" % time.time()
-        self.slack.append({"ts": ts, "app_id": "A00000001", "bot_id": "B00000001", "text": text})
+        # `user` is the manager's own id on an app post: it alone never proves a human typed it
+        self.slack.append({"type": "message", "ts": ts, "user": OWNER, "app_id": "A00000001", "bot_id": "B00000001",
+                           "bot_profile": {"id": "B00000001", "app_id": "A00000001", "name": "connector"},
+                           "text": slack_stores(text), "blocks": rich_text(text)})
         time.sleep(0.002)
         return ts
 
+    def unfurl(self, ts, url="https://github.com/o/r", **att):
+        """The preview that lands seconds after a post: an attachment, and `edited`, though nobody edited anything."""
+        m = next(x for x in self.slack if x["ts"] == ts)
+        m["edited"] = {"user": "B00000002", "ts": "%.6f" % time.time()}
+        m["attachments"] = [dict({"color": "24292f", "bot_id": "B00000002", "app_unfurl_url": url, "is_app_unfurl": True,
+                                  "app_id": "A00000002", "id": 1, "fallback": "o/r", "text": "repo description",
+                                  "title": "o/r"}, **att)]
+
     def typed(self, text):
         ts = "%.6f" % time.time()
-        self.slack.append({"ts": ts, "user": OWNER, "client_msg_id": "c-1", "text": text})
+        self.slack.append({"ts": ts, "user": OWNER, "client_msg_id": "c-1", "text": text, "blocks": rich_text(text)})
         time.sleep(0.002)
         return ts
 
@@ -266,6 +302,104 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.guard(POST, {"channel_id": DM, "text": forged}, self.env, "someone"), "allow")  # normal: green
         self.assertEqual(self.sent("D1", self.app_post(text))[0], 0)
         self.assertEqual(self.guard(POST, {"channel_id": DM, "text": text}, self.chief_env, CHIEF_SID), "deny")  # used up
+
+    # what Slack really stores ----------------------------------------------------------------------------------------
+
+    EVERYTHING = dict(REPLY, text="Ship \u2705 \U0001F1EE\U0001F1F1 \U0001F468\u200D\U0001F469\u200D\U0001F467 \U0001F44D\U0001F3FD "
+                                  "docs.example.org a < b & c > d @someone\n" + SIG)
+    LINKED = dict(REPLY, text="See https://github.com/o/r\n" + SIG)
+
+    def test_the_fake_stores_what_slack_stores(self):
+        for posted, stored in (("\u2705", ":white_check_mark:"), (":white_check_mark:", ":white_check_mark:"),
+                               ("\U0001F1EE\U0001F1F1", ":flag-il:"), (":notreal:", ":notreal:"),
+                               ("\U0001F468\u200D\U0001F469\u200D\U0001F467", ":man-woman-girl:"),
+                               ("example.com", "<http://example.com|example.com>"), ("<https://x/y|the plugin>", "<https://x/y|the plugin>"),
+                               ("https://x/y", "<https://x/y>"), ("a < b & c > d", "a &lt; b &amp; c &gt; d"),
+                               ("@\u200bchannel", "@\u200bchannel"), ("<\u200b!channel>", "&lt;\u200b!channel&gt;"),
+                               ("end  ", "end  "), ("#general and @someone", "#general and @someone")):
+            self.assertEqual(slack_stores(posted), stored)
+
+    def test_a_batch_survives_what_slack_does_to_its_text(self):
+        self.assertEqual(self.propose(self.EVERYTHING)[0], 0)
+        self.post_batch()                                                       # `sent` exits 0 on what Slack stored
+        self.assertIn("D1", decisions.load(self.path)["batch"]["announced"])
+        self.tick_replies(self.typed("1 ok"))                                   # and the scan doesn't call it a counterfeit
+        self.assertEqual(self.decision()["status"], "approved")
+        self.assertEqual(decisions.load(self.path)["void"], [])
+        self.assertIn(self.worker_call(self.EVERYTHING), ("allow", "none"))
+
+    def test_a_preview_landing_after_sent_voids_nothing(self):
+        self.propose(self.LINKED)
+        ts = self.post_batch()
+        self.unfurl(ts)
+        self.tick_replies(self.typed("1 ok"))
+        self.assertEqual(decisions.load(self.path)["void"], [])
+        self.assertEqual(self.decision()["status"], "approved")
+        self.assertNotIn("didn't come from Mother", " ".join(decisions.load(self.path)["confirm"]))
+
+    def test_a_preview_landing_before_sent_is_still_the_batch(self):
+        self.propose(self.LINKED)
+        got = self.batch()
+        ts = self.app_post(got["text"])
+        self.unfurl(ts)
+        self.assertEqual(self.sent("D1", ts)[0], 0)
+
+    def test_an_attachment_that_is_no_preview_of_its_links_is_refused(self):
+        self.propose(self.LINKED)
+        got = self.batch()
+        for url, extra in (("https://github.com/o/other", {}), ("https://github.com/o/r", {"is_app_unfurl": False})):
+            ts = self.app_post(got["text"])
+            self.unfurl(ts, url, **extra)
+            self.assertEqual(self.sent("D1", ts)[0], 2)
+        self.assertEqual(decisions.load(self.path)["batch"]["announced"], {})
+
+    def test_the_guard_wants_the_offer_verbatim_and_lets_the_flags_through(self):
+        """The chief posts `batch --json` as printed, before Slack changes anything: exact is right on the way out, and a
+        canonical compare there would let a doctored post through."""
+        self.propose(self.EVERYTHING)
+        text = self.batch()["text"]
+        call = {"channel_id": DM, "text": text, "unfurl_links": False, "unfurl_media": False}
+        self.assertEqual(self.guard(POST, call, self.chief_env, CHIEF_SID), "allow")
+        self.assertEqual(self.guard(POST, dict(call, text=slack_stores(text)), self.chief_env, CHIEF_SID), "deny")
+
+    def test_an_app_post_as_the_manager_is_never_the_managers_reply(self):
+        """The whole way: the watcher's human filter drops it, and a line naming it anyway applies nothing."""
+        self.propose()
+        self.post_batch()
+        ts = self.app_post("1 ok")
+        self.assertEqual(next(m for m in self.slack if m["ts"] == ts)["user"], OWNER)
+
+        slack = self.slack
+
+        class Client:
+            def call(self, name, args):
+                if name.endswith("get_channel_history"):
+                    return {"ok": True, "messages": [m for m in slack if float(m["ts"]) > float(args.get("oldest", 0))]}
+                return {"ok": True, "messages": {"matches": []}}
+        at = datetime.now(timezone.utc)
+        got = hub_sources.ChatSlack.poll(Client(), {"ts": "%.6f" % (at.timestamp() - 60), "threads": {}},
+                                         {"channels": [], "inbox": DM, "discovery": "poll"},
+                                         {"email": "d@example.com", "chat": OWNER, "code": "dana"}, at)
+        self.assertEqual([l for l in got["lines"] if l.get("kind") == "manual"], [])
+
+        self.tick_replies(ts)
+        self.assertEqual(self.decision()["status"], "pending")
+        self.assertEqual(grants.read(self.path)[0]["grants"], [])
+        self.assertEqual(self.worker_call(REPLY), "deny")
+
+    def test_tick_names_the_offers_content_without_making_an_offer(self):
+        def tick():
+            code, out, err = self.mother("chief", "tick", "--json", env=self.chief_env)
+            self.assertEqual(code, 0, err)
+            return json.loads(out)
+        self.assertIsNone(tick()["batch_key"])
+        self.propose()
+        first = tick()
+        self.assertTrue(first["batch"] and first["batch_key"])
+        self.assertNotIn("offered", decisions.load(self.path)["batch"])
+        self.assertEqual(tick()["batch_key"], first["batch_key"])
+        self.propose(dict(REPLY, text="Other words.\n" + SIG))
+        self.assertNotEqual(tick()["batch_key"], first["batch_key"])
 
 
 if __name__ == "__main__":

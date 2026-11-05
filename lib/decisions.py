@@ -4,12 +4,13 @@
   propose <key> --tool T --recommend R [--why W] [--urgent] --stdin     stdin: the tool's input JSON
   answer <n> <ok|no|edit|say> --via pane [-- <text>]                    the Chief pane's answer (mod only)
   batch [--json]                                                        the message due for the manager's DM, if any
-  sent [--ids D7,D8|''] --ts TS                                         that message went out (TS: its Slack ts, re-read)
+  sent --ts TS [--ids D7,D8|'']                                         that message went out (TS: its Slack ts, re-read)
 
 State is <workspace>/.mother/chief/decisions.json, changed only under `locked(ws)` (flock on decisions.lock) and
 written atomically. Python 3.9 stdlib only.
 """
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -337,7 +338,8 @@ def edit_view(d: dict, cfg: dict) -> dict:
 
 _NUM = re.compile(r"^d?(\d+)$")
 _START_NUM = re.compile(r"^d?\d+(?!\w)(.*)$", re.I | re.S)
-_SAY = re.compile(r"^d?(\d+)\s*:(.*)$", re.I | re.S)
+_SAY = re.compile(r"^d?(\d+)\s*:(?:\s(.*))?$", re.I | re.S)  # a colon and whitespace: "10:30 call" is a note
+_SAY_START = re.compile(r"^\s*d?\d+[ \t]*:(?:\s|$)", re.I)
 _START_WORD = re.compile(r"^(\S+)\s+(?:d?\d+|all)(?!\w)", re.I)
 _EDIT = re.compile(r"^\s*d?(\d+)\s+edit(?!\w)(.*)$", re.I | re.S)
 
@@ -347,7 +349,9 @@ def _starts_like_reply(t: str) -> bool:
     m = _START_NUM.match(t)
     if m:
         rest = m.group(1).lstrip(" \t")
-        if not rest.strip() or rest[0] in ":,;\r\n":
+        if rest[:1] == ":":
+            return not rest[1:] or rest[1].isspace()
+        if not rest.strip() or rest[0] in ",;\r\n":
             return True
         word = re.split(r"[\s,;]", rest, maxsplit=1)[0].lower()
         return bool(re.match(r"edit(?!\w)", word)) or word in (channels.SEND_WORDS | channels.NO_WORDS)
@@ -359,7 +363,8 @@ def _clause(c: str, open_ids: Set[int]) -> Optional[list]:
     """Items for one non-edit clause, or None when it doesn't parse."""
     said = _SAY.match(c)
     if said:
-        return [(int(said.group(1)), "say", " ".join(said.group(2).split()))] if said.group(2).strip() else None
+        words = " ".join((said.group(2) or "").split())
+        return [(int(said.group(1)), "say", words)] if words else None
     toks = c.split()
     if len(toks) < 2:
         return None
@@ -407,7 +412,8 @@ def parse_reply(text: str, open_ids: Set[int]) -> Optional[List[Tuple[int, str, 
             payload = c.group(1)
             items.append((int(e.group(1)), "edit", payload))
             break
-        parts = re.split(r"[,;\n]", rest, maxsplit=1)
+        # the words of `7: ...` are the manager's, commas and all: only a new line ends them
+        parts = re.split(r"\n" if _SAY_START.match(rest) else r"[,;\n]", rest, maxsplit=1)
         got = _clause(parts[0].strip(), open_ids)
         if not got:
             return []
@@ -444,12 +450,18 @@ def _chat_clients(cfg: dict) -> dict:
 
 
 def _read_message(clients: dict, channel: str, ts: str) -> Optional[dict]:
+    """The message at `ts`, or None when Slack read fine and has none. Raises on a read that failed, `ok: false` included:
+    Slack's refusal arrives as a successful tool call, and says nothing about the message."""
+    import hub_sources
     from hub_mcp import McpError
     c = clients.get("chat")
     if c is None or isinstance(c, Exception):
         raise c if isinstance(c, Exception) else McpError("other", "no chat client")
     res = c.call("get_channel_history", {"channel_id": channel, "oldest": ts, "latest": ts, "inclusive": True,
                                          "limit": 1})
+    why = hub_sources.refused(res)
+    if why:
+        raise McpError("other", "Slack refused the read: %s" % why)
     for m in (res or {}).get("messages") or []:
         if isinstance(m, dict) and m.get("ts") == ts:
             return m
@@ -1038,13 +1050,13 @@ def scan_counterfeits(ws: Path, channel: str, history, first_reply: float) -> No
     with locked(ws):
         doc = load(ws)
         b = doc["batch"]
-        known = {_norm(t) for x in b.get("posts") or [] for t in x["texts"] if isinstance(t, str)}
-        known |= {_norm(o["text"]) for o in b.get("offers") or []}
+        known = [t for x in b.get("posts") or [] for t in x["texts"] if isinstance(t, str)]
+        known += [o["text"] for o in b.get("offers") or []]
         seen = {v["from"] for v in doc["void"]}
         open_ = {d.get("id") for d in doc["decisions"] if d.get("status") == "pending"}
         changed = False
         for m in sorted((m for m in msgs if isinstance(m.get("ts"), str)), key=lambda m: guard.parse_time(m["ts"]) or 0):
-            if m["ts"] in seen or not _app_posted(m) or (_norm(m.get("text")) in known and _plain(m)):
+            if m["ts"] in seen or not _app_posted(m) or (_plain(m) and any(_same_text(t, m.get("text")) for t in known)):
                 continue
             ids = rows_named(m)
             if ids is None:
@@ -1217,6 +1229,12 @@ def batch(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
     return {"text": "\n".join(rows), "ids": [d.get("id") for d in open_]}
 
 
+def batch_key(got: Optional[dict]) -> Optional[str]:
+    """What a batch says, as a short hash: `mother chief tick` hands it to the mod, which counts posts per offer content
+    and must see a change without making an offer. None when nothing is due."""
+    return hashlib.sha256(got["text"].encode("utf-8")).hexdigest()[:16] if got else None
+
+
 def offer(ws: Path, cfg: dict, at: datetime) -> Optional[dict]:
     """`batch`, recorded as the message about to be posted: `sent` stamps only these ids."""
     ws = Path(ws)
@@ -1241,27 +1259,87 @@ class SlackReadFailed(Exception):
     """The post couldn't be checked: worth trying again, unlike a post that isn't there."""
 
 
+EMOJI_SLOT = "\ufffc"  # stands for any emoji, however Slack spelt it, when comparing a post with what was offered
+_WIRE_LINK = re.compile(r"<((?:https?|mailto|tel):[^|>\s]*)(?:\|([^>]*))?>")
+# Unicode's emoji: everything in the pictograph blocks, and the BMP characters that can be one. Not ✓ or → or the like.
+_EMOJI_CHARS = "\U0001F000-\U0001FAFF\u00A9\u00AE\u203C\u2049\u2122\u2139\u2194-\u2199\u21A9\u21AA\u231A\u231B\u2328\u23CF" \
+               "\u23E9-\u23F3\u23F8-\u23FA\u24C2\u25AA\u25AB\u25B6\u25C0\u25FB-\u25FE\u2600-\u2604\u260E\u2611\u2614\u2615" \
+               "\u2618\u261D\u2620\u2622\u2623\u2626\u262A\u262E\u262F\u2638-\u263A\u2640\u2642\u2648-\u2653\u265F\u2660" \
+               "\u2663\u2665\u2666\u2668\u267B\u267E\u267F\u2692-\u2697\u2699\u269B\u269C\u26A0\u26A1\u26A7\u26AA\u26AB\u26B0" \
+               "\u26B1\u26BD\u26BE\u26C4\u26C5\u26C8\u26CE\u26CF\u26D1\u26D3\u26D4\u26E9\u26EA\u26F0-\u26F5\u26F7-\u26FA\u26FD" \
+               "\u2702\u2705\u2708-\u270D\u270F\u2712\u2714\u2716\u271D\u2721\u2728\u2733\u2734\u2744\u2747\u274C\u274E" \
+               "\u2753-\u2755\u2757\u2763\u2764\u2795-\u2797\u27A1\u27B0\u27BF\u2934\u2935\u2B05-\u2B07\u2B1B\u2B1C\u2B50\u2B55" \
+               "\u3030\u303D\u3297\u3299"
+_UNI_EMOJI = "(?:[%s]|[0-9#*]\ufe0f?\u20e3)[\U000E0020-\U000E007F]*" % _EMOJI_CHARS
+# A name holds a letter, or it's one of these: `:30:` in 10:30:45 is a time, and two times must not compare equal.
+_CODE = r":(?:[a-z0-9_+'\-]*[a-z][a-z0-9_+'\-]*|\+1|-1|100|1234):(?::skin-tone-[2-6](?:-[2-6])?:)?"
+_JOIN = "[\u200d\ufe0f]*"
+_EMOJI_RUN = re.compile(r"(?:(?<![\w:])%s(?!\w)|%s)(?:%s(?:%s(?!\w)|%s))*%s" % (_CODE, _UNI_EMOJI, _JOIN, _CODE, _UNI_EMOJI, _JOIN))
+_GLUED_SLOT = "(?:%s|%s%s)+" % (EMOJI_SLOT, _CODE, _JOIN)
+_ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
+
+
+def _unescaped(t: str) -> str:
+    for ent, ch in _ENTITIES:
+        t = t.replace(ent, ch)
+    return t
+
+
+def _unwired(m) -> str:
+    return m.group(2) or m.group(1)
+
+
 def _norm(text) -> str:
-    """A message's text for comparing with what was offered, however often the path to Slack escaped it. It is compared
-    with text this code wrote, so undoing an escape too many can't let anything else match."""
+    """A message's text in the one form a post and an offer are compared in, whatever Slack did to it: `<url|label>` as
+    its label, `<url>` as the url, entities undone (however often the path to Slack escaped them), every emoji spelling
+    as one EMOJI_SLOT, and no trailing spaces on a line. A zero-width space stays: Slack keeps it. For comparing only:
+    `slack_text` is what a reader gets."""
     t = text if isinstance(text, str) else ""
     for _ in range(3):
-        u = slack_text(t)
+        u = _unescaped(_WIRE_LINK.sub(_unwired, t))
         if u == t:
             break
         t = u
+    t = _EMOJI_RUN.sub(EMOJI_SLOT, t)
     return "\n".join(l.rstrip() for l in t.replace("\r\n", "\n").split("\n")).strip()
+
+
+def _same_text(offered, stored) -> bool:
+    """`stored` says what `offered` said. A shortcode touching a word ("Done:white_check_mark:") reads as an emoji only
+    where the offer has one: anywhere else `key:one:two` is words, and words must match."""
+    a, b = _norm(offered), _norm(stored)
+    if a == b:
+        return True
+    return EMOJI_SLOT in a and re.fullmatch(_GLUED_SLOT.join(map(re.escape, a.split(EMOJI_SLOT))), b) is not None
 
 
 def _app_posted(msg: dict) -> bool:
     return bool(msg.get("app_id") or msg.get("bot_id") or msg.get("subtype") == "bot_message")
 
 
+def _bare_url(u: str) -> str:
+    return re.sub(r"^(?:https?://|mailto:|tel:)", "", _unescaped(u or ""), flags=re.I).rstrip("/").lower()
+
+
+def _is_preview(att, text: str) -> bool:
+    """A link preview of a link in the message's own text, which Slack adds after the post and nobody wrote. `edited`
+    comes with it, so `edited` on a post means nothing."""
+    if not isinstance(att, dict) or not (att.get("is_app_unfurl") is True or att.get("from_url")):
+        return False
+    links = {u.rstrip("/") for u in re.findall(r"(?:https?://|mailto:|tel:)[^\s|<>]+", _unescaped(text))}
+    return any(isinstance(att.get(k), str) and _unescaped(att[k]).rstrip("/") in links
+               for k in ("app_unfurl_url", "from_url", "original_url"))
+
+
 def _plain(msg: dict) -> bool:
-    """It draws what its `text` says: no attachments, and no blocks but the rich_text Slack adds on its own."""
+    """It draws what its `text` says: no attachments but a preview of its own links, no blocks but the rich_text Slack adds
+    on its own, and no link labelled as anything but its address (an offer has none, and Slack's auto-links are that)."""
     blocks = msg.get("blocks") or []
-    return not msg.get("attachments") and isinstance(blocks, list) \
-        and all(isinstance(x, dict) and x.get("type") == "rich_text" for x in blocks)
+    text = msg.get("text") if isinstance(msg.get("text"), str) else ""
+    atts = msg.get("attachments") or []
+    return isinstance(atts, list) and all(_is_preview(a, text) for a in atts) and isinstance(blocks, list) \
+        and all(isinstance(x, dict) and x.get("type") == "rich_text" for x in blocks) \
+        and all(not m.group(2) or _bare_url(m.group(2)) == _bare_url(m.group(1)) for m in _WIRE_LINK.finditer(text))
 
 
 def _batch_channel(cfg: dict) -> Optional[str]:
@@ -1295,7 +1373,7 @@ def record_post(ws: Path, cfg: dict, at: datetime, ids: List[str], ts: Optional[
     if not _app_posted(msg):
         raise ValueError("the message at %s wasn't posted by the app, so it isn't the batch; nothing was recorded" % ts)
     if not _plain(msg):
-        raise ValueError("the message at %s carries blocks or attachments, so it isn't the batch; nothing was recorded" % ts)
+        raise ValueError("the message at %s carries blocks, attachments or a relabelled link, so it isn't the batch; nothing was recorded" % ts)
     sent(ws, at, ids, str(ts), posted=msg.get("text"))
 
 
@@ -1319,7 +1397,7 @@ def sent(ws: Path, at: datetime, ids: List[str], ts: Optional[str] = None, poste
         offers = b.get("offers") or []
         shown, offered_at = b.get("offered_ids") or [], b.get("offered_at")
         if posted is not None:
-            match = next((o for o in reversed(offers) if _norm(o["text"]) == _norm(posted)), None)
+            match = next((o for o in reversed(offers) if _same_text(o["text"], posted)), None)
             if match is None:
                 raise ValueError("the message at %s isn't the batch `mother decide batch` offered: its text differs. "
                                  "Nothing was recorded" % ts)
@@ -1422,7 +1500,7 @@ def main(args, ws, cfg, out=sys.stdout, err=sys.stderr, at: Optional[datetime] =
 
 
 def _main_batch(verb, rest, ws, cfg, out, err, at) -> int:
-    """mother decide batch [--json] | sent [--ids D7,D8] [--ts TS]. Refused in a worker's process: announcing is what
+    """mother decide batch [--json] | sent --ts TS [--ids D7,D8|'']. Refused in a worker's process: announcing is what
     lets a reply reach a decision, so a worker must not be able to mark its own draft as seen."""
     if os.environ.get(guard.CHIEF_WORKER_ENV, "").strip():
         print(json.dumps({"ok": False, "message": "A chief worker can't announce decisions."}), file=out)

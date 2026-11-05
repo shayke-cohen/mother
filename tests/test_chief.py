@@ -1861,7 +1861,7 @@ class TestTick(Base):
         chief.pause(self.ws)
         r = chief.tick(self.ws, {}, AT)
         self.assertEqual(r, {"paused": True, "decided": [], "wake": None, "judge": [], "dispatched": [],
-                             "reconciled": [], "batch": False})
+                             "reconciled": [], "batch": False, "batch_key": None})
         hb = json.loads((chief.chief_dir(self.ws) / "heartbeat.json").read_text())
         self.assertEqual(hb, {"at": hub._iso(AT), "pid": os.getpid()})
         self.assertFalse((chief.chief_dir(self.ws) / "wake.json").exists())
