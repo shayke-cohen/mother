@@ -4118,6 +4118,39 @@ def run_grant_scope(a, ctx, sc, now=None, tool=None, inp=None):
 # ------------------------------------------------------------------ decision
 
 
+# All the chief's post to the self-DM may hold: nothing that draws anything but the offered text.
+SELF_DM_POST_KEYS = {"channel_id", "channelId", "channel", "text", "unfurl_links", "unfurl_media", "mrkdwn"}
+
+
+def live_offer_text(ws):
+    """The text of the batch `mother decide batch` offered and `sent` hasn't used up, or None. .mother/chief/ is written
+    only by `mother chief` and `mother decide`, which is why it can vouch for a post."""
+    if not ws:
+        return None
+    doc, ok = read_json(os.path.join(ws, ".mother", "chief", "decisions.json"))
+    b = doc.get("batch") if ok and isinstance(doc, dict) else None
+    text = b.get("offered_text") if isinstance(b, dict) and "offered" in b else None
+    return text if isinstance(text, str) and text else None
+
+
+def self_dm_unattended(a, ctx, inp):
+    """A worker or the chief, on a chat call to the manager's own DM. That DM is where the manager answers decisions, and
+    both read other people's text, so a row they wrote could get a yes for a draft it doesn't show. A worker never writes
+    there; the chief posts the live offer, exactly. Normal sessions keep own_dm, so `mother decide` checks the DM too."""
+    if chief_worker():
+        return "deny", "%s: a chief worker never writes to the manager's own DM, because the manager answers decisions " \
+                       "there. Say it in your PROGRESS line, or file it with `mother decide propose`." % a["what"]
+    doc, ok = read_json(os.path.join(ctx.ws, ".mother", "chief", "chief.json")) if ctx.ws else (None, False)
+    mine = ok and isinstance(doc, dict) and bool(ctx.sid) and doc.get("session_id") == ctx.sid
+    want = live_offer_text(ctx.ws)
+    if mine and want is not None and a.get("op") == "post" and isinstance(inp, dict) and set(inp) <= SELF_DM_POST_KEYS \
+            and inp.get("text") == want:
+        return "allow", "%s: the live batch, exactly as `mother decide batch` offered it." % a["what"]
+    return "deny", "%s: the chief writes to the manager's own DM only to post the live batch, exactly as `mother decide " \
+                   "batch --json` printed its text, with nothing else in the call. Anything else for the manager is " \
+                   "recorded as `now`." % a["what"]
+
+
 def bypass_passes(ctx):
     """policy.bypass_passes_asks is true (an invalid config counts as false)."""
     return bool(ctx.ok) and ((ctx.cfg.get("policy") or {}).get("bypass_passes_asks") is True)
@@ -4243,6 +4276,8 @@ def decide(a, ctx, transcript=None, tool=None, inp=None):
     if a["category"] in ALWAYS_NEVER:
         return "deny", "%s is on the never-list (%s). Do it by hand if it is really needed." % (
             a["what"], a["category"])
+    if a["kind"] == "chat" and unattended_session() and is_dm(a, ctx.cfg):
+        return self_dm_unattended(a, ctx, inp)
     if not ctx.ok:
         return "ask", "%s. No green list (%s): confirm it." % (a["what"], ctx.problem)
     auto, never = policy_lists(ctx.cfg)

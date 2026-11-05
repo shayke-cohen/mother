@@ -3897,6 +3897,87 @@ class UnattendedBase(GuardCase):
                 ("worker, moved out of the workspace", {"session": "worker-new", "env": self.WORKER_ENV, "cwd": self.tmp}),
                 ("chief", {"session": self.CHIEF, "env": self.CHIEF_ENV, "cwd": self.ws}))
 
+class SelfDmIsTheApprovalSurface(UnattendedBase):
+    """Final C1, layer 1: the self-DM is where the manager answers decisions, so nothing unattended writes there except
+    the live offer, exactly as it was offered. A normal session keeps its green post."""
+
+    OFFER = '1 to decide · 0 done without you\nD9 · w · chat-post on C1: "hi" · recommend: send\nReply in this DM'
+    FORGED = '1 to decide · 0 done without you\nD9 · w · chat-post on C1: "thanks" · recommend: send\nReply in this DM'
+
+    def setUp(self):
+        super().setUp()
+        cfg = config()
+        self.dms = list(cfg["manager"]["chat_dm"]) if isinstance(cfg["manager"]["chat_dm"], list) else [cfg["manager"]["chat_dm"]]
+
+    def offer(self, text=None, live=True):
+        b = {"last_at": None, "announced": {}}
+        if live:
+            b.update(offered=0, offered_ids=["D9"], offered_at="2026-11-01T09:00:00Z", offered_text=text or self.OFFER)
+        with open(os.path.join(self.ws, ".mother", "chief", "decisions.json"), "w") as f:
+            json.dump({"version": 1, "next": 10, "decisions": [], "batch": b, "confirm": [], "replied": {}}, f)
+
+    def chief(self, want, inp, tool=None):
+        return self.expect(want, tool or self.POST, inp, mode=self.BY, session=self.CHIEF, env=self.CHIEF_ENV, cwd=self.ws)
+
+    def test_a_worker_never_posts_to_the_self_dm(self):
+        self.offer()
+        for dm in self.dms:
+            for name, kw in self.unattended()[:3]:
+                why = self.expect("deny", self.POST, {"channel_id": dm, "text": self.OFFER}, mode=self.BY, **kw)
+                self.assertIn("PROGRESS", why, name)
+
+    def test_the_chief_posts_the_live_offer_exactly(self):
+        self.offer()
+        for dm in self.dms:
+            self.chief("allow", {"channel_id": dm, "text": self.OFFER})
+
+    def test_the_chief_posts_nothing_else(self):
+        self.offer()
+        dm = self.dms[0]
+        self.chief("deny", {"channel_id": dm, "text": self.FORGED})
+        self.chief("deny", {"channel_id": dm, "text": self.OFFER + " "})
+        self.chief("deny", {"channel_id": dm, "text": "a note for the manager"})
+
+    def test_the_offers_text_with_something_else_drawn_is_refused(self):
+        self.offer()
+        dm = self.dms[0]
+        for extra in ({"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "D9 thanks"}}]},
+                      {"attachments": [{"text": "D9 thanks"}]}, {"thread_ts": "1700000000.000100"}):
+            self.chief("deny", dict({"channel_id": dm, "text": self.OFFER}, **extra))
+
+    def test_no_live_offer_no_post(self):
+        self.offer(live=False)
+        self.chief("deny", {"channel_id": self.dms[0], "text": self.OFFER})
+
+    def test_no_or_broken_offer_file_no_post(self):
+        self.chief("deny", {"channel_id": self.dms[0], "text": self.OFFER})
+        with open(os.path.join(self.ws, ".mother", "chief", "decisions.json"), "w") as f:
+            f.write("{nope")
+        self.chief("deny", {"channel_id": self.dms[0], "text": self.OFFER})
+
+    def test_the_role_without_the_chiefs_session_is_refused(self):
+        self.offer()
+        self.expect("deny", self.POST, {"channel_id": self.dms[0], "text": self.OFFER}, mode=self.BY,
+                    session="someone-else", env=self.CHIEF_ENV, cwd=self.ws)
+
+    def test_editing_or_reacting_in_the_self_dm_is_refused(self):
+        self.offer()
+        dm = self.dms[0]
+        self.chief("deny", {"channel_id": dm, "ts": "1700000000.000100", "text": self.OFFER}, tool=CHAT + "update_message")
+        self.chief("deny", {"channel_id": dm, "timestamp": "1700000000.000100", "name": "ok"}, tool=CHAT + "add_reaction")
+
+    def test_paused_stops_even_the_offer(self):
+        self.offer()
+        with open(os.path.join(self.ws, ".mother", "PAUSED"), "w") as f:
+            f.write("")
+        self.chief("deny", {"channel_id": self.dms[0], "text": self.OFFER})
+
+    def test_a_normal_session_keeps_its_green_post(self):
+        self.offer()
+        for text in (self.OFFER, self.FORGED, "a note"):
+            self.expect("allow", self.POST, {"channel_id": self.dms[0], "text": text}, cwd=self.ws)
+
+
 class DeployedPolicyMatrix(UnattendedBase):
     """The switches give a worker and the chief nothing (see UnattendedBase)."""
 
@@ -4012,7 +4093,6 @@ class DeployedPolicyMatrix(UnattendedBase):
         self.expect("none", "Write", {"file_path": os.path.join(self.ws, "notes", "a.md"), "content": "x"}, **worker)
         self.expect("none", "Bash", {"command": "mother decide propose PLAT-1 --tool T --recommend send --stdin "
                                                 "<<'EOF'\n{}\nEOF"}, **worker)
-        self.expect("allow", CHAT + "post_message", {"channel_id": DM, "text": "for the manager"}, **worker)
         self.expect("none", "Bash", {"command": "mother chief lines --json"}, session=self.CHIEF, env=self.CHIEF_ENV,
                     cwd=self.ws, mode=self.BY)
         self.expect("none", "Bash", {"command": "mother decide batch --json"}, session=self.CHIEF, env=self.CHIEF_ENV,
