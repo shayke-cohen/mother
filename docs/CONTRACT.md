@@ -1305,14 +1305,30 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   never `.mother/PAUSED`; either one pauses the tick and the triage.
 - **Triage, decided in code** (`leadOnce` in `hooks/chief.tsx`; desktop surface only, once a minute). After a tick
   it led that returned `judge` lines, the mod reads them with `lines --json` (`{id, key, kind, title, who, link,
-  summary, also, session}`, `session` `"desktop"` when the key has a live hub session, else null) and asks the model
-  (`chief.triage_model`, `$.model.complete`, 20 s timeout, 300 tokens; never for a `manual` line or one whose key
-  has a live session; none at all when the budget is spent) for a verdict `{is_work, needs_attention, title, tldr}`
-  per line, then sends `{judge, verdicts}` to `triage --stdin --decide`, which records a decision for every judge
+  summary, also, session, source, channel, to_manager}`, `session` `"desktop"` when the key has a live hub session,
+  else null; `source` the key's kind, `channel` a chat channel's configured name, `to_manager` `addressed` for a
+  direct message, `mentioned` when the line's text names the manager, else null) and asks the model
+  (`chief.triage_model`, `$.model.complete`, 30 s timeout, 900 tokens; never for a `manual` line or one whose key
+  has a live session; none at all when the budget is spent) for a verdict per line: `{is_work, needs_attention,
+  kind: decide|reply|act|fyi, on: manager|team|other, urgency: now|today|later, title (<= 60), tldr (<= 200),
+  actions: [{label (<= 24), prompt (<= 300)}]}` with 2-3 actions, the recommended one first. `decide` = only the
+  manager can settle it, `reply` = someone waits for the manager's answer, `act` = work an agent can mostly do,
+  `fyi` = nothing to do; an action's `prompt` is an instruction for an agent session, its `label` a short button. The
+  older four-field verdict is still valid; an unknown `kind` reads `act`, `on` `manager`, `urgency` `today`; an
+  action off-shape is dropped, the rest are one safe line each, at most 3. The prompt is a fixed note, then
+  `{context, line}` as JSON, at most 6000 characters, all of it untrusted data. `context` is `mother chief context
+  --json`, read once per session: `{version, manager: {name, short}, teams: [{name, people: [names]}], projects,
+  repos}` (the hub's followed tracker projects and repos plus each team's own), at most 1500 characters. **What
+  leaves the machine for triage**, to the model API: the line (its key, title, summary up to 1000 characters, who
+  wrote it, link) and these names of the manager, the teams and their people, projects and repos. No ids, no emails.
+  The mod then sends `{judge, verdicts}` to `triage --stdin --decide`, which records a decision for every judge
   line in one `hub decide`: `log` when a well-formed verdict for its key says `is_work` false or `needs_attention`
   false (`why: "triage: <title>"`; never a `manual` or `error` line, one whose key has a live session, or an update
   whose decide would also settle older same-key updates) and for a `sweep` line; `now` for the rest, with title and
-  why from the verdict's title and tldr, else the line's title and summary, and the line's link. No verdict (a failed
+  why from the verdict's title and tldr, else the line's title and summary, and the line's link. A `now` item's
+  `kind`, `on`, `urgency` and `actions` are kept in `.mother/chief/triage.json` (`{version, items: {<update id>:
+  {...}}}`; a side file, so hub.json's schema is unchanged), dropped when the hub no longer holds the update or the
+  key is decided again with no verdict. No verdict (a failed
   call, no budget) is `now`, never `log`. It prints `{paused, logged, now}`. `hub.decide` stores a `now` whose key has
   a live session as a route to it. Nothing here ever submits a prompt or posts anywhere.
 - **Spend.** The mod reports the cost of triage, TL;DR and floor calls through `mother chief spend --stdin`
@@ -1330,8 +1346,9 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   `led_by` is that heartbeat's `session_id` while it is alive, else null. `desktop` is the snapshot rows still live in
   the app (`last_report` is the first 200 characters of the last turn report). `spent` reads 0 when `spend.json` is
   unreadable; `unreadable` is then true, and `over` (spent at the limit, or unreadable) says no model call is made.
-  `inbox` is the hub's open updates, which is what a `now` decision makes (`{id, key, title, why, link, at, session}`,
-  each text one safe line, newest first, at most 10) and `inbox_count` all of them. An open update keyed
+  `inbox` is the hub's open updates, which is what a `now` decision makes (`{id, key, title, why, link, at, session, kind, on, urgency, actions}`,
+  each text one safe line; by urgency `now`, `today`, `later`, then newest first; at most 10; `kind`, `on` and
+  `urgency` are null and `actions` `[]` for an item decided with no verdict, which sorts as `today`) and `inbox_count` all of them. An open update keyed
   `watcher:<source>` (a source the watcher could not read) is not work: it is left out of both and listed in `health`.
   The text form (`status`) prints who leads, the budget, and the pinned and inbox counts.
 - **`health`** (in `status --json`; `health_doc`), so the pane reads no more files: `{guard, watcher, watcher_errors,
@@ -1379,7 +1396,17 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   it. Then bordered **cards**, coloured by kind: **Needs you** (the floor, below), **Inbox** (coloured and badged
   by source, read from the key's shape: chat, mail, tracker, code, calendar, manual, error) and **Pinned** (a state
   badge `asks` / `active Nm` / `idle Nh`; this session's own card says `this session`). A card is compact (title
-  row, badge, key or repo, age, its primary button) or expanded: Inbox adds the why, two suggested prompts fixed per
+  row, badge, key or repo, age, and up to 3 short action buttons, the first, primary one being the recommended) or
+  expanded. The compact buttons: an Inbox card's are its verdict's actions (`inbox-act:<id>:<n>`; each opens a new
+  session on the item's case brief with the action's prompt as its prompt line, or, when the key already has a live
+  case session, sends the prompt to that session as the chat box does and opens a new one only if that is not
+  delivered; "Cases" below), else the two suggestions fixed per source, then Done;
+  a Needs you card's are its options; a pinned card's are its TL;DR's reply chips (a press fills the card's chat box
+  and opens the card), then Open; a Today, Team or Suggested card's are the tick's actions (each fills `mother now do
+  <id>`, as the Now panel). An Inbox card also wears a kind badge after its source badge (`decide` in the warning
+  colour, `reply`, `act`; none for `fyi`) and `urgent` in the error colour while its urgency is `now`; expanded it
+  adds one dim line `<kind> · on <on> · <urgency>` and, dim under the buttons, what each one sends. The Inbox is
+  sorted by urgency, then newest. Expanded, Inbox adds the why and, for an item with no actions of its own, two suggested prompts fixed per
   source (a chosen one becomes the brief Open session types into a new session; with none, Open session is the
   key's live session, else the item filled into a new session's prompt, never sent), Done (`mother hub done`) and
   Snooze (`mother hub snooze`); Pinned adds the TL;DR or last report, the chat box and the chips. The title row
@@ -1454,7 +1481,7 @@ value, anything else reads as `sonnet`). The keys of the removed layer (`max_wor
   this session (a claim never makes a route for a key the hub did not raise); or the key is live in another session
   whose row was opened or routed to in the last 7 days (older: that row is dropped and the key moves). An update whose
   key has a live case is not pruned (not by its TTL either) until it is done; the status' inbox item carries
-  `session: {key, title, kind: "case", cli_session_id}` and its card a `has a session` badge.
+  `session: {key, title, kind: "case", cli_session_id}` and its card a `case` badge.
 - **Status.** `cases: [{key, cli_session_id, title, link, label, unseen, last_routed_at, opened_at, deliver_now}]`
   (live case rows, oldest first; `unseen` = routed lines not yet delivered) and `relay: {on}`. A session in `cases` is
   on the floor like a pinned one: it writes its card, and Needs you shows it. The Sessions tab lists the pinned

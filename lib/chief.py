@@ -166,18 +166,109 @@ def _session_kind(sessions: dict, line: dict) -> Optional[str]:
     return "desktop" if hit is not None and not _is_cli(hit[1]) else None
 
 
-def lines(ws: Path) -> List[dict]:
+def _manager_names(cfg: dict) -> Tuple[str, str]:
+    """(name, short name) of the manager from config.json -> agent; '' for one that is not set."""
+    a = (cfg or {}).get("agent")
+    a = a if isinstance(a, dict) else {}
+    name = safe_line(a.get("manager") if isinstance(a.get("manager"), str) else "", NAME_MAX)
+    short = safe_line(a.get("manager_short") if isinstance(a.get("manager_short"), str) else "", NAME_MAX)
+    return name, short
+
+
+def _to_manager(cfg: dict, l: dict) -> Optional[str]:
+    """`addressed` for a direct message, `mentioned` when the line's text names the manager (their chat id as a
+    mention, or their name or short name as a word), else None: only what the line itself shows."""
+    key = str(l.get("key") or "")
+    if key.endswith("/dm") or (key.startswith("wa:") and not key.endswith("@g.us")):
+        return "addressed"
+    text = "%s %s" % (l.get("title") or "", l.get("summary") or "")
+    me = hub.build_me(cfg or {})
+    if me.get("chat") and "<@%s" % me["chat"] in text:
+        return "mentioned"
+    for n in _manager_names(cfg):
+        if len(n) >= 2 and re.search(r"(?<!\w)@?%s(?!\w)" % re.escape(n), text, re.IGNORECASE):
+            return "mentioned"
+    return None
+
+
+def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
     """The lines waiting for a decision: the digest after the cursor, trimmed to the fields triage needs, plus
-    `session` ("desktop" for a live hub session, else None)."""
+    `session` ("desktop" for a live hub session, else None), `source` (the key's kind), `channel` (a chat channel's
+    configured name, else None) and `to_manager` (`addressed`, `mentioned` or None, as `_to_manager`)."""
     ws = Path(ws)
     sessions = hub._sessions_doc(ws)
+    channels = _channel_names(cfg or {})
     out = []
     for l in _pending_lines(ws):
         d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
         d["also"] = list(l.get("also") or [])
         d["session"] = _session_kind(sessions, l)
+        key = str(l.get("key") or "")
+        d["source"] = source_of(key)
+        name = channels.get(key.split("/", 1)[0]) if d["source"] == "chat" and "/" in key else None
+        d["channel"] = safe_line(name, LABEL_MAX) if name else None
+        d["to_manager"] = _to_manager(cfg or {}, l)
         out.append(d)
     return out
+
+
+# ---- triage context: who the manager is and what they run, names only, for the triage prompt ----
+
+NAME_MAX = 40
+CONTEXT_MAX = 1500          # characters of the context as compact JSON
+CONTEXT_TEAMS, CONTEXT_PEOPLE, CONTEXT_LIST = 8, 12, 12
+
+
+def triage_context(ws: Path, cfg: dict) -> dict:
+    """`context --json`: {version, manager: {name, short}, teams: [{name, people: [names]}], projects, repos}. Names
+    only: no ids, no emails. `projects` and `repos` are what the hub follows (config and the watch list) plus each
+    team's own. Trimmed from the end of its longest list until the compact JSON is at most CONTEXT_MAX characters."""
+    cfg = cfg or {}
+    name, short = _manager_names(cfg)
+    teams, projects, repos = [], [], []
+
+    def add(dst, v):
+        v = safe_line(v, NAME_MAX) if isinstance(v, str) else ""
+        if v and v not in dst and len(dst) < CONTEXT_LIST:
+            dst.append(v)
+
+    for t in cfg.get("teams") if isinstance(cfg.get("teams"), list) else []:
+        if not isinstance(t, dict):
+            continue
+        people = []
+        for p in t.get("people") if isinstance(t.get("people"), list) else []:
+            add(people, p.get("name") if isinstance(p, dict) else None)
+        tname = safe_line(t.get("name") if isinstance(t.get("name"), str) else "", NAME_MAX) \
+            or safe_line(t.get("slug") if isinstance(t.get("slug"), str) else "", NAME_MAX)
+        if tname and len(teams) < CONTEXT_TEAMS:
+            teams.append({"name": tname, "people": people[:CONTEXT_PEOPLE]})
+        tr = t.get("tracker")
+        add(projects, tr.get("project") if isinstance(tr, dict) else None)
+        for r in t.get("repos") if isinstance(t.get("repos"), list) else []:
+            add(repos, r)
+    try:
+        watch = hub.merged_watch(cfg, hub.load_watch(ws))
+    except Exception:  # an unreadable watch list: the config's own teams still say enough
+        watch = {}
+    for k in (watch.get("tracker") or {}).get("projects") or []:
+        add(projects, k)
+    for r in (watch.get("code") or {}).get("repos") or []:
+        add(repos, r)
+    doc = {"version": 1, "manager": {"name": name, "short": short}, "teams": teams, "projects": projects, "repos": repos}
+
+    def size():
+        return len(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
+
+    while size() > CONTEXT_MAX:
+        lists = [repos, projects] + [t["people"] for t in teams]
+        longest = max(lists, key=len)
+        if longest:
+            longest.pop()
+        elif teams:
+            teams.pop()
+        else:
+            break
+    return doc
 
 
 def _read_obj(path: Path) -> dict:
@@ -267,6 +358,61 @@ def _verdict_ok(v) -> bool:
             and isinstance(v.get("title"), str) and isinstance(v.get("tldr"), str))
 
 
+KINDS, ONS, URGENCIES = ("decide", "reply", "act", "fyi"), ("manager", "team", "other"), ("now", "today", "later")
+KIND_DEFAULT, ON_DEFAULT, URGENCY_DEFAULT = "act", "manager", "today"
+ACTIONS_MAX, ACTION_LABEL_MAX, ACTION_PROMPT_MAX = 3, 24, 300
+TRIAGE_FILE = "triage.json"   # .mother/chief/triage.json: {version, items: {<update id>: {kind, on, urgency, actions}}}
+
+
+def clean_actions(actions) -> List[dict]:
+    """A verdict's actions as a card may show them: at most 3 of {label, prompt}, each one safe line (24 and 300
+    characters), both non-empty. Anything off-shape is dropped."""
+    out = []
+    for a in actions if isinstance(actions, list) else []:
+        if not isinstance(a, dict) or not isinstance(a.get("label"), str) or not isinstance(a.get("prompt"), str):
+            continue
+        label, prompt = safe_line(a["label"], ACTION_LABEL_MAX), safe_line(a["prompt"], ACTION_PROMPT_MAX)
+        if label and prompt:
+            out.append({"label": label, "prompt": prompt})
+        if len(out) == ACTIONS_MAX:
+            break
+    return out
+
+
+def verdict_extra(v) -> Optional[dict]:
+    """{kind, on, urgency, actions} from a verdict that carries any of them, else None (the older four-field
+    verdict). An unknown kind reads `act`, an unknown `on` `manager`, an unknown urgency `today`."""
+    if not isinstance(v, dict) or not any(k in v for k in ("kind", "on", "urgency", "actions")):
+        return None
+
+    def pick(name, allowed, default):
+        return v[name] if isinstance(v.get(name), str) and v[name] in allowed else default
+
+    return {"kind": pick("kind", KINDS, KIND_DEFAULT), "on": pick("on", ONS, ON_DEFAULT),
+            "urgency": pick("urgency", URGENCIES, URGENCY_DEFAULT), "actions": clean_actions(v.get("actions"))}
+
+
+def _triage_items(ws: Path) -> dict:
+    items = _read_obj(chief_dir(ws) / TRIAGE_FILE).get("items")
+    return items if isinstance(items, dict) else {}
+
+
+def _store_extras(ws: Path, extras: dict) -> None:
+    """Keep each `now` item's verdict extras by update id (None drops one: the item was decided again with no
+    verdict), and drop the entries whose update the hub no longer holds."""
+    with hub.locked(ws):
+        items = _triage_items(ws)
+        for uid, extra in extras.items():
+            if extra is None:
+                items.pop(uid, None)
+            else:
+                items[uid] = extra
+        held = {u.get("id") for u in hub._hub_doc(ws)["updates"] if isinstance(u, dict)}
+        items = {k: v for k, v in items.items() if k in held}
+        chief_dir(ws).mkdir(parents=True, exist_ok=True)
+        _write_atomic(chief_dir(ws) / TRIAGE_FILE, json.dumps({"version": 1, "items": items}, ensure_ascii=False) + "\n")
+
+
 def _folds_others(raw: List[dict], start: int, l: dict) -> bool:
     """True when deciding `l` would also settle another line: an update stands for every same-key update after the
     cursor with no later `at` (hub.decide moves the cursor past them all; the digest showed only the newest)."""
@@ -284,7 +430,8 @@ def _one_line(text: str, cap: int) -> str:
 def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts: List[dict]) -> dict:
     """Decide every `judge` line in code, for the leading session (no model turn).
 
-    `verdicts` is [{line_id, key, is_work, needs_attention, title, tldr}]. A line is logged when it has a well-formed
+    `verdicts` is [{line_id, key, is_work, needs_attention, title, tldr, kind?, on?, urgency?, actions?}]; the last
+    four (`verdict_extra`) are kept for a `now` item in .mother/chief/triage.json by its update id. A line is logged when it has a well-formed
     verdict for its key that says is_work false or needs_attention false (never a `manual` or `error` line, one whose
     key has a live session, or an update whose decide would also fold other same-key updates), with
     `why: "triage: <title>"`, and a `sweep` line is logged too: it asks a hub session to look again, and there is none. Every
@@ -323,7 +470,12 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
             items.append({"line_id": l["id"], "key": l["key"], "decision": "now", "title": title, "why": why,
                           "link": l.get("link") or ""})
     if items:
-        hub.decide(ws, cfg, at, items)
+        extras = {}
+        for res in hub.decide(ws, cfg, at, items):
+            if res.get("decision") == "now" and res.get("update_id"):
+                extras[res["update_id"]] = verdict_extra(by_id.get(res["line_id"]))
+        if extras:
+            _store_extras(ws, extras)
         sync_relays(ws)   # a line routed to a case session waits in relays.json for that session to take
     out["logged"] = [it["line_id"] for it in items if it["decision"] == "log"]
     out["now"] = [it["line_id"] for it in items if it["decision"] == "now"]
@@ -402,12 +554,13 @@ def _item_session(hit) -> dict:
 
 
 def inbox_items(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
-    """The hub's open updates (what a `now` decision makes), newest first, for the Chief pane's Inbox section. The
+    """The hub's open updates (what a `now` decision makes), by urgency (`now`, `today`, `later`; none reads
+    `today`) then newest first, each with its triage `kind`, `on`, `urgency` and `actions` when it has them, for the Chief pane's Inbox section. The
     text is line- or model-written, so each field is one safe line. `session` is the live hub session for the key.
     `source` is the key's kind, `who` the person its newest inbox line names ('' when none) and `label` what a card
     shows in place of the raw key (`item_label`)."""
     h, sessions = hub._hub_doc(ws), hub._sessions_doc(ws)
-    whos, channels = _who_by_key(ws), _channel_names(cfg or {})
+    whos, channels, extras = _who_by_key(ws), _channel_names(cfg or {}), _triage_items(ws)
     rows = []
     for u in h["updates"]:
         if not isinstance(u, dict) or u.get("state") != "open" or not isinstance(u.get("id"), str):
@@ -419,7 +572,11 @@ def inbox_items(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
                      "link": u.get("link") if isinstance(u.get("link"), str) else "", "at": u.get("at"),
                      "source": source_of(u.get("key")), "who": who, "label": item_label(u.get("key"), who, channels),
                      "session": (_item_session(hit) if hit and not _is_cli(hit[1]) else None)})
+        # the triage verdict's extras, cleaned again on the way out (the file is only data); None / [] when none
+        x = verdict_extra(extras.get(u["id"])) or {"kind": None, "on": None, "urgency": None, "actions": []}
+        rows[-1].update(x)
     rows.sort(key=lambda r: str(r["at"] or ""), reverse=True)
+    rows.sort(key=lambda r: URGENCIES.index(r["urgency"] or URGENCY_DEFAULT))   # stable: newest first inside one urgency
     return rows
 
 
@@ -1054,6 +1211,8 @@ USAGE = """usage: mother chief <verb> ...
                         decided in code, `log` when its verdict says it needs no attention and `now` for the rest;
                         prints {paused, logged, now}
   lines [--json]        the inbox lines waiting for a decision
+  context --json        what the triage prompt says about the manager: their name, the teams with their people's
+                        names, the followed tracker projects and repos; names only, at most 1500 characters
   status [--json]       paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}
@@ -1085,7 +1244,7 @@ A valued option takes --opt=V or --opt V."""
 
 # verb: (boolean flags, valued options); only `report` and `relay` take a positional
 VERBS = {
-    "lines": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
+    "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
@@ -1325,12 +1484,15 @@ def main(args, ws, cfg, at) -> int:
         print("chief %s" % ("paused" if verb == "pause" else "resumed"))
         return EXIT_OK
     if verb == "lines":
-        got = lines(ws)
+        got = lines(ws, cfg)
         if as_json:
             print(json.dumps(got, indent=2, ensure_ascii=False))
         else:
             for l in got:
                 print("%s  %s  [%s]  %s: %s" % (l["id"], l["key"], l["session"] or "-", l["who"], l["title"]))
+        return EXIT_OK
+    if verb == "context":
+        print(json.dumps(triage_context(ws, cfg), ensure_ascii=False))
         return EXIT_OK
     if verb == "triage":
         if not (opts.get("stdin") and opts.get("decide")):

@@ -221,6 +221,11 @@ export type ChiefInboxItem = {
   source?: string                    // the key's kind: chat, mail, tracker, code, calendar, manual, error, other
   who?: string                       // the person its newest inbox line names; '' when none
   label?: string                     // what a card shows in place of the raw key: a channel's name, a person, `mail thread`…
+  // the triage verdict, from .mother/chief/triage.json; null / [] for an item decided with none (hooks/pane_ui.tsx verdictExtra)
+  kind?: 'decide' | 'reply' | 'act' | 'fyi' | null
+  on?: 'manager' | 'team' | 'other' | null
+  urgency?: 'now' | 'today' | 'later' | null
+  actions?: { label: string; prompt: string }[]   // at most 3, the first the recommended one
   session: { key: string; title: string; kind?: 'case'; cli_session_id?: string } | null   // the live hub session for the key; a case names its session
 }
 
