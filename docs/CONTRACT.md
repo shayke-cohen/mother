@@ -1298,8 +1298,10 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   (`{"YYYY-MM-DD": usd}` in the configured timezone, the last 14 days). `desktop.json` (`{at, sessions: [{session_id,
   cli_session_id, title, cwd, link}]}`: the pinned desktop sessions, written only by `mother chief pinned --stdin`).
   `desktop-cache.json` (fields read from the app's session files, keyed by mtime and size), `tldr.json` (the pane's
-  TL;DRs), `status.json` (the last `status --json --save`, for the fast refresh) and `PAUSED` (the chief-only switch). Every write is a temp-file rename; spend, `desktop.json` and
-  `tldr.json` take `hub.locked`. **What the removed layer left** (`chief.json`, `wake.json`, `queue.jsonl`,
+  session cards), `status.json` (the last `status --json --save`, for the fast refresh), `triage.json` and
+  `verdicts.jsonl` (triage, below), `asks.json` (ask-box holds), `relays.json` and `relay-now/` (Cases), `actions.jsonl`,
+  `habits.json` and `quieted.json` (Habits), and the switches `PAUSED` (chief only), `RELAY_OFF` and `HABITS_OFF`. Every
+  write is a temp-file rename; spend, `desktop.json` and `tldr.json` take `hub.locked`. **What the removed layer left** (`chief.json`, `wake.json`, `queue.jsonl`,
   `decisions.json`, `run/`, `logs/`, `keeper.*`, and worker rows in `sessions.json`, the entries with `kind: "cli"`)
   is never read and never crashes anything. A worker row that still reads `live` is marked `dropped` on the next
   tick, so no line is routed to a worker that no longer runs; such a row is never a session for triage, the Inbox
@@ -1349,18 +1351,19 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   each append); `mother chief why <key> [--json]` prints that key's last 10, newest first. No verdict (a failed
   call, no budget) is `now`, never `log`. It prints `{paused, logged, now}`. `hub.decide` stores a `now` whose key has
   a live session as a route to it. Nothing here ever submits a prompt or posts anywhere.
-- **Spend.** The mod reports the cost of triage, TL;DR and floor calls through `mother chief spend --stdin`
+- **Spend.** The mod reports the cost of triage, session-card, floor and Ask-routing calls through `mother chief spend --stdin`
   (`{model, input_tokens?, output_tokens?}`), so they count in `daily_budget_usd`. A missing usage counts as 1024
   output tokens and an unknown model at the dearest price. Over budget, or with an unreadable `spend.json` (which
-  `spend` never overwrites), no model call is made: lines are recorded as `now` untriaged and stored TL;DRs stay on
-  the cards.
+  `spend` never overwrites), no model call is made: lines are recorded as `now` untriaged, stored cards stay on the
+  pane, and an ask opens a case without routing. A question from `wrap_up` costs no call and is still written.
 - **Pinned desktop sessions.** `mother chief pinned --stdin` takes `list_sessions` rows (JSON array) and writes
   `desktop.json` from those with `pinned: true`; the CLI session id is read from the app's own `local_<id>.json`,
   never from the row, and archived or unreadable sessions are dropped. A pinned session is shown and talked to, never
   driven.
 - **`ChiefStatus`** (`status --json`, version 1, `types/index.d.ts`): `{version, at, paused, chief: {alive,
   heartbeat_at}, budget: {spent, limit, unreadable, over}, desktop: [{session_id, cli_session_id, title, cwd, repo,
-  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard, health, quiet}`. `quiet` is true inside `manager.quiet_hours`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
+  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, cases, relay, guard, health, habits, quieted,
+  floor, quiet}` (`cases` and `relay`: "Cases"; `habits` and `quieted`: "Habits"; `floor`: "Waiting on"). `quiet` is true inside `manager.quiet_hours`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
   `led_by` is that heartbeat's `session_id` while it is alive, else null. `desktop` is the snapshot rows still live in
   the app (`last_report` is the first 200 characters of the last turn report). `spent` reads 0 when `spend.json` is
   unreadable; `unreadable` is then true, and `over` (spent at the limit, or unreadable) says no model call is made.
@@ -1378,22 +1381,22 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   be delivered to the manager's DM: `[{name, routine, date, bytes}]`, newest first, at most 20, plain files only.
   `mother chief report <name>` prints one such file's text; a name off `^[a-z0-9-]+-unsent-\d{4}-\d{2}-\d{2}\.md$`,
   a missing file, a link, a file outside `.mother/` or one past 64 KB exits 2 and prints nothing.
-- **TL;DR, chips and Open on the Chief pane.** `mother chief tail --json` prints `{version: 1, model, sessions:
-  [{id, kind: "pinned", fingerprint, text, cached?}]}`: one row per pinned session (`id` its CLI id) with something
-  to summarise. `text` is the transcript's last 12 main-thread user and assistant messages from
+- **TL;DR, chips and Open on the Chief pane.** `mother chief tail --json` prints `{version: 1, model, refresh_minutes, sessions:
+  [{id, kind: "pinned" | "case", fingerprint, text, cached?, ...}]}`: one row per pinned or live case session (`id` its
+  CLI id) with something to summarise; "Session refresh" below has the other fields. `text` is the transcript's last 12 main-thread user and assistant messages from
   `~/.claude/projects/<cwd slug>/<id>.jsonl` (the snapshot's `cwd`; the last 512 KB read), `role: text` per line
   with tool output, thinking and sidechains left out, each message cut to 1500 and the whole to its last 6000
   characters; `fingerprint` is `t:<size>:<mtime_ns>`. With no transcript, the session's `last_report` (`r:<sha1>`).
   `model` is `chief.tldr_model`. `cached` is `tldr.json`'s entry for that id when its fingerprint and model both
   match. `mother chief tldr --stdin` takes `[{id, fingerprint, model, tldr, chips}]` and merges them into `tldr.json`
-  (`{<id>: {fingerprint, model, tldr, chips, at}}`, live sessions only; entries for sessions that are gone are pruned
-  on every store); prints `{stored: N}`. **These tails leave the machine:** while the pane is shown, the recent
-  transcript tails of every pinned desktop session (any repo) leave this machine: the tails,
+  (`{<id>: {fingerprint, model, tldr, chips, at}}`, plus the card fields, live sessions only; entries for sessions that
+  are gone are pruned on every store); prints `{stored, cards}`. **These tails leave the machine:** the recent
+  transcript tails of every pinned desktop session (any repo) and every live case session leave this machine: the tails,
   pinned desktop sessions included, are sent to the model API, as the session's own requests are. The mod asks the model (`$.model.complete`, `chief.tldr_model`,
   effort `low`, 1024 tokens, 30 s) only for a row with no match (id, fingerprint and model) in its memory or
-  `cached`, only while the Chief pane is shown (`$.ui.panes()`), from the timer pass (detached; one batch at a time)
-  and when `/chief` opens the pane (never from a draw), at most every 15 s and 6 calls a minute; a failed row is
-  asked again after 5 minutes or when it moves. Results a `tldr --stdin` failed to store are sent again on the next
+  `cached`, from the timer pass (detached; one batch at a time) and when `/chief` opens the pane (never from a draw),
+  at most every 15 s and 6 calls a minute, while the pane is shown or, on the leading session, with no pane shown
+  ("Session refresh" below); a failed row is asked again after 5 minutes or when it moves. Results a `tldr --stdin` failed to store are sent again on the next
   refresh. The tail goes in as JSON data under a fixed note; the reply must be one JSON object `{tldr, chips}`, and
   anything off keeps the card's `last_report`. Both the CLI and the mod drop control characters (C0 but newline,
   DEL, C1) and bidi marks, embeddings, overrides and isolates from the TL;DR and chip text, and keep `tldr` to 2
@@ -1429,7 +1432,7 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   <source>` or `Network: <source> unreachable`, the short reason, **Retry** (coral: `mother hub check <source>`, then
   `mother hub refresh` when it answers, then the status again) and **How to fix** (folded). A card goes when the
   watcher reads the source again.
-- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | notify on|off|status | expand | collapse | skin dark|dark-app|plain|status | tab <name>]`; the mod polls once a minute; drawn
+- **The pane** (`/chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab <name>]`; the mod polls once a minute; drawn
   by `hooks/chief.tsx` with the frames, badges and strip of `hooks/pane_ui.tsx`, in the skin of `hooks/skin.tsx`).
   **The skin**: on the desktop app the pane is one dark panel (the banner its first row, cropped to its width) with
   dark cards (the border coloured by kind; the selected card's bold and coral), light text, rounded badges and filled
@@ -1450,15 +1453,16 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   as words (`waiting on your yes`, `from <name>` through the config's people, `raised 3h ago`, `first seen` only
   when it differs), and every open card that stands for a dots action loads what it does (`dots-detail`) on the
   console pass and on `/chief expand`, once per item, never in a draw. **Who leads**: with nobody leading the badge is a dim `starting…` until the heartbeat is older
-  than 3 minutes (or absent), and only then a red `nobody leading`. A **header strip**: the picture,
-  "Mother" / "Chief of Stuff", the counts as pills (`N need you`, `N inbox`, `N sessions`), the budget (`$1.50 /
-  $20` and a bar), who leads (`led here`, `led by another session` or `nobody leading`, from `led_by` and this
-  session's id) and the heartbeat's age; an unreadable spend file, a spent budget and the pause are red lines under
+  than 3 minutes (or absent), and only then a red `nobody leading`. A **header strip**: the picture
+  (with "Mother" / "Chief of Stuff" beside it unless a banner carries them), the mood line, the what-just-changed line,
+  then one row: the budget (`$1.50 / $20` and a bar), who leads (from `led_by` and this session's id; the plain skin
+  writes `led here` or `led by another session` in full), a red `guard off` or `paused` pill and the heartbeat's age. The
+  counts are on the tabs, not the strip. An unreadable spend file, a spent budget and the pause are red lines under
   it. Then bordered **cards**, coloured by kind: **Needs you** (the floor, below), **Inbox** (coloured and badged
-  by source, read from the key's shape: chat, mail, tracker, code, calendar, manual, error) and **Pinned** (a state
-  badge `asks` / `active Nm` / `idle Nh`; this session's own card says `this session`). A card is compact (title
-  row, badge, key or repo, age, and up to 3 short action buttons, the first, primary one being the recommended) or
-  expanded. The compact buttons: an Inbox card's are its verdict's actions (`inbox-act:<id>:<n>`; each opens a new
+  by source, read from the key's shape: chat, mail, tracker, code, calendar, manual, error) and the session cards (a
+  refreshed card's state badge, "Session refresh" below, else the older `asks` / `active Nm` / `idle Nh`; this session's
+  own card says `this session`). A card is compact (title, badges, human label, age and link, and up to 3 short action
+  buttons, the first, primary one being the recommended) or expanded. The compact buttons: an Inbox card's are its verdict's actions (`inbox-act:<id>:<n>`; each opens a new
   session on the item's case brief with the action's prompt as its prompt line, or, when the key already has a live
   case session, sends the prompt to that session as the chat box does and opens a new one only if that is not
   delivered; "Cases" below), else the two suggestions fixed per source, then Done;
@@ -1473,9 +1477,10 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   Snooze (`mother hub snooze`); Pinned adds the TL;DR or last report, the chat box and the chips. The title row
   toggles a card (`chiefOpen`); Needs you starts expanded, the rest compact, `/chief expand | collapse` sets all.
   The card a button was last pressed on is the selected one (`chiefSelected`): a bold border, and open. An empty
-  section is one dim line. The status line adds ` · N need you` and ` · N in inbox`, each only when N > 0.
-- **Tabs.** Under the strip, a row of buttons with counts: `Needs you`, `Inbox`, `Sessions`, `Today`, `Team`, `Health`
-  (no count; a red dot when something is wrong), then `All`.
+  section is one dim line. The status line's two counts appear only when N > 0.
+- **Tabs.** Under the Ask box, a row of buttons with counts: `Needs you` (sign-in cards and questions; chase and Done
+  cards are listed, not counted), `Inbox`, `Sessions`, `Today`, `Team`, `Health` (no count; a red dot when something is
+  wrong), then `All`.
   Only the shown tab's section is drawn (no heading: the tab is it); `All` stacks every section under its heading.
   The shown tab is the manager's pick (`chiefTab.picked`, by a press or `/chief tab needs|inbox|sessions|today|team|health|all`),
   else the first tab that holds something, else `All`. A tab whose count is above the count it had when last opened
@@ -1510,10 +1515,11 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   JPEG of at most 120000 base64 characters (its size from the SOF0/SOF2 frame header), and `svg` the markup of
   `assets/art/mother-cos.svg`. `source` is `custom` when either workspace file is used; both are machine-local and
   never synced. The mod runs the verb once per session. A wide picture (width / height >= 1.4) is a banner above the
-  strip (44 columns, rows by its shape, 6 to 14), a squarer one a 10 by 5 spot at the strip's left. The terminal
-  draws `png` in an `Image`. The desktop app has no `Image`: it draws `jpeg` wrapped in an `Svg` (`<image
-  href="data:image/jpeg;base64,…">`), else `svg` as a spot, so a custom PNG with no usable JPEG shows the bundled
-  vector there.
+  strip, a squarer one a spot at the strip's left. The terminal draws `png` in an `Image` (a banner 44 columns wide, rows
+  by its shape, 3 to 6; a spot 10 by 5). The desktop app has no `Image`: a wide `jpeg` is a banner in an `Svg` that
+  carries the title inside it (on the dark skin the panel's first row, a 1600 px navy band clipped to the panel's
+  width), a squarer `jpeg` a 64 px spot (`<image href="data:image/jpeg;base64,…">`), else `svg` as a spot, so a custom
+  PNG with no usable JPEG shows the bundled vector there.
 - **Guard** (§5). A tool write under `.mother/chief/` asks, and so does a write under `~/.claude/sessions/` (the
   peer-socket registry). **Every message into a pinned desktop session asks**, naming the session, whoever sends it
   (the pane's chat, a Needs-you button, a model's `SendMessage`, any session): nothing a session can write can vouch
@@ -1556,8 +1562,8 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   the line there). Empty input runs nothing and shows "Type what you need first".
 - **Ask box routing** (`hooks/ask_route.ts`). Before a case, the text is routed; only a case takes the path above.
   Read in code: `tell|ask <session> …` (the longest leading words that name one session: a case key, `also` or label,
-  a CLI id's first characters, the title, words of the title), `status of <session>`, `hide|show <session>`, `open <key
-  or session>`, `pause|resume`, `why <key>`. Anything else is one model call (`triage_model`, counted, none over budget):
+  a CLI id's first characters, the title, words of the title), `status [of|on|for] <session>` (or `how is`, `where is`),
+  `hide|show <session>`, `open <key or session>`, `pause|resume`, `why <key>`. Anything else is one model call (`triage_model`, counted, none over budget):
   the floor as JSON data (sessions with id, title, state, waiting on and TL;DR; Needs you questions; inbox titles; Today's
   Top 3) under a fixed note, replying `{"kind": "answer", "text"}`, `{"kind": "tell", "session", "text"}`, `{"kind":
   "status", "session"}` or `{"kind": "case", …}`. A session must be on the floor; a failed, off-shape or unknown reply is a
@@ -1610,13 +1616,17 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   card: <progress>`, `updated Nm ago`, and on a done case session `Close case` (`close-case` for each of its keys).
   Sessions sort waiting on you, stuck, working, waiting on others, idle, done; a state that differs from the one a
   session had when the Sessions tab was last opened or left marks that tab.
+
 ### Waiting on, Done cards, claims from what the manager names (`hooks/waiting.ts`, `hooks/archive.ts`, `lib/floor.py`)
 
 - **The line.** A pinned session's own mod adds one `session`-scope section, last, to its system prompt (`prompt.compose`,
   id `mother:waiting-on`) asking it to end every turn with `Waiting on: the manager — …`, `Waiting on: <who> — …` or
   `Waiting on: nothing — done`. Not for a session running under the cos skill (a claimed case, which has it there; a
   row with `origin: "mention"` is not one), a cwd under `chief.ignore_folders`, or after `/chief floor off` (per session,
-  plugin store `chiefFloorOff`; `/chief floor on|status`). `status --json` carries `floor: {ignore_folders}`.
+  plugin store `chiefFloorOff`; `/chief floor on|status`). `status --json` carries `floor: {ignore_folders}`. The section
+  depends on no earlier plugin consuming `prompt.compose`: the engine runs hooks in turn, so a plugin that answers the
+  event without calling `next` skips this one, and the session never gets the instruction. Its waiting state then comes
+  only from the session-card refresh (`tail --json` and the model's `waiting_on`).
 - **The wait.** A turn-end card passes the final message's last 2000 characters as `waiting_text`; `mother floor card`
   reads its last line in code (`waiting_line`, the parser the refresh uses) into the card's `waiting: {kind: manager |
   other | nothing, who, what, since}`. `since` holds while the same who (any case) and what repeat; a new wait starts now and
@@ -1631,7 +1641,7 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   (coral: asks the session for a draft, never a send, then as Keep waiting), `Keep waiting` (mark `keep`: `snooze_until`
   3 days on) and `Drop it` (mark `drop`: no chase for this wait). The leader raises one desktop notification per session
   and who/what (`notifyOnce`); a Done card raises none. Needs you orders sign-in cards, questions, chase cards, Done cards;
-  its count holds the first two, and the mood line puts chase and Done under urgent items and Health, above working sessions.
+  its count holds the first two.
 - **Done card.** `waiting.kind` `nothing`, not asking, not running, and 10 minutes since the card's `at` and the app's last
   activity: a Needs you card (and on its session card a `done` badge with the same pills): `Archive` (coral), `Keep` (mark
   `done-keep`: `done_kept` = the card's `at`, so the next write brings it back).
@@ -1710,7 +1720,7 @@ model, and as a rule that stops showing what the manager never engages with. All
   whose row was opened or routed to in the last 7 days (older: that row is dropped and the key moves). An update whose
   key has a live case is not pruned (not by its TTL either) until it is done; the status' inbox item carries
   `session: {key, title, kind: "case", cli_session_id}` and its card a `case` badge.
-- **Status.** `cases: [{key, cli_session_id, title, link, label, unseen, last_routed_at, opened_at, deliver_now}]`
+- **Status.** `cases: [{key, cli_session_id, title, link, links, also, label, unseen, last_routed_at, opened_at, deliver_now, origin?}]`
   (live case rows, oldest first; `unseen` = routed lines not yet delivered) and `relay: {on}`. A session in `cases` is
   on the floor like a pinned one: it writes its card, and Needs you shows it. The Sessions tab lists the pinned
   sessions, then `Cases N`: case sessions that are not pinned. A session's card that holds a case shows a `case`
@@ -1742,7 +1752,7 @@ model, and as a rule that stops showing what the manager never engages with. All
 
 ### The floor: session cards and "Needs you" (`lib/floor.py`, `mother floor`, `hooks/floor.ts`)
 
-Every session runs its own copy of the mod, so each pinned session reports on itself.
+Every session runs its own copy of the mod, so each pinned or case session reports on itself.
 - **The card.** `<workspace>/.mother/floor/<session_id>.json`: `{session_id, asks, question, options, waiting_on, at}`
   plus, on an asking card, `ask_id`, and each optional field only when it says something: `recommendation` (200, the
   exact instruction one press sends), `why_manager` (100), `recap` (200, also on a card that doesn't ask), `source`
@@ -1752,12 +1762,13 @@ Every session runs its own copy of the mod, so each pinned session reports on it
   most 80 characters or null, `at` when the question was first asked: the same question written again over a card
   that still asks it keeps that `at`. `ask_id` is a hash of the question and `at`, computed again on every read and
   never taken from the file. Machine-local, never synced.
-- **Verbs.** (`mother floor mark --stdin`: "Waiting on" above.) `mother floor card --stdin` takes `{session_id, asks, question, options, waiting_on}`, cuts each text to
+- **Verbs.** (`mother floor mark --stdin`: "Waiting on" above.) `mother floor card --stdin` takes `{session_id, asks, question, options, waiting_on,
+  recommendation?, why_manager?, recap?, source?, cwd?, waiting_text?}`, cuts each text to
   its cap and writes the card atomically; a `session_id` that isn't `^[0-9a-f-]{36}$` exits 2 and writes nothing.
   `mother floor list --json` prints `{version: 1, cards: [...]}` oldest first, skips unreadable files and deletes
   cards older than 7 days.
 - **Written.** When a main-loop turn ends with an answer (not a subagent's turn, an interrupt, a refusal or an error)
-  in a session whose CLI id is a `cli_session_id` in the last status's `desktop` rows. **From `wrap_up` first:** when
+  in a session whose CLI id is a `cli_session_id` in the last status's `desktop` rows or holds a live case. **From `wrap_up` first:** when
   the turn called the desktop app's turn-end tool (matched by its `__wrap_up` suffix; the name is the host's), its
   `ask` is the question, its `actions` with a label and no app `action` are the options (`message` = the label), the
   first action is the `recommendation` only when it is one of those, and the first line of `recap` is the recap;
@@ -1766,10 +1777,11 @@ Every session runs its own copy of the mod, so each pinned session reports on it
   falls back to the model: the mod asks it once (`triage_model`, counted against `daily_budget_usd`; nothing is asked or written over budget)
   and stores the reply. A failed, timed-out or off-shape reply stores `asks: false`. The call is detached from the turn.
 - **Cleared.** A prompt submitted in that session rewrites its card with `asks: false`, with no model call.
-- **What leaves the machine.** The last 3000 characters of a pinned session's final message go to the model API, as
-  JSON data under a fixed system note. Nothing else does.
-- **Needs you.** Each pass reads the list. The Chief pane draws, first, one card per pinned session
-  other than its own whose card asks, oldest first; the tab says how old the oldest is. A card, top to bottom: title,
+- **What leaves the machine.** Only for a turn with no `wrap_up` call: the last 3000 characters of a pinned or case
+  session's final message go to the model API, as JSON data under a fixed system note. Nothing else does. `waiting_text`
+  (2000 characters) is read in code and stays on this machine.
+- **Needs you.** Each pass reads the list. After the sign-in cards the Chief pane draws one card per session on the
+  floor (pinned or holding a case) other than its own whose card asks, oldest first; the tab says how old the oldest is. A card, top to bottom: title,
   the question, recap, repo and branch, `why_manager`, `waiting_on` and age, PR links (a URL in the question or recap,
   or a bare `#123` only with a `repo_url`), the pills, what each sends, a `Tell this session…` reply field. Pills: the
   options, a `recommendation` no option says as its own pill labelled with its first verb, Open, Hold, and `Deliver
@@ -1778,11 +1790,12 @@ Every session runs its own copy of the mod, so each pinned session reports on it
   toast `That question has moved on`, when the session's `ask_id` changed. An answer goes to that session as the
   pinned chat box does (same prefix, same guard question) and, once delivered, hides the card until the next list
   read. Hold hides the card while its `ask_id` stays the same (the plugin's store, `chiefHeld`); the tab says how many
-  are on hold. A card with no pinned row is not drawn.
-- **Mood line.** Under the banner, above the budget row: one sentence computed from the counts, no model call. The
-  first that holds: questions for the manager (warning), urgent Inbox items (error), Health problems (warning),
-  sessions working (ink), Inbox waiting (ink), all clear (success). The status line adds `· N need you`. All of it is model-written from session text:
+  are on hold. A card with no row on the floor is not drawn. All of a card is model- or session-written:
   cleaned of control and bidi characters, drawn as plain Text and Buttons.
+- **Mood line.** Under the banner, above the budget row: one sentence computed from the counts, no model call. The
+  first that holds: sign-in or network problems (warning, naming questions too), questions for the manager (warning),
+  urgent Inbox items (error), Health problems (warning), waits to chase (ink), sessions done (ink), sessions working
+  (ink), Inbox waiting (ink), all clear (success). The status line adds ` · N need you` and ` · N in inbox`.
 
 ## 6. Sync (`bin/mother sync`)
 
