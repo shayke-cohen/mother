@@ -1156,6 +1156,13 @@ class Install(unittest.TestCase):
                   which=self.which, out=buf)
         self.assertIn("tracker | \u2717 | other: boom", buf.getvalue())
         self.assertIn("code | \u2717 | not logged in", buf.getvalue())
+        buf = io.StringIO()  # one source: only that connection is read
+        c.tools = ["mcp__x__get-issues", "mcp__x__get-issue-changelog", "mcp__x__list-projects"]
+        self.assertEqual(hub.check(self.cfg, factory=lambda cfg, have: {"tracker": c}, gh_user=bad,
+                                   which=self.which, out=buf, only="tracker"), 0)
+        self.assertIn("tracker | ok |", buf.getvalue())
+        self.assertNotIn("code |", buf.getvalue())
+        self.assertEqual(hub.check(self.cfg, gh_user=bad, which=self.which, out=io.StringIO(), only="mail"), 1)
 
 
 class Status(unittest.TestCase):
@@ -2622,6 +2629,37 @@ class Presence(unittest.TestCase):
         hub.status(self.ws, self.AT, out=out)
         self.assertIn("    pacing: 2 every 900s", out.getvalue())
         self.assertIn("presence: away (test)", out.getvalue())
+
+
+    def test_poll_once_hands_recent_chat_keys_and_records_degraded(self):
+        seen = []
+
+        class Chat:
+            @classmethod
+            def poll(cls, client, cursor, cfg, me, at):
+                seen.append(dict(cfg))
+                return {"lines": [], "cursor": {"ts": "1"}, "partial": ["rate limited, backing off until x"],
+                        "degraded": "rate limited since 09:58, reading known conversations only"}
+        saved = dict(hub_sources.ADAPTERS)
+        hub_sources.ADAPTERS["chat:slack"] = Chat
+        self.addCleanup(lambda: (hub_sources.ADAPTERS.clear(), hub_sources.ADAPTERS.update(saved)))
+        cfg = {"version": 1, "manager": {"email": "dana@example.com", "timezone": "Europe/London", "chat_dm": "U00000000",
+                                         "workdays": ["Mon", "Tue", "Wed", "Thu", "Fri"]},
+               "connectors": {"chat": "slack"},
+               "hub": {"enabled": True, "connections": {"chat": {"command": "x", "args": [], "env": {}}}}}
+        hub.append_inbox(self.ws, [
+            hub.make_line("chat", "update", "C00000001/1.000100", "2026-10-29T09:00:00Z", title="recent"),
+            hub.make_line("chat", "update", "C00000001/2.000200", "2026-10-27T09:00:00Z", title="too old"),
+            hub.make_line("tracker", "update", "PLAT-1", "2026-10-29T09:00:00Z", title="not chat")])
+        beat = hub.poll_once(self.ws, cfg, self.AT, {"chat": object()},
+                             presence_fn=lambda ws, c, at: {"away": False, "why": "test"})
+        self.assertEqual(seen[0]["_recent"], ["C00000001/1.000100"])
+        self.assertEqual(seen[0]["_tz"], "Europe/London")
+        self.assertEqual(beat["sources"]["chat"]["degraded"], "rate limited since 09:58, reading known conversations only")
+        import io
+        out = io.StringIO()
+        hub.status(self.ws, self.AT, out=out)
+        self.assertIn("    degraded: rate limited since 09:58", out.getvalue())
 
 
 REAL_PRESENCE = hub.presence

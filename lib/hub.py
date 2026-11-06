@@ -848,7 +848,8 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
         if cap == "chat":
             if pres is None:
                 pres = presence_fn(ws, cfg, at)
-            wcfg.update(_away=pres["away"], _hot=live_session_keys(ws), _force=force)
+            wcfg.update(_away=pres["away"], _hot=live_session_keys(ws), _force=force, _recent=recent_chat_keys(ws, at),
+                        _tz=((cfg or {}).get("manager") or {}).get("timezone") or "")
         try:
             res = adapter.poll(client, cursors.get(cap), wcfg, me, at)
         except ForbiddenTool:
@@ -880,6 +881,8 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             sources[cap] = {"status": "ok"}
         if isinstance(res.get("pacing"), dict):
             sources[cap]["pacing"] = res["pacing"]
+        if isinstance(res.get("degraded"), str) and res["degraded"]:  # reading less than usual (rate limited)
+            sources[cap]["degraded"] = res["degraded"][:200]
         notes = [str(n)[:200] for n in res.get("notes") or []][:20]
         if notes:  # expected limits (a busy channel), not failures: the status is unchanged
             sources[cap]["notes"] = notes
@@ -963,6 +966,36 @@ def drop_auto(ws: Path, projects) -> None:
             w["auto"]["projects"] = keep
             w["unfollowed"] = list(dict.fromkeys(w["unfollowed"] + list(projects)))
             save_watch(ws, w)
+
+
+RECENT_HOURS = 24
+RECENT_MAX = 20
+
+
+def recent_chat_keys(ws: Path, at: datetime) -> List[str]:
+    """Chat thread keys (`<channel>/<ts>`) with an inbox line in the last RECENT_HOURS, newest first, at most
+    RECENT_MAX: what the chat source still reads while rate limited. Only today's inbox.jsonl is read."""
+    out = []  # type: List[str]
+    try:
+        text = (hub_dir(ws) / "inbox.jsonl").read_text()
+    except OSError:
+        return out
+    floor = at - timedelta(hours=RECENT_HOURS)
+    for raw in reversed(text.splitlines()[-2000:]):
+        try:
+            l = json.loads(raw)
+        except ValueError:
+            continue
+        key = l.get("key") if isinstance(l, dict) else None
+        if l.get("source") != "chat" or not isinstance(key, str) or "/" not in key or key in out:
+            continue
+        t = _parse_at(l.get("at"))
+        if t is None or t < floor:
+            continue
+        out.append(key)
+        if len(out) >= RECENT_MAX:
+            break
+    return out
 
 
 def _failed(ws, cap, stamp, ent) -> bool:
@@ -1283,7 +1316,9 @@ USAGE = """mother hub <verb>
   watch       run the watcher in the foreground (what the launchd job runs); home machine only
   install     write ~/Library/LaunchAgents/com.mother.hub.plist and load it (home machine only)
   uninstall   unload the job and remove the plist
-  check       one read per hub.connections entry, under the plist's environment: cap | ok/✗ | reason; exit 1 if any fails
+  check [<source>]
+              one read per hub.connections entry (or that source's), under the plist's environment: cap | ok/✗ |
+              reason; exit 1 if any fails
   status      watcher and hub heartbeats; exit 2 if either is stale or the watcher never ran
   refresh     reconnect now: restart the watcher job (install it if missing) and make it poll every source at once,
               whatever the hour; prints cap | status | reason; exit 2 if a source fails, 3 if no pass within 90 s
@@ -1438,16 +1473,22 @@ def _gh_user() -> None:
         raise RuntimeError((p.stderr or "gh api user failed").strip()[:200])
 
 
-def check(cfg: dict, factory=None, gh_user=None, which=None, out=None) -> int:
+def check(cfg: dict, factory=None, gh_user=None, which=None, out=None, only: Optional[str] = None) -> int:
     """One read per connection, under the PATH the plist sets: an MCP server must start and answer `tools/list`
     with every tool on its adapter's read allow-list (each exactly once); `gh` must answer `gh api user`. Never calls a write
-    tool. Prints `cap | ok/✗ | reason`; exit 1 if any fails."""
+    tool. Prints `cap | ok/✗ | reason`; exit 1 if any fails. `only`: that one source (exit 1 when it has no
+    connection)."""
     import hub_mcp
     import hub_sources
     out = out or sys.stdout
     factory = factory or build_clients
     gh_user = gh_user or _gh_user
     conns = _conns(cfg)
+    if only is not None:
+        conns = {k: v for k, v in conns.items() if k == only}
+        if not conns:
+            print("mother hub check: no connection for %s" % only, file=sys.stderr)
+            return 1
     if not conns:
         print("mother hub check: hub.connections is empty", file=sys.stderr)
         return 1
@@ -1619,6 +1660,8 @@ def status(ws: Path, at: datetime, out=None, cfg=None) -> int:
             if active and sage > 2 * severy:
                 extra += ", STALE"
         print("  %s: %s%s%s" % (cap, ent.get("status"), " (%s)" % why if why else "", extra), file=out)
+        if ent.get("degraded"):
+            print("    degraded: %s" % ent["degraded"], file=out)
         for n in ent.get("notes") or []:
             print("    note: %s" % n, file=out)
         pace = ent.get("pacing") if isinstance(ent.get("pacing"), dict) else None
@@ -2521,8 +2564,11 @@ def main(args, ws, cfg, at) -> int:
         return install(ws, cfg)
     if verb == "uninstall":
         return uninstall()
-    if verb == "check":
-        return check(cfg)
+    if verb == "check":  # `check [<source>]`
+        if len(rest) > 1 or (rest and rest[0] not in CAPS):
+            print("usage: mother hub check [%s]" % "|".join(CAPS), file=sys.stderr)
+            return 2
+        return check(cfg, only=rest[0] if rest else None)
     if verb == "status":
         return status(ws, at, cfg=cfg)
     if verb == "smoke":

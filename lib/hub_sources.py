@@ -102,10 +102,15 @@ def _first(*vals):
 # ones (every `slow_seconds`). When the server refuses search (missing scope), every watched conversation is polled as
 # before, and search is retried every `search_retry_seconds`. A pass makes at most `max_calls` calls; what is left
 # waits for the next pass, most overdue first. A channel's 7-day lookback runs at most every `lookback_seconds`.
+# Rate limited (429) and backing off: discovery and search stop, but the conversations already known to matter are
+# still read, each at most every `limited_seconds` and at most `limited_calls` calls a pass: followed threads, the
+# self-DM inbox, the manager's DMs with people in config, and threads with a recent inbox line (`_recent`, from
+# the watcher). The result carries `degraded` until a whole pass runs without a 429.
 PACING = {"hot_seconds": 120, "warm_seconds": 600, "cold_seconds": 2700, "dm_max_seconds": 600,
           "away_seconds": 900, "hot_mine_minutes": 120, "hot_any_minutes": 30, "warm_hours": 24,
           "away_idle_minutes": 15, "away_quiet_minutes": 30, "backoff_seconds": 120, "outage_minutes": 30,
-          "slow_seconds": 1800, "max_calls": 20, "lookback_seconds": 1800, "search_retry_seconds": 21600}
+          "slow_seconds": 1800, "max_calls": 20, "lookback_seconds": 1800, "search_retry_seconds": 21600,
+          "limited_seconds": 300, "limited_calls": 6}
 MAX_BACKOFF = 1800
 _RATE = re.compile(r"\b429\b|ratelimited|rate[ _-]?limit", re.I)
 
@@ -144,6 +149,22 @@ class RateLimited(Exception):
         self.retry_after = retry_after
 
 
+class _Backing(Exception):
+    """The backed-off pass read its known conversations: skip discovery and search."""
+
+
+def hhmm(ts: float, tz_name=None) -> str:
+    """`HH:MM` of an epoch time in the manager's timezone (`_tz`, the watcher passes manager.timezone), else UTC."""
+    tz = UTC
+    if isinstance(tz_name, str) and tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = UTC
+    return datetime.fromtimestamp(ts, tz).strftime("%H:%M")
+
+
 class OutOfCalls(Exception):
     """This pass has made `max_calls` calls: the rest waits for the next pass."""
 
@@ -173,9 +194,9 @@ class ChatSlack(Adapter):
         away = cfg.get("_away") is True
         force = cfg.get("_force") is True  # `mother hub refresh` / smoke: every conversation and the search, now
         limited = dict(cursor.get("limited") or {})
-        if limited and now < float(limited.get("until") or 0):  # honour Retry-After: no call at all
-            return _result([], dict(cursor), ["rate limited, backing off until %s" % ts_iso(limited["until"])])
-        if limited and now - float(limited.get("last") or 0) > p["outage_minutes"] * 60:
+        # honour Retry-After: no discovery and no search, only the conversations already known (see `known_pass`)
+        backing = bool(limited) and now < float(limited.get("until") or 0)
+        if limited and not backing and now - float(limited.get("last") or 0) > p["outage_minutes"] * 60:
             limited = {}  # quiet long enough: the outage is over, the next 429 is a new one
         since = float(cursor["ts"])
         threads = dict(cursor.get("threads") or {})
@@ -199,7 +220,7 @@ class ChatSlack(Adapter):
         names = me.get("people") or {}
         tiers = {}  # type: Dict[str, int]
 
-        left = [p["max_calls"]]
+        left = [p["limited_calls"] if backing else p["max_calls"]]
 
         def call(name, args):
             if left[0] <= 0:
@@ -361,6 +382,57 @@ class ChatSlack(Adapter):
                 c["back"] = now
             c["read"] = now
 
+        def due_slow(conv):
+            """Backing off: a known conversation is read at most every `limited_seconds`."""
+            c = convs.get(conv) or {}
+            tiers[conv] = p["limited_seconds"]
+            return force or not c.get("read") or now - float(c["read"]) >= p["limited_seconds"] - 5
+
+        def replies(key, floor):
+            """New replies in one thread (`<channel>/<thread ts>`) after `floor`; returns the newest ts seen."""
+            ch, tts = key.split("/", 1)
+            res = call("get_thread_replies", {"channel_id": ch, "thread_ts": tts})
+            newest = floor
+            for m in (res or {}).get("messages") or []:
+                if m.get("ts") == tts:
+                    continue
+                touch(key, m)
+                if float(m.get("ts", 0)) > floor:
+                    add(ch, dict(m, thread_ts=tts), floor=floor)
+                    newest = max(newest, float(m["ts"]))
+            return newest
+
+        def known_pass():
+            """One backed-off pass: the inbox, followed threads, mapped DMs, then threads with a recent inbox line;
+            one call each (history or replies), on the slow pace and the small call budget."""
+            if inbox and due_slow(inbox):
+                res = call("get_channel_history", {"channel_id": inbox, "oldest": "%.6f" % since,
+                                                   "limit": MAX_HISTORY + 1})
+                for m in ((res or {}).get("messages") or [])[:MAX_HISTORY]:
+                    note(inbox, m)
+                convs.setdefault(inbox, {})["read"] = now
+            for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
+                if "/" not in key or not due_slow(key):
+                    continue
+                threads[key] = max(float(tseen), replies(key, float(tseen)))
+                convs.setdefault(key, {})["read"] = now
+            for ch in dms:
+                if not due_slow(ch):
+                    continue
+                mark = float((convs.get(ch) or {}).get("read") or since)
+                res = call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % mark,
+                                                   "limit": MAX_HISTORY + 1})
+                for m in ((res or {}).get("messages") or [])[:MAX_HISTORY]:
+                    add(ch, m, floor=mark, dm=True)
+                convs.setdefault(ch, {})["read"] = now
+            for key in [k for k in cfg.get("_recent") or [] if isinstance(k, str)]:
+                ch, _, tts = key.partition("/")
+                if not tts or tts == "dm" or key in threads or ch == inbox or ch in dms or not due_slow(key):
+                    continue
+                c = convs.setdefault(key, {})
+                replies(key, float(c.get("read") or since))
+                c["read"] = now
+
         search_ts = float(cursor.get("search_ts") or since)
         searched = False
         off = dict(cursor.get("search_off") or {})  # the server refused search for good (missing scope)
@@ -372,6 +444,9 @@ class ChatSlack(Adapter):
         deferred = []
         bursts = {}  # type: Dict[str, List[dict]]
         try:
+            if backing:
+                known_pass()
+                raise _Backing()
             if inbox:  # the manager's self-DM, first and every pass: each note of theirs is a `manual` line
                 try:
                     res = call("get_channel_history", {"channel_id": inbox, "oldest": "%.6f" % since,
@@ -477,11 +552,15 @@ class ChatSlack(Adapter):
                         raise
                     partial.append("%s: history %s" % (ch, e.kind))  # a DM that fails is partial
             limited = {}  # a whole pass without a 429
+        except _Backing:
+            partial.append("rate limited, backing off until %s" % ts_iso(limited["until"]))
         except RateLimited as e:
             # Skip the rest of the pass. What was read keeps its read time; the rest is read next pass. One
             # `watcher:chat` error line per outage: a 429 within `outage_minutes` of the last one is the same outage.
             n = int(limited.get("n") or 0) + 1
             wait = e.retry_after if e.retry_after else min(p["backoff_seconds"] * 2 ** (n - 1), MAX_BACKOFF)
+            if backing:  # a 429 while reading the known conversations: wait at least as long as already asked
+                wait = max(wait, int(float(limited.get("until") or 0) - now))
             if not limited:
                 lines.append(hub.make_line("chat", "error", "watcher:chat", iso(at), title="chat source rate limited",
                                            summary="the chat server returned 429 (rate limited); backing off "
@@ -489,14 +568,18 @@ class ChatSlack(Adapter):
             limited = {"first": limited.get("first", now), "last": now, "until": now + wait, "n": n}
             partial.append("rate limited (429): backing off %ds" % wait)
         except OutOfCalls:
-            pass  # a search or the inbox ran out of calls: the rest is read next pass
+            if backing:  # the backed-off pass used its small budget: the rest is read next pass
+                partial.append("rate limited, backing off until %s" % ts_iso(limited["until"]))
+            # else a search or the inbox ran out of calls: the rest is read next pass
         lines.extend(dm_lines(bursts))
         if deferred:  # expected under the budget, not a failure
             notes.append("call budget (%d) reached: %d conversation(s) wait for the next pass"
                          % (p["max_calls"], len(deferred)))
         keep = dict(list(threads.items())[-MAX_THREADS:])
-        live = set(cfg.get("channels") or []) | set(dms) | set(keep)
-        out = {"ts": "%.6f" % now, "threads": keep, "seen": seen[-300:], "followed": followed,
+        live = set(cfg.get("channels") or []) | set(dms) | set(keep) | {inbox} | {
+            k for k in cfg.get("_recent") or [] if isinstance(k, str)}  # the known pass keeps its read times
+        # backing off, the cursor's time stays put: what the known pass did not reach is read from it later
+        out = {"ts": "%.6f" % (since if backing else now), "threads": keep, "seen": seen[-300:], "followed": followed,
                "convs": {k: v for k, v in convs.items() if k in live},
                "search_ts": "%.6f" % (now if searched else search_ts)}
         if me_at:
@@ -506,6 +589,9 @@ class ChatSlack(Adapter):
         if off:
             out["search_off"] = off
         res = _result(lines, out, partial, notes)
+        if limited:
+            res["degraded"] = "rate limited since %s, reading known conversations only" % hhmm(
+                float(limited.get("first") or now), cfg.get("_tz"))
         counts = {}  # type: Dict[str, int]
         for every in tiers.values():
             counts[str(every)] = counts.get(str(every), 0) + 1

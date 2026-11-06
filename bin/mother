@@ -141,7 +141,7 @@ HUB_PACING = {"hot_seconds": (30, 3600), "warm_seconds": (60, 7200), "cold_secon
               "hot_any_minutes": (1, 1440), "warm_hours": (1, 168), "away_idle_minutes": (1, 240),
               "away_quiet_minutes": (1, 240), "backoff_seconds": (10, 1800), "outage_minutes": (1, 240),
               "slow_seconds": (300, 14400), "max_calls": (4, 200), "lookback_seconds": (120, 14400),
-              "search_retry_seconds": (600, 86400)}
+              "search_retry_seconds": (600, 86400), "limited_seconds": (60, 3600), "limited_calls": (1, 50)}
 HUB_CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
 HUB_CONN_KEYS = {"command", "args", "env", "cli", "local"}
 HUB_WATCH_INTERVALS = {"every_seconds", "idle_every_seconds"}
