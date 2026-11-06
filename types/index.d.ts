@@ -192,6 +192,17 @@ export type FloorCard = {
   source?: 'wrap_up'                 // from the session's own wrap_up call; absent when a model read its final message
   repo?: string; branch?: string     // of the session's checkout, when known
   repo_url?: string                  // when known and on a host where `#123` can be made a link
+  waiting?: FloorWaiting             // the session's last `Waiting on:` line, read in code (lib/floor.py)
+  done_kept?: string                 // Keep on its Done card, at this card `at`: no Done card until the session moves
+}
+// A session's wait: `since` holds while the same who and what repeat; the rest is what the manager pressed on it.
+export type FloorWaiting = {
+  kind: 'manager' | 'other' | 'nothing'
+  who: string; what: string; since: string
+  checked_at?: string                // the last `Check now` sent; at most one a day
+  snooze_until?: string              // `Keep waiting`: no chase card until then
+  dropped?: true                     // `Drop it`: no chase card for this wait
+  check_due?: boolean                // computed on each list read: waiting on someone else over a day, no check in a day
 }
 // `held`: session id -> the ask id the manager put on hold; the card stays hidden until its ask id changes.
 export type FloorState = { cards: FloorCard[]; self: string | null; answered: string[]; held?: Record<string, string> }
@@ -206,6 +217,7 @@ export type ChiefCase = {
   unseen: number
   last_routed_at: string | null; opened_at: string | null
   deliver_now?: boolean              // `mother chief relay deliver` asked it to deliver once though relay is off
+  origin?: 'mention'                 // made from keys the manager named to a pinned session, not from a case brief
 }
 
 // `mother chief status --json` (lib/chief.py status_doc, version 1).
@@ -228,7 +240,13 @@ export type ChiefStatus = {
   habits?: { on: boolean }           // false while .mother/chief/HABITS_OFF exists: nothing is quieted, no habit reaches a triage prompt
   // lines the quiet rule logged instead of showing (lib/habits.py): how many in 7 days, and the last 10, newest first
   quieted?: { count_7d: number; recent: { id: string; key: string; title: string; label: string; bucket: string; at: string; why: string }[] }
+  floor?: { ignore_folders: string[] }   // config chief.ignore_folders, absolute: no `Waiting on:` instruction there
 }
+
+// The Ask box's answer card (hooks/ask_route.ts): the route taken, what it says, and a send waiting for a yes.
+export type ChiefAnswer = { route: string; text: string; confirm?: { cli: string; title: string; text: string } | null }
+// Archive's Undo pill (hooks/archive.ts): what was done to which session, until when it can be reversed.
+export type ChiefUndo = { how: 'archived' | 'unpinned' | 'hidden'; cli: string; session_id: string; title: string; repin: boolean; until: number }
 
 // `mother chief status --json` -> health (lib/chief.py health_doc): what the Chief pane's Health tab draws.
 export type ChiefHealth = {
@@ -302,6 +320,9 @@ declare module 'claude-code' {
       chiefPeople: Record<string, string> | null    // chat user ids to names, from `mother chief context --json`, read at session start
       chiefTyped: Record<string, string> | null     // what a field holds as it is typed, by Input key; read on a press, never by a draw
       chiefSelected: string | null                  // the card id (`sess:<cli id>`, `inbox:<U-id>`) a button was last pressed on; drawn with a bold border
+      chiefAnswer: ChiefAnswer | null               // the Ask box's answer card
+      chiefHidden: Record<string, true> | null      // sessions hidden from the floor (`hide <session>`, Archive's last fallback), by CLI id
+      chiefUndo: ChiefUndo | null                   // the last Archive, while its Undo pill shows
     }
   }
 }

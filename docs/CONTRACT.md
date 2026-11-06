@@ -1280,8 +1280,9 @@ with a cheap model's triage), and the **Chief pane** shows what needs the manage
 long-lived chief session kept alive by launchd and tmux, headless `claude -p` workers and a decision queue posted to
 the manager's self-DM; all of that is gone. Work happens in visible desktop sessions. Config: the optional `chief`
 block (§3), keys `daily_budget_usd` (20), `tldr_model` and `triage_model` (both `sonnet`; `opus` is the one other
-value, anything else reads as `sonnet`) and `refresh_minutes` (5; a whole number 1-60: how often the leading session
-re-reads each session for its card, "Session refresh" below). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
+value, anything else reads as `sonnet`), `refresh_minutes` (5; a whole number 1-60: how often the leading session
+re-reads each session for its card, "Session refresh" below) and `ignore_folders` (`[]`; absolute or `~/` paths: a
+pinned session under one gets no `Waiting on:` instruction, "Waiting on" below). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
 `worker_model`, `tick_seconds`, `batch_minutes`, `decision_hours`) are accepted and ignored, so an older
 `config.json` still loads; any other unknown key is a validation error, as before.
 
@@ -1523,6 +1524,20 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   Inbox after 10 minutes. A key that already has an open item is not held (`update_id` names it: its card stays and
   the new session claims it as any case); a key a live case holds gets no second session (`owned_by`: the hub routes
   the line there). Empty input runs nothing and shows "Type what you need first".
+- **Ask box routing** (`hooks/ask_route.ts`). Before a case, the text is routed; only a case takes the path above.
+  Read in code: `tell|ask <session> …` (the longest leading words that name one session: a case key, `also` or label,
+  a CLI id's first characters, the title, words of the title), `status of <session>`, `hide|show <session>`, `open <key
+  or session>`, `pause|resume`, `why <key>`. Anything else is one model call (`triage_model`, counted, none over budget):
+  the floor as JSON data (sessions with id, title, state, waiting on and TL;DR; Needs you questions; inbox titles; Today's
+  Top 3) under a fixed note, replying `{"kind": "answer", "text"}`, `{"kind": "tell", "session", "text"}`, `{"kind":
+  "status", "session"}` or `{"kind": "case", …}`. A session must be on the floor; a failed, off-shape or unknown reply is a
+  case, always from the manager's own words (the model's title and prompt are not used). The result draws in a
+  dim-bordered card under the field: `Route: <route> · read in code | one model call`, the text, Dismiss. `tell` goes
+  through the pane's send (same prefix, same guard); text with a risky word (merge, master, main, prod, deploy, release,
+  rollout, rollback, delete, drop, force, send, post, publish, email, payment; whole words, any case) or a URL to anything
+  but a local or `.test` host waits on `Send anyway?` with Send and Cancel. `status` uses the stored card and refreshes
+  it; it types nothing into the session. Every route logs `ask`. `hide` keeps a CLI id in the plugin's store
+  (`chiefHidden`): the pane draws that session nowhere until `show`.
 - **More than one key per case.** `claim --stdin` takes `also: [keys]`, kept in the row's `also`, so lines of those
   keys route to the same session. `mother chief watch-key <key> --for <session id>` adds one key to a live case that
   session holds; both refuse an off-shape key and a key live in another session whose row is under 7 days old, and
@@ -1565,6 +1580,43 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   card: <progress>`, `updated Nm ago`, and on a done case session `Close case` (`close-case` for each of its keys).
   Sessions sort waiting on you, stuck, working, waiting on others, idle, done; a state that differs from the one a
   session had when the Sessions tab was last opened or left marks that tab.
+### Waiting on, Done cards, claims from what the manager names (`hooks/waiting.ts`, `hooks/archive.ts`, `lib/floor.py`)
+
+- **The line.** A pinned session's own mod adds one `session`-scope section, last, to its system prompt (`prompt.compose`,
+  id `mother:waiting-on`) asking it to end every turn with `Waiting on: the manager — …`, `Waiting on: <who> — …` or
+  `Waiting on: nothing — done`. Not for a session running under the cos skill (a claimed case, which has it there; a
+  row with `origin: "mention"` is not one), a cwd under `chief.ignore_folders`, or after `/chief floor off` (per session,
+  plugin store `chiefFloorOff`; `/chief floor on|status`). `status --json` carries `floor: {ignore_folders}`.
+- **The wait.** A turn-end card passes the final message's last 2000 characters as `waiting_text`; `mother floor card`
+  reads its last line in code (`waiting_line`, the parser the refresh uses) into the card's `waiting: {kind: manager |
+  other | nothing, who, what, since}`. `since` holds while the same who (any case) and what repeat; a new wait starts now and
+  loses its marks. A card written with no such line keeps the wait it had. `tldr --stdin` also records a transcript's line
+  there (`note_waiting`), for a session whose mod is not running. A caller cannot set `waiting` or `done_kept` directly.
+  Over budget a turn with no `wrap_up` writes no card, so its line waits for the next refresh.
+- **Check due.** `floor list` adds `waiting.check_due`: waiting on someone other than the manager for over 24 hours, with no
+  re-check in the last 24 (computed on each read, so every pane shows it). The session's card shows a `check due` badge and
+  `Check now`, which `mother floor mark --stdin` `{session_id, mark: "checked"}` counts (exit 1 within 24 hours) and then
+  sends a short read-only instruction; never while the card says running.
+- **Chase card.** Waiting on someone for 3 days: a Needs you card `Waiting N days on <who>: <what>`, with `Draft a nudge`
+  (coral: asks the session for a draft, never a send, then as Keep waiting), `Keep waiting` (mark `keep`: `snooze_until`
+  3 days on) and `Drop it` (mark `drop`: no chase for this wait).
+- **Done card.** `waiting.kind` `nothing`, not asking, not running, and 10 minutes since the card's `at` and the app's last
+  activity: a Needs you card (and on its session card a `done` badge with the same pills): `Archive` (coral), `Keep` (mark
+  `done-keep`: `done_kept` = the card's `at`, so the next write brings it back).
+- **Archive.** `ccd_sidebar set_pinned false` (an archive refuses a pinned session), then `ccd_session_mgmt archive_session`.
+  Refused or unreachable: unpinned, else neither, and either way hidden from the floor; the toast says which. A row under
+  the header strip offers `Undo` for 10 seconds: `unarchive_session`, `set_pinned true`, unhide, whichever applied. A case
+  session's case closes (`close-case`) only after those 10 seconds, and not if undone.
+- **Claims from what the manager names.** A prompt with origin `composer` or `bridge`, not meta and not a command, not
+  starting with a frame of ours (`Mother case:`, `Mother relay:`, the pane's prefix), in a pinned or case session, runs
+  `mother chief mention --stdin` `{session_id, text, title}`: chat message links, tracker keys and PRs, at most 5, join that
+  session's case, which is made (`origin: "mention"`, no inbox item needed) when it has none. A key live in another session
+  under 7 days old is refused (`{added, refused}`).
+- **Send to X.** An Inbox card whose key a live session holds, or that names a ticket or PR that exactly one session's
+  title, TL;DR, case keys or links name, shows `Send to <session>` as its coral pill. It sends the item framed as a relay
+  (other people's words), runs `mention` with `keys: [key]` (the item carries the case from then on, and later lines route
+  there), and the card says `sent to <session>`.
+
 ### Habits: learning from what the manager does (`lib/habits.py`, `hooks/habits.ts`, `mother chief act-log|habits`)
 
 The pane logs what the manager does with each card, code counts it, and triage uses the counts: as a hint to the
@@ -1668,7 +1720,7 @@ Every session runs its own copy of the mod, so each pinned session reports on it
   most 80 characters or null, `at` when the question was first asked: the same question written again over a card
   that still asks it keeps that `at`. `ask_id` is a hash of the question and `at`, computed again on every read and
   never taken from the file. Machine-local, never synced.
-- **Verbs.** `mother floor card --stdin` takes `{session_id, asks, question, options, waiting_on}`, cuts each text to
+- **Verbs.** (`mother floor mark --stdin`: "Waiting on" above.) `mother floor card --stdin` takes `{session_id, asks, question, options, waiting_on}`, cuts each text to
   its cap and writes the card atomically; a `session_id` that isn't `^[0-9a-f-]{36}$` exits 2 and writes nothing.
   `mother floor list --json` prints `{version: 1, cards: [...]}` oldest first, skips unreadable files and deletes
   cards older than 7 days.

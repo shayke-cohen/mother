@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { chiefStatusText, cleanTldr, ledByText, sessionOrder, parseVerdict, triagePrompt, ASK_EMPTY, CONTEXT_MAX, TRIAGE_PROMPT_MAX, TRIAGE_SYSTEM } from './chief'
+import { chiefStatusText, cleanTldr, ledByText, sessionOrder, parseVerdict, triagePrompt, typedByManager, ASK_EMPTY, CONTEXT_MAX, TRIAGE_PROMPT_MAX, TRIAGE_SYSTEM } from './chief'
 import { caseBrief, parseCase, relayText, unframed } from './cos'
 import { FLOOR_SYSTEM, parseFloor, prLinks, recommendationLabel, recommendedOption } from './floor'
 import { moodLine, bannerSvg, leadPill, wideBannerSvg, LEAD_GRACE_MS, WIDE_W, budgetBar, cardState, clip, humanLabel, inboxOrder, isOpen, itemSource, linksOf, portraitLayout, shownTab, sourceOf, suggestedBrief, suggestionsFor, tabHover, tabIsNew, whyText } from './pane_ui'
@@ -7,6 +7,9 @@ import { Card, ICONS, PALETTE, Pill, barSvg, labelOf, pillFills, skinFor, skinUi
 import { CLI } from '../tests/fixtures/chief_cli'
 import { decisionLabel, dotsId, guardState, healthProblems, isWatcherError, sourceRows, teamGroups } from './pane_tabs'
 import { promptHabits, quietedOf } from './habits'
+import { claimantOf, findSession, isRisky, parseAskCommand, parseRoute, splitTell } from './ask_route'
+import { CHECK_NOW_TEXT, WAITING_SECTION, WAITING_SECTION_ID, chaseCards, checkDue, doneCards, runsCosSkill, underFolder, wantsWaitingSection } from './waiting'
+import { withoutHidden } from './archive'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-11-02T10:00:00Z')
@@ -334,7 +337,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -855,15 +858,20 @@ const CLI_B = '22222222-2222-4222-8222-222222222222'
 const isFloorAsk = (e: any) => String(e.system).includes('final message')
 
 // The session is `sessionId` (CLI_A is the pinned one); a floor model call answers `reply`; `floor list` hands `cards`.
-async function bootFloor($: any, on: any, o: { sessionId?: string; reply?: () => any; cards?: () => unknown[]; cli?: TlOpts['cli']; expand?: boolean } = {}) {
-  const f = { cards: [] as any[], floorAsks: [] as any[] }
-  const booted = await bootTldr($, on, { sessionId: o.sessionId, expand: o.expand,
+async function bootFloor($: any, on: any, o: { sessionId?: string; reply?: () => any; cards?: () => unknown[]; cli?: TlOpts['cli']; expand?: boolean; mcp?: TlOpts['mcp'] } = {}) {
+  const f = { cards: [] as any[], floorAsks: [] as any[], waitTexts: [] as (string | undefined)[] }
+  const booted = await bootTldr($, on, { sessionId: o.sessionId, expand: o.expand, mcp: o.mcp,
     reply: e => { if (!isFloorAsk(e)) return answered(TLDR); f.floorAsks.push(e); return (o.reply ?? (() => answered(JSON.stringify(ASK))))() },
     cli: (argv, stdin) => {
       const over = o.cli?.(argv, stdin)
       if (over) return over
       if (argv[0] !== 'floor') return undefined
-      if (argv[1] === 'card') { f.cards.push(JSON.parse(String(stdin))); return { exitCode: 0, stdout: '{}\n' } }
+      if (argv[1] === 'card') {
+        const { waiting_text, ...card } = JSON.parse(String(stdin))   // the turn's tail, kept apart: what it says is the CLI's to read
+        f.cards.push(card)
+        f.waitTexts.push(waiting_text)
+        return { exitCode: 0, stdout: '{}\n' }
+      }
       return { exitCode: 0, stdout: JSON.stringify({ version: 1, cards: (o.cards ?? (() => []))() }) }
     } })
   return { ...booted, f }
@@ -877,6 +885,7 @@ test('test_floor_pinned_turn_end_writes_its_card', async ($, on) => {
   await clock.settle()
   expect(out.argv.filter(a => a[2] === 'floor' && a[3] === 'card').map(a => a.slice(3))).toEqual([['card', '--stdin']])
   expect(f.cards).toEqual([{ session_id: CLI_A, ...ASK }])
+  expect(f.waitTexts).toEqual([long.slice(-2000)])                                          // its Waiting on: line is read by the CLI, in code
   expect(f.floorAsks.length).toBe(1)
   const a = f.floorAsks[0]
   expect(a.model).toBe('sonnet')
@@ -941,6 +950,7 @@ test('test_floor_the_managers_prompt_clears_the_card', async ($, on) => {
   await clock.settle()
   expect(f.cards).toEqual([{ session_id: CLI_A, asks: false, question: '', options: [], waiting_on: null }])
   expect(f.floorAsks).toEqual([])                                                // clearing asks no model
+  expect(f.waitTexts).toEqual([undefined])                                       // a typed prompt carries no Waiting on: text
 })
 
 test('test_floor_an_unpinned_sessions_prompt_writes_nothing', async ($, on) => {
@@ -3645,4 +3655,431 @@ test('test_e2_triage_keeps_a_reason_and_passes_a_threads_first_post', async () =
   const p = triagePrompt({ id: 'L1', key: 'C1/1.1', title: 'Not me', thread_first: { who: 'Dana', text: 'Who owns the migration?' } } as any)
   expect(JSON.parse(p.split('\n')[1]).line.thread_first).toEqual({ who: 'Dana', text: 'Who owns the migration?' })
   expect(JSON.parse(triagePrompt({ id: 'L1', key: 'PLAT-1' } as any).split('\n')[1]).line.thread_first).toBeUndefined()
+})
+
+// ---- B2: the Ask box routes, Waiting on, Done and Archive, claims and Send to X ----
+const MIN = 60_000
+const isRoute = (e: any) => String(e.system).startsWith('You route one request')
+const askBox = async (ui: any, clock: any, text: string) => { await ui.input({ key: 'ask-input', text }); await clock.settle() }
+const sentTo = (e: any) => JSON.stringify(e.to)
+const coral = async (ui: any, keys: string[]) => {
+  const out: string[] = []
+  for (const key of keys) {
+    const b = await ui.find({ key })
+    expect(b).toBeDefined()
+    if (b.props.variant === 'primary') out.push(key)
+  }
+  return out
+}
+const answerAt = async (ui: any) => { const all = await texts(ui); const i = all.findIndex((x: string) => x.startsWith('Route: ')); return i < 0 ? [] : [all[i], all[i + 1]] }
+const answerText = async (ui: any) => (await answerAt(ui))[1] as string | undefined
+const answerRoute = async (ui: any) => (await answerAt(ui))[0] as string | undefined
+const floorMarks = (out: { argv: string[][] }) => out.argv.filter(a => a[2] === 'floor' && a[3] === 'mark')
+const isoAt = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
+const waitCard = (w: Record<string, unknown>, over: Record<string, unknown> = {}) =>
+  ({ session_id: CLI_A, asks: false, question: '', options: [], waiting_on: null, at: isoAt(NOW - 20 * MIN),
+     waiting: { kind: 'other', who: 'Dana', what: 'the API key', since: isoAt(NOW - 2 * 86_400_000), ...w }, ...over })
+
+test('test_b2_ask_commands_are_read_in_code', () => {
+  expect(parseAskCommand('tell login bug to rerun the tests')).toEqual({ kind: 'tell-or-ask', rest: 'login bug to rerun the tests' })
+  expect(parseAskCommand('Status of the docs session?')).toEqual({ kind: 'status', target: 'the docs session' })
+  expect(parseAskCommand('hide login bug')).toEqual({ kind: 'hide', target: 'login bug' })
+  expect(parseAskCommand('show login bug')).toEqual({ kind: 'show', target: 'login bug' })
+  expect(parseAskCommand('open PLAT-7')).toEqual({ kind: 'open', target: 'PLAT-7' })
+  expect([parseAskCommand('pause'), parseAskCommand('Resume.')]).toEqual([{ kind: 'pause' }, { kind: 'resume' }])
+  expect(parseAskCommand('why PLAT-7?')).toEqual({ kind: 'why', key: 'PLAT-7' })
+  expect(parseAskCommand('what is on fire today')).toBe(null)
+  const rows = [PINNED, PINNED_2] as any[]
+  const cases = [{ key: 'PLAT-9', cli_session_id: CLI_2, title: 'x', link: null, unseen: 0, last_routed_at: null, opened_at: null, also: ['acme/api#3'] }] as any[]
+  expect((findSession(rows, cases, 'PLAT-9') as any).d.cli_session_id).toBe(CLI_2)          // a case key
+  expect((findSession(rows, cases, 'acme/api#3') as any).d.cli_session_id).toBe(CLI_2)      // one it also holds
+  expect((findSession(rows, cases, 'the login bug session') as any).d.cli_session_id).toBe(CLI_A)
+  expect((findSession(rows, cases, CLI_A.slice(0, 8)) as any).d.cli_session_id).toBe(CLI_A)
+  expect((findSession([PINNED, { ...PINNED_2, title: 'Fix the docs bug' }] as any, [], 'fix') as any).ambiguous.length).toBe(2)
+  expect(findSession(rows, cases, 'billing')).toBe(null)
+  expect(splitTell('login bug to rerun the tests', rows, cases)).toEqual({ d: PINNED, text: 'rerun the tests' })
+  expect(splitTell('review the docs: ship the summary', rows, cases)?.text).toBe('ship the summary')
+  expect(splitTell('Dana about the budget', rows, cases)).toBe(null)                       // no session: the model decides
+})
+
+test('test_b2_risky_words_are_whole_words_in_any_case', () => {
+  for (const t of ['merge it', 'push to MAIN', 'Deploy now', 'force push', 'rollback the change', 'email Dana', 'post it',
+                   'see https://example.com/x', 'drop the table']) expect([t, isRisky(t)]).toEqual([t, true])
+  for (const t of ['rerun the tests', 'mainly docs', 'remerged notes', 'see http://localhost:3000/x', 'http://app.test/y', 'summarise it'])
+    expect([t, isRisky(t)]).toEqual([t, false])
+})
+
+test('test_b2_parse_route_takes_each_kind_and_refuses_the_rest', () => {
+  const ids = new Set([CLI_A])
+  expect(parseRoute('{"kind": "answer", "text": "Two sessions wait on you."}', ids)).toEqual({ kind: 'answer', text: 'Two sessions wait on you.' })
+  expect(parseRoute('```json\n{"kind": "tell", "session": "' + CLI_A + '", "text": "rerun"}\n```', ids)).toEqual({ kind: 'tell', session: CLI_A, text: 'rerun' })
+  expect(parseRoute(`{"kind": "status", "session": "${CLI_A}"}`, ids)).toEqual({ kind: 'status', session: CLI_A })
+  expect(parseRoute('{"kind": "case", "title": "t", "prompt": "p"}', ids)).toEqual({ kind: 'case' })
+  for (const bad of [`{"kind": "tell", "session": "${CLI_B}", "text": "x"}`, '{"kind": "status"}', '{"kind": "answer", "text": " "}',
+                     '{"kind": "launch"}', 'Sure! {"kind": "answer"}', '[]'])
+    expect([bad, parseRoute(bad, ids)]).toEqual([bad, null])
+})
+
+test('test_b2_ask_box_runs_the_code_routes', async ($, on) => {
+  const { clock, out, t } = await bootTldr($, on, { cli: argv => {
+    if (argv[0] === 'why') return { exitCode: 0, stdout: JSON.stringify({ version: 1, key: 'PLAT-7', verdicts: [{ at: '2026-11-02T08:00:00Z', decision: 'now', reason: 'it blocks a release' }] }) }
+    if (argv[0] === 'pause') return { exitCode: 0, stdout: 'chief paused\n' }
+    return undefined
+  } })
+  const ui = await shown($, clock)
+  await askBox(ui, clock, 'tell login bug to rerun the tests')
+  expect(t.sends.map(e => e.text)).toEqual(['From the manager via the Chief pane: rerun the tests'])
+  expect(sentTo(t.sends[0])).toContain(CLI_A)
+  expect([await answerRoute(ui), await answerText(ui)]).toEqual(['Route: tell · read in code', 'Told "Fix the login bug": rerun the tests'])
+  expect((await ui.find({ key: 'answer-dismiss' }))?.props.variant).toBe('primary')
+  expect(t.asks.filter(isRoute)).toEqual([])                                          // no model call for a command
+  expect(out.acts.filter((r: any) => r.verb === 'ask').map((r: any) => r.item_id)).toEqual(['ask:tell'])
+  const tails = chiefCalls(out, 'tail').length
+  await askBox(ui, clock, 'status of review the docs')
+  expect(await answerText(ui)).toMatch(/^"Review the docs": .*Refreshing its card\.$/)
+  await clock.settle()
+  expect(chiefCalls(out, 'tail').length).toBeGreaterThan(tails)                        // the status route refreshes that card
+  expect(t.sends.length).toBe(1)                                                       // and types nothing into it
+  await askBox(ui, clock, 'hide login bug')
+  expect(await answerText(ui)).toMatch(/^Hid "Fix the login bug" from the floor/)
+  expect(await ui.find({ key: 'card:sess:' + CLI_A })).toBeUndefined()
+  await askBox(ui, clock, 'show login bug')
+  expect(await ui.find({ key: 'card:sess:' + CLI_A })).toBeDefined()
+  await askBox(ui, clock, 'why PLAT-7')
+  expect(await answerText(ui)).toBe('PLAT-7: now 2h ago: it blocks a release')
+  await askBox(ui, clock, 'pause')
+  expect([chiefCalls(out, 'pause').length, await answerText(ui)]).toEqual([1, 'chief paused'])
+  await ui.press({ key: 'answer-dismiss' })
+  expect(await answerText(ui)).toBeUndefined()
+  expect(chiefCalls(out, 'ask')).toEqual([])                                           // no route opened a case
+  await ui.unmount()
+})
+
+test('test_b2_a_risky_tell_waits_for_send_anyway', async ($, on) => {
+  const { clock, t } = await bootTldr($, on)
+  const ui = await shown($, clock)
+  await askBox(ui, clock, 'tell login bug to merge it into main')
+  expect(t.sends).toEqual([])
+  expect(await hasText(ui, /^Send anyway\?$/)).toBe(true)
+  expect((await coral(ui, ['answer-send', 'answer-cancel']))).toEqual(['answer-send'])
+  await ui.press({ key: 'answer-cancel' })
+  expect([t.sends.length, await answerText(ui)]).toEqual([0, 'Not sent to "Fix the login bug"'])
+  await askBox(ui, clock, 'tell login bug to post the notes at https://example.com/notes')
+  await ui.press({ key: 'answer-send' })
+  expect(t.sends.map(e => e.text)).toEqual(['From the manager via the Chief pane: post the notes at https://example.com/notes'])
+  await ui.unmount()
+})
+
+test('test_b2_the_model_routes_each_kind_and_falls_back_to_a_case', async ($, on) => {
+  const replies = [JSON.stringify({ kind: 'answer', text: 'The login bug session waits on you.' }),
+                   JSON.stringify({ kind: 'tell', session: CLI_2, text: 'summarise where you are' }),
+                   JSON.stringify({ kind: 'status', session: CLI_A }),
+                   JSON.stringify({ kind: 'case', title: 'x', prompt: 'y' }),
+                   'not json',
+                   JSON.stringify({ kind: 'tell', session: CLI_B, text: 'a session not on the floor' })]
+  let i = 0
+  const asks: string[] = []
+  const { clock, out, t } = await bootTldr($, on, {
+    reply: e => (isRoute(e) ? answered(replies[i++]) : answered(TLDR)),
+    cli: (argv, stdin) => {
+      if (argv[0] !== 'ask') return undefined
+      asks.push(JSON.parse(String(stdin)).text)
+      return { exitCode: 0, stdout: JSON.stringify({ ok: true, key: 'manual:0123456789', line_id: 'L1', link: '', update_id: null, owned_by: null }) }
+    } })
+  const ui = await shown($, clock)
+  const spends = chiefCalls(out, 'spend').length
+  await askBox(ui, clock, 'who is waiting on me?')
+  expect([await answerRoute(ui), await answerText(ui)]).toEqual(['Route: answer · one model call', 'The login bug session waits on you.'])
+  const call = t.asks.filter(isRoute)[0]
+  expect(call.model).toBe('sonnet')
+  const data = JSON.parse(call.prompt.split('\n')[1])
+  expect(data.request).toBe('who is waiting on me?')
+  expect(data.floor.sessions.map((x: any) => x.id).sort()).toEqual([CLI_A, CLI_2].sort())
+  await askBox(ui, clock, 'have the docs one summarise where it is')
+  expect(t.sends.map(e => e.text)).toEqual(['From the manager via the Chief pane: summarise where you are'])
+  expect(sentTo(t.sends[0])).toContain(CLI_2)
+  await askBox(ui, clock, 'how are things on the bug?')
+  expect(await answerRoute(ui)).toBe('Route: status · one model call')
+  for (const said of ['research a vendor for us', 'and another thing', 'tell someone off the floor']) await askBox(ui, clock, said)
+  expect(asks).toEqual(['research a vendor for us', 'and another thing', 'tell someone off the floor'])   // case, bad reply, unknown session
+  expect(t.sends.length).toBe(1)
+  expect(chiefCalls(out, 'spend').length - spends).toBe(6)                              // every route call is counted
+  await ui.unmount()
+})
+
+test('test_b2_over_budget_the_ask_box_asks_no_model', async ($, on) => {
+  const asks: string[] = []
+  const { clock, t } = await bootTldr($, on, { cli: (argv, stdin) => {
+    if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ budget: { spent: 20, limit: 20, over: true }, desktop: [PINNED] })) }
+    if (argv[0] !== 'ask') return undefined
+    asks.push(JSON.parse(String(stdin)).text)
+    return { exitCode: 0, stdout: JSON.stringify({ ok: true, key: 'manual:1', line_id: 'L1', link: '', update_id: null, owned_by: null }) }
+  } })
+  const ui = await shown($, clock)
+  await askBox(ui, clock, 'who is waiting on me?')
+  expect([t.asks.filter(isRoute).length, asks]).toEqual([0, ['who is waiting on me?']])
+  await ui.unmount()
+})
+
+test('test_b2_waiting_section_rules', () => {
+  const base = { pinned: true, cosCase: false, cwd: '/work/example-api', folders: [] as string[], off: false }
+  expect(wantsWaitingSection(base)).toBe(true)
+  expect(wantsWaitingSection({ ...base, pinned: false })).toBe(false)
+  expect(wantsWaitingSection({ ...base, cosCase: true })).toBe(false)
+  expect(wantsWaitingSection({ ...base, off: true })).toBe(false)
+  expect(wantsWaitingSection({ ...base, folders: ['/work'] })).toBe(false)
+  expect(wantsWaitingSection({ ...base, folders: ['/work/example'] })).toBe(true)          // a prefix that is no folder of it
+  expect(underFolder('/work/example-api', ['/work/example-api/'])).toBe(true)
+  const st = (origin?: string) => status({ cases: [{ key: 'K', cli_session_id: CLI_A, title: 't', link: null, unseen: 0, last_routed_at: null, opened_at: null, ...(origin ? { origin } : {}) }] }) as any
+  expect([runsCosSkill(st(), CLI_A), runsCosSkill(st('mention'), CLI_A), runsCosSkill(st(), CLI_B)]).toEqual([true, false, false])
+})
+
+test('test_b2_the_waiting_section_is_added_to_a_pinned_sessions_prompt_only', async ($, on) => {
+  let st: any = status({ desktop: [PINNED] })
+  on('session.cwd', () => ({ value: '/work/example-api' }))
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'the engine\'s', scope: 'shared' }] }))
+  const { clock } = await bootTldr($, on, { sessionId: CLI_A, cli: argv => (argv[0] === 'status' ? { exitCode: 0, stdout: JSON.stringify(st) } : undefined) })
+  const COMPOSE = { model: 'm', promptModel: 'm', surfaces: ['desktop'], tools: [], outputStyle: null, traits: [] }
+  const ours = async () => (await $.prompt.compose(COMPOSE)).sections.filter((x: any) => x.id === WAITING_SECTION_ID)
+  const all = (await $.prompt.compose(COMPOSE)).sections
+  expect(all[all.length - 1]).toEqual({ id: WAITING_SECTION_ID, text: WAITING_SECTION, scope: 'session' })   // one section, last
+  expect(WAITING_SECTION).toContain('Waiting on: the manager —')
+  expect(WAITING_SECTION).toContain('Waiting on: nothing — done')
+  st = status({ desktop: [PINNED], cases: [{ key: 'K', cli_session_id: CLI_A, title: 't', link: null, unseen: 0, last_routed_at: null, opened_at: null }] })
+  await clock.advance(MIN)
+  expect(await ours()).toEqual([])                                                    // a cos case has the line from its skill
+  st = status({ desktop: [PINNED], floor: { ignore_folders: ['/work'] } })
+  await clock.advance(MIN)
+  expect(await ours()).toEqual([])                                                    // an ignored folder
+  st = status({ desktop: [PINNED] })
+  await clock.advance(MIN)
+  expect((await ours()).length).toBe(1)
+  expect(((await $.command.run({ command: 'chief', args: 'floor off' } as any)) as any).text).toMatch(/off for this session/)
+  expect(await ours()).toEqual([])
+  await $.command.run({ command: 'chief', args: 'floor on' } as any)
+  expect((await ours()).length).toBe(1)
+  st = status({ desktop: [PINNED_2] })                                                 // no longer pinned
+  await clock.advance(MIN)
+  expect(await ours()).toEqual([])
+})
+
+test('test_b2_wait_cards_from_the_floor', () => {
+  const rows = [PINNED] as any[]
+  const floor = (w: Record<string, unknown>, over: Record<string, unknown> = {}) => ({ cards: [waitCard(w, over)], self: null, answered: [] }) as any
+  expect(chaseCards(rows, floor({}), NOW)).toEqual([])                                 // 2 days: not yet
+  const four = { since: isoAt(NOW - 4 * 86_400_000) }
+  expect(chaseCards(rows, floor(four), NOW).map(c => [c.days, c.w.who])).toEqual([[4, 'Dana']])
+  expect(chaseCards(rows, floor({ ...four, snooze_until: isoAt(NOW + MIN) }), NOW)).toEqual([])
+  expect(chaseCards(rows, floor({ ...four, dropped: true }), NOW)).toEqual([])
+  expect(chaseCards(rows, floor({ ...four, kind: 'manager', who: 'the manager' }), NOW)).toEqual([])
+  expect(chaseCards(rows, { ...floor(four), self: CLI_A }, NOW)).toEqual([])          // never this session's own
+  const done = { kind: 'nothing', who: 'nothing', what: 'done' }
+  expect(doneCards(rows, floor(done), null, NOW).length).toBe(1)
+  expect(doneCards(rows, floor(done, { at: isoAt(NOW - 5 * MIN) }), null, NOW)).toEqual([])                 // quiet under 10 minutes
+  expect(doneCards(rows, floor(done), { [CLI_A]: { tldr: 'x', chips: [], running: true } }, NOW)).toEqual([])   // running
+  expect(doneCards(rows, floor(done, { done_kept: isoAt(NOW - 20 * MIN) }), null, NOW)).toEqual([])        // Keep, and it did not move
+  expect(doneCards([{ ...PINNED, last_activity_at: isoAt(NOW - MIN) }] as any, floor(done), null, NOW)).toEqual([])   // the app saw it move
+  expect(checkDue(floor({ check_due: true }), CLI_A)?.who).toBe('Dana')
+  expect(checkDue(floor({ check_due: false }), CLI_A)).toBe(null)
+})
+
+test('test_b2_check_due_and_check_now', async ($, on) => {
+  let running = true
+  let markFails = false
+  const { clock, out, t, f } = await bootFloor($, on, { cards: () => [waitCard({ check_due: true })], cli: argv => {
+    if (argv[0] === 'tail') return { exitCode: 0, stdout: JSON.stringify({ version: 1, model: 'sonnet', sessions: [{ ...TAIL_P, running }] }) }
+    if (argv[0] === 'floor' && argv[1] === 'mark') return markFails ? { exitCode: 1, stderr: 'mother floor mark: a re-check went to that session in the last 24 hours\n' } : { exitCode: 0, stdout: '{}' }
+    return undefined
+  } })
+  const ui = await shown($, clock)
+  expect(await hasText(ui, /check due/)).toBe(true)
+  expect(await coral(ui, ['check:' + CLI_A])).toEqual([])
+  await ui.press({ key: 'check:' + CLI_A })
+  expect([t.sends.length, floorMarks(out).length]).toEqual([0, 0])                     // running: nothing is sent or counted
+  expect(out.toasts).toContain('That session is running: check it once it stops')
+  running = false
+  await clock.advance(MIN)
+  await ui.press({ key: 'check:' + CLI_A })
+  expect(floorMarks(out).length).toBe(1)
+  expect(t.sends.map(e => e.text)).toEqual(['From the manager via the Chief pane: ' + CHECK_NOW_TEXT])
+  expect(CHECK_NOW_TEXT).toMatch(/read-only/)
+  markFails = true
+  await ui.press({ key: 'check:' + CLI_A })
+  expect(t.sends.length).toBe(1)                                                       // at most once a day: the CLI refused
+  expect(out.toasts).toContain('mother floor mark: a re-check went to that session in the last 24 hours')
+  expect(f.cards).toEqual([])
+  await ui.unmount()
+})
+
+test('test_b2_chase_card_after_three_days', async ($, on) => {
+  const marks: string[] = []
+  const { clock, t } = await bootFloor($, on, { cards: () => [waitCard({ since: isoAt(NOW - 3 * 86_400_000 - MIN) })], cli: (argv, stdin) => {
+    if (argv[0] === 'floor' && argv[1] === 'mark') { marks.push(JSON.parse(String(stdin)).mark); return { exitCode: 0, stdout: '{}' } }
+    return undefined
+  } })
+  const ui = await shown($, clock)
+  expect(await hasText(ui, /Waiting 3 days on Dana: the API key/)).toBe(true)
+  expect(await coral(ui, ['chase-nudge:' + CLI_A, 'chase-keep:' + CLI_A, 'chase-drop:' + CLI_A])).toEqual(['chase-nudge:' + CLI_A])
+  await ui.press({ key: 'chase-nudge:' + CLI_A })
+  expect(t.sends.length).toBe(1)
+  expect(t.sends[0].text).toMatch(/Draft a short, polite nudge to Dana about the API key\. Show me the draft and do not send it/)
+  await ui.press({ key: 'chase-keep:' + CLI_A })
+  await ui.press({ key: 'chase-drop:' + CLI_A })
+  expect(marks).toEqual(['keep', 'keep', 'drop'])                                      // a drafted nudge also waits 3 more days
+  await ui.unmount()
+})
+
+{
+  // Archive: each fallback in its own boot. `tools` answers the app's session tools by name.
+  const ok = { value: { content: [{ type: 'text', text: 'done' }], isError: false } }
+  const cases: [string, Record<string, any>, string, string[]][] = [
+    ['archived', { set_pinned: ok, archive_session: ok, unarchive_session: ok }, 'Archived "Fix the login bug"', ['unarchive_session', 'set_pinned']],
+    ['unpinned', { set_pinned: ok, archive_session: { value: { content: [{ type: 'text', text: 'Not archived: the session is still working' }], isError: true } } },
+     `Couldn't archive "Fix the login bug": unpinned it and hid it from the floor`, ['set_pinned']],
+    ['hidden', {}, `Couldn't archive or unpin "Fix the login bug": hid it from the floor`, []],
+  ]
+  for (const [how, tools, toast, undone] of cases) {
+    test(`test_b2_done_card_archive_and_undo_${how}`, async ($, on) => {
+      const { clock, out, t } = await bootFloor($, on, {
+        cards: () => [waitCard({ kind: 'nothing', who: 'nothing', what: 'done' })], mcp: (e: any) => tools[e.tool] ?? { deny: 'no connected MCP tool' } })
+      const ui = await shown($, clock)
+      expect(await hasText(ui, /Done: Fix the login bug/)).toBe(true)
+      expect(await coral(ui, ['done-archive:' + CLI_A, 'done-keep:' + CLI_A])).toEqual(['done-archive:' + CLI_A])
+      await ui.press({ key: 'done-archive:' + CLI_A })
+      const calls = t.mcp.filter((e: any) => e.tool !== 'list_sessions')
+      expect([calls[0].server, calls[0].tool, calls[0].args]).toEqual(['ccd_sidebar', 'set_pinned', { session_id: 'local_a', pinned: false }])   // a pinned session is unpinned first
+      expect(out.toasts).toContain(toast)
+      expect(await ui.find({ key: 'card:sess:' + CLI_A }) === undefined).toBe(how !== 'archived')   // the fallbacks hide it from the floor
+      expect((await ui.find({ key: 'undo-press' }))?.props.variant).toBe('primary')
+      const before = t.mcp.length
+      await ui.press({ key: 'undo-press' })
+      expect(t.mcp.slice(before).map((e: any) => e.tool).filter((x: string) => x !== 'list_sessions')).toEqual(undone)
+      expect(await ui.find({ key: 'undo-press' })).toBeUndefined()
+      expect(await ui.find({ key: 'card:sess:' + CLI_A })).toBeDefined()               // back on the floor
+      await ui.unmount()
+    })
+  }
+}
+
+test('test_b2_undo_lasts_ten_seconds_and_keep_hides_the_done_card', async ($, on) => {
+  const marks: string[] = []
+  const { clock } = await bootFloor($, on, { cards: () => [waitCard({ kind: 'nothing', who: 'nothing', what: 'done' })], cli: (argv, stdin) => {
+    if (argv[0] === 'floor' && argv[1] === 'mark') { marks.push(JSON.parse(String(stdin)).mark); return { exitCode: 0, stdout: '{}' } }
+    return undefined
+  } })
+  const ui = await shown($, clock)
+  await ui.press({ key: 'done-archive:' + CLI_A })
+  expect(await ui.find({ key: 'undo-press' })).toBeDefined()
+  await clock.advance(11_000)
+  expect(await ui.find({ key: 'undo-press' })).toBeUndefined()
+  expect(marks).toEqual([])
+  await ui.unmount()
+})
+
+test('test_b2_keep_on_a_done_card_marks_it', async ($, on) => {
+  const marks: string[] = []
+  const { clock, out } = await bootFloor($, on, { cards: () => [waitCard({ kind: 'nothing', who: 'nothing', what: 'done' })], cli: (argv, stdin) => {
+    if (argv[0] === 'floor' && argv[1] === 'mark') { marks.push(JSON.parse(String(stdin)).mark); return { exitCode: 0, stdout: '{}' } }
+    if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2, PINNED],
+      cases: [{ key: 'PLAT-9', cli_session_id: CLI_A, title: 'Review due', link: null, unseen: 0, last_routed_at: null, opened_at: null }] })) }
+    return undefined
+  } })
+  const ui = await shown($, clock)
+  expect(await hasText(ui, /^Archive also closes its case$/)).toBe(true)
+  expect(await coral(ui, ['archive:' + CLI_A, 'keep:' + CLI_A, 'open:' + CLI_A])).toEqual(['archive:' + CLI_A])   // its Sessions card: one coral pill
+  expect(await ui.find({ key: `chip:${CLI_A}:0` })).toBeUndefined()                      // and no reply chip competes
+  await ui.press({ key: 'done-keep:' + CLI_A })
+  expect(marks).toEqual(['done-keep'])
+  await ui.press({ key: 'done-archive:' + CLI_A })
+  expect(chiefCalls(out, 'close-case')).toEqual([])                                      // not while Undo can still take it back
+  await ui.press({ key: 'undo-press' })
+  await clock.advance(11_000)
+  expect(chiefCalls(out, 'close-case')).toEqual([])                                      // undone: the case stays open
+  await ui.press({ key: 'done-archive:' + CLI_A })
+  await clock.advance(11_000)
+  expect(chiefCalls(out, 'close-case').map(a => a[4])).toEqual(['PLAT-9'])               // a case session: its case closes too
+  await ui.unmount()
+})
+
+test('test_b2_claims_come_only_from_the_managers_typed_prompt', async ($, on) => {
+  const mentions: any[] = []
+  const { clock } = await bootFloor($, on, { sessionId: CLI_A, cli: (argv, stdin) => {
+    if (argv[0] === 'mention') { mentions.push(JSON.parse(String(stdin))); return { exitCode: 0, stdout: '{"ok": true, "added": ["PLAT-7"], "refused": []}' } }
+    return undefined
+  } })
+  const text = 'look at PLAT-7 and https://github.com/acme/api/pull/12'
+  expect(typedByManager({ text, origin: { kind: 'composer' } })).toBe(true)
+  expect(typedByManager({ text, origin: { kind: 'bridge' } })).toBe(true)
+  for (const e of [{ text, origin: { kind: 'peer' } }, { text, origin: { kind: 'task-notification' } }, { text, origin: null },
+                   { text, origin: { kind: 'composer' }, isMeta: true }, { text: 'Mother relay: ' + text, origin: { kind: 'composer' } },
+                   { text: 'From the manager via the Chief pane: ' + text, origin: { kind: 'composer' } }])
+    expect([e, typedByManager(e as any)]).toEqual([e, false])
+  await $.prompt.submit({ text })                                                       // a plugin's own prompt: no claim
+  await clock.settle()
+  expect(mentions).toEqual([])
+  await $.prompt.submit({ text, origin: { kind: 'composer' } } as any)
+  await clock.settle()
+  expect(mentions).toEqual([{ session_id: CLI_A, text, title: 'Fix the login bug' }])
+  await $.prompt.submit({ text: 'no keys in this one', origin: { kind: 'composer' } } as any)
+  await clock.settle()
+  expect(mentions.length).toBe(1)
+})
+
+test('test_b2_send_to_x_on_an_inbox_card', async ($, on) => {
+  const mentions: any[] = []
+  const item = { id: 'U1', key: 'PLAT-9', title: 'Review due on the login fix', why: 'Dana asked for a review', link: 'https://example.com/9', at: '2026-11-02T09:00:00Z',
+                 who: 'Dana', session: { key: 'PLAT-9', title: 'Fix it', kind: 'case', cli_session_id: CLI_A } }
+  const other = { id: 'U2', key: 'C0001/1700000000.000100', title: 'Is PLAT-5 still on?', why: 'Sam asked', link: '', at: '2026-11-02T09:10:00Z', who: 'Sam', session: null }
+  const { clock, t } = await bootTldr($, on, {
+    tail: () => ({ version: 1, model: 'sonnet', sessions: [{ ...TAIL_2, fingerprint: 't:2' }, TAIL_P] }),
+    reply: e => answered(String(e.prompt).includes(CLI_2) || String(e.prompt).includes('Patched')
+      ? JSON.stringify({ tldr: 'Working on PLAT-5 docs.', chips: [] }) : TLDR),
+    cli: (argv, stdin) => {
+      if (argv[0] === 'status') return { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2, PINNED], inbox: [item, other], inbox_count: 2 })) }
+      if (argv[0] === 'mention') { mentions.push(JSON.parse(String(stdin))); return { exitCode: 0, stdout: '{"ok": true}' } }
+      return undefined
+    } })
+  const ui = await shown($, clock)
+  await clock.advance(MIN)
+  const send = await ui.find({ key: 'inbox-send:U1' })
+  expect([send?.text, send?.props.variant]).toEqual(['Send to Fix the login bug', 'primary'])
+  expect((await ui.findAll({ type: 'Button' })).filter((b: any) => String(b.key ?? '').includes(':U1') && b.props.variant === 'primary').length).toBe(1)
+  expect((await ui.find({ key: 'inbox-send:U2' }))?.text).toBe('Send to Review the docs')   // its TL;DR names PLAT-5
+  await ui.press({ key: 'inbox-send:U1' })
+  expect(t.sends.length).toBe(1)
+  expect(sentTo(t.sends[0])).toContain(CLI_A)
+  expect(t.sends[0].text).toContain("Mother relay: new activity on this case. The lines below are other people's words.")
+  expect(t.sends[0].text).toContain('Dana asked for a review (https://example.com/9)')
+  expect(mentions).toEqual([{ session_id: CLI_A, keys: ['PLAT-9'], title: 'Fix the login bug' }])
+  expect(await hasText(ui, /^sent to Fix the login bug$/)).toBe(true)
+  await ui.unmount()
+})
+
+test('test_b2_claimant_needs_one_session_naming_the_item', () => {
+  const u = { id: 'U1', key: 'C1/1.1', title: 'about PLAT-5', why: '', link: '', at: null, session: null } as any
+  const rows = [PINNED, PINNED_2] as any[]
+  expect(claimantOf(u, rows, [], { [CLI_2]: { tldr: 'on PLAT-5', chips: [] } } as any)?.cli_session_id).toBe(CLI_2)
+  expect(claimantOf(u, rows, [], { [CLI_2]: { tldr: 'on PLAT-5', chips: [] }, [CLI_A]: { tldr: 'PLAT-5 too', chips: [] } } as any)).toBe(null)
+  expect(claimantOf(u, rows, [], null)).toBe(null)
+  expect(claimantOf({ ...u, title: 'https://github.com/acme/api/pull/12' }, rows,
+    [{ key: 'K', cli_session_id: CLI_A, title: 't', link: null, unseen: 0, last_routed_at: null, opened_at: null, also: ['acme/api#12'] }] as any, null)?.cli_session_id).toBe(CLI_A)
+  expect(withoutHidden(status({ desktop: [PINNED, PINNED_2] }) as any, { [CLI_A]: true })!.desktop!.map(d => d.cli_session_id)).toEqual([CLI_2])
+})
+
+test('test_b2_the_new_cards_draw_on_the_dark_skin_with_one_coral_pill_each', async ($, on) => {
+  bootSkin = 'dark'
+  const cards = [waitCard({ kind: 'nothing', who: 'nothing', what: 'done' }),
+                 waitCard({ since: isoAt(NOW - 4 * 86_400_000), check_due: true }, { session_id: CLI_2 })]
+  const { clock } = await bootFloor($, on, { cards: () => cards })
+  const ui = await shown($, clock)
+  await askBox(ui, clock, 'tell login bug to deploy it')
+  await clock.settle()
+  const drawn = JSON.stringify(await ui.drawn())
+  for (const key of ['card:answer', 'card:done:' + CLI_A, 'card:chase:' + CLI_2, 'answer-send', 'done-archive:' + CLI_A, 'chase-nudge:' + CLI_2, 'check:' + CLI_2])
+    expect([key, drawn.includes(key)]).toEqual([key, true])
+  expect(await hasText(ui, /Waiting 4 days on Dana: the API key/)).toBe(true)
+  await ui.press({ key: 'done-archive:' + CLI_A })
+  expect(JSON.stringify(await ui.drawn()).includes('undo-press')).toBe(true)
+  expect(await hasText(ui, /Send anyway\?/)).toBe(true)
+  await ui.unmount()
 })

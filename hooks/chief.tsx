@@ -2,10 +2,15 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import { SNOOZES, age, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe, todaysTop } from './shared'
-import { askFloor, askIdOf, forgetWrapUp, heldCount, holdAsk, isPinned, loadHeld, markAnswered, needsYou, noteWrapUp, ownAsks, parseFloor, prLinks, readCards, recommendationLabel,
+import { askFloor, askIdOf, forgetWrapUp, heldCount, holdAsk, isPinned, loadHeld, markAnswered, markCard, needsYou, noteWrapUp, ownAsks, parseFloor, prLinks, readCards, recommendationLabel,
          recommendedOption, reloadFloor, storeCard, takeWrapUp, FLOOR_TAIL_MAX, NO_ASK } from './floor'
 import type { FloorReply } from './floor'
-import { askDeliver, caseBrief, caseMeta, caseOnlyRows, caseRows, claimCase, firstCase, floorRows, holdsClaim, noteTurn, relayIsOn, relayPass, relaySwitch, resetCos } from './cos'
+import { askDeliver, caseBrief, caseMeta, caseOnlyRows, caseRows, claimCase, firstCase, floorRows, holdsClaim, noteTurn, relayIsOn, relayPass, relaySwitch, relayText, resetCos,
+         CASE_PREFIX, RELAY_PREFIX } from './cos'
+import { CHECK_NOW_TEXT, WAITING_SECTION, WAITING_SECTION_ID, chaseCards, checkDue, doneCards, nudgeText, runsCosSkill, wantsWaitingSection } from './waiting'
+import type { Chase, DoneOne } from './waiting'
+import { ROUTE_MAX_TOKENS, ROUTE_SYSTEM, ROUTE_TIMEOUT_MS, claimantOf, findSession, isRisky, parseAskCommand, parseRoute, routePrompt, splitTell } from './ask_route'
+import { UNDO_MS, archiveSession, archivedSays, loadHidden, setHidden, undoArchive, withoutHidden } from './archive'
 import type { CaseItem } from './cos'
 import { HABITS_NOTE, HABITS_RE, habitNote, inboxRow, logAct, nowRow, picked, promptHabits } from './habits'
 import type { ActRow, ActVerb } from './habits'
@@ -23,7 +28,8 @@ import { actionSays, decisionLabel, guardState, healthProblems, healthSection, i
          loadDismissed, loadOpenDetails, suggestedRows, suggestedSection, teamCount, teamSection } from './pane_tabs'
 import type { Details } from './pane_tabs'
 import type { ChiefHealthState } from '../types'
-import type { ChiefCardState, ChiefChip, ChiefDesktop, ChiefInboxItem, FloorCard, ChiefOpen, ChiefStatus, ChiefTabs, ChiefTldr, NowDoc, NowItem, NowTop } from '../types'
+import type { ChiefCardState, ChiefChip, ChiefDesktop, ChiefInboxItem, FloorCard, ChiefOpen, ChiefStatus, ChiefTabs, ChiefTldr, NowDoc, NowItem, NowTop,
+              ChiefAnswer, ChiefUndo } from '../types'
 
 // The Chief pane: which session leads, Needs you, the Inbox, and one card per pinned desktop session with a chat box.
 // Every write goes through `mother chief …`; the pane never edits a chief file itself.
@@ -36,6 +42,9 @@ export const chiefOpenAtom = atom({ plugin: 'mother', key: 'chiefOpen' } as cons
 export const chiefSelectedAtom = atom({ plugin: 'mother', key: 'chiefSelected' } as const, null)
 export const chiefTabAtom = atom({ plugin: 'mother', key: 'chiefTab' } as const, null)
 export const chiefSkinAtom = atom({ plugin: 'mother', key: 'chiefSkin' } as const, null)
+export const chiefAnswerAtom = atom({ plugin: 'mother', key: 'chiefAnswer' } as const, null)   // the Ask box's answer card
+const hiddenAtom = atom({ plugin: 'mother', key: 'chiefHidden' } as const, null)   // written in hooks/archive.ts
+const undoAtom = atom({ plugin: 'mother', key: 'chiefUndo' } as const, null)       // written in hooks/archive.ts
 // What a field holds as it is typed, by Input key. No draw reads it (a handler does, on a press), so a keystroke
 // redraws nothing.
 const chiefTypedAtom = atom({ plugin: 'mother', key: 'chiefTyped' } as const, null)
@@ -647,13 +656,56 @@ async function refreshNow($: Dollar, bin: string, which: string): Promise<string
 }
 
 // Close case on a done session's card: every case it holds is closed (`mother chief close-case <key>`).
-async function closeCase($: Dollar, bin: string, cliId: string): Promise<void> {
+async function closeCase($: Dollar, bin: string, cliId: string, quiet = false): Promise<void> {
   let ok = true
   for (const c of caseRows(lastStatus).filter(c => c.cli_session_id === cliId)) {
     logAct($, bin, 'done', { item_id: 'sess:' + cliId, key: c.key, source: 'session', title: oneLine(c.title, TITLE_MAX) })   // for habits
     ok = (await cli($, bin, ['close-case', c.key])).ok && ok
   }
-  $.ui.toast(ok ? 'Case closed: the session can be archived' : 'mother chief close-case failed')
+  if (!quiet || !ok) $.ui.toast(ok ? 'Case closed: the session can be archived' : 'mother chief close-case failed')
+  await reloadStatus($, bin)
+}
+
+// ---- what a wait, a Done card and an Inbox card's Send to X run (hooks/waiting.ts, hooks/archive.ts) ----
+async function markAndReload($: Dollar, bin: string, cli: string, mark: 'checked' | 'keep' | 'drop' | 'done-keep'): Promise<boolean> {
+  const why = await markCard($, bin, cli, mark)
+  if (why) $.ui.toast(why)
+  await reloadFloor($, bin)
+  return why === null
+}
+
+// Check now: a short read-only instruction, at most once a day per session and never into a running session.
+async function checkNow($: Dollar, bin: string, cli: string): Promise<void> {
+  if ((await read($, chiefTldrAtom))?.[cli]?.running === true) { $.ui.toast('That session is running: check it once it stops'); return }
+  if (!(await markAndReload($, bin, cli, 'checked'))) return
+  logAct($, bin, 'action', { item_id: 'sess:' + cli, source: 'session' }, picked('Check now', 0))
+  await sendPinned($, cli, CHECK_NOW_TEXT)
+}
+
+// Archive on a Done card: archived, else unpinned, else hidden, with Undo. A case session's case closes too, once
+// the Undo window has passed, since a closed case cannot be reopened.
+const closingCases = new Set<string>()
+async function archiveDone($: Dollar, bin: string, d: ChiefDesktop): Promise<void> {
+  const cli = d.cli_session_id
+  logAct($, bin, 'done', { item_id: 'sess:' + cli, source: 'session', title: oneLine(d.title, TITLE_MAX) })
+  if (caseRows(lastStatus).some(c => c.cli_session_id === cli)) {
+    closingCases.add(cli)
+    void $.clock.sleep(UNDO_MS).then(() => (closingCases.delete(cli) ? closeCase($, bin, cli, true) : undefined)).catch(() => undefined)
+  }
+  const pinned = (lastStatus?.desktop ?? []).some(x => x.cli_session_id === cli)
+  const u = await archiveSession($, d, pinned, await $.clock.now())
+  $.ui.toast(archivedSays(u))
+  void snapshotPinned($, bin).then(() => reloadStatus($, bin)).catch(() => undefined)
+}
+
+// Send to X: the Inbox item into the session it belongs with, as other people's words, then its key routes there.
+async function sendToSession($: Dollar, bin: string, u: ChiefInboxItem, d: ChiefDesktop): Promise<void> {
+  const title = oneLine(d.title, 60)
+  const line = { id: u.id, key: u.key, at: u.at, who: String(u.who ?? ''), title: String(u.title ?? ''), summary: String(u.why ?? ''), link: String(u.link ?? '') }
+  if (!(await sendPinned($, d.cli_session_id, relayText([line], await $.clock.now())))) { $.ui.toast(`Not delivered to "${title}"`); return }
+  await cli($, bin, ['mention', '--stdin'], JSON.stringify({ session_id: d.cli_session_id, keys: [u.key], title: d.title }))
+  await update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), ['routed:' + u.id]: title }))
+  $.ui.toast(`Sent to "${title}": later activity on it goes there too`)
   await reloadStatus($, bin)
 }
 
@@ -815,7 +867,171 @@ export const ASK_ERROR_KEY = 'ask-error'
 export const ASK_EMPTY = 'Type what you need first'
 const ASK_MAX = 2000
 const ASK_TITLE_MAX = 60
+// The ask box's press: a route read in code or by one model call (hooks/ask_route.ts) when it is one, else a case as
+// before. Empty input shows the inline error and runs nothing.
 async function startAsk($: Dollar, bin: string, value: string): Promise<void> {
+  const text = oneLine(value, ASK_MAX)
+  if (text) {
+    let routed = false
+    try { routed = await routeAsk($, bin, text) } catch { routed = false }
+    if (routed) {
+      await untype($, ASK_KEY)
+      await update($, chiefDraftAtom, prev => {
+        const next = { ...(prev ?? {}) }
+        delete next[ASK_ERROR_KEY]
+        delete next[ASK_KEY]
+        return next
+      })
+      return
+    }
+  }
+  await startCase($, bin, value)
+}
+
+// ---- the ask box's routes (docs/CONTRACT.md §5g "Ask box routing") ----
+const ANSWER_ROUTES = { code: 'read in code', model: 'one model call' }
+async function sayAnswer($: Dollar, route: string, text: string, confirm: ChiefAnswer['confirm'] = null): Promise<void> {
+  await update($, chiefAnswerAtom, () => ({ route, text, confirm }))
+}
+
+// A message for a session: straight to it, unless it reads risky, then it waits on the answer card's Send anyway?.
+// Only a session on the floor (pinned, or holding a case) is ever a target.
+async function tellSession($: Dollar, d: ChiefDesktop, msg: string, how: string): Promise<void> {
+  const title = oneLine(d.title, 60)
+  if (isRisky(msg)) return sayAnswer($, `tell · ${how}`, `To "${title}": ${msg}`, { cli: d.cli_session_id, title, text: msg })
+  const ok = await sendPinned($, d.cli_session_id, msg)
+  const said = (await read($, chiefSentAtom))?.[d.cli_session_id] ?? ''
+  await sayAnswer($, `tell · ${how}`, ok ? `Told "${title}": ${msg}` : `Not sent to "${title}" (${said || 'not delivered'})`)
+}
+
+// A session's stored card in one answer (no typing into the session), then a Refresh of that card.
+async function statusAnswer($: Dollar, bin: string, d: ChiefDesktop, how: string): Promise<void> {
+  const cli = d.cli_session_id
+  const t = (await read($, chiefTldrAtom))?.[cli]
+  const card = (await read($, floorAtom))?.cards.find(c => c.session_id === cli)
+  const nowMs = await $.clock.now()
+  const w = card?.waiting
+  const parts = [
+    t?.state ? t.state.replace('_', ' ') : 'no card yet',
+    oneLine((t?.tldr ?? d.last_report ?? '').split('\n')[0], 200),
+    w ? `waiting on ${oneLine(w.who, 80)}${w.what ? ': ' + oneLine(w.what, 120) : ''}` : t?.waiting_on ? `waiting on ${oneLine(t.waiting_on, 80)}` : '',
+    t?.at ? `updated ${ago(t.at, nowMs)} ago` : '',
+  ].filter(Boolean)
+  await sayAnswer($, `status · ${how}`, `"${oneLine(d.title, 60)}": ${parts.join(' · ')}. Refreshing its card.`)
+  void refreshTldrs($, bin, { force: cli }).catch(() => undefined)
+}
+
+// True when the text took a route other than a case; false hands it to startCase.
+async function routeAsk($: Dollar, bin: string, text: string): Promise<boolean> {
+  const s = lastStatus
+  const hidden = (await read($, hiddenAtom)) ?? {}
+  const all = floorRows(s)
+  const rows = all.filter(d => !hidden[d.cli_session_id])
+  const cases = caseRows(s)
+  const log = (route: string) => logAct($, bin, 'ask', { item_id: 'ask:' + route, title: clip(text, ASK_TITLE_MAX) })   // for habits, as today
+  const which = (list: readonly ChiefDesktop[]) => `Which one: ${list.slice(0, 4).map(d => `"${oneLine(d.title, 40)}"`).join(', ')}?`
+  const cmd = parseAskCommand(text)
+  const code = ANSWER_ROUTES.code
+  if (cmd) {
+    if (cmd.kind === 'pause' || cmd.kind === 'resume') {
+      const ran = await cli($, bin, [cmd.kind])
+      await sayAnswer($, `${cmd.kind} · ${code}`, firstLine(ran.ok ? ran.stdout : ran.stderr) || `mother chief ${cmd.kind} failed`)
+      await reloadStatus($, bin)
+      log(cmd.kind)
+      return true
+    }
+    if (cmd.kind === 'why') {
+      const ran = await cli($, bin, ['why', cmd.key, '--json'])
+      const nowMs = await $.clock.now()
+      let rows: any[] = []
+      try { rows = ran.ok ? JSON.parse(ran.stdout)?.verdicts ?? [] : [] } catch { rows = [] }
+      const lines = (Array.isArray(rows) ? rows : []).slice(0, 3).map((r: any) =>
+        `${oneLine(r?.decision, 20)} ${ago(r?.at, nowMs)} ago: ${oneLine(r?.reason, 100) || 'no reason given'}`)
+      await sayAnswer($, `why · ${code}`, !ran.ok ? (firstLine(ran.stderr) || 'mother chief why failed')
+        : lines.length ? `${oneLine(cmd.key, 60)}: ${lines.join('; ')}` : `No verdicts for ${oneLine(cmd.key, 60)} in the last 30 days`)
+      log('why')
+      return true
+    }
+    if (cmd.kind === 'hide' || cmd.kind === 'show') {
+      const pool = cmd.kind === 'show' ? all.filter(d => hidden[d.cli_session_id]) : rows
+      const hit = findSession(pool, cases, cmd.target)
+      if (!hit) await sayAnswer($, `${cmd.kind} · ${code}`, cmd.kind === 'show' ? `No hidden session is called "${oneLine(cmd.target, 60)}"` : `No session on the floor is called "${oneLine(cmd.target, 60)}"`)
+      else if ('ambiguous' in hit) await sayAnswer($, `${cmd.kind} · ${code}`, which(hit.ambiguous))
+      else {
+        await setHidden($, hit.d.cli_session_id, cmd.kind === 'hide')
+        await sayAnswer($, `${cmd.kind} · ${code}`, cmd.kind === 'hide' ? `Hid "${oneLine(hit.d.title, 60)}" from the floor: \`show ${oneLine(hit.d.title, 40)}\` brings it back`
+          : `"${oneLine(hit.d.title, 60)}" is on the floor again`)
+      }
+      log(cmd.kind)
+      return true
+    }
+    if (cmd.kind === 'open') {
+      const key = cmd.target.trim()
+      const holder = cases.find(c => c.key === key || (c.also ?? []).includes(key))
+      const item = (Array.isArray(s?.inbox) ? s!.inbox! : []).find(u => u && u.key === key)
+      const hit = holder ? { d: rows.find(d => d.cli_session_id === holder.cli_session_id)! } : findSession(rows, cases, key)
+      if (hit && 'd' in hit && hit.d) {
+        await openPinned($, hit.d)
+        await sayAnswer($, `open · ${code}`, `Opening "${oneLine(hit.d.title, 60)}"`)
+      } else if (hit && 'ambiguous' in hit) {
+        await sayAnswer($, `open · ${code}`, which(hit.ambiguous))
+      } else if (item) {
+        const id = 'inbox:' + item.id
+        await select($, id)
+        await toggleCard($, id, true)
+        await update($, chiefTabAtom, prev => ({ ...(prev ?? { seen: {} }), picked: 'inbox', seen: prev?.seen ?? {} }))
+        await sayAnswer($, `open · ${code}`, `Opened the Inbox card "${oneLine(item.title, 60)}"`)
+      } else {
+        await sayAnswer($, `open · ${code}`, `Nothing on the floor or in the Inbox is called "${oneLine(key, 60)}"`)
+      }
+      log('open')
+      return true
+    }
+    if (cmd.kind === 'status') {
+      const hit = findSession(rows, cases, cmd.target)
+      if (hit && 'd' in hit) { await statusAnswer($, bin, hit.d, code); log('status'); return true }
+      if (hit) { await sayAnswer($, `status · ${code}`, which(hit.ambiguous)); log('status'); return true }
+    }
+    if (cmd.kind === 'tell-or-ask') {
+      const hit = splitTell(cmd.rest, rows, cases)
+      if (hit) { await tellSession($, hit.d, hit.text, code); log('tell'); return true }
+    }
+  }
+  // one model call over the floor; over budget, failed or unsure: a case, as before
+  if (overBudget(s)) return false
+  const model = await triageModel($, bin)
+  const prompt = routePrompt(text, s, rows, await read($, floorAtom), await read($, chiefTldrAtom), todaysTop(await read($, docAtom), await $.clock.now()))
+  let route = null as ReturnType<typeof parseRoute>
+  try {
+    const r = await $.model.complete({ model, system: ROUTE_SYSTEM, prompt, maxTokens: ROUTE_MAX_TOKENS, timeoutMs: ROUTE_TIMEOUT_MS })
+    await recordSpend($, bin, model, r.usage)
+    route = r.isAnswered ? parseRoute(r.text, new Set(rows.map(d => d.cli_session_id))) : null
+  } catch {
+    await recordSpend($, bin, model, undefined)
+    route = null
+  }
+  if (!route || route.kind === 'case') return false
+  const how = ANSWER_ROUTES.model
+  if (route.kind === 'answer') await sayAnswer($, `answer · ${how}`, route.text)
+  else {
+    const d = rows.find(x => x.cli_session_id === route!.session)!
+    if (route.kind === 'tell') await tellSession($, d, route.text, how)
+    else await statusAnswer($, bin, d, how)
+  }
+  log(route.kind)
+  return true
+}
+
+// The answer card's Send anyway?: the held message goes to its session; Cancel drops it.
+async function confirmTell($: Dollar, a: ChiefAnswer, send: boolean): Promise<void> {
+  if (!a.confirm) return
+  if (!send) return sayAnswer($, a.route, `Not sent to "${a.confirm.title}"`)
+  const ok = await sendPinned($, a.confirm.cli, a.confirm.text)
+  const said = (await read($, chiefSentAtom))?.[a.confirm.cli] ?? ''
+  await sayAnswer($, a.route, ok ? `Told "${a.confirm.title}": ${a.confirm.text}` : `Not sent to "${a.confirm.title}" (${said || 'not delivered'})`)
+}
+
+async function startCase($: Dollar, bin: string, value: string): Promise<void> {
   const text = oneLine(value, ASK_MAX)
   if (!text) {
     await update($, chiefDraftAtom, prev => ({ ...(prev ?? {}), [ASK_ERROR_KEY]: '1' }))
@@ -917,7 +1133,11 @@ type CardCtx = { open: ChiefOpen | null; selected: string | null; portrait?: Por
                  tabs?: ChiefTabs | null; doc?: NowDoc | null
                  health?: ChiefHealthState | null     // the Health tab's dismissed reports and loaded texts (hooks/pane_tabs.tsx)
                  details?: Details                    // what each dots item does, once its card was pressed or found open
-                 people?: Record<string, string> | null }   // chat user ids to names (`context --json`)
+                 people?: Record<string, string> | null     // chat user ids to names (`context --json`)
+                 tldrs?: Record<string, ChiefTldr> | null   // each session's card, for an Inbox card's Send to X
+                 answer?: ChiefAnswer | null                // the Ask box's answer card
+                 undo?: ChiefUndo | null                    // the last Archive, while it can be undone
+                 hidden?: Record<string, true> | null }     // sessions hidden from the floor
 
 // ---- Today: the tick's Top 3 and the on-you items of now.json, as register.tsx read it (its poll, its atom) ----
 // Its buttons are the Now panel's own, from register.tsx: `nowVerb` runs `mother now …` and re-reads now.json at once
@@ -1125,15 +1345,26 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
           ? own.map((a, n) => ({ key: `inbox-act:${u.id}:${n}`, label: a.label, says: a.prompt, run: () => { note('action', picked(a.label, n)); return runAction($, bin, a.prompt, u) } }))
           : suggestionsFor(source).map((text, n) => ({ key: `inbox-act:${u.id}:${n}`, label: suggestionLabels(source)[n], says: text,
               run: () => { note('action', picked(suggestionLabels(source)[n], n)); return runAction($, bin, text, u) } }))
-        const actBtns = actButtons(ui, acts, press)
+        // the live session this item belongs with (its key's case, or one whose card names its ticket or PR): Send to X is
+        // the one coral pill, the item framed as other people's words, and its key routes there from then on
+        const target = claimantOf(u, floorRows(s), caseRows(s), ctx.tldrs ?? null)
+        const routed = drafts?.['routed:' + u.id]
+        const sendBtn = target
+          ? <Button key={'inbox-send:' + u.id} variant="primary" onPress={press(() => { note('action', picked('Send to', 0)); return sendToSession($, bin, u, target) })}>
+              {`Send to ${clipLabel(oneLine(target.title, 60), 20)}`}</Button>
+          : null
+        const actBtns = target
+          ? acts.slice(0, ACTIONS_SHOWN - 1).map(a => <Button key={a.key} variant="secondary" onPress={press(a.run)}>{a.label}</Button>)
+          : actButtons(ui, acts, press)
         const openBtn = <Button key={'inbox-open:' + u.id} onPress={press(() => { note('open_case'); return openIt() })}>Open session</Button>
         const doneBtn = <Button key={'inbox-done:' + u.id} onPress={press(() => { note('done'); return goHub(['done', u.id]) })}>Done</Button>
         return card(ui, { id, color: SOURCE_COLOR[source], selected: ctx.selected === id }, [
-          ...(titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [...actBtns, doneBtn], (tail: unknown) => (
+          ...(titleRow(ui, id, title, open, press(() => toggleCard($, id, !open)), null, open ? undefined : [sendBtn, ...actBtns, doneBtn], (tail: unknown) => (
           <Box key={'meta:' + id} {...pillRow(ui)}>
             {sourceBadge(ui, source, source, 'badge:' + id)}
             {kindBadges(ui, extra, id)}
             {u.session?.kind === 'case' ? badge(ui, 'case', SESSION_COLOR, 'badge:case:' + id) : null}
+            {routed ? <Text key={'routed:' + id} dimColor>{`sent to ${oneLine(routed, 40)}`}</Text> : null}
             <Text dimColor>{`${label} · ${ago(u.at, nowMs)} `}</Text>
             {open ? null : sourceLink(ui, id, links)}
           {tail as any}</Box>)) as unknown[]),
@@ -1142,12 +1373,12 @@ function inboxSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, nowMs: num
           open && extra ? <Text key={'verdict:' + id} dimColor>{verdictLine(extra)}</Text> : null,
           open && oneLine(u.reason, REASON_MAX) ? <Text key={'reason:' + id} dimColor wrap="wrap">{oneLine(u.reason, REASON_MAX)}</Text> : null,
           open && habitNote(u) ? <Text key={'habit:' + id} dimColor wrap="wrap">{`habit: ${habitNote(u)}`}</Text> : null,
-          open && own.length ? <Box key={'inbox-acts:' + id} {...(dark ? pillRow(ui, true) : { flexWrap: 'wrap', gap: 'xs' })}>{actBtns}</Box> : null,
+          open && (own.length || sendBtn) ? <Box key={'inbox-acts:' + id} {...(dark ? pillRow(ui, true) : { flexWrap: 'wrap', gap: 'xs' })}>{sendBtn}{own.length ? actBtns : null}</Box> : null,
           ...(open && own.length ? actSays(ui, id, acts) : []),
           open && !own.length
             ? <Box key={'sug:' + id} {...(dark ? pillRow(ui, true) : { flexWrap: 'wrap', gap: 'xs' })}>
                 {suggestionsFor(source).map((text, i) => (
-                  <Button key={`inbox-sug:${u.id}:${i}`} variant={(dark && !chosen ? i === 0 : chosen === text) ? 'primary' : 'secondary'}
+                  <Button key={`inbox-sug:${u.id}:${i}`} variant={!target && (dark && !chosen ? i === 0 : chosen === text) ? 'primary' : 'secondary'}
                     onPress={press(() => update($, chiefDraftAtom, prev => {
                       const next = { ...(prev ?? {}) }
                       if (next[sugKey] === text) delete next[sugKey]; else next[sugKey] = text
@@ -1196,6 +1427,41 @@ export function ledByText(s: ChiefStatus, self: string | null): string {
   return leadPill(s, self).text
 }
 
+// The Ask box's answer, under the field: a dim-bordered card that says which route was taken, what came back, and
+// either Dismiss or, for a risky message, Send anyway? with Send and Cancel. One coral pill.
+function answerCard($: Dollar, ui: Ui, a: ChiefAnswer) {
+  const { Box, Text, Button } = ui
+  const dismiss = () => update($, chiefAnswerAtom, () => null)
+  return card(ui, { id: 'answer', color: 'subtle', selected: false }, [
+    <Text key="answer-route" dimColor size="caption">{`Route: ${a.route}`}</Text>,
+    <Text key="answer-text" wrap="wrap">{a.text}</Text>,
+    a.confirm ? <Text key="answer-confirm" color="warning">Send anyway?</Text> : null,
+    <Box key="answer-acts" {...pillRow(ui, true)}>
+      {a.confirm
+        ? [<Button key="answer-send" variant="primary" onPress={() => confirmTell($, a, true)}>Send</Button>,
+           <Button key="answer-cancel" onPress={() => confirmTell($, a, false)}>Cancel</Button>]
+        : <Button key="answer-dismiss" variant="primary" onPress={dismiss}>Dismiss</Button>}
+    </Box>,
+  ])
+}
+
+// Archive's Undo, for 10 seconds, right under the header strip.
+function undoRow($: Dollar, ui: Ui, bin: string, u: ChiefUndo | null, nowMs: number) {
+  if (!u || u.until <= nowMs) return null
+  const { Box, Text, Button } = ui
+  const done = u.how === 'archived' ? 'Archived' : u.how === 'unpinned' ? 'Unpinned and hid' : 'Hid'
+  return (
+    <Box key="undo" {...pillRow(ui, true)}>
+      <Text key="undo-text" dimColor>{`${done} "${u.title}"`}</Text>
+      <Button key="undo-press" variant="primary" onPress={async () => {
+        closingCases.delete(u.cli)
+        $.ui.toast((await undoArchive($, u)) ? `Brought back "${u.title}"` : `Undid what could be undone for "${u.title}"`)
+        void snapshotPinned($, bin).then(() => reloadStatus($, bin)).catch(() => undefined)
+      }}>Undo</Button>
+    </Box>
+  )
+}
+
 function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: string | null, nowMs: number,
                   sent: Record<string, string> | null, tldrs: Record<string, ChiefTldr> | null,
                   drafts: Record<string, string> | null, floor: FloorState | null = null, self: string | null = null,
@@ -1203,6 +1469,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   const { Box, Text, Button, Input } = ui
   const dark = skinOf(ui).dark
   if (!s) return Panel(ui, error ? <Text color="warning">{error}</Text> : <Text dimColor>No chief status yet.</Text>)
+  s = withoutHidden(s, ctx.hidden)!   // `hide <session>` and Archive's last fallback: off the floor
   const since = s.chief?.heartbeat_at ? ago(s.chief.heartbeat_at, nowMs) : ''
   const beat = !since ? 'no heartbeat' : since === 'now' ? 'heartbeat now' : `heartbeat ${since} ago`
   const sentLine = (id: string) => {
@@ -1247,6 +1514,9 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   // the session's own card asks, answered from here, on hold or not: its relays wait (hooks/cos.ts)
   const cardAsks = (cli: string) => !!floor?.cards.some(c => c.session_id === cli && c.asks)
   const states = sessionStates(s, floor, tldrs)
+  const chases = chaseCards(floorRows(s), floor, nowMs)
+  const dones = doneCards(floorRows(s), floor, tldrs, nowMs)
+  const doneIds = new Set(dones.map(x => x.d.cli_session_id))
   // a case session's sources: each case's own link first, then the rest; none for a session that holds no case
   const caseLinks = (cli: string) => caseRows(s).filter(c => c.cli_session_id === cli)
     .flatMap(c => linksOf(c.link, c.links, sourceOf(c.key))).filter((l, n, all) => all.findIndex(x => x.url === l.url) === n)
@@ -1264,10 +1534,18 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     const updated = t?.at ? ago(t.at, nowMs) : ''
     const meta = oneLine(d.repo, 80)
     const press = (run: () => unknown) => pressing($, id, run)
-    const quick = open ? [] : quickChips(d)
-    // one coral pill per card: the first reply chip when there is one, else Open; this session's card has no Open
-    const replies = t ? chipActs($, t.chips, d).length : 0
-    const openBtn = active ? null : <Button key={'open:' + cli} variant={replies ? 'secondary' : 'primary'} onPress={press(() => openPinned($, d))}>Open</Button>
+    // done and quiet (hooks/waiting.ts): Archive is the card's coral pill, Keep beside it, and no reply chip competes
+    const isDone = doneIds.has(cli)
+    const due = checkDue(floor, cli)
+    const quick = open || isDone ? [] : quickChips(d)
+    // one coral pill per card: Archive on a done one, else the first reply chip when there is one, else Open; this
+    // session's card has no Open
+    const replies = t && !isDone ? chipActs($, t.chips, d).length : 0
+    const openBtn = active ? null : <Button key={'open:' + cli} variant={replies || isDone ? 'secondary' : 'primary'} onPress={press(() => openPinned($, d))}>Open</Button>
+    const doneBtns = isDone ? [
+      <Button key={'archive:' + cli} variant="primary" onPress={press(() => archiveDone($, bin, d))}>Archive</Button>,
+      <Button key={'keep:' + cli} onPress={press(() => markAndReload($, bin, cli, 'done-keep'))}>Keep</Button>] : []
+    const checkBtn = due ? <Button key={'check:' + cli} onPress={press(() => checkNow($, bin, cli))}>Check now</Button> : null
     // a session that holds a case: its key's label, how many routed lines wait for it, and (relay off) Deliver now
     const cm = caseMeta(s, cli)
     const links = caseLinks(cli)
@@ -1278,9 +1556,11 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     const preview = clip(oneLine(question.get(cli) ?? (tldrs?.[cli]?.tldr ?? d.last_report ?? '').split('\n')[0] ?? '', 200), PREVIEW_MAX)
     return card(ui, { id, color: SESSION_COLOR, selected: ctx.selected === id, active, scope: scopeOf(cli) }, [
       ...(titleRow(ui, id, oneLine(d.title, 200), open, press(() => toggleCard($, id, !open)),
-               active ? badge(ui, 'this session', SELF_COLOR, 'badge:self:' + cli) : null, open ? undefined : [...quick, openBtn], (tail: unknown) => (
+               active ? badge(ui, 'this session', SELF_COLOR, 'badge:self:' + cli) : null, open ? undefined : [...doneBtns, ...quick, checkBtn, openBtn], (tail: unknown) => (
       <Box key={'meta:' + id} flexWrap={open ? 'wrap' : 'nowrap'} gap="xs" alignItems="center">
         {badge(ui, state.text, state.color, 'badge:' + id, st === 'idle')}
+        {isDone && st !== 'done' ? badge(ui, 'done', 'success', 'badge:done:' + cli) : null}
+        {due ? badge(ui, 'check due', 'warning', 'badge:check:' + cli) : null}
         {cm ? badge(ui, 'case', SESSION_COLOR, 'badge:case:' + cli) : null}
         {cm && cm.labels.length ? <Text key={'case-label:' + cli} dimColor>{cm.labels.join(', ')}</Text> : null}
         {cm && cm.unseen > 0 ? <Text key={'case-new:' + cli} color="warning">{`${cm.unseen} new`}</Text> : null}
@@ -1307,13 +1587,16 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
               const value = await typedIn($, 'say:' + cli, drafts?.['say:' + cli])
               if (value.trim()) await clearDraft($, 'say:' + cli).then(() => sendPinned($, cli, value))
             }) }) : null}
+            {doneBtns}
             {openBtn}
+            {checkBtn}
             {deliverBtn}
             <Button key={'refresh:' + cli} onPress={press(() => refreshNow($, bin, cli))}>Refresh</Button>
             {st === 'done' && cm ? <Button key={'close-case:' + cli} onPress={press(() => closeCase($, bin, cli))}>Close case</Button> : null}
           </Box>
         : null,
-      ...(open ? chipRow(d) : []),
+      ...(open && !isDone ? chipRow(d) : []),
+      open && due ? <Text key={'check-says:' + id} dimColor wrap="wrap">{`Check now: "${CHECK_NOW_TEXT}"`}</Text> : null,
     ])
   }
   // Needs you: a pinned session whose last turn stopped on a question. Everything on the card comes from that session,
@@ -1407,6 +1690,53 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       sentLine(cli),
     ])
   }
+  // Needs you also holds a long wait to chase and a finished session to archive (hooks/waiting.ts)
+  const chaseCard = ({ d, w, days }: Chase) => {
+    const cli = d.cli_session_id
+    const id = 'chase:' + cli
+    const sel = 'sess:' + cli
+    const open = isOpen(ctx.open, id, 'need', ctx.selected === sel ? id : null)
+    const press = (run: () => unknown) => pressing($, sel, run)
+    const nudge = nudgeText(w)
+    const pills = [
+      <Button key={'chase-nudge:' + cli} variant="primary" onPress={press(async () => {
+        logAct($, bin, 'answer', { item_id: 'sess:' + cli, source: 'session', title: oneLine(d.title, TITLE_MAX) }, picked('Draft a nudge', 0))
+        if (await sendPinned($, cli, nudge)) await markAndReload($, bin, cli, 'keep')
+      })}>Draft a nudge</Button>,
+      <Button key={'chase-keep:' + cli} onPress={press(() => markAndReload($, bin, cli, 'keep'))}>Keep waiting</Button>,
+      <Button key={'chase-drop:' + cli} onPress={press(() => markAndReload($, bin, cli, 'drop'))}>Drop it</Button>,
+    ]
+    return card(ui, { id, color: NEED_COLOR, selected: ctx.selected === sel, scope: scopeOf(cli) }, [
+      ...(titleRow(ui, id, `Waiting ${days} days on ${oneLine(w.who, 60)}: ${oneLine(w.what, 120) || 'an answer'}`, open, press(() => toggleCard($, id, !open)), null, pills,
+        (tail: unknown) => (
+        <Box key={'meta:' + id} {...pillRow(ui)}>
+          {badge(ui, 'waiting', NEED_COLOR, 'badge:' + id)}
+          <Text key={'chase-sess:' + id} dimColor wrap="truncate-end">{oneLine(d.title, 80)}</Text>
+        {tail as any}</Box>)) as unknown[]),
+      open ? <Text key={'chase-says:' + id} dimColor wrap="wrap">{`Draft a nudge: "${nudge}"`}</Text> : null,
+      open ? sentLine(cli) : null,
+    ])
+  }
+  const doneCard = ({ d }: DoneOne) => {
+    const cli = d.cli_session_id
+    const id = 'done:' + cli
+    const sel = 'sess:' + cli
+    const open = isOpen(ctx.open, id, 'need', ctx.selected === sel ? id : null)
+    const press = (run: () => unknown) => pressing($, sel, run)
+    const isCase = caseRows(s).some(c => c.cli_session_id === cli)
+    const pills = [
+      <Button key={'done-archive:' + cli} variant="primary" onPress={press(() => archiveDone($, bin, d))}>Archive</Button>,
+      <Button key={'done-keep:' + cli} onPress={press(() => markAndReload($, bin, cli, 'done-keep'))}>Keep</Button>,
+    ]
+    return card(ui, { id, color: 'success', selected: ctx.selected === sel, scope: scopeOf(cli) }, [
+      ...(titleRow(ui, id, `Done: ${oneLine(d.title, 200)}`, open, press(() => toggleCard($, id, !open)), null, pills, (tail: unknown) => (
+        <Box key={'meta:' + id} {...pillRow(ui)}>
+          {badge(ui, 'done', 'success', 'badge:' + id)}
+          <Text key={'done-what:' + id} dimColor wrap="truncate-end">{isCase ? 'Archive also closes its case' : 'quiet for 10 minutes'}</Text>
+        {tail as any}</Box>)) as unknown[]),
+      open ? <Text key={'done-says:' + id} dimColor wrap="wrap">{oneLine((tldrs?.[cli]?.tldr ?? d.last_report ?? '').split('\n')[0], 200) || 'It said it waits on nothing.'}</Text> : null,
+    ])
+  }
   const pinned = sessionOrder(Array.isArray(s.desktop) ? s.desktop : [], asking, nowMs, states)
   const caseOnly = sessionOrder(caseOnlyRows(s), asking, nowMs, states)   // case sessions that are not pinned: listed under Cases
   // a session whose state is not the one it had when the Sessions tab was last opened or left: the tab is marked
@@ -1417,11 +1747,13 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   const oldest = needs.length ? ago(needs[0].card.at, nowMs) : ''
   const held = heldCount(s, floor)
   const tabs: Tab[] = [
-    { id: 'needs', label: 'Needs you', count: counts.needs, section: withHeading => [   // not `h`: the JSX factory is named that
-      needs.length ? (withHeading ? sectionHeading(ui, 'needs-heading', `Needs you ${needs.length}`) : null) : emptyLine(ui, 'needs-empty', 'Nothing needs you'),
+    { id: 'needs', label: 'Needs you', count: counts.needs + chases.length + dones.length, section: withHeading => [   // not `h`: the JSX factory is named that
+      needs.length + chases.length + dones.length
+        ? (withHeading ? sectionHeading(ui, 'needs-heading', `Needs you ${needs.length + chases.length + dones.length}`) : null)
+        : emptyLine(ui, 'needs-empty', 'Nothing needs you'),
       needs.length ? <Text key="needs-oldest" dimColor>{oldest === 'now' ? 'oldest just now' : `oldest ${oldest} ago`}</Text> : null,
       held ? <Text key="needs-held" dimColor>{`${held} on hold until the question changes`}</Text> : null,
-      ...needs.map(needCard)] },
+      ...needs.map(needCard), ...chases.map(chaseCard), ...dones.map(doneCard)] },
     { id: 'inbox', label: 'Inbox', count: counts.inbox, section: h => [inboxSection($, ui, bin, s, nowMs, drafts, ctx, h)] },
     { id: 'sessions', label: 'Sessions', count: counts.sessions, fresh: sessionsFresh, section: h => [
       pinned.length ? (h ? sectionHeading(ui, 'pinned-heading', `Pinned ${pinned.length}`) : null) : emptyLine(ui, 'pinned-empty', 'No pinned sessions'),
@@ -1466,12 +1798,13 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
         : <Input key="ask-input" placeholder="Ask Mother…" submitLabel="Start" value={drafts?.[ASK_KEY]}
             onSubmit={(value: string) => { void startAsk($, bin, value) }} />}
       {drafts?.[ASK_ERROR_KEY] !== undefined ? <Text key="ask-error" color={dark ? 'error' : 'warning'}>{ASK_EMPTY}</Text> : null}
+      {ctx.answer ? answerCard($, ui, ctx.answer) : null}
     </Box>,
     tabRow(ui, tabs, shown, ctx.tabs?.seen, id => pickTab($, id, counts, states)),
     ...drawn.map(t => <Box key={'sec:' + t.id} flexDirection="column">{t.section(shown === 'all') as any}</Box>),
   ]
   // One column; on the dark skin it is the dark panel, the banner its first row.
-  return Panel(ui, [headerStrip(ui, strip), ...body])
+  return Panel(ui, [headerStrip(ui, strip), undoRow($, ui, bin, ctx.undo ?? null, nowMs), ...body])
 }
 
 // This session's own card (hooks/floor.ts), written when its turn ends on an answer and cleared (`answer` null) when a
@@ -1488,12 +1821,13 @@ async function floorCard($: Dollar, configured: string, answer: string | null, s
     if (answer === null) { await storeCard($, bin, id, NO_ASK); return }
     let cwd: string | undefined
     try { cwd = await $.session.cwd() } catch { /* the card goes without its repo and branch */ }
-    if (said) { await storeCard($, bin, id, said, cwd); return }
+    const tail = String(answer ?? '')   // its last `Waiting on:` line is read in code (lib/floor.py)
+    if (said) { await storeCard($, bin, id, said, cwd, tail); return }
     if (overBudget(lastStatus)) return
     const model = await triageModel($, bin)
-    const got = await askFloor($, model, String(answer ?? '').slice(-FLOOR_TAIL_MAX))
+    const got = await askFloor($, model, tail.slice(-FLOOR_TAIL_MAX))
     await recordSpend($, bin, model, got.usage)
-    await storeCard($, bin, id, got.reply, cwd)
+    await storeCard($, bin, id, got.reply, cwd, tail)
   } finally {
     if (answer !== null) cardsWriting -= 1
   }
@@ -1506,6 +1840,60 @@ async function claimFirst($: Dollar, configured: string, text: unknown): Promise
   if (!c) return
   const bin = await motherBin($, configured)
   if (await claimCase($, bin, c)) await reloadStatus($, bin)
+}
+
+// The manager typed a prompt here naming a chat message link, a tracker key or a PR: those keys join this session's
+// case (`mother chief mention`, which makes one for a pinned session that has none). Only the manager's own typed
+// prompts (the composer, or the bridge from a phone) count: never a relay, a pane send, a peer, a tool's output or a
+// case brief. The CLI takes at most 5 keys. Errors are swallowed.
+const MENTION_RE = /\/archives\/[CG][A-Z0-9]+\/p\d{16}|\b[A-Z][A-Z0-9_]*-\d+\b|\/pull\/\d+|\b[\w.-]+\/[\w.-]+#\d+\b/
+const MENTION_TEXT_MAX = 8000
+export function typedByManager(e: { text?: unknown; origin?: { kind?: string } | null; isMeta?: boolean; command?: unknown }): boolean {
+  const kind = e.origin?.kind
+  const text = String(e.text ?? '')
+  return (kind === 'composer' || kind === 'bridge') && !e.isMeta && !e.command &&
+    ![CASE_PREFIX, RELAY_PREFIX, PINNED_PREFIX].some(p => text.startsWith(p))
+}
+async function claimMentions($: Dollar, configured: string, e: any): Promise<void> {
+  if (!typedByManager(e) || !MENTION_RE.test(String(e.text ?? ''))) return
+  const id = String((await $.session.id()) ?? '')
+  if (!isPinned(lastStatus, id) && !holdsClaim(lastStatus, id)) return
+  const bin = await motherBin($, configured)
+  const title = floorRows(lastStatus).find(d => d.cli_session_id === id)?.title
+  const ran = await cli($, bin, ['mention', '--stdin'], JSON.stringify({ session_id: id, text: String(e.text).slice(0, MENTION_TEXT_MAX), ...(title ? { title } : {}) }))
+  if (ran.ok) await reloadStatus($, bin)
+}
+
+// ---- the `Waiting on:` section of this session's own system prompt (hooks/waiting.ts) ----
+// `/chief floor off|on`: this session only, kept in the plugin's store by session id.
+const FLOOR_OFF_KEY = 'chiefFloorOff'
+let floorOff = false
+async function loadFloorOff($: Dollar): Promise<void> {
+  floorOff = false
+  try {
+    const v = await $.store.get(FLOOR_OFF_KEY)
+    const id = String((await $.session.id()) ?? '')
+    floorOff = !!(v && typeof v === 'object' && (v as Record<string, unknown>)[id] === true)
+  } catch { /* on */ }
+}
+async function setFloorOff($: Dollar, off: boolean): Promise<boolean> {
+  floorOff = off
+  try {
+    const id = String((await $.session.id()) ?? '')
+    const v = await $.store.get(FLOOR_OFF_KEY)
+    const next: Record<string, true> = {}
+    if (v && typeof v === 'object') for (const [k, x] of Object.entries(v as Record<string, unknown>).slice(-200)) if (x === true && k !== id) next[k] = true
+    if (off && id) next[id] = true
+    await $.store.set(FLOOR_OFF_KEY, next)
+    return true
+  } catch { return false }
+}
+async function waitingSectionWanted($: Dollar): Promise<boolean> {
+  const id = String((await $.session.id()) ?? '')
+  let cwd: string | null = null
+  try { cwd = await $.session.cwd() } catch { cwd = null }
+  return wantsWaitingSection({ pinned: isPinned(lastStatus, id), cosCase: runsCosSkill(lastStatus, id), cwd,
+                               folders: lastStatus?.floor?.ignore_folders, off: floorOff })
 }
 
 // Deliver now on a session's card (relay off): this session's own lines are submitted here at once; another session
@@ -1526,7 +1914,7 @@ let busy = false
 export async function startChief($: Dollar, configured: string): Promise<number> {
   const bin = await motherBin($, configured)
   try {
-    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | refresh | status | pause | resume | relay on|off|status | habits on|off|status | skin dark|dark-app|plain|status)' })
+    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | refresh | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | skin dark|dark-app|plain|status)' })
   } catch {
     // carry on without the command
   }
@@ -1541,6 +1929,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   tldrUnstored.clear()
   tldrAskedAt.clear()
   opening.clear()
+  closingCases.clear()
   spendOwed.length = 0
   spendFlushing = false
   cardsWriting = 0
@@ -1550,6 +1939,8 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   await loadDismissed($)
   await loadHeld($)
   await loadSkin($)
+  await loadHidden($)
+  await loadFloorOff($)
   await triageContext($, bin)   // the people map for the cards; the triage prompt's context too
   await reloadStatus($, bin)
   // not awaited: a slow list_sessions (up to its 10 s timeout) must not hold up the session's start
@@ -1602,8 +1993,22 @@ export function registerChief(on: On, configured: string): void {
   // The manager typed here: this session's question, if it had one, is answered. Detached as well.
   on('prompt.submit', async ($, e, next) => {
     void claimFirst($, configured, e.text).catch(() => undefined)   // a `Mother case:` brief claims its key; detached
+    void claimMentions($, configured, e).catch(() => undefined)     // keys the manager named here join this session's case
     void floorCard($, configured, null).catch(() => undefined)
     return next(e)
+  })
+
+  // A pinned session's own prompt ends on one more section: the `Waiting on:` line (hooks/waiting.ts). Never twice,
+  // never for a cos case, an ignored folder or `/chief floor off`; any failure leaves the prompt as it was.
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      if ((e.traits ?? []).includes('bare') || r.sections.some(x => x.id === WAITING_SECTION_ID)) return r
+      if (!(await waitingSectionWanted($))) return r
+      return { sections: [...r.sections, { id: WAITING_SECTION_ID, text: WAITING_SECTION, scope: 'session' as const }] }
+    } catch {
+      return r
+    }
   })
 
   // /chief [open] opens the pane; /chief status says `mother chief status`; /chief expand|collapse open or close every
@@ -1642,6 +2047,16 @@ export function registerChief(on: On, configured: string): void {
       await reloadStatus($, bin)
       return { text: text ?? '`mother chief relay` failed.' }
     }
+    const fl = /^floor(?:\s+(on|off|status))?$/.exec(verb)
+    if (fl) {
+      const want = fl[1] ?? 'status'
+      if (want === 'status') {
+        return { text: `Chief floor: the Waiting on line is ${floorOff ? 'off' : 'on'} for this session` +
+          ((await waitingSectionWanted($).catch(() => false)) ? ' and in its prompt.' : ' and not in its prompt (it is off, not pinned, a case, or in an ignored folder).') }
+      }
+      const kept = await setFloorOff($, want === 'off')
+      return { text: `Chief floor: the Waiting on line is ${want} for this session${kept ? '' : ' (until it ends: the store could not be written)'}.` }
+    }
     if (verb === 'refresh') {
       const said = await refreshTldrs($, bin, { force: 'all' })
       await reloadStatus($, bin)
@@ -1671,7 +2086,7 @@ export function registerChief(on: On, configured: string): void {
                     sessionStates(lastStatus, floor, await read($, chiefTldrAtom)))
       return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]' }
+    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
@@ -1685,6 +2100,7 @@ export function registerChief(on: On, configured: string): void {
       await $.clock.now(), await read($, chiefSentAtom), await read($, chiefTldrAtom), await read($, chiefDraftAtom),
       await read($, floorAtom), self, { open: await read($, chiefOpenAtom), selected: await read($, chiefSelectedAtom), portrait,
         surface: String(e.surface), tabs: await read($, chiefTabAtom), doc: await read($, docAtom), health: await read($, healthAtom),
-        details: await read($, detailAtom), people: await read($, chiefPeopleAtom) })
+        details: await read($, detailAtom), people: await read($, chiefPeopleAtom), tldrs: await read($, chiefTldrAtom),
+        answer: await read($, chiefAnswerAtom), undo: await read($, undoAtom), hidden: await read($, hiddenAtom) })
   })
 }

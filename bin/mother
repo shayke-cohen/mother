@@ -467,7 +467,8 @@ def validate_hub(h) -> list:
 
 # config.json -> chief (CONTRACT §5g; lib/chief.py DEFAULTS, which a test holds equal): "money" a number from 0,
 # "model" a TL;DR or triage model.
-CHIEF_FIELDS = {"daily_budget_usd": "money", "tldr_model": "model", "triage_model": "model", "refresh_minutes": "minutes"}
+CHIEF_FIELDS = {"daily_budget_usd": "money", "tldr_model": "model", "triage_model": "model", "refresh_minutes": "minutes",
+                "ignore_folders": "folders"}
 # the chief session's and its workers' keys (before 0.18.0): accepted, ignored
 CHIEF_LEGACY_KEYS = {"max_workers", "run_minutes", "chief_model", "worker_model", "tick_seconds", "batch_minutes",
                      "decision_hours"}
@@ -491,6 +492,9 @@ def validate_chief(c) -> list:
             errs.append(f"chief.{k} must be a whole number from 1 to 60")
         elif kind == "model" and v not in CHIEF_MODELS:
             errs.append(f"chief.{k} must be one of {', '.join(CHIEF_MODELS)}")
+        elif kind == "folders" and not (isinstance(v, list) and all(
+                isinstance(f, str) and (f.startswith("/") or f == "~" or f.startswith("~/")) for f in v)):
+            errs.append(f"chief.{k} must be a list of absolute or ~/ folder paths")
     return errs
 
 
@@ -1347,7 +1351,7 @@ def cmd_inbox(args):
 def cmd_floor(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import floor
-    if args[:1] in ([], ["help"], ["-h"], ["--help"]) or args not in (["card", "--stdin"], ["list", "--json"]):
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]) or args not in (["card", "--stdin"], ["list", "--json"], ["mark", "--stdin"]):
         sys.exit(floor.main(args, None, {}))  # no workspace needed: help and usage errors
     ws = workspace()
     sys.exit(floor.main(args, ws, load_config(ws), _now()))

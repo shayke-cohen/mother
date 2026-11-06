@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "bin" / "mother"
 
 
-def run(args, env, cwd=None):
-    return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True, env=env, cwd=cwd)
+def run(args, env, cwd=None, stdin=None):
+    return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True, env=env, cwd=cwd, input=stdin)
 
 
 def git(cwd, *args):
@@ -380,6 +380,22 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["budget"]["limit"], 8.0)
 
+    def test_floor_wait_and_mention_through_the_cli(self):
+        """The verbs the pane runs, end to end: a turn's `Waiting on:` line, a mark on it, keys the manager named."""
+        self.init()
+        self.write_config()
+        sid = "11111111-1111-4111-8111-111111111111"
+        doc = {"session_id": sid, "asks": False, "question": "", "options": [], "waiting_on": None, "waiting_text": "Done.\nWaiting on: Dana — the key"}
+        self.assertEqual(run(["floor", "card", "--stdin"], self.env, stdin=json.dumps(doc)).returncode, 0)
+        r = run(["floor", "mark", "--stdin"], self.env, stdin=json.dumps({"session_id": sid, "mark": "keep"}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        card = json.loads(run(["floor", "list", "--json"], self.env).stdout)["cards"][0]
+        self.assertEqual((card["waiting"]["who"], card["waiting"]["what"], "snooze_until" in card["waiting"]), ("Dana", "the key", True))
+        r = run(["chief", "mention", "--stdin"], self.env, stdin=json.dumps({"session_id": sid, "text": "see PLAT-7", "title": "T"}))
+        self.assertEqual((r.returncode, json.loads(r.stdout)["added"]), (0, ["PLAT-7"]), r.stderr)
+        cases = json.loads(run(["chief", "status", "--json"], self.env).stdout)["cases"]
+        self.assertEqual([(c["key"], c["origin"]) for c in cases], [("PLAT-7", "mention")])
+
     def test_the_validator_knows_every_chief_setting(self):
         sys.path.insert(0, str(ROOT / "lib"))
         import chief
@@ -394,7 +410,8 @@ class CliTest(unittest.TestCase):
                                   ({"daily_budget_usd": True}, "chief.daily_budget_usd"),
                                   ({"tldr_model": "gpt"}, "chief.tldr_model"), ({"triage_model": "gpt"}, "chief.triage_model"),
                                   ({"refresh_minutes": 0}, "chief.refresh_minutes"), ({"refresh_minutes": 61}, "chief.refresh_minutes"),
-                                  ({"refresh_minutes": 2.5}, "chief.refresh_minutes")):
+                                  ({"refresh_minutes": 2.5}, "chief.refresh_minutes"),
+                                  ({"ignore_folders": "/work"}, "chief.ignore_folders"), ({"ignore_folders": ["rel/path"]}, "chief.ignore_folders")):
             cfg = self.write_config()
             cfg["chief"] = chief_block
             (self.ws / "config.json").write_text(json.dumps(cfg))

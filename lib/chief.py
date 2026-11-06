@@ -21,7 +21,8 @@ import habits
 import hub
 import now as nowmod
 
-DEFAULTS = {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5}
+DEFAULTS = {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5,
+            "ignore_folders": []}
 REFRESH_MINUTES = (1, 60)   # chief.refresh_minutes: how often the leading session re-reads each session for its card
 TLDR_MODELS = ("sonnet", "opus")   # the Chief pane's TL;DR model; anything else reads as the default
 SPEND_KEEP_DAYS = 14
@@ -41,7 +42,29 @@ def settings(cfg: dict) -> dict:
     r = out["refresh_minutes"]
     if not (isinstance(r, int) and not isinstance(r, bool) and REFRESH_MINUTES[0] <= r <= REFRESH_MINUTES[1]):
         out["refresh_minutes"] = DEFAULTS["refresh_minutes"]
+    out["ignore_folders"] = ignore_folders(out["ignore_folders"])
     return out
+
+
+IGNORE_FOLDERS_MAX = 50
+
+
+def ignore_folders(v, home: Optional[str] = None) -> List[str]:
+    """chief.ignore_folders as absolute paths: each an absolute or `~/` path, `~` expanded, no trailing slash;
+    anything else is dropped. A pinned session under one gets no `Waiting on:` instruction (CONTRACT §5g)."""
+    home = home if home is not None else os.path.expanduser("~")
+    out = []
+    for f in v if isinstance(v, list) else []:
+        if not isinstance(f, str):
+            continue
+        f = f.strip()
+        if f == "~" or f.startswith("~/"):
+            f = home + f[1:]
+        if f.startswith("/") and len(f) > 1:
+            f = f.rstrip("/") or "/"
+            if f not in out:
+                out.append(f)
+    return out[:IGNORE_FOLDERS_MAX]
 
 
 # ---- pause ------------------------------------------------------------------------------------------
@@ -1026,6 +1049,80 @@ def watch_key(ws: Path, cfg: dict, at: datetime, key, cli) -> dict:
     return {"ok": True, "key": sk, "session_id": cli, "also": [a for a in row.get("also") or [] if isinstance(a, str)]}
 
 
+MENTION_KEYS_MAX = 5
+MENTION_TEXT_MAX = 8000
+
+
+def mention_keys(text) -> List[str]:
+    """The keys a prompt names, in order, at most 5: each chat message link's thread, then tracker keys and PRs."""
+    text = str(text or "")[:MENTION_TEXT_MAX]
+    out = []
+    for m in hub._SLACK_LINK.finditer(text):
+        k = hub.thing_key("chat", {"channel": m.group("c"), "ts": "%s.%s" % (m.group("a"), m.group("b")),
+                                   "thread_ts": m.group("t")})
+        if k not in out:
+            out.append(k)
+    for k in hub.extract_also(text):
+        if k not in out:
+            out.append(k)
+    return [k for k in out if hub._KEY_TOKEN.fullmatch(k)][:MENTION_KEYS_MAX]
+
+
+def mention(ws: Path, cfg: dict, at: datetime, doc) -> dict:
+    """`mention --stdin` {session_id, text?, keys?, title?}: the keys the manager named to a session (the chat links,
+    tracker keys and PRs of a prompt they typed there, or an Inbox item they sent there) join that session's case, so
+    their lines route to it; a session with no live case gets one (`origin: "mention"`), its first key the row's.
+    At most 5 keys. A key live in another session whose row is under 7 days old is refused, and so is a key already
+    this session's (nothing to add). Prints {added, refused}; ValueError for an off-shape id."""
+    if not isinstance(doc, dict):
+        raise ValueError("stdin must be a JSON object {session_id, text?, keys?, title?}")
+    cli = doc.get("session_id")
+    if not (isinstance(cli, str) and CLI_ID_RE.fullmatch(cli)):
+        raise ValueError("session_id is not a session id")
+    keys = mention_keys(doc.get("text"))
+    for k in doc.get("keys") if isinstance(doc.get("keys"), list) else []:
+        if isinstance(k, str) and hub._KEY_TOKEN.fullmatch(k) and k not in keys:
+            keys.append(k)
+    keys = keys[:MENTION_KEYS_MAX]
+    added, refused = [], []
+    stamp = hub._iso(at)
+    with hub.locked(ws):
+        sess, h = hub._sessions_doc(ws), hub._hub_doc(ws)
+        items = sess["sessions"]
+        for key in keys:
+            hit = hub.find_session(sess, [key])
+            if hit is not None and str(hit[1].get("session_id")) == cli and _is_case(hit[1]):
+                continue   # already this session's
+            try:
+                _refuse_owned(sess, key, cli, at)
+            except ValueError:
+                refused.append(key)
+                continue
+            if hit is not None and not _is_cli(hit[1]) and str(hit[1].get("session_id")) != cli:
+                hit[1]["state"] = "dropped"   # a stale owner: the key moves
+            mine = sorted(((sk, r) for sk, r in items.items() if _is_case(r) and r.get("cli_session_id") == cli),
+                          key=lambda x: str(x[1].get("opened_at") or ""))
+            if mine:
+                row = mine[0][1]
+                if key != mine[0][0]:
+                    row["also"] = _merged_also(row.get("also"), [key])
+            else:
+                title = safe_line(doc.get("title") or key, TITLE_MAX)
+                items[key] = {"session_id": cli, "cli_session_id": cli, "kind": "case", "origin": "mention",
+                              "name": "case-" + re.sub(r"[^A-Za-z0-9]+", "-", key).strip("-")[:40], "title": title,
+                              "link": None, "also": [], "opened_at": stamp, "last_routed_at": None, "unseen": 0,
+                              "state": "live"}
+            for u in h["updates"]:
+                if isinstance(u, dict) and u.get("key") == key and u.get("state") != "done":
+                    u["session_id"] = cli
+            h["pending"] = [p for p in h["pending"] if p.get("key") != key]
+            added.append(key)
+        if added:
+            hub.save_json(ws, "sessions.json", sess)
+            hub._save_hub(ws, h, sess, cfg, at)
+    return {"ok": True, "session_id": cli, "added": added, "refused": refused}
+
+
 def close_case(ws: Path, cfg: dict, at: datetime, key) -> dict:
     """`close-case <key>`: the live case that holds `key` is done, and so is every open inbox item of its keys; later
     activity on them raises a new item. ValueError when no live case holds the key."""
@@ -1171,7 +1268,8 @@ def cases(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
                     "label": item_label(sk, safe_line(whos.get(sk) or "", LABEL_MAX), channels),
                     "unseen": len((doc["keys"].get(sk) or {}).get("waiting", [])),
                     "last_routed_at": r.get("last_routed_at"), "opened_at": r.get("opened_at"),
-                    "deliver_now": _deliver_flag(ws, cli).exists()})
+                    "deliver_now": _deliver_flag(ws, cli).exists(),
+                    **({"origin": "mention"} if r.get("origin") == "mention" else {})})
     out.sort(key=lambda c: str(c["opened_at"] or ""))
     return out
 
@@ -1357,27 +1455,13 @@ STUCK_SECONDS = 30 * 60        # a card that said `working` with no movement for
 STUCK_MAX_SECONDS = 2 * 60 * 60   # ... until this long: past it the session was interrupted or closed, and reads idle
 STATES = ("working", "waiting_manager", "waiting_other", "done", "stuck", "idle")
 PROGRESS_MAX_CHARS = 160
-_WAITING_RE = re.compile(r"^\W{0,3}Waiting on:\s*(.+?)\s*(?:—|–|--|-)\s*(.*?)\W{0,3}$", re.IGNORECASE)
 _ERROR_END_RE = re.compile(r"\b(api error|rate limit|usage limit|limit reached|overloaded|credit balance is too low|"
                            r"request timed out|connection error|prompt is too long)\b", re.IGNORECASE)
 ERROR_END_MAX = 400
 
-
-def waiting_line(text) -> Optional[dict]:
-    """The cos skill's last line (`Waiting on: <who> — <what>`) of a message, read in code: {state, on, what} with
-    state `waiting_manager` (the manager), `done` (nothing) or `waiting_other` (anyone else, named in `on`). None
-    when the message's last non-empty line is not one."""
-    rows = [l.strip() for l in str(text or "").splitlines() if l.strip()]
-    m = _WAITING_RE.match(rows[-1]) if rows else None
-    if not m:
-        return None
-    who, what = safe_line(m.group(1), 80), safe_line(m.group(2), 200)
-    low = who.lower()
-    if low in ("nothing", "nobody", "no one"):
-        return {"state": "done", "on": None, "what": what}
-    if low in ("the manager", "manager", "you"):
-        return {"state": "waiting_manager", "on": None, "what": what}
-    return {"state": "waiting_other", "on": who, "what": what}
+# The cos skill's (and every pinned session's) last line `Waiting on: <who> — <what>`, read in code: lib/floor.py's
+# parser, so the turn-end card and the refresh read it the same way.
+waiting_line = floormod.waiting_line
 
 
 def _transcript_read(path: Path) -> Optional[dict]:
@@ -1646,6 +1730,8 @@ def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = 
                 c["prev_state"] = old.get("state") if isinstance(old, dict) and old.get("state") in STATES else None
                 try:
                     _fill_floor(ws, at, r["id"], c, row)
+                    if w:
+                        floormod.note_waiting(ws, at, r["id"], w)   # the floor card's wait, for a session whose mod is not running
                 except OSError:
                     pass   # the card is stored all the same; Needs you misses this ask until the next refresh
             doc[r["id"]] = dict(c, fingerprint=r["fingerprint"], at=hub._iso(at),
@@ -1887,6 +1973,10 @@ USAGE = """usage: mother chief <verb> ...
                         add one more key (a related thread, ticket or PR) to a live case that session holds;
                         refused (exit 1) as a claim is, and when that session holds no live case
   close-case <key>      the live case that holds the key is done, with every open inbox item of its keys
+  mention --stdin       the keys the manager named to a session ({session_id, text?, keys?, title?}: chat message
+                        links, tracker keys and PRs in `text`, plus `keys`; at most 5) join its case, which is made
+                        (`origin: "mention"`) when it has none; a key live in another session is refused; prints
+                        {ok, session_id, added, refused}
   ask --stdin           the ask box: {text} on stdin becomes a `manual` inbox line (as `mother hub add`) whose key
                         is held for the case the pane starts; prints {ok, key, line_id, link, update_id, owned_by}
   dots-detail <id> --json
@@ -1922,7 +2012,7 @@ VERBS = {
     "act-log": (("--stdin", "--json"), ("--days",)), "habits": (("--json",), ()),
     "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
     "watch-key": ((), ("--for",)), "close-case": ((), ()), "ask": (("--stdin",), ()), "dots-detail": (("--json",), ()),
-    "why": (("--json",), ()),
+    "why": (("--json",), ()), "mention": (("--stdin",), ()),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -2042,6 +2132,7 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "health": health_doc(ws, at, errors),
         "habits": {"on": habits.is_on(ws)},
         "quieted": habits.quieted_doc(ws, at),
+        "floor": {"ignore_folders": settings(cfg)["ignore_folders"]},
     }
 
 
@@ -2242,6 +2333,19 @@ def main(args, ws, cfg, at) -> int:
             print(json.dumps(ask(ws, cfg, at, doc.get("text") if isinstance(doc, dict) else None), ensure_ascii=False))
         except ValueError as e:
             print("mother chief ask: %s" % e, file=sys.stderr)
+            return EXIT_FAILED
+        return EXIT_OK
+    if verb == "mention":
+        if not opts.get("stdin"):
+            return _usage("mention reads {session_id, text, keys, title} from stdin: pass --stdin")
+        try:
+            doc = json.loads(sys.stdin.read())
+        except ValueError as e:
+            return _usage("mention: stdin is not JSON (%s)" % e)
+        try:
+            print(json.dumps(mention(ws, cfg, at, doc)))
+        except ValueError as e:
+            print("mother chief mention: %s" % e, file=sys.stderr)
             return EXIT_FAILED
         return EXIT_OK
     if verb == "dots-detail":
