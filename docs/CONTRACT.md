@@ -1391,15 +1391,20 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   `open_session_in` with the `local_…` id and `target: "focus"`, and counts it opened only when the answer says so:
   an error, a timeout, an empty answer or a refusal without an error ("only…", "cannot…", "changes nothing";
   "already" counts as shown) fills the prompt with a request to open it instead and says why.
-- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | expand | collapse | skin dark|plain|status | tab <name>]`; the mod polls once a minute; drawn
+- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | expand | collapse | skin dark|dark-app|plain|status | tab <name>]`; the mod polls once a minute; drawn
   by `hooks/chief.tsx` with the frames, badges and strip of `hooks/pane_ui.tsx`, in the skin of `hooks/skin.tsx`).
-  **The skin**: on the desktop app the pane is one dark panel with dark cards (the border coloured by kind; the
-  selected card's bold and coral), light text, rounded badges and filled pills (coral for the recommended action
-  and the shown tab, quieter for the rest); a pill's label is the app's own text colour, so its fill follows the
-  app's theme (the `theme` row of `$.config.list()`, read at session start and when `/chief` opens the pane).
-  `/chief skin plain` draws the app's own colours and native buttons instead, `/chief skin dark` goes back; the
-  choice is kept in the plugin's store, on this machine. A terminal always draws its own look. No skin changes an
-  element's key or what a press does. A **header strip**: the picture,
+  **The skin**: on the desktop app the pane is one dark panel (the banner its first row, cropped to its width) with
+  dark cards (the border coloured by kind; the selected card's bold and coral), light text, rounded badges and filled
+  pills (coral for the recommended action, the first of any action list and the shown tab; quieter for the rest; a
+  card's toggle is a small round pill holding the caret). A pill's label is the app's own text colour and takes none
+  of the mod's, and nothing the mod can read says how the desktop app is drawn (the `theme` config row is the CLI's),
+  so the manager says it: `/chief skin dark` (the default) fills pills for an app in light mode (cream and coral,
+  dark labels), `/chief skin dark-app` for an app in dark mode (slate and a darker coral, light labels), `/chief
+  skin plain` draws the app's own colours and native buttons. The choice is kept in the plugin's store, on this
+  machine. A terminal always draws its own look. A compact card whose recommended label is over 16 characters
+  gives the title its whole row and puts its pills at the end of the second. No skin changes an element's key or
+  what a press does. **Who leads**: with nobody leading the badge is a dim `starting…` until the heartbeat is older
+  than 3 minutes (or absent), and only then a red `nobody leading`. A **header strip**: the picture,
   "Mother" / "Chief of Stuff", the counts as pills (`N need you`, `N inbox`, `N sessions`), the budget (`$1.50 /
   $20` and a bar), who leads (`led here`, `led by another session` or `nobody leading`, from `led_by` and this
   session's id) and the heartbeat's age; an unreadable spend file, a spent budget and the pause are red lines under

@@ -264,10 +264,9 @@ export type ChiefOpen = { all: boolean | null; cards: Record<string, boolean> }
 // `states` is each session's card state when the Sessions tab was last opened or left: a change since marks the tab.
 export type ChiefTabs = { picked: string | null; seen: Record<string, number>; states?: Record<string, string> }
 
-// The Chief pane's skin: `mode` is the manager's `/chief skin dark|plain` (kept in the plugin's store; null = the
-// default, dark on the desktop app); `theme` is the app's own theme as `$.config.list()` named it, which picks the
-// fill a pill's label reads on.
-export type ChiefSkin = { mode: 'dark' | 'plain' | null; theme: 'light' | 'dark' | 'unknown' }
+// The Chief pane's skin: the manager's `/chief skin dark|dark-app|plain`, kept in the plugin's store; null = the
+// default (`dark`: a dark panel on the desktop app, its pills filled for the dark labels of an app in light mode).
+export type ChiefSkin = { mode: 'dark' | 'dark-app' | 'plain' | null }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -284,13 +283,14 @@ declare module 'claude-code' {
       chiefError: string | null    // the last chief CLI failure the Chief pane shows
       chiefSent: Record<string, string> | null   // a pinned card's last send, by cli_session_id: "delivered" or why not
       chiefTldr: Record<string, ChiefTldr> | null   // each card's TL;DR and chips, by a pinned session's cli_session_id
-      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<cli id>`); `inbox-snooze:<id>` is set while an Inbox item's snooze picker is open; `typed:<Input key>` is what a field holds as it is typed (dark skin: the pill beside it sends that)
+      chiefDraft: Record<string, string> | null     // text held in a card's box, by Input key: a reply chip's (`say:<cli id>`); `inbox-snooze:<id>` is set while an Inbox item's snooze picker is open
       chiefFloor: FloorState | null                 // `mother floor list --json` as last read, this session's id, and the cards answered from the pane since
       chiefOpen: ChiefOpen | null                   // which Chief pane cards are expanded; null = the defaults
       chiefTab: ChiefTabs | null                    // the Chief pane's tab and the counts last seen on each
       chiefHealth: ChiefHealthState | null          // the Health tab: dismissed undelivered reports, loaded report texts
       chiefDetail: Record<string, ChiefDetail | null> | null   // what each dots item does, by Now item id, once its card was pressed (null = nothing on disk)
-      chiefSkin: ChiefSkin | null                   // the pane's skin and the app's theme, read at session start and when the pane opens
+      chiefSkin: ChiefSkin | null                   // the pane's skin, read from the store at session start
+      chiefTyped: Record<string, string> | null     // what a field holds as it is typed, by Input key; read on a press, never by a draw
       chiefSelected: string | null                  // the card id (`sess:<cli id>`, `inbox:<U-id>`) a button was last pressed on; drawn with a bold border
     }
   }
