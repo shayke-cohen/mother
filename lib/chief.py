@@ -22,8 +22,9 @@ import hub
 import now as nowmod
 
 DEFAULTS = {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5,
-            "ignore_folders": []}
+            "ignore_folders": [], "mention_search_seconds": 180}
 REFRESH_MINUTES = (1, 60)   # chief.refresh_minutes: how often the leading session re-reads each session for its card
+MENTION_SECONDS = (60, 1800)   # chief.mention_search_seconds: how often the leader runs the desktop mention search
 TLDR_MODELS = ("sonnet", "opus")   # the Chief pane's TL;DR model; anything else reads as the default
 SPEND_KEEP_DAYS = 14
 
@@ -42,6 +43,9 @@ def settings(cfg: dict) -> dict:
     r = out["refresh_minutes"]
     if not (isinstance(r, int) and not isinstance(r, bool) and REFRESH_MINUTES[0] <= r <= REFRESH_MINUTES[1]):
         out["refresh_minutes"] = DEFAULTS["refresh_minutes"]
+    m = out["mention_search_seconds"]
+    if not (isinstance(m, int) and not isinstance(m, bool) and MENTION_SECONDS[0] <= m <= MENTION_SECONDS[1]):
+        out["mention_search_seconds"] = DEFAULTS["mention_search_seconds"]
     out["ignore_folders"] = ignore_folders(out["ignore_folders"])
     return out
 
@@ -210,6 +214,8 @@ def _to_manager(cfg: dict, l: dict) -> Optional[str]:
     key = str(l.get("key") or "")
     if key.endswith("/dm") or (key.startswith("wa:") and not key.endswith("@g.us")):
         return "addressed"
+    if l.get("to_manager") is True:  # a desktop search hit for a mention of the manager (`mother hub ingest`)
+        return "mentioned"
     text = "%s %s" % (l.get("title") or "", l.get("summary") or "")
     me = hub.build_me(cfg or {})
     if me.get("chat") and "<@%s" % me["chat"] in text:
@@ -1990,7 +1996,137 @@ def health_doc(ws: Path, at: datetime, errors: List[dict]) -> dict:
     watcher = watcher_health(ws, at)
     return {"guard": guard_state(ws), "watcher": watcher,
             "watcher_errors": errors[:WATCHER_ERRORS_MAX], "watcher_error_count": len(errors),
-            "undelivered": undelivered(ws), "access": access_problems(watcher, errors)}
+            "undelivered": undelivered(ws), "access": access_problems(watcher, errors),
+            "mention_search": mention_health(ws)}
+
+
+# ---- mention search: the leading desktop session's chat connector finds mentions and DMs (CONTRACT §5g) ----
+# The watcher's own token may not search (missing scope), so mentions in channels it does not poll, group DMs and
+# DMs from people not in config would never reach the inbox. The leader runs two searches on its own connector
+# (`plan` says when and from what time), and hands the raw answers to `record`, which parses them and writes the
+# hits through `hub.ingest_chat`. No model call, no post; the state is .mother/chief/mention_search.json.
+MENTION_FILE = "mention_search.json"
+MENTION_FIRST_HOURS = 6
+MENTION_OVERLAP = 600
+MENTION_PAGES = 3
+MENTION_BACKOFF_MAX = 1800
+MENTION_STATUSES = ("ok", "error", "rate_limited", "unavailable")
+MENTION_UNAVAILABLE = "not available (no Slack search connector in this session)"
+
+
+def mention_state(ws: Path) -> dict:
+    return _read_obj(chief_dir(ws) / MENTION_FILE)
+
+
+def mention_plan(ws: Path, cfg: dict, at: datetime, session: str = "", force: bool = False) -> dict:
+    """`mention-search plan`: {due, why?, every_seconds, next_at?} and, when due, {after (Unix seconds, a string),
+    started_at, max_pages, queries: [{label, query}]}. Only the session that wrote the fresh heartbeat (`--as`) is
+    due; `--force` (`/chief refresh`) skips the interval and any backoff, never the leader rule. `after` is the last
+    fully successful run less a 10-minute overlap; the first run reaches back 6 hours."""
+    ws = Path(ws)
+    st = mention_state(ws)
+    every = settings(cfg)["mention_search_seconds"]
+    out = {"version": 1, "due": False, "every_seconds": every}
+    mine = hub.build_me(cfg).get("chat") or ""
+    now = at.timestamp()
+    if not mine:
+        out["why"] = "no manager chat user id (manager.chat_user)"
+        return out
+    if paused(ws):
+        out["why"] = "paused"
+        return out
+    if session:
+        beat = _read_obj(chief_dir(ws) / "heartbeat.json")
+        when = hub._parse_at(beat.get("at"))
+        if beat.get("session_id") != session or when is None or abs((at - when).total_seconds()) >= ALIVE_SECONDS:
+            out["why"] = "another session leads"
+            return out
+    else:
+        out["why"] = "only a leading desktop session searches (--as)"
+        return out
+    nxt = _num(st.get("next_at"))
+    if not force and nxt and now < nxt:
+        out.update(why="not due", next_at=hub._iso(datetime.fromtimestamp(nxt, timezone.utc)))
+        return out
+    wm = _num(st.get("watermark"))
+    after = wm - MENTION_OVERLAP if wm else now - MENTION_FIRST_HOURS * 3600
+    out.update(due=True, after=str(int(after)), started_at=now, max_pages=MENTION_PAGES,
+               queries=[{"label": "mentions", "query": "<@%s>" % mine}, {"label": "DMs", "query": "to:me"}])
+    return out
+
+
+def _num(v) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f > 0 and f == f and f != float("inf") else 0.0
+
+
+def mention_record(ws: Path, cfg: dict, at: datetime, doc) -> dict:
+    """`mention-search record --stdin`: {started_at, status: ok|error|rate_limited|unavailable, reason?, calls?,
+    pages: [{label, results (the tool's markdown), truncated?}]}. Every page's hits are written (the dedup makes a
+    retry safe); only an `ok` run moves the watermark: to `started_at`, or, when a query stopped at its page cap, to the
+    newest hit it reached (the pages run oldest first). A failure doubles the wait, up to 30 minutes."""
+    import hub_sources
+    ws = Path(ws)
+    if not isinstance(doc, dict):
+        raise ValueError("stdin must be an object")
+    status = doc.get("status")
+    if status not in MENTION_STATUSES:
+        raise ValueError("status must be one of %s" % ", ".join(MENTION_STATUSES))
+    now = at.timestamp()
+    started = min(_num(doc.get("started_at")) or now, now)
+    hits, cut = [], []
+    for pg in doc.get("pages") if isinstance(doc.get("pages"), list) else []:
+        if not isinstance(pg, dict) or not isinstance(pg.get("results"), str):
+            continue
+        got = hub_sources.parse_search_results(pg["results"])
+        mention = pg.get("label") == "mentions"
+        hits += [dict(h, is_mention=mention and not h["is_dm"]) for h in got]
+        if pg.get("truncated") is True:
+            cut.append(max([float(h["ts"]) for h in got] or [0.0]))
+    res = hub.ingest_chat(ws, cfg, at, hits)
+    st = mention_state(ws)
+    every = settings(cfg)["mention_search_seconds"]
+    wait = every
+    if status == "ok":
+        if not cut:
+            st["watermark"] = started
+        elif any(c > 0 for c in cut):  # a cut page with no readable hit says nothing: the watermark stays
+            st["watermark"] = min([c for c in cut if c > 0] + [started])
+        st.pop("backoff_seconds", None)
+        reason = ""
+    elif status == "unavailable":
+        reason = MENTION_UNAVAILABLE
+    else:
+        wait = min(max(int(_num(st.get("backoff_seconds"))), every) * 2, MENTION_BACKOFF_MAX)
+        st["backoff_seconds"] = wait
+        reason = safe_line(doc.get("reason") or ("rate limited (429)" if status == "rate_limited" else "search failed"), 160)
+    calls = doc.get("calls")
+    st.update(version=1, status=status, reason=reason, last_run_at=hub._iso(at), next_at=now + wait,
+              every_seconds=every, found=res["added"], results=len(hits),
+              calls=calls if isinstance(calls, int) and not isinstance(calls, bool) and 0 <= calls <= 6 else None)
+    if status == "ok":
+        st["last_ok_at"] = hub._iso(at)
+    _write_atomic(chief_dir(ws) / MENTION_FILE, json.dumps(st, indent=2) + "\n")
+    return {"version": 1, "status": status, "added": res["added"], "skipped": res["skipped"],
+            "next_at": hub._iso(datetime.fromtimestamp(now + wait, timezone.utc))}
+
+
+def mention_health(ws: Path) -> dict:
+    """ChiefStatus.health.mention_search: {status (never when it never ran), reason, last_run_at, last_ok_at, found,
+    every_seconds, next_at}, for the Health tab's chat row."""
+    st = mention_state(ws)
+    status = st.get("status") if st.get("status") in MENTION_STATUSES else "never"
+    nxt = _num(st.get("next_at"))
+    found = st.get("found")
+    return {"status": status, "reason": safe_line(st.get("reason"), 160),
+            "last_run_at": st.get("last_run_at") if isinstance(st.get("last_run_at"), str) else None,
+            "last_ok_at": st.get("last_ok_at") if isinstance(st.get("last_ok_at"), str) else None,
+            "found": found if isinstance(found, int) and not isinstance(found, bool) else 0,
+            "every_seconds": st.get("every_seconds") if isinstance(st.get("every_seconds"), int) else None,
+            "next_at": hub._iso(datetime.fromtimestamp(nxt, timezone.utc)) if nxt else None}
 
 
 # ---- status and the `mother chief` CLI ----------------------------------------------------------------
@@ -2008,6 +2144,13 @@ USAGE = """usage: mother chief <verb> ...
                         prints {paused, logged, now}
   why <key> [--json]    the last triage verdicts of one key, newest first: {at, line_id, key, label, decision, kind,
                         urgency, reason, title}, from .mother/chief/verdicts.jsonl (no bodies, 30 days)
+  mention-search plan [--as <session_id>] [--force]
+                        whether the leading desktop session runs the mention and DM search now, and its queries and
+                        `after`; prints {due, why?, after, started_at, max_pages, queries}
+  mention-search record --stdin
+                        the run's raw search answers ({started_at, status, pages: [{label, results, truncated}]}):
+                        hits into the inbox through `mother hub ingest`, the watermark and backoff into
+                        .mother/chief/mention_search.json; prints {status, added, skipped, next_at}
   lines [--json]        the inbox lines waiting for a decision
   context --json        what the triage prompt says about the manager: their name, the teams with their people's
                         names, the followed tracker projects and repos, names only; plus `people`, the configured
@@ -2079,6 +2222,7 @@ VERBS = {
     "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
     "watch-key": ((), ("--for",)), "close-case": ((), ()), "ask": (("--stdin",), ()), "dots-detail": (("--json",), ()),
     "why": (("--json",), ()), "mention": (("--stdin",), ()),
+    "mention-search": (("--json", "--stdin", "--force"), ("--as",)),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -2371,7 +2515,7 @@ def main(args, ws, cfg, at) -> int:
         opts, pos = _parse(rest, flags, valued)
     except ValueError as e:
         return _usage(str(e))
-    if pos and verb not in ("report", "relay", "habits", "watch-key", "close-case", "dots-detail", "why"):
+    if pos and verb not in ("report", "relay", "habits", "watch-key", "close-case", "dots-detail", "why", "mention-search"):
         return _usage("%s takes no arguments" % verb)
     ws = Path(ws)
     if verb == "why":
@@ -2431,6 +2575,20 @@ def main(args, ws, cfg, at) -> int:
             print(json.dumps(mention(ws, cfg, at, doc)))
         except ValueError as e:
             print("mother chief mention: %s" % e, file=sys.stderr)
+            return EXIT_FAILED
+        return EXIT_OK
+    if verb == "mention-search":
+        if pos not in (["plan"], ["record"]):
+            return _usage("mention-search takes plan [--as <session_id>] [--force] or record --stdin")
+        if pos == ["plan"]:
+            print(json.dumps(mention_plan(ws, cfg, at, opts.get("as") or "", bool(opts.get("force")))))
+            return EXIT_OK
+        if not opts.get("stdin"):
+            return _usage("mention-search record reads the run from stdin: pass --stdin")
+        try:
+            print(json.dumps(mention_record(ws, cfg, at, json.loads(sys.stdin.read()))))
+        except ValueError as e:
+            print("mother chief mention-search: %s" % e, file=sys.stderr)
             return EXIT_FAILED
         return EXIT_OK
     if verb == "dots-detail":

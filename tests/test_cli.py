@@ -411,6 +411,8 @@ class CliTest(unittest.TestCase):
                                   ({"tldr_model": "gpt"}, "chief.tldr_model"), ({"triage_model": "gpt"}, "chief.triage_model"),
                                   ({"refresh_minutes": 0}, "chief.refresh_minutes"), ({"refresh_minutes": 61}, "chief.refresh_minutes"),
                                   ({"refresh_minutes": 2.5}, "chief.refresh_minutes"),
+                                  ({"mention_search_seconds": 59}, "chief.mention_search_seconds"),
+                                  ({"mention_search_seconds": 1801}, "chief.mention_search_seconds"),
                                   ({"ignore_folders": "/work"}, "chief.ignore_folders"), ({"ignore_folders": ["rel/path"]}, "chief.ignore_folders")):
             cfg = self.write_config()
             cfg["chief"] = chief_block

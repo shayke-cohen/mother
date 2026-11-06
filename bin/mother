@@ -468,7 +468,7 @@ def validate_hub(h) -> list:
 # config.json -> chief (CONTRACT §5g; lib/chief.py DEFAULTS, which a test holds equal): "money" a number from 0,
 # "model" a TL;DR or triage model.
 CHIEF_FIELDS = {"daily_budget_usd": "money", "tldr_model": "model", "triage_model": "model", "refresh_minutes": "minutes",
-                "ignore_folders": "folders"}
+                "ignore_folders": "folders", "mention_search_seconds": "search_seconds"}
 # the chief session's and its workers' keys (before 0.18.0): accepted, ignored
 CHIEF_LEGACY_KEYS = {"max_workers", "run_minutes", "chief_model", "worker_model", "tick_seconds", "batch_minutes",
                      "decision_hours"}
@@ -490,6 +490,8 @@ def validate_chief(c) -> list:
             errs.append(f"chief.{k} must be a number of 0 or more")
         elif kind == "minutes" and not (isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 60):
             errs.append(f"chief.{k} must be a whole number from 1 to 60")
+        elif kind == "search_seconds" and not (isinstance(v, int) and not isinstance(v, bool) and 60 <= v <= 1800):
+            errs.append(f"chief.{k} must be a whole number from 60 to 1800")
         elif kind == "model" and v not in CHIEF_MODELS:
             errs.append(f"chief.{k} must be one of {', '.join(CHIEF_MODELS)}")
         elif kind == "folders" and not (isinstance(v, list) and all(

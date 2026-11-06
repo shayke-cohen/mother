@@ -87,14 +87,14 @@ class TestPausedSettings(Base):
     def test_settings_defaults_and_overrides(self):
         s = chief.settings({})
         self.assertEqual(s, {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5,
-                             "ignore_folders": []})
+                             "ignore_folders": [], "mention_search_seconds": 180})
         self.assertEqual([chief.settings({"chief": {"refresh_minutes": v}})["refresh_minutes"] for v in (1, 60, 0, 61, "5", True, 2.5)],
                          [1, 60, 5, 5, 5, 5, 5])
         self.assertEqual(chief.settings({"chief": {"triage_model": "gpt"}})["triage_model"], "sonnet")
         self.assertEqual(chief.settings({"chief": {"triage_model": "opus"}})["triage_model"], "opus")
         s = chief.settings({"chief": {"daily_budget_usd": 5, "max_workers": 5, "batch_minutes": 30, "bogus": 1}})
         self.assertEqual(s, {"daily_budget_usd": 5, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5,
-                             "ignore_folders": []})
+                             "ignore_folders": [], "mention_search_seconds": 180})
 
 
 def line(**kw):
@@ -684,7 +684,8 @@ class TestHealth(Base):
     def test_health_of_an_empty_workspace(self):
         self.assertEqual(chief.status_doc(self.ws, {}, AT)["health"], {
             "guard": "on", "watcher": None, "watcher_errors": [], "watcher_error_count": 0, "undelivered": [],
-            "access": []})
+            "access": [], "mention_search": {"status": "never", "reason": "", "last_run_at": None, "last_ok_at": None,
+                                             "found": 0, "every_seconds": None, "next_at": None}})
 
     def test_guard_states_and_paused_wins(self):
         state = self.ws / ".mother"
@@ -1995,3 +1996,167 @@ class TestIgnoreFolders(Base):
         self.assertEqual(chief.status_doc(self.ws, {"chief": {"ignore_folders": ["/work/x"]}}, AT)["floor"],
                          {"ignore_folders": ["/work/x"]})
 
+
+
+def hit_md(*hits):
+    """A desktop search answer's `results` markdown (invented ids and host): hits as (channel, label, user, name, ts,
+    text, thread_ts, bot)."""
+    out = ["# Search Results\n\n## Messages (%d results)" % len(hits)]
+    for i, (ch, label, user, name, ts, text, tts, bot) in enumerate(hits, 1):
+        link = "https://example.slack.com/archives/%s/p%s" % (ch, ts.replace(".", "")) + ("?thread_ts=%s" % tts if tts else "")
+        out.append("### Result %d of %d\nChannel: %s (ID: %s)\nFrom: %s (ID: %s)%s\nTime: 2026-11-01 11:00:00 IST\n"
+                   "Message_ts: %s\nPermalink: [link](%s)\nText: %s\n---" % (i, len(hits), label, ch, name, user,
+                                                                         "  [BOT]" if bot else "", ts, link, text))
+    return "\n".join(out) + "\n"
+
+
+class TestMentionSearch(TestCases):
+    SID = "33333333-3333-4333-8333-333333333333"
+    CFG = {"manager": {"chat_user": "U00000000", "chat_dm": ["D0SELFSLF"]},
+           "hub": {"watch": {"chat": {"channels": ["C0WATCHED"], "follow": ["C0FOLLOWD/1793960000.000300"]}}},
+           "teams": [{"slug": "p", "people": [{"name": "Sam Roe", "chat": "U0SSSSSSS"}]}]}
+    T0 = 1793520000.0  # a message an hour before AT
+
+    def lead(self, at=AT):
+        self.assertIsNone(chief.lead(self.ws, at, self.SID))
+
+    def record(self, status="ok", md="", at=AT, label="mentions", **kw):
+        return chief.mention_record(self.ws, self.CFG, at, dict({"started_at": at.timestamp(), "status": status,
+                                                                 "pages": [{"label": label, "results": md}]}, **kw))
+
+    def test_plan_is_the_leaders_on_its_interval_from_six_hours_back(self):
+        self.assertFalse(chief.mention_plan(self.ws, self.CFG, AT)["due"])                 # no --as: never
+        chief.lead(self.ws, AT - timedelta(seconds=130), self.A)
+        self.assertEqual(chief.mention_plan(self.ws, self.CFG, AT, self.SID)["why"], "another session leads")
+        self.lead()
+        p = chief.mention_plan(self.ws, self.CFG, AT, self.SID)
+        self.assertTrue(p["due"])
+        self.assertEqual(int(p["after"]), int(AT.timestamp()) - 6 * 3600)
+        self.assertEqual([q["query"] for q in p["queries"]], ["<@U00000000>", "to:me"])
+        self.assertEqual((p["max_pages"], p["every_seconds"]), (3, 180))
+        self.assertEqual(chief.mention_plan(self.ws, {}, AT, self.SID)["why"], "no manager chat user id (manager.chat_user)")
+        self.record()
+        later = AT + timedelta(seconds=100)
+        self.lead(later)
+        self.assertEqual(chief.mention_plan(self.ws, self.CFG, later, self.SID)["why"], "not due")
+        forced = chief.mention_plan(self.ws, self.CFG, later, self.SID, force=True)          # /chief refresh
+        self.assertTrue(forced["due"])
+        self.assertEqual(int(forced["after"]), int(AT.timestamp()) - 600)                  # the last good run less 10 min
+        self.lead(AT + timedelta(seconds=181))
+        self.assertTrue(chief.mention_plan(self.ws, self.CFG, AT + timedelta(seconds=181), self.SID)["due"])
+
+    def test_interval_setting_and_its_range(self):
+        for v, want in ((60, 60), (1800, 1800), (59, 180), (1801, 180), ("90", 180), (True, 180)):
+            self.assertEqual(chief.settings({"chief": {"mention_search_seconds": v}})["mention_search_seconds"], want)
+
+    def test_failures_back_off_doubling_to_30_minutes_and_keep_the_watermark(self):
+        self.record()
+        wm = chief.mention_state(self.ws)["watermark"]
+        waits = []
+        for status in ("rate_limited", "error", "rate_limited", "rate_limited"):
+            got = self.record(status, at=AT + timedelta(seconds=10), reason="429 Too Many Requests")
+            waits.append(chief.mention_state(self.ws)["next_at"] - (AT.timestamp() + 10))
+            self.assertEqual(got["status"], status)
+        self.assertEqual(waits, [360, 720, 1440, 1800])
+        st = chief.mention_state(self.ws)
+        self.assertEqual((st["watermark"], st["reason"]), (wm, "429 Too Many Requests"))
+        h = chief.health_doc(self.ws, AT, [])["mention_search"]
+        self.assertEqual((h["status"], h["reason"]), ("rate_limited", "429 Too Many Requests"))
+        self.record(at=AT + timedelta(seconds=20))
+        st = chief.mention_state(self.ws)
+        self.assertEqual((st["next_at"] - st["watermark"], "backoff_seconds" in st), (180, False))
+
+    def test_unavailable_is_said_and_never_moves_the_watermark(self):
+        self.assertEqual(chief.health_doc(self.ws, AT, [])["mention_search"]["status"], "never")
+        self.record("unavailable")
+        h = chief.health_doc(self.ws, AT, [])["mention_search"]
+        self.assertEqual((h["status"], h["reason"]), ("unavailable", chief.MENTION_UNAVAILABLE))
+        self.assertNotIn("watermark", chief.mention_state(self.ws))
+        with self.assertRaises(ValueError):
+            chief.mention_record(self.ws, self.CFG, AT, {"status": "maybe"})
+
+    def test_a_query_cut_at_its_page_cap_moves_the_watermark_to_its_newest_hit(self):
+        md = hit_md(("C0OTHERCH", "#other", "U0KKKKKKK", "Kim", "%.6f" % self.T0, "<@U00000000> hi", None, False))
+        self.record(md=md, truncated=None, pages=[{"label": "mentions", "results": md, "truncated": True}])
+        self.assertEqual(chief.mention_state(self.ws)["watermark"], self.T0)
+
+    def test_ingest_writes_lines_like_the_watcher_and_skips_what_it_must(self):
+        ts = lambda n: "%.6f" % (self.T0 + n)
+        md = hit_md(("D0AAAAAAA", "DM", "U0SSSSSSS", "S. Roe", ts(1), "can you look?", None, False),
+                    ("C0OTHERCH", "#other", "U0KKKKKKK", "Kim Lee", ts(2), "<@U00000000> PLAT-12 call", "1793960000.000200", False),
+                    ("D0BBBBBBB", "DM", "U0BOTBOTB", "CI", ts(3), "build passed", None, True),           # a bot
+                    ("C0OTHERCH", "#other", "U00000000", "Dana", ts(4), "my own", None, False),          # the manager's
+                    ("D0SELFSLF", "DM", "U0SSSSSSS", "Sam", ts(5), "self dm", None, False),              # the self-DM
+                    ("C0WATCHED", "#watched", "U0KKKKKKK", "Kim", ts(6), "<@U00000000> w", None, False),  # polled
+                    ("C0FOLLOWD", "#f", "U0KKKKKKK", "Kim", ts(7), "<@U00000000> f", "1793960000.000300", False))
+        with hub.locked(self.ws):   # the watcher's own search wanted the scope: it polls every watched channel
+            hub.save_json(self.ws, "cursors.json", {"chat": {"ts": "1", "search_off": {"at": 1, "why": "missing scope"}}})
+        got = self.record(md=md)
+        self.assertEqual((got["added"], got["skipped"]), (2, {"bot": 1, "own": 1, "self_dm": 1, "watched": 2}))
+        lines = hub.read_inbox(self.ws)
+        dm, men = lines
+        self.assertEqual((dm["key"], dm["who"], dm["kind"], dm["to_manager"], dm["link"]),
+                         ("D0AAAAAAA/dm", "Sam Roe <U0SSSSSSS>", "update", True,
+                          "https://example.slack.com/archives/D0AAAAAAA/p%s" % ts(1).replace(".", "")))
+        self.assertEqual((men["key"], men["who"], men["also"], men["id"]),
+                         ("C0OTHERCH/1793960000.000200", "Kim Lee <U0KKKKKKK>", ["PLAT-12"],
+                          "chat:C0OTHERCH/1793960000.000200:%s" % ts(2)))
+        shown = {l["key"]: l["to_manager"] for l in chief.lines(self.ws, self.CFG)}
+        self.assertEqual(shown, {"D0AAAAAAA/dm": "addressed", "C0OTHERCH/1793960000.000200": "mentioned"})
+        self.assertEqual(self.record(md=md)["skipped"].get("seen"), 2)                         # never twice
+        self.assertEqual(len(hub.read_inbox(self.ws)), 2)
+        self.assertEqual(set(hub.ingested_keys(self.ws)), {"D0AAAAAAA:%s" % ts(1), "C0OTHERCH:%s" % ts(2)})
+
+    def test_ingest_skips_what_the_watcher_already_wrote(self):
+        ts = "%.6f" % self.T0
+        key = "C0OTHERCH/%s" % ts
+        hub.append_inbox(self.ws, [hub.make_line("chat", "update", key, "2026-11-01T08:00:00Z", uid=ts)])
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "cursors.json", {"chat": {"ts": "1", "seen": ["C0THIRDCH:%s" % ts]}})
+        md = hit_md(("C0OTHERCH", "#other", "U0KKKKKKK", "Kim", ts, "<@U00000000> a", None, False),
+                    ("C0THIRDCH", "#third", "U0KKKKKKK", "Kim", ts, "<@U00000000> b", None, False))
+        self.assertEqual(self.record(md=md)["skipped"], {"seen": 2})
+        # search-first and no scope trouble: a watched channel is not polled, so a hit there is the search's to write
+        md = hit_md(("C0WATCHED", "#watched", "U0KKKKKKK", "Kim", ts, "<@U00000000> c", None, False))
+        self.assertEqual(self.record(md=md)["added"], 1)
+
+    def test_a_mention_in_a_claimed_thread_routes_to_the_case(self):
+        key = "C0OTHERCH/1793960000.000200"
+        self.now_item(key)
+        self.claim(key, self.A)
+        md = hit_md(("C0OTHERCH", "#other", "U0KKKKKKK", "Kim", "%.6f" % self.T0, "<@U00000000> any news?",
+                     "1793960000.000200", False))
+        self.assertEqual(self.record(md=md)["added"], 1)
+        new = [l for l in hub.read_inbox(self.ws) if l.get("to_manager")]
+        chief.triage_decide(self.ws, self.CFG, AT, [new[0]["id"]], [])
+        got = chief.relays(self.ws, AT, self.A)
+        self.assertEqual([(r["id"], r["key"], r["summary"]) for r in got], [(new[0]["id"], key, "<@U00000000> any news?")])
+
+    def test_cli_plan_and_record(self):
+        self.lead()
+        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(chief.main(["mention-search", "plan", "--as", self.SID], self.ws, self.CFG, AT), 0)
+        self.assertTrue(json.loads(out.getvalue())["due"])
+        doc = json.dumps({"started_at": AT.timestamp(), "status": "ok", "pages": []})
+        with mock.patch.object(sys, "stdin", io.StringIO(doc)), mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(chief.main(["mention-search", "record", "--stdin"], self.ws, self.CFG, AT), 0)
+        self.assertEqual(json.loads(out.getvalue())["status"], "ok")
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertNotEqual(chief.main(["mention-search", "nope"], self.ws, self.CFG, AT), 0)
+
+    def test_hub_ingest_cli_takes_a_list_or_the_raw_markdown(self):
+        ts = "%.6f" % self.T0
+        raw = json.dumps({"results": hit_md(("C0OTHERCH", "#other", "U0KKKKKKK", "Kim", ts, "<@U00000000> a", None, False))})
+        with mock.patch.object(sys, "stdin", io.StringIO(raw)), mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(hub.main(["ingest", "--source", "chat", "--stdin", "--raw"], self.ws, self.CFG, AT), 0)
+        self.assertEqual(json.loads(out.getvalue())["added"], 1)
+        hits = [{"channel": "C0OTHERCH", "ts": "%.6f" % (self.T0 + 1), "user": "U0KKKKKKK", "user_name": "Kim‮",
+                 "text": "x", "permalink": "javascript:alert(1)", "is_dm": False, "is_mention": True},
+                {"channel": "not a channel", "ts": ts}]
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(hits))), mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            self.assertEqual(hub.main(["ingest", "--source", "chat", "--stdin"], self.ws, self.CFG, AT), 0)
+        self.assertEqual(json.loads(out.getvalue())["skipped"], {"malformed": 1})
+        last = hub.read_inbox(self.ws)[-1]
+        self.assertEqual((last["who"], last["link"]), ("Kim <U0KKKKKKK>", ""))             # cleaned, no unsafe link
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(hub.main(["ingest", "--source", "mail", "--stdin"], self.ws, self.CFG, AT), 2)

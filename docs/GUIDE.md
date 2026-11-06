@@ -80,6 +80,12 @@ chat connector in a normal session, match the user ids to the people in `config.
 id; `mother hub dms show` lists the map, `mother hub dms drop U00000001` removes one). A message from that person
 reaches the inbox; your own reply in the DM clears it.
 
+Mentions of you in channels the watcher doesn't read, group DMs and DMs from people not in config are found by
+search. When the watcher's chat token can't search (Health says "missing scope"), the leading desktop session runs
+the search with its own Slack connector every 3 minutes (`chief.mention_search_seconds`) and on `/chief refresh`, and
+hands what it finds to the inbox. It needs a desktop session with the Slack connector connected; Health shows
+`chat: mentions via desktop search: ok, last run 2m ago, N found`, or why it isn't running.
+
 To use the DM with yourself as an inbox, run `mother hub dms inbox <its D… id>`: every note you type there
 becomes an inbox line, like `mother hub add` (posts made by apps, MOTHER's included, are skipped).
 

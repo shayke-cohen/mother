@@ -849,6 +849,7 @@ def poll_once(ws: Path, cfg: dict, at: datetime, clients: dict, poll: bool = Tru
             if pres is None:
                 pres = presence_fn(ws, cfg, at)
             wcfg.update(_away=pres["away"], _hot=live_session_keys(ws), _force=force, _recent=recent_chat_keys(ws, at),
+                        _ingested=ingested_keys(ws),
                         _tz=((cfg or {}).get("manager") or {}).get("timezone") or "")
         try:
             res = adapter.poll(client, cursors.get(cap), wcfg, me, at)
@@ -1339,6 +1340,8 @@ USAGE = """mother hub <verb>
               drop its watcher lines and its Now items (`unmute` undoes); --scope channel mutes a thread's channel
               mute --words w1,w2 [--channel C]: a rule for similar messages (any word, whole word, any case)
   watching    [--json]  the merged watch list (config plus follows) and the mutes
+  ingest      --source chat --stdin [--raw]  desktop search hits (a JSON list, or with --raw the search tool's
+              markdown) into the inbox as the watcher would write them, deduplicated against it; prints {added, skipped}
   dms         set <user id>=<DM id> [...] | drop <user id> | inbox <self-DM id>|none | show [--json]
               DMs with people in config the watcher reads, and the self-DM it reads as your inbox"""
 
@@ -2553,6 +2556,165 @@ def dms_cmd(ws: Path, cfg: dict, args, as_json: bool, out) -> int:
     return 2
 
 
+# ---- desktop search: hits a desktop session's chat connector found, handed in for the inbox (CONTRACT §5e) ----
+INGESTED_FILE = "ingested.json"  # .mother/hub/ingested.json: {"seen": ["<channel>:<ts>", ...]}, newest last
+INGESTED_MAX = 1000
+INGEST_MAX = 120  # hits per call
+_HIT_TS = re.compile(r"^\d{9,11}\.\d{1,6}$")
+_HIT_CHANNEL = re.compile(r"^[CDG][A-Z0-9]{2,}$")
+
+
+def ingested_keys(ws: Path) -> List[str]:
+    """`<channel>:<ts>` of every message `ingest_chat` wrote, so the watcher never writes one again."""
+    doc = load_json(ws, INGESTED_FILE, {})
+    got = doc.get("seen") if isinstance(doc, dict) else None
+    return [k for k in got if isinstance(k, str)] if isinstance(got, list) else []
+
+
+def polled_chat(ws: Path, cfg: dict) -> Tuple[set, set]:
+    """(channel ids, thread keys) the watcher reads history of itself, so a desktop search hit there is left to it:
+    the DMs mapped for people in config and followed threads always; watched channels when it polls them all
+    (`chat.discovery` "poll", or its own search refused), else only `chat.poll` and `chat.read_all` ones."""
+    eff = effective_cfg(cfg, load_watch(ws))
+    chat = _watch_cfg(eff, _hub_cfg(eff), "chat")
+    cur = load_json(ws, "cursors.json", {})
+    cur = (cur.get("chat") if isinstance(cur, dict) else None) or {}
+    poll_all = chat.get("discovery") == "poll" or bool(isinstance(cur, dict) and cur.get("search_off"))
+    chans = set(_as_list(chat.get("channels"))) if poll_all else set()
+    chans |= set(_as_list(chat.get("poll"))) | set(_as_list(chat.get("read_all")))
+    chans |= {d for d in (chat.get("dms") or {}).values() if isinstance(d, str)}
+    threads = {t for t in _as_list(chat.get("follow")) if "/" in t}
+    return chans, threads
+
+
+def _self_dms(ws: Path, cfg: dict) -> set:
+    m = (cfg or {}).get("manager") or {}
+    out = {x for x in _as_list(m.get("chat_dm")) if _DM_CHANNEL.match(x)}
+    inbox = load_watch(ws)["follow"].get("inbox") or ""
+    return out | ({inbox} if inbox else set())
+
+
+def _clean_hit(h) -> Optional[dict]:
+    """One hit with its fields checked; None when its channel or ts is malformed."""
+    if not isinstance(h, dict):
+        return None
+    ch, ts = str(h.get("channel") or ""), str(h.get("ts") or "")
+    if not _HIT_CHANNEL.match(ch) or not _HIT_TS.match(ts):
+        return None
+    tts = h.get("thread_ts")
+    tts = tts if isinstance(tts, str) and _HIT_TS.match(tts) and tts != ts else None
+    link = h.get("permalink") if isinstance(h.get("permalink"), str) else ""
+    link = link if re.match(r"^https://[^\s<>\"']{1,500}$", link) else ""
+    user = h.get("user") if isinstance(h.get("user"), str) and _CHAT_USER.match(h.get("user") or "") else ""
+    return {"channel": ch, "ts": ts, "thread_ts": tts, "user": user,
+            "user_name": plain(h.get("user_name") if isinstance(h.get("user_name"), str) else "").strip()[:80],
+            "text": str(h.get("text") or "")[:4000], "permalink": link, "is_dm": h.get("is_dm") is True,
+            "is_mention": h.get("is_mention") is True, "is_bot": h.get("is_bot") is True}
+
+
+def ingest_chat(ws: Path, cfg: dict, at: datetime, hits) -> dict:
+    """Write desktop search hits as chat inbox lines, with the watcher's keys (`<channel>/<thread ts or ts>`, a DM
+    `<channel>/dm`) and `to_manager: true`. Skipped: bots, the manager's own messages, the self-DM, conversations
+    the watcher polls itself (`polled_chat`), muted lines, and anything already written by the watcher (its `seen`
+    set or an inbox line with the same id) or by an earlier ingest (`ingested.json`). Returns {added, skipped}."""
+    import hub_sources
+    ws = Path(ws)
+    me = build_me(cfg)
+    mine = me.get("chat") or ""
+    people = me.get("people") or {}
+    selfs = _self_dms(ws, cfg)
+    chans, threads = polled_chat(ws, cfg)
+    mute = live_mute(merged_watch(cfg, load_watch(ws))["mute"] or {}, at)
+    cur = load_json(ws, "cursors.json", {})
+    cur = (cur.get("chat") if isinstance(cur, dict) else None) or {}
+    seen = set(cur.get("seen") or []) if isinstance(cur, dict) else set()
+    seen |= set(ingested_keys(ws))
+    ids = {l["id"] for l in read_inbox(ws)}
+    skipped = {}  # type: Dict[str, int]
+    lines, keys = [], []
+
+    def skip(why):
+        skipped[why] = skipped.get(why, 0) + 1
+
+    for raw in list(hits or [])[:INGEST_MAX]:
+        h = _clean_hit(raw)
+        if h is None:
+            skip("malformed")
+            continue
+        ch, ts, tts = h["channel"], h["ts"], h["thread_ts"]
+        dm = h["is_dm"] or ch.startswith("D")
+        key = thing_key("chat", {"channel": ch, "ts": "dm" if dm else ts, "thread_ts": None if dm else tts})
+        sk = "%s:%s" % (ch, ts)
+        if h["is_bot"]:
+            skip("bot")
+        elif mine and h["user"] == mine:
+            skip("own")
+        elif ch in selfs:
+            skip("self_dm")
+        elif ch in chans or key in threads:
+            skip("watched")
+        elif sk in seen or sk in keys or "chat:%s:%s" % (key, ts) in ids:
+            skip("seen")
+        else:
+            name = people.get(h["user"]) or h["user_name"]
+            who = "%s <%s>" % (name, h["user"]) if name and h["user"] else (name or h["user"])
+            ln = _hit_line(hub_sources, key, ts, who, h["text"], h["permalink"])
+            if is_muted(ln, mute):
+                skip("muted")
+                continue
+            lines.append(ln)
+            keys.append(sk)
+    if keys:
+        append_inbox(ws, lines)
+        with locked(ws):
+            got = ingested_keys(ws)
+            save_json(ws, INGESTED_FILE, {"seen": (got + [k for k in keys if k not in got])[-INGESTED_MAX:]})
+    return {"added": len(lines), "skipped": skipped, "keys": [l["key"] for l in lines]}
+
+
+def _hit_line(hub_sources, key: str, ts: str, who: str, text: str, link: str) -> dict:
+    """One ingested hit's inbox line: an `update`, as the watcher writes one, marked `to_manager`."""
+    ln = make_line("chat", "update", key, hub_sources.ts_iso(ts), title=text[:80], who=who, link=link, summary=text,
+                   also=extract_also(text), uid=ts)
+    ln["to_manager"] = True
+    ln["via"] = "desktop_search"
+    return ln
+
+
+def ingest_cmd(ws: Path, cfg: dict, at: datetime, args, out) -> int:
+    """`ingest --source chat --stdin [--raw]`: stdin is a JSON list of hits, or with --raw the search tool's
+    `results` markdown (or `{results}`); prints {added, skipped, keys}."""
+    try:
+        pos, opts = _parse_flags(args, {"source"})
+    except ValueError as e:
+        print("mother hub ingest: %s" % e, file=sys.stderr)
+        return 2
+    extra = [k for k in opts if k not in ("source", "stdin", "raw")]
+    if opts.get("source") != "chat" or opts.get("stdin") is not True or pos or extra:
+        print("usage: mother hub ingest --source chat --stdin [--raw]", file=sys.stderr)
+        return 2
+    body = sys.stdin.read()
+    if opts.get("raw") is True:
+        import hub_sources
+        try:
+            doc = json.loads(body)
+            body = doc.get("results", "") if isinstance(doc, dict) else body
+        except ValueError:
+            pass
+        hits = [dict(h, is_mention=not h["is_dm"]) for h in hub_sources.parse_search_results(body)]
+    else:
+        try:
+            hits = json.loads(body)
+        except ValueError as e:
+            print("mother hub ingest: stdin is not JSON (%s)" % e, file=sys.stderr)
+            return 2
+        if not isinstance(hits, list):
+            print("mother hub ingest: stdin must be a list of hits", file=sys.stderr)
+            return 2
+    print(json.dumps(ingest_chat(ws, cfg, at, hits)), file=out)
+    return 0
+
+
 def main(args, ws, cfg, at) -> int:
     verb, rest = (args[0], args[1:]) if args else ("", [])
     if verb in ("", "help", "-h", "--help"):
@@ -2617,6 +2779,8 @@ def main(args, ws, cfg, at) -> int:
         return add_cmd(ws, at, rest, sys.stdout, as_json)
     if verb == "dms":
         return dms_cmd(ws, cfg, rest, as_json, sys.stdout)
+    if verb == "ingest":
+        return ingest_cmd(ws, cfg, at, rest, sys.stdout)
     if verb in ("follow", "unfollow", "mute", "unmute", "watching"):
         return watch_cmd(ws, cfg, verb, rest, as_json, sys.stdout, at)
     print("mother hub: unknown verb %r; see `mother hub help`" % verb, file=sys.stderr)

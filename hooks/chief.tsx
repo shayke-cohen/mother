@@ -35,6 +35,7 @@ import { observeEvents, resetEvents, shownEvent } from './events'
 import { chaseNotice, notifyOnce, notifyPass, notifyStatusText, setNotify } from './notify'
 import { accessCards, accessRows } from './access'
 import { FAST_MS, NO_SIGS, changed, readBeat, readSigs, readStatusFile, withBeat } from './fastloop'
+import { mentionPass, resetMentionSearch } from './mention_search'
 import type { Sigs } from './fastloop'
 
 // The Chief pane: which session leads, Needs you, the Inbox, and one card per pinned desktop session with a chat box.
@@ -2009,6 +2010,7 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   spendFlushing = false
   cardsWriting = 0
   forgetWrapUp()
+  resetMentionSearch()
   resetCos()
   resetEvents()
   fastTimer?.cancel()
@@ -2042,6 +2044,7 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
     await flushSpend($, bin)
     await snapshotPinned($, bin)
     const led = (await onDesktop($)) ? await leadOnce($, bin) : false   // a terminal session only reads
+    if (led) await mentionPass($, (a, i) => cli($, bin, a, i)).catch(() => undefined)   // mentions and DMs the watcher cannot search for
     const fresh = await reloadStatus($, bin)
     await reloadFloor($, bin)                          // each session's card, for the pane's Needs you
     // routed lines waiting for a case this session holds: one framed prompt into itself (hooks/cos.ts), within its
@@ -2150,9 +2153,11 @@ export function registerChief(on: On, configured: string): void {
       return { text: `Chief floor: the Waiting on line is ${want} for this session${kept ? '' : ' (until it ends: the store could not be written)'}.` }
     }
     if (verb === 'refresh') {
+      // the mention search too, now, when this desktop session leads (`plan` checks the heartbeat)
+      const searched = (await onDesktop($)) ? await mentionPass($, (a, i) => cli($, bin, a, i), true).catch(() => '') : ''
       const said = await refreshTldrs($, bin, { force: 'all' })
       await reloadStatus($, bin)
-      return { text: `Chief pane: ${said || 'session cards refreshed'}.` }
+      return { text: `Chief pane: ${said || 'session cards refreshed'}${/found$/.test(searched) ? `; mention search: ${searched}` : ''}.` }
     }
     if (verb === 'expand' || verb === 'collapse') {
       await update($, chiefOpenAtom, () => allCards(verb === 'expand'))
