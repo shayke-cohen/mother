@@ -4268,3 +4268,10 @@ test('test_mention_search_row_on_the_health_tab', async ($, on) => {
   expect(await texts(ui)).toContain('chat: mentions via desktop search: not available (no Slack search connector in this session)')
   await ui.unmount()
 })
+
+test('test_chief_with_unknown_words_still_opens_the_pane', async ($, on) => {
+  const { out } = await boot($, on, 'console')
+  const r: any = await $.command.run({ command: 'chief', args: 'decisions' } as any)
+  expect(out.opened).toContain('mother-chief')
+  expect(r.text).toMatch(/^Chief pane opened\. Didn't recognise "decisions"\. Usage: \/chief/)
+})
