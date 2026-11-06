@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -197,16 +197,36 @@ def _to_manager(cfg: dict, l: dict) -> Optional[str]:
     return None
 
 
+_THREAD_KEY = re.compile(r"^[A-Z0-9]+/(\d+\.\d+)$")
+THREAD_FIRST_MAX = 300
+
+
+def _thread_first(stored: dict, line: dict) -> Optional[dict]:
+    """A chat reply's thread opener, as {who, text}, when the inbox already holds it: the watcher writes a post under
+    `chat:<channel>/<ts>:<ts>`. Never a read of the chat: an opener the watcher didn't see gives nothing."""
+    m = _THREAD_KEY.match(str(line.get("key") or ""))
+    if not m:
+        return None
+    root = stored.get("chat:%s:%s" % (line["key"], m.group(1)))
+    if not root or root.get("id") == line.get("id"):
+        return None
+    text = safe_line(str(root.get("summary") or root.get("title") or ""), THREAD_FIRST_MAX)
+    return {"who": safe_line(str(root.get("who") or ""), LABEL_MAX), "text": text} if text else None
+
+
 def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
     """The lines waiting for a decision: the digest after the cursor, trimmed to the fields triage needs, plus
     `session` ("desktop" for a live hub session, else None), `source` (the key's kind), `channel` (a chat channel's
-    configured name, else None) and `to_manager` (`addressed`, `mentioned` or None, as `_to_manager`)."""
+    configured name, else None), `to_manager` (`addressed`, `mentioned` or None, as `_to_manager`) and, when the inbox
+    holds it, `thread_first` (a reply's thread opener, as `_thread_first`)."""
     ws = Path(ws)
     sessions = hub._sessions_doc(ws)
     channels = _channel_names(cfg or {})
     hab = habits.habits(ws, datetime.now(timezone.utc)) if habits.is_on(ws) else None
     out = []
-    for l in _pending_lines(ws):
+    pending = _pending_lines(ws)
+    stored = {r["id"]: r for r in hub.read_inbox(ws)} if any(_THREAD_KEY.match(str(l.get("key") or "")) for l in pending) else {}
+    for l in pending:
         d = {k: l.get(k) for k in ("id", "key", "kind", "title", "who", "link", "summary")}
         d["also"] = list(l.get("also") or [])
         d["session"] = _session_kind(sessions, l)
@@ -216,6 +236,9 @@ def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
         d["channel"] = safe_line(name, LABEL_MAX) if name else None
         d["to_manager"] = _to_manager(cfg or {}, l)
         d["habits"] = habits.for_line(hab, d["source"], key, l.get("who"))   # the manager's past handling of its own buckets
+        first = _thread_first(stored, l)
+        if first:
+            d["thread_first"] = first
         out.append(d)
     return out
 
@@ -410,8 +433,56 @@ def verdict_extra(v) -> Optional[dict]:
     def pick(name, allowed, default):
         return v[name] if isinstance(v.get(name), str) and v[name] in allowed else default
 
-    return {"kind": pick("kind", KINDS, KIND_DEFAULT), "on": pick("on", ONS, ON_DEFAULT),
-            "urgency": pick("urgency", URGENCIES, URGENCY_DEFAULT), "actions": clean_actions(v.get("actions"))}
+    out = {"kind": pick("kind", KINDS, KIND_DEFAULT), "on": pick("on", ONS, ON_DEFAULT),
+           "urgency": pick("urgency", URGENCIES, URGENCY_DEFAULT), "actions": clean_actions(v.get("actions"))}
+    reason = _reason(v)
+    return dict(out, reason=reason) if reason else out
+
+
+VERDICT_REASON_MAX = 100
+VERDICTS_FILE = "verdicts.jsonl"   # .mother/chief/verdicts.jsonl: one row per decided line, no bodies
+VERDICTS_KEEP_DAYS = 30
+VERDICTS_SHOWN = 10
+
+
+def _reason(v) -> str:
+    r = v.get("reason") if isinstance(v, dict) else None
+    return safe_line(r, VERDICT_REASON_MAX) if isinstance(r, str) else ""
+
+
+def _read_verdicts(ws: Path) -> List[dict]:
+    try:
+        text = (chief_dir(ws) / VERDICTS_FILE).read_text()
+    except OSError:
+        return []
+    rows = []
+    for raw in text.splitlines():
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and hub._parse_at(row.get("at")) is not None and isinstance(row.get("key"), str):
+            rows.append(row)
+    return rows
+
+
+def log_verdicts(ws: Path, at: datetime, rows: List[dict]) -> None:
+    """Append the rows and drop what is older than 30 days. It only explains a decision already made, so a file that
+    can't be written costs the row and nothing else."""
+    if not rows:
+        return
+    floor = at - timedelta(days=VERDICTS_KEEP_DAYS)
+    try:
+        with hub.locked(ws):
+            kept = [r for r in _read_verdicts(ws) if hub._parse_at(r["at"]) >= floor] + rows
+            _write_atomic(chief_dir(ws) / VERDICTS_FILE, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
+    except OSError:
+        pass
+
+
+def verdicts_for(ws: Path, key: str) -> List[dict]:
+    """The last verdicts of one key, newest first."""
+    return [r for r in _read_verdicts(ws) if r["key"] == key][-VERDICTS_SHOWN:][::-1]
 
 
 def _triage_items(ws: Path) -> dict:
@@ -502,9 +573,18 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
             items.append({"line_id": l["id"], "key": l["key"], "decision": "now", "title": title, "why": why,
                           "link": l.get("link") or ""})
     if items:
-        extras, shown, hushed = {}, [], []
+        extras, shown, hushed, explained = {}, [], [], []
         for res in hub.decide(ws, cfg, at, items):
             v = by_id.get(res["line_id"])
+            l = lines_by_id[res["line_id"]]
+            if l.get("kind") != "sweep":      # a sweep line was never judged
+                hush = quieted.get(res["line_id"])
+                explained.append({"at": hub._iso(at), "line_id": res["line_id"], "key": l["key"],
+                                  "label": item_label(l["key"], habits.who_name(l.get("who")), channels),
+                                  "decision": res.get("decision"), "kind": v.get("kind") if v else None,
+                                  "urgency": v.get("urgency") if v else None,
+                                  "reason": _reason(v) or (safe_line(hush["why"], VERDICT_REASON_MAX) if hush else ""),
+                                  "title": _one_line(v["title"] if v else str(l.get("title") or ""), TITLE_MAX)})
             if res.get("decision") == "now" and res.get("update_id"):
                 extra, note = verdict_extra(v), habits.habit_note(v)
                 extras[res["update_id"]] = dict(extra, habit_note=note) if extra and note else extra
@@ -515,6 +595,7 @@ def triage_decide(ws: Path, cfg: dict, at: datetime, judge: List[str], verdicts:
             _store_extras(ws, extras)
         habits.append_actions(ws, at, shown)     # what was shown: the denominator of every habit
         habits.record_quieted(ws, at, hushed)
+        log_verdicts(ws, at, explained)
         sync_relays(ws)   # a line routed to a case session waits in relays.json for that session to deliver
     out["logged"] = [it["line_id"] for it in items if it["decision"] == "log"]
     out["now"] = [it["line_id"] for it in items if it["decision"] == "now"]
@@ -1775,6 +1856,8 @@ USAGE = """usage: mother chief <verb> ...
                         the leading session's: stdin is {judge: [line ids], verdicts: [...]}; every judge line is
                         decided in code, `log` when its verdict says it needs no attention and `now` for the rest;
                         prints {paused, logged, now}
+  why <key> [--json]    the last triage verdicts of one key, newest first: {at, line_id, key, label, decision, kind,
+                        urgency, reason, title}, from .mother/chief/verdicts.jsonl (no bodies, 30 days)
   lines [--json]        the inbox lines waiting for a decision
   context --json        what the triage prompt says about the manager: their name, the teams with their people's
                         names, the followed tracker projects and repos, names only; plus `people`, the configured
@@ -1829,7 +1912,7 @@ USAGE = """usage: mother chief <verb> ...
 
 A valued option takes --opt=V or --opt V."""
 
-# verb: (boolean flags, valued options); only `report`, `relay`, `habits`, `watch-key`, `close-case` and `dots-detail` take a positional
+# verb: (boolean flags, valued options); only `report`, `relay`, `habits`, `watch-key`, `close-case`, `dots-detail` and `why` take a positional
 VERBS = {
     "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
@@ -1839,6 +1922,7 @@ VERBS = {
     "act-log": (("--stdin", "--json"), ("--days",)), "habits": (("--json",), ()),
     "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
     "watch-key": ((), ("--for",)), "close-case": ((), ()), "ask": (("--stdin",), ()), "dots-detail": (("--json",), ()),
+    "why": (("--json",), ()),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -2111,9 +2195,21 @@ def main(args, ws, cfg, at) -> int:
         opts, pos = _parse(rest, flags, valued)
     except ValueError as e:
         return _usage(str(e))
-    if pos and verb not in ("report", "relay", "habits", "watch-key", "close-case", "dots-detail"):
+    if pos and verb not in ("report", "relay", "habits", "watch-key", "close-case", "dots-detail", "why"):
         return _usage("%s takes no arguments" % verb)
     ws = Path(ws)
+    if verb == "why":
+        if len(pos) != 1:
+            return _usage("why takes one key")
+        rows = verdicts_for(ws, pos[0])
+        if opts.get("json"):
+            print(json.dumps({"version": 1, "key": pos[0], "verdicts": rows}, ensure_ascii=False))
+        else:
+            for r in rows:
+                print("%s  %s  %s" % (r.get("at"), r.get("decision"), r.get("reason") or "no reason given"))
+            if not rows:
+                print("No verdicts for %s in the last %d days." % (pos[0], VERDICTS_KEEP_DAYS))
+        return EXIT_OK
     if verb == "report":
         text = report_text(ws, pos[0]) if len(pos) == 1 else None
         if text is None:

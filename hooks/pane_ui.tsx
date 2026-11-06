@@ -552,6 +552,25 @@ export type Strip = {
   portrait: Portrait | null
   surface: string       // `terminal` draws an Image; any other surface an Svg when it has one
   guard?: string | null // `off` and `paused` each draw a red pill; `on`, or absent, nothing
+  mood?: Mood | null    // one sentence on how things stand, above the budget row
+}
+
+// ---- the mood line: how things stand, in one sentence, from the counts alone (no model call) ----
+export type Mood = { text: string; color?: Color }
+export type MoodCounts = { questions: number; oldest: string; urgent: number; health: number; working: number; inbox: number }
+const plural = (n: number, one: string, many = one + 's'): string => `${n} ${n === 1 ? one : many}`
+// The first of these that holds: questions, urgent inbox, Health problems, working sessions, inbox waiting, all clear.
+export function moodLine(c: MoodCounts): Mood {
+  if (c.questions > 0) {
+    const when = c.oldest === 'now' ? (c.questions === 1 ? 'just asked' : 'oldest just now')
+      : c.oldest ? (c.questions === 1 ? `asked ${c.oldest} ago` : `oldest ${c.oldest}`) : ''
+    return { text: `${plural(c.questions, 'question')} for you${when ? ', ' + when : ''}`, color: 'warning' }
+  }
+  if (c.urgent > 0) return { text: `${plural(c.urgent, 'urgent inbox item')} to look at`, color: 'error' }
+  if (c.health > 0) return { text: `${plural(c.health, 'problem')} in Health`, color: 'warning' }
+  if (c.working > 0) return { text: `${plural(c.working, 'session')} working, nothing for you yet` }
+  if (c.inbox > 0) return { text: `${plural(c.inbox, 'inbox item')} waiting, none urgent` }
+  return { text: 'All clear: nothing waits for you', color: 'success' }
 }
 
 // The header: the picture (a slim banner above, which carries the title on a surface with Svg, or a spot at the
@@ -580,9 +599,10 @@ function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
       <Box key="strip-text" flexDirection="column" flexGrow={1}>
       {titled ? null : <Text weight="bold" size="title" color={SELF_COLOR}>Mother</Text>}
       {titled ? null : <Text dimColor size="caption">Chief of Stuff</Text>}
+      {s.mood ? <Text key="mood" color={s.mood.color} wrap="wrap">{s.mood.text}</Text> : null}
       {dark
         ? <Box key="strip-line" flexWrap="wrap" gap={1} alignItems="center">
-            <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
+            <Text key="pill:budget" dimColor color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
             {Svg ? <Svg key="pill:bar" source={barSvg(ratio)} alt={`budget ${Math.round(Math.min(1, Math.max(0, ratio)) * 100)}%`} width={BAR_W} height={BAR_H} />
               : <Text key="pill:bar" color={bar.color}>{bar.text}</Text>}
             {leadBadge(ui, s.lead, 'pill:lead')}
@@ -590,7 +610,7 @@ function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
             <Text key="pill:beat" dimColor size="footnote">{s.beat}</Text>
           </Box>
         : <Box key="strip-line" flexWrap="wrap" gap="xs">
-            <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
+            <Text key="pill:budget" dimColor color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
             <Text key="pill:bar" color={bar.color}>{bar.text}</Text>
             {badge(ui, s.lead.text, s.lead.color, 'pill:lead', !!s.lead.dim)}
             {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}

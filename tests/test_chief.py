@@ -348,6 +348,81 @@ class TestLeader(Base):
         chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT, session="s-1")["judge"], [])
         self.assertEqual(sorted(json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())["items"]), ["U2"])
 
+    def verdict_rows(self):
+        return [json.loads(l) for l in (chief.chief_dir(self.ws) / "verdicts.jsonl").read_text().splitlines()]
+
+    def test_every_verdict_is_logged_with_its_reason_and_no_body(self):
+        a, b, c = line(key="PLAT-7", summary="SECRET BODY"), line(key="PLAT-8", summary="SECRET BODY"), line(key="PLAT-9", title="no verdict", summary="SECRET BODY")
+        self.inbox(a, b, c)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        chief.triage_decide(self.ws, {}, AT, judge, [
+            verdict(a, needs_attention=False, title="Thanks note", kind="fyi", urgency="later", on="other", actions=[], reason="A thank-you\nwith nothing to do"),
+            verdict(b, title="Owner?", kind="decide", urgency="now", on="manager", actions=[], reason="r" * 200)])
+        rows = self.verdict_rows()
+        self.assertEqual([(r["key"], r["decision"]) for r in rows], [("PLAT-7", "log"), ("PLAT-8", "now"), ("PLAT-9", "now")])
+        self.assertEqual(sorted(rows[0]), ["at", "decision", "key", "kind", "label", "line_id", "reason", "title", "urgency"])
+        self.assertEqual((rows[0]["reason"], rows[0]["kind"], rows[0]["title"], rows[0]["label"]), ("A thank-you with nothing to do", "fyi", "Thanks note", "PLAT-7"))
+        self.assertEqual(len(rows[1]["reason"]), 100)
+        self.assertEqual((rows[2]["reason"], rows[2]["kind"], rows[2]["title"]), ("", None, "no verdict"))   # no verdict came back: said so
+        self.assertNotIn("SECRET BODY", (chief.chief_dir(self.ws) / "verdicts.jsonl").read_text())
+
+    def test_the_reason_is_stored_with_the_verdict_and_shown_on_the_item(self):
+        a = line(key="PLAT-7")
+        self.inbox(a)
+        chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT, session="s-1")["judge"],
+                            [verdict(a, kind="decide", urgency="today", on="manager", actions=[], reason="Only the manager owns this")])
+        stored = json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())["items"]
+        self.assertEqual(list(stored.values())[0]["reason"], "Only the manager owns this")
+        self.assertEqual(chief.inbox_items(self.ws, {}, AT)[0]["reason"], "Only the manager owns this")
+
+    def test_verdicts_are_pruned_after_30_days_on_append(self):
+        old, new = line(key="PLAT-7"), line(key="PLAT-8", at="2026-10-29T10:00:00Z")
+        self.inbox(old)
+        chief.triage_decide(self.ws, {}, AT - timedelta(days=31), chief.tick(self.ws, {}, AT, session="s-1")["judge"], [])
+        self.inbox(new)
+        chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT + timedelta(seconds=1), session="s-1")["judge"], [])
+        self.assertEqual([r["key"] for r in self.verdict_rows()], ["PLAT-8"])
+
+    def test_why_prints_the_last_verdicts_of_a_key_newest_first(self):
+        for n in range(3):
+            l = line(key="PLAT-7", at="2026-10-29T1%d:00:00Z" % n)
+            self.inbox(l)
+            chief.triage_decide(self.ws, {}, AT + timedelta(hours=n), chief.tick(self.ws, {}, AT + timedelta(hours=n), session="s-1")["judge"],
+                                [verdict(l, kind="act", urgency="today", on="team", actions=[], reason="pass %d" % n)])
+        code, out, _ = self.main("why", "PLAT-7", "--json")
+        self.assertEqual(code, 0)
+        doc = json.loads(out)
+        self.assertEqual((doc["version"], doc["key"]), (1, "PLAT-7"))
+        self.assertEqual([r["reason"] for r in doc["verdicts"]], ["pass 2", "pass 1", "pass 0"])
+        code, out, _ = self.main("why", "NOPE-1", "--json")
+        self.assertEqual((code, json.loads(out)["verdicts"]), (0, []))
+        self.assertEqual(self.main("why")[0], chief.EXIT_USAGE)
+        self.assertEqual(self.main("why", "a", "b")[0], chief.EXIT_USAGE)
+        self.assertIn("pass 2", self.main("why", "PLAT-7")[1])
+
+    def test_a_reply_carries_its_threads_first_post_when_the_inbox_holds_it(self):
+        key = "C00000002/1700000001.000100"
+        root = line(source="chat", key=key, uid="1700000001.000100", at="2026-10-29T09:00:00Z", who="Dana", summary="Who owns the\nmigration?")
+        reply = line(source="chat", key=key, uid="1700000002.000100", at="2026-10-29T09:05:00Z", who="Sam", summary="Not me")
+        with hub.locked(self.ws):
+            d = hub._hub_doc(self.ws)
+            d["inbox_cursor"] = root["id"]
+            hub.save_json(self.ws, "hub.json", d)
+        self.inbox(root, reply)
+        got = chief.lines(self.ws)
+        self.assertEqual([l["id"] for l in got], [reply["id"]])
+        self.assertEqual(got[0]["thread_first"], {"who": "Dana", "text": "Who owns the migration?"})
+
+    def test_no_thread_first_for_the_first_post_or_an_unseen_one(self):
+        key = "C00000002/1700000001.000100"
+        self.inbox(line(source="chat", key=key, uid="1700000001.000100", summary="The first post"))
+        self.assertNotIn("thread_first", chief.lines(self.ws)[0])                       # it is the post itself
+        other = "C00000003/1700000009.000100"
+        self.inbox(line(source="chat", key=other, uid="1700000010.000100", summary="A reply"), line(key="PLAT-7"))
+        by_key = {l["key"]: l for l in chief.lines(self.ws)}
+        self.assertNotIn("thread_first", by_key[other])                                 # never fetched
+        self.assertNotIn("thread_first", by_key["PLAT-7"])
+
     def test_fyi_logs_and_manual_and_error_never_do(self):
         a, m = line(key="PLAT-7"), line(source="manual", kind="manual", key="PLAT-3")
         e = line(source="tracker", kind="error", key="watcher:tracker")
