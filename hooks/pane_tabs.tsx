@@ -9,6 +9,7 @@ import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, 
 import { SectionHeading, Stat, pillRow } from './skin'
 import type { Ui } from './pane_ui'
 import { inboxRow, logAct, nowRow, picked, quietedOf } from './habits'
+import { mentionSearchText } from './mention_search'
 import type { ActVerb } from './habits'
 import type { ChiefDetail, ChiefHealth, ChiefHealthState, ChiefInboxItem, ChiefOpen, ChiefStatus, NowAction, NowDoc, NowItem } from '../types'
 
@@ -494,6 +495,12 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       // reading less than usual (the chat source while rate limited): said on its own line, in amber
       if (v?.degraded) out.push(<Text key={'health-watch-degraded:' + name} color="warning" wrap="wrap">{`${oneLine(name, 40)} degraded: ${oneLine(v.degraded, 200)}`}</Text>)
     }
+  }
+  // the chat source's other half: the leading desktop session's mention and DM search (hooks/mention_search.ts)
+  const ms = hd.mention_search
+  if (ms && typeof ms === 'object' && (ms.status !== 'never' || !!(w as any)?.sources?.chat)) {
+    const bad = ms.status === 'error' || ms.status === 'rate_limited'
+    out.push(<Text key="health-mention-search" color={bad ? 'warning' : undefined} dimColor={!bad && ms.status !== 'ok'} wrap="wrap">{`chat: ${oneLine(mentionSearchText(ms, nowMs), 300)}`}</Text>)
   }
 
   // Watcher errors: Inbox items keyed `watcher:`; Done is the Inbox's own verb

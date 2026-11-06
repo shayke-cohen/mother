@@ -10,6 +10,7 @@ import { promptHabits, quietedOf } from './habits'
 import { claimantOf, findSession, isRisky, parseAskCommand, parseRoute, splitTell } from './ask_route'
 import { CHECK_NOW_TEXT, WAITING_SECTION, WAITING_SECTION_ID, chaseCards, checkDue, doneCards, runsCosSkill, underFolder, wantsWaitingSection } from './waiting'
 import { withoutHidden } from './archive'
+import { mentionSearchText, nextCursor, pageOf } from './mention_search'
 
 const WS = '/work/ws'
 const NOW = Date.parse('2026-11-02T10:00:00Z')
@@ -4131,4 +4132,139 @@ test('test_b2_mood_puts_chase_and_done_below_what_needs_the_manager', () => {
   expect(moodLine({ ...base, chases: 2, dones: 1, working: 3 }).text).toBe('2 waits to chase')
   expect(moodLine({ ...base, dones: 1, working: 3 }).text).toBe('1 session done, ready to archive')
   expect(moodLine({ ...base, signin: 1 }).text).toBe('1 sign-in or network problem for you')
+})
+
+// ---- the mention and DM search: the leading desktop session's own chat connector (hooks/mention_search.ts) ----
+const SEARCH = 'mcp__0c0ffee0-aaaa-bbbb__slack_search_public_and_private'
+const PLAN = { version: 1, due: true, after: '1793500000', started_at: 1793520000, max_pages: 3, every_seconds: 180,
+  queries: [{ label: 'mentions', query: '<@U00000001>' }, { label: 'DMs', query: 'to:me' }] }
+const RESULTS = '### Result 1 of 1\nChannel: #x (ID: C0XXXXXXX)\nFrom: Kim (ID: U0KKKKKKK)\nMessage_ts: 1793519000.000100\nText: <@U00000001> hi\n---\n'
+const answer = (results: string, info = '') => ({ value: { content: [{ type: 'text', text: JSON.stringify({ results, pagination_info: info }) }], isError: false } })
+
+type MsOpts = { plan?: (argv: string[]) => any; tools?: () => any[]; search?: (e: any, n: number) => any; surface?: 'terminal' | 'desktop';
+                tick?: () => any }
+async function bootSearch($: any, on: any, o: MsOpts = {}) {
+  const plans: string[][] = []
+  const records: any[] = []
+  let n = 0
+  on('tool.list', () => ({ value: (o.tools ?? (() => [{ name: SEARCH, description: 'search', mcp: true }]))() }))
+  const booted = await bootTldr($, on, {
+    surface: o.surface,
+    mcp: (e: any) => (e.tool === 'slack_search_public_and_private' ? (o.search ?? (() => answer(RESULTS)))(e, n++) : { deny: 'no connected MCP tool' }),
+    cli: (argv, stdin) => {
+      if (argv[0] === 'tick' && o.tick) return { exitCode: 0, stdout: JSON.stringify(o.tick()) }
+      if (argv[0] === 'mention-search' && argv[1] === 'plan') { plans.push(argv); return { exitCode: 0, stdout: JSON.stringify((o.plan ?? (() => PLAN))(argv)) } }
+      if (argv[0] === 'mention-search' && argv[1] === 'record') { records.push(JSON.parse(String(stdin))); return { exitCode: 0, stdout: '{"status": "ok", "added": 1}' } }
+      return undefined
+    },
+  })
+  const searches = () => booted.t.mcp.filter((e: any) => e.tool === 'slack_search_public_and_private')
+  return { ...booted, plans, records, searches }
+}
+
+test('test_mention_search_finds_the_tool_by_name_and_runs_from_the_leader', async ($, on) => {
+  const { clock, plans, records, searches } = await bootSearch($, on)
+  await clock.advance(60_000)
+  expect(plans[0]).toEqual(['mention-search', 'plan', '--as', 'sess-1'])
+  const s = searches()
+  expect(s.length).toBe(2)                                                        // one page each: no cursor
+  expect(s.map((e: any) => e.server)).toEqual(['0c0ffee0-aaaa-bbbb', '0c0ffee0-aaaa-bbbb'])   // the server from the tool's name
+  expect(s[0].args).toEqual({ query: '<@U00000001>', after: '1793500000', sort: 'timestamp', sort_dir: 'asc', limit: 20,
+                              include_context: false, include_bots: false, response_format: 'detailed' })
+  expect(s[1].args.query).toBe('to:me')
+  expect(records[0]).toEqual({ started_at: 1793520000, status: 'ok', calls: 2, pages: [
+    { label: 'mentions', results: RESULTS, truncated: false }, { label: 'DMs', results: RESULTS, truncated: false }] })
+})
+
+test('test_mention_search_pages_at_most_three_and_six_calls', async ($, on) => {
+  const { clock, records, searches } = await bootSearch($, on, { search: () => answer(RESULTS, 'For the next page of results use cursor `Q1VSUkVOVF9QQUdFOjI=`') })
+  await clock.advance(60_000)
+  expect(searches().length).toBe(6)
+  expect(searches()[1].args.cursor).toBe('Q1VSUkVOVF9QQUdFOjI=')
+  expect(records[0].pages.map((p: any) => [p.label, p.truncated])).toEqual([['mentions', false], ['mentions', false], ['mentions', true],
+                                                                           ['DMs', false], ['DMs', false], ['DMs', true]])
+})
+
+test('test_mention_search_waits_when_the_plan_says_not_due_or_another_leads', async ($, on) => {
+  const { clock, plans, records, searches } = await bootSearch($, on, { plan: () => ({ version: 1, due: false, why: 'not due', next_at: '2026-11-02T10:04:00Z' }) })
+  await clock.advance(60_000)
+  expect(plans.length).toBe(1)
+  expect([searches().length, records.length]).toEqual([0, 0])
+  await clock.advance(60_000)
+  expect(plans.length).toBe(1)                                                    // asked again only at next_at
+  await clock.advance(120_000)
+  expect(plans.length).toBe(2)
+})
+
+test('test_mention_search_never_runs_from_a_session_that_does_not_lead', async ($, on) => {
+  const { clock, plans, searches } = await bootSearch($, on, { tick: () => ({ skipped: 'another session leads' }) })
+  await clock.advance(60_000)
+  expect([plans.length, searches().length]).toEqual([0, 0])
+})
+
+test('test_mention_search_never_runs_from_a_terminal_session', async ($, on) => {
+  const { clock, plans, searches } = await bootSearch($, on, { surface: 'terminal' })
+  await clock.advance(60_000)
+  expect([plans.length, searches().length]).toEqual([0, 0])
+})
+
+test('test_mention_search_without_a_connector_records_unavailable', async ($, on) => {
+  const { clock, records, searches } = await bootSearch($, on, { tools: () => [{ name: 'mcp__x__slack_search_public', description: '', mcp: true },
+                                                                             { name: 'slack_search_public_and_private', description: '', mcp: false }] })
+  await clock.advance(60_000)
+  expect(searches().length).toBe(0)
+  expect(records).toEqual([{ started_at: 1793520000, status: 'unavailable', calls: 0, pages: [] }])
+})
+
+test('test_mention_search_finds_an_on_demand_tool_through_the_context_breakdown', async ($, on) => {
+  on('session.usage', () => ({ value: { context: { breakdown: { mcpTools: [{ name: SEARCH, serverName: 'claude.ai Chat', tokens: 1, isLoaded: false }] } } } }))
+  const { clock, searches } = await bootSearch($, on, { tools: () => [] })
+  await clock.advance(60_000)
+  expect(searches().map((e: any) => e.server)).toEqual(['claude.ai Chat', 'claude.ai Chat'])
+})
+
+test('test_mention_search_a_429_or_error_is_recorded_for_the_backoff', async ($, on) => {
+  let fail = 'rate_limited (429) too many requests'
+  const { clock, records } = await bootSearch($, on, { search: () => ({ value: { content: [{ type: 'text', text: fail }], isError: true } }) })
+  await clock.advance(60_000)
+  expect([records[0].status, records[0].reason, records[0].calls]).toEqual(['rate_limited', fail, 1])
+  fail = 'channel_not_found'
+  await clock.advance(60_000)
+  expect(records.length).toBe(1)                                                  // the record's wait: no plan in between
+  await clock.advance(120_000)
+  expect([records[1].status, records[1].reason]).toEqual(['error', 'channel_not_found'])
+})
+
+test('test_chief_refresh_forces_a_mention_search', async ($, on) => {
+  const { plans, searches } = await bootSearch($, on)
+  const said = await $.command.run({ command: 'chief', args: 'refresh' } as any)
+  expect(plans.at(-1)).toEqual(['mention-search', 'plan', '--as', 'sess-1', '--force'])
+  expect(searches().length).toBe(2)
+  expect(said.text).toContain('mention search: 1 found')
+})
+
+test('test_mention_search_health_text', () => {
+  const at = '2026-11-02T09:58:00Z'
+  expect(mentionSearchText({ status: 'ok', last_run_at: at, found: 3 }, NOW)).toBe('mentions via desktop search: ok, last run 2m ago, 3 found')
+  expect(mentionSearchText({ status: 'unavailable', reason: 'not available (no Slack search connector in this session)' }, NOW))
+    .toBe('mentions via desktop search: not available (no Slack search connector in this session)')
+  expect(mentionSearchText({ status: 'rate_limited', reason: '429', last_run_at: at, next_at: '2026-11-02T10:06:00Z' }, NOW))
+    .toBe('mentions via desktop search: rate limited (429), backing off, next try in 6m; last run 2m ago')
+  expect(mentionSearchText({ status: 'never' }, NOW)).toContain('not run yet')
+  expect(nextCursor('For the next page of results use cursor `Q1VSUkVOVF9QQUdFOjI=`\n')).toBe('Q1VSUkVOVF9QQUdFOjI=')
+  expect(nextCursor('')).toBe('')
+  expect(pageOf('plain markdown')).toEqual({ results: 'plain markdown', info: '' })
+})
+
+test('test_mention_search_row_on_the_health_tab', async ($, on) => {
+  const watcher = { at: '2026-11-02T10:00:00Z', every_seconds: 120, active: true, stale: false, sources: { chat: { status: 'ok', reason: '', since: null, at: null } } }
+  let ms: Record<string, unknown> = { status: 'ok', last_run_at: '2026-11-02T09:58:00Z', found: 2 }
+  const { clock } = await bootHealth($, on, () => HEALTH({ watcher, mention_search: ms }))
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab:health' })
+  expect(await texts(ui)).toContain('chat: mentions via desktop search: ok, last run 2m ago, 2 found')
+  ms = { status: 'unavailable', reason: 'not available (no Slack search connector in this session)', last_run_at: '2026-11-02T09:58:00Z' }
+  await clock.advance(60_000)
+  expect(await texts(ui)).toContain('chat: mentions via desktop search: not available (no Slack search connector in this session)')
+  await ui.unmount()
 })

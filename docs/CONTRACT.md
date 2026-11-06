@@ -1165,6 +1165,20 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   `resolved` with `who` the manager when the manager wrote last, else `update` from the first other person. Lines
   of one key in a pass still coalesce, so of two bursts in one pass the newer is kept. `sources.chat.pacing` also
   carries `discovery` (`search`|`poll`, what the pass did) and `calls`; `mother hub status` prints both.
+  **Desktop search hand-in (`mother hub ingest --source chat --stdin [--raw]`).** When the watcher's own token cannot
+  search, the leading desktop session searches with its chat connector (§5g "Mention search") and hands the hits in.
+  stdin is a JSON list `[{channel, ts, thread_ts, user, user_name, text, permalink, is_dm, is_mention}]`, or with
+  `--raw` the search tool's `results` markdown (or `{results}`), parsed by `hub_sources.parse_search_results` (a
+  hit's `thread_ts` comes from its permalink's `thread_ts=`, else it is top-level). Each hit becomes an `update` line
+  as the watcher would write it: key `<channel>/<thread_ts or ts>`, a DM `<channel>/dm`; `who` the config name or the
+  search's name with the user id; `link` the permalink (an `https://` URL, else empty); title and who cleaned by
+  `make_line`; plus `to_manager: true` and `via: "desktop_search"`. Skipped (counted in `skipped`): malformed hits,
+  bots, the manager's own messages, the self-DM (`manager.chat_dm` D-ids and the watch inbox), conversations the
+  watcher reads itself (mapped DMs, followed threads, and watched channels when it polls them all: `discovery`
+  `"poll"` or `search_off`; else only `chat.poll` and `chat.read_all`), muted lines, and messages already written,
+  by the watcher (its cursor's `seen`, or an inbox line with the same id) or by an earlier ingest
+  (`.mother/hub/ingested.json` `{seen: ["<channel>:<ts>"]}`, the last 1000). The watcher passes that store to the chat
+  adapter (`_ingested`), so a message the search handed in is never written twice. Prints `{added, skipped, keys}`.
   **Away.** `presence` (lib/hub.py) is worked out once per pass that polls chat: away when the Mac's HIDIdleTime is
   at least `away_idle_minutes` (15) or the screen has been locked that long (`_presence.locked_since` in
   `cursors.json`), and the manager has no chat or WhatsApp post (`me_at` in those cursors) and no turn typed in a
@@ -1288,8 +1302,9 @@ long-lived chief session kept alive by launchd and tmux, headless `claude -p` wo
 the manager's self-DM; all of that is gone. Work happens in visible desktop sessions. Config: the optional `chief`
 block (§3), keys `daily_budget_usd` (20), `tldr_model` and `triage_model` (both `sonnet`; `opus` is the one other
 value, anything else reads as `sonnet`), `refresh_minutes` (5; a whole number 1-60: how often the leading session
-re-reads each session for its card, "Session refresh" below) and `ignore_folders` (`[]`; absolute or `~/` paths: a
-pinned session under one gets no `Waiting on:` instruction, "Waiting on" below). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
+re-reads each session for its card, "Session refresh" below), `mention_search_seconds` (180; a whole number 60-1800:
+how often the leader runs the mention search, "Mention search" below) and `ignore_folders` (`[]`; absolute or `~/`
+paths: a pinned session under one gets no `Waiting on:` instruction, "Waiting on" below). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
 `worker_model`, `tick_seconds`, `batch_minutes`, `decision_hours`) are accepted and ignored, so an older
 `config.json` still loads; any other unknown key is a validation error, as before.
 
@@ -1320,7 +1335,8 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   it led that returned `judge` lines, the mod reads them with `lines --json` (`{id, key, kind, title, who, link,
   summary, also, session, source, channel, to_manager}`, `session` `"desktop"` when the key has a live hub session,
   else null; `source` the key's kind, `channel` a chat channel's configured name, `to_manager` `addressed` for a
-  direct message, `mentioned` when the line's text names the manager, else null) and asks the model
+  direct message, `mentioned` when the line's text names the manager or the line carries `to_manager: true` (a
+  desktop search hit), else null) and asks the model
   (`chief.triage_model`, `$.model.complete`, 30 s timeout, 900 tokens; never for a `manual` line or one whose key
   has a live session; none at all when the budget is spent) for a verdict per line: `{is_work, needs_attention,
   kind: decide|reply|act|fyi, on: manager|team|other, urgency: now|today|later, title (<= 60), tldr (<= 300),
@@ -1351,6 +1367,27 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   each append); `mother chief why <key> [--json]` prints that key's last 10, newest first. No verdict (a failed
   call, no budget) is `now`, never `log`. It prints `{paused, logged, now}`. `hub.decide` stores a `now` whose key has
   a live session as a route to it. Nothing here ever submits a prompt or posts anywhere.
+- **Mention search** (`hooks/mention_search.ts`; the leading desktop session only, after a tick it led, and on
+  `/chief refresh`). Finds `<@manager>` mentions and DMs the watcher cannot see when its token lacks search. `mother
+  chief mention-search plan --as <session_id> [--force]` prints `{due, why?, every_seconds, next_at?}` and, when due,
+  `{after, started_at, max_pages: 3, queries}`: due only for the session in the fresh heartbeat, with a manager chat
+  user id, not paused, and `chief.mention_search_seconds` (or the backoff) after the last run; `--force` skips the
+  wait, never the leader rule. `after` (Unix seconds) is the last fully successful run less 10 minutes; the first run
+  reaches back 6 hours. The mod finds the search tool by its name, the MCP tool ending in
+  `__slack_search_public_and_private` in `$.tool.list()` (the server name differs per machine), and runs `<@manager>`
+  and `to:me` (`sort: timestamp`, `sort_dir: asc`, `limit: 20`, no context, no bots), up to 3 pages each and 6 calls
+  a run, 20 s each. It never reads the text: `mention-search record --stdin` takes `{started_at, status:
+  ok|error|rate_limited|unavailable, reason?, calls, pages: [{label, results, truncated}]}`, writes the hits through
+  `mother hub ingest` (§5e), and keeps `.mother/chief/mention_search.json` `{watermark, status, reason, last_run_at,
+  last_ok_at, next_at, every_seconds, found, results, calls, backoff_seconds?}`. Only `ok` moves the watermark: to
+  `started_at`, or to the newest hit a query reached when it stopped at its page cap. A 429 or error doubles the
+  wait, up to 30 minutes; no connector is `unavailable` ("not available (no Slack search connector in this
+  session)"). The new lines are triaged on the next lead pass like any other; they are addressed to the manager
+  (`to_manager`), so the quiet rule never logs them, and a line whose key a case holds is routed to it. No model
+  call, no post, no reaction; the searches go from the session's own connector to the chat server, so nothing new
+  leaves the machine. `health.mention_search` is `{status: never|ok|error|rate_limited|unavailable, reason,
+  last_run_at, last_ok_at, found, every_seconds, next_at}`; Health shows it under Watcher as `chat: mentions via
+  desktop search: ok, last run 2m ago, N found`, or the reason it is not running.
 - **Spend.** The mod reports the cost of triage, session-card, floor and Ask-routing calls through `mother chief spend --stdin`
   (`{model, input_tokens?, output_tokens?}`), so they count in `daily_budget_usd`. A missing usage counts as 1024
   output tokens and an unknown model at the dearest price. Over budget, or with an unreadable `spend.json` (which
@@ -1373,7 +1410,7 @@ pinned session under one gets no `Waiting on:` instruction, "Waiting on" below).
   `watcher:<source>` (a source the watcher could not read) is not work: it is left out of both and listed in `health`.
   The text form (`status`) prints who leads, the budget, and the pinned and inbox counts.
 - **`health`** (in `status --json`; `health_doc`), so the pane reads no more files: `{guard, watcher, watcher_errors,
-  watcher_error_count, undelivered, access}`. `guard` is `paused` (`.mother/PAUSED`, which wins), `off` (`.mother/GUARD_OFF`)
+  watcher_error_count, undelivered, access, mention_search}` (the last: "Mention search" above). `guard` is `paused` (`.mother/PAUSED`, which wins), `off` (`.mother/GUARD_OFF`)
   or `on`. `watcher` is null when `.mother/hub/watcher.json` has no `at`, else `{at, every_seconds, active, stale,
   sources: {<name>: {status, reason, since, at, degraded?}}}`, `stale` as `mother hub status` judges it (in active hours and older
   than twice the interval). `watcher_errors` are the `watcher:` updates in the Inbox item shape, newest first, at most

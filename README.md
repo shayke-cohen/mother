@@ -134,7 +134,9 @@ flowchart TD
 - **The watcher** (`mother hub install`) is a plain Python process under launchd. It reads through a read-only
   allow-list and appends one line per changed thing to `<workspace>/.mother/hub/inbox.jsonl`. It never calls a model
   or writes to a source. When chat rate-limits it, it backs off, keeps reading the conversations that matter, and
-  Health says so.
+  Health says so. When its chat token can't search, the leading desktop session searches for your mentions and DMs
+  with its own Slack connector and hands the hits to the inbox, so a mention in a channel nobody watches still
+  arrives.
 - **One desktop session leads.** Every open desktop session runs the plugin's module; the first to tick leads, and
   another takes over when its heartbeat goes stale (120 s). Each minute the leader logs muted lines and asks a model
   about the rest: is it work, does it need attention, what kind (`decide`, `reply`, `act`, `fyi`), who it is on, how
@@ -289,7 +291,8 @@ MOTHER has no server and sends no telemetry. What goes where:
 | Your workspace files | Your own private git remote, if you set one | `mother sync`, at the end of each turn. A secret scan runs first and stops the commit on a hit |
 | Connector reads | The connectors you configured | The watcher and the sessions |
 
-The watcher itself calls no model. WhatsApp chats are read from the local database and copied nowhere. The action log
+The watcher itself calls no model. The mention search sends nothing new: it runs from the session's own chat
+connector to the chat server, and the hits stay on this machine until triage reads them as inbox lines. WhatsApp chats are read from the local database and copied nowhere. The action log
 and verdict log stay on this machine. The pane's model calls run on `chief.triage_model` and `chief.tldr_model`
 (Sonnet by default; the pilot sets triage to Opus) and count against `chief.daily_budget_usd` (default $20). Over budget
 none are made: lines show up untriaged, cards keep their last summary, and an ask opens a case.

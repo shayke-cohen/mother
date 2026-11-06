@@ -206,6 +206,7 @@ class ChatSlack(Adapter):
         marks = [m for m in me.get("marks") or [] if m]
         lines, partial, notes = [], [], []
         seen = list(cursor.get("seen") or [])
+        ingested = {k for k in cfg.get("_ingested") or [] if isinstance(k, str)}
         followed = [t for t in cfg.get("follow") or [] if isinstance(t, str)]
         hot_keys = set(followed) | {k for k in cfg.get("_hot") or [] if isinstance(k, str)}
         hot_chans = {k.split("/", 1)[0] for k in hot_keys}
@@ -278,6 +279,8 @@ class ChatSlack(Adapter):
             if not ts or float(ts) <= floor or "%s:%s" % (ch, ts) in seen:
                 return
             seen.append("%s:%s" % (ch, ts))  # every path (history, replies, search) shares this set
+            if "%s:%s" % (ch, ts) in ingested:
+                return  # the desktop search already handed it in (`mother hub ingest`): never twice
             raw = sender(msg)
             first = (msg.get("text") or "").lstrip().split("\n", 1)[0]
             if marks and any(k in first for k in marks) and (not (msg.get("user") or msg.get("user_id"))
@@ -1287,6 +1290,67 @@ class WhatsApp(Adapter):
         if me_at:
             out["me_at"] = me_at
         return _result(lines, out, partial)
+
+
+# --------------------------------------------------------------------------------------------------- desktop search
+# The desktop session's chat connector can search where the watcher's token cannot (no search scope). Its search tool
+# answers `{"results": "<markdown>", "pagination_info": "..."}`; `results` lists one block per hit:
+#   ### Result 1 of 3 / Channel: DM (ID: D…) or #name (ID: C…) / Participants: … / From: Name (ID: U…)  [BOT] /
+#   Time: … / Message_ts: 1793965143.605369 / Permalink: [link](https://…/archives/D…/p…) / Text: <may span lines> / ---
+# The text is untrusted: it only reaches the inbox through `hub.make_line`.
+_HIT_HEAD = re.compile(r"^#{2,4}\s*Result\s+\d+", re.M)
+_HIT_FIELD = re.compile(r"^(Channel|Participants|From|Time|Message_ts|Permalink|Text):[ \t]?(.*)$")
+_HIT_ID = re.compile(r"\(ID:\s*([A-Z0-9]+)\)")
+_HIT_URL = re.compile(r"\((https://[^\s()]+)\)|(https://\S+)")
+_HIT_TS = re.compile(r"^\d{9,11}\.\d{1,6}$")
+_HIT_CHANNEL = re.compile(r"^[CDG][A-Z0-9]{2,}$")
+HIT_TEXT_MAX = 4000
+
+
+def parse_search_results(md) -> List[dict]:
+    """The hits in a desktop search tool's `results` markdown, as `{channel, ts, thread_ts, user, user_name, text,
+    permalink, is_dm, is_bot}`. A block without a channel id or a message ts is dropped. `thread_ts` comes from the
+    permalink's `thread_ts=` (search gives no other), else None: the hit is then read as top-level."""
+    md = str(md or "")
+    starts = [m.start() for m in _HIT_HEAD.finditer(md)]
+    out = []
+    for i, s in enumerate(starts):
+        block = md[s:starts[i + 1] if i + 1 < len(starts) else len(md)].splitlines()[1:]
+        f, text, in_text = {}, [], False
+        for raw in block:
+            if in_text:
+                if raw.strip() == "---":
+                    in_text = False
+                    continue
+                text.append(raw)
+                continue
+            m = _HIT_FIELD.match(raw)
+            if not m:
+                continue
+            if m.group(1) == "Text":
+                in_text = True
+                if m.group(2).strip():
+                    text.append(m.group(2))
+            else:
+                f[m.group(1)] = m.group(2).strip()
+        chan = _HIT_ID.search(f.get("Channel", ""))
+        ts = f.get("Message_ts", "")
+        if not chan or not _HIT_CHANNEL.match(chan.group(1)) or not _HIT_TS.match(ts):
+            continue
+        frm = f.get("From", "")
+        uid = _HIT_ID.search(frm)
+        name = frm[:uid.start()].strip() if uid else re.sub(r"\[BOT\]", "", frm).strip()
+        url = _HIT_URL.search(f.get("Permalink", ""))
+        link = (url.group(1) or url.group(2)) if url else ""
+        tts = re.search(r"[?&]thread_ts=(\d{9,11}\.\d{1,6})", link)
+        label = f.get("Channel", "")
+        ch = chan.group(1)
+        out.append({"channel": ch, "ts": ts, "thread_ts": tts.group(1) if tts and tts.group(1) != ts else None,
+                    "user": uid.group(1) if uid else "", "user_name": name, "permalink": link,
+                    "text": "\n".join(text).strip()[:HIT_TEXT_MAX],
+                    "is_dm": ch.startswith("D") or bool(re.match(r"^\s*(Group\s+)?DM\b", label, re.I)),
+                    "is_bot": "[BOT]" in frm})
+    return out
 
 
 ADAPTERS = {

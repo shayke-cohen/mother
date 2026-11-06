@@ -197,6 +197,15 @@ class TestPacing(unittest.TestCase):
     def searched(f):
         return any(n.endswith("search-messages") for n, _ in f.calls)
 
+    def test_a_message_the_desktop_search_handed_in_is_not_written_again(self):
+        ts = "%.6f" % (NOW - 30)
+        self.history[self.CH] = [{"ts": ts, "user": "U00000005", "text": "<@U00000000> look"},
+                                 {"ts": "%.6f" % (NOW - 20), "user": "U00000005", "text": "second"}]
+        cur = {"ts": "%.6f" % (NOW - 120), "threads": {}}
+        out, _ = self.poll(cur, AT, _ingested=["%s:%s" % (self.CH, ts)])
+        self.assertEqual([l["summary"] for l in out["lines"]], ["second"])
+        self.assertIn("%s:%s" % (self.CH, ts), out["cursor"]["seen"])
+
     def test_tier_rules(self):
         p = hs.pacing({})
         self.assertEqual(hs.tier({}, NOW, p), "cold")
@@ -1696,3 +1705,71 @@ class TestWhatsApp(unittest.TestCase):
         whatsapp.read_messages_after = lambda *a, **kw: {"status": "couldnt_check", "reason": "denied", "items": []}
         with self.assertRaises(whatsapp.ReaderError):
             r.messages_after(3, 5)
+
+
+# A desktop search answer's `results`, in the shape the chat connector returns it (invented ids and host).
+SEARCH_MD = """# Search Results for: to:me
+
+## Messages (4 results)
+### Result 1 of 4
+Channel: DM (ID: D0AAAAAAA)
+Participants: Sam Roe (ID: U0SSSSSSS), Dana Levi (ID: U00000000)
+From: Sam Roe (ID: U0SSSSSSS)
+Time: 2026-11-06 13:39:03 IST
+Message_ts: 1793965143.605369
+Permalink: [link](https://example.slack.com/archives/D0AAAAAAA/p1793965143605369)
+Text: can you look at the
+release plan today?
+---
+### Result 2 of 4
+Channel: #platform (ID: C0CCCCCCC)
+From: Kim Lee (ID: U0KKKKKKK)
+Time: 2026-11-06 13:40:00 IST
+Message_ts: 1793965200.000100
+Permalink: [link](https://example.slack.com/archives/C0CCCCCCC/p1793965200000100?thread_ts=1793960000.000200&cid=C0CCCCCCC)
+Text: <@U00000000> PLAT-12 needs your call
+---
+### Result 3 of 4
+Channel: DM (ID: D0BBBBBBB)
+Participants: CI (ID: U0BOTBOTB), Dana Levi (ID: U00000000)
+From:  (ID: U00)  [BOT]
+Time: 2026-11-06 13:42:31 IST
+Message_ts: 1793965351.279989
+Permalink: [link](https://example.slack.com/archives/D0BBBBBBB/p1793965351279989)
+Text: 
+build passed
+---
+### Result 4 of 4
+Channel: #general (ID: C0GGGGGGG)
+From: Kim Lee (ID: U0KKKKKKK)
+Time: 2026-11-06 13:43:00 IST
+Message_ts: not-a-ts
+Text: dropped
+---
+"""
+
+
+class TestDesktopSearchParse(unittest.TestCase):
+    def test_parses_dm_channel_bot_and_multiline(self):
+        got = hs.parse_search_results(SEARCH_MD)
+        self.assertEqual(len(got), 3)                                      # the block without a real ts is dropped
+        dm, ch, bot = got
+        self.assertEqual((dm["channel"], dm["ts"], dm["thread_ts"], dm["user"], dm["user_name"], dm["is_dm"], dm["is_bot"]),
+                         ("D0AAAAAAA", "1793965143.605369", None, "U0SSSSSSS", "Sam Roe", True, False))
+        self.assertEqual(dm["text"], "can you look at the\nrelease plan today?")
+        self.assertEqual(dm["permalink"], "https://example.slack.com/archives/D0AAAAAAA/p1793965143605369")
+        self.assertEqual((ch["channel"], ch["thread_ts"], ch["is_dm"], ch["text"]),
+                         ("C0CCCCCCC", "1793960000.000200", False, "<@U00000000> PLAT-12 needs your call"))
+        self.assertTrue(ch["permalink"].startswith("https://example.slack.com/archives/C0CCCCCCC/"))
+        self.assertEqual((bot["is_bot"], bot["user_name"], bot["text"]), (True, "", "build passed"))
+
+    def test_no_results_and_junk(self):
+        self.assertEqual(hs.parse_search_results("# Search Results for: to:me\n\nNo results found."), [])
+        self.assertEqual(hs.parse_search_results(""), [])
+        self.assertEqual(hs.parse_search_results(None), [])
+
+    def test_a_permalink_thread_ts_equal_to_the_ts_is_top_level(self):
+        md = ("### Result 1 of 1\nChannel: #x (ID: C0XXXXXXX)\nFrom: A (ID: U0AAAAAAA)\nMessage_ts: 1793960000.000200\n"
+              "Permalink: [link](https://example.slack.com/archives/C0XXXXXXX/p1793960000000200?thread_ts=1793960000.000200)\n"
+              "Text: hi\n---\n")
+        self.assertIsNone(hs.parse_search_results(md)[0]["thread_ts"])

@@ -263,6 +263,9 @@ export type ChiefHealth = {
   // sources only the manager can fix, matched against lib/chief.py ACCESS_PATTERNS: a sign-in or token (`signin`), or
   // the VPN, network or a timeout (`network`); one row per source, gone once the watcher reads it again
   access?: ChiefAccess[]
+  // .mother/chief/mention_search.json: the leading desktop session's mention and DM search (hooks/mention_search.ts)
+  mention_search?: { status: 'never' | 'ok' | 'error' | 'rate_limited' | 'unavailable'; reason?: string; last_run_at?: string | null
+                     last_ok_at?: string | null; found?: number; every_seconds?: number | null; next_at?: string | null }
 }
 
 export type ChiefAccess = { source: string; kind: 'signin' | 'network'; reason: string; help: string; since?: string | null }
