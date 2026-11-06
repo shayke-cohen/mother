@@ -2183,7 +2183,13 @@ export function registerChief(on: On, configured: string): void {
                     sessionStates(lastStatus, floor, await read($, chiefTldrAtom)))
       return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]' }
+    const usage = 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]'
+    // A known verb with a bad argument, or `help`, gets the usage.
+    if (/^(help|relay|habits|floor|notify|skin|tab)\b/.test(verb)) return { text: usage }
+    // Any other text still opens the pane: the app can hand a command words the person didn't mean as a verb.
+    const shown = await $.ui.open({ id: CHIEF_PANE, title: 'Chief' })
+    if (shown.isPlaced) armFast($, configured)
+    return { text: `${shown.isPlaced ? 'Chief pane opened. ' : ''}Didn't recognise "${oneLine(verb, 40)}". ${usage}` }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on

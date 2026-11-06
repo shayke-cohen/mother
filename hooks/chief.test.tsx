@@ -338,7 +338,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'help' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
