@@ -30,6 +30,12 @@ import type { Details } from './pane_tabs'
 import type { ChiefHealthState } from '../types'
 import type { ChiefCardState, ChiefChip, ChiefDesktop, ChiefInboxItem, FloorCard, ChiefOpen, ChiefStatus, ChiefTabs, ChiefTldr, NowDoc, NowItem, NowTop,
               ChiefAnswer, ChiefUndo } from '../types'
+import type { ChiefEvent } from '../types'
+import { observeEvents, resetEvents, shownEvent } from './events'
+import { chaseNotice, notifyOnce, notifyPass, notifyStatusText, setNotify } from './notify'
+import { accessCards, accessRows } from './access'
+import { FAST_MS, NO_SIGS, changed, readBeat, readSigs, readStatusFile, withBeat } from './fastloop'
+import type { Sigs } from './fastloop'
 
 // The Chief pane: which session leads, Needs you, the Inbox, and one card per pinned desktop session with a chat box.
 // Every write goes through `mother chief …`; the pane never edits a chief file itself.
@@ -54,6 +60,7 @@ const healthAtom = atom({ plugin: 'mother', key: 'chiefHealth' } as const, null)
 const detailAtom = atom({ plugin: 'mother', key: 'chiefDetail' } as const, null)   // what each dots item does (hooks/pane_tabs.tsx loadDetail); only read here
 const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)   // now.json as register.tsx last read it; only read here
 const floorAtom = atom({ plugin: 'mother', key: 'chiefFloor' } as const, null)   // written in hooks/floor.ts; a read names a const of this file
+const eventAtom = atom({ plugin: 'mother', key: 'chiefEvent' } as const, null)   // written in hooks/events.ts; only read here
 
 export const CHIEF_PANE = 'mother-chief'
 export const CHIEF_COMMAND = 'chief'
@@ -102,7 +109,7 @@ let lastStatus: ChiefStatus | null = null
 // `mother chief status --json`. A failure keeps the last good status and sets chiefError. Returns this read's status,
 // or null when this read failed (the last good one is not returned: a caller deciding from it must read fresh).
 async function reloadStatus($: Dollar, bin: string): Promise<ChiefStatus | null> {
-  const ran = await cli($, bin, ['status', '--json'])
+  const ran = await cli($, bin, ['status', '--json', '--save'])   // --save: .mother/chief/status.json, for the fast loop
   let parsed: ChiefStatus | null = null
   let error: string | null = null
   if (!ran.ok) {
@@ -1137,7 +1144,8 @@ type CardCtx = { open: ChiefOpen | null; selected: string | null; portrait?: Por
                  tldrs?: Record<string, ChiefTldr> | null   // each session's card, for an Inbox card's Send to X
                  answer?: ChiefAnswer | null                // the Ask box's answer card
                  undo?: ChiefUndo | null                    // the last Archive, while it can be undone
-                 hidden?: Record<string, true> | null }     // sessions hidden from the floor
+                 hidden?: Record<string, true> | null       // sessions hidden from the floor
+                 event?: ChiefEvent | null }                // what just changed (hooks/events.ts)
 
 // ---- Today: the tick's Top 3 and the on-you items of now.json, as register.tsx read it (its poll, its atom) ----
 // Its buttons are the Now panel's own, from register.tsx: `nowVerb` runs `mother now …` and re-reads now.json at once
@@ -1158,7 +1166,7 @@ export function todayRows(doc: NowDoc | null | undefined, nowMs: number): { top:
 export function tabCounts(s: ChiefStatus | null, floor: FloorState | null, doc: NowDoc | null | undefined, nowMs: number): Record<TabId, number> {
   const today = todayRows(doc, nowMs)
   const inbox = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
-  return { needs: needsYou(s, floor).length, inbox, sessions: (Array.isArray(s?.desktop) ? s!.desktop!.length : 0) + caseOnlyRows(s).length,
+  return { needs: needsYou(s, floor).length + accessRows(s).length, inbox, sessions: (Array.isArray(s?.desktop) ? s!.desktop!.length : 0) + caseOnlyRows(s).length,
            today: today.top.length + today.items.length + suggestedRows(doc).length, all: 0, team: teamCount(doc), health: healthProblems(s, doc) }
 }
 
@@ -1746,11 +1754,14 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   const counts = tabCounts(s, floor, ctx.doc, nowMs)
   const oldest = needs.length ? ago(needs[0].card.at, nowMs) : ''
   const held = heldCount(s, floor)
+  const access = accessCards($, ui, bin, s, ctx.open, ctx.selected, () => reloadStatus($, bin))
   const tabs: Tab[] = [
-    { id: 'needs', label: 'Needs you', count: counts.needs + chases.length + dones.length, section: withHeading => [   // not `h`: the JSX factory is named that
-      needs.length + chases.length + dones.length
-        ? (withHeading ? sectionHeading(ui, 'needs-heading', `Needs you ${needs.length + chases.length + dones.length}`) : null)
+    // the tab's count and the header's are sign-in cards and questions; a chase or a Done card is listed, not counted
+    { id: 'needs', label: 'Needs you', count: counts.needs, section: withHeading => [   // not `h`: the JSX factory is named that
+      needs.length + access.length + chases.length + dones.length
+        ? (withHeading ? sectionHeading(ui, 'needs-heading', needs.length + access.length ? `Needs you ${needs.length + access.length}` : 'Needs you') : null)
         : emptyLine(ui, 'needs-empty', 'Nothing needs you'),
+      ...access,   // sign-in and network problems first: nothing else reads until they are fixed (hooks/access.tsx)
       needs.length ? <Text key="needs-oldest" dimColor>{oldest === 'now' ? 'oldest just now' : `oldest ${oldest} ago`}</Text> : null,
       held ? <Text key="needs-held" dimColor>{`${held} on hold until the question changes`}</Text> : null,
       ...needs.map(needCard), ...chases.map(chaseCard), ...dones.map(doneCard)] },
@@ -1771,7 +1782,8 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
                   sessions: pinned.length + caseOnly.length, spent: s.budget?.spent, limit: s.budget?.limit,
                   overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self, nowMs), beat,
                   portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: guardState(s) /* the one read the Health tab's Guard row shows */,
-                  mood: moodLine({ questions: needs.length, oldest, inbox: counts.inbox, health: healthProblems(s, ctx.doc, ctx.health?.dismissed),
+                  event: shownEvent(ctx.event, nowMs),
+                  mood: moodLine({ questions: needs.length, signin: access.length, chases: chases.length, dones: dones.length, oldest, inbox: counts.inbox, health: healthProblems(s, ctx.doc, ctx.health?.dismissed),
                                    urgent: (Array.isArray(s.inbox) ? s.inbox : []).filter(u => !!u && !isWatcherError(u) && verdictExtra(u)?.urgency === 'now').length,
                                    working: [...pinned, ...caseOnly].filter(d => {
                                      const st = states[d.cli_session_id]
@@ -1904,6 +1916,69 @@ async function deliverNow($: Dollar, bin: string, cli: string, own: boolean): Pr
   await reloadStatus($, bin)
 }
 
+// ---- after every status read: "what just changed" and the leader's notifications (no model call, no process) ----
+async function afterRead($: Dollar, s: ChiefStatus | null): Promise<void> {
+  if (!s) return
+  const floor = await read($, floorAtom)
+  if (!floor) return   // the floor is read at start: until then a question could look new
+  await observeEvents($, s, floor, sessionStates(s, floor, await read($, chiefTldrAtom)))
+  let self: string | null = null
+  try { self = String((await $.session.id()) ?? '') || null } catch { self = null }
+  await notifyPass($, s, floor, self)
+  // a chase card, once per session and wait: `notifyOnce` remembers it, and only the leader raises it. A Done card is silent.
+  const nowMs = await $.clock.now()
+  for (const { d, w } of chaseCards(floorRows(withoutHidden(s, await read($, hiddenAtom))), floor, nowMs)) {
+    await notifyOnce($, s, self, chaseNotice(`${d.cli_session_id}:${w.who.toLowerCase()}|${w.what}`, w.who, w.what))
+  }
+}
+
+// ---- the fast refresh (hooks/fastloop.ts): every 5 s while the pane is shown, from files, redrawn on change only ----
+let fastTimer: ReturnType<Dollar['clock']['every']> | null = null
+let fastSigs: Sigs = NO_SIGS
+let fastWs: string | null = null
+let fastBusy = false
+
+function armFast($: Dollar, configured: string): void {
+  if (fastTimer) return
+  fastTimer = $.clock.every(FAST_MS, async () => { await fastPass($, configured).catch(() => undefined) })
+}
+
+async function fastPass($: Dollar, configured: string): Promise<void> {
+  if (fastBusy) return
+  fastBusy = true
+  try {
+    if (!(await paneShown($))) {   // hidden: the loop stops; the minute pass or /chief open starts it again
+      fastTimer?.cancel()
+      fastTimer = null
+      fastSigs = NO_SIGS
+      return
+    }
+    const bin = await motherBin($, configured)
+    if (fastWs === null) fastWs = (await workspace($, bin)) || null
+    if (fastWs === null) return
+    const sigs = await readSigs($, fastWs)
+    const what = changed(fastSigs, sigs)
+    fastSigs = sigs
+    if (!what.any) return
+    if (what.status || what.beat) {
+      const saved = what.status ? await readStatusFile($, fastWs) : null
+      // never back in time: this session's own minute read may be newer than what another session last saved
+      const base = saved && !(lastStatus && Date.parse(saved.at) < Date.parse(lastStatus.at)) ? saved : lastStatus
+      if (base) {
+        const next = withBeat(base, await readBeat($, fastWs), await $.clock.now())
+        if (JSON.stringify(next) !== JSON.stringify(lastStatus)) {
+          lastStatus = next
+          await update($, chiefAtom, () => next)
+        }
+      }
+    }
+    if (what.floor) await reloadFloor($, bin, true)
+    await afterRead($, lastStatus)
+  } finally {
+    fastBusy = false
+  }
+}
+
 // The pass state; a reload of the mod starts it over. register.tsx owns the timer: the engine's scan lets `$` reach
 // only functions declared at a file's top level, so a timer callback here could not call back into register's
 // status-line draw.
@@ -1914,7 +1989,7 @@ let busy = false
 export async function startChief($: Dollar, configured: string): Promise<number> {
   const bin = await motherBin($, configured)
   try {
-    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | refresh | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | skin dark|dark-app|plain|status)' })
+    await $.command.register({ name: CHIEF_COMMAND, description: 'Open the Chief pane: needs you, inbox, pinned sessions, today (tab <name> | expand | collapse | refresh | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | skin dark|dark-app|plain|status)' })
   } catch {
     // carry on without the command
   }
@@ -1935,6 +2010,12 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   cardsWriting = 0
   forgetWrapUp()
   resetCos()
+  resetEvents()
+  fastTimer?.cancel()
+  fastTimer = null
+  fastSigs = NO_SIGS
+  fastWs = null
+  fastBusy = false
   await loadPortrait($, bin)
   await loadDismissed($)
   await loadHeld($)
@@ -1943,6 +2024,8 @@ export async function startChief($: Dollar, configured: string): Promise<number>
   await loadFloorOff($)
   await triageContext($, bin)   // the people map for the cards; the triage prompt's context too
   await reloadStatus($, bin)
+  await reloadFloor($, bin).catch(() => undefined)
+  await afterRead($, lastStatus).catch(() => undefined)   // seeds "what just changed" (no event on the first read) and notifies what is new
   // not awaited: a slow list_sessions (up to its 10 s timeout) must not hold up the session's start
   void snapshotPinned($, bin).then(() => reloadStatus($, bin)).catch(() => undefined)
   return CONSOLE_POLL_MS
@@ -1966,6 +2049,8 @@ export async function chiefPass($: Dollar, configured: string): Promise<number |
     const waitsOnManager = cardsWriting > 0 || ownAsks(await read($, floorAtom))
     if (await relayPass($, bin, fresh, false, waitsOnManager)) await reloadStatus($, bin)
     await loadOpenDetails($, bin).catch(() => undefined)   // what each open dots card does, once per item
+    await afterRead($, lastStatus).catch(() => undefined)
+    if (await paneShown($)) armFast($, configured)          // the fast refresh, while the pane is shown
     void refreshTldrs($, bin, { led }).catch(() => undefined)   // detached; one batch at a time; the leader refreshes with no pane shown
     return null
   } finally {
@@ -2024,6 +2109,7 @@ export function registerChief(on: On, configured: string): void {
     if (verb === '' || verb === 'open') {
       const opened = await $.ui.open({ id: CHIEF_PANE, title: 'Chief' })
       if (opened.isPlaced) {
+        armFast($, configured)
         void refreshTldrs($, bin).catch(() => undefined)   // not awaited: the command answers at once
         return { text: 'Chief pane opened.' }
       }
@@ -2040,6 +2126,12 @@ export function registerChief(on: On, configured: string): void {
       const text = await say(['habits', habits[1] ?? 'status'], '`mother chief habits` failed.')
       await reloadStatus($, bin)
       return { text }
+    }
+    const notify = /^notify(?:\s+(on|off|status))?$/.exec(verb)   // desktop notifications (hooks/notify.ts)
+    if (notify) {
+      const want = notify[1] ?? 'status'
+      if (want !== 'status' && !(await setNotify($, want === 'on'))) return { text: 'Chief notifications: the store could not be written.' }
+      return { text: await notifyStatusText($) }
     }
     const relay = /^relay(?:\s+(on|off|status))?$/.exec(verb)
     if (relay) {
@@ -2086,7 +2178,7 @@ export function registerChief(on: On, configured: string): void {
                     sessionStates(lastStatus, floor, await read($, chiefTldrAtom)))
       return { text: `Chief pane: showing ${tab === 'all' ? 'every section' : tab}.` }
     }
-    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]' }
+    return { text: 'Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]' }
   })
 
   // Drawing is pure (the engine refuses a state write made while ui.render is dispatched), so the TL;DRs refresh on
@@ -2101,6 +2193,6 @@ export function registerChief(on: On, configured: string): void {
       await read($, floorAtom), self, { open: await read($, chiefOpenAtom), selected: await read($, chiefSelectedAtom), portrait,
         surface: String(e.surface), tabs: await read($, chiefTabAtom), doc: await read($, docAtom), health: await read($, healthAtom),
         details: await read($, detailAtom), people: await read($, chiefPeopleAtom), tldrs: await read($, chiefTldrAtom),
-        answer: await read($, chiefAnswerAtom), undo: await read($, undoAtom), hidden: await read($, hiddenAtom) })
+        answer: await read($, chiefAnswerAtom), undo: await read($, undoAtom), hidden: await read($, hiddenAtom), event: await read($, eventAtom) })
   })
 }

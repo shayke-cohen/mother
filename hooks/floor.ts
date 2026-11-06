@@ -196,13 +196,14 @@ export async function readCards($: Dollar, bin: string): Promise<FloorCard[] | n
 }
 
 // `mother floor list --json` into the atom, with this session's id; a failed or unreadable read keeps the last one.
-// A fresh read forgets which cards the pane answered: a session that still asks shows again.
-export async function reloadFloor($: Dollar, bin: string): Promise<void> {
+// A fresh read forgets which cards the pane answered: a session that still asks shows again. `keepAnswered` (the 5 s
+// refresh): they stay hidden until the minute read, or an answered card would flash back while its session wakes.
+export async function reloadFloor($: Dollar, bin: string, keepAnswered = false): Promise<void> {
   const cards = await readCards($, bin)
   if (cards === null) return
   let self: string | null = null
   try { self = await $.session.id() } catch { /* unknown: no card is taken for this session's own */ }
-  await update($, floorAtom, (prev: FloorState | null) => ({ cards, self, answered: [], ...(prev?.held ? { held: prev.held } : {}) }))
+  await update($, floorAtom, (prev: FloorState | null) => ({ cards, self, answered: keepAnswered ? prev?.answered ?? [] : [], ...(prev?.held ? { held: prev.held } : {}) }))
 }
 
 // Is this session's own last question still open? Its relays wait then (hooks/cos.ts relayPass).

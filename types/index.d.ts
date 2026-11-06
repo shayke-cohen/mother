@@ -241,6 +241,7 @@ export type ChiefStatus = {
   // lines the quiet rule logged instead of showing (lib/habits.py): how many in 7 days, and the last 10, newest first
   quieted?: { count_7d: number; recent: { id: string; key: string; title: string; label: string; bucket: string; at: string; why: string }[] }
   floor?: { ignore_folders: string[] }   // config chief.ignore_folders, absolute: no `Waiting on:` instruction there
+  quiet?: boolean                    // inside manager.quiet_hours (manager.timezone): the pane notifies only urgent things
 }
 
 // The Ask box's answer card (hooks/ask_route.ts): the route taken, what it says, and a send waiting for a yes.
@@ -253,12 +254,21 @@ export type ChiefHealth = {
   guard?: 'on' | 'off' | 'paused'    // .mother/PAUSED (wins), .mother/GUARD_OFF, else on
   // .mother/hub/watcher.json; null = the watcher never ran. `stale`: in active hours and older than twice its interval
   watcher?: { at: string; every_seconds?: number; active?: boolean; stale?: boolean
-              sources?: Record<string, { status: string; reason?: string; since?: string | null; at?: string | null }> } | null
+              sources?: Record<string, { status: string; reason?: string; since?: string | null; at?: string | null
+                                         degraded?: string }> } | null   // degraded: reading less than usual (rate limited)
   watcher_errors?: ChiefInboxItem[]  // the hub's open updates keyed `watcher:<source>`, newest first, at most 20
   watcher_error_count?: number
   // .mother/<routine>-unsent-<YYYY-MM-DD>.md: reports that did not reach the manager's DM, newest first, at most 20
   undelivered?: { name: string; routine: string; date: string; bytes: number }[]
+  // sources only the manager can fix, matched against lib/chief.py ACCESS_PATTERNS: a sign-in or token (`signin`), or
+  // the VPN, network or a timeout (`network`); one row per source, gone once the watcher reads it again
+  access?: ChiefAccess[]
 }
+
+export type ChiefAccess = { source: string; kind: 'signin' | 'network'; reason: string; help: string; since?: string | null }
+
+// The pane's "what just changed" line (hooks/events.ts): the one current event, shown under the mood line.
+export type ChiefEvent = { kind: string; subject: string; text: string; color: string; at: number }
 
 // The Health tab's own state: report names the manager dismissed (also kept in the plugin store as `chiefDismissed`),
 // and each expanded report's text as `mother chief report <name>` printed it (null = it could not be read).
@@ -323,6 +333,7 @@ declare module 'claude-code' {
       chiefAnswer: ChiefAnswer | null               // the Ask box's answer card
       chiefHidden: Record<string, true> | null      // sessions hidden from the floor (`hide <session>`, Archive's last fallback), by CLI id
       chiefUndo: ChiefUndo | null                   // the last Archive, while its Undo pill shows
+      chiefEvent: ChiefEvent | null                 // what just changed, by priority (hooks/events.ts); null = nothing to say
     }
   }
 }

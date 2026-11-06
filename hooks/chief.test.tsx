@@ -337,7 +337,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | floor on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -3110,7 +3110,8 @@ test('test_dark_skin_tabs_are_pills_and_the_shown_one_is_primary', async ($, on)
   expect(await dot('health')).toEqual([[['●'], PALETTE.red, 'footnote']])
   await ui.press({ key: 'tab:all' })                                                     // leaving Inbox with its 3 unseen since boot: its dot, the same glyph and size in coral
   expect(await dot('inbox')).toEqual([])
-  expect(await dot('needs')).toEqual([[['●'], PALETTE.coral, 'footnote']])
+  // the question was read with the floor at session start, so `tab all` at boot already saw it: no dot on Needs you
+  expect(await dot('needs')).toEqual([])
   expect(trimmed((await ui.find({ key: 'tab:health' }))?.text)).toBe('Health')
   await ui.unmount()
 })
@@ -4082,4 +4083,52 @@ test('test_b2_the_new_cards_draw_on_the_dark_skin_with_one_coral_pill_each', asy
   expect(JSON.stringify(await ui.drawn()).includes('undo-press')).toBe(true)
   expect(await hasText(ui, /Send anyway\?/)).toBe(true)
   await ui.unmount()
+})
+
+test('test_b2_a_chase_card_notifies_once_per_wait_on_the_leader', async ($, on) => {
+  const notes: string[] = []
+  on('ui.notify', (_: any, e: any) => { notes.push(e.message ?? e.text); return { value: undefined } })
+  let who = 'Dana'
+  const led = (over: Record<string, unknown> = {}) => ({ exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2, PINNED], led_by: 'sess-1', ...over })) })
+  let st = led()
+  const { clock } = await bootFloor($, on, {
+    cards: () => [waitCard({ who, since: isoAt(NOW - 4 * 86_400_000) }), waitCard({ kind: 'nothing', who: 'nothing', what: 'done' }, { session_id: CLI_2 })],
+    cli: argv => (argv[0] === 'status' ? st : undefined) })
+  await clock.advance(MIN)
+  expect(notes).toEqual(['Chase Dana: the API key'])                                    // the Done card says nothing
+  await clock.advance(MIN)
+  expect(notes.length).toBe(1)                                                          // once
+  who = 'Sam'
+  await clock.advance(MIN)
+  expect(notes).toEqual(['Chase Dana: the API key', 'Chase Sam: the API key'])          // a new wait is a new notice
+  who = 'Lee'
+  st = led({ led_by: CLI_B })                                                           // another session leads: it raises, not this one
+  await clock.advance(MIN)
+  expect(notes.length).toBe(2)
+})
+
+test('test_b2_needs_you_order_counts_and_mood', async ($, on) => {
+  const access = [{ source: 'chat', kind: 'signin', reason: 'token expired', help: 'Sign in again' }]
+  const cards = [asking(), waitCard({ since: isoAt(NOW - 4 * 86_400_000) }, { session_id: CLI_2 })]
+  const third = '33333333-3333-4333-8333-333333333334'
+  const { clock } = await bootFloor($, on, { cards: () => [...cards, waitCard({ kind: 'nothing', who: 'nothing', what: 'done' }, { session_id: third })],
+    cli: argv => (argv[0] === 'status' ? { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED_2, PINNED, { ...PINNED, session_id: 'local_z', cli_session_id: third, title: 'Third' }],
+      health: { watcher: { at: '2026-11-02T10:00:00Z', sources: {} }, access } })) } : undefined) })
+  const ui = await shown($, clock)
+  const keys = JSON.stringify(await ui.drawn())
+  const at = (k: string) => { const i = keys.indexOf(k); expect([k, i >= 0]).toEqual([k, true]); return i }
+  expect(at('card:access:chat')).toBeLessThan(at('card:need:' + CLI_A))
+  expect(at('card:need:' + CLI_A)).toBeLessThan(at('card:chase:' + CLI_2))
+  expect(at('card:chase:' + CLI_2)).toBeLessThan(at('card:done:' + third))
+  expect(await hasText(ui, /^Needs you 2$/)).toBe(true)                                 // sign-in and the question; not the chase or the Done card
+  expect(await hasText(ui, /^1 sign-in or network problem and 1 question for you$/)).toBe(true)
+  await ui.unmount()
+})
+
+test('test_b2_mood_puts_chase_and_done_below_what_needs_the_manager', () => {
+  const base = { questions: 0, oldest: '', urgent: 0, health: 0, working: 0, inbox: 0 }
+  expect(moodLine({ ...base, chases: 1, dones: 1, urgent: 1 }).text).toBe('1 urgent inbox item to look at')
+  expect(moodLine({ ...base, chases: 2, dones: 1, working: 3 }).text).toBe('2 waits to chase')
+  expect(moodLine({ ...base, dones: 1, working: 3 }).text).toBe('1 session done, ready to archive')
+  expect(moodLine({ ...base, signin: 1 }).text).toBe('1 sign-in or network problem for you')
 })

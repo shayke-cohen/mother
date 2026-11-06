@@ -553,14 +553,23 @@ export type Strip = {
   surface: string       // `terminal` draws an Image; any other surface an Svg when it has one
   guard?: string | null // `off` and `paused` each draw a red pill; `on`, or absent, nothing
   mood?: Mood | null    // one sentence on how things stand, above the budget row
+  event?: { text: string; color: string } | null   // what just changed (hooks/events.ts), dim under the mood line
 }
 
 // ---- the mood line: how things stand, in one sentence, from the counts alone (no model call) ----
 export type Mood = { text: string; color?: Color }
-export type MoodCounts = { questions: number; oldest: string; urgent: number; health: number; working: number; inbox: number }
+export type MoodCounts = { questions: number; oldest: string; urgent: number; health: number; working: number; inbox: number
+                          signin?: number; chases?: number; dones?: number }
 const plural = (n: number, one: string, many = one + 's'): string => `${n} ${n === 1 ? one : many}`
-// The first of these that holds: questions, urgent inbox, Health problems, working sessions, inbox waiting, all clear.
+// The first of these that holds: sign-in cards and questions, urgent inbox, Health problems, a wait to chase, a
+// session done, working sessions, inbox waiting, all clear. Chase and Done come below what truly needs the manager, and
+// above "nothing for you", which they would make untrue.
 export function moodLine(c: MoodCounts): Mood {
+  const signin = c.signin ?? 0
+  if (signin > 0) {
+    const asks = c.questions > 0 ? ` and ${plural(c.questions, 'question')}` : ''
+    return { text: `${plural(signin, 'sign-in or network problem')}${asks} for you`, color: 'warning' }
+  }
   if (c.questions > 0) {
     const when = c.oldest === 'now' ? (c.questions === 1 ? 'just asked' : 'oldest just now')
       : c.oldest ? (c.questions === 1 ? `asked ${c.oldest} ago` : `oldest ${c.oldest}`) : ''
@@ -568,6 +577,8 @@ export function moodLine(c: MoodCounts): Mood {
   }
   if (c.urgent > 0) return { text: `${plural(c.urgent, 'urgent inbox item')} to look at`, color: 'error' }
   if (c.health > 0) return { text: `${plural(c.health, 'problem')} in Health`, color: 'warning' }
+  if ((c.chases ?? 0) > 0) return { text: `${plural(c.chases!, 'wait')} to chase` }
+  if ((c.dones ?? 0) > 0) return { text: `${plural(c.dones!, 'session')} done, ready to archive` }
   if (c.working > 0) return { text: `${plural(c.working, 'session')} working, nothing for you yet` }
   if (c.inbox > 0) return { text: `${plural(c.inbox, 'inbox item')} waiting, none urgent` }
   return { text: 'All clear: nothing waits for you', color: 'success' }
@@ -600,6 +611,10 @@ function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
       {titled ? null : <Text weight="bold" size="title" color={SELF_COLOR}>Mother</Text>}
       {titled ? null : <Text dimColor size="caption">Chief of Stuff</Text>}
       {s.mood ? <Text key="mood" color={s.mood.color} wrap="wrap">{s.mood.text}</Text> : null}
+      {s.event ? <Box key="event" gap={1} alignItems="center">
+          <Text key="event-dot" color={s.event.color as Color}>●</Text>
+          <Text key="event-text" dimColor wrap="truncate-end">{s.event.text}</Text>
+        </Box> : null}
       {dark
         ? <Box key="strip-line" flexWrap="wrap" gap={1} alignItems="center">
             <Text key="pill:budget" dimColor color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>

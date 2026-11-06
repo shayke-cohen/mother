@@ -491,6 +491,8 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
     }
     for (const [name, v] of polledSources) {
       if (v?.status !== 'ok' && v?.reason) out.push(<Text key={'health-watch-why:' + name} wrap="wrap">{`${oneLine(name, 40)}: ${oneLine(v.reason, 300)}`}</Text>)
+      // reading less than usual (the chat source while rate limited): said on its own line, in amber
+      if (v?.degraded) out.push(<Text key={'health-watch-degraded:' + name} color="warning" wrap="wrap">{`${oneLine(name, 40)} degraded: ${oneLine(v.degraded, 200)}`}</Text>)
     }
   }
 
