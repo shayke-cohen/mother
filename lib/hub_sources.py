@@ -404,34 +404,38 @@ class ChatSlack(Adapter):
 
         def known_pass():
             """One backed-off pass: the inbox, followed threads, mapped DMs, then threads with a recent inbox line;
-            one call each (history or replies), on the slow pace and the small call budget."""
-            if inbox and due_slow(inbox):
-                res = call("get_channel_history", {"channel_id": inbox, "oldest": "%.6f" % since,
+            one call each (history or replies), on the slow pace and the small call budget. A read that fails for any
+            reason but a 429 is `partial`: a deleted thread never takes the source down while it is limited."""
+            def history(ch, oldest, take):
+                res = call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % oldest,
                                                    "limit": MAX_HISTORY + 1})
                 for m in ((res or {}).get("messages") or [])[:MAX_HISTORY]:
-                    note(inbox, m)
-                convs.setdefault(inbox, {})["read"] = now
-            for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
-                if "/" not in key or not due_slow(key):
-                    continue
-                threads[key] = max(float(tseen), replies(key, float(tseen)))
-                convs.setdefault(key, {})["read"] = now
-            for ch in dms:
-                if not due_slow(ch):
-                    continue
-                mark = float((convs.get(ch) or {}).get("read") or since)
-                res = call("get_channel_history", {"channel_id": ch, "oldest": "%.6f" % mark,
-                                                   "limit": MAX_HISTORY + 1})
-                for m in ((res or {}).get("messages") or [])[:MAX_HISTORY]:
-                    add(ch, m, floor=mark, dm=True)
+                    take(m)
                 convs.setdefault(ch, {})["read"] = now
+
+            todo = []
+            if inbox:
+                todo.append((inbox, lambda ch=inbox: history(ch, since, lambda m: note(ch, m))))
+            for key, tseen in list(threads.items())[:MAX_THREADS * 2]:
+                if "/" in key:
+                    todo.append((key, lambda k=key, t=float(tseen): (threads.__setitem__(k, max(t, replies(k, t))),
+                                                                     convs.setdefault(k, {}).__setitem__("read", now))))
+            for ch in dms:
+                mark = float((convs.get(ch) or {}).get("read") or since)
+                todo.append((ch, lambda c=ch, m0=mark: history(c, m0, lambda m: add(c, m, floor=m0, dm=True))))
             for key in [k for k in cfg.get("_recent") or [] if isinstance(k, str)]:
                 ch, _, tts = key.partition("/")
-                if not tts or tts == "dm" or key in threads or ch == inbox or ch in dms or not due_slow(key):
+                if tts and tts != "dm" and key not in threads and ch != inbox and ch not in dms:
+                    floor = float((convs.get(key) or {}).get("read") or since)
+                    todo.append((key, lambda k=key, f=floor: (replies(k, f),
+                                                              convs.setdefault(k, {}).__setitem__("read", now))))
+            for conv, go in todo:
+                if not due_slow(conv):
                     continue
-                c = convs.setdefault(key, {})
-                replies(key, float(c.get("read") or since))
-                c["read"] = now
+                try:
+                    go()
+                except McpError as e:
+                    partial.append("%s: %s" % (conv, e.kind))
 
         search_ts = float(cursor.get("search_ts") or since)
         searched = False

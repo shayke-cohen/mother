@@ -553,6 +553,7 @@ export type Strip = {
   surface: string       // `terminal` draws an Image; any other surface an Svg when it has one
   guard?: string | null // `off` and `paused` each draw a red pill; `on`, or absent, nothing
   mood?: Mood | null    // one sentence on how things stand, above the budget row
+  event?: { text: string; color: string } | null   // what just changed (hooks/events.ts), dim under the mood line
 }
 
 // ---- the mood line: how things stand, in one sentence, from the counts alone (no model call) ----
@@ -600,6 +601,10 @@ function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
       {titled ? null : <Text weight="bold" size="title" color={SELF_COLOR}>Mother</Text>}
       {titled ? null : <Text dimColor size="caption">Chief of Stuff</Text>}
       {s.mood ? <Text key="mood" color={s.mood.color} wrap="wrap">{s.mood.text}</Text> : null}
+      {s.event ? <Box key="event" gap={1} alignItems="center">
+          <Text key="event-dot" color={s.event.color as Color}>●</Text>
+          <Text key="event-text" dimColor wrap="truncate-end">{s.event.text}</Text>
+        </Box> : null}
       {dark
         ? <Box key="strip-line" flexWrap="wrap" gap={1} alignItems="center">
             <Text key="pill:budget" dimColor color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>

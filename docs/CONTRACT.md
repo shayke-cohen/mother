@@ -1297,7 +1297,7 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   (`{"YYYY-MM-DD": usd}` in the configured timezone, the last 14 days). `desktop.json` (`{at, sessions: [{session_id,
   cli_session_id, title, cwd, link}]}`: the pinned desktop sessions, written only by `mother chief pinned --stdin`).
   `desktop-cache.json` (fields read from the app's session files, keyed by mtime and size), `tldr.json` (the pane's
-  TL;DRs) and `PAUSED` (the chief-only switch). Every write is a temp-file rename; spend, `desktop.json` and
+  TL;DRs), `status.json` (the last `status --json --save`, for the fast refresh) and `PAUSED` (the chief-only switch). Every write is a temp-file rename; spend, `desktop.json` and
   `tldr.json` take `hub.locked`. **What the removed layer left** (`chief.json`, `wake.json`, `queue.jsonl`,
   `decisions.json`, `run/`, `logs/`, `keeper.*`, and worker rows in `sessions.json`, the entries with `kind: "cli"`)
   is never read and never crashes anything. A worker row that still reads `live` is marked `dropped` on the next
@@ -1359,7 +1359,7 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   driven.
 - **`ChiefStatus`** (`status --json`, version 1, `types/index.d.ts`): `{version, at, paused, chief: {alive,
   heartbeat_at}, budget: {spent, limit, unreadable, over}, desktop: [{session_id, cli_session_id, title, cwd, repo,
-  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard, health}`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
+  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard, health, quiet}`. `quiet` is true inside `manager.quiet_hours`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
   `led_by` is that heartbeat's `session_id` while it is alive, else null. `desktop` is the snapshot rows still live in
   the app (`last_report` is the first 200 characters of the last turn report). `spent` reads 0 when `spend.json` is
   unreadable; `unreadable` is then true, and `over` (spent at the limit, or unreadable) says no model call is made.
@@ -1369,9 +1369,9 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   `watcher:<source>` (a source the watcher could not read) is not work: it is left out of both and listed in `health`.
   The text form (`status`) prints who leads, the budget, and the pinned and inbox counts.
 - **`health`** (in `status --json`; `health_doc`), so the pane reads no more files: `{guard, watcher, watcher_errors,
-  watcher_error_count, undelivered}`. `guard` is `paused` (`.mother/PAUSED`, which wins), `off` (`.mother/GUARD_OFF`)
+  watcher_error_count, undelivered, access}`. `guard` is `paused` (`.mother/PAUSED`, which wins), `off` (`.mother/GUARD_OFF`)
   or `on`. `watcher` is null when `.mother/hub/watcher.json` has no `at`, else `{at, every_seconds, active, stale,
-  sources: {<name>: {status, reason, since, at}}}`, `stale` as `mother hub status` judges it (in active hours and older
+  sources: {<name>: {status, reason, since, at, degraded?}}}`, `stale` as `mother hub status` judges it (in active hours and older
   than twice the interval). `watcher_errors` are the `watcher:` updates in the Inbox item shape, newest first, at most
   20. `undelivered` lists `<workspace>/.mother/<routine>-unsent-<YYYY-MM-DD>.md`, the routine reports that could not
   be delivered to the manager's DM: `[{name, routine, date, bytes}]`, newest first, at most 20, plain files only.
@@ -1405,7 +1405,30 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   `open_session_in` with the `local_…` id and `target: "focus"`, and counts it opened only when the answer says so:
   an error, a timeout, an empty answer or a refusal without an error ("only…", "cannot…", "changes nothing";
   "already" counts as shown) fills the prompt with a request to open it instead and says why.
-- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | expand | collapse | skin dark|dark-app|plain|status | tab <name>]`; the mod polls once a minute; drawn
+- **The fast refresh** (`hooks/fastloop.ts`). `status --json --save`, the pane's minute read, also writes the same JSON
+  to `.mother/chief/status.json` (temp-file rename). While the pane is shown, a 5 s loop stats that file,
+  `heartbeat.json` and `.mother/floor/*.json` with `$.fs`; only when a size or mtime moved does it re-read them and
+  redraw. `status.json` and `heartbeat.json` are read directly; a moved floor card re-reads through `mother floor list`,
+  the one place cards are validated. No model call, no tick; the loop stops itself when the pane is hidden, and the
+  minute pass or `/chief open` starts it again.
+- **What just changed** (`hooks/events.ts`). Each read is diffed in code against the one before: a new question > an
+  urgent Inbox item > a source down > a session finished or stuck > a new Inbox item > a source back. One event is
+  kept and drawn under the mood line, dim with a coloured dot, for 15 minutes or until one of equal or higher priority
+  replaces it. Warning-level events (a source down, a session stuck) cool down for 30 minutes per subject. The first
+  read after a start only seeds the snapshot, so nothing replays.
+- **Notifications** (`hooks/notify.ts`, `/chief notify on|off|status`, on by default; store `chiefNotifyOff`). The
+  leading session (`led_by`) raises `$.ui.notify`, title `Mother`, one line, once per new question (`ask:<ask_id>`),
+  urgent Inbox item (`urgent:<id>`), source down (`down:<source>:<since>`) and chase card (`notifyOnce`), at most 3 a
+  pass. What was raised is in the store (`chiefNotified`, 14 days, at most 400), so neither a reload nor a change of
+  leader repeats it; a store that never held the key is seeded silently. Inside `manager.quiet_hours` (`status.quiet`)
+  only urgent items are raised; the rest is remembered as seen and not raised later.
+- **Sign-in and network cards** (`hooks/access.tsx`). `health.access` is `[{source, kind: signin|network, reason, help,
+  since}]`: a source down (`couldnt_check`), or an open `watcher:<source>` line for one not read as ok or partial, whose
+  error matches the one list `lib/chief.py ACCESS_PATTERNS`. Each is a Needs you card at the top: `Sign-in needed:
+  <source>` or `Network: <source> unreachable`, the short reason, **Retry** (coral: `mother hub check <source>`, then
+  `mother hub refresh` when it answers, then the status again) and **How to fix** (folded). A card goes when the
+  watcher reads the source again.
+- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | notify on|off|status | expand | collapse | skin dark|dark-app|plain|status | tab <name>]`; the mod polls once a minute; drawn
   by `hooks/chief.tsx` with the frames, badges and strip of `hooks/pane_ui.tsx`, in the skin of `hooks/skin.tsx`).
   **The skin**: on the desktop app the pane is one dark panel (the banner its first row, cropped to its width) with
   dark cards (the border coloured by kind; the selected card's bold and coral), light text, rounded badges and filled

@@ -334,7 +334,7 @@ test('test_chief_command_open_status_pause', async ($, on) => {
   expect(opened.text).toMatch(/Chief pane opened/)
   const st: any = await $.command.run({ command: 'chief', args: 'status' } as any)
   expect(st.text).toBe('chief: led by a desktop session\nbudget: $0.00 of $20.00 today')
-  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
+  expect(((await $.command.run({ command: 'chief', args: 'decisions' } as any)) as any).text).toBe('Usage: /chief [open | status | pause | resume | relay on|off|status | habits on|off|status | notify on|off|status | refresh | expand | collapse | skin dark|dark-app|plain|status | tab needs|inbox|sessions|today|team|health|all]')
   await $.command.run({ command: 'chief', args: 'pause' } as any)
   await $.command.run({ command: 'chief', args: 'resume' } as any)
   expect(out.argv.filter(a => a[2] === 'chief' && ['pause', 'resume'].includes(a[3])).map(a => a.slice(3))).toEqual([['pause'], ['resume']])
@@ -3100,7 +3100,8 @@ test('test_dark_skin_tabs_are_pills_and_the_shown_one_is_primary', async ($, on)
   expect(await dot('health')).toEqual([[['●'], PALETTE.red, 'footnote']])
   await ui.press({ key: 'tab:all' })                                                     // leaving Inbox with its 3 unseen since boot: its dot, the same glyph and size in coral
   expect(await dot('inbox')).toEqual([])
-  expect(await dot('needs')).toEqual([[['●'], PALETTE.coral, 'footnote']])
+  // the question was read with the floor at session start, so `tab all` at boot already saw it: no dot on Needs you
+  expect(await dot('needs')).toEqual([])
   expect(trimmed((await ui.find({ key: 'tab:health' }))?.text)).toBe('Health')
   await ui.unmount()
 })

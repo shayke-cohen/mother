@@ -986,7 +986,9 @@ def recent_chat_keys(ws: Path, at: datetime) -> List[str]:
             l = json.loads(raw)
         except ValueError:
             continue
-        key = l.get("key") if isinstance(l, dict) else None
+        if not isinstance(l, dict):
+            continue
+        key = l.get("key")
         if l.get("source") != "chat" or not isinstance(key, str) or "/" not in key or key in out:
             continue
         t = _parse_at(l.get("at"))

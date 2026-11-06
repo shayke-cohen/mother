@@ -1832,15 +1832,79 @@ def watcher_health(ws: Path, at: datetime) -> Optional[dict]:
             "status": safe_line(ent.get("status"), 40) or "unknown", "reason": safe_line(ent.get("reason"), REASON_MAX),
             "since": ent.get("since") if isinstance(ent.get("since"), str) else None,
             "at": ent.get("at") if isinstance(ent.get("at"), str) else None}
+        if ent.get("degraded"):  # reading less than usual (the chat source, rate limited)
+            sources[safe_line(cap, 40)]["degraded"] = safe_line(ent.get("degraded"), REASON_MAX)
     return {"at": w["at"], "every_seconds": every, "active": active,
             "stale": active and (age is None or age > 2 * every), "sources": sources}
 
 
+# What a source's error says, when only the manager can fix it: a sign-in that expired or a refused token
+# (`signin`), or the network, the VPN or a timeout (`network`). The one list both the watcher's source status and its
+# `watcher:` error lines are matched against; the first pattern that matches names the kind. Rate limits are neither.
+ACCESS_PATTERNS = (
+    ("signin", r"\b40[13]\b|unauthori[sz]ed|forbidden|invalid[_ ]auth|needs?[_ ]auth|not authenticated|"
+               r"(?:token|sign[- ]?in|log[- ]?in|session|credentials?|auth\w*)\W+(?:\w+\W+){0,3}?"
+               r"(?:expired|invalid|revoked|refused|rejected|missing)|expired\W+(?:\w+\W+){0,2}?(?:token|session)|"
+               r"invalidated|re-?authenticate|reconnect it from connector settings|please sign ?in|sign ?in again"),
+    ("network", r"\bvpn\b|econnrefused|enotfound|econnreset|ehostunreach|enetunreach|getaddrinfo|"
+                r"connection (?:refused|reset)|timed? ?out|timeout|no reply to [\w/-]+ within|unreachable|"
+                r"fetch failed|network|\bdns\b|could not resolve"),
+)
+ACCESS_HELP = {
+    "signin": "Sign in to this connector again (its sign-in or token expired or was refused), then Retry.",
+    "network": "Reconnect the VPN or the network this connector needs (its server could not be reached), then Retry.",
+}
+
+
+def access_kind(text) -> Optional[str]:
+    """`signin`, `network` or None for one error text (ACCESS_PATTERNS)."""
+    low = str(text or "").lower()
+    if not low or _rate_limited(low):
+        return None
+    for kind, pat in ACCESS_PATTERNS:
+        if re.search(pat, low):
+            return kind
+    return None
+
+
+def _rate_limited(low: str) -> bool:
+    return bool(re.search(r"\b429\b|ratelimited|rate[ _-]?limit", low))
+
+
+def access_problems(watcher: Optional[dict], errors: List[dict]) -> List[dict]:
+    """ChiefStatus.health.access: one row per source whose failure only the manager can fix, `{source, kind,
+    reason, help, since}`. From the watcher's source status when the source is down (`couldnt_check`), else from an
+    open `watcher:<source>` error line; a source the watcher reads as ok or partial has none."""
+    out, seen = [], set()
+    sources = (watcher or {}).get("sources") if isinstance((watcher or {}).get("sources"), dict) else {}
+    for cap, ent in sorted(sources.items()):
+        if not isinstance(ent, dict) or ent.get("status") != "couldnt_check":
+            continue
+        kind = access_kind(ent.get("reason"))
+        if kind:
+            seen.add(cap)
+            out.append({"source": cap, "kind": kind, "reason": safe_line(ent.get("reason"), 120),
+                        "help": ACCESS_HELP[kind], "since": ent.get("since")})
+    for e in errors:
+        cap = str(e.get("key") or "")[len(WATCHER_KEY_PREFIX):]
+        if not cap or cap in seen or (isinstance(sources.get(cap), dict) and sources[cap].get("status") in ("ok", "partial")):
+            continue
+        reason = e.get("why") or e.get("title") or ""
+        kind = access_kind(reason)
+        if kind:
+            seen.add(cap)
+            out.append({"source": safe_line(cap, 40), "kind": kind, "reason": safe_line(reason, 120),
+                        "help": ACCESS_HELP[kind], "since": e.get("at")})
+    return out
+
+
 def health_doc(ws: Path, at: datetime, errors: List[dict]) -> dict:
-    """ChiefStatus.health: the watcher, its errors (Inbox items keyed `watcher:`), undelivered reports, the guard."""
-    return {"guard": guard_state(ws), "watcher": watcher_health(ws, at),
+    """ChiefStatus.health: the watcher, its errors (Inbox items keyed `watcher:`), undelivered reports, the guard,
+    and the sources only the manager can fix (`access`)."""
+    watcher = watcher_health(ws, at)
+    return {"guard": guard_state(ws), "watcher": watcher,
             "watcher_errors": errors[:WATCHER_ERRORS_MAX], "watcher_error_count": len(errors),
-            "undelivered": undelivered(ws)}
+            "undelivered": undelivered(ws), "access": access_problems(watcher, errors)}
 
 
 # ---- status and the `mother chief` CLI ----------------------------------------------------------------
@@ -1862,7 +1926,9 @@ USAGE = """usage: mother chief <verb> ...
   context --json        what the triage prompt says about the manager: their name, the teams with their people's
                         names, the followed tracker projects and repos, names only; plus `people`, the configured
                         chat ids to names, for the pane's `from` (never sent); at most 1500 characters
-  status [--json]       paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox
+  status [--json] [--save]
+                        paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox; --save also
+                        writes the JSON to .mother/chief/status.json (atomically) for the pane's fast refresh
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}
   tail --json           each pinned or case session's recent tail (at most 6000 characters) for its card, what
@@ -1914,7 +1980,7 @@ A valued option takes --opt=V or --opt V."""
 
 # verb: (boolean flags, valued options); only `report`, `relay`, `habits`, `watch-key`, `close-case`, `dots-detail` and `why` take a positional
 VERBS = {
-    "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
+    "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json", "--save"), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
@@ -2042,7 +2108,26 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "health": health_doc(ws, at, errors),
         "habits": {"on": habits.is_on(ws)},
         "quieted": habits.quieted_doc(ws, at),
+        "quiet": quiet_now(cfg, at),
     }
+
+
+def quiet_now(cfg: dict, at: datetime) -> bool:
+    """Inside manager.quiet_hours ("HH:MM-HH:MM" in manager.timezone): the pane notifies only urgent things."""
+    import channels
+    try:
+        return bool(channels.quiet_now(cfg or {}, now=at.timestamp()))
+    except Exception:
+        return False
+
+
+STATUS_SNAPSHOT = "status.json"
+
+
+def save_status(ws: Path, doc: dict) -> None:
+    """`status --json --save`: the same JSON also at .mother/chief/status.json, written atomically, for the pane's
+    fast refresh (it re-reads the file every few seconds, the CLI only every minute)."""
+    _write_atomic(chief_dir(ws) / STATUS_SNAPSHOT, json.dumps(doc, indent=2, ensure_ascii=False))
 
 
 def _usage(msg: str) -> int:
@@ -2331,6 +2416,11 @@ def main(args, ws, cfg, at) -> int:
         return EXIT_OK
     if verb == "status":
         doc = status_doc(ws, cfg, at)
+        if opts.get("save"):
+            try:
+                save_status(ws, doc)
+            except OSError as e:
+                print("status snapshot not written: %s" % e, file=sys.stderr)
         if as_json:
             print(json.dumps(doc, indent=2, ensure_ascii=False))
         else:

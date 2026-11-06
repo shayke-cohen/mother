@@ -341,6 +341,26 @@ class TestPacing(unittest.TestCase):
         self.assertNotIn("limited", out["cursor"])
         self.assertIn("channel news", [l["title"] for l in out["lines"]])  # what the known pass skipped is not lost
 
+    def test_backing_off_a_read_that_fails_is_partial_and_the_rest_is_read(self):
+        gone = "%s/1788000000.000300" % self.CH
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        self.error = McpErrorAlias("other", "status code 429", retry_after=900)
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=2))
+        self.error = None
+        client, f = self.client()
+        real = client.call
+
+        def call(name, args):
+            if name.endswith("get_thread_replies"):
+                raise McpErrorAlias("other", "thread_not_found")
+            return real(name, args)
+        client.call = call
+        got = hs.ChatSlack.poll(client, out["cursor"], {"channels": [self.CH], "dms": {"U00000002": self.DM}, "inbox": self.INBOX,
+                                                        "discovery": "poll", "_recent": [gone]}, ME, AT + timedelta(minutes=8))
+        self.assertTrue(any(x.startswith(gone) for x in got["partial"]))
+        self.assertEqual(sorted(self.read(f)), sorted([self.DM, self.INBOX]))
+        self.assertIn("degraded", got)
+
     def test_backing_off_keeps_to_the_small_call_budget(self):
         out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
         self.error = McpErrorAlias("other", "status code 429", retry_after=900)
