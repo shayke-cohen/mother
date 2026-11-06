@@ -36,23 +36,24 @@ answer session (`lib/channels.py`) and the A/B harness (`lib/evals.py`).
 ```mermaid
 flowchart TD
   subgraph BG["Background, no model"]
-    W["launchd: mother hub watch"]
+    W["launchd, mother hub watch"]
   end
   subgraph FILES["Workspace .mother, machine-local"]
-    IN[("hub/inbox.jsonl")]
-    HUB[("hub/hub.json and sessions.json")]
-    CH[("chief/: heartbeat, spend, triage, relays, desktop, tldr")]
-    FL[("floor/ one card per session")]
+    IN[("hub inbox.jsonl")]
+    HUB[("hub.json and sessions.json")]
+    CH[("chief files, heartbeat, status, spend, triage, relays, tldr, actions")]
+    FL[("floor, one card per session")]
     NOW[("now.json")]
   end
   subgraph DESK["Claude Code desktop sessions, each runs the hooks module"]
-    LEAD["Leading session: chief tick, triage, decide"]
-    PANE["Chief pane: hooks/chief.tsx"]
-    CASE["Case session: skills/cos"]
-    ROUT["Scheduled routine sessions: skills/routine"]
+    LEAD["Leading session, tick, triage, decide, notify"]
+    PANE["Chief pane, minute pass and 5 second file read"]
+    PIN["Pinned session, writes its own card"]
+    CASE["Case session, skills cos"]
+    ROUT["Scheduled routine sessions"]
   end
-  SRC["Sources: chat, tracker, code, mail, calendar, WhatsApp"]
-  G{"hooks/guard.py"}
+  SRC["Sources, chat, tracker, code, mail, calendar, WhatsApp"]
+  G{"hooks guard.py"}
   OUT["Other people"]
 
   SRC -->|"read-only"| W --> IN
@@ -63,10 +64,12 @@ flowchart TD
   CH --> PANE
   FL --> PANE
   NOW --> PANE
-  PANE -->|"Mother case: brief"| CASE
+  PANE -->|"case brief, or Ask box"| CASE
+  PANE -->|"a message the guard asks about"| PIN
   CASE -->|"chief claim"| HUB
   HUB -->|"relays for a claimed key"| CASE
   CASE -->|"floor card"| FL
+  PIN -->|"floor card"| FL
   ROUT --> NOW
   CASE --> G
   ROUT --> G
@@ -80,13 +83,21 @@ flowchart TD
 | `.claude-plugin/` | Plugin manifest and marketplace entry | Version lives here and in `bin/mother` |
 | `hooks/hooks.json` | Wires the hooks | `modules` → `hooks/register.tsx` (the one hooks module); PreToolUse → `hooks/guard.py` for the tools it has rules for and `hooks/guard_fast.py` for every other tool (`tests/test_packaging.py` checks each tool reaches exactly one); Stop and SessionEnd → `mother sync --quiet`. The command hooks run even if the module fails to load |
 | `hooks/register.tsx`, `types/index.d.ts` | The hooks module's entry (mod API, early access) and the Now panel: `/now-panel` opens Home, a row opens the Inspector pane, status line, toasts. Owns the module's one `session.start` hook and the one-minute timer, and calls `registerChief` | Reads `.mother/now.json` and the hub's files; writes only through `mother now …` / `mother hub …`. `mother_bin` userConfig, empty = `${plugin root}/bin/mother`. Tests: `claude plugin test .` (`hooks/register.test.tsx`) |
-| `hooks/chief.tsx` | The Chief pane (`/chief`) and the leading session's pass: `chiefPass` (snapshot pinned sessions, `tick --as`, triage, relay, floor reload, TL;DRs), the Inbox, Sessions, Needs you and Today sections, the `/chief` verbs | Every write is a `mother chief …` or `mother hub …` verb. Model calls: triage (`TRIAGE_SYSTEM`) and TL;DRs (`TLDR_SYSTEM`), both counted in the daily budget. Tests: `hooks/chief.test.tsx` |
-| `hooks/pane_ui.tsx` | The pane's drawing kit: header strip and banner, tab row, card frame, badges, action buttons, the source colour map, the verdict's shape (`kind`, `on`, `urgency`, `actions`) | Pure: reads no state, runs no action |
-| `hooks/skin.tsx` | The pane's skin: the palette and the primitives every section draws through (panel, card, pill, badge, ink and dim text, headings); dark on the desktop app, the app's own look in a terminal and after `/chief skin plain` | Pure. A Button's label takes no colour on the desktop, so a pill is a filled Box around a `plain` Button; every hover Box is keyed |
+| `hooks/chief.tsx` | The Chief pane (`/chief`) and the leading session's pass: `chiefPass` (snapshot pinned sessions, `tick --as`, triage, relay, floor reload, session cards), the Ask box, the Inbox, Sessions, Needs you and Today sections, the `/chief` verbs, the `prompt.compose` section | Every write is a `mother chief …` or `mother hub …` verb. Model calls: triage (`TRIAGE_SYSTEM`), session cards (`TLDR_SYSTEM`) and Ask routing, all counted in the daily budget. Tests: `hooks/chief.test.tsx`, `hooks/chief_core.test.tsx` |
+| `hooks/pane_ui.tsx` | The pane's drawing kit: header strip and banner, the mood line, tab row, card frame, badges, action buttons, the source colour map, session states, the verdict's shape (`kind`, `on`, `urgency`, `actions`) | Pure: reads no state, runs no action |
+| `hooks/skin.tsx` | The pane's skin: the palette and the primitives every section draws through (panel, card, pill, badge, ink and dim text, headings); `/chief skin dark` and `dark-app` on the desktop app, the app's own look in a terminal and after `plain`. Kept in the plugin's store | Pure. A Button's label takes no colour on the desktop, so a pill is a filled Box around a `plain` Button; every hover Box is keyed |
 | `hooks/pane_tabs.tsx` | The Team and Health tabs, the Suggested cards on Today, Follow / Ignore on an Inbox card | Handed what `hooks/chief.tsx` read; never reads a file itself |
 | `hooks/cos.ts` | Cases: the `Mother case:` brief, the claim on a session's first prompt, the relay (`Mother relay:`) with its bounds | Contract for the session itself: `skills/cos/SKILL.md`. CONTRACT §5g "Cases" |
-| `hooks/floor.ts` | The floor: when a pinned or case session's turn ends, one model call says whether it stopped on a question; the card feeds Needs you | Writes through `mother floor card`. CONTRACT §5g "The floor" |
-| `hooks/shared.ts` | Helpers both panes use: the `mother` binary path, text cleaning (`safe`, `oneLine`), ages, the prompt-fill helpers | |
+| `hooks/floor.ts` | The floor: when a pinned or case session's turn ends its card says whether it stopped on a question, from its `wrap_up` call (no model call), else one model call; the card feeds Needs you. `ask_id` stale-press drop, Hold | Writes through `mother floor card`. CONTRACT §5g "The floor" |
+| `hooks/waiting.ts` | The `Waiting on:` system-prompt section and what it feeds: `check due`, chase cards, Done cards | Pure; no model call. CONTRACT §5g "Waiting on" |
+| `hooks/archive.ts` | Archive on a Done card (unpin, archive, else hide) and its 10-second Undo; the hidden list | Through the desktop app's session tools and the plugin's store. Deletes nothing |
+| `hooks/ask_route.ts` | The Ask box's routing: commands read in code, the one model call's prompt and strict parse, the risky-word check, finding a session by name, Send to X | Pure; `hooks/chief.tsx` runs the routes. CONTRACT §5g "Ask box routing" |
+| `hooks/habits.ts` | Logs each manager action (`logAct`), the `habits` block of a triage prompt, the Health tab's quieted list | Fire and forget; labels only. Engine: `lib/habits.py` |
+| `hooks/notify.ts` | Desktop notifications, once per thing, leader only, quiet hours; `/chief notify` | Remembered in the plugin's store. No model call |
+| `hooks/events.ts` | "What just changed": each status read diffed against the last, one event under the mood line | No model call, no process |
+| `hooks/fastloop.ts` | The 5-second refresh while the pane is shown: stats `.mother/chief/status.json`, `heartbeat.json` and `.mother/floor/` | Redraws only when a file moved; stops when the pane is hidden |
+| `hooks/access.tsx` | Sign-in and network cards at the top of Needs you, Retry, How to fix | Rows come from `health.access` (`ACCESS_PATTERNS` in `lib/chief.py`) |
+| `hooks/shared.ts` | Helpers both panes use: the `mother` binary path, text cleaning (`safe`, `oneLine`), ages, the prompt-fill helpers, `SNOOZES` | |
 | `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call; `.mother/GUARD_OFF` (`mother guard off`) turns every rule off, `.mother/PAUSED` denies everything outbound and wins | Recognises tools by capability, not server name. Fails closed. |
 | `hooks/guard_fast.py` | The fast path for tools the guard has no every-session rule for (Read, Grep, Glob, …): hands the call to `hooks/guard.py` only for sub-agents, channel sessions, hub and hub-fed sessions | Never decides by itself. CONTRACT §5 |
 | `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, `guard off\|on\|status`, register, runs watchdog, speak/tts | Dispatches `channels`, `whatsapp`, `hub`, `chief`, `floor`, `inbox`, `grant`, `items`, `now`, `eval`, `health` to `lib/`. `VERSION` lives here and in `.claude-plugin/plugin.json` |
@@ -95,14 +106,14 @@ flowchart TD
 | `lib/whatsapp.py` | `mother whatsapp`: chats and read from the local WhatsApp database, send through the bridge, setup and link | Home machine only; the guard asks before each send to someone else. CONTRACT §5d |
 | `bridge/whatsapp/` | Send-only WhatsApp bridge (Node, Baileys linked device) on a 0600 Unix socket | Optional; `checks.mjs` = pure send rules (cap, gap), `bridge.mjs` = socket + WhatsApp. CONTRACT §5d |
 | `lib/grants.py` | `mother grant add\|remove\|list`: the one writer of `.mother/grants.json` for unattended runs | Checks each grant with the guard's own `valid_grant` before writing; the guard asks for any other write. CONTRACT §5 |
-| `lib/floor.py` | `mother floor card\|list`: one card per session in `.mother/floor/` | Each pinned or case session's own copy of the module (`hooks/floor.ts`) writes whether its last turn stopped on a question for the manager; the Chief pane draws them as Needs you (CONTRACT §5g). |
+| `lib/floor.py` | `mother floor card\|list\|mark`: one card per session in `.mother/floor/`; reads the `Waiting on:` line in code, computes `ask_id` and `check_due` | Each pinned or case session's own copy of the module (`hooks/floor.ts`) writes whether its last turn stopped on a question for the manager; the Chief pane draws them as Needs you (CONTRACT §5g). |
 | `lib/items.py` | Evidence check on a reader sub-agent's reply | Drops uncited items; bad output = `couldnt_check`. CONTRACT §5c |
 | `lib/now.py` | Deterministic core of the hourly tick and Now panel (working hours, signal thresholds, merge into `now.json`, the `mother now` verbs) | Python 3.9 stdlib only |
-| `lib/hub.py` | State core of the watcher and hub: thing keys, inbox lines, `.mother/hub/` files (atomic, locked) | Python 3.9 stdlib only |
+| `lib/hub.py` | State core of the watcher and hub: thing keys, inbox lines, `.mother/hub/` files (atomic, locked), `mother hub` verbs | Python 3.9 stdlib only |
 | `lib/hub_mcp.py` | Minimal MCP stdio client plus the read-only wrapper the watcher uses | Allow-list enforced before send. CONTRACT §5e |
 | `lib/inbox.py` | `mother inbox archive\|read`: the Now panel's mail triage over the hub's mail connection, no model | Asks `guard.classify_mcp` before each write, stops while PAUSED, logs to guard.log; the triage tools live in `hub_sources.MailGmail.TRIAGE`. CONTRACT §5f |
-| `lib/hub_sources.py` | Per-capability poll adapters and the deterministic prefilter | Product-specific tool names live only here. The `whatsapp` adapter reads through `LocalWhatsApp` (the reader functions of `lib/whatsapp.py` only: no bridge, no send). CONTRACT §5e |
-| `lib/chief.py` | `mother chief tick\|triage\|lines\|context\|status\|pinned\|tail\|tldr\|spend\|portrait\|report\|claim\|relays\|relay\|pause\|resume`: the leading desktop session's pass (heartbeat and leader rule, muted lines logged, judge lines decided in code from a triage model's verdicts), the names-only triage context, the pane's status, pinned sessions, TL;DRs, the daily model spend, case claims and the relay queue, all under `.mother/chief/` | The model never writes a decision: `triage --stdin --decide` does. What the layer removed in 0.18.0 left on disk is ignored. CONTRACT §5g |
+| `lib/hub_sources.py` | Per-capability poll adapters, the deterministic prefilter and the chat rate-limit fallback (back off, read only known conversations, `degraded`) | Product-specific tool names live only here. The `whatsapp` adapter reads through `LocalWhatsApp` (the reader functions of `lib/whatsapp.py` only: no bridge, no send). CONTRACT §5e |
+| `lib/chief.py` | `mother chief tick\|triage\|why\|lines\|context\|status\|pinned\|tail\|tldr\|spend\|portrait\|report\|claim\|watch-key\|close-case\|mention\|ask\|dots-detail\|relays\|relay\|act-log\|habits\|pause\|resume`: the leading desktop session's pass (heartbeat and leader rule, muted lines logged, judge lines decided in code from a triage model's verdicts), the names-only triage context, the pane's status, pinned sessions, session cards, the daily model spend, sign-in detection, case claims and the relay queue, all under `.mother/chief/` | The model never writes a decision: `triage --stdin --decide` does. What the layer removed in 0.18.0 left on disk is ignored. CONTRACT §5g |
 | `lib/habits.py` | `mother chief act-log\|habits`: the log of what the manager did with each card (`.mother/chief/actions.jsonl`, labels and titles only), the per-bucket counts made from it, the quiet rule triage applies, and the quieted list | Machine-local. Only per-bucket counts reach a triage prompt (CONTRACT §5g "Habits"). |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
@@ -181,7 +192,11 @@ every desktop session: hooks/register.tsx timer → chiefPass (hooks/chief.tsx),
   │     a `now` whose key has a live session is stored as a route to it
   ├─ relay: a session holding a live case with waiting lines submits ONE `Mother relay:` prompt into itself
   ├─ mother floor list --json          every session's card, for Needs you
-  └─ TL;DRs for pinned sessions, only while the pane is shown (mother chief tail → model → mother chief tldr)
+  ├─ events and notifications, in code: what just changed; the leader raises new questions, urgent items, sources down, chases
+  └─ session cards, when a session moved: any session with its pane shown, the leader with none (tail → model → tldr)
+
+while the pane is shown: hooks/fastloop.ts, every 5 s
+  └─ stat chief/status.json, chief/heartbeat.json, floor/*.json → redraw only when one moved; no model, no tick
 ```
 
 A terminal session runs the same module but never ticks: it only reads. `/mother:hub` (`skills/hub/SKILL.md`)
@@ -200,17 +215,21 @@ happen on the timer pass, a button press or a command, never in a draw.
 
 | Tab | Holds | Drawn by |
 |---|---|---|
-| Needs you | Sessions on the floor whose card asks: the question, one button per option, Open | `hooks/chief.tsx` (cards from `hooks/floor.ts`) |
+| Needs you | Sign-in cards, then sessions on the floor whose card asks, then chase cards, then Done cards | `hooks/access.tsx`, `hooks/chief.tsx` (cards from `hooks/floor.ts`, `hooks/waiting.ts`) |
 | Inbox | The hub's open `now` items by urgency then age, at most 10; watcher errors are Health's | `hooks/chief.tsx` `inboxSection` |
-| Sessions | Pinned desktop sessions (asking, active, idle), then case sessions that are not pinned | `hooks/chief.tsx` |
+| Sessions | Pinned desktop sessions, then case sessions that are not pinned, with a state badge | `hooks/chief.tsx` |
 | Today | Suggested, the tick's Top 3, the on-you items of `now.json` | `hooks/chief.tsx`, `hooks/pane_tabs.tsx` |
 | Team | The tick's neglected items, a group per team | `hooks/pane_tabs.tsx` |
-| Health | Sources, the watcher's last poll, watcher errors, undelivered routine reports, budget and lead, guard | `hooks/pane_tabs.tsx` |
+| Health | Sources, the watcher's last poll, watcher errors, undelivered routine reports, budget and lead, guard, quieted by habit | `hooks/pane_tabs.tsx` |
 | All | Every section stacked | |
 
-A card is two rows closed (title with up to three action buttons, the first primary; then badges, a human
-label, age, source link) and everything when open. An Inbox card's actions are the verdict's, else two fixed
-suggestions per source. All model- or line-written text is cleaned (`safe`, `oneLine`) and drawn as plain text.
+Above the tabs: the banner, the mood line (`moodLine`), what just changed (`hooks/events.ts`), budget and lead, the Ask
+box. On the dark skin a card is three rows: caret and title; badges, a human label, age, source link; then the pills,
+exactly one coral. Open, it shows everything. An Inbox card's actions are the verdict's, else two fixed suggestions per
+source. All model- or line-written text is cleaned (`safe`, `oneLine`) and drawn as plain text.
+
+An Ask goes through `parseAskCommand` first; only what no command matches costs a model call, and only a case takes the
+`mother chief ask` path. The answer card names the route.
 
 ## Cases, relay and the floor
 
@@ -234,12 +253,12 @@ sequenceDiagram
   M->>C: presses Enter
   C->>L: chief claim: the key is a live case of this session
   C->>C: works under skills/cos
-  C->>P: turn ends, floor card says it asks
-  M->>C: an option button sends its message, the guard asks first
+  C->>P: turn ends, the floor card says it asks, from wrap_up or one model call
+  M->>C: a pill or the reply field sends its message, the guard asks first
   C->>S: outbound action, through the guard
   S->>W: a reply on the thread
-  W->>C: routed to the case, delivered as a Mother relay prompt
-  C->>P: mother hub done closes the item and the case
+  W->>C: routed to the case, delivered as a Mother relay prompt once it no longer waits on the manager
+  C->>P: ends on Waiting on nothing, mother hub done closes the item and the case
 ```
 
 - **Brief and claim** (`hooks/cos.ts`). `caseBrief` writes `Mother case: <title>`, `Key:`, `Source:`, why, the
@@ -247,19 +266,76 @@ sequenceDiagram
   runs `mother chief claim --stdin`; the key's row in `.mother/hub/sessions.json` becomes a live case.
 - **Relay.** `hub.decide` stores a `now` for a claimed key as a route. `mother chief relays --for <id>` lists
   what waits; the session submits it as one prompt and only then acknowledges (`--ack`), so a failed submit
-  loses nothing. At most one attempt per 5 minutes and 6 an hour; `.mother/chief/RELAY_OFF` holds it back.
+  loses nothing. At most one attempt per 5 minutes and 6 an hour; held while the session's own question waits on the
+  manager; a relayed line that starts like one of our frames is dropped; `.mother/chief/RELAY_OFF` holds it back.
+- **Claims from what the manager names** (`typedByManager`, `mother chief mention`). A key the manager types in a
+  pinned or case session's prompt joins its case; only composer and bridge prompts count.
 - **Floor** (`hooks/floor.ts`, `lib/floor.py`). When a main-loop turn of a pinned or case session ends on an
-  answer, one model call over the last 3000 characters of its final message decides `asks`, the question and up
-  to four options. A prompt submitted in that session clears its card with no model call.
+  answer, its `wrap_up` call gives the question, options and recommendation with no model call; a turn with none
+  falls back to one model call over the last 3000 characters of its final message. `lib/floor.py` reads the last
+  `Waiting on:` line in code. A prompt submitted in that session clears its card with no model call.
+- **Waiting on** (`hooks/waiting.ts`). A pinned session's own module adds one section through `prompt.compose`. It
+  depends on no earlier plugin consuming that event; if one does, the session gets no instruction and its state comes
+  only from the session-card refresh.
+- **Habits** (`hooks/habits.ts`, `lib/habits.py`). Every press is logged; per-bucket counts go into triage as a hint,
+  and `habits.quiet` in `triage_decide` logs what the manager never engages with. CONTRACT §5g "Habits".
 - **A case session is hub-fed** for the guard: its id is in `sessions.json`, so functional autonomy is off there
   and outbound actions ask.
+
+## The guard's decision, simplified
+
+```mermaid
+flowchart LR
+  A["A tool call"] --> Q{"Does it reach another person, or change the guard?"}
+  Q -->|"no"| R["Not the guard's business, your normal permission rules apply"]
+  Q -->|"yes"| N{"On the never list?"}
+  N -->|"yes"| D["Denied, credentials, payments, deletions"]
+  N -->|"no"| S{"Only you see it?"}
+  S -->|"yes"| OK["Allowed, your own DM, a mail draft, a calendar event without guests"]
+  S -->|"no"| F{"Routine work on something that exists?"}
+  F -->|"yes"| P["Runs unasked by default, except in a case session"]
+  F -->|"no"| ASK["Asks you, a message, a mail, an invite, a new ticket, a merge, an approval"]
+```
+
+## What lives under `.mother/`
+
+Machine-local, gitignored, in the workspace. Everything is written atomically through the CLI; the module draws only
+what the CLI and these files say.
+
+| File | Written by | Read by |
+|---|---|---|
+| `hub/inbox.jsonl` | The watcher, `mother hub add`, `mother chief ask` | `mother chief tick` and `lines`, `mother hub tail` |
+| `hub/hub.json` | `mother hub decide` (from `mother chief triage`), `done`, `snooze` | `mother chief status`, the Now panel |
+| `hub/sessions.json` | `mother chief claim`, `watch-key`, `close-case`, `mention`, `mother hub session` | `mother chief status`, the guard (a hub-fed session), the Now panel |
+| `hub/watch.json` | `mother hub follow`, `mute`, `dms` | The watcher, `tick`, the Now panel |
+| `hub/watcher.json`, `hub/cursors.json` | The watcher | `mother hub status`, `health_doc` in `lib/chief.py`, the Now panel |
+| `chief/heartbeat.json` | `mother chief tick` | `status`, `hooks/fastloop.ts` |
+| `chief/status.json` | `mother chief status --json --save`, each session's minute pass | `hooks/fastloop.ts` |
+| `chief/spend.json` | `mother chief spend` | `status`, the budget check |
+| `chief/desktop.json`, `chief/desktop-cache.json` | `mother chief pinned` | `status`, `tail` |
+| `chief/triage.json` | `mother chief triage` | `status` (a card's kind, urgency, actions, reason) |
+| `chief/verdicts.jsonl` | `mother chief triage`, no bodies, 30 days | `mother chief why` |
+| `chief/tldr.json` | `mother chief tldr` | `tail`, the pane's session cards |
+| `chief/relays.json`, `chief/relay-now/` | `triage`, `relays`, `relay deliver` | `mother chief relays`, `status` |
+| `chief/asks.json` | `mother chief ask`, `claim`, 7 days | `status` (a held key is not an Inbox card), `claim` |
+| `chief/actions.jsonl` | `mother chief act-log` (`logAct`), triage's `shown`; labels and titles, 90 days | `lib/habits.py` |
+| `chief/habits.json`, `chief/quieted.json` | `habits except`; the quiet rule in `triage_decide` | `lib/habits.py`, `status` |
+| `chief/PAUSED`, `chief/RELAY_OFF`, `chief/HABITS_OFF` | `mother chief pause`, `relay off`, `habits off` | `lib/chief.py` |
+| `floor/<session id>.json` | `mother floor card` and `mark`, `mother chief tldr` (`note_waiting`, a stored ask) | `mother floor list`, `hooks/fastloop.ts` (stat only) |
+| `now.json`, `now-state.json` | `mother now merge` from the tick; `mother now done\|snooze\|top` | `hooks/register.tsx`, the Today and Team tabs, `mother now show` |
+| `portrait.png`, `portrait.jpg` | The manager | `mother chief portrait` |
+| `<routine>-unsent-<date>.md` | A routine that could not reach the DM | `health_doc`, `mother chief report` |
+| `guard.log`, `grants.json`, `ledger.json`, `PAUSED`, `GUARD_OFF` | The guard, `mother grant`, `mother guard`, the manager | `hooks/guard.py`, the Health tab |
+
+The plugin's own store (per machine, outlasts a session, not a file you edit) keeps the choices a command or press makes:
+`chiefSkin`, `chiefNotifyOff`, `chiefNotified`, `chiefHidden`, `chiefFloorOff`, `chiefHeld`, `chiefDismissed`.
 
 ## Invariants the code relies on
 
 - **Visible work only.** Model work happens in sessions the manager can open. The one background process
   (the watcher) has no model.
 - **Code records decisions.** A triage model's verdict is data; `mother chief triage --decide` decides, and a
-  missing or off-shape verdict keeps the line in front of the manager.
+  missing or off-shape verdict keeps the line in front of the manager. A failed Ask route is a case.
 - **One writer.** Only MOTHER (the routine or interactive session) judges, writes and posts. Sub-agents and
   channel sessions read and hand back data; their output approves nothing.
 - **Capabilities before claims.** A routine checks each capability it needs before using it. A source it

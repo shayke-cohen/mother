@@ -32,9 +32,9 @@ Read next, as the task needs:
 |---|---|
 | `.claude-plugin/` | The plugin manifest and the marketplace entry. The version lives here and in `bin/mother` |
 | `bin/mother` | The CLI: owns workspace state, sync and git; dispatches verbs to `lib/` |
-| `lib/` | Deterministic engines behind the CLI (hub, chief, floor, now, health, channels, WhatsApp). Python 3.9 stdlib |
+| `lib/` | Deterministic engines behind the CLI (hub, chief, floor, habits, now, health, channels, WhatsApp). Python 3.9 stdlib |
 | `hooks/guard.py`, `hooks/guard_fast.py` | The approval guard: allow, ask or deny for every tool call that reaches someone |
-| `hooks/register.tsx` and the other `.ts` / `.tsx` files in `hooks/` | The hooks module (mod API): the Chief pane, the Now panel, cases, relay, the floor |
+| `hooks/register.tsx` and the other `.ts` / `.tsx` files in `hooks/` | The hooks module (mod API). `hooks/chief.tsx` the pane and the pass; `hooks/pane_ui.tsx`, `hooks/pane_tabs.tsx` and `hooks/skin.tsx` what it draws; `hooks/cos.ts` cases and relay; `hooks/floor.ts` and `hooks/waiting.ts` questions and waits; `hooks/ask_route.ts` the Ask box; `hooks/archive.ts`, `hooks/access.tsx`, `hooks/habits.ts`, `hooks/notify.ts`, `hooks/events.ts`, `hooks/fastloop.ts` one job each; `hooks/shared.ts` helpers |
 | `hooks/hooks.json` | Wires the module, the guard (PreToolUse) and `mother sync` (Stop, SessionEnd) |
 | `types/` | Types for the module's state and the JSON the CLI prints to it |
 | `skills/` | What the model does for a request (`mother:<name>`); Markdown |
@@ -51,11 +51,11 @@ Read next, as the task needs:
 
 ```bash
 claude plugin validate .                    # manifests, hooks.json, the module's static scan (seconds)
-claude plugin test .                        # the module's tests: hooks/chief.test.tsx, hooks/register.test.tsx
+claude plugin test .                        # the module's 453 tests: hooks/chief.test.tsx, hooks/chief_core.test.tsx, hooks/register.test.tsx (~20 s)
 python3 -m unittest tests.test_docs tests.test_packaging   # under 2 s; run after any doc or new-file change
 python3 -m unittest tests.test_guard        # one module, while iterating
 python3 -m unittest tests.test_guard.TestGrants            # one class (or .TestGrants.test_name)
-python3 -m unittest discover tests          # everything: over 1,000 tests, many minutes. Run it last, once
+python3 -m unittest discover tests          # everything: over 1,100 tests, many minutes. Run it last, once
 ```
 
 Pick the module that covers what you touched:
@@ -63,8 +63,9 @@ Pick the module that covers what you touched:
 | You changed | Run | Speed |
 |---|---|---|
 | A doc, or added or moved a file | `tests.test_docs`, `tests.test_packaging` | seconds |
-| `lib/chief.py`, `lib/floor.py` | `tests.test_chief`, `tests.test_floor` | seconds |
-| `hooks/chief.tsx`, `hooks/pane_ui.tsx`, `hooks/pane_tabs.tsx`, `hooks/skin.tsx`, `hooks/cos.ts`, `hooks/floor.ts`, `hooks/register.tsx` | `claude plugin test .` | under a minute |
+| `lib/chief.py`, `lib/floor.py`, `lib/habits.py` | `tests.test_chief`, `tests.test_floor` | seconds |
+| Any `.ts` or `.tsx` file in `hooks/` | `claude plugin test .` | under a minute |
+| The JSON a `mother` verb prints to the pane | `tests.test_cli_contract` (refresh `tests/fixtures/chief_cli.ts` with `--write`), then `claude plugin test .` | seconds |
 | `lib/hub_sources.py`, `lib/hub_mcp.py` | `tests.test_hub_sources` | ~10 s |
 | `lib/hub.py` | `tests.test_hub`, `tests.test_hub_e2e` | slow |
 | `lib/now.py` | `tests.test_now` | ~15 s |
@@ -139,6 +140,24 @@ Each of these cost a past change real time. The API is early access; the engine'
   beneath the module's; extend it, don't add another (`hooks/chief.test.tsx`, top of file).
 - **Detach slow work from a turn.** Model calls from `turn.complete` or `prompt.submit` are `void …catch()`:
   they must never delay or fail the manager's turn.
+- **Module variables don't carry from `command.run` to a draw.** A value set in a `/chief` handler is not there when
+  `ui.render` runs. Keep it in an atom, or the plugin's store if it should outlast the session.
+- **`prompt.compose` can be consumed by an earlier plugin.** A plugin that runs first and handles the event without
+  calling `next` means this one never runs, and nothing reports it. Don't build on the section being there: the
+  `Waiting on:` state also comes from the session-card refresh.
+- **A hover Box needs a `key`,** or the whole pane fails to draw, not only that Box.
+
+### What the desktop pane draws
+
+Measured in a live pane; `hooks/skin.tsx` is built around them. A terminal honours theme colours and differs.
+
+- **The desktop pane draws no body colour.** It is the app's, so the dark panel is one Box with a fill.
+- **A Button's label colour can't be set.** It is the app's text colour. A pill is a filled rounded Box around a `plain`
+  Button, its fill chosen to read under that label.
+- **Uncoloured Text is invisible on dark fills.** A Text with no colour is the app's default, dark in light mode. Every
+  Text in the panel gets one: draw through `skinUi`, never the raw table.
+- **The `theme` config row is the CLI's, not the desktop app's.** Nothing a mod can read says how the app is drawn, which
+  is why `/chief skin dark` and `dark-app` are the manager's call.
 
 ## Gotchas while you work here
 
@@ -180,9 +199,12 @@ Each of these cost a past change real time. The API is early access; the engine'
 ### Add a CLI verb (example: `lib/floor.py`, the smallest module)
 
 1. A new top-level command: a `cmd_<name>` in `bin/mother`, an entry in `COMMANDS`, a line in the docstring at
-   the top of the file. A verb of an existing command: that module's `VERBS` / `USAGE` and its `main`.
-2. State is written atomically (temp file, then rename) and under the hub lock when another process reads it.
-3. CONTRACT (the section for that module), `docs/GUIDE.md` command table, a test in the module's test file.
+   the top of the file. A verb of an existing command: that module's `VERBS` / `USAGE` and its `main` (`lib/chief.py`,
+   `lib/floor.py`, `lib/hub.py`).
+2. State is written atomically (temp file, then rename) and under the hub lock when another process reads it. A new
+   file under `.mother/` gets a row in ARCHITECTURE's table of who writes and reads it.
+3. CONTRACT (the section for that module), `docs/GUIDE.md` command tables, a test in the module's test file. If the pane
+   reads the verb's JSON, its shape in `types/index.d.ts` and `tests/test_cli_contract.py`.
 4. If the module is new: a row in ARCHITECTURE's code map (tested).
 
 ### Add a pane tab (example: the Health tab, `healthSection` in `hooks/pane_tabs.tsx`)
@@ -191,9 +213,12 @@ Each of these cost a past change real time. The API is early access; the engine'
 2. Write the section as a top-level `function` in `hooks/pane_tabs.tsx` that takes what it needs and returns
    elements. It reads no file and writes no state while drawing.
 3. Add one row to the `tabs` list in `paneTree` (`hooks/chief.tsx`) and a count in `tabCounts`.
-4. Add the id to the `/chief tab …` usage text and the command description in `hooks/chief.tsx`.
-5. New data comes through a `mother …` verb and its JSON shape in `types/index.d.ts`, loaded on the timer pass.
-6. Tests in `hooks/chief.test.tsx`; CONTRACT §5g; the README's pane section.
+4. Add the id to the `/chief tab …` usage text and the command description (`startChief`) in `hooks/chief.tsx`.
+5. New data comes through a `mother …` verb and its JSON shape in `types/index.d.ts`, loaded on the timer pass
+   (`chiefPass`). State a draw reads is an atom declared in the reading file. A field in `status --json` is on the fast
+   refresh for free (`hooks/fastloop.ts`).
+6. Draw through the `ui` it is handed (`skinUi`): every Text coloured, every hover Box keyed, one coral pill.
+7. Tests in `hooks/chief.test.tsx`; CONTRACT §5g; the README's pane table and `docs/GUIDE.md`'s tab section.
 
 ### Where other changes go
 
@@ -201,7 +226,9 @@ Each of these cost a past change real time. The API is early access; the engine'
 |---|---|---|
 | Change what may go out | `hooks/guard.py` | `rules/outbound.md`; CONTRACT §5; `tests/test_guard.py`; `tests/test_redteam.py` |
 | Add a config key | `validate()` in `bin/mother` | CONTRACT §3; `templates/workspace/config.example.json` |
-| Change triage, cases, relay or the floor | `hooks/chief.tsx`, `hooks/cos.ts`, `hooks/floor.ts`, `lib/chief.py`, `lib/floor.py` | CONTRACT §5g; `skills/cos/SKILL.md` if the session's contract changes |
+| Change triage, cases, relay or the floor | `hooks/chief.tsx`, `hooks/cos.ts`, `hooks/floor.ts`, `hooks/waiting.ts`, `lib/chief.py`, `lib/floor.py` | CONTRACT §5g; `skills/cos/SKILL.md` if the session's contract changes |
+| Change what the pane sends a model | the prompt's module, `hooks/ask_route.ts` for the Ask box | CONTRACT §5g; the README's "What leaves the machine" |
+| Change the pane's look | `hooks/skin.tsx`, `hooks/pane_ui.tsx` | `docs/assets/` mocks when the change is visible |
 | Change what the watcher reads | `lib/hub_sources.py` | CONTRACT §5e; `tests/test_hub_sources.py` |
 | Change connector health or alerts | `lib/health.py` | CONTRACT §4; `tests/test_health.py` |
 | Add a sub-agent | a file under `agents/` | the guard's `agent_type` handling; CONTRACT §5c |
