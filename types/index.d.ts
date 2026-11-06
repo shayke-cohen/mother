@@ -139,7 +139,7 @@ export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watc
 
 // One recommended action on a Chief pane card. Only these kinds exist; the pane drops anything else.
 export type ChiefChip =
-  | { kind: 'reply'; text: string }
+  | { kind: 'reply'; text: string; label?: string }   // `text` is sent; `label` (<= 24) is the button's words, else the text's first words
   | { kind: 'open' }
 
 // A card's TL;DR (at most 2 short lines) and up to 3 chips, from one model call over the session's recent tail.
@@ -290,6 +290,7 @@ declare module 'claude-code' {
       chiefHealth: ChiefHealthState | null          // the Health tab: dismissed undelivered reports, loaded report texts
       chiefDetail: Record<string, ChiefDetail | null> | null   // what each dots item does, by Now item id, once its card was pressed (null = nothing on disk)
       chiefSkin: ChiefSkin | null                   // the pane's skin, read from the store at session start
+      chiefPeople: Record<string, string> | null    // chat user ids to names, from `mother chief context --json`, read at session start
       chiefTyped: Record<string, string> | null     // what a field holds as it is typed, by Input key; read on a press, never by a draw
       chiefSelected: string | null                  // the card id (`sess:<cli id>`, `inbox:<U-id>`) a button was last pressed on; drawn with a bold border
     }

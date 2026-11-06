@@ -1313,7 +1313,7 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   direct message, `mentioned` when the line's text names the manager, else null) and asks the model
   (`chief.triage_model`, `$.model.complete`, 30 s timeout, 900 tokens; never for a `manual` line or one whose key
   has a live session; none at all when the budget is spent) for a verdict per line: `{is_work, needs_attention,
-  kind: decide|reply|act|fyi, on: manager|team|other, urgency: now|today|later, title (<= 60), tldr (<= 200),
+  kind: decide|reply|act|fyi, on: manager|team|other, urgency: now|today|later, title (<= 60), tldr (<= 300),
   actions: [{label (<= 24), prompt (<= 300)}]}` with 2-3 actions, the recommended one first. `decide` = only the
   manager can settle it, `reply` = someone waits for the manager's answer, `act` = work an agent can mostly do,
   `fyi` = nothing to do; an action's `prompt` is an instruction for an agent session, its `label` a short button. The
@@ -1321,9 +1321,10 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   action off-shape is dropped, the rest are one safe line each, at most 3. The prompt is a fixed note, then
   `{context, line}` as JSON, at most 6000 characters, all of it untrusted data. `context` is `mother chief context
   --json`, read once per session: `{version, manager: {name, short}, teams: [{name, people: [names]}], projects,
-  repos}` (the hub's followed tracker projects and repos plus each team's own), at most 1500 characters. **What
-  leaves the machine for triage**, to the model API: the line (its key, title, summary up to 1000 characters, who
-  wrote it, link) and these names of the manager, the teams and their people, projects and repos. No ids, no emails.
+  repos, people}` (the hub's followed tracker projects and repos plus each team's own; `people` maps the configured
+  chat ids to names, which the pane uses for a card's `from` and the prompt never carries), at most 1500 characters.
+  **What leaves the machine for triage**, to the model API: the line (its key, title, summary up to 1000 characters,
+  who wrote it, link) and these names of the manager, the teams and their people, projects and repos. No ids, no emails.
   The mod then sends `{judge, verdicts}` to `triage --stdin --decide`, which records a decision for every judge
   line in one `hub decide`: `log` when a well-formed verdict for its key says `is_work` false or `needs_attention`
   false (`why: "triage: <title>"`; never a `manual` or `error` line, one whose key has a live session, or an update
@@ -1382,8 +1383,8 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   refresh. The tail goes in as JSON data under a fixed note; the reply must be one JSON object `{tldr, chips}`, and
   anything off keeps the card's `last_report`. Both the CLI and the mod drop control characters (C0 but newline,
   DEL, C1) and bidi marks, embeddings, overrides and isolates from the TL;DR and chip text, and keep `tldr` to 2
-  non-empty lines of 160 characters and chips to the kinds `reply` (a one-line `text` of 1..200 characters, shown
-  whole on the chip) and `open`, each once, at most 6 stored; the card draws the first 3. A chip acts only on a
+  non-empty lines of 160 characters and chips to the kinds `reply` (a one-line `text` of 1..200 characters and a `label` of at most 24, the
+  button's words) and `open`, each once, at most 6 stored; the card draws the first 3. A chip acts only on a
   click. A `reply` chip sends nothing: the model wrote its text from an untrusted transcript, so a click puts the text
   in the card's chat box (`chiefDraft`), and only the manager's Send runs the pinned send (prefixed `From the manager
   via the Chief pane: `, and asked by the guard as every pinned send is). **Open** never runs twice at once for one
@@ -1401,9 +1402,17 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   so the manager says it: `/chief skin dark` (the default) fills pills for an app in light mode (cream and coral,
   dark labels), `/chief skin dark-app` for an app in dark mode (slate and a darker coral, light labels), `/chief
   skin plain` draws the app's own colours and native buttons. The choice is kept in the plugin's store, on this
-  machine. A terminal always draws its own look. A compact card whose recommended label is over 16 characters
-  gives the title its whole row and puts its pills at the end of the second. No skin changes an element's key or
-  what a press does. **Who leads**: with nobody leading the badge is a dim `starting…` until the heartbeat is older
+  machine. A terminal always draws its own look. A dark-skin card is three rows: the toggle (a small round pill) and
+  the title, the whole row wide and cut with `…`; the badges, label, age and link; then one wrapping row of pills,
+  the recommended one first and the only coral one (on a session card the first reply chip, else Open; this
+  session's card has no Open, and its `Send` is quiet). Action rows wrap and keep a row's gap between them. A pill's
+  label is at most 28 characters; a reply chip's is its `label` (the model's, at most 24, else the text's first
+  words with `…`), and an expanded card shows the full text dim under the row. Who leads is a short `led` badge
+  with `here` or `by another session` dim beside it. No skin changes an element's key or what a press does.
+  An expanded card never shows a raw key or the verb a button types (`mother now do S1`); a Now item's facts read
+  as words (`waiting on your yes`, `from <name>` through the config's people, `raised 3h ago`, `first seen` only
+  when it differs), and every open card that stands for a dots action loads what it does (`dots-detail`) on the
+  console pass and on `/chief expand`, once per item, never in a draw. **Who leads**: with nobody leading the badge is a dim `starting…` until the heartbeat is older
   than 3 minutes (or absent), and only then a red `nobody leading`. A **header strip**: the picture,
   "Mother" / "Chief of Stuff", the counts as pills (`N need you`, `N inbox`, `N sessions`), the budget (`$1.50 /
   $20` and a bar), who leads (`led here`, `led by another session` or `nobody leading`, from `led_by` and this
@@ -1528,8 +1537,9 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   the workspace folder), asleep or not, each with what its transcript says in code: `running` (it moved in the last 2
   minutes, or its turn is open and it moved in the last 30), `idle_for` (seconds), `last_from` (`assistant` or
   `manager`), `open_turn`, `waiting` (the cos skill's last line `Waiting on: <who> — <what>`, as `{state, on, what}`),
-  `error_end`, `stuck` (the tail ends in an API error or limit message; or nothing moved for 30 minutes while the turn
-  is open or the stored card said `working` twice running), `cached` (the stored card for the same fingerprint and
+  `error_end`, `stuck` (the tail ends in an API error or limit message; or the stored card said `working` and nothing
+  moved for between 30 minutes and 2 hours: longer than that with no error is an interrupted or closed session, which
+  reads idle; an open turn alone says nothing), `cached` (the stored card for the same fingerprint and
   model) and `prev` (the stored card whatever it was made from, with `at` and `fingerprint`); the document adds
   `refresh_minutes`. A row whose fingerprint equals its card's gets no call. The call's reply is `{state: working |
   waiting_manager | waiting_other | done | stuck | idle, tldr, progress, asks, question, options, waiting_on, chips}`;

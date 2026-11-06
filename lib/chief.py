@@ -14,7 +14,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import floor as floormod
 import habits
@@ -225,15 +225,23 @@ def lines(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
 NAME_MAX = 40
 CONTEXT_MAX = 1500          # characters of the context as compact JSON
 CONTEXT_TEAMS, CONTEXT_PEOPLE, CONTEXT_LIST = 8, 12, 12
+CONTEXT_PEOPLE_IDS = 60     # chat ids the `people` map names
 
 
 def triage_context(ws: Path, cfg: dict) -> dict:
-    """`context --json`: {version, manager: {name, short}, teams: [{name, people: [names]}], projects, repos}. Names
-    only: no ids, no emails. `projects` and `repos` are what the hub follows (config and the watch list) plus each
-    team's own. Trimmed from the end of its longest list until the compact JSON is at most CONTEXT_MAX characters."""
+    """`context --json`: {version, manager: {name, short}, teams: [{name, people: [names]}], projects, repos, people}.
+    `people` maps each configured person's chat id to their name (and the manager's own), so the pane can say who
+    an item is from; everything else is names only: no ids, no emails. `projects` and `repos` are what the hub
+    follows (config and the watch list) plus each team's own. Trimmed from the end of its longest list until the
+    compact JSON is at most CONTEXT_MAX characters (`people` last, whole)."""
     cfg = cfg or {}
     name, short = _manager_names(cfg)
     teams, projects, repos = [], [], []
+    by_chat: Dict[str, str] = {}
+    me = cfg.get("manager") if isinstance(cfg.get("manager"), dict) else {}
+    for key in ("chat_user", "chat_dm"):   # a `U…` user id; a `D…` DM channel id is not one (lib/hub.py manager_ids)
+        if isinstance(me.get(key), str) and re.match(r"^U[A-Z0-9]+$", me[key].strip()) and (short or name):
+            by_chat[me[key].strip()] = short or name
 
     def add(dst, v):
         v = safe_line(v, NAME_MAX) if isinstance(v, str) else ""
@@ -246,6 +254,9 @@ def triage_context(ws: Path, cfg: dict) -> dict:
         people = []
         for p in t.get("people") if isinstance(t.get("people"), list) else []:
             add(people, p.get("name") if isinstance(p, dict) else None)
+            pname = safe_line(p.get("name"), NAME_MAX) if isinstance(p, dict) and isinstance(p.get("name"), str) else ""
+            if pname and isinstance(p.get("chat"), str) and p["chat"].strip() and len(by_chat) < CONTEXT_PEOPLE_IDS:
+                by_chat.setdefault(p["chat"].strip(), pname)
         tname = safe_line(t.get("name") if isinstance(t.get("name"), str) else "", NAME_MAX) \
             or safe_line(t.get("slug") if isinstance(t.get("slug"), str) else "", NAME_MAX)
         if tname and len(teams) < CONTEXT_TEAMS:
@@ -262,7 +273,8 @@ def triage_context(ws: Path, cfg: dict) -> dict:
         add(projects, k)
     for r in (watch.get("code") or {}).get("repos") or []:
         add(repos, r)
-    doc = {"version": 1, "manager": {"name": name, "short": short}, "teams": teams, "projects": projects, "repos": repos}
+    doc = {"version": 1, "manager": {"name": name, "short": short}, "teams": teams, "projects": projects, "repos": repos,
+           "people": by_chat}
 
     def size():
         return len(json.dumps(doc, ensure_ascii=False, separators=(",", ":")))
@@ -274,6 +286,8 @@ def triage_context(ws: Path, cfg: dict) -> dict:
             longest.pop()
         elif teams:
             teams.pop()
+        elif by_chat:
+            by_chat.clear()
         else:
             break
     return doc
@@ -356,8 +370,8 @@ def tick(ws: Path, cfg: dict, at: datetime, session: Optional[str] = None) -> di
 
 # ---- triage: a cheap model's verdicts, made by the mod, decide every judge line in code ----
 
-TITLE_MAX, TLDR_MAX = 60, 200
-WHY_MAX = 300   # a `now` item's why: a verdict's tldr (200) or the line's own summary, which the hub stores up to 300
+TITLE_MAX, TLDR_MAX = 60, 300
+WHY_MAX = 300   # a `now` item's why: a verdict's tldr or the line's own summary, which the hub stores up to 300
 TRIAGE_NEVER_LOG = ("manual", "error")  # a person's own line, and a source failure: never logged on a model's say-so
 
 def _verdict_ok(v) -> bool:
@@ -1218,7 +1232,21 @@ TAIL_MESSAGES = 12
 TAIL_MESSAGE_MAX = 1500
 TLDR_LINES, TLDR_LINE_MAX = 2, 160
 CHIP_KINDS = ("reply", "open")
-CHIPS_MAX, CHIP_TEXT_MAX = 6, 200   # stored; the pane shows at most 3 that apply to the card now
+CHIPS_MAX, CHIP_TEXT_MAX, CHIP_LABEL_MAX = 6, 200, 24   # stored; the pane shows at most 3 that apply to the card now
+
+
+def chip_label(text: str, label=None) -> str:
+    """A reply chip's button label: the model's own (one line, at most 24 characters) when it gave one, else the text's
+    first words that fit 24 characters, cut at a word boundary with `…` when the text is longer."""
+    own = safe_line(label, CHIP_LABEL_MAX) if isinstance(label, str) else ""
+    if own and len(safe_line(label, 500)) <= CHIP_LABEL_MAX:
+        return own
+    text = " ".join(_safe(text).split())
+    if len(text) <= CHIP_LABEL_MAX:
+        return text
+    head = text[:CHIP_LABEL_MAX - 1]
+    cut = head.rfind(" ")
+    return (head[:cut] if cut > 0 else head).rstrip(" .,;:!?-") + "…"
 
 
 def project_slug(path: str) -> str:
@@ -1244,7 +1272,8 @@ def _block_text(content) -> str:
 
 
 RUNNING_SECONDS = 120          # a transcript that moved this recently is running
-STUCK_SECONDS = 30 * 60        # an open turn, or a card that said `working` twice, with no movement for this long
+STUCK_SECONDS = 30 * 60        # a card that said `working` with no movement for this long is stuck ...
+STUCK_MAX_SECONDS = 2 * 60 * 60   # ... until this long: past it the session was interrupted or closed, and reads idle
 STATES = ("working", "waiting_manager", "waiting_other", "done", "stuck", "idle")
 PROGRESS_MAX_CHARS = 160
 _WAITING_RE = re.compile(r"^\W{0,3}Waiting on:\s*(.+?)\s*(?:—|–|--|-)\s*(.*?)\W{0,3}$", re.IGNORECASE)
@@ -1394,8 +1423,8 @@ def safe_line(text, cap: int) -> str:
 
 def clean_tldr(tldr, chips) -> Optional[dict]:
     """{tldr, chips} as the pane may show them, or None: tldr at most 2 non-empty lines of 160 characters; chips at
-    most 6 of CHIP_KINDS, each kind once, a `reply` with a one-line text of 1..200 characters. Anything else is
-    dropped."""
+    most 6 of CHIP_KINDS, each kind once, a `reply` with a one-line text of 1..200 characters and a `label` of at
+    most 24 (the model's, else the text's first words: `chip_label`). Anything else is dropped."""
     if not isinstance(tldr, str):
         return None
     lines = [" ".join(_safe(l).split())[:TLDR_LINE_MAX] for l in tldr.split("\n")]
@@ -1413,7 +1442,7 @@ def clean_tldr(tldr, chips) -> Optional[dict]:
             if text is None or "\n" in text.strip() or not text.strip() or len(text.strip()) > CHIP_TEXT_MAX:
                 continue
             ident = ("reply", text.strip())
-            chip = {"kind": "reply", "text": text.strip()}
+            chip = {"kind": "reply", "text": text.strip(), "label": chip_label(text.strip(), c.get("label"))}
         else:
             ident, chip = (kind,), {"kind": kind}
         if ident in seen:
@@ -1454,12 +1483,13 @@ def _stored_card(hit) -> Optional[dict]:
 
 
 def _is_stuck(row: dict, card: Optional[dict]) -> bool:
-    """The code rule: the tail ends in an error or limit message; or nothing moved for STUCK_SECONDS while the turn
-    is open or the card said `working` at its last two refreshes."""
+    """The code rule: the tail ends in an error or limit message; or the card said `working` and nothing moved for
+    between 30 minutes and 2 hours. Longer than that with no error is not stuck: the turn was interrupted or the
+    app closed, and the session reads idle (an open turn alone says nothing: it stays open when the app closes)."""
     idle = row.get("idle_for")
-    still = isinstance(idle, int) and idle >= STUCK_SECONDS
-    twice = bool(card) and card.get("state") == "working" and card.get("prev_state") == "working"
-    return bool(row.get("error_end")) or (still and (bool(row.get("open_turn")) or twice))
+    still = isinstance(idle, int) and STUCK_SECONDS <= idle < STUCK_MAX_SECONDS
+    working = bool(card) and card.get("state") == "working"
+    return bool(row.get("error_end")) or (still and working)
 
 
 def session_tails(ws: Path, cfg: dict, home: Optional[Path] = None, app_dir: Optional[Path] = None,
@@ -1551,7 +1581,7 @@ DOTS_ID_RE = re.compile(r"^[AM]\d{1,3}$")
 DOTS_TEXT_MAX = 1500
 DOTS_FILE_MAX = 256 * 1024
 DOTS_FILES = 7
-DOTS_LABEL_MAX = 40
+DOTS_LABEL_MAX = 24        # a button's width: a longer clause is no label
 _DOTS_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})\.md$")
 
 
@@ -1605,7 +1635,7 @@ def _dots_block(lines: List[str], ident: str) -> Optional[List[str]]:
 
 def dots_label(line: str, ident: str) -> Optional[str]:
     """A short verb phrase for the action's button ("Annotate 7 todos"), from its own line: the first clause after
-    the id, when it is 2 or more words and at most 40 characters. None otherwise."""
+    the id, when it is 2 or more words and at most 24 characters. None otherwise."""
     text = re.sub(r"^\s*(?:[-*]\s+|\d+[.)]\s+)?[*_`]{0,2}(?:%s)?[*_`]{0,2}[\s:.)—-]*" % re.escape(ident), "", line)
     clause = re.split(r"\s+[—–]\s+|\s+--?\s+|\s+because\s+|[(:;]", text, 1)[0].strip(" .*`_")
     clause = safe_line(clause, 200)
@@ -1747,7 +1777,8 @@ USAGE = """usage: mother chief <verb> ...
                         prints {paused, logged, now}
   lines [--json]        the inbox lines waiting for a decision
   context --json        what the triage prompt says about the manager: their name, the teams with their people's
-                        names, the followed tracker projects and repos; names only, at most 1500 characters
+                        names, the followed tracker projects and repos, names only; plus `people`, the configured
+                        chat ids to names, for the pane's `from` (never sent); at most 1500 characters
   status [--json]       paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}

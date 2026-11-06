@@ -369,11 +369,11 @@ class TestLeader(Base):
         self.assertEqual(json.loads(out), {
             "version": 1, "manager": {"name": "Dana Levi", "short": "Dana"},
             "teams": [{"name": "Platform team", "people": ["Sam Roe"]}],
-            "projects": ["PLAT", "OPS"], "repos": ["example-org/platform-api", "example-org/web"]})
-        for secret in ("example.com", "U0000"):
-            self.assertNotIn(secret, out)
+            "projects": ["PLAT", "OPS"], "repos": ["example-org/platform-api", "example-org/web"],
+            "people": {"U00000000": "Dana", "U00000001": "Sam Roe"}})                 # chat ids to names, for the pane's `from`
+        self.assertNotIn("example.com", out)
         self.assertEqual(chief.triage_context(self.ws, {}), {
-            "version": 1, "manager": {"name": "", "short": ""}, "teams": [], "projects": [], "repos": []})
+            "version": 1, "manager": {"name": "", "short": ""}, "teams": [], "projects": [], "repos": [], "people": {}})
         big = {"teams": [{"name": "Team %d" % t, "people": [{"name": "Person %d-%d %s" % (t, i, "x" * 30)} for i in range(30)]}
                          for t in range(12)]}
         doc = chief.triage_context(self.ws, big)
@@ -882,7 +882,7 @@ class TestTldr(Base):
         self.assertEqual(n, 1)
         [s] = self.tails()["sessions"]
         self.assertEqual(s["cached"], {"tldr": "Fixing it.\nTests next.",
-                                       "chips": [{"kind": "reply", "text": "Ship it"}, {"kind": "open"}]})
+                                       "chips": [{"kind": "reply", "text": "Ship it", "label": "Ship it"}, {"kind": "open"}]})
         # the session moved: the cached entry no longer applies
         p.write_text(p.read_text() + msg("assistant", "Done now") + "\n")
         [s] = self.tails()["sessions"]
@@ -891,7 +891,15 @@ class TestTldr(Base):
     def test_clean_tldr_strips_control_and_bidi(self):
         got = chief.clean_tldr("Done‮ gnihtyreve\x1b[31m red\r\nnext⁦\x07\x9b",
                                [{"kind": "reply", "text": "Ship‏ it\x00"}, {"kind": "reply", "text": "‮\x1b"}])
-        self.assertEqual(got, {"tldr": "Done gnihtyreve[31m red\nnext", "chips": [{"kind": "reply", "text": "Ship it"}]})
+        self.assertEqual(got, {"tldr": "Done gnihtyreve[31m red\nnext", "chips": [{"kind": "reply", "text": "Ship it", "label": "Ship it"}]})
+
+    def test_chip_labels_are_short(self):
+        long = "Approved. Push the branches and open the PRs in your proposed order."
+        got = chief.clean_tldr("ok", [{"kind": "reply", "text": long}, {"kind": "reply", "text": "Go ahead", "label": "Yes, go\u202e"},
+                                      {"kind": "reply", "text": "Hold it", "label": "x" * 30}])
+        self.assertEqual([c["label"] for c in got["chips"]], ["Approved. Push the…", "Yes, go", "Hold it"])   # a word boundary, the model's own, too long: the text
+        self.assertEqual(chief.chip_label("a" * 30), "a" * 23 + "…")                 # one long word: cut where the cap falls
+        self.assertTrue(all(len(c["label"]) <= chief.CHIP_LABEL_MAX for c in got["chips"]))
 
     def test_cache_is_keyed_by_model_and_store_prunes_gone_sessions(self):
         self.pin()
@@ -1418,7 +1426,7 @@ class TestDotsDetail(Base):
         self.assertEqual(got["text"], "- A23 Annotate 7 stale todos and intake lines (no closes) — because none moved in 14 days — todos/open.md\n"
                                       "   - adds `stale since <date>` to each line\n"
                                       "- cutoff: plan says Thursday · ticket says Friday (see A23)")
-        self.assertEqual(got["label"], "Annotate 7 stale todos and intake lines")
+        self.assertEqual(got["label"], None)                                       # the clause is over 24 characters: no label
         self.assertEqual(chief.dots_detail(self.ws, "A3")["label"], None)          # one word: the button keeps its label
         m = chief.dots_detail(self.ws, "M2")
         self.assertEqual((m["text"], m["label"]), ("2. Decide the cutoff — because the plan and the ticket disagree", "Decide the cutoff"))
@@ -1439,7 +1447,9 @@ class TestDotsDetail(Base):
         code, out, _ = self.main("dots-detail", "A99", "--json")
         self.assertEqual((code, json.loads(out)), (0, None))
         code, out, _ = self.main("dots-detail", "A1", "--json")
-        self.assertEqual((code, json.loads(out)["label"]), (0, "Draft a nudge to the owner of PLAT-7"))
+        self.assertEqual((code, json.loads(out)["label"]), (0, None))               # 37 characters: too long for a button
+        self.assertEqual(chief.dots_label("- A24 Post pointer comments on the three PRs", "A24"), None)
+        self.assertEqual(chief.dots_label("- A24 Post pointer comments — on the three PRs", "A24"), "Post pointer comments")
         self.assertEqual(self.main("dots-detail")[0], 2)
 
 
@@ -1488,7 +1498,7 @@ class TestSessionCards(TestTldr):
         self.assertEqual((s["running"], s["open_turn"], s["last_from"], s["waiting"], s["stuck"]), (True, True, "assistant", None, False))
         self.aged(p, 1801)
         s = self.tails_at()["sessions"][0]
-        self.assertEqual((s["running"], s["stuck"]), (False, True))
+        self.assertEqual((s["running"], s["stuck"]), (False, False))                 # an open turn alone is not stuck: the app may have closed
         p = self.transcript("/work/api", CLI_A, [msg("user", "go"), msg("assistant", [{"type": "text", "text": "API Error: rate limit reached"}])])
         self.aged(p, 600)
         self.assertEqual([self.tails_at()["sessions"][0][k] for k in ("error_end", "stuck")], [True, True])
@@ -1523,11 +1533,14 @@ class TestSessionCards(TestTldr):
         self.assertEqual(self.store([self.card(fp, state="idle")])[1][CLI_A]["state"], "working")
         self.aged(p, 600)
         self.assertEqual(self.store([self.card(fp, state="bogus")])[1][CLI_A]["state"], "idle")
-        # twice `working`, then nothing moves for 30 minutes: stuck
+        # `working`, then nothing moves for 30 minutes: stuck; past 2 hours it was interrupted or closed: idle again
         self.aged(p, 10)
         self.store([self.card(fp)])
-        self.store([self.card(fp)])
         self.aged(p, 1900)
+        self.assertTrue(self.tails_at()["sessions"][0]["stuck"])
+        self.aged(p, 2 * 3600)
+        self.assertFalse(self.tails_at()["sessions"][0]["stuck"])
+        self.aged(p, 2 * 3600 - 1)
         self.assertTrue(self.tails_at()["sessions"][0]["stuck"])
 
     def test_an_asleep_sessions_ask_fills_its_floor_card(self):
