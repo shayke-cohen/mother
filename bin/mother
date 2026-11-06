@@ -59,7 +59,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.24.0"
+VERSION = "0.25.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -141,7 +141,7 @@ HUB_PACING = {"hot_seconds": (30, 3600), "warm_seconds": (60, 7200), "cold_secon
               "hot_any_minutes": (1, 1440), "warm_hours": (1, 168), "away_idle_minutes": (1, 240),
               "away_quiet_minutes": (1, 240), "backoff_seconds": (10, 1800), "outage_minutes": (1, 240),
               "slow_seconds": (300, 14400), "max_calls": (4, 200), "lookback_seconds": (120, 14400),
-              "search_retry_seconds": (600, 86400)}
+              "search_retry_seconds": (600, 86400), "limited_seconds": (60, 3600), "limited_calls": (1, 50)}
 HUB_CAPS = ("chat", "mail", "tracker", "calendar", "code", "whatsapp")
 HUB_CONN_KEYS = {"command", "args", "env", "cli", "local"}
 HUB_WATCH_INTERVALS = {"every_seconds", "idle_every_seconds"}
@@ -467,7 +467,8 @@ def validate_hub(h) -> list:
 
 # config.json -> chief (CONTRACT §5g; lib/chief.py DEFAULTS, which a test holds equal): "money" a number from 0,
 # "model" a TL;DR or triage model.
-CHIEF_FIELDS = {"daily_budget_usd": "money", "tldr_model": "model", "triage_model": "model", "refresh_minutes": "minutes"}
+CHIEF_FIELDS = {"daily_budget_usd": "money", "tldr_model": "model", "triage_model": "model", "refresh_minutes": "minutes",
+                "ignore_folders": "folders"}
 # the chief session's and its workers' keys (before 0.18.0): accepted, ignored
 CHIEF_LEGACY_KEYS = {"max_workers", "run_minutes", "chief_model", "worker_model", "tick_seconds", "batch_minutes",
                      "decision_hours"}
@@ -491,6 +492,9 @@ def validate_chief(c) -> list:
             errs.append(f"chief.{k} must be a whole number from 1 to 60")
         elif kind == "model" and v not in CHIEF_MODELS:
             errs.append(f"chief.{k} must be one of {', '.join(CHIEF_MODELS)}")
+        elif kind == "folders" and not (isinstance(v, list) and all(
+                isinstance(f, str) and (f.startswith("/") or f == "~" or f.startswith("~/")) for f in v)):
+            errs.append(f"chief.{k} must be a list of absolute or ~/ folder paths")
     return errs
 
 
@@ -1347,7 +1351,7 @@ def cmd_inbox(args):
 def cmd_floor(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import floor
-    if args[:1] in ([], ["help"], ["-h"], ["--help"]) or args not in (["card", "--stdin"], ["list", "--json"]):
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]) or args not in (["card", "--stdin"], ["list", "--json"], ["mark", "--stdin"]):
         sys.exit(floor.main(args, None, {}))  # no workspace needed: help and usage errors
     ws = workspace()
     sys.exit(floor.main(args, ws, load_config(ws), _now()))

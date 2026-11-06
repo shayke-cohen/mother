@@ -21,7 +21,8 @@ import habits
 import hub
 import now as nowmod
 
-DEFAULTS = {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5}
+DEFAULTS = {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5,
+            "ignore_folders": []}
 REFRESH_MINUTES = (1, 60)   # chief.refresh_minutes: how often the leading session re-reads each session for its card
 TLDR_MODELS = ("sonnet", "opus")   # the Chief pane's TL;DR model; anything else reads as the default
 SPEND_KEEP_DAYS = 14
@@ -41,7 +42,29 @@ def settings(cfg: dict) -> dict:
     r = out["refresh_minutes"]
     if not (isinstance(r, int) and not isinstance(r, bool) and REFRESH_MINUTES[0] <= r <= REFRESH_MINUTES[1]):
         out["refresh_minutes"] = DEFAULTS["refresh_minutes"]
+    out["ignore_folders"] = ignore_folders(out["ignore_folders"])
     return out
+
+
+IGNORE_FOLDERS_MAX = 50
+
+
+def ignore_folders(v, home: Optional[str] = None) -> List[str]:
+    """chief.ignore_folders as absolute paths: each an absolute or `~/` path, `~` expanded, no trailing slash;
+    anything else is dropped. A pinned session under one gets no `Waiting on:` instruction (CONTRACT §5g)."""
+    home = home if home is not None else os.path.expanduser("~")
+    out = []
+    for f in v if isinstance(v, list) else []:
+        if not isinstance(f, str):
+            continue
+        f = f.strip()
+        if f == "~" or f.startswith("~/"):
+            f = home + f[1:]
+        if f.startswith("/") and len(f) > 1:
+            f = f.rstrip("/") or "/"
+            if f not in out:
+                out.append(f)
+    return out[:IGNORE_FOLDERS_MAX]
 
 
 # ---- pause ------------------------------------------------------------------------------------------
@@ -1026,6 +1049,80 @@ def watch_key(ws: Path, cfg: dict, at: datetime, key, cli) -> dict:
     return {"ok": True, "key": sk, "session_id": cli, "also": [a for a in row.get("also") or [] if isinstance(a, str)]}
 
 
+MENTION_KEYS_MAX = 5
+MENTION_TEXT_MAX = 8000
+
+
+def mention_keys(text) -> List[str]:
+    """The keys a prompt names, in order, at most 5: each chat message link's thread, then tracker keys and PRs."""
+    text = str(text or "")[:MENTION_TEXT_MAX]
+    out = []
+    for m in hub._SLACK_LINK.finditer(text):
+        k = hub.thing_key("chat", {"channel": m.group("c"), "ts": "%s.%s" % (m.group("a"), m.group("b")),
+                                   "thread_ts": m.group("t")})
+        if k not in out:
+            out.append(k)
+    for k in hub.extract_also(text):
+        if k not in out:
+            out.append(k)
+    return [k for k in out if hub._KEY_TOKEN.fullmatch(k)][:MENTION_KEYS_MAX]
+
+
+def mention(ws: Path, cfg: dict, at: datetime, doc) -> dict:
+    """`mention --stdin` {session_id, text?, keys?, title?}: the keys the manager named to a session (the chat links,
+    tracker keys and PRs of a prompt they typed there, or an Inbox item they sent there) join that session's case, so
+    their lines route to it; a session with no live case gets one (`origin: "mention"`), its first key the row's.
+    At most 5 keys. A key live in another session whose row is under 7 days old is refused, and so is a key already
+    this session's (nothing to add). Prints {added, refused}; ValueError for an off-shape id."""
+    if not isinstance(doc, dict):
+        raise ValueError("stdin must be a JSON object {session_id, text?, keys?, title?}")
+    cli = doc.get("session_id")
+    if not (isinstance(cli, str) and CLI_ID_RE.fullmatch(cli)):
+        raise ValueError("session_id is not a session id")
+    keys = mention_keys(doc.get("text"))
+    for k in doc.get("keys") if isinstance(doc.get("keys"), list) else []:
+        if isinstance(k, str) and hub._KEY_TOKEN.fullmatch(k) and k not in keys:
+            keys.append(k)
+    keys = keys[:MENTION_KEYS_MAX]
+    added, refused = [], []
+    stamp = hub._iso(at)
+    with hub.locked(ws):
+        sess, h = hub._sessions_doc(ws), hub._hub_doc(ws)
+        items = sess["sessions"]
+        for key in keys:
+            hit = hub.find_session(sess, [key])
+            if hit is not None and str(hit[1].get("session_id")) == cli and _is_case(hit[1]):
+                continue   # already this session's
+            try:
+                _refuse_owned(sess, key, cli, at)
+            except ValueError:
+                refused.append(key)
+                continue
+            if hit is not None and not _is_cli(hit[1]) and str(hit[1].get("session_id")) != cli:
+                hit[1]["state"] = "dropped"   # a stale owner: the key moves
+            mine = sorted(((sk, r) for sk, r in items.items() if _is_case(r) and r.get("cli_session_id") == cli),
+                          key=lambda x: str(x[1].get("opened_at") or ""))
+            if mine:
+                row = mine[0][1]
+                if key != mine[0][0]:
+                    row["also"] = _merged_also(row.get("also"), [key])
+            else:
+                title = safe_line(doc.get("title") or key, TITLE_MAX)
+                items[key] = {"session_id": cli, "cli_session_id": cli, "kind": "case", "origin": "mention",
+                              "name": "case-" + re.sub(r"[^A-Za-z0-9]+", "-", key).strip("-")[:40], "title": title,
+                              "link": None, "also": [], "opened_at": stamp, "last_routed_at": None, "unseen": 0,
+                              "state": "live"}
+            for u in h["updates"]:
+                if isinstance(u, dict) and u.get("key") == key and u.get("state") != "done":
+                    u["session_id"] = cli
+            h["pending"] = [p for p in h["pending"] if p.get("key") != key]
+            added.append(key)
+        if added:
+            hub.save_json(ws, "sessions.json", sess)
+            hub._save_hub(ws, h, sess, cfg, at)
+    return {"ok": True, "session_id": cli, "added": added, "refused": refused}
+
+
 def close_case(ws: Path, cfg: dict, at: datetime, key) -> dict:
     """`close-case <key>`: the live case that holds `key` is done, and so is every open inbox item of its keys; later
     activity on them raises a new item. ValueError when no live case holds the key."""
@@ -1171,7 +1268,8 @@ def cases(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
                     "label": item_label(sk, safe_line(whos.get(sk) or "", LABEL_MAX), channels),
                     "unseen": len((doc["keys"].get(sk) or {}).get("waiting", [])),
                     "last_routed_at": r.get("last_routed_at"), "opened_at": r.get("opened_at"),
-                    "deliver_now": _deliver_flag(ws, cli).exists()})
+                    "deliver_now": _deliver_flag(ws, cli).exists(),
+                    **({"origin": "mention"} if r.get("origin") == "mention" else {})})
     out.sort(key=lambda c: str(c["opened_at"] or ""))
     return out
 
@@ -1357,27 +1455,13 @@ STUCK_SECONDS = 30 * 60        # a card that said `working` with no movement for
 STUCK_MAX_SECONDS = 2 * 60 * 60   # ... until this long: past it the session was interrupted or closed, and reads idle
 STATES = ("working", "waiting_manager", "waiting_other", "done", "stuck", "idle")
 PROGRESS_MAX_CHARS = 160
-_WAITING_RE = re.compile(r"^\W{0,3}Waiting on:\s*(.+?)\s*(?:—|–|--|-)\s*(.*?)\W{0,3}$", re.IGNORECASE)
 _ERROR_END_RE = re.compile(r"\b(api error|rate limit|usage limit|limit reached|overloaded|credit balance is too low|"
                            r"request timed out|connection error|prompt is too long)\b", re.IGNORECASE)
 ERROR_END_MAX = 400
 
-
-def waiting_line(text) -> Optional[dict]:
-    """The cos skill's last line (`Waiting on: <who> — <what>`) of a message, read in code: {state, on, what} with
-    state `waiting_manager` (the manager), `done` (nothing) or `waiting_other` (anyone else, named in `on`). None
-    when the message's last non-empty line is not one."""
-    rows = [l.strip() for l in str(text or "").splitlines() if l.strip()]
-    m = _WAITING_RE.match(rows[-1]) if rows else None
-    if not m:
-        return None
-    who, what = safe_line(m.group(1), 80), safe_line(m.group(2), 200)
-    low = who.lower()
-    if low in ("nothing", "nobody", "no one"):
-        return {"state": "done", "on": None, "what": what}
-    if low in ("the manager", "manager", "you"):
-        return {"state": "waiting_manager", "on": None, "what": what}
-    return {"state": "waiting_other", "on": who, "what": what}
+# The cos skill's (and every pinned session's) last line `Waiting on: <who> — <what>`, read in code: lib/floor.py's
+# parser, so the turn-end card and the refresh read it the same way.
+waiting_line = floormod.waiting_line
 
 
 def _transcript_read(path: Path) -> Optional[dict]:
@@ -1646,6 +1730,8 @@ def tldr_store(ws: Path, at: datetime, rows: List[dict], home: Optional[Path] = 
                 c["prev_state"] = old.get("state") if isinstance(old, dict) and old.get("state") in STATES else None
                 try:
                     _fill_floor(ws, at, r["id"], c, row)
+                    if w:
+                        floormod.note_waiting(ws, at, r["id"], w)   # the floor card's wait, for a session whose mod is not running
                 except OSError:
                     pass   # the card is stored all the same; Needs you misses this ask until the next refresh
             doc[r["id"]] = dict(c, fingerprint=r["fingerprint"], at=hub._iso(at),
@@ -1832,15 +1918,79 @@ def watcher_health(ws: Path, at: datetime) -> Optional[dict]:
             "status": safe_line(ent.get("status"), 40) or "unknown", "reason": safe_line(ent.get("reason"), REASON_MAX),
             "since": ent.get("since") if isinstance(ent.get("since"), str) else None,
             "at": ent.get("at") if isinstance(ent.get("at"), str) else None}
+        if ent.get("degraded"):  # reading less than usual (the chat source, rate limited)
+            sources[safe_line(cap, 40)]["degraded"] = safe_line(ent.get("degraded"), REASON_MAX)
     return {"at": w["at"], "every_seconds": every, "active": active,
             "stale": active and (age is None or age > 2 * every), "sources": sources}
 
 
+# What a source's error says, when only the manager can fix it: a sign-in that expired or a refused token
+# (`signin`), or the network, the VPN or a timeout (`network`). The one list both the watcher's source status and its
+# `watcher:` error lines are matched against; the first pattern that matches names the kind. Rate limits are neither.
+ACCESS_PATTERNS = (
+    ("signin", r"\b40[13]\b|unauthori[sz]ed|forbidden|invalid[_ ]auth|needs?[_ ]auth|not authenticated|"
+               r"(?:token|sign[- ]?in|log[- ]?in|session|credentials?|auth\w*)\W+(?:\w+\W+){0,3}?"
+               r"(?:expired|invalid|revoked|refused|rejected|missing)|expired\W+(?:\w+\W+){0,2}?(?:token|session)|"
+               r"invalidated|re-?authenticate|reconnect it from connector settings|please sign ?in|sign ?in again"),
+    ("network", r"\bvpn\b|econnrefused|enotfound|econnreset|ehostunreach|enetunreach|getaddrinfo|"
+                r"connection (?:refused|reset)|timed? ?out|timeout|no reply to [\w/-]+ within|unreachable|"
+                r"fetch failed|network|\bdns\b|could not resolve"),
+)
+ACCESS_HELP = {
+    "signin": "Sign in to this connector again (its sign-in or token expired or was refused), then Retry.",
+    "network": "Reconnect the VPN or the network this connector needs (its server could not be reached), then Retry.",
+}
+
+
+def access_kind(text) -> Optional[str]:
+    """`signin`, `network` or None for one error text (ACCESS_PATTERNS)."""
+    low = str(text or "").lower()
+    if not low or _rate_limited(low):
+        return None
+    for kind, pat in ACCESS_PATTERNS:
+        if re.search(pat, low):
+            return kind
+    return None
+
+
+def _rate_limited(low: str) -> bool:
+    return bool(re.search(r"\b429\b|ratelimited|rate[ _-]?limit", low))
+
+
+def access_problems(watcher: Optional[dict], errors: List[dict]) -> List[dict]:
+    """ChiefStatus.health.access: one row per source whose failure only the manager can fix, `{source, kind,
+    reason, help, since}`. From the watcher's source status when the source is down (`couldnt_check`), else from an
+    open `watcher:<source>` error line; a source the watcher reads as ok or partial has none."""
+    out, seen = [], set()
+    sources = (watcher or {}).get("sources") if isinstance((watcher or {}).get("sources"), dict) else {}
+    for cap, ent in sorted(sources.items()):
+        if not isinstance(ent, dict) or ent.get("status") != "couldnt_check":
+            continue
+        kind = access_kind(ent.get("reason"))
+        if kind:
+            seen.add(cap)
+            out.append({"source": cap, "kind": kind, "reason": safe_line(ent.get("reason"), 120),
+                        "help": ACCESS_HELP[kind], "since": ent.get("since")})
+    for e in errors:
+        cap = str(e.get("key") or "")[len(WATCHER_KEY_PREFIX):]
+        if not cap or cap in seen or (isinstance(sources.get(cap), dict) and sources[cap].get("status") in ("ok", "partial")):
+            continue
+        reason = e.get("why") or e.get("title") or ""
+        kind = access_kind(reason)
+        if kind:
+            seen.add(cap)
+            out.append({"source": safe_line(cap, 40), "kind": kind, "reason": safe_line(reason, 120),
+                        "help": ACCESS_HELP[kind], "since": e.get("at")})
+    return out
+
+
 def health_doc(ws: Path, at: datetime, errors: List[dict]) -> dict:
-    """ChiefStatus.health: the watcher, its errors (Inbox items keyed `watcher:`), undelivered reports, the guard."""
-    return {"guard": guard_state(ws), "watcher": watcher_health(ws, at),
+    """ChiefStatus.health: the watcher, its errors (Inbox items keyed `watcher:`), undelivered reports, the guard,
+    and the sources only the manager can fix (`access`)."""
+    watcher = watcher_health(ws, at)
+    return {"guard": guard_state(ws), "watcher": watcher,
             "watcher_errors": errors[:WATCHER_ERRORS_MAX], "watcher_error_count": len(errors),
-            "undelivered": undelivered(ws)}
+            "undelivered": undelivered(ws), "access": access_problems(watcher, errors)}
 
 
 # ---- status and the `mother chief` CLI ----------------------------------------------------------------
@@ -1862,7 +2012,9 @@ USAGE = """usage: mother chief <verb> ...
   context --json        what the triage prompt says about the manager: their name, the teams with their people's
                         names, the followed tracker projects and repos, names only; plus `people`, the configured
                         chat ids to names, for the pane's `from` (never sent); at most 1500 characters
-  status [--json]       paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox
+  status [--json] [--save]
+                        paused, who leads (the heartbeat), today's budget, pinned sessions and the inbox; --save also
+                        writes the JSON to .mother/chief/status.json (atomically) for the pane's fast refresh
   pinned --stdin        snapshot the pinned desktop sessions from list_sessions rows (JSON array on stdin) into
                         .mother/chief/desktop.json; prints {pinned: N}
   tail --json           each pinned or case session's recent tail (at most 6000 characters) for its card, what
@@ -1887,6 +2039,10 @@ USAGE = """usage: mother chief <verb> ...
                         add one more key (a related thread, ticket or PR) to a live case that session holds;
                         refused (exit 1) as a claim is, and when that session holds no live case
   close-case <key>      the live case that holds the key is done, with every open inbox item of its keys
+  mention --stdin       the keys the manager named to a session ({session_id, text?, keys?, title?}: chat message
+                        links, tracker keys and PRs in `text`, plus `keys`; at most 5) join its case, which is made
+                        (`origin: "mention"`) when it has none; a key live in another session is refused; prints
+                        {ok, session_id, added, refused}
   ask --stdin           the ask box: {text} on stdin becomes a `manual` inbox line (as `mother hub add`) whose key
                         is held for the case the pane starts; prints {ok, key, line_id, link, update_id, owned_by}
   dots-detail <id> --json
@@ -1914,7 +2070,7 @@ A valued option takes --opt=V or --opt V."""
 
 # verb: (boolean flags, valued options); only `report`, `relay`, `habits`, `watch-key`, `close-case`, `dots-detail` and `why` take a positional
 VERBS = {
-    "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json",), ()), "tick": (("--json",), ("--as",)),
+    "lines": (("--json",), ()), "context": (("--json",), ()), "status": (("--json", "--save"), ()), "tick": (("--json",), ("--as",)),
     "pause": ((), ()), "resume": ((), ()),
     "triage": (("--stdin", "--decide"), ()), "pinned": (("--stdin",), ()),
     "tail": (("--json",), ()), "tldr": (("--stdin",), ()), "spend": (("--stdin",), ()),
@@ -1922,7 +2078,7 @@ VERBS = {
     "act-log": (("--stdin", "--json"), ("--days",)), "habits": (("--json",), ()),
     "claim": (("--stdin",), ()), "relays": (("--ack", "--stdin", "--json"), ("--for",)), "relay": ((), ("--for",)),
     "watch-key": ((), ("--for",)), "close-case": ((), ()), "ask": (("--stdin",), ()), "dots-detail": (("--json",), ()),
-    "why": (("--json",), ()),
+    "why": (("--json",), ()), "mention": (("--stdin",), ()),
 }
 
 # ---- the pane's picture: the manager's own file in the workspace, else the one the plugin ships ------------------
@@ -2042,7 +2198,27 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
         "health": health_doc(ws, at, errors),
         "habits": {"on": habits.is_on(ws)},
         "quieted": habits.quieted_doc(ws, at),
+        "floor": {"ignore_folders": settings(cfg)["ignore_folders"]},
+        "quiet": quiet_now(cfg, at),
     }
+
+
+def quiet_now(cfg: dict, at: datetime) -> bool:
+    """Inside manager.quiet_hours ("HH:MM-HH:MM" in manager.timezone): the pane notifies only urgent things."""
+    import channels
+    try:
+        return bool(channels.quiet_now(cfg or {}, now=at.timestamp()))
+    except Exception:
+        return False
+
+
+STATUS_SNAPSHOT = "status.json"
+
+
+def save_status(ws: Path, doc: dict) -> None:
+    """`status --json --save`: the same JSON also at .mother/chief/status.json, written atomically, for the pane's
+    fast refresh (it re-reads the file every few seconds, the CLI only every minute)."""
+    _write_atomic(chief_dir(ws) / STATUS_SNAPSHOT, json.dumps(doc, indent=2, ensure_ascii=False))
 
 
 def _usage(msg: str) -> int:
@@ -2244,6 +2420,19 @@ def main(args, ws, cfg, at) -> int:
             print("mother chief ask: %s" % e, file=sys.stderr)
             return EXIT_FAILED
         return EXIT_OK
+    if verb == "mention":
+        if not opts.get("stdin"):
+            return _usage("mention reads {session_id, text, keys, title} from stdin: pass --stdin")
+        try:
+            doc = json.loads(sys.stdin.read())
+        except ValueError as e:
+            return _usage("mention: stdin is not JSON (%s)" % e)
+        try:
+            print(json.dumps(mention(ws, cfg, at, doc)))
+        except ValueError as e:
+            print("mother chief mention: %s" % e, file=sys.stderr)
+            return EXIT_FAILED
+        return EXIT_OK
     if verb == "dots-detail":
         if len(pos) != 1:
             return _usage("dots-detail takes one id (A<n> or M<n>)")
@@ -2331,6 +2520,11 @@ def main(args, ws, cfg, at) -> int:
         return EXIT_OK
     if verb == "status":
         doc = status_doc(ws, cfg, at)
+        if opts.get("save"):
+            try:
+                save_status(ws, doc)
+            except OSError as e:
+                print("status snapshot not written: %s" % e, file=sys.stderr)
         if as_json:
             print(json.dumps(doc, indent=2, ensure_ascii=False))
         else:

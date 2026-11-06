@@ -115,7 +115,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.tick` | map, optional | the hourly pulse behind the Now list (`mother now`); absent = off. `every` (minutes, one of 30, 60, 120, 180, 240; default 60), `active_hours` (`"HH:MM-HH:MM"`, start before end, default `"06:00-22:00"`, in `manager.timezone`; no tick runs outside it), `days` (`workdays` / `all` / a day / list of days; not `monthly:`), `thresholds` (map signal -> `Nh`, `Nd` or `0`, counted in working time; default per signal), `signals` (map signal -> `true`/`false`; all on by default, and a signal whose source connector is `none` is off), `notify` (`none` default, or `dm` = one DM to `manager.chat_dm` for a new on-you item; never while `now.json.quiet`), `slow_every` (integer 1-6, default 3: every Nth slot scans every signal, the others only the on-you signals and `default_branch_red`), `max_age_days` (integer 0-365, default 30: work whose `since` is older is left off the list, except workspace signals; `0` = no cap). Default thresholds: `review_requested` 4h, `unanswered_mention` 2h, `decision_open` 1d, `mail_needs_reply` 4h, `pr_no_reviewer` 1d, `pr_approved_unmerged` 2d, `pr_changes_silent` 3d, `default_branch_red` 2h, `ticket_stalled` 3d, `bug_unowned` 1d, `blocker_cleared` 1d, `outside_question` 4h, `action_item_no_ticket` 1d, the rest 0. Signals: on you `review_requested`, `unanswered_mention`, `decision_open`, `ticket_waiting_on_you`, `mail_needs_reply`, `invite_unanswered`, `promise_due`, `suggestion_waiting`; neglected `pr_no_reviewer`, `pr_approved_unmerged`, `pr_changes_silent`, `default_branch_red`, `ticket_stalled`, `bug_unowned`, `blocker_cleared`, `sprint_at_risk`, `outside_question`, `action_item_no_ticket`, `one_on_one_drift`. Unknown keys or signals fail `mother status`. |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
 | `whatsapp` | map, optional | WhatsApp read and send from the manager's own number (§5d). `enabled` (bool), `self_jid` (the manager's own JID, `<digits>@s.whatsapp.net`; required when `enabled`), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `read`, `send` (bool). Other unknown keys fail. The keys of the earlier design, `allow`, `approve_via` and `max_prompts_per_day`, are accepted with any value and ignored; `mother whatsapp setup` drops them the next time it writes the block, and they are removed one release after WhatsApp ships. The block is written by `mother whatsapp setup`, run by the manager in their own terminal (§5d); the agent never edits it. JIDs are phone numbers: they live in `config.json` and tool output only, never in memory, journal or people files. |
-| `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 3600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `pacing` (map, all optional ints: `hot_seconds` 30-3600, `warm_seconds` 60-7200, `cold_seconds` 300-14400, `dm_max_seconds` 60-3600, `away_seconds` 120-7200, `hot_mine_minutes` 1-1440, `hot_any_minutes` 1-1440, `warm_hours` 1-168, `away_idle_minutes` 1-240, `away_quiet_minutes` 1-240, `backoff_seconds` 10-1800, `outage_minutes` 1-240, `slow_seconds` 300-14400, `max_calls` 4-200, `lookback_seconds` 120-14400, `search_retry_seconds` 600-86400: the chat source's per-conversation tiers, away mode, 429 backoff, search-first discovery and call budget, §5e), `connections` (map from capability `chat|mail|tracker|calendar|code|whatsapp` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required; the `whatsapp` capability takes only `{local: "whatsapp"}`, the local database, and no other capability may use `local`), `watch` (`chat.channels` [id], `chat.discovery` `"search"` (default) or `"poll"`, `chat.read_all` [id], `chat.poll` [id] (§5e Discovery), `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str], `whatsapp.groups` [group JID]; and for every source `every_seconds` (int 30-86400) and `idle_every_seconds` (int 0-86400; 0 = only during working hours), which override the global intervals for that source alone, under `chat|mail|tracker|calendar|code|whatsapp`: e.g. `mail` 3600, `calendar` 900, `tracker` 600, `code` 600, `chat` and `whatsapp` on the defaults. `chat.every_seconds` also paces the pick-up of notes typed in the self-DM inbox and of DMs with people (they are read by the chat source). The hub-lag and stale thresholds (2x the watcher's `every_seconds`) scale with the wake interval, which is the shortest source interval: with every source slow, the hub is judged against that slower beat. None is needed, so `config.example.json` sets none. A calendar checked less often than `calendar.lead_minutes` is allowed; `mother hub check` / `status` only warn). Unknown keys fail `mother status`. |
+| `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 3600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `pacing` (map, all optional ints: `hot_seconds` 30-3600, `warm_seconds` 60-7200, `cold_seconds` 300-14400, `dm_max_seconds` 60-3600, `away_seconds` 120-7200, `hot_mine_minutes` 1-1440, `hot_any_minutes` 1-1440, `warm_hours` 1-168, `away_idle_minutes` 1-240, `away_quiet_minutes` 1-240, `backoff_seconds` 10-1800, `outage_minutes` 1-240, `slow_seconds` 300-14400, `max_calls` 4-200, `lookback_seconds` 120-14400, `search_retry_seconds` 600-86400, `limited_seconds` 60-3600, `limited_calls` 1-50: the chat source's per-conversation tiers, away mode, 429 backoff and what it still reads while backing off, search-first discovery and call budget, §5e), `connections` (map from capability `chat|mail|tracker|calendar|code|whatsapp` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required; the `whatsapp` capability takes only `{local: "whatsapp"}`, the local database, and no other capability may use `local`), `watch` (`chat.channels` [id], `chat.discovery` `"search"` (default) or `"poll"`, `chat.read_all` [id], `chat.poll` [id] (§5e Discovery), `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str], `whatsapp.groups` [group JID]; and for every source `every_seconds` (int 30-86400) and `idle_every_seconds` (int 0-86400; 0 = only during working hours), which override the global intervals for that source alone, under `chat|mail|tracker|calendar|code|whatsapp`: e.g. `mail` 3600, `calendar` 900, `tracker` 600, `code` 600, `chat` and `whatsapp` on the defaults. `chat.every_seconds` also paces the pick-up of notes typed in the self-DM inbox and of DMs with people (they are read by the chat source). The hub-lag and stale thresholds (2x the watcher's `every_seconds`) scale with the wake interval, which is the shortest source interval: with every source slow, the hub is judged against that slower beat. None is needed, so `config.example.json` sets none. A calendar checked less often than `calendar.lead_minutes` is allowed; `mother hub check` / `status` only warn). Unknown keys fail `mother status`. |
 | `routines.<id>` | map | `at` (HH:MM), `days` (`workdays` / `all` / a day / list of days / `monthly:<1-28>`), plus routine-specific options; absent = off |
 | `policy` | map | defaults in `rules/outbound.md`; per-user overrides only tighten |
 | `policy.autonomy` | `"functional"` (default) or `"strict"`, optional | `functional`: commenting on, transitioning and updating existing tracker issues, and code-host writes other than merging or approving, go without a question outside hub-fed sessions (§5, "Functional autonomy"); every other ask stands. `strict`: every ask stands, as before 0.10. Any other value fails `mother status` |
@@ -1175,10 +1175,17 @@ Nothing holds a message body beyond a summary of at most 300 characters, and not
   count}}`; `mother hub status` prints both. **Rate limits.** A 429 (`ratelimited`) from any chat read stops the pass:
   what was read keeps its read time and lines, the rest waits. The cursor's `limited` `{first, last, until, n}`
   holds the backoff: `Retry-After` when the error text carries one (`McpError.retry_after`, read before the text is
-  cut), else `backoff_seconds` (120) doubling per 429 up to 30 minutes; passes before `until` make no call and are
-  `partial` ("rate limited, backing off until …"). One `error` line (key `watcher:chat`, title "chat source rate
-  limited") per outage: a 429 within `outage_minutes` (30) of the last one is the same outage, and a pass without
-  one ends the backoff.
+  cut), else `backoff_seconds` (120) doubling per 429 up to 30 minutes. Passes before `until` skip discovery and
+  search but still read the conversations already known to matter, each at most every `limited_seconds` (300) and
+  at most `limited_calls` (6) calls a pass: the self-DM inbox, followed threads, the mapped DMs, and chat threads with
+  an inbox line in the last 24 hours (`_recent`, `hub.recent_chat_keys`, at most 20); one call each, history or
+  replies, and the cursor's `ts` stays put so nothing between is lost. They are `partial` ("rate limited, backing
+  off until …"); a 429 among them is the same outage and never shortens the wait. While `limited` is set the result
+  carries `degraded` ("rate limited since HH:MM, reading known conversations only", HH:MM in `manager.timezone`),
+  which `watcher.json` keeps on the source, `mother hub status` prints and the Health tab shows. One `error` line
+  (key `watcher:chat`, title "chat source rate limited") per outage: a 429 within `outage_minutes` (30) of the last
+  one is the same outage, and a pass without one ends the backoff and clears `degraded`. `mother hub check <source>`
+  checks one connection.
   **Who.** A chat message's author is the first of `user`, `user_id`, `username` and `bot_profile.name`; that raw id
   is what the manager and mapped-DM checks compare, and the line's `who` is `Name <U…>` when the id is a person in
   config (`teams[].people[].chat` with a `name`), else the raw id (mute by user id still matches the `<…>` part).
@@ -1280,8 +1287,9 @@ with a cheap model's triage), and the **Chief pane** shows what needs the manage
 long-lived chief session kept alive by launchd and tmux, headless `claude -p` workers and a decision queue posted to
 the manager's self-DM; all of that is gone. Work happens in visible desktop sessions. Config: the optional `chief`
 block (§3), keys `daily_budget_usd` (20), `tldr_model` and `triage_model` (both `sonnet`; `opus` is the one other
-value, anything else reads as `sonnet`) and `refresh_minutes` (5; a whole number 1-60: how often the leading session
-re-reads each session for its card, "Session refresh" below). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
+value, anything else reads as `sonnet`), `refresh_minutes` (5; a whole number 1-60: how often the leading session
+re-reads each session for its card, "Session refresh" below) and `ignore_folders` (`[]`; absolute or `~/` paths: a
+pinned session under one gets no `Waiting on:` instruction, "Waiting on" below). The keys of the removed layer (`max_workers`, `run_minutes`, `chief_model`,
 `worker_model`, `tick_seconds`, `batch_minutes`, `decision_hours`) are accepted and ignored, so an older
 `config.json` still loads; any other unknown key is a validation error, as before.
 
@@ -1290,7 +1298,7 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   (`{"YYYY-MM-DD": usd}` in the configured timezone, the last 14 days). `desktop.json` (`{at, sessions: [{session_id,
   cli_session_id, title, cwd, link}]}`: the pinned desktop sessions, written only by `mother chief pinned --stdin`).
   `desktop-cache.json` (fields read from the app's session files, keyed by mtime and size), `tldr.json` (the pane's
-  TL;DRs) and `PAUSED` (the chief-only switch). Every write is a temp-file rename; spend, `desktop.json` and
+  TL;DRs), `status.json` (the last `status --json --save`, for the fast refresh) and `PAUSED` (the chief-only switch). Every write is a temp-file rename; spend, `desktop.json` and
   `tldr.json` take `hub.locked`. **What the removed layer left** (`chief.json`, `wake.json`, `queue.jsonl`,
   `decisions.json`, `run/`, `logs/`, `keeper.*`, and worker rows in `sessions.json`, the entries with `kind: "cli"`)
   is never read and never crashes anything. A worker row that still reads `live` is marked `dropped` on the next
@@ -1352,7 +1360,7 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   driven.
 - **`ChiefStatus`** (`status --json`, version 1, `types/index.d.ts`): `{version, at, paused, chief: {alive,
   heartbeat_at}, budget: {spent, limit, unreadable, over}, desktop: [{session_id, cli_session_id, title, cwd, repo,
-  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard, health}`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
+  last_activity_at, last_report, open_link}], led_by, inbox, inbox_count, guard, health, quiet}`. `quiet` is true inside `manager.quiet_hours`. `guard` is `on`, `off` (.mother/GUARD_OFF) or `paused` (.mother/PAUSED, which wins); an inbox item also carries `source` (its key's kind), `who` (the person its newest line names) and `label` (what a card shows in place of the raw key: a configured channel name, the person, `chat thread`, `mail thread`, `calendar`, or a tracker / code key as it is). `alive` is a heartbeat under 120 s old;
   `led_by` is that heartbeat's `session_id` while it is alive, else null. `desktop` is the snapshot rows still live in
   the app (`last_report` is the first 200 characters of the last turn report). `spent` reads 0 when `spend.json` is
   unreadable; `unreadable` is then true, and `over` (spent at the limit, or unreadable) says no model call is made.
@@ -1362,9 +1370,9 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   `watcher:<source>` (a source the watcher could not read) is not work: it is left out of both and listed in `health`.
   The text form (`status`) prints who leads, the budget, and the pinned and inbox counts.
 - **`health`** (in `status --json`; `health_doc`), so the pane reads no more files: `{guard, watcher, watcher_errors,
-  watcher_error_count, undelivered}`. `guard` is `paused` (`.mother/PAUSED`, which wins), `off` (`.mother/GUARD_OFF`)
+  watcher_error_count, undelivered, access}`. `guard` is `paused` (`.mother/PAUSED`, which wins), `off` (`.mother/GUARD_OFF`)
   or `on`. `watcher` is null when `.mother/hub/watcher.json` has no `at`, else `{at, every_seconds, active, stale,
-  sources: {<name>: {status, reason, since, at}}}`, `stale` as `mother hub status` judges it (in active hours and older
+  sources: {<name>: {status, reason, since, at, degraded?}}}`, `stale` as `mother hub status` judges it (in active hours and older
   than twice the interval). `watcher_errors` are the `watcher:` updates in the Inbox item shape, newest first, at most
   20. `undelivered` lists `<workspace>/.mother/<routine>-unsent-<YYYY-MM-DD>.md`, the routine reports that could not
   be delivered to the manager's DM: `[{name, routine, date, bytes}]`, newest first, at most 20, plain files only.
@@ -1398,7 +1406,30 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   `open_session_in` with the `local_…` id and `target: "focus"`, and counts it opened only when the answer says so:
   an error, a timeout, an empty answer or a refusal without an error ("only…", "cannot…", "changes nothing";
   "already" counts as shown) fills the prompt with a request to open it instead and says why.
-- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | expand | collapse | skin dark|dark-app|plain|status | tab <name>]`; the mod polls once a minute; drawn
+- **The fast refresh** (`hooks/fastloop.ts`). `status --json --save`, the pane's minute read, also writes the same JSON
+  to `.mother/chief/status.json` (temp-file rename). While the pane is shown, a 5 s loop stats that file,
+  `heartbeat.json` and `.mother/floor/*.json` with `$.fs`; only when a size or mtime moved does it re-read them and
+  redraw. `status.json` and `heartbeat.json` are read directly; a moved floor card re-reads through `mother floor list`,
+  the one place cards are validated. No model call, no tick; the loop stops itself when the pane is hidden, and the
+  minute pass or `/chief open` starts it again.
+- **What just changed** (`hooks/events.ts`). Each read is diffed in code against the one before: a new question > an
+  urgent Inbox item > a source down > a session finished or stuck > a new Inbox item > a source back. One event is
+  kept and drawn under the mood line, dim with a coloured dot, for 15 minutes or until one of equal or higher priority
+  replaces it. Warning-level events (a source down, a session stuck) cool down for 30 minutes per subject. The first
+  read after a start only seeds the snapshot, so nothing replays.
+- **Notifications** (`hooks/notify.ts`, `/chief notify on|off|status`, on by default; store `chiefNotifyOff`). The
+  leading session (`led_by`) raises `$.ui.notify`, title `Mother`, one line, once per new question (`ask:<ask_id>`),
+  urgent Inbox item (`urgent:<id>`), source down (`down:<source>:<since>`) and chase card (`notifyOnce`), at most 3 a
+  pass. What was raised is in the store (`chiefNotified`, 14 days, at most 400), so neither a reload nor a change of
+  leader repeats it; a store that never held the key is seeded silently. Inside `manager.quiet_hours` (`status.quiet`)
+  only urgent items are raised; the rest is remembered as seen and not raised later.
+- **Sign-in and network cards** (`hooks/access.tsx`). `health.access` is `[{source, kind: signin|network, reason, help,
+  since}]`: a source down (`couldnt_check`), or an open `watcher:<source>` line for one not read as ok or partial, whose
+  error matches the one list `lib/chief.py ACCESS_PATTERNS`. Each is a Needs you card at the top: `Sign-in needed:
+  <source>` or `Network: <source> unreachable`, the short reason, **Retry** (coral: `mother hub check <source>`, then
+  `mother hub refresh` when it answers, then the status again) and **How to fix** (folded). A card goes when the
+  watcher reads the source again.
+- **The pane** (`/chief [open | status | pause | resume | habits on|off|status | notify on|off|status | expand | collapse | skin dark|dark-app|plain|status | tab <name>]`; the mod polls once a minute; drawn
   by `hooks/chief.tsx` with the frames, badges and strip of `hooks/pane_ui.tsx`, in the skin of `hooks/skin.tsx`).
   **The skin**: on the desktop app the pane is one dark panel (the banner its first row, cropped to its width) with
   dark cards (the border coloured by kind; the selected card's bold and coral), light text, rounded badges and filled
@@ -1523,6 +1554,20 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   Inbox after 10 minutes. A key that already has an open item is not held (`update_id` names it: its card stays and
   the new session claims it as any case); a key a live case holds gets no second session (`owned_by`: the hub routes
   the line there). Empty input runs nothing and shows "Type what you need first".
+- **Ask box routing** (`hooks/ask_route.ts`). Before a case, the text is routed; only a case takes the path above.
+  Read in code: `tell|ask <session> …` (the longest leading words that name one session: a case key, `also` or label,
+  a CLI id's first characters, the title, words of the title), `status of <session>`, `hide|show <session>`, `open <key
+  or session>`, `pause|resume`, `why <key>`. Anything else is one model call (`triage_model`, counted, none over budget):
+  the floor as JSON data (sessions with id, title, state, waiting on and TL;DR; Needs you questions; inbox titles; Today's
+  Top 3) under a fixed note, replying `{"kind": "answer", "text"}`, `{"kind": "tell", "session", "text"}`, `{"kind":
+  "status", "session"}` or `{"kind": "case", …}`. A session must be on the floor; a failed, off-shape or unknown reply is a
+  case, always from the manager's own words (the model's title and prompt are not used). The result draws in a
+  dim-bordered card under the field: `Route: <route> · read in code | one model call`, the text, Dismiss. `tell` goes
+  through the pane's send (same prefix, same guard); text with a risky word (merge, master, main, prod, deploy, release,
+  rollout, rollback, delete, drop, force, send, post, publish, email, payment; whole words, any case) or a URL to anything
+  but a local or `.test` host waits on `Send anyway?` with Send and Cancel. `status` uses the stored card and refreshes
+  it; it types nothing into the session. Every route logs `ask`. `hide` keeps a CLI id in the plugin's store
+  (`chiefHidden`): the pane draws that session nowhere until `show`.
 - **More than one key per case.** `claim --stdin` takes `also: [keys]`, kept in the row's `also`, so lines of those
   keys route to the same session. `mother chief watch-key <key> --for <session id>` adds one key to a live case that
   session holds; both refuse an off-shape key and a key live in another session whose row is under 7 days old, and
@@ -1565,6 +1610,45 @@ re-reads each session for its card, "Session refresh" below). The keys of the re
   card: <progress>`, `updated Nm ago`, and on a done case session `Close case` (`close-case` for each of its keys).
   Sessions sort waiting on you, stuck, working, waiting on others, idle, done; a state that differs from the one a
   session had when the Sessions tab was last opened or left marks that tab.
+### Waiting on, Done cards, claims from what the manager names (`hooks/waiting.ts`, `hooks/archive.ts`, `lib/floor.py`)
+
+- **The line.** A pinned session's own mod adds one `session`-scope section, last, to its system prompt (`prompt.compose`,
+  id `mother:waiting-on`) asking it to end every turn with `Waiting on: the manager — …`, `Waiting on: <who> — …` or
+  `Waiting on: nothing — done`. Not for a session running under the cos skill (a claimed case, which has it there; a
+  row with `origin: "mention"` is not one), a cwd under `chief.ignore_folders`, or after `/chief floor off` (per session,
+  plugin store `chiefFloorOff`; `/chief floor on|status`). `status --json` carries `floor: {ignore_folders}`.
+- **The wait.** A turn-end card passes the final message's last 2000 characters as `waiting_text`; `mother floor card`
+  reads its last line in code (`waiting_line`, the parser the refresh uses) into the card's `waiting: {kind: manager |
+  other | nothing, who, what, since}`. `since` holds while the same who (any case) and what repeat; a new wait starts now and
+  loses its marks. A card written with no such line keeps the wait it had. `tldr --stdin` also records a transcript's line
+  there (`note_waiting`), for a session whose mod is not running. A caller cannot set `waiting` or `done_kept` directly.
+  Over budget a turn with no `wrap_up` writes no card, so its line waits for the next refresh.
+- **Check due.** `floor list` adds `waiting.check_due`: waiting on someone other than the manager for over 24 hours, with no
+  re-check in the last 24 (computed on each read, so every pane shows it). The session's card shows a `check due` badge and
+  `Check now`, which `mother floor mark --stdin` `{session_id, mark: "checked"}` counts (exit 1 within 24 hours) and then
+  sends a short read-only instruction; never while the card says running.
+- **Chase card.** Waiting on someone for 3 days: a Needs you card `Waiting N days on <who>: <what>`, with `Draft a nudge`
+  (coral: asks the session for a draft, never a send, then as Keep waiting), `Keep waiting` (mark `keep`: `snooze_until`
+  3 days on) and `Drop it` (mark `drop`: no chase for this wait). The leader raises one desktop notification per session
+  and who/what (`notifyOnce`); a Done card raises none. Needs you orders sign-in cards, questions, chase cards, Done cards;
+  its count holds the first two, and the mood line puts chase and Done under urgent items and Health, above working sessions.
+- **Done card.** `waiting.kind` `nothing`, not asking, not running, and 10 minutes since the card's `at` and the app's last
+  activity: a Needs you card (and on its session card a `done` badge with the same pills): `Archive` (coral), `Keep` (mark
+  `done-keep`: `done_kept` = the card's `at`, so the next write brings it back).
+- **Archive.** `ccd_sidebar set_pinned false` (an archive refuses a pinned session), then `ccd_session_mgmt archive_session`.
+  Refused or unreachable: unpinned, else neither, and either way hidden from the floor; the toast says which. A row under
+  the header strip offers `Undo` for 10 seconds: `unarchive_session`, `set_pinned true`, unhide, whichever applied. A case
+  session's case closes (`close-case`) only after those 10 seconds, and not if undone.
+- **Claims from what the manager names.** A prompt with origin `composer` or `bridge`, not meta and not a command, not
+  starting with a frame of ours (`Mother case:`, `Mother relay:`, the pane's prefix), in a pinned or case session, runs
+  `mother chief mention --stdin` `{session_id, text, title}`: chat message links, tracker keys and PRs, at most 5, join that
+  session's case, which is made (`origin: "mention"`, no inbox item needed) when it has none. A key live in another session
+  under 7 days old is refused (`{added, refused}`).
+- **Send to X.** An Inbox card whose key a live session holds, or that names a ticket or PR that exactly one session's
+  title, TL;DR, case keys or links name, shows `Send to <session>` as its coral pill. It sends the item framed as a relay
+  (other people's words), runs `mention` with `keys: [key]` (the item carries the case from then on, and later lines route
+  there), and the card says `sent to <session>`.
+
 ### Habits: learning from what the manager does (`lib/habits.py`, `hooks/habits.ts`, `mother chief act-log|habits`)
 
 The pane logs what the manager does with each card, code counts it, and triage uses the counts: as a hint to the
@@ -1668,7 +1752,7 @@ Every session runs its own copy of the mod, so each pinned session reports on it
   most 80 characters or null, `at` when the question was first asked: the same question written again over a card
   that still asks it keeps that `at`. `ask_id` is a hash of the question and `at`, computed again on every read and
   never taken from the file. Machine-local, never synced.
-- **Verbs.** `mother floor card --stdin` takes `{session_id, asks, question, options, waiting_on}`, cuts each text to
+- **Verbs.** (`mother floor mark --stdin`: "Waiting on" above.) `mother floor card --stdin` takes `{session_id, asks, question, options, waiting_on}`, cuts each text to
   its cap and writes the card atomically; a `session_id` that isn't `^[0-9a-f-]{36}$` exits 2 and writes nothing.
   `mother floor list --json` prints `{version: 1, cards: [...]}` oldest first, skips unreadable files and deletes
   cards older than 7 days.

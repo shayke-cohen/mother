@@ -188,5 +188,101 @@ class FloorTest(unittest.TestCase):
         self.assertEqual(floor.repo_facts(str(wt)), {"branch": "side", "repo": "o/r", "repo_url": "https://github.com/o/r"})
 
 
+class WaitingTest(unittest.TestCase):
+    """The card's `waiting` (CONTRACT §5g "Waiting on"): parsed from the final message, `since` kept while it repeats."""
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ws = Path(self._tmp.name)
+
+    def card(self, at, text=None, **more):
+        doc = {"session_id": SID, "asks": False, "question": "", "options": [], "waiting_on": None, **more}
+        if text is not None:
+            doc["waiting_text"] = text
+        return floor.write_card(self.ws, at, doc)
+
+    def listed(self, at):
+        return {c["session_id"]: c for c in floor.list_cards(self.ws, at)}
+
+    def test_parses_the_last_line_in_each_form(self):
+        self.assertEqual(self.card(AT, "done the fix.\nWaiting on: Dana — the API key")["waiting"],
+                         {"kind": "other", "who": "Dana", "what": "the API key", "since": floor._iso(AT)})
+        self.assertEqual(self.card(AT, "Waiting on: the manager — pick a name")["waiting"]["kind"], "manager")
+        self.assertEqual(self.card(AT, "Waiting on: nothing — done")["waiting"]["kind"], "nothing")
+        self.assertEqual(floor.waiting_line("Waiting on: Dana — x\nmore text"), None)   # only the last line counts
+
+    def test_since_is_kept_while_the_same_wait_repeats(self):
+        self.card(AT, "Waiting on: Dana — the API key")
+        later = AT + timedelta(hours=5)
+        self.assertEqual(self.card(later, "ok\nWaiting on: dana — the API key")["waiting"]["since"], floor._iso(AT))
+        self.card(later + timedelta(minutes=1))                         # the manager typed: no text, the wait stays
+        self.assertEqual(self.listed(later)[SID]["waiting"]["since"], floor._iso(AT))
+        self.card(later, "turn with no line")                            # a turn that forgot the line keeps it too
+        self.assertEqual(self.listed(later)[SID]["waiting"]["since"], floor._iso(AT))
+        moved = self.card(later, "Waiting on: Dana — the signed contract")["waiting"]   # what changed: a new wait
+        self.assertEqual(moved["since"], floor._iso(later))
+        self.assertEqual(self.card(later, "Waiting on: Sam — the signed contract")["waiting"]["since"], floor._iso(later))
+
+    def test_a_caller_cannot_set_the_wait_or_its_marks(self):
+        got = self.card(AT, None, waiting={"kind": "other", "who": "X", "what": "y", "since": "2020-01-01T00:00:00Z"},
+                        done_kept=floor._iso(AT))
+        self.assertNotIn("waiting", got)
+        self.assertNotIn("done_kept", got)
+
+    def test_check_due_after_24_hours_and_once_a_day(self):
+        self.card(AT, "Waiting on: Dana — the API key")
+        self.assertFalse(self.listed(AT + timedelta(hours=23))[SID]["waiting"]["check_due"])
+        day = AT + timedelta(hours=25)
+        self.assertTrue(self.listed(day)[SID]["waiting"]["check_due"])
+        self.assertEqual(floor.mark(self.ws, day, {"session_id": SID, "mark": "checked"})["mark"], "checked")
+        self.assertFalse(self.listed(day)[SID]["waiting"]["check_due"])
+        with self.assertRaisesRegex(ValueError, "last 24 hours"):
+            floor.mark(self.ws, day + timedelta(hours=2), {"session_id": SID, "mark": "checked"})
+        self.assertTrue(self.listed(day + timedelta(hours=24))[SID]["waiting"]["check_due"])
+        self.card(day, "Waiting on: the manager — a yes")                 # waiting on the manager is never re-checked
+        self.assertFalse(self.listed(day + timedelta(days=3))[SID]["waiting"]["check_due"])
+
+    def test_marks_keep_the_cards_time_and_reset_with_a_new_wait(self):
+        written = self.card(AT, "Waiting on: Dana — the API key")["at"]
+        floor.mark(self.ws, AT + timedelta(days=3), {"session_id": SID, "mark": "keep"})
+        floor.mark(self.ws, AT + timedelta(days=3), {"session_id": SID, "mark": "drop"})
+        c = self.listed(AT + timedelta(days=3))[SID]
+        self.assertEqual((c["at"], c["waiting"]["snooze_until"], c["waiting"]["dropped"]),
+                         (written, floor._iso(AT + timedelta(days=6)), True))
+        self.card(AT + timedelta(days=4), "Waiting on: Dana — the API key")   # the same wait: marks stay
+        self.assertTrue(self.listed(AT + timedelta(days=4))[SID]["waiting"]["dropped"])
+        self.card(AT + timedelta(days=4), "Waiting on: Dana — a review")      # a new one: none
+        self.assertNotIn("dropped", self.listed(AT + timedelta(days=4))[SID]["waiting"])
+
+    def test_done_keep_lasts_until_the_session_moves(self):
+        c = self.card(AT, "Waiting on: nothing — done")
+        floor.mark(self.ws, AT + timedelta(minutes=11), {"session_id": SID, "mark": "done-keep"})
+        self.assertEqual(self.listed(AT + timedelta(minutes=11))[SID]["done_kept"], c["at"])
+        self.card(AT + timedelta(minutes=20))                             # it moved: the mark is gone
+        self.assertNotIn("done_kept", self.listed(AT + timedelta(minutes=20))[SID])
+
+    def test_mark_refusals_and_cli(self):
+        for doc, why in (({"session_id": "x", "mark": "keep"}, "36-character"), ({"session_id": SID, "mark": "nope"}, "mark must"),
+                         ({"session_id": SID, "mark": "keep"}, "no card")):
+            with self.assertRaisesRegex(ValueError, why):
+                floor.mark(self.ws, AT, doc)
+        self.card(AT)
+        with self.assertRaisesRegex(ValueError, "waits on nothing"):
+            floor.mark(self.ws, AT, {"session_id": SID, "mark": "keep"})
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": SID, "mark": "done-keep"}))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(floor.main(["mark", "--stdin"], self.ws, {}, AT), 0)
+        self.assertEqual(json.loads(out.getvalue())["mark"], "done-keep")
+
+    def test_note_waiting_from_a_transcript(self):
+        floor.note_waiting(self.ws, AT, SID, {"state": "waiting_other", "on": "Dana", "what": "the key"})
+        c = self.listed(AT)[SID]
+        self.assertEqual((c["asks"], c["waiting"]["who"], c["waiting"]["since"]), (False, "Dana", floor._iso(AT)))
+        floor.note_waiting(self.ws, AT + timedelta(hours=1), SID, {"state": "waiting_other", "on": "Dana", "what": "the key"})
+        self.assertEqual(self.listed(AT)[SID]["waiting"]["since"], floor._iso(AT))
+        self.assertIsNone(floor.note_waiting(self.ws, AT, "bad", {"state": "done", "on": None, "what": ""}))
+
+
 if __name__ == "__main__":
     unittest.main()

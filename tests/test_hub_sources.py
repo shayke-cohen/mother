@@ -160,6 +160,7 @@ class TestPacing(unittest.TestCase):
 
     def setUp(self):
         self.history = {}
+        self.replies = {}  # "<channel>/<thread ts>" -> the thread's messages
         self.error = None  # an McpError every call raises once set
 
     def client(self):
@@ -174,7 +175,11 @@ class TestPacing(unittest.TestCase):
             if self.error:
                 raise self.error
             return {"ok": True, "messages": {"matches": []}}
-        return ro({"get_channel_history": hist, "get_thread_replies": lambda a: {"messages": []},
+        def reps(a):
+            if self.error:
+                raise self.error
+            return {"messages": self.replies.get("%s/%s" % (a["channel_id"], a["thread_ts"]), [])}
+        return ro({"get_channel_history": hist, "get_thread_replies": reps,
                    "search-messages": srch}, hs.ChatSlack.READ_TOOLS)
 
     def poll(self, cursor, at, **cfg):
@@ -291,15 +296,80 @@ class TestPacing(unittest.TestCase):
         self.assertEqual([(l["key"], l["title"]) for l in errs], [("watcher:chat", "chat source rate limited")])
         self.assertTrue(any("429" in x for x in out["partial"]))
         self.assertEqual(out["cursor"]["limited"]["until"], NOW + 150)
-        out2, f = self.poll(out["cursor"], AT + timedelta(minutes=2, seconds=20))  # inside Retry-After: no call
-        self.assertEqual(f.calls, [])
-        self.assertEqual(out2["cursor"], out["cursor"])
+        # inside Retry-After: no search and no channel, only the known conversations that are due (the inbox; the
+        # DM was read 2 min ago), and the 429 it meets again is the same outage
+        out2, f = self.poll(out["cursor"], AT + timedelta(minutes=2, seconds=20))
+        self.assertEqual(self.read(f), [self.INBOX])
+        self.assertFalse(self.searched(f))
+        self.assertEqual([l for l in out2["lines"] if l["kind"] == "error"], [])
+        self.assertGreaterEqual(out2["cursor"]["limited"]["until"], out["cursor"]["limited"]["until"])
+        self.assertEqual(out2["cursor"]["ts"], out["cursor"]["ts"])  # the cursor's time stays put while backing off
         out, f = self.poll(out["cursor"], AT + timedelta(minutes=4))  # still 429: same outage, no second line
         self.assertEqual([l for l in out["lines"] if l["kind"] == "error"], [])
         self.error = None
         out, f = self.poll(out["cursor"], AT + timedelta(minutes=6))  # it recovers
         self.assertNotIn("limited", out["cursor"])
         self.assertEqual(out["partial"], [])
+
+    @staticmethod
+    def threads_read(f):
+        return ["%s/%s" % (a["channel_id"], a["thread_ts"]) for n, a in f.calls if n.endswith("get_thread_replies")]
+
+    def test_429_backing_off_still_reads_known_conversations_and_says_degraded(self):
+        followed, recent = "%s/1788000000.000100" % self.CH, "%s/1788000000.000200" % self.CH
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT, follow=[followed])
+        self.error = McpErrorAlias("other", "status code 429", retry_after=600)
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=2), follow=[followed], _tz="UTC")
+        self.assertEqual(out["degraded"], "rate limited since 10:02, reading known conversations only")
+        self.error = None  # the server would answer now, but Retry-After still holds: only known conversations
+        self.history[self.DM] = [msg(NOW + 400, user="U00000002", text="dm while limited")]
+        self.replies[followed] = [msg(NOW + 410, text="reply in a followed thread")]
+        self.replies[recent] = [msg(NOW + 420, text="reply in a thread with an inbox line")]
+        self.history[self.CH] = [msg(NOW + 430, text="channel news")]
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=8), follow=[followed], _recent=[recent], _tz="UTC")
+        self.assertEqual(sorted(self.read(f)), sorted([self.DM, self.INBOX]))  # the watched channel waits
+        self.assertEqual(sorted(self.threads_read(f)), sorted([followed, recent]))
+        self.assertFalse(self.searched(f))
+        self.assertEqual(sorted(l["title"] for l in out["lines"]),
+                         ["dm while limited", "reply in a followed thread", "reply in a thread with an inbox line"])
+        self.assertIn("degraded", out)
+        self.assertTrue(any("backing off" in x for x in out["partial"]))
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=9), follow=[followed], _recent=[recent])
+        self.assertEqual(f.calls, [])  # each known conversation at most every limited_seconds
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=13), follow=[followed], _recent=[recent])
+        self.assertNotIn("degraded", out)  # Retry-After passed and a whole pass ran without a 429: recovered
+        self.assertNotIn("limited", out["cursor"])
+        self.assertIn("channel news", [l["title"] for l in out["lines"]])  # what the known pass skipped is not lost
+
+    def test_backing_off_a_read_that_fails_is_partial_and_the_rest_is_read(self):
+        gone = "%s/1788000000.000300" % self.CH
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        self.error = McpErrorAlias("other", "status code 429", retry_after=900)
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=2))
+        self.error = None
+        client, f = self.client()
+        real = client.call
+
+        def call(name, args):
+            if name.endswith("get_thread_replies"):
+                raise McpErrorAlias("other", "thread_not_found")
+            return real(name, args)
+        client.call = call
+        got = hs.ChatSlack.poll(client, out["cursor"], {"channels": [self.CH], "dms": {"U00000002": self.DM}, "inbox": self.INBOX,
+                                                        "discovery": "poll", "_recent": [gone]}, ME, AT + timedelta(minutes=8))
+        self.assertTrue(any(x.startswith(gone) for x in got["partial"]))
+        self.assertEqual(sorted(self.read(f)), sorted([self.DM, self.INBOX]))
+        self.assertIn("degraded", got)
+
+    def test_backing_off_keeps_to_the_small_call_budget(self):
+        out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)
+        self.error = McpErrorAlias("other", "status code 429", retry_after=900)
+        out, _ = self.poll(out["cursor"], AT + timedelta(minutes=2))
+        self.error = None
+        many = ["%s/17880000%02d.000100" % (self.CH, i) for i in range(10)]
+        out, f = self.poll(out["cursor"], AT + timedelta(minutes=8), _recent=many)
+        self.assertEqual(len(f.calls), hs.PACING["limited_calls"])
+        self.assertIn("degraded", out)
 
     def test_429_without_retry_after_backs_off_exponentially_and_a_later_outage_alerts_again(self):
         out, _ = self.poll({"ts": "%.6f" % (NOW - 120), "threads": {}}, AT)

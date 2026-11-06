@@ -86,13 +86,15 @@ class TestPausedSettings(Base):
 
     def test_settings_defaults_and_overrides(self):
         s = chief.settings({})
-        self.assertEqual(s, {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5})
+        self.assertEqual(s, {"daily_budget_usd": 20, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5,
+                             "ignore_folders": []})
         self.assertEqual([chief.settings({"chief": {"refresh_minutes": v}})["refresh_minutes"] for v in (1, 60, 0, 61, "5", True, 2.5)],
                          [1, 60, 5, 5, 5, 5, 5])
         self.assertEqual(chief.settings({"chief": {"triage_model": "gpt"}})["triage_model"], "sonnet")
         self.assertEqual(chief.settings({"chief": {"triage_model": "opus"}})["triage_model"], "opus")
         s = chief.settings({"chief": {"daily_budget_usd": 5, "max_workers": 5, "batch_minutes": 30, "bogus": 1}})
-        self.assertEqual(s, {"daily_budget_usd": 5, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5})
+        self.assertEqual(s, {"daily_budget_usd": 5, "tldr_model": "sonnet", "triage_model": "sonnet", "refresh_minutes": 5,
+                             "ignore_folders": []})
 
 
 def line(**kw):
@@ -604,7 +606,7 @@ class TestMain(Base):
         self.assertEqual(code, 0)
         doc = json.loads(out)
         self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "led_by", "inbox",
-                                    "inbox_count", "cases", "relay", "guard", "health", "habits", "quieted"})
+                                    "inbox_count", "cases", "relay", "guard", "health", "habits", "quieted", "floor", "quiet"})
         self.assertEqual((doc["habits"], doc["quieted"]), ({"on": True}, {"count_7d": 0, "recent": []}))
         self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))
         self.assertEqual(doc["desktop"], [])                    # no snapshot yet
@@ -681,7 +683,8 @@ class TestHealth(Base):
 
     def test_health_of_an_empty_workspace(self):
         self.assertEqual(chief.status_doc(self.ws, {}, AT)["health"], {
-            "guard": "on", "watcher": None, "watcher_errors": [], "watcher_error_count": 0, "undelivered": []})
+            "guard": "on", "watcher": None, "watcher_errors": [], "watcher_error_count": 0, "undelivered": [],
+            "access": []})
 
     def test_guard_states_and_paused_wins(self):
         state = self.ws / ".mother"
@@ -720,6 +723,72 @@ class TestHealth(Base):
         with hub.locked(self.ws):   # outside active hours an old poll is not stale
             hub.save_json(self.ws, "watcher.json", {"at": hub._iso(AT - timedelta(hours=9)), "active": False})
         self.assertIs(chief.status_doc(self.ws, {}, AT)["health"]["watcher"]["stale"], False)
+
+    def test_access_kind_names_each_pattern(self):
+        signin = ["token expired", "HTTP 401", "403 Forbidden", "Unauthorized", "invalid_auth", "needs_auth",
+                  "the session has expired", "invalidated: reconnect it from connector settings",
+                  "please re-authenticate", "credentials were rejected", "auth token revoked", "sign in again"]
+        network = ["VPN is not connected", "connect ECONNREFUSED 10.0.0.1:443", "getaddrinfo ENOTFOUND host",
+                   "request timed out", "timeout after 30s", "no reply to tools/call within 30s", "host unreachable",
+                   "fetch failed", "network error", "DNS lookup failed", "connection reset by peer"]
+        for t in signin:
+            self.assertEqual(chief.access_kind(t), "signin", t)
+        for t in network:
+            self.assertEqual(chief.access_kind(t), "network", t)
+        for t in ("status code 429 ratelimited", "server exited", "missing read tools: x", "", None, "bad json"):
+            self.assertIsNone(chief.access_kind(t), t)
+
+    def watcher(self, **sources):
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "watcher.json", {"at": hub._iso(AT), "every_seconds": 120, "active": True,
+                                                    "sources": sources})
+
+    def test_access_cards_from_a_down_source_and_clear_when_it_is_healthy(self):
+        self.watcher(mail={"status": "couldnt_check", "reason": "401 token expired", "since": "2026-11-01T07:00:00Z"},
+                     tracker={"status": "couldnt_check", "reason": "no reply to tools/list within 30s"},
+                     code={"status": "couldnt_check", "reason": "server exited"},
+                     chat={"status": "partial", "reason": "DMs: unreachable"})
+        got = chief.status_doc(self.ws, {}, AT)["health"]["access"]
+        self.assertEqual([(a["source"], a["kind"]) for a in got], [("mail", "signin"), ("tracker", "network")])
+        self.assertEqual(got[0]["reason"], "401 token expired")
+        self.assertIn("Sign in", got[0]["help"])
+        self.assertIn("VPN", got[1]["help"])
+        self.watcher(mail={"status": "ok"}, tracker={"status": "ok"})
+        self.assertEqual(chief.status_doc(self.ws, {}, AT)["health"]["access"], [])
+
+    def test_access_cards_from_watcher_error_lines(self):
+        with hub.locked(self.ws):
+            hub.save_json(self.ws, "hub.json", {"version": 1, "updates": [
+                {"id": "U1", "key": "watcher:calendar", "title": "calendar source unreachable",
+                 "why": "connect ECONNREFUSED", "link": None, "at": hub._iso(AT), "state": "open"},
+                {"id": "U2", "key": "watcher:mail", "title": "mail source unreachable", "why": "Unauthorized",
+                 "link": None, "at": hub._iso(AT), "state": "open"}]})
+        self.watcher(mail={"status": "ok"})   # mail reads again: its old error line is no card
+        got = chief.status_doc(self.ws, {}, AT)["health"]["access"]
+        self.assertEqual([(a["source"], a["kind"]) for a in got], [("calendar", "network")])
+
+    def test_degraded_reaches_the_health_watcher_row(self):
+        self.watcher(chat={"status": "partial", "reason": "rate limited, backing off until x",
+                           "degraded": "rate limited since 09:58, reading known conversations only"})
+        w = chief.status_doc(self.ws, {}, AT)["health"]["watcher"]
+        self.assertEqual(w["sources"]["chat"]["degraded"], "rate limited since 09:58, reading known conversations only")
+
+    def test_quiet_follows_the_managers_quiet_hours(self):
+        cfg = {"manager": {"timezone": "UTC", "quiet_hours": "20:00-07:00"}}
+        self.assertIs(chief.status_doc(self.ws, cfg, AT.replace(hour=21))["quiet"], True)
+        self.assertIs(chief.status_doc(self.ws, cfg, AT.replace(hour=12))["quiet"], False)
+        self.assertIs(chief.status_doc(self.ws, {}, AT.replace(hour=21))["quiet"], False)
+
+    def test_status_save_writes_the_same_json(self):
+        code, out, _ = self.main("status", "--json", "--save")
+        self.assertEqual(code, 0)
+        saved = (chief.chief_dir(self.ws) / "status.json").read_text()
+        self.assertEqual(json.loads(saved), json.loads(out))
+        self.assertEqual(json.loads(saved)["floor"], {"ignore_folders": []})   # the fast loop reads the session half's fields too
+        self.assertEqual([p.name for p in chief.chief_dir(self.ws).iterdir() if p.name.endswith(".tmp")], [])
+        (chief.chief_dir(self.ws) / "status.json").unlink()
+        self.main("status", "--json")   # without --save nothing is written
+        self.assertFalse((chief.chief_dir(self.ws) / "status.json").exists())
 
     def test_undelivered_lists_matching_files_newest_first(self):
         self.unsent("brief-unsent-2026-10-30.md", "old\n")
@@ -1877,3 +1946,52 @@ class TestHabits(Base):
         self.assertNotIn("summary", rows[0])
         note = chief.status_doc(self.ws, self.CFG, AT)["inbox"][0]["habit_note"]
         self.assertEqual((len(note), note.startswith("usually ignored x")), (80, True))
+
+
+class TestMention(TestCases):
+    """Keys the manager names to a session join its case (CONTRACT §5g "Claims from what the manager names")."""
+
+    def main(self, *args, stdin=""):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+            code = chief.main(list(args), self.ws, {}, AT)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_typed_prompts_keys_make_a_case_for_a_pinned_session(self):
+        text = ("look at https://acme.slack.com/archives/C00000001/p1700000000123456 and PLAT-7, also "
+                "https://github.com/acme/api/pull/12")
+        self.assertEqual(chief.mention_keys(text), ["C00000001/1700000000.123456", "PLAT-7", "acme/api#12"])
+        got = chief.mention(self.ws, {}, AT, {"session_id": self.A, "text": text, "title": "Fix the login bug"})
+        self.assertEqual((got["added"], got["refused"]), (["C00000001/1700000000.123456", "PLAT-7", "acme/api#12"], []))
+        c = chief.cases(self.ws)
+        self.assertEqual([(x["key"], x["also"], x["origin"], x["title"]) for x in c],
+                         [("C00000001/1700000000.123456", ["PLAT-7", "acme/api#12"], "mention", "Fix the login bug")])
+        self.assertEqual(chief.mention(self.ws, {}, AT, {"session_id": self.A, "text": "PLAT-7 again"})["added"], [])
+
+    def test_a_key_another_session_holds_is_refused_and_at_most_five(self):
+        self.now_item("PLAT-7")
+        self.claim("PLAT-7", self.B)
+        got = chief.mention(self.ws, {}, AT, {"session_id": self.A, "text": "PLAT-7 PLAT-1 PLAT-2 PLAT-3 PLAT-4 PLAT-5"})
+        self.assertEqual((got["refused"], len(got["added"])), (["PLAT-7"], 4))
+        self.assertNotIn("origin", [c for c in chief.cases(self.ws) if c["key"] == "PLAT-7"][0])   # a claimed case says nothing
+        with self.assertRaisesRegex(ValueError, "not a session id"):
+            chief.mention(self.ws, {}, AT, {"session_id": "nope", "text": "PLAT-1"})
+
+    def test_an_inbox_item_sent_to_a_session_is_routed_there(self):
+        uid = self.now_item("PLAT-9")["update_id"]
+        code, out, _ = self.main("mention", "--stdin", stdin=json.dumps({"session_id": self.A, "keys": ["PLAT-9"], "title": "T"}))
+        self.assertEqual((code, json.loads(out)["added"]), (0, ["PLAT-9"]))
+        u = [x for x in hub._hub_doc(self.ws)["updates"] if x["id"] == uid][0]
+        self.assertEqual((u["state"], u["session_id"]), ("open", self.A))
+        self.follow_up("PLAT-9", 30)
+        self.assertEqual([r["key"] for r in chief.relays(self.ws, AT, self.A)], ["PLAT-9"])
+
+
+class TestIgnoreFolders(Base):
+    def test_settings_expand_and_drop_off_shape(self):
+        got = chief.ignore_folders(["~/scratch/", "/work/x", "relative", 3, "/work/x"], home="/home/m")
+        self.assertEqual(got, ["/home/m/scratch", "/work/x"])
+        self.assertEqual(chief.settings({})["ignore_folders"], [])
+        self.assertEqual(chief.status_doc(self.ws, {"chief": {"ignore_folders": ["/work/x"]}}, AT)["floor"],
+                         {"ignore_folders": ["/work/x"]})
+

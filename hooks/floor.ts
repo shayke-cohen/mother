@@ -23,6 +23,7 @@ export const FLOOR_SYSTEM = 'You read the final message of one coding-agent sess
   '"why_manager": "<<= 100 chars: why this needs the manager rather than the session>"}. options: 0 to 4, only answers the message itself offers. ' +
   'asks is false for a finished report, a status update or a rhetorical question; then question is "" and options is [].'
 export const FLOOR_TAIL_MAX = 3000
+const WAITING_TEXT_MAX = 2000
 const FLOOR_MAX_TOKENS = 500
 const FLOOR_TIMEOUT_MS = 20_000
 const FLOOR_CLI_TIMEOUT_MS = 30_000
@@ -163,8 +164,21 @@ async function floorCli($: Dollar, bin: string, args: string[], stdin?: string):
 
 // `mother floor card --stdin`: this session's card. True when the CLI took it. `cwd` says which checkout the card's repo
 // and branch are read from.
-export async function storeCard($: Dollar, bin: string, sessionId: string, reply: FloorReply, cwd?: string): Promise<boolean> {
-  return (await floorCli($, bin, ['card', '--stdin'], JSON.stringify({ session_id: sessionId, ...reply, ...(cwd ? { cwd } : {}) }))) !== null
+// `waitingText` (the end of the turn's final message) carries its `Waiting on:` line, which the CLI reads in code.
+export async function storeCard($: Dollar, bin: string, sessionId: string, reply: FloorReply, cwd?: string, waitingText?: string): Promise<boolean> {
+  return (await floorCli($, bin, ['card', '--stdin'], JSON.stringify({ session_id: sessionId, ...reply, ...(cwd ? { cwd } : {}),
+    ...(typeof waitingText === 'string' ? { waiting_text: waitingText.slice(-WAITING_TEXT_MAX) } : {}) }))) !== null
+}
+
+// `mother floor mark --stdin`: Check now, Keep waiting, Drop it, Keep on a Done card. null when it went through, else why not.
+export async function markCard($: Dollar, bin: string, sessionId: string, mark: 'checked' | 'keep' | 'drop' | 'done-keep'): Promise<string | null> {
+  try {
+    const ran = await $.process.run(['python3', bin, 'floor', 'mark', '--stdin'], { timeoutMs: FLOOR_CLI_TIMEOUT_MS, stdin: JSON.stringify({ session_id: sessionId, mark }) })
+    if (ran.exitCode === 0) return null
+    return String(ran.stderr ?? '').split('\n').find(l => l.trim())?.trim() || 'mother floor mark failed'
+  } catch (err) {
+    return `mother floor mark failed: ${(err as Error).message ?? String(err)}`
+  }
 }
 
 // `mother floor list --json`: every card; null when the read failed or is off-shape.
@@ -182,13 +196,14 @@ export async function readCards($: Dollar, bin: string): Promise<FloorCard[] | n
 }
 
 // `mother floor list --json` into the atom, with this session's id; a failed or unreadable read keeps the last one.
-// A fresh read forgets which cards the pane answered: a session that still asks shows again.
-export async function reloadFloor($: Dollar, bin: string): Promise<void> {
+// A fresh read forgets which cards the pane answered: a session that still asks shows again. `keepAnswered` (the 5 s
+// refresh): they stay hidden until the minute read, or an answered card would flash back while its session wakes.
+export async function reloadFloor($: Dollar, bin: string, keepAnswered = false): Promise<void> {
   const cards = await readCards($, bin)
   if (cards === null) return
   let self: string | null = null
   try { self = await $.session.id() } catch { /* unknown: no card is taken for this session's own */ }
-  await update($, floorAtom, (prev: FloorState | null) => ({ cards, self, answered: [], ...(prev?.held ? { held: prev.held } : {}) }))
+  await update($, floorAtom, (prev: FloorState | null) => ({ cards, self, answered: keepAnswered ? prev?.answered ?? [] : [], ...(prev?.held ? { held: prev.held } : {}) }))
 }
 
 // Is this session's own last question still open? Its relays wait then (hooks/cos.ts relayPass).

@@ -7,7 +7,7 @@ export const CLI = {
  },
  "status_idle": {
   "exitCode": 0,
-  "stdout": "{\n  \"version\": 1,\n  \"at\": \"2026-11-02T09:00:00Z\",\n  \"paused\": false,\n  \"chief\": {\n    \"alive\": true,\n    \"heartbeat_at\": \"2026-11-02T09:00:00Z\"\n  },\n  \"budget\": {\n    \"spent\": 0.0,\n    \"limit\": 20.0,\n    \"unreadable\": false,\n    \"over\": false\n  },\n  \"desktop\": [],\n  \"led_by\": null,\n  \"inbox\": [],\n  \"inbox_count\": 0,\n  \"cases\": [],\n  \"relay\": {\n    \"on\": true\n  },\n  \"guard\": \"on\",\n  \"health\": {\n    \"guard\": \"on\",\n    \"watcher\": null,\n    \"watcher_errors\": [],\n    \"watcher_error_count\": 0,\n    \"undelivered\": []\n  },\n  \"habits\": {\n    \"on\": true\n  },\n  \"quieted\": {\n    \"count_7d\": 0,\n    \"recent\": []\n  }\n}\n",
+  "stdout": "{\n  \"version\": 1,\n  \"at\": \"2026-11-02T09:00:00Z\",\n  \"paused\": false,\n  \"chief\": {\n    \"alive\": true,\n    \"heartbeat_at\": \"2026-11-02T09:00:00Z\"\n  },\n  \"budget\": {\n    \"spent\": 0.0,\n    \"limit\": 20.0,\n    \"unreadable\": false,\n    \"over\": false\n  },\n  \"desktop\": [],\n  \"led_by\": null,\n  \"inbox\": [],\n  \"inbox_count\": 0,\n  \"cases\": [],\n  \"relay\": {\n    \"on\": true\n  },\n  \"guard\": \"on\",\n  \"health\": {\n    \"guard\": \"on\",\n    \"watcher\": null,\n    \"watcher_errors\": [],\n    \"watcher_error_count\": 0,\n    \"undelivered\": [],\n    \"access\": []\n  },\n  \"habits\": {\n    \"on\": true\n  },\n  \"quieted\": {\n    \"count_7d\": 0,\n    \"recent\": []\n  },\n  \"floor\": {\n    \"ignore_folders\": []\n  },\n  \"quiet\": false\n}\n",
   "stderr": ""
  },
  "tick_skipped": {
