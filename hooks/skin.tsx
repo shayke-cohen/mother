@@ -88,20 +88,33 @@ export const PILL_EXTRA = 6     // what a pill takes beside its label, in cells:
 export const pillCells = (el: unknown): number => (pillLabel(el) ? pillLabel(el) + PILL_EXTRA : 0)
 
 // `tight` is a pill with no padding of its own (the label's two spaces are all of it): the tab row, seven on one line.
-type PillOpts = { key?: string; variant?: PillVariant; label: string; onPress: () => unknown; tight?: boolean }
+// `bare` has neither padding nor the spaces, for a glyph on a pill of a fixed `width` (a card's toggle).
+type PillOpts = { key?: string; variant?: PillVariant; label: string; onPress: () => unknown; tight?: boolean; bare?: boolean; width?: number }
+export const PILL_LABEL_MAX = 28   // a longer label is cut at a word boundary: a pill never takes half a card's row
+
+// A label of at most `cap` characters, cut at the last word boundary that fits, ending in `…`.
+export function clipLabel(text: string, cap = PILL_LABEL_MAX): string {
+  const t = text.split(/\s+/).filter(Boolean).join(' ')
+  if (t.length <= cap) return t
+  const head = t.slice(0, Math.max(1, cap - 1))
+  const at = head.lastIndexOf(' ')
+  return (at > 0 ? head.slice(0, at) : head).replace(/[\s.,;:!?-]+$/, '') + '…'
+}
 
 function darkPill(raw: any, skin: Skin, o: PillOpts) {
   const { Box, Button } = raw
   const c = pillFills(skin)[o.variant ?? 'secondary']
-  const pad = o.tight ? 0 : 1
+  const pad = o.tight || o.bare ? 0 : 1
+  const label = o.bare ? o.label : clipLabel(o.label)
   // every hover Box is keyed: one without a key makes the whole pane fail to draw
   const hover = o.key ? { key: 'pill:' + o.key, hover: { backgroundColor: c.hover, borderColor: c.hover } } : {}
+  const size = o.width ? { width: o.width, justifyContent: 'center' as const } : {}
   const el = (
-    <Box {...hover} borderStyle="round" borderColor={c.fill} backgroundColor={c.fill} paddingX={pad} paddingY={0} height={1} flexShrink={0}>
-      <Button key={o.key} plain onPress={o.onPress}>{NB + o.label + NB}</Button>
+    <Box {...hover} {...size} borderStyle="round" borderColor={c.fill} backgroundColor={c.fill} paddingX={pad} paddingY={0} height={1} flexShrink={0}>
+      <Button key={o.key} plain onPress={o.onPress}>{o.bare ? label : NB + label + NB}</Button>
     </Box>
   )
-  if (el && typeof el === 'object') PILL_LABEL.set(el as object, o.label.length)
+  if (el && typeof el === 'object') PILL_LABEL.set(el as object, label.length)
   return el
 }
 
@@ -182,9 +195,10 @@ export function Card(ui: Ui, f: CardFrame, children: unknown) {
 }
 
 // A row of pills (and the fields beside them): it wraps, and on the dark skin wrapped lines keep a gap so they
-// never touch.
-export function pillRow(ui: Ui): Record<string, unknown> {
-  return skinOf(ui).dark ? { flexWrap: 'wrap', gap: 1, rowGap: 1, alignItems: 'center' } : { flexWrap: 'wrap', gap: 'xs', alignItems: 'center' }
+// never touch; `apart` also keeps it a row away from what is above it (one action row under another).
+export function pillRow(ui: Ui, apart = false): Record<string, unknown> {
+  return skinOf(ui).dark ? { flexWrap: 'wrap', gap: 1, rowGap: 1, alignItems: 'center', ...(apart ? { marginTop: 1 } : {}) }
+    : { flexWrap: 'wrap', gap: 'xs', alignItems: 'center' }
 }
 
 // A button: a filled rounded pill on the dark skin (coral for the recommended action and the shown tab, quieter for

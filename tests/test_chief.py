@@ -348,6 +348,81 @@ class TestLeader(Base):
         chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT, session="s-1")["judge"], [])
         self.assertEqual(sorted(json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())["items"]), ["U2"])
 
+    def verdict_rows(self):
+        return [json.loads(l) for l in (chief.chief_dir(self.ws) / "verdicts.jsonl").read_text().splitlines()]
+
+    def test_every_verdict_is_logged_with_its_reason_and_no_body(self):
+        a, b, c = line(key="PLAT-7", summary="SECRET BODY"), line(key="PLAT-8", summary="SECRET BODY"), line(key="PLAT-9", title="no verdict", summary="SECRET BODY")
+        self.inbox(a, b, c)
+        judge = chief.tick(self.ws, {}, AT, session="s-1")["judge"]
+        chief.triage_decide(self.ws, {}, AT, judge, [
+            verdict(a, needs_attention=False, title="Thanks note", kind="fyi", urgency="later", on="other", actions=[], reason="A thank-you\nwith nothing to do"),
+            verdict(b, title="Owner?", kind="decide", urgency="now", on="manager", actions=[], reason="r" * 200)])
+        rows = self.verdict_rows()
+        self.assertEqual([(r["key"], r["decision"]) for r in rows], [("PLAT-7", "log"), ("PLAT-8", "now"), ("PLAT-9", "now")])
+        self.assertEqual(sorted(rows[0]), ["at", "decision", "key", "kind", "label", "line_id", "reason", "title", "urgency"])
+        self.assertEqual((rows[0]["reason"], rows[0]["kind"], rows[0]["title"], rows[0]["label"]), ("A thank-you with nothing to do", "fyi", "Thanks note", "PLAT-7"))
+        self.assertEqual(len(rows[1]["reason"]), 100)
+        self.assertEqual((rows[2]["reason"], rows[2]["kind"], rows[2]["title"]), ("", None, "no verdict"))   # no verdict came back: said so
+        self.assertNotIn("SECRET BODY", (chief.chief_dir(self.ws) / "verdicts.jsonl").read_text())
+
+    def test_the_reason_is_stored_with_the_verdict_and_shown_on_the_item(self):
+        a = line(key="PLAT-7")
+        self.inbox(a)
+        chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT, session="s-1")["judge"],
+                            [verdict(a, kind="decide", urgency="today", on="manager", actions=[], reason="Only the manager owns this")])
+        stored = json.loads((chief.chief_dir(self.ws) / "triage.json").read_text())["items"]
+        self.assertEqual(list(stored.values())[0]["reason"], "Only the manager owns this")
+        self.assertEqual(chief.inbox_items(self.ws, {}, AT)[0]["reason"], "Only the manager owns this")
+
+    def test_verdicts_are_pruned_after_30_days_on_append(self):
+        old, new = line(key="PLAT-7"), line(key="PLAT-8", at="2026-10-29T10:00:00Z")
+        self.inbox(old)
+        chief.triage_decide(self.ws, {}, AT - timedelta(days=31), chief.tick(self.ws, {}, AT, session="s-1")["judge"], [])
+        self.inbox(new)
+        chief.triage_decide(self.ws, {}, AT, chief.tick(self.ws, {}, AT + timedelta(seconds=1), session="s-1")["judge"], [])
+        self.assertEqual([r["key"] for r in self.verdict_rows()], ["PLAT-8"])
+
+    def test_why_prints_the_last_verdicts_of_a_key_newest_first(self):
+        for n in range(3):
+            l = line(key="PLAT-7", at="2026-10-29T1%d:00:00Z" % n)
+            self.inbox(l)
+            chief.triage_decide(self.ws, {}, AT + timedelta(hours=n), chief.tick(self.ws, {}, AT + timedelta(hours=n), session="s-1")["judge"],
+                                [verdict(l, kind="act", urgency="today", on="team", actions=[], reason="pass %d" % n)])
+        code, out, _ = self.main("why", "PLAT-7", "--json")
+        self.assertEqual(code, 0)
+        doc = json.loads(out)
+        self.assertEqual((doc["version"], doc["key"]), (1, "PLAT-7"))
+        self.assertEqual([r["reason"] for r in doc["verdicts"]], ["pass 2", "pass 1", "pass 0"])
+        code, out, _ = self.main("why", "NOPE-1", "--json")
+        self.assertEqual((code, json.loads(out)["verdicts"]), (0, []))
+        self.assertEqual(self.main("why")[0], chief.EXIT_USAGE)
+        self.assertEqual(self.main("why", "a", "b")[0], chief.EXIT_USAGE)
+        self.assertIn("pass 2", self.main("why", "PLAT-7")[1])
+
+    def test_a_reply_carries_its_threads_first_post_when_the_inbox_holds_it(self):
+        key = "C00000002/1700000001.000100"
+        root = line(source="chat", key=key, uid="1700000001.000100", at="2026-10-29T09:00:00Z", who="Dana", summary="Who owns the\nmigration?")
+        reply = line(source="chat", key=key, uid="1700000002.000100", at="2026-10-29T09:05:00Z", who="Sam", summary="Not me")
+        with hub.locked(self.ws):
+            d = hub._hub_doc(self.ws)
+            d["inbox_cursor"] = root["id"]
+            hub.save_json(self.ws, "hub.json", d)
+        self.inbox(root, reply)
+        got = chief.lines(self.ws)
+        self.assertEqual([l["id"] for l in got], [reply["id"]])
+        self.assertEqual(got[0]["thread_first"], {"who": "Dana", "text": "Who owns the migration?"})
+
+    def test_no_thread_first_for_the_first_post_or_an_unseen_one(self):
+        key = "C00000002/1700000001.000100"
+        self.inbox(line(source="chat", key=key, uid="1700000001.000100", summary="The first post"))
+        self.assertNotIn("thread_first", chief.lines(self.ws)[0])                       # it is the post itself
+        other = "C00000003/1700000009.000100"
+        self.inbox(line(source="chat", key=other, uid="1700000010.000100", summary="A reply"), line(key="PLAT-7"))
+        by_key = {l["key"]: l for l in chief.lines(self.ws)}
+        self.assertNotIn("thread_first", by_key[other])                                 # never fetched
+        self.assertNotIn("thread_first", by_key["PLAT-7"])
+
     def test_fyi_logs_and_manual_and_error_never_do(self):
         a, m = line(key="PLAT-7"), line(source="manual", kind="manual", key="PLAT-3")
         e = line(source="tracker", kind="error", key="watcher:tracker")
@@ -369,11 +444,11 @@ class TestLeader(Base):
         self.assertEqual(json.loads(out), {
             "version": 1, "manager": {"name": "Dana Levi", "short": "Dana"},
             "teams": [{"name": "Platform team", "people": ["Sam Roe"]}],
-            "projects": ["PLAT", "OPS"], "repos": ["example-org/platform-api", "example-org/web"]})
-        for secret in ("example.com", "U0000"):
-            self.assertNotIn(secret, out)
+            "projects": ["PLAT", "OPS"], "repos": ["example-org/platform-api", "example-org/web"],
+            "people": {"U00000000": "Dana", "U00000001": "Sam Roe"}})                 # chat ids to names, for the pane's `from`
+        self.assertNotIn("example.com", out)
         self.assertEqual(chief.triage_context(self.ws, {}), {
-            "version": 1, "manager": {"name": "", "short": ""}, "teams": [], "projects": [], "repos": []})
+            "version": 1, "manager": {"name": "", "short": ""}, "teams": [], "projects": [], "repos": [], "people": {}})
         big = {"teams": [{"name": "Team %d" % t, "people": [{"name": "Person %d-%d %s" % (t, i, "x" * 30)} for i in range(30)]}
                          for t in range(12)]}
         doc = chief.triage_context(self.ws, big)
@@ -882,7 +957,7 @@ class TestTldr(Base):
         self.assertEqual(n, 1)
         [s] = self.tails()["sessions"]
         self.assertEqual(s["cached"], {"tldr": "Fixing it.\nTests next.",
-                                       "chips": [{"kind": "reply", "text": "Ship it"}, {"kind": "open"}]})
+                                       "chips": [{"kind": "reply", "text": "Ship it", "label": "Ship it"}, {"kind": "open"}]})
         # the session moved: the cached entry no longer applies
         p.write_text(p.read_text() + msg("assistant", "Done now") + "\n")
         [s] = self.tails()["sessions"]
@@ -891,7 +966,15 @@ class TestTldr(Base):
     def test_clean_tldr_strips_control_and_bidi(self):
         got = chief.clean_tldr("Done‮ gnihtyreve\x1b[31m red\r\nnext⁦\x07\x9b",
                                [{"kind": "reply", "text": "Ship‏ it\x00"}, {"kind": "reply", "text": "‮\x1b"}])
-        self.assertEqual(got, {"tldr": "Done gnihtyreve[31m red\nnext", "chips": [{"kind": "reply", "text": "Ship it"}]})
+        self.assertEqual(got, {"tldr": "Done gnihtyreve[31m red\nnext", "chips": [{"kind": "reply", "text": "Ship it", "label": "Ship it"}]})
+
+    def test_chip_labels_are_short(self):
+        long = "Approved. Push the branches and open the PRs in your proposed order."
+        got = chief.clean_tldr("ok", [{"kind": "reply", "text": long}, {"kind": "reply", "text": "Go ahead", "label": "Yes, go\u202e"},
+                                      {"kind": "reply", "text": "Hold it", "label": "x" * 30}])
+        self.assertEqual([c["label"] for c in got["chips"]], ["Approved. Push the…", "Yes, go", "Hold it"])   # a word boundary, the model's own, too long: the text
+        self.assertEqual(chief.chip_label("a" * 30), "a" * 23 + "…")                 # one long word: cut where the cap falls
+        self.assertTrue(all(len(c["label"]) <= chief.CHIP_LABEL_MAX for c in got["chips"]))
 
     def test_cache_is_keyed_by_model_and_store_prunes_gone_sessions(self):
         self.pin()
@@ -1418,7 +1501,7 @@ class TestDotsDetail(Base):
         self.assertEqual(got["text"], "- A23 Annotate 7 stale todos and intake lines (no closes) — because none moved in 14 days — todos/open.md\n"
                                       "   - adds `stale since <date>` to each line\n"
                                       "- cutoff: plan says Thursday · ticket says Friday (see A23)")
-        self.assertEqual(got["label"], "Annotate 7 stale todos and intake lines")
+        self.assertEqual(got["label"], None)                                       # the clause is over 24 characters: no label
         self.assertEqual(chief.dots_detail(self.ws, "A3")["label"], None)          # one word: the button keeps its label
         m = chief.dots_detail(self.ws, "M2")
         self.assertEqual((m["text"], m["label"]), ("2. Decide the cutoff — because the plan and the ticket disagree", "Decide the cutoff"))
@@ -1439,7 +1522,9 @@ class TestDotsDetail(Base):
         code, out, _ = self.main("dots-detail", "A99", "--json")
         self.assertEqual((code, json.loads(out)), (0, None))
         code, out, _ = self.main("dots-detail", "A1", "--json")
-        self.assertEqual((code, json.loads(out)["label"]), (0, "Draft a nudge to the owner of PLAT-7"))
+        self.assertEqual((code, json.loads(out)["label"]), (0, None))               # 37 characters: too long for a button
+        self.assertEqual(chief.dots_label("- A24 Post pointer comments on the three PRs", "A24"), None)
+        self.assertEqual(chief.dots_label("- A24 Post pointer comments — on the three PRs", "A24"), "Post pointer comments")
         self.assertEqual(self.main("dots-detail")[0], 2)
 
 
@@ -1488,7 +1573,7 @@ class TestSessionCards(TestTldr):
         self.assertEqual((s["running"], s["open_turn"], s["last_from"], s["waiting"], s["stuck"]), (True, True, "assistant", None, False))
         self.aged(p, 1801)
         s = self.tails_at()["sessions"][0]
-        self.assertEqual((s["running"], s["stuck"]), (False, True))
+        self.assertEqual((s["running"], s["stuck"]), (False, False))                 # an open turn alone is not stuck: the app may have closed
         p = self.transcript("/work/api", CLI_A, [msg("user", "go"), msg("assistant", [{"type": "text", "text": "API Error: rate limit reached"}])])
         self.aged(p, 600)
         self.assertEqual([self.tails_at()["sessions"][0][k] for k in ("error_end", "stuck")], [True, True])
@@ -1523,11 +1608,14 @@ class TestSessionCards(TestTldr):
         self.assertEqual(self.store([self.card(fp, state="idle")])[1][CLI_A]["state"], "working")
         self.aged(p, 600)
         self.assertEqual(self.store([self.card(fp, state="bogus")])[1][CLI_A]["state"], "idle")
-        # twice `working`, then nothing moves for 30 minutes: stuck
+        # `working`, then nothing moves for 30 minutes: stuck; past 2 hours it was interrupted or closed: idle again
         self.aged(p, 10)
         self.store([self.card(fp)])
-        self.store([self.card(fp)])
         self.aged(p, 1900)
+        self.assertTrue(self.tails_at()["sessions"][0]["stuck"])
+        self.aged(p, 2 * 3600)
+        self.assertFalse(self.tails_at()["sessions"][0]["stuck"])
+        self.aged(p, 2 * 3600 - 1)
         self.assertTrue(self.tails_at()["sessions"][0]["stuck"])
 
     def test_an_asleep_sessions_ask_fills_its_floor_card(self):

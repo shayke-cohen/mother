@@ -1,11 +1,11 @@
-import { atom, update } from 'claude-code'
+import { atom, read, update } from 'claude-code'
 import type { Color } from 'claude-code'
 
-import { SNOOZES, age, ago, askPrompt, isUrl, oneLine, safe } from './shared'
+import { SNOOZES, age, ago, askPrompt, isUrl, oneLine, safe, todaysTop } from './shared'
 import type { Dollar } from './shared'
 import { THREAD_KEY, followArgs, ignoreArgs, ignoreOptions, nowVerb, openInspector } from './register'
 import { ACTIONS_SHOWN, ACTION_LABEL_MAX, SOURCE_COLOR, badge, card, emptyLine, isOpen, itemSource, leadPill, linkRows, linksOf, money, sectionHeading,
-         sourceBadge, sourceLink, subHeading, titleRow, toggled, whyText } from './pane_ui'
+         leadBadge, sourceBadge, sourceLink, subHeading, titleRow, toggled, whyText } from './pane_ui'
 import { SectionHeading, Stat, pillRow } from './skin'
 import type { Ui } from './pane_ui'
 import { inboxRow, logAct, nowRow, picked, quietedOf } from './habits'
@@ -22,10 +22,11 @@ const openAtom = atom({ plugin: 'mother', key: 'chiefOpen' } as const, null)
 const selectedAtom = atom({ plugin: 'mother', key: 'chiefSelected' } as const, null)
 const healthAtom = atom({ plugin: 'mother', key: 'chiefHealth' } as const, null)
 const detailAtom = atom({ plugin: 'mother', key: 'chiefDetail' } as const, null)
+const docAtom = atom({ plugin: 'mother', key: 'doc' } as const, null)       // now.json as register.tsx last read it; only read here
 
 // What chief.tsx hands each section: the open and selected cards, the picker flags (`chiefDraft`), the Health state.
 export type Details = Record<string, ChiefDetail | null> | null   // by Now item id; null inside = nothing on disk has it
-export type TabCtx = { open: ChiefOpen | null; selected: string | null; health?: ChiefHealthState | null; details?: Details }
+export type TabCtx = { open: ChiefOpen | null; selected: string | null; health?: ChiefHealthState | null; details?: Details; people?: Record<string, string> | null }
 type Drafts = Record<string, string> | null
 type GoHub = (args: string[]) => Promise<boolean>
 
@@ -38,6 +39,30 @@ function pressing($: Dollar, sel: string, run: () => unknown) {
 function toggleCard($: Dollar, id: string, nowOpen: boolean) {
   return update($, openAtom, prev => toggled(prev, id, nowOpen))
 }
+
+// What a Now item is from, as words: a chat user id becomes the person's name through the config's people (`mother
+// chief context --json`); an id nobody is named for is left out, anything else is shown as it is.
+const CHAT_ID_RE = /^[UW][A-Z0-9]{6,}$/
+export function fromWords(from: unknown, people: Record<string, string> | null | undefined): string {
+  const f = oneLine(from, 80)
+  if (!f) return ''
+  if (people && people[f]) return oneLine(people[f], 40)
+  return CHAT_ID_RE.test(f) ? '' : f
+}
+
+// A tick signal as words: the known ones have their own, an unknown one loses its underscores.
+const SIGNAL_WORDS: Record<string, string> = {
+  suggestion_waiting: 'waiting on your yes', unanswered_mention: 'unanswered mention', mail_needs_reply: 'mail needs a reply',
+  outside_question: 'question from outside', review_requested: 'review requested', pr_no_reviewer: 'PR with no reviewer',
+  pr_changes_silent: 'PR changes went quiet', pr_approved_unmerged: 'approved, not merged', default_branch_red: 'default branch is red',
+  decision_open: 'decision open',
+}
+export const signalWords = (signal: unknown): string => {
+  const sig = oneLine(signal, 40)
+  return sig ? SIGNAL_WORDS[sig] ?? sig.replace(/_/g, ' ') : ''
+}
+// `17h ago`, or `just now` for an age under an hour.
+export const agoWords = (a: string): string => (a === '0h' || a === 'now' ? 'just now' : `${a} ago`)
 // A flag in `chiefDraft` (an open picker, a group drawn in full): set by one press, cleared by the next.
 function flip($: Dollar, key: string) {
   return update($, draftAtom, prev => {
@@ -93,24 +118,51 @@ export function decisionLabel(a: Partial<NowAction>, n: number, detail: ChiefDet
   return n === 0 && detail?.label && /^run\b/i.test(label) ? oneLine(detail.label, DECISION_LABEL_MAX) : label
 }
 
-// Under an expanded card's buttons, one dim line per action: its label and the whole instruction it runs (the
-// routine's own words, then the prompt the button fills when that is something else).
+// Under an expanded card's buttons, one dim line per action: its label and the instruction it runs, in the routine's
+// own words. Never the verb the button types (`mother now do S1`): the manager reads what happens, not how. A dots
+// action's line says nothing either: "What this does" above it is the detail.
+const VERB_RE = /^(mother\s+now\s+do\s+\S+|dots\s+(?:do\s+|action\s+)?[AM]\d{1,3})\s*$/i
 export function actionSays(ui: Ui, id: string, acts: readonly NowAction[], detail: ChiefDetail | null | undefined, cap: number) {
   const { Text } = ui
   return acts.map((a, n) => {
     const task = oneLine(a.task || a.prompt, TASK_SHOWN_MAX)
-    const fills = oneLine(a.prompt, TASK_SHOWN_MAX)
-    return <Text key={`says:${id}:${n}`} dimColor wrap="wrap">{`${decisionLabel(a, n, detail, cap)}: ${task}${fills && fills !== task ? ` · fills: ${fills}` : ''}`}</Text>
+    if (!task || VERB_RE.test(task)) return null
+    return <Text key={`says:${id}:${n}`} dimColor wrap="wrap">{`${decisionLabel(a, n, detail, cap)}: ${task}`}</Text>
   })
+}
+
+// The detail of every open card that stands for a dots action, loaded once per item: on the console pass and when
+// a card opens (`/chief expand`, a restored toggle), never in a draw. A press on a card loads its own as before.
+export async function loadOpenDetails($: Dollar, bin: string): Promise<void> {
+  const doc = await read($, docAtom)
+  if (!doc) return
+  const open = await read($, openAtom)
+  const selected = await read($, selectedAtom)
+  const nowMs = await $.clock.now()
+  const items = (doc.items ?? []).filter(i => !!i)
+  const byId = new Map(items.map(i => [i.id, i]))
+  const cards: [string, NowItem | undefined][] = [
+    ...todaysTop(doc, nowMs).filter(e => e && e.state !== 'done').map(e => ['today:top:' + e.rank, e.item_id ? byId.get(e.item_id) : undefined] as [string, NowItem | undefined]),
+    ...items.map(i => [`${i.section === 'neglected' ? 'team' : i.section === 'suggestion' ? 'sug' : 'today'}:${i.id}`, i] as [string, NowItem | undefined]),
+  ]
+  for (const [id, i] of cards) {
+    if (!i || !dotsId(i) || !isOpen(open, id, 'today', selected)) continue
+    const loaded = await read($, detailAtom)
+    if (loaded && i.id in loaded) continue
+    await loadDetail($, bin, i, loaded)
+  }
 }
 
 // The rest an item carries, for an expanded card: its signal, sender and ages; every labelled link (or `no source
 // link`); its other keys; the "similar" rule; and for a dots item what the action does, as the dots file words it.
-export function itemDetail(ui: Ui, id: string, i: NowItem, nowMs: number, details: Details | undefined) {
+export function itemDetail(ui: Ui, id: string, i: NowItem, nowMs: number, details: Details | undefined, people?: Record<string, string> | null) {
   const { Box, Text } = ui
+  const from = fromWords(i.from, people)
+  const raised = age(i.since, nowMs)
+  const first = i.first_seen ? age(i.first_seen, nowMs) : ''
   const facts = [
-    i.signal ? `signal ${oneLine(i.signal, 40)}` : '', i.from ? `from ${oneLine(i.from, 80)}` : '', i.team ? `team ${oneLine(i.team, 40)}` : '',
-    age(i.since, nowMs) ? `raised ${age(i.since, nowMs)} ago` : '', i.first_seen && ago(i.first_seen, nowMs) ? `first seen ${ago(i.first_seen, nowMs)} ago` : '',
+    signalWords(i.signal), from ? `from ${from}` : '', i.team ? `team ${oneLine(i.team, 40)}` : '',
+    raised ? `raised ${agoWords(raised)}` : '', first && first !== raised ? `first seen ${agoWords(first)}` : '',
   ].filter(Boolean).join(' · ')
   const also = (Array.isArray(i.also) ? i.also : []).map(a => oneLine(a, 80)).filter(Boolean).slice(0, 8)
   const words = Array.isArray(i.similar?.words) ? i.similar!.words.map(w => oneLine(w, 30)).filter(Boolean) : []
@@ -123,7 +175,7 @@ export function itemDetail(ui: Ui, id: string, i: NowItem, nowMs: number, detail
     words.length ? <Text key={'similar:' + id} dimColor wrap="wrap">{`similar: ${words.join(', ')}${i.similar?.channel ? ` in ${oneLine(i.similar.channel, 40)}` : ''}`}</Text> : null,
     dots && detail
       ? <Box key={'detail:' + id} flexDirection="column">
-          <Text key={'detail-head:' + id} weight="semibold">What this does</Text>
+          <Text key={'detail-head:' + id} weight="semibold" size="footnote">What this does</Text>
           {detail.text.split('\n').slice(0, DETAIL_LINES_MAX).map((line, n) => <Text key={`detail:${id}:${n}`} wrap="wrap">{line || ' '}</Text>)}
           <Text key={'detail-from:' + id} dimColor size="caption">{`${dots} · ${detail.source_file}${detail.date ? ` · ${detail.date}` : ''}`}</Text>
         </Box>
@@ -169,10 +221,10 @@ function nowCard($: Dollar, ui: Ui, bin: string, i: NowItem, nowMs: number, draf
       {open ? null : sourceLink(ui, id, linksOf(i.link, i.links, source))}
     {tail as any}</Box>)) as unknown[]),
     open && why ? <Text key={'why:' + id} wrap="wrap">{why}</Text> : null,
-    ...(open ? itemDetail(ui, id, i, nowMs, ctx.details) : []),
+    ...(open ? itemDetail(ui, id, i, nowMs, ctx.details, ctx.people) : []),
     ...(open ? actionSays(ui, id, acts, detail, 40) : []),
     open
-      ? <Box key={'acts:' + id} {...pillRow(ui)}>
+      ? <Box key={'acts:' + id} {...pillRow(ui, true)}>
           {doIt}
           {ask}
           {done}
@@ -395,17 +447,25 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
   const sources = sourceRows(doc)
   out.push(sub(ui, 'health-sources', 'Sources'))
   if (!sources.length) out.push(<Text key="health-sources-none" dimColor>{doc ? 'The tick named no source' : 'No source report yet: the tick has not written now.json'}</Text>)
+  // every source that is fine on one row of badges; a source that is not on its own row, with its reason
+  const fine = sources.filter(([, c]) => c.status === 'ok')
+  if (fine.length) {
+    out.push(
+      <Box key="health-src-ok" {...pillRow(ui)}>
+        {fine.map(([name]) => badge(ui, `${name} ok`, 'success', 'health-src-badge:' + name))}
+      </Box>)
+  }
   for (const [name, c] of sources) {
-    const bad = c.status !== 'ok'
-    const since = bad && c.since ? age(c.since, nowMs) : ''
+    if (c.status === 'ok') continue
+    const since = c.since ? age(c.since, nowMs) : ''
     out.push(
       <Box key={'health-src:' + name} flexDirection="column">
         <Box flexWrap="wrap" gap="xs" alignItems="center">
           {badge(ui, statusWord(c.status), statusColor(c.status), 'health-src-badge:' + name)}
           <Text>{name}</Text>
-          {since ? <Text dimColor>{`for ${since}`}</Text> : null}
+          {since ? <Text dimColor>{since === '0h' ? 'just now' : `for ${since}`}</Text> : null}
         </Box>
-        {bad && c.reason ? <Text key={'health-src-why:' + name} wrap="wrap">{safe(String(c.reason)).trim()}</Text> : null}
+        {c.reason ? <Text key={'health-src-why:' + name} wrap="wrap">{safe(String(c.reason)).trim()}</Text> : null}
       </Box>)
   }
 
@@ -473,7 +533,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
       ...(open ? lines.slice(0, REPORT_LINES_MAX).map((line, n) => <Text key={`report:${r.name}:${n}`} wrap="wrap">{line || ' '}</Text>) : []),
       open && lines.length > REPORT_LINES_MAX ? <Text key={'report-more:' + id} dimColor>{`${lines.length - REPORT_LINES_MAX} more lines in .mother/${r.name}`}</Text> : null,
       open
-        ? <Box key={'acts:' + id} {...pillRow(ui)}>
+        ? <Box key={'acts:' + id} {...pillRow(ui, true)}>
             <Button key={'health-dismiss:' + r.name} onPress={pressing($, id, () => { logAct($, bin, 'dismiss', { item_id: r.name, source: 'report', title: oneLine(r.routine, 60) }); return dismiss($, r.name) })}>Dismiss</Button>
           </Box>
         : null,
@@ -495,7 +555,7 @@ export function healthSection($: Dollar, ui: Ui, bin: string, s: ChiefStatus, do
   out.push(
     <Box key="health-budget-row" flexWrap="wrap" gap="xs" alignItems="center">
       {Stat(ui, { value: b?.unreadable ? 'spend file unreadable' : `${money(b?.spent)} of ${money(b?.limit)} today`, tone: b?.over || b?.unreadable ? 'error' : undefined })}
-      {badge(ui, lead.text, lead.color, 'health-lead', !!lead.dim)}
+      {leadBadge(ui, lead, 'health-lead')}
       <Text dimColor>{!beat ? 'no heartbeat' : beat === 'now' ? 'heartbeat now' : `heartbeat ${beat} ago`}</Text>
     </Box>)
 

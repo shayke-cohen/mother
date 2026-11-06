@@ -2,7 +2,7 @@ import type { Color } from 'claude-code'
 
 import { oneLine } from './shared'
 import type { Dollar } from './shared'
-import { Badge, Card, Empty, Icon, Pill, SectionHeading, barSvg, pillCells, pillLabel, skinOf, BAR_H, BAR_W } from './skin'
+import { Badge, Card, Empty, Icon, Pill, SectionHeading, barSvg, pillRow, skinOf, BAR_H, BAR_W } from './skin'
 import type { CardFrame } from './skin'
 import type { ChiefCardState, ChiefDesktop, ChiefOpen, ChiefStatus, ChiefTldr } from '../types'
 
@@ -225,7 +225,7 @@ export function tabRow(ui: Ui, tabs: readonly Tab[], shown: TabId, seen: Record<
         {rows.map(t => (
           <Box key={'tab-cell:' + t.id} gap={0} alignItems="center" flexShrink={0}>
             {Pill(ui, { key: 'tab:' + t.id, variant: t.id === shown ? 'primary' : 'secondary', label: t.text, tight: true, onPress: () => onPick(t.id) })}
-            {t.alert ? <Text key={'tab-alert:' + t.id} color="error">{'●'}</Text> : t.isNew ? <Text key={'tab-dot:' + t.id} color="claude">{'•'}</Text> : null}
+            {t.alert ? <Text key={'tab-alert:' + t.id} color="error" size="footnote">{'●'}</Text> : t.isNew ? <Text key={'tab-dot:' + t.id} color="claude" size="footnote">{'●'}</Text> : null}
           </Box>
         ))}
       </Box>
@@ -262,9 +262,11 @@ export type Pill = { text: string; color: Color }
 // 3 minutes (or there never was one): a session takes the lead within a minute of a start or a reload, and until
 // then the badge is a dim `starting…`. Without `nowMs` the heartbeat's age is not read.
 export const LEAD_GRACE_MS = 3 * 60_000
-export function leadPill(s: ChiefStatus, self: string | null, nowMs?: number): Pill & { dim?: boolean } {
+// `short` and `detail` are the dark skin's split: a `led` badge with the detail dim beside it.
+export type LeadPill = Pill & { dim?: boolean; short?: string; detail?: string }
+export function leadPill(s: ChiefStatus, self: string | null, nowMs?: number): LeadPill {
   const by = typeof s.led_by === 'string' && s.led_by ? s.led_by : null
-  if (by) return by === self ? { text: 'led here', color: 'success' } : { text: 'led by another session', color: 'success' }
+  if (by) return by === self ? { text: 'led here', color: 'success', short: 'led', detail: 'here' } : { text: 'led by another session', color: 'success', short: 'led', detail: 'by another session' }
   const beat = s.chief?.heartbeat_at ? Date.parse(s.chief.heartbeat_at) : NaN
   if (nowMs !== undefined && !Number.isNaN(beat) && nowMs - beat <= LEAD_GRACE_MS) return { text: 'starting…', color: 'subtle', dim: true }
   return { text: 'nobody leading', color: 'error' }
@@ -360,6 +362,13 @@ export function badge(ui: Ui, text: string, color: Color, key?: string, dim = fa
   return Badge(ui, { tone: color, text, key, dim })
 }
 
+// Who leads: the dark skin's short `led` badge with its detail dim beside it; the plain skin's full words.
+export function leadBadge(ui: Ui, lead: LeadPill, key: string) {
+  const { Text } = ui
+  if (!skinOf(ui).dark || !lead.short) return badge(ui, lead.text, lead.color, key, !!lead.dim)
+  return [badge(ui, lead.short, lead.color, key), <Text key={key + ':detail'} dimColor size="footnote">{lead.detail}</Text>]
+}
+
 // A card's source badge, with the source's small mark before it where the skin draws one.
 export function sourceBadge(ui: Ui, source: Source, text: string, key: string) {
   return [Icon(ui, source, 'icon:' + key), badge(ui, text, SOURCE_COLOR[source], key)]
@@ -388,45 +397,31 @@ export function card(ui: Ui, f: CardFrame, children: unknown) {
 
 export const COMPACT_TITLE_MAX = 56
 
-export const ROW_CELLS = 48       // the pills a compact card's first row holds beside its title, in cells
-export const PRIMARY_LABEL_MAX = 16   // a longer recommended label leaves the title its whole row
+export const TOGGLE_WIDTH = 3     // the dark skin's toggle pill: a glyph wide
 
 // The title row: a plain Button whose press toggles the card; `▾` open, `▸` closed. `actions` (a compact card's
 // primary button, and a small second one) sit at the right end of the same row; the title is then one cut line.
 // `meta` builds the card's second row (badges, label, age, link) around what the title row hands it: with it the
 // answer is both rows, [title, meta].
 // Dark skin: a Button's label takes no colour, so the toggle is a small round pill holding the caret and the title
-// is ink text beside it, cut with `…` before the pills. The recommended pill is pinned right. Pills that do not all
-// fit the row leave only the recommended one there; a recommended label over 16 characters leaves the title the
-// whole row. The pills that left go to the end of the second row (`meta`'s argument).
+// is ink text beside it, the whole row wide, cut with `…`. The pills never share the title's row: a compact card is
+// three rows, the title, the badges, then one wrapping row of pills, the recommended one first, so it is always in
+// the same place and nothing pokes past the card's border.
 export function titleRow(ui: Ui, id: string, title: string, open: boolean, onPress: () => unknown, trailing?: unknown, actions?: unknown,
                          meta?: (tail: unknown) => unknown) {
   const { Box, Button, Text } = ui
   if (skinOf(ui).dark) {
-    const caret = Pill(ui, { key: 'toggle:' + id, variant: 'secondary', label: open ? '▾' : '▸', onPress })
+    const caret = Pill(ui, { key: 'toggle:' + id, variant: 'secondary', label: open ? '▾' : '▸', bare: true, width: TOGGLE_WIDTH, onPress })
     const all = actions ? (Array.isArray(actions) ? actions.flat(3) : [actions]).filter(Boolean) : []
-    const below = all.length > 0 && pillLabel(all[0]) > PRIMARY_LABEL_MAX
-    const fits = all.reduce((n: number, a) => n + pillCells(a), 0) <= ROW_CELLS
-    const first = below ? [] : fits ? all : all.slice(0, 1)
-    const rest = all.slice(first.length)
-    const words = <Text key={'title-ink:' + id} weight="semibold" wrap={actions ? 'truncate-end' : 'wrap'}>{first.length ? clip(title, COMPACT_TITLE_MAX) : title}</Text>
-    const row = !actions
-      ? <Box key={'title:' + id} gap={1} alignItems="center">
-          {caret}
-          {words}
-          {trailing as any}
-        </Box>
-      : <Box key={'title:' + id} gap={1} justifyContent="space-between" alignItems="center">
-          <Box key={'title-text:' + id} gap={1} flexShrink={1} minWidth={0} alignItems="center">
-            {caret}
-            {words}
-            {trailing as any}
-          </Box>
-          {first.length ? <Box key={'title-acts:' + id} gap={1} flexShrink={0} alignItems="center">{first as any}</Box> : null}
-        </Box>
-    const more = rest.length ? <Box key={'title-more:' + id} flexWrap="wrap" gap={1} rowGap={1} flexShrink={0} alignItems="center">{rest as any}</Box> : null
-    if (meta) return [row, meta(more)]
-    return more ? [row, more] : row
+    const row = (
+      <Box key={'title:' + id} gap={1} alignItems="center">
+        {caret}
+        <Text key={'title-ink:' + id} weight="semibold" wrap={all.length ? 'truncate-end' : 'wrap'}>{title}</Text>
+        {trailing as any}
+      </Box>
+    )
+    const pills = all.length ? <Box key={'title-more:' + id} {...pillRow(ui, true)}>{all as any}</Box> : null
+    return meta ? [row, meta(null), pills] : [row, pills]
   }
   const plain = () => {
   const toggle = (text: string) => (
@@ -553,10 +548,29 @@ function portraitOf(ui: Ui, p: Portrait, surface: string): { el: unknown; banner
 export type Strip = {
   needs: number; inbox: number; sessions: number   // the tabs carry these counts; the strip no longer draws them
   spent: number | undefined; limit: number | undefined; overBudget: boolean
-  lead: Pill & { dim?: boolean }; beat: string
+  lead: LeadPill; beat: string
   portrait: Portrait | null
   surface: string       // `terminal` draws an Image; any other surface an Svg when it has one
   guard?: string | null // `off` and `paused` each draw a red pill; `on`, or absent, nothing
+  mood?: Mood | null    // one sentence on how things stand, above the budget row
+}
+
+// ---- the mood line: how things stand, in one sentence, from the counts alone (no model call) ----
+export type Mood = { text: string; color?: Color }
+export type MoodCounts = { questions: number; oldest: string; urgent: number; health: number; working: number; inbox: number }
+const plural = (n: number, one: string, many = one + 's'): string => `${n} ${n === 1 ? one : many}`
+// The first of these that holds: questions, urgent inbox, Health problems, working sessions, inbox waiting, all clear.
+export function moodLine(c: MoodCounts): Mood {
+  if (c.questions > 0) {
+    const when = c.oldest === 'now' ? (c.questions === 1 ? 'just asked' : 'oldest just now')
+      : c.oldest ? (c.questions === 1 ? `asked ${c.oldest} ago` : `oldest ${c.oldest}`) : ''
+    return { text: `${plural(c.questions, 'question')} for you${when ? ', ' + when : ''}`, color: 'warning' }
+  }
+  if (c.urgent > 0) return { text: `${plural(c.urgent, 'urgent inbox item')} to look at`, color: 'error' }
+  if (c.health > 0) return { text: `${plural(c.health, 'problem')} in Health`, color: 'warning' }
+  if (c.working > 0) return { text: `${plural(c.working, 'session')} working, nothing for you yet` }
+  if (c.inbox > 0) return { text: `${plural(c.inbox, 'inbox item')} waiting, none urgent` }
+  return { text: 'All clear: nothing waits for you', color: 'success' }
 }
 
 // The header: the picture (a slim banner above, which carries the title on a surface with Svg, or a spot at the
@@ -585,17 +599,18 @@ function headerParts(ui: Ui, s: Strip): { banner: unknown; strip: unknown } {
       <Box key="strip-text" flexDirection="column" flexGrow={1}>
       {titled ? null : <Text weight="bold" size="title" color={SELF_COLOR}>Mother</Text>}
       {titled ? null : <Text dimColor size="caption">Chief of Stuff</Text>}
+      {s.mood ? <Text key="mood" color={s.mood.color} wrap="wrap">{s.mood.text}</Text> : null}
       {dark
         ? <Box key="strip-line" flexWrap="wrap" gap={1} alignItems="center">
-            <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
+            <Text key="pill:budget" dimColor color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
             {Svg ? <Svg key="pill:bar" source={barSvg(ratio)} alt={`budget ${Math.round(Math.min(1, Math.max(0, ratio)) * 100)}%`} width={BAR_W} height={BAR_H} />
               : <Text key="pill:bar" color={bar.color}>{bar.text}</Text>}
-            {badge(ui, s.lead.text, s.lead.color, 'pill:lead', !!s.lead.dim)}
+            {leadBadge(ui, s.lead, 'pill:lead')}
             {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}
             <Text key="pill:beat" dimColor size="footnote">{s.beat}</Text>
           </Box>
         : <Box key="strip-line" flexWrap="wrap" gap="xs">
-            <Text key="pill:budget" color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
+            <Text key="pill:budget" dimColor color={s.overBudget ? 'error' : undefined}>{`${money(s.spent)} / ${limit}`}</Text>
             <Text key="pill:bar" color={bar.color}>{bar.text}</Text>
             {badge(ui, s.lead.text, s.lead.color, 'pill:lead', !!s.lead.dim)}
             {s.guard === 'paused' ? badge(ui, 'paused', 'error', 'pill:guard') : s.guard === 'off' ? badge(ui, 'guard off', 'error', 'pill:guard') : null}

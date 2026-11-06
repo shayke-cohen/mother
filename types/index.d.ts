@@ -139,7 +139,7 @@ export type HubBundle = { hub: HubDoc | null; sessions: HubSessions | null; watc
 
 // One recommended action on a Chief pane card. Only these kinds exist; the pane drops anything else.
 export type ChiefChip =
-  | { kind: 'reply'; text: string }
+  | { kind: 'reply'; text: string; label?: string }   // `text` is sent; `label` (<= 24) is the button's words, else the text's first words
   | { kind: 'open' }
 
 // A card's TL;DR (at most 2 short lines) and up to 3 chips, from one model call over the session's recent tail.
@@ -176,7 +176,7 @@ export type ChiefDesktop = {
 }
 
 // One session's card (lib/floor.py): did its last turn stop on a question for the manager. Written by that session's
-// own mod at turn end from one model call over its final message; all of it is untrusted text.
+// own mod at turn end, from its wrap_up call or one model call over its final message; all of it is untrusted text.
 export type FloorOption = { label: string; message: string }     // the button, and what it sends as the manager
 export type FloorCard = {
   session_id: string                 // the session's CLI id (a pinned row's cli_session_id)
@@ -184,9 +184,17 @@ export type FloorCard = {
   question: string
   options: FloorOption[]             // 0-4
   waiting_on: string | null
-  at: string                         // when the card was written
+  at: string                         // when the question was first asked
+  ask_id?: string                    // names this question at this `at`: a press drawn for another one is dropped
+  recommendation?: string            // the exact instruction one press would send; absent when nothing was recommended
+  why_manager?: string               // why this needs the manager
+  recap?: string                     // one line on where the session stands
+  source?: 'wrap_up'                 // from the session's own wrap_up call; absent when a model read its final message
+  repo?: string; branch?: string     // of the session's checkout, when known
+  repo_url?: string                  // when known and on a host where `#123` can be made a link
 }
-export type FloorState = { cards: FloorCard[]; self: string | null; answered: string[] }
+// `held`: session id -> the ask id the manager put on hold; the card stays hidden until its ask id changes.
+export type FloorState = { cards: FloorCard[]; self: string | null; answered: string[]; held?: Record<string, string> }
 
 // A session that owns one inbox item's key until it is closed (hooks/cos.ts, skills/cos): a `kind: "case"` row of the
 // hub's sessions.json. `unseen` is how many routed lines wait to be delivered into it.
@@ -250,6 +258,7 @@ export type ChiefInboxItem = {
   on?: 'manager' | 'team' | 'other' | null
   urgency?: 'now' | 'today' | 'later' | null
   actions?: { label: string; prompt: string }[]   // at most 3, the first the recommended one
+  reason?: string                    // why it reached the manager, in the verdict's words; at most 100 characters
   habit_note?: string | null         // set by triage when the manager's habits changed its verdict; at most 80 characters
   session: { key: string; title: string; kind?: 'case'; cli_session_id?: string } | null   // the live hub session for the key; a case names its session
 }
@@ -290,6 +299,7 @@ declare module 'claude-code' {
       chiefHealth: ChiefHealthState | null          // the Health tab: dismissed undelivered reports, loaded report texts
       chiefDetail: Record<string, ChiefDetail | null> | null   // what each dots item does, by Now item id, once its card was pressed (null = nothing on disk)
       chiefSkin: ChiefSkin | null                   // the pane's skin, read from the store at session start
+      chiefPeople: Record<string, string> | null    // chat user ids to names, from `mother chief context --json`, read at session start
       chiefTyped: Record<string, string> | null     // what a field holds as it is typed, by Input key; read on a press, never by a draw
       chiefSelected: string | null                  // the card id (`sess:<cli id>`, `inbox:<U-id>`) a button was last pressed on; drawn with a bold border
     }

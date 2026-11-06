@@ -41,7 +41,7 @@ class FloorTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out), {"stored": SID, "asks": True})
         stored = json.loads((self.ws / ".mother" / "floor" / (SID + ".json")).read_text())
-        self.assertEqual(stored, dict(CARD, at="2026-11-01T09:00:00Z"))
+        self.assertEqual(stored, dict(CARD, at="2026-11-01T09:00:00Z", ask_id=floor.ask_id(CARD["question"], "2026-11-01T09:00:00Z")))
         code, out, _ = self.run_main(["list", "--json"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out), {"version": 1, "cards": [stored]})
@@ -90,7 +90,7 @@ class FloorTest(unittest.TestCase):
         self.assertEqual(len(card["waiting_on"]), 80)
         self.assertEqual(len(card["options"]), 4)
         self.assertEqual((len(card["options"][0]["label"]), len(card["options"][0]["message"])), (24, 200))
-        self.assertEqual(sorted(card), ["asks", "at", "options", "question", "session_id", "waiting_on"])
+        self.assertEqual(sorted(card), ["ask_id", "asks", "at", "options", "question", "session_id", "waiting_on"])
         cleared = floor.write_card(self.ws, AT, dict(CARD, asks=False))
         self.assertEqual((cleared["asks"], cleared["question"], cleared["options"], cleared["waiting_on"]), (False, "", [], None))
         self.assertFalse(floor.write_card(self.ws, AT, dict(CARD, asks="yes"))["asks"])   # only a real true asks
@@ -112,6 +112,80 @@ class FloorTest(unittest.TestCase):
         floor.write_card(self.ws, AT, CARD)
         floor.write_card(self.ws, AT - timedelta(hours=1), dict(CARD, session_id=SID_B))
         self.assertEqual([c["session_id"] for c in floor.list_cards(self.ws, AT)], [SID_B, SID])
+
+    def test_ask_id_is_the_question_at_its_time(self):
+        first = floor.write_card(self.ws, AT, CARD)
+        self.assertRegex(first["ask_id"], r"^[0-9a-f]{16}$")
+        self.assertEqual(floor.list_cards(self.ws, AT)[0]["ask_id"], first["ask_id"])
+        # the same question written again is the same question: a refresh doesn't restart its age or lift a Hold
+        again = floor.write_card(self.ws, AT + timedelta(hours=1), CARD)
+        self.assertEqual((again["ask_id"], again["at"]), (first["ask_id"], first["at"]))
+        # another question is another id
+        other = floor.write_card(self.ws, AT + timedelta(hours=2), dict(CARD, question="Merge or wait?"))
+        self.assertNotEqual(other["ask_id"], first["ask_id"])
+        # asked afresh after an answer cleared it: another id, though the words match
+        cleared = floor.write_card(self.ws, AT + timedelta(hours=3), dict(CARD, asks=False))
+        self.assertNotIn("ask_id", cleared)
+        afresh = floor.write_card(self.ws, AT + timedelta(hours=4), CARD)
+        self.assertNotEqual(afresh["ask_id"], first["ask_id"])
+        self.assertEqual(afresh["at"], "2026-11-01T13:00:00Z")
+
+    def test_a_stored_ask_id_is_never_believed(self):
+        floor.write_card(self.ws, AT, CARD)
+        path = floor.floor_dir(self.ws) / (SID + ".json")
+        path.write_text(json.dumps(dict(json.loads(path.read_text()), ask_id="forged")))
+        self.assertNotEqual(floor.list_cards(self.ws, AT)[0]["ask_id"], "forged")
+
+    def test_new_fields_are_kept_cleaned_and_only_when_they_say_something(self):
+        card = floor.write_card(self.ws, AT, dict(CARD, recommendation="Ship it\nnow " + "r" * 300, why_manager="w" * 200, recap="Tests pass.\n" + "x" * 300,
+                                                  source="wrap_up", repo="o/r", branch="feat/x", repo_url="https://github.com/o/r"))
+        self.assertTrue(card["recommendation"].startswith("Ship it now "))
+        self.assertEqual((len(card["recommendation"]), len(card["why_manager"]), len(card["recap"])), (200, 100, 200))
+        self.assertEqual((card["source"], card["repo"], card["branch"], card["repo_url"]), ("wrap_up", "o/r", "feat/x", "https://github.com/o/r"))
+        listed = floor.list_cards(self.ws, AT)[0]
+        self.assertEqual({k: listed[k] for k in ("recommendation", "source", "repo_url")}, {k: card[k] for k in ("recommendation", "source", "repo_url")})
+        bare = floor.write_card(self.ws, AT, dict(CARD, session_id=SID_B, source="anything", repo_url="javascript:alert(1)", recommendation=7))
+        self.assertEqual([k for k in ("source", "repo_url", "recommendation", "why_manager", "recap", "repo", "branch") if k in bare], [])
+        # a card with no ask keeps its recap, and no recommendation
+        done = floor.write_card(self.ws, AT, {"session_id": SID, "asks": False, "recap": "Merged.", "recommendation": "x", "source": "wrap_up"})
+        self.assertEqual((done["recap"], done["source"], "recommendation" in done, "ask_id" in done), ("Merged.", "wrap_up", False, False))
+
+    def checkout(self, remote, head="ref: refs/heads/feat/x\n"):
+        repo = self.ws / "co"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "HEAD").write_text(head)
+        (repo / ".git" / "config").write_text('[core]\n\tbare = false\n[remote "origin"]\n\turl = %s\n\tfetch = x\n[branch "m"]\n\tremote = origin\n' % remote)
+        (repo / "src").mkdir()
+        return repo
+
+    def test_repo_and_branch_come_from_the_checkouts_files(self):
+        repo = self.checkout("git@github.com:o/r.git")
+        card = floor.write_card(self.ws, AT, dict(CARD, cwd=str(repo / "src")))
+        self.assertEqual((card["repo"], card["branch"], card["repo_url"]), ("o/r", "feat/x", "https://github.com/o/r"))
+        self.assertNotIn("cwd", card)
+        self.assertNotIn("cwd", json.loads((floor.floor_dir(self.ws) / (SID + ".json")).read_text()))
+
+    def test_repo_facts_keeps_no_credential_and_guesses_no_link(self):
+        got = floor.repo_facts(str(self.checkout("https://user:hunter2@github.com/o/r")))
+        self.assertEqual(got, {"branch": "feat/x", "repo": "o/r", "repo_url": "https://github.com/o/r"})
+        self.assertNotIn("hunter2", json.dumps(got))
+
+    def test_repo_facts_elsewhere(self):
+        self.assertEqual(floor.repo_facts(str(self.checkout("https://gitlab.example.com/o/r.git", head="abc123\n"))), {"repo": "o/r"})  # no PR link shape; detached: no branch
+        self.assertEqual(floor.repo_facts(str(self.ws / "co2")), {})
+        self.assertEqual(floor.repo_facts("relative/path"), {})
+        self.assertEqual(floor.repo_facts(None), {})
+
+    def test_repo_facts_in_a_worktree(self):
+        main = self.checkout("git@github.com:o/r.git", head="ref: refs/heads/main\n")
+        wt = self.ws / "wt"
+        wt.mkdir()
+        gitdir = main / ".git" / "worktrees" / "wt"
+        gitdir.mkdir(parents=True)
+        (gitdir / "HEAD").write_text("ref: refs/heads/side\n")
+        (gitdir / "commondir").write_text("../..\n")
+        (wt / ".git").write_text("gitdir: %s\n" % gitdir)
+        self.assertEqual(floor.repo_facts(str(wt)), {"branch": "side", "repo": "o/r", "repo_url": "https://github.com/o/r"})
 
 
 if __name__ == "__main__":
