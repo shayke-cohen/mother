@@ -36,6 +36,9 @@ Commands:
   memory index <memory-file> [--title T] [--hook H] | check
                                add one `- [Title](file.md) — hook` line to memory/MEMORY.md (idempotent); check
                                lists unindexed memory files and index lines pointing at missing ones (JSON)
+  todo close <match> [--expired] [--date YYYY-MM-DD] | todo list [--json]
+                               archive the one todos/open.md item matching <match> as a valid `- [x] ... `done:`
+                               `~origin@date`` line (never hand-write one); runs scripts/lint-todos.sh if present
   items check [--file F] [--max N]
                                evidence check on a reader sub-agent's reply: drop uncited items; exit 2 = unusable
   now merge|show|done|snooze|top|do
@@ -1695,6 +1698,15 @@ def cmd_memory(args):
     print(json.dumps({"ok": True, "changed": changed, "line": line}, ensure_ascii=False))
 
 
+def cmd_todo(args):
+    """`mother todo close|list`: the open-loop store's writer (lib/todos.py, rules/todos.md)."""
+    sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
+    import todos
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]):
+        sys.exit(todos.main(args, None, _now()))
+    sys.exit(todos.main(args, workspace(), _now()))
+
+
 def cmd_eval(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import evals
@@ -1745,7 +1757,7 @@ def cmd_guard(args):
 # ---------------------------------------------------------------- main
 
 COMMANDS = {"guard": cmd_guard, "init": cmd_init, "join": cmd_join, "sync": cmd_sync, "scan": cmd_scan, "home": cmd_home,
-            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "chief": cmd_chief, "inbox": cmd_inbox, "grant": cmd_grant, "floor": cmd_floor, "memory": cmd_memory, "eval": cmd_eval, "retro": cmd_retro, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
+            "status": cmd_status, "register": cmd_register, "runs": cmd_runs, "link": cmd_link, "channels": cmd_channels, "whatsapp": cmd_whatsapp, "items": cmd_items, "now": cmd_now, "hub": cmd_hub, "chief": cmd_chief, "inbox": cmd_inbox, "grant": cmd_grant, "floor": cmd_floor, "memory": cmd_memory, "todo": cmd_todo, "eval": cmd_eval, "retro": cmd_retro, "health": cmd_health, "speak": cmd_speak, "tts": cmd_tts,
             "path": lambda a: print(workspace()), "version": lambda a: print(VERSION)}
 
 

@@ -25,7 +25,7 @@ replying; a malformed line breaks the brief and the nightly sweep.
 Every invocation starts by sweeping, because the manager may have ticked boxes in an editor:
 
 1. Every `- [x]` line in `open.md` → `archive.md` with `` `done:<today>` `` inserted before the origin;
-   remove it from `open.md`.
+   remove it from `open.md`. Use `mother todo close "<text>"` for each one (below).
 2. A section left empty keeps its heading and gets `_none_`.
 
 Then do what was asked.
@@ -49,7 +49,19 @@ queue (`mother:team`, `rules/teams.md`), where the digest puts it in front of th
 
 ## Closing
 
-Move the line to `archive.md` with `` `done:<today>` `` before the origin. Never delete it.
+Close with `mother todo close`, never by hand:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" todo close "<part of the item's text>"            # done:<today>
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" todo close "<part of the item's text>" --expired  # expired:<today>
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" todo close "<text>" --date 2026-11-27             # another day
+```
+
+It finds the one item in `open.md` whose text contains the match (case-insensitive), moves it to
+`archive.md` as `` - [x] <text> … `done:<date>` `~<origin>@<date>` `` with the origin still last, leaves every
+other line alone (an emptied section gets `_none_`), prints the archived line and runs the workspace's
+`scripts/lint-todos.sh` if it has one (exit 3 if that fails). No match or several: nothing is written, the
+candidates are listed, exit 1; give a longer match. Never delete the line yourself.
 
 **Never close on inference.** If a sent mail or a Done ticket suggests an item is finished, say "this
 looks done — close it?" and wait.
@@ -62,7 +74,7 @@ it.
 
 ## Listing
 
-Report `open.md` grouped by section: overdue (`due:` past) first, then aging `~manager` items (21+ days),
+`mother todo list` (or `--json`) prints the items by section. Report `open.md` grouped by section: overdue (`due:` past) first, then aging `~manager` items (21+ days),
 then the rest, with a count. For `~agent/*` items close to expiry, say so: "expires in 3 days unless you
 want it kept". If every section is `_none_`, say the list is empty.
 
