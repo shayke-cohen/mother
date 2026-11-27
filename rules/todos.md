@@ -76,7 +76,8 @@ reads the list and surfaces overdue and aging items; capture happens in sessions
 
 ## Closing
 
-- **The agent closes it** — move the line to `archive.md` with `` `done:<today>` `` before the origin.
+- **The agent closes it** — `mother todo close "<match>"` moves the line to `archive.md` with
+  `` `done:<today>` `` before the origin (`--expired` for `expired:`). Never hand-write an archive line.
 - **The manager ticks the box in an editor** — the line becomes `- [x]` and stays until swept. Any
   invocation of `mother:todo`, and `mother:reflect` nightly, sweeps `- [x]` lines into the archive.
 

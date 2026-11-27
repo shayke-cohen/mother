@@ -1890,6 +1890,16 @@ links (outside code spans) to files that don't exist. Idempotent: no
 change when a line already links `(<name>.md)`. Atomic, under `.mother/memory.lock`. Exit 1 for anything else,
 2 for usage. Prints `{ok, changed, line}`.
 
+**`mother todo close <match> [--expired] [--date YYYY-MM-DD]`** is the writer of `todos/archive.md` (`rules/todos.md`):
+it finds the one item line in `todos/open.md` whose text (the line without its checkbox and origin token) contains
+`<match>`, case-insensitive, and moves it to `todos/archive.md` as `- [x] <rest> `done:<date>` `~<origin>@<date>``
+(`expired:` with `--expired`; `<date>` defaults to today in `manager.timezone`), the origin token still last. Other
+lines are untouched; a section left empty gets `_none_`. Zero or several matches, a line not ending in its origin
+token, or one already carrying an outcome: nothing is written, exit 1, the candidates on stderr. The archive is
+written first, then `open.md`, both atomically under `.mother/todos.lock`. Prints the archived line, then, when the
+workspace has `scripts/lint-todos.sh`, `lint-todos.sh: ok|FAILED` (exit 3 on FAILED, the move already done).
+`mother todo list [--json]` prints the open items by section. Exit 2 for usage. On the guard's allow-list.
+
 ## 7. Skills in v0
 
 `setup`, `doctor` (also routine `doctor`, daily; heals unattended with retry, reconnect and fall back only, never write checks or sign-ins, and alerts once per issue per day), `routine` (dispatcher), `brief`, `digest` (team standup + decision queue), `dots`
