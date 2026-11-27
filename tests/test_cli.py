@@ -246,6 +246,75 @@ class CliTest(unittest.TestCase):
         self.assertIn("memory/a.md", files)
         self.assertIn("memory/b.md", files)
 
+    # -- worktree fold
+    def _ws_with_remote_and_worktree(self, name="s1"):
+        remote = self.t / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        self.init("--remote", str(remote))
+        self.assertEqual(run(["sync"], self.env).returncode, 0)
+        wt = self.ws / ".claude" / "worktrees" / name
+        self.assertEqual(git(self.ws, "worktree", "add", "-q", "-b", f"claude/{name}", str(wt)).returncode, 0)
+        return remote, wt
+
+    def test_sync_from_a_worktree_session_folds_it_into_main(self):
+        remote, wt = self._ws_with_remote_and_worktree()
+        (wt / "memory" / "from-wt.md").write_text("made in a worktree session\n")
+        # the Stop hook passes the session's cwd on stdin
+        r = run(["sync"], self.env, stdin=json.dumps({"cwd": str(wt), "hook_event_name": "Stop"}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("memory/from-wt.md", git(remote, "ls-tree", "-r", "--name-only", "main").stdout)
+        self.assertTrue((self.ws / "memory" / "from-wt.md").is_file(), "clean main checkout is fast-forwarded")
+        self.assertEqual(git(wt, "status", "--porcelain").stdout, "")
+
+    def test_worktree_fold_rebases_over_new_main_commits(self):
+        remote, wt = self._ws_with_remote_and_worktree()
+        (self.ws / "memory" / "on-main.md").write_text("main moved on\n")
+        self.assertEqual(run(["sync"], self.env).returncode, 0)
+        (wt / "memory" / "from-wt.md").write_text("x\n")
+        run(["sync"], self.env, cwd=wt)
+        files = git(remote, "ls-tree", "-r", "--name-only", "main").stdout
+        self.assertIn("memory/on-main.md", files)
+        self.assertIn("memory/from-wt.md", files)
+
+    def test_worktree_fold_conflict_keeps_work_on_its_branch(self):
+        remote, wt = self._ws_with_remote_and_worktree()
+        (self.ws / "memory" / "same.md").write_text("main version\n")
+        run(["sync"], self.env)
+        (wt / "memory" / "same.md").write_text("worktree version\n")
+        r = run(["sync"], self.env, cwd=wt)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("conflicts with main", r.stderr)
+        self.assertIn("worktree version", git(wt, "show", "HEAD:memory/same.md").stdout)
+        self.assertEqual(git(remote, "show", "main:memory/same.md").stdout, "main version\n")
+        self.assertFalse((Path(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip()) / "rebase-merge").exists())
+
+    def test_worktree_fold_skips_secrets(self):
+        remote, wt = self._ws_with_remote_and_worktree()
+        (wt / "memory" / "leak.md").write_text(f"x {self.fake_token()}\n")
+        r = run(["sync"], self.env, cwd=wt)
+        self.assertIn("credential-shaped", r.stderr)
+        self.assertNotIn("memory/leak.md", git(remote, "ls-tree", "-r", "--name-only", "main").stdout)
+        self.assertIn("leak.md", git(wt, "status", "--porcelain").stdout)
+
+    def test_sweep_folds_idle_worktrees_but_not_busy_ones(self):
+        remote, idle = self._ws_with_remote_and_worktree("idle")
+        busy = self.ws / ".claude" / "worktrees" / "busy"
+        git(self.ws, "worktree", "add", "-q", "-b", "claude/busy", str(busy))
+        f = idle / "memory" / "idle.md"
+        f.write_text("old edit\n")
+        old = 1_700_000_000
+        os.utime(f, (old, old))
+        (busy / "memory" / "busy.md").write_text("being edited now\n")
+        r = run(["sync", "--all"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        files = git(remote, "ls-tree", "-r", "--name-only", "main").stdout
+        self.assertIn("memory/idle.md", files)
+        self.assertNotIn("memory/busy.md", files)
+        # a plain sync right after does not sweep again (hourly throttle)
+        os.utime(busy / "memory" / "busy.md", (old, old))
+        run(["sync"], self.env)
+        self.assertNotIn("memory/busy.md", git(remote, "ls-tree", "-r", "--name-only", "main").stdout)
+
     def test_sync_quarantines_secret_and_commits_nothing(self):
         self.init()
         run(["sync"], self.env)

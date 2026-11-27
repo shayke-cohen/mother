@@ -3,3 +3,5 @@
 .DS_Store
 # Scratch space inside projects
 projects/*/files/tmp/
+# Desktop-session worktrees: folded into the branch by `mother sync`, never committed as nested repos
+.claude/worktrees/

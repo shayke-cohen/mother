@@ -4,7 +4,8 @@
 Commands:
   init <path> [--remote URL]   create a workspace (layout, git, pointer)
   join <git-url> [path]        clone an existing workspace on another machine
-  sync [--quiet]               scan, commit, rebase, push (always exits 0; used by hooks)
+  sync [--quiet] [--all]       scan, commit, rebase, push (always exits 0; used by hooks); also folds the
+                               session's linked worktree into the workspace branch, and hourly (--all: now) every idle one
   scan [files...]              secret-scan files (default: changed files in the workspace); exit 1 on a hit
   home show|set [host]|check|move <host>
                                which machine runs routines (check: 0 = here, 2 = elsewhere, 3 = unset)
@@ -59,7 +60,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.26.1"
+VERSION = "0.27.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -675,6 +676,183 @@ def _only_tick_runs(ws: Path) -> bool:
     return added > 0
 
 
+# ---- worktree fold
+# Desktop sessions often run in a linked git worktree of the workspace (<ws>/.claude/worktrees/<name>). The
+# workspace pointer names the main checkout, so a worktree session's Stop hook synced main and never saw the
+# worktree's own edits: they sat there, uncommitted, until someone noticed. Every sync now folds the session's
+# own worktree into the workspace branch (commit on its branch, rebase onto it, push to it), and at most hourly
+# sweeps the other worktrees the same way, skipping any with an edit in the last FOLD_IDLE_SECS.
+
+FOLD_IDLE_SECS = 20 * 60
+FOLD_SWEEP_SECS = 60 * 60
+
+
+def _hook_cwd() -> Path:
+    """The session's folder: the Stop/SessionEnd hook JSON on stdin carries `cwd`; else the process cwd."""
+    try:
+        import select
+        if not sys.stdin.isatty() and select.select([sys.stdin], [], [], 0.2)[0]:
+            data = sys.stdin.read()
+            if data.strip():
+                c = json.loads(data).get("cwd")
+                if c:
+                    return Path(c)
+    except Exception:
+        pass
+    return Path.cwd()
+
+
+def _common_dir(p: Path):
+    r = git(p, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(r.stdout.strip()).resolve() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _linked_worktree(ws: Path, cwd: Path):
+    """The top of the linked worktree of the workspace repo that holds cwd; None for the main checkout or another repo."""
+    if not cwd.is_dir():
+        return None
+    r = git(cwd, "rev-parse", "--show-toplevel")
+    if r.returncode or not r.stdout.strip():
+        return None
+    top = Path(r.stdout.strip()).resolve()
+    if top == ws.resolve():
+        return None
+    c = _common_dir(top)
+    return top if c and c == _common_dir(ws) else None
+
+
+def _worktrees(ws: Path) -> list:
+    out = git(ws, "worktree", "list", "--porcelain").stdout
+    tops = [Path(l[len("worktree "):]) for l in out.splitlines() if l.startswith("worktree ")]
+    return [t for t in tops if t.is_dir() and t.resolve() != ws.resolve()]
+
+
+def _busy(gitdir: Path) -> bool:
+    return any((gitdir / x).exists() for x in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"))
+
+
+def _fold_worktree(ws: Path, wt: Path, say, warn, sweep=False, fetch=True) -> str:
+    """Fold one linked worktree into the workspace branch. Returns folded | current | skipped | conflict."""
+    import time
+    name = wt.name
+    branch = git(wt, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    target = git(ws, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    if not branch or not target or branch == target:
+        return "skipped"                       # detached, or the workspace itself is detached
+    if _busy(Path(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip())):
+        return "skipped"
+    if (ws / "QUARANTINE.md").exists():
+        return "skipped"
+    record = ws / ".mother" / "fold-conflicts.json"
+    try:
+        conflicts = json.loads(record.read_text())
+    except Exception:
+        conflicts = {}
+    key = str(wt)
+    dirty = bool(git(wt, "status", "--porcelain").stdout.strip())
+    if sweep:
+        if dirty:
+            now = time.time()
+            for f in changed_files(wt):
+                try:
+                    if now - f.stat().st_mtime < FOLD_IDLE_SECS:
+                        return "skipped"       # someone is working there; its own Stop hook folds it
+                except OSError:
+                    pass
+        elif conflicts.get(key) == git(wt, "rev-parse", "HEAD").stdout.strip():
+            return "skipped"                   # already reported as a conflict and unchanged since
+    if dirty:
+        hits = scan_files(changed_files(wt))
+        if hits:
+            warn(f"worktree {name}: credential-shaped content, not folded: " + "; ".join(hits[:3]))
+            return "skipped"
+        git(wt, "add", "-A")
+        if git(wt, "diff", "--cached", "--quiet").returncode:
+            n = len(git(wt, "diff", "--cached", "--name-only").stdout.splitlines())
+            r = git(wt, "commit", "--no-verify", "-q", "-m", f"chore(sync): worktree {name} {now_iso()} ({n} file(s))")
+            if r.returncode:
+                warn(f"worktree {name}: commit failed: {r.stderr.strip()}")
+                return "skipped"
+    remote = "origin" in git(ws, "remote").stdout.split()
+    base = f"origin/{target}" if remote else target
+
+    def save():
+        try:
+            record.parent.mkdir(exist_ok=True)
+            record.write_text(json.dumps(conflicts, indent=1) + "\n")
+        except OSError:
+            pass
+
+    for _ in range(3):
+        if remote and fetch and git(wt, "fetch", "-q", "origin", target).returncode:
+            warn(f"worktree {name}: fetch failed; the work is committed on branch {branch}, the next sync folds it")
+            return "skipped"
+        fetch = True
+        if not git(wt, "log", "--oneline", f"{base}..HEAD").stdout.strip():
+            git(wt, "merge", "--ff-only", "-q", base)    # nothing of ours left: just keep the worktree current
+            return "current"
+        if git(wt, "rebase", "-q", base).returncode:
+            git(wt, "rebase", "--abort")
+            conflicts[key] = git(wt, "rev-parse", "HEAD").stdout.strip()
+            save()
+            warn(f"worktree {name}: conflicts with {target}; the work is committed on branch {branch}. "
+                 f"Fold it by hand: git -C {wt} rebase {base}")
+            return "conflict"
+        if remote:
+            ok = git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{target}").returncode == 0
+        else:
+            ok = git(ws, "merge", "--ff-only", "-q", branch).returncode == 0
+        if ok:
+            if conflicts.pop(key, None):
+                save()
+            say(f"folded worktree {name} into {target}")
+            return "folded"
+    warn(f"worktree {name}: push to {target} still rejected after 3 tries; the work is committed on branch {branch}")
+    return "skipped"
+
+
+def _ff_main(ws: Path) -> None:
+    """Fast-forward a clean main checkout that is strictly behind its upstream (after a fold pushed to it)."""
+    if git(ws, "symbolic-ref", "--quiet", "HEAD").returncode:
+        return
+    if _busy(Path(git(ws, "rev-parse", "--absolute-git-dir").stdout.strip())):
+        return
+    if git(ws, "rev-parse", "--verify", "--quiet", "@{upstream}").returncode:
+        return
+    if git(ws, "status", "--porcelain").stdout.strip():
+        return                                 # dirty: its own commit-push-rebase path integrates
+    if git(ws, "log", "--oneline", "@{upstream}..HEAD").stdout.strip():
+        return
+    if git(ws, "log", "--oneline", "HEAD..@{upstream}").stdout.strip():
+        git(ws, "merge", "--ff-only", "-q", "@{upstream}")
+
+
+def _sweep_worktrees(ws: Path, skip, say, warn, force=False) -> dict:
+    stamp = ws / ".mother" / "last-fold-sweep"
+    if not force:
+        try:
+            last = _dt.datetime.strptime(stamp.read_text().strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+            if (_dt.datetime.now(_dt.timezone.utc) - last).total_seconds() < FOLD_SWEEP_SECS:
+                return {}
+        except Exception:
+            pass
+    try:
+        stamp.parent.mkdir(exist_ok=True)
+        stamp.write_text(now_iso() + "\n")
+    except OSError:
+        pass
+    if "origin" in git(ws, "remote").stdout.split():
+        target = git(ws, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+        if not target or git(ws, "fetch", "-q", "origin", target).returncode:
+            return {}
+    out = {}
+    for wt in _worktrees(ws):
+        if skip and wt.resolve() == skip.resolve():
+            continue
+        out[str(wt)] = _fold_worktree(ws, wt, say, warn, sweep=True, fetch=False)
+    return out
+
+
 def cmd_sync(args):
     quiet = "--quiet" in args
     def say(m):
@@ -684,11 +862,14 @@ def cmd_sync(args):
         print(f"mother sync: {m}", file=sys.stderr)
     if os.environ.get("MOTHER_NO_SYNC"):
         return  # a channel reply session: the loop's own session syncs, and parallel syncs collide on git
-    ws, tick_only = None, False
+    ws, tick_only, here = None, False, None
     try:
         ws = workspace(required=False)
         if not ws or not (ws / ".git").exists():
             return
+        here = _linked_worktree(ws, _hook_cwd())
+        if here:
+            _fold_worktree(ws, here, say, warn)
         if git(ws, "symbolic-ref", "--quiet", "--short", "HEAD").returncode:
             warn("detached HEAD, skipping")
             return
@@ -747,6 +928,12 @@ def cmd_sync(args):
                 (ws / ".mother" / "last-sync").write_text(now_iso() + "\n")
         except Exception:
             pass
+        try:
+            if ws and (ws / ".git").exists():
+                _sweep_worktrees(ws, here, say, warn, force="--all" in args)
+                _ff_main(ws)
+        except Exception as e:
+            warn(f"worktree fold: {e}")
 
 # ---------------------------------------------------------------- home machine
 
