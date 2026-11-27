@@ -33,7 +33,7 @@ matches `one_on_one.title`. Today's 1:1s get prep. The most recent past one is "
 
 ## Prep — `one-on-ones/<slug>/<date>.md`
 
-Gather, in parallel, **since the last 1:1** (cap 30 days), each line with a link:
+Gather, in parallel (chat reads excepted: one call at a time, `mother:routine` → "Chat reads: one call at a time"), **since the last 1:1** (cap 30 days), each line with a link:
 
 - **Carry-over** — the last note's `## Carry over` and unchecked `## Commitments`, and every line in
   `next.md`.

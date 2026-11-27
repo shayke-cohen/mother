@@ -70,6 +70,8 @@ Silence is not a yes: unanswered actions lapse after 3 days and are marked `laps
 
 ## 2. Gather — in parallel
 
+Chat is the exception: its reads go one call at a time, never in parallel, and a 429 is waited out and retried once (`mother:routine` → "Chat reads: one call at a time").
+
 From the window, collect **items** (each with a link or file path you can cite):
 
 | Source | What to pull |

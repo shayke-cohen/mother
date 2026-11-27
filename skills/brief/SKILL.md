@@ -45,11 +45,16 @@ list records verified quirks; read it.
 
 ## 1. Gather — in parallel; the sources are independent
 
+Chat is the exception: its reads go one call at a time, never in parallel, and a 429 is waited out and retried once (`mother:routine` → "Chat reads: one call at a time").
+
 **Gather mode:** `routines.brief.gather` is `inline` (the default: read every source yourself, as written
 below) or `readers`. An A/B run passes it explicitly (see **Dry run** below).
 
 With `readers`, the five external sources (Calendar, Mail, Chat, Tracker, Code) each go to one
 `mother:reader` sub-agent. Dispatch them all **in one message**, so they run at the same time:
+- Exactly one reader gets `source: chat`; make no chat reads of your own while it runs. When it comes back
+  `partial` with `reason: rate-limited` and a `retry`, wait and retry that one call yourself, once, as in
+  `mother:routine` → "Chat reads: one call at a time"; still limited means `Chat partial — rate-limited`.
 - Dispatch only sources whose capability is `ok`. Anything else goes straight into the Sources line as `couldn't check`, as
   in §0. A reader is never a way around a missing capability.
 - Each reader's brief contains:

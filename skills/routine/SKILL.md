@@ -108,6 +108,29 @@ Instead, **once** per capability:
 
 A switch is named as in "Naming a switch" above (for example `chat.read via fallback slack2`), and the run is still `ok` if nothing else went wrong.
 
+### Chat reads: one call at a time
+
+The chat server rate-limits bursts (HTTP 429), and parallel reads were the usual cause of `partial: chat`.
+So, in every routine run:
+- **Serial, never parallel.** Chat calls (history, thread replies, search, profile lookups) go one after
+  another: never two chat tool calls in the same message, and never two agents reading chat at once. At
+  most **one chat reader per run**: when a routine dispatches `mother:reader`s, exactly one gets
+  `source: chat`, and the routine itself makes no chat reads while that reader runs. The other sources may
+  still run in parallel with it. Posting the routine's own output to the DM comes after the reads.
+- **A 429 is not a broken capability.** Don't `mother health record` it and don't switch servers for it.
+  Wait the time the error gives (`retryAfterSeconds`, `retry_after`, `Retry-After`; none given = 30 s),
+  **capped at 60 s**, then retry that one call **once**. Wait with a background command or the Monitor
+  tool if a foreground `sleep` is blocked; never in a loop.
+- **Still limited after the retry:** stop reading chat for this run, keep what you already have, mark
+  chat `partial` and write **`rate-limited`** in the output and the `runs.md` note (`partial — chat
+  rate-limited; tracker ok; DM sent`), never a generic error.
+- The per-run read budget (page sizes, caps, how many threads you open) is unchanged. A retry replaces
+  the failed call; it doesn't add reads.
+- A `mother:reader` can't wait. It stops at the first 429 and hands back `coverage.status: partial`,
+  `reason: rate-limited`, `retry_after` and `retry` (the one call that failed). You do the wait and the
+  single retry yourself, only when `retry.tool` is a read tool of the chat server you gave the reader, and
+  add what it returns to that reader's items. Never re-dispatch a chat reader in the same run.
+
 Unattended rules, in addition to whatever the routine file says:
 - **Outbound goes to the manager's DM** (`manager.chat_dm`) or is a draft. Anything else is blocked by the
   approval guard unless a grant in `.mother/grants.json` covers it; never try to route around the guard,
@@ -128,6 +151,7 @@ Unattended rules, in addition to whatever the routine file says:
 
 Write the `runs.md` line(s) last — even after an unexpected error, catch it and log `failed — <short>`.
 Note examples: `ok — 4 sources, DM sent`, `partial — chat search missing_scope; tracker ok; DM sent`,
+`partial — chat rate-limited; tracker ok; DM sent`,
 `failed — DM post expired`.
 
 If the routine's frontmatter says `sync: false`, don't run `mother sync`: the
