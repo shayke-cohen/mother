@@ -1284,7 +1284,7 @@ def cases(ws: Path, cfg: Optional[dict] = None) -> List[dict]:
 
 REPORT_MAX = 200
 APP_FILE_MAX = 2 * 1024 * 1024    # an app session file past this is skipped, never parsed
-APP_FIELDS = ("cliSessionId", "isArchived", "cwd", "lastActivityAt", "lastTurnReport")
+APP_FIELDS = ("cliSessionId", "isArchived", "cwd", "lastActivityAt", "lastTurnReport", "title")
 LOCAL_ID_RE = re.compile(r"local_[0-9A-Za-z-]{1,80}")
 CLI_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
@@ -1406,6 +1406,109 @@ def desktop_status(ws: Path, app_dir: Optional[Path] = None) -> List[dict]:
             _write_atomic(cache_path, json.dumps(cache) + "\n")
         except OSError:
             pass  # a cache that cannot be written only costs a re-read
+    return out
+
+
+AGENT_ROW_HOURS = 12      # a session that is not pinned shows under Other agents while its floor card is this fresh
+APP_LINK = "claude://claude.ai/epitaxy/%s"
+
+
+def _recent_app_files(app_dir: Path, since_s: float, cache: dict) -> Dict[str, Tuple[str, dict]]:
+    """{cli id: (local id, APP_FIELDS)} for every app session file (archived too) touched since `since_s` (a stat each, then
+    `_app_fields` with its mtime cache, so an unchanged file is not parsed again)."""
+    out = {}
+    base = Path(app_dir)
+    for pattern in ("local_*.json", "*/local_*.json", "*/*/local_*.json"):
+        for path in base.glob(pattern):
+            try:
+                if path.stat().st_mtime < since_s:
+                    continue
+            except OSError:
+                continue
+            doc = _app_fields(path, cache)
+            cli = doc.get("cliSessionId") if doc else None
+            if isinstance(cli, str) and CLI_ID_RE.fullmatch(cli) and LOCAL_ID_RE.fullmatch(path.stem):
+                out[cli] = (path.stem, doc)
+    return out
+
+
+def _scheduled_names(app_dir: Path) -> set:
+    """The display names of the app's scheduled tasks: a run's session carries its task's name as its title."""
+    names = set()
+    for pattern in ("scheduled-tasks.json", "*/scheduled-tasks.json", "*/*/scheduled-tasks.json"):
+        for path in Path(app_dir).glob(pattern):
+            tasks = _read_obj(path).get("scheduledTasks")
+            for t in tasks if isinstance(tasks, list) else []:
+                if isinstance(t, dict) and isinstance(t.get("displayName"), str) and t["displayName"].strip():
+                    names.add(t["displayName"].strip())
+    return names
+
+
+def agent_status(ws: Path, at: datetime, app_dir: Optional[Path] = None, pinned: Optional[List[dict]] = None) -> List[dict]:
+    """The pane's Other agents rows: each session that is not pinned and wrote a floor card with an `agent` in the
+    last AGENT_ROW_HOURS (a desktop session nobody pinned, a Claude terminal, dev3, Codex), newest first. Shaped as
+    `desktop_status` rows plus {agent, surface, dev3_task?, tmux?}. A desktop session is matched to its app file by
+    CLI id: its own title, report and open link; an archived one, and a scheduled task's run, are left out. The rest
+    read from their card."""
+    ws = Path(ws)
+    app_dir = Path(app_dir or default_app_dir())
+    skip = {d["cli_session_id"] for d in (pinned if pinned is not None else desktop_status(ws, app_dir))}
+    skip |= {r["cli_session_id"] for r in _case_ids(ws)}
+    cutoff = at - timedelta(hours=AGENT_ROW_HOURS)
+    cards = []
+    for c in floormod.list_cards(ws, at):
+        when = hub._parse_at(c.get("at"))
+        if c.get("agent") and c["session_id"] not in skip and when is not None and when >= cutoff:
+            cards.append((when, c))
+    if not cards:
+        return []
+    cache_path = chief_dir(ws) / "agent-cache.json"
+    before = _read_obj(cache_path)
+    cache = dict(before)
+    apps = _recent_app_files(app_dir, cutoff.timestamp() - 3600, cache)
+    routines = _scheduled_names(app_dir)
+    out = []
+    for when, c in sorted(cards, key=lambda x: x[0], reverse=True):
+        sid = c["session_id"]
+        app = apps.get(sid)
+        row = {"cli_session_id": sid, "agent": c["agent"], "last_activity_at": hub._iso(when)}
+        if app:
+            local, doc = app
+            if doc.get("isArchived") is True:
+                continue   # archived in the app: the manager is done with it
+            if str(doc.get("title") or "").strip() in routines:
+                continue   # a scheduled task's run: the routine's own log reports it, not a session to watch
+            cwd = str(doc.get("cwd") or c.get("cwd") or "")
+            report = doc.get("lastTurnReport")
+            row.update({"session_id": local, "title": safe_line(doc.get("title") or "", 200) or os.path.basename(cwd.rstrip("/")),
+                        "cwd": cwd, "surface": "desktop", "open_link": APP_LINK % local,
+                        "last_report": report[:REPORT_MAX] if isinstance(report, str) else (c.get("recap") or "")})
+        else:
+            cwd = str(c.get("cwd") or "")
+            row.update({"session_id": "", "title": c.get("title") or " · ".join(x for x in (c.get("repo"), c.get("branch")) if x),
+                        "cwd": cwd, "surface": c.get("surface") or "cli", "open_link": None,
+                        "last_report": c.get("recap") or ""})
+            for k in ("dev3_task", "tmux"):
+                if c.get(k):
+                    row[k] = c[k]
+        row["repo"] = c.get("repo") or os.path.basename(row["cwd"].rstrip("/"))
+        out.append(row)
+    keep = {k: v for k, v in cache.items() if os.path.basename(k)[:-5] in {r["session_id"] for r in out}}
+    if keep != before:
+        try:
+            _write_atomic(cache_path, json.dumps(keep) + "\n")
+        except OSError:
+            pass
+    return out
+
+
+def _case_ids(ws: Path) -> List[dict]:
+    """The live case sessions' CLI ids ({cli_session_id}), which the pane already lists under Cases."""
+    out = []
+    for r in hub._sessions_doc(ws)["sessions"].values():
+        cli = r.get("cli_session_id") if _is_case(r) else None
+        if isinstance(cli, str) and CLI_ID_RE.fullmatch(cli):
+            out.append({"cli_session_id": cli})
     return out
 
 
@@ -1547,7 +1650,7 @@ def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path], at: Optional[d
     """Every session the pane draws a card for, with its tail: the pinned desktop sessions, then the live case
     sessions that are not pinned (their transcript is looked for under the workspace folder, where a case starts),
     asleep or not. One with neither a transcript nor a last report has nothing to summarise. Each row is {id, kind
-    (pinned | case), fingerprint, text} plus what the transcript says without a model: `running` (it moved in the
+    (pinned | case | agent: `agent_status`), fingerprint, text} plus what the transcript says without a model: `running` (it moved in the
     last 2 minutes, or its turn is open and it moved in the last 30), `idle_for` (seconds since it last moved;
     None without a transcript), `last_from` (assistant | manager), `waiting` (`waiting_line`) and `error_end`."""
     out, seen = [], set()
@@ -1574,6 +1677,15 @@ def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path], at: Optional[d
             got = _tail_for(home, [str(ws)], cli)
             if got:
                 row(cli, "case", got)
+    for a in agent_status(ws, at or datetime.now(timezone.utc), app_dir):
+        cli = a["cli_session_id"]
+        if cli in seen:
+            continue
+        got = _tail_for(home, [a["cwd"]], cli) if a["agent"] == "claude" else None
+        if not got and a["last_report"].strip():
+            got = {"fingerprint": _short_fp("r", a["last_report"]), "text": a["last_report"]}
+        if got:
+            row(cli, "agent", got)
     return out
 
 
@@ -2328,11 +2440,13 @@ def status_doc(ws: Path, cfg: dict, at: datetime) -> dict:
     tz = nowmod.Schedule.from_config(cfg or {}).tz
     spent, limit = round(spent_today(ws, at, tz), 6), float(settings(cfg)["daily_budget_usd"])
     unreadable = _spend_unreadable(ws)
+    pinned = desktop_status(ws, default_app_dir())
     return {
         "version": 1, "at": hub._iso(at), "paused": paused(ws),
         "chief": {"alive": alive, "heartbeat_at": beat if beat_at is not None else None},
         "budget": {"spent": spent, "limit": limit, "unreadable": unreadable, "over": unreadable or spent >= limit},
-        "desktop": desktop_status(ws, default_app_dir()),
+        "desktop": pinned,
+        "agents": agent_status(ws, at, default_app_dir(), pinned),
         "led_by": leader if alive and isinstance(leader, str) and leader else None,
         "inbox": inbox[:INBOX_MAX],
         "inbox_count": len(inbox),

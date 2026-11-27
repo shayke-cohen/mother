@@ -241,7 +241,7 @@ def clean(doc) -> Optional[dict]:
 
 
 def identity(doc) -> dict:
-    """Who the session is, from untrusted input: {agent, surface, title, tmux, dev3_task}, each only when well-formed."""
+    """Who the session is, from untrusted input: {agent, surface, title, tmux, dev3_task, cwd}, each only when well-formed."""
     out = {}
     if doc.get("agent") in AGENTS:
         out["agent"] = doc["agent"]
@@ -258,6 +258,9 @@ def identity(doc) -> dict:
     task = doc.get("dev3_task")
     if isinstance(task, str) and _TASK.match(task):
         out["dev3_task"] = task
+    cwd = doc.get("cwd")
+    if out.get("agent") and isinstance(cwd, str) and cwd.startswith("/") and len(cwd) <= 500 and not _UNSAFE.search(cwd):
+        out["cwd"] = cwd   # where its transcript lives (lib/chief.py agent_status)
     return out
 
 

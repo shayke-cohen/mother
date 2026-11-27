@@ -164,6 +164,14 @@ export type ChiefTldr = {
 export type ChiefDetail = { id: string; text: string; date: string; source_file: string; label?: string | null }
 
 // A pinned desktop session (lib/chief.py desktop_status), from the snapshot a desktop session writes.
+// A session under Other agents: a desktop session nobody pinned (session_id and open_link set), or a Claude terminal,
+// dev3 or Codex session (session_id ''), with where it runs.
+export type ChiefAgent = ChiefDesktop & {
+  agent: string                      // claude | codex
+  surface: string                    // desktop | cli | tmux | dev3
+  dev3_task?: string
+  tmux?: { pane: string; socket?: string }
+}
 export type ChiefDesktop = {
   session_id: string                 // local_…
   cli_session_id: string             // what $.session.send reaches it by
@@ -235,6 +243,7 @@ export type ChiefStatus = {
   // call is made
   budget: { spent: number; limit: number; unreadable?: boolean; over?: boolean }
   desktop?: ChiefDesktop[]           // pinned desktop sessions
+  agents?: ChiefAgent[]              // sessions not pinned that wrote a floor card lately (lib/chief.py agent_status)
   led_by?: string | null             // the session id that wrote the heartbeat while it is fresh (under 120 s), else null
   inbox?: ChiefInboxItem[]           // the hub's open updates (`now` decisions), newest first, at most 10
   inbox_count?: number               // all of them

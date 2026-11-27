@@ -985,17 +985,21 @@ test('test_needs_you_shows_a_codex_card_with_no_pinned_row', async ($, on) => {
   await ui.unmount()
 })
 
-test('test_sessions_tab_lists_terminal_and_dev3_agents_but_not_old_or_desktop_cards', async ($, on) => {
-  const { clock } = await bootFloor($, on, { cards: () => [
-    { ...asking({ session_id: CLI_B, agent: 'claude', surface: 'dev3', title: '#12 Fix login' }), asks: false, question: '', options: [], recap: 'Tests pass, opening the PR' },
-    { ...asking({ session_id: 'old-cli', agent: 'claude', surface: 'cli', repo: 'acme/old' }), asks: false, question: '', options: [], at: '2000-01-01T00:00:00Z' },
-    { ...asking({ session_id: 'desk-x', agent: 'claude', surface: 'desktop', repo: 'acme/desk' }), asks: false, question: '', options: [] }] })
+test('test_other_agents_draw_as_session_cards_with_tldr_chat_and_open', async ($, on) => {
+  const AG_DESK = { ...PINNED, session_id: 'local_agent-desk', cli_session_id: 'aaaaaaaa-1111-4222-8333-444444444444', title: 'ASC Node issue 160',
+                    open_link: 'claude://claude.ai/epitaxy/local_agent-desk', agent: 'claude', surface: 'desktop' }
+  const AG_DEV3 = { ...PINNED, session_id: '', cli_session_id: CLI_B, title: '#12 Fix login', open_link: null, agent: 'claude', surface: 'dev3',
+                    dev3_task: 'abc12345', last_report: 'Tests pass, opening the PR' }
+  const { clock, out } = await bootFloor($, on, { cli: argv => argv[0] === 'status'
+    ? { exitCode: 0, stdout: JSON.stringify(status({ desktop: [PINNED], agents: [AG_DESK, AG_DEV3] })) } : undefined })
   const ui = await shown($, clock)
   const all = await texts(ui)
-  expect(all).toContain('Other agents 1')
+  expect(all).toContain('Other agents 2')
+  expect(all.some(x => x.endsWith(' ASC Node issue 160'))).toBe(true)                       // a desktop one keeps its app title
   expect(all.some(x => x.includes('[Claude · dev3] #12 Fix login'))).toBe(true)
-  expect(all).toContain('Tests pass, opening the PR')
-  expect(all.some(x => x.includes('acme/old') || x.includes('acme/desk'))).toBe(false)
+  await ui.press({ key: `open:${CLI_B}` })
+  await clock.settle()
+  expect(out.argv.some(a => a.join(' ') === 'dev3 task open --task abc12345')).toBe(true)
   await ui.unmount()
 })
 

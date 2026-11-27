@@ -3,7 +3,7 @@ import { atom, update } from 'claude-code'
 import { floorRows } from './cos'
 import { oneLine } from './shared'
 import type { Dollar } from './shared'
-import type { ChiefDesktop, ChiefStatus, FloorCard, FloorOption, FloorState } from '../types'
+import type { ChiefAgent, ChiefDesktop, ChiefStatus, FloorCard, FloorOption, FloorState } from '../types'
 
 export type { FloorState } from '../types'
 
@@ -261,32 +261,26 @@ export function heldCount(s: ChiefStatus | null, floor: FloorState | null): numb
 // cards that say which agent wrote them; the title carries the tool, so the manager can tell a Codex card at a glance.
 const AGENT_NAME: Record<string, string> = { codex: 'Codex', claude: 'Claude' }
 const SURFACE_NAME: Record<string, string> = { dev3: 'dev3', tmux: 'terminal', cli: 'terminal', desktop: 'desktop' }
+function tagged(agentId: string | undefined, surface: string | undefined, title: string | undefined): string {
+  const agent = (agentId && AGENT_NAME[agentId]) || 'Agent'
+  const where = surface ? SURFACE_NAME[surface] ?? '' : ''
+  const tag = where && where !== 'desktop' && !(agentId === 'claude' && where === 'terminal') ? `${agent} · ${where}` : agent
+  return oneLine(`[${tag}] ${title || 'a session'}`, 120)
+}
 export function agentRow(card: FloorCard): ChiefDesktop | null {
-  const agent = card.agent ? AGENT_NAME[card.agent] : undefined
-  if (!agent) return null
-  const where = card.surface ? SURFACE_NAME[card.surface] : ''
-  const tag = where && where !== 'desktop' && !(card.agent === 'claude' && where === 'terminal') ? `${agent} · ${where}` : agent
-  const name = card.title || [card.repo, card.branch].filter(Boolean).join(' · ') || 'a session'
-  return { session_id: '', cli_session_id: card.session_id, title: oneLine(`[${tag}] ${name}`, 120), cwd: '', repo: card.repo ?? '',
+  if (!card.agent || !AGENT_NAME[card.agent]) return null
+  const name = card.title || [card.repo, card.branch].filter(Boolean).join(' · ')
+  return { session_id: '', cli_session_id: card.session_id, title: tagged(card.agent, card.surface, name), cwd: '', repo: card.repo ?? '',
            last_activity_at: card.at, last_report: card.recap ?? '', open_link: null }
 }
 
-// The sessions that are not pinned but wrote a card of their own (a Claude terminal, dev3, Codex): listed under the
-// Sessions tab so the manager sees what each is on, newest first. Desktop cards are left out (the pinned rows carry
-// those), and so is a card older than AGENT_ROW_HOURS: a terminal closed without a goodbye leaves its last card behind.
-export const AGENT_ROW_HOURS = 12
-export function agentRows(s: ChiefStatus | null, floor: FloorState | null, nowMs: number): { card: FloorCard; d: ChiefDesktop }[] {
-  if (!floor) return []
-  const pinned = floorRows(s)
-  const out: { card: FloorCard; d: ChiefDesktop }[] = []
-  for (const card of floor.cards) {
-    if (card.surface === 'desktop' || card.session_id === floor.self || pinned.some(p => p.cli_session_id === card.session_id)) continue
-    const at = Date.parse(card.at)
-    if (!at || nowMs - at > AGENT_ROW_HOURS * 3600_000) continue
-    const d = agentRow(card)
-    if (d) out.push({ card, d })
-  }
-  return out.sort((a, b) => (Date.parse(b.card.at) || 0) - (Date.parse(a.card.at) || 0))
+// The sessions that are not pinned but wrote a card of their own (lib/chief.py agent_status: a desktop session nobody
+// pinned, a Claude terminal, dev3, Codex), newest first, for the Sessions tab's Other agents. This session's own is
+// left out. A desktop one keeps its app title; the rest wear the tool they run in, as `agentRow` does.
+export function agentRows(s: ChiefStatus | null, floor: FloorState | null): ChiefAgent[] {
+  const self = floor?.self ?? null
+  return (Array.isArray(s?.agents) ? s!.agents! : []).filter(a => a && typeof a.cli_session_id === 'string' && a.cli_session_id !== self)
+    .map(a => a.surface === 'desktop' ? a : { ...a, title: tagged(a.agent, a.surface, a.title) })
 }
 
 // The cards to draw, oldest first: asking, not this session's own, not just answered, not on hold, and of a pinned
@@ -297,7 +291,7 @@ export function needsYou(s: ChiefStatus | null, floor: FloorState | null): { car
   const out: { card: FloorCard; d: ChiefDesktop }[] = []
   for (const card of floor.cards) {
     if (!card.asks || card.session_id === floor.self || floor.answered.includes(card.session_id) || isHeld(floor, card)) continue
-    const d = pinned.find(p => p.cli_session_id === card.session_id) ?? agentRow(card)
+    const d = pinned.find(p => p.cli_session_id === card.session_id) ?? agentRows(s, floor).find(a => a.cli_session_id === card.session_id) ?? agentRow(card)
     if (d && !out.some(o => o.d.cli_session_id === d.cli_session_id)) out.push({ card, d })
   }
   return out.sort((a, b) => (Date.parse(a.card.at) || 0) - (Date.parse(b.card.at) || 0))
