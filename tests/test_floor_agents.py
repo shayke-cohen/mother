@@ -24,6 +24,9 @@ class AgentsTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.ws = Path(self._tmp.name)
+        spool = mock.patch.dict(os.environ, {"MOTHER_FLOOR_SPOOL": str(self.ws / "no-spool")})
+        spool.start()
+        self.addCleanup(spool.stop)
         env = mock.patch.dict(os.environ, {"TMUX_PANE": "%7", "TMUX": "/tmp/tmux-501/dev3,123,0"}, clear=False)
         env.start()
         self.addCleanup(env.stop)
@@ -64,6 +67,26 @@ class AgentsTest(unittest.TestCase):
         self.assertEqual(floor.list_cards(self.ws, AT), [])
         self.assertIsNone(floor.codex_event(self.ws, AT, {"hook_event_name": "Stop", "session_id": "../../x"}))
         self.assertIsNone(floor.codex_event(self.ws, AT, "nope"))
+
+    def test_spool_then_fold_keeps_order_and_env(self):
+        folder = self.ws / "spool"
+        ev = lambda name, **kw: dict(session_id=SID, cwd="/nowhere", hook_event_name=name, **kw)
+        floor.spool_event(ev("PermissionRequest", tool_name="Bash", tool_input={"command": "git push"}), {"TMUX_PANE": "%4"}, folder)
+        floor.spool_event(ev("PostToolUse", tool_name="Bash"), {"TMUX_PANE": "%4"}, folder)
+        floor.spool_event(ev("Stop", last_assistant_message="ok\nWaiting on: the user — merge it?"), {"TMUX_PANE": "%4"}, folder)
+        self.assertEqual(floor.fold_spool(self.ws, AT, folder), 3)
+        self.assertEqual(list(folder.glob("*.json")), [])
+        card = floor.list_cards(self.ws, AT)[0]
+        self.assertEqual((card["question"], card["tmux"]), ("merge it", {"pane": "%4"}))
+
+    def test_spool_refuses_junk_and_a_shared_folder(self):
+        folder = self.ws / "spool"
+        self.assertIsNone(floor.spool_event({"hook_event_name": "Stop", "session_id": "../x"}, {}, folder))
+        folder.mkdir(exist_ok=True)
+        os.chmod(folder, 0o777)
+        self.assertIsNone(floor.spool_event(dict(session_id=SID, hook_event_name="Stop"), {}, folder))
+        (folder / "1.json").write_text(json.dumps({"event": dict(session_id=SID, hook_event_name="SessionStart")}))
+        self.assertEqual(floor.fold_spool(self.ws, AT, folder), 0)   # another user could have written it: never read
 
     def test_codex_hook_never_fails(self):
         with mock.patch.object(sys, "stdin", __import__("io").StringIO("{not json")):

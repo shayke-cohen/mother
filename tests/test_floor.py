@@ -29,6 +29,9 @@ class FloorTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.ws = Path(self._tmp.name)
+        spool = mock.patch.dict(os.environ, {"MOTHER_FLOOR_SPOOL": str(self.ws / "no-spool")})
+        spool.start()
+        self.addCleanup(spool.stop)
 
     def run_main(self, args, stdin="", at=AT):
         out, err = io.StringIO(), io.StringIO()

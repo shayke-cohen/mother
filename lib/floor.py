@@ -312,7 +312,8 @@ def write_card(ws: Path, at: datetime, doc) -> Optional[dict]:
     if isinstance(doc, dict):
         doc = {k: v for k, v in doc.items() if k not in ("waiting", "done_kept")}   # those are the file's, never the caller's
         if doc.get("identify") is True:
-            found = identify_env(cwd=doc.get("cwd"))
+            env = doc.get("env") if isinstance(doc.get("env"), dict) else None   # a spooled Codex event's environment
+            found = identify_env(env={k: str(v) for k, v in env.items()} if env else None, cwd=doc.get("cwd"))
             if doc.get("surface") == "desktop":
                 found["surface"] = "desktop"
             doc = dict(found, **{k: v for k, v in doc.items()
@@ -355,7 +356,9 @@ def write_card(ws: Path, at: datetime, doc) -> Optional[dict]:
 
 
 def list_cards(ws: Path, at: datetime) -> List[dict]:
-    """Every readable card, oldest first. A card older than 7 days is deleted; an unreadable file is skipped."""
+    """Every readable card, oldest first. A card older than 7 days is deleted; an unreadable file is skipped.
+    Codex events waiting in the spool are folded in first."""
+    fold_spool(ws, at)
     cards = []
     folder = floor_dir(ws)
     if not folder.is_dir():
@@ -468,7 +471,78 @@ def _codex_ask(doc) -> str:
     return ("Approve %s: %s" % (tool, what) if what else "Approve %s" % tool)[:QUESTION_MAX]
 
 
-def codex_event(ws: Path, at: datetime, doc) -> Optional[dict]:
+# Codex runs its hooks inside its sandbox, which can't write the workspace but can write /tmp. So the hook only spools
+# the event (with the environment that says where the session runs) into a private folder there, and the next
+# `floor list` (outside the sandbox: the pane's 5-second and minute reads) folds the events into cards, in order.
+SPOOL_ENV = ("TMUX_PANE", "TMUX", "DEV3_TASK_ID")
+SPOOL_MAX = 500       # events kept at most; older ones are dropped unread
+_seq = [0]
+
+
+def spool_dir() -> Path:
+    if os.environ.get("MOTHER_FLOOR_SPOOL", "").startswith("/"):   # tests point it at their own folder
+        return Path(os.environ["MOTHER_FLOOR_SPOOL"])
+    return Path("/private/tmp" if os.path.isdir("/private/tmp") else "/tmp") / ("mother-floor-%d" % os.getuid())
+
+
+def spool_event(doc, env=None, folder: Optional[Path] = None) -> Optional[Path]:
+    """Write one Codex hook event to the spool; None when it is off-shape or the folder can't be made private."""
+    if not isinstance(doc, dict) or doc.get("hook_event_name") not in CODEX_EVENTS:
+        return None
+    if not (isinstance(doc.get("session_id"), str) and SESSION_ID_RE.match(doc["session_id"])):
+        return None
+    env = os.environ if env is None else env
+    folder = folder or spool_dir()
+    folder.mkdir(mode=0o700, exist_ok=True)
+    if not _private(folder):
+        return None
+    _seq[0] += 1
+    name = "%020d-%06d-%04d.json" % (__import__("time").time_ns(), os.getpid() % 1000000, _seq[0] % 10000)
+    body = {"event": doc, "env": {k: env[k] for k in SPOOL_ENV if isinstance(env.get(k), str)}}
+    tmp = folder / (name + ".tmp")
+    tmp.write_text(json.dumps(body, ensure_ascii=False))
+    os.replace(str(tmp), str(folder / name))
+    return folder / name
+
+
+def _private(folder: Path) -> bool:
+    """Ours and nobody else's: anything another user could write there is never read."""
+    try:
+        st = folder.lstat()
+    except OSError:
+        return False
+    import stat
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
+def fold_spool(ws: Path, at: datetime, folder: Optional[Path] = None) -> int:
+    """Every spooled event into its card, oldest first, then deleted. Returns how many were folded."""
+    folder = folder or spool_dir()
+    if not folder.is_dir() or not _private(folder):
+        return 0
+    names = sorted(p for p in folder.glob("*.json"))
+    for extra in names[:-SPOOL_MAX]:
+        try:
+            extra.unlink()
+        except OSError:
+            pass
+    done = 0
+    for path in names[-SPOOL_MAX:]:
+        try:
+            body = json.loads(path.read_text())
+            if isinstance(body, dict) and isinstance(body.get("event"), dict):
+                codex_event(ws, at, body["event"], body.get("env") if isinstance(body.get("env"), dict) else {})
+                done += 1
+        except (OSError, ValueError):
+            pass
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return done
+
+
+def codex_event(ws: Path, at: datetime, doc, env=None) -> Optional[dict]:
     """One Codex hook event into its session's card; None when nothing was written. Codex's payload is Claude Code's
     shape: session_id, cwd, hook_event_name, plus last_assistant_message on Stop, tool_name and tool_input on
     PermissionRequest."""
@@ -484,7 +558,7 @@ def codex_event(ws: Path, at: datetime, doc) -> Optional[dict]:
         except OSError:
             pass
         return None
-    base = {"session_id": sid, "agent": "codex", "identify": True, "cwd": doc.get("cwd"),
+    base = {"session_id": sid, "agent": "codex", "identify": True, "cwd": doc.get("cwd"), **({"env": env} if env is not None else {}),
             "asks": False, "question": "", "options": [], "waiting_on": None}
     if ev == "PostToolUse":   # an approval was given in Codex itself: the approval card is answered
         try:
@@ -596,8 +670,8 @@ def main(args, ws, cfg, at=None) -> int:
         print(json.dumps({"version": 1, "cards": list_cards(ws, at)}, ensure_ascii=False))
         return 0
     if args == ["codex-hook"]:
-        try:
-            codex_event(ws, at, json.loads(sys.stdin.read() or "null"))
+        try:   # spool it: Codex's sandbox can't write the workspace; the next `floor list` folds it in
+            spool_event(json.loads(sys.stdin.read() or "null"))
         except Exception:   # never block or break a Codex turn
             pass
         return 0

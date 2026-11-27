@@ -9,6 +9,9 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import tempfile as _tf_spool
+os.environ["MOTHER_FLOOR_SPOOL"] = _tf_spool.mkdtemp(prefix="mother-spool-test-")   # never fold the real spool
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "lib"))
