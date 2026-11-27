@@ -218,6 +218,7 @@ Call one by asking in plain words, or as `/mother:<name>`.
 | `meeting` | "prep the weekly" | Sprint plan page, meeting deck with meeting mode, results written back to the tracker, recap |
 | `now` | "what's on me now" | The tick's current list; runs one suggested action when you ask |
 | `cos` | starts from a `Mother case:` brief | The contract for a session that owns one item until it is closed |
+| `land` | "land these PRs", "are we done?" | Drives a session's PRs to merged in any repo: fixes CI, rebases, answers reviews, reports progress unprompted; merges only on your yes. The status report leads with what didn't land |
 | `todo` | "add a todo", "what's open" | Open loops: add, close, adopt, sweep |
 | `remember` | "remember that …" | Writes one durable fact to memory |
 | `project` | "start a project for X" | A container for work that spans sessions |
