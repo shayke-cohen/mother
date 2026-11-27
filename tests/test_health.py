@@ -128,6 +128,34 @@ class HealthTest(unittest.TestCase):
     def record(self, cap, server, status, *extra):
         return self.run_cli("record", "--kind", "chat", "--cap", cap, "--server", server, "--status", status, *extra)
 
+    def test_pick_all_returns_one_object_per_need(self):
+        self.two_servers(w="expired", c="ok")
+        r = self.run_cli("pick-all", "--needs", "chat.read,chat.post_dm", "--max-age-hours", "6")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(set(out), {"chat.read", "chat.post_dm"})
+        self.assertTrue(out["chat.read"]["found"])
+        self.assertEqual(out["chat.read"]["server"], C)
+
+    def test_pick_all_rejects_bad_entry(self):
+        self.two_servers()
+        r = self.run_cli("pick-all", "--needs", "chatread")
+        self.assertEqual(r.returncode, 2)
+
+    def test_record_accepts_aliases(self):
+        self.two_servers()
+        r = self.run_cli("record", "--kind", "chat", "--cap", "read", "--server", W,
+                         "--status", "invalidated", "--class", "auth_required")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        e = self.caps()["health"][W]["read"]
+        self.assertEqual((e["status"], e["class"]), ("expired", "invalidated"))
+
+    def test_subcommand_help_lists_valid_values(self):
+        r = self.run_cli("record", "--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("invalidated", r.stdout)
+        self.assertIn("expired", r.stdout)
+
     def test_record_updates_rollup_and_keeps_order(self):
         self.two_servers()
         r = self.record("read", W, "error:unreachable", "--class", "unreachable")

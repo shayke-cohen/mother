@@ -12,6 +12,10 @@ Commands (JSON out, one object per call):
                                the server to use now -> {server, status, fresh, fallback, stamped, verified}
                                (a write capability may be `untested`: verified false; a tool-based
                                connector answers {server: null, tool, ...})
+  pick-all --needs K.C[,K.C...] [--max-age-hours N]
+                               `pick` for several capabilities in one call -> {"K.C": {..pick result.., found}};
+                               write caps are picked with --target other (chat.post_dm with --target dm);
+                               always exits 0, read `found` per entry
   merge --file F               merge the doctor's fresh capabilities JSON in -> {changed: [kind.cap, ...]};
                                logs an `open` line per newly failing entry
   alert --kind K --cap C --server S [--urgent] [--sent]
@@ -23,6 +27,9 @@ servers on one `_gateway`, every entry there with the same class; never for `ok`
 (`pending`) during manager.quiet_hours unless --urgent.
 `record` also appends one line per failure or fix to <workspace>/health.md (no ids, no content);
 `--fixed-by fallback` on a backup logs the preferred server's failure as fixed by fallback.
+Aliases accepted by `record`: --class auth_required|auth|expired -> invalidated, timeout|network ->
+unreachable, forbidden|permission -> denied; --status invalidated|auth_required -> expired,
+failed|broken|dropped|unreachable -> error:<word>. Any command takes --help for its flags and valid values.
 Exit codes: 0 ok; 2 bad file or bad arguments; 3 `pick` found no usable server.
 $MOTHER_NOW (epoch seconds) pins the clock. Python 3.9 stdlib only.
 """
@@ -522,11 +529,35 @@ def need(opts, *names):
             raise HealthError("missing --%s" % n.replace("_", "-"))
 
 
+CLASS_ALIASES = {"auth_required": "invalidated", "auth": "invalidated", "expired": "invalidated",
+                 "timeout": "unreachable", "network": "unreachable", "forbidden": "denied", "permission": "denied"}
+STATUS_ALIASES = {"invalidated": "expired", "auth_required": "expired", "failed": "error:failed",
+                  "broken": "error:broken", "dropped": "error:dropped", "unreachable": "error:unreachable"}
+
+SUB_HELP = {
+    "record": "record --kind K --cap C --server S --status V [--class X] [--gateway H] [--fixed-by F]\n"
+              "  --status: %s, or %s<detail>\n  --class: %s\n  --fixed-by: %s" % (
+                  "|".join(STATUS_WORDS), "|".join(STATUS_PREFIXES), "|".join(CLASSES), "|".join(FIXED_BY)),
+    "pick": "pick --kind K --cap C [--target dm|other] [--max-age-hours N]  (exit 3: no usable server)",
+    "pick-all": "pick-all --needs K.C[,K.C...] [--max-age-hours N]  e.g. --needs chat.read,tracker.read,mail.read",
+    "classify": "classify --error TEXT",
+    "summary": "summary [--days N]",
+    "merge": "merge --file F",
+    "alert": "alert --kind K --cap C --server S [--urgent] [--sent]",
+    "pending": "pending",
+}
+
+
 def cmd_record(ws, args):
     o = parse_args(args, ("--kind", "--cap", "--server", "--status", "--class", "--gateway", "--fixed-by"))
+    if o.get("status") in STATUS_ALIASES:
+        o["status"] = STATUS_ALIASES[o["status"]]
+    if o.get("class") in CLASS_ALIASES:
+        o["class"] = CLASS_ALIASES[o["class"]]
     need(o, "kind", "cap", "server", "status")
     if not valid_status(o["status"]):
-        raise HealthError("bad --status '%s'" % o["status"])
+        raise HealthError("bad --status '%s' (%s, or %s<detail>)" % (o["status"], "|".join(STATUS_WORDS),
+                                                                       "|".join(STATUS_PREFIXES)))
     if o.get("class") and o["class"] not in CLASSES:
         raise HealthError("bad --class '%s' (one of %s)" % (o["class"], ", ".join(CLASSES)))
     if o.get("fixed_by") and o["fixed_by"] not in FIXED_BY:
@@ -577,6 +608,33 @@ def cmd_pick(ws, args):
     res = pick(normalize(load(ws), cfg), vendor, o["cap"], o.get("target"), age)
     found = res["server"] or (res.get("tool") and usable(res["status"], o["cap"]))
     return (0 if found else 3), res
+
+
+WRITE_CAPS = ("post", "post_dm", "create", "comment", "transition", "sprint", "draft", "send", "write")
+
+
+def cmd_pick_all(ws, args):
+    o = parse_args(args, ("--needs", "--max-age-hours"))
+    need(o, "needs")
+    out = {}
+    for item in [x.strip() for x in o["needs"].split(",") if x.strip()]:
+        if "." not in item:
+            raise HealthError("bad --needs entry '%s' (want kind.cap, e.g. chat.read)" % item)
+        kind, cap = item.split(".", 1)
+        sub = ["--kind", kind, "--cap", cap]
+        if cap == "post_dm":
+            sub = ["--kind", kind, "--cap", "post", "--target", "dm"]
+        elif cap in WRITE_CAPS:
+            sub += ["--target", "other"]
+        elif o.get("max_age_hours"):
+            sub += ["--max-age-hours", o["max_age_hours"]]
+        try:
+            code, res = cmd_pick(ws, sub)
+            res = dict(res, found=(code == 0))
+        except HealthError as e:
+            res = {"found": False, "error": str(e)}
+        out[item] = res
+    return 0, out
 
 
 def cmd_classify(ws, args):
@@ -669,7 +727,7 @@ def cmd_pending(ws, args):
     return 0, due_pending(normalize(load(ws), cfg), cfg)
 
 
-COMMANDS = {"record": cmd_record, "pick": cmd_pick, "classify": cmd_classify, "summary": cmd_summary,
+COMMANDS = {"record": cmd_record, "pick": cmd_pick, "pick-all": cmd_pick_all, "classify": cmd_classify, "summary": cmd_summary,
             "merge": cmd_merge, "alert": cmd_alert, "pending": cmd_pending}
 
 
@@ -681,6 +739,9 @@ def main(argv, ws):
     if not cmd:
         print("mother health: unknown command '%s' — see `mother health help`" % argv[0], file=sys.stderr)
         return 2
+    if "--help" in argv[1:] or "-h" in argv[1:]:
+        print(SUB_HELP.get(argv[0], argv[0]))
+        return 0
     try:
         code, out = cmd(ws, argv[1:])
     except HealthError as e:

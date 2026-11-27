@@ -37,7 +37,7 @@ there is nowhere to log: print the error and stop.
 | Check | On failure |
 |---|---|
 | `${CLAUDE_PLUGIN_ROOT}/bin/mother home check` exits 0 | `failed — not home machine (<host>)`, stop. If the home machine is unset: `failed — home machine not set; run mother home set`, stop |
-| `.mother/PAUSED` does not exist | `failed — paused`, stop |
+| The same `home check` output says `paused: no` (do not `ls .mother/PAUSED`: it exits 1 in the normal case and logs a false error) | `paused: yes` → `failed — paused`, stop |
 | Remote set, and the routine isn't `sync: false`: `git pull --rebase --autostash -q` | Continue on the local copy; note `pull failed` |
 | `mother status` validates `config.json` | `failed — config invalid: <first error>`, stop |
 | `config.json` has `routines.<id>` | `failed — routine not configured (disabled?)`, stop |
@@ -65,7 +65,9 @@ run continues, and §4 still writes its one `runs.md` line.
 1. **Pending alerts first.** `mother health pending` lists held alerts now outside quiet hours. Send each
    as in the doctor skill, section 9 (`alert … --sent` once delivered; push if present, DM via `pick
    --kind chat --cap post --target dm`; a gateway group alerts once; chat broken means push only).
-2. **Per capability in `needs`** (`chat.read` is `--kind chat --cap read`).
+2. **Per capability in `needs`** (`chat.read` is `--kind chat --cap read`). Start with one call for all of
+   them: `mother health pick-all --needs <needs, comma-separated> --max-age-hours 6` (JSON keyed by
+   `kind.cap`). Don't loop over `pick` in the shell: zsh does not word-split `set -- $var`.
    **Write capabilities** (`post`, `post_dm`, `create`, `comment`, `transition`, `sprint`, `draft`, `send`,
    `write`) are **never probed**: run only `mother health pick --kind K --cap C --target T`, and apply
    only ladder step 3 (switch servers by recorded health). Mapping: `chat.post_dm` is `--kind chat --cap
@@ -73,6 +75,9 @@ run continues, and §4 still writes its one `runs.md` line.
    DM (`--target dm`). A write `pick` may answer `untested` with `"verified": false`: that server is
    usable, and nothing to heal or alert. For **read** capabilities: `mother health pick --kind K --cap C --max-age-hours 6`. If the answer is `fresh` and `ok`, trust it
    and use that server (a tool-based connector, `code`, answers `server: null` and its `tool`, e.g. `gh`).
+   **A sign-in a human must fix is not re-probed.** If every server for the capability answers `expired`
+   or `denied`, don't probe and don't call it: it is "couldn't check" in §3, and step 3 alerts (deduped to
+   once a day). The doctor owns re-authentication; re-probing an expired sign-in every run only adds errors.
    Otherwise probe the picked server (or the preferred one in `servers.<cap>` when
    none is ok) with the doctor's probe for that kind (doctor skill, section 2), classify and record it
    (`mother health classify`, `mother health record`), then run the doctor's ladder steps 1-3 (re-test,

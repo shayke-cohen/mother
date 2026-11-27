@@ -395,6 +395,19 @@ class CliTest(unittest.TestCase):
         self.assertEqual(run(["home", "move", "laptop-b"], self.env).returncode, 0)
         self.assertEqual(run(["home", "check"], env_b).returncode, 0)
 
+    def test_home_check_reports_pause_without_failing(self):
+        self.init()
+        self.write_config()
+        run(["home", "set"], self.env)
+        r = run(["home", "check"], self.env)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("paused: no", r.stdout)
+        (self.ws / ".mother").mkdir(exist_ok=True)
+        (self.ws / ".mother" / "PAUSED").write_text("")
+        r = run(["home", "check"], self.env)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("paused: yes", r.stdout)
+
     # -- status / validate
     def test_status_valid_example(self):
         self.init()

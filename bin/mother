@@ -964,6 +964,8 @@ def cmd_home(args):
             print(f"not the home machine ({here}); routines run on {home}", file=sys.stderr)
             sys.exit(2)
         print(f"home machine: {here}")
+        # one call answers both pre-flight questions; exit stays 0 when paused (the routine decides)
+        print("paused: " + ("yes" if (ws / ".mother" / "PAUSED").exists() else "no"))
     else:
         die("usage: mother home show|set [host]|check|move <host>")
 
