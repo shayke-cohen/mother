@@ -608,7 +608,7 @@ class TestMain(Base):
         code, out, _ = self.main("status", "--json")
         self.assertEqual(code, 0)
         doc = json.loads(out)
-        self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "led_by", "inbox",
+        self.assertEqual(set(doc), {"version", "at", "paused", "chief", "budget", "desktop", "agents", "led_by", "inbox",
                                     "inbox_count", "cases", "relay", "guard", "health", "habits", "quieted", "floor", "quiet"})
         self.assertEqual((doc["habits"], doc["quieted"]), ({"on": True}, {"count_7d": 0, "recent": []}))
         self.assertEqual((doc["led_by"], doc["inbox"], doc["inbox_count"]), (None, [], 0))

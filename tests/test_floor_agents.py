@@ -124,3 +124,53 @@ class AgentsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentStatusTest(unittest.TestCase):
+    """lib/chief.py agent_status: the Sessions tab's Other agents rows."""
+    def setUp(self):
+        import chief
+        self.chief = chief
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.ws = Path(self._tmp.name) / "ws"
+        self.app = Path(self._tmp.name) / "app" / "acct" / "org"
+        self.app.mkdir(parents=True)
+        spool = mock.patch.dict(os.environ, {"MOTHER_FLOOR_SPOOL": str(Path(self._tmp.name) / "no-spool")})
+        spool.start()
+        self.addCleanup(spool.stop)
+
+    def card(self, sid, at, **kw):
+        folder = floor.floor_dir(self.ws)
+        folder.mkdir(parents=True, exist_ok=True)
+        doc = dict({"session_id": sid, "asks": False, "question": "", "options": [], "waiting_on": None, "at": at}, **kw)
+        (folder / (sid + ".json")).write_text(json.dumps(doc))
+
+    def app_file(self, local, cli, title, archived=False):
+        (self.app / (local + ".json")).write_text(json.dumps({"cliSessionId": cli, "title": title, "cwd": "/w/repo",
+                                                               "isArchived": archived, "lastTurnReport": "Done, PR open"}))
+
+    def test_rows_match_desktop_skip_routines_archived_stale_and_pinned(self):
+        now = datetime.now(timezone.utc)
+        iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ids = ["%08d-0000-4000-8000-000000000000" % n for n in range(6)]
+        self.card(ids[0], iso, agent="claude", surface="cli")                       # a desktop session nobody pinned
+        self.app_file("local_desk", ids[0], "ASC Node issue 160")
+        self.card(ids[1], iso, agent="claude", surface="dev3", title="#12 Fix login", dev3_task="abc12345", recap="Tests pass")
+        self.card(ids[2], iso, agent="claude", surface="cli")                       # a scheduled task's run
+        self.app_file("local_tick", ids[2], "Mother: tick")
+        (self.app / "scheduled-tasks.json").write_text(json.dumps({"scheduledTasks": [{"displayName": "Mother: tick"}]}))
+        self.card(ids[3], "2000-01-01T00:00:00Z", agent="claude", surface="cli")    # stale
+        self.card(ids[4], iso, agent="claude", surface="cli")                       # archived in the app
+        self.app_file("local_arch", ids[4], "Old", archived=True)
+        self.card(ids[5], iso)                                                      # no agent: an old-style card
+        rows = self.chief.agent_status(self.ws, now, self.app.parent.parent, pinned=[])
+        by = {r["cli_session_id"]: r for r in rows}
+        self.assertEqual(by[ids[0]]["title"], "ASC Node issue 160")
+        self.assertEqual((by[ids[0]]["surface"], by[ids[0]]["open_link"]), ("desktop", "claude://claude.ai/epitaxy/local_desk"))
+        self.assertEqual((by[ids[1]]["surface"], by[ids[1]]["dev3_task"], by[ids[1]]["last_report"]), ("dev3", "abc12345", "Tests pass"))
+        self.assertNotIn(ids[2], by)
+        self.assertNotIn(ids[3], by)
+        self.assertEqual(sorted(by), sorted([ids[0], ids[1]]))   # archived, stale, a routine and an old-style card are left out
+        pinned = self.chief.agent_status(self.ws, now, self.app.parent.parent, pinned=[{"cli_session_id": ids[0]}])
+        self.assertEqual([r["cli_session_id"] for r in pinned], [ids[1]])

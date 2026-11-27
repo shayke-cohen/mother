@@ -589,7 +589,7 @@ async function refreshTldrs($: Dollar, bin: string, opts: RefreshOpts = {}): Pro
     const minutes = Number.isInteger(doc.refresh_minutes) && doc.refresh_minutes >= 1 && doc.refresh_minutes <= 60 ? doc.refresh_minutes : REFRESH_MINUTES_DEFAULT
     const every = minutes * 60_000
     const rows = doc.sessions.filter((r: any): r is TailRow => !!r && typeof r.id === 'string' && typeof r.fingerprint === 'string' &&
-      typeof r.text === 'string' && (r.kind === 'pinned' || r.kind === 'case'))
+      typeof r.text === 'string' && (r.kind === 'pinned' || r.kind === 'case' || r.kind === 'agent'))
     // forget sessions that are gone, and results to store for a session that moved or went
     const live = new Map<string, string>(rows.map((r: TailRow) => [r.id, r.fingerprint]))
     for (const m of [tldrMade, tldrFailed, tldrAskedAt] as Map<string, unknown>[]) for (const id of [...m.keys()]) if (!live.has(id)) m.delete(id)
@@ -797,6 +797,26 @@ async function workspace($: Dollar, bin: string): Promise<string> {
 const REFUSED_RE = /refus|denied|not allowed|cannot|can't|couldn't|unable|\bonly\b|not (on screen|started|visible|shown|open)|changes? nothing|nothing changed|no-op|ask the user/i
 const ALREADY_RE = /\balready\b/i
 const APP_LINK_RE = /^claude:\/\/claude\.ai\/epitaxy\/local_[A-Za-z0-9-]+$/
+
+// Open a session's card: a desktop one (pinned or not) through the app; a dev3 task in dev3; a tmux pane is selected
+// in its tmux; anything else fills the prompt and says why.
+async function openRow($: Dollar, d: ChiefDesktop): Promise<void> {
+  if (LOCAL_RE.test(d.session_id)) return openPinned($, d)
+  const a = (lastStatus?.agents ?? []).find(x => x.cli_session_id === d.cli_session_id)
+  const run = async (argv: string[]) => {
+    try { return (await $.process.run(argv, { timeoutMs: DEFAULT_TIMEOUT_MS })).exitCode === 0 } catch { return false }
+  }
+  if (a?.dev3_task && await run(['dev3', 'task', 'open', '--task', a.dev3_task])) { $.ui.toast(`Opened "${d.title}" in dev3`); return }
+  if (a?.tmux?.pane) {
+    const sock = a.tmux.socket ? ['-S', a.tmux.socket] : []
+    if (await run(['tmux', ...sock, 'select-window', '-t', a.tmux.pane]) && await run(['tmux', ...sock, 'select-pane', '-t', a.tmux.pane])) {
+      $.ui.toast(`Selected tmux pane ${a.tmux.pane}: "${d.title}"`)
+      return
+    }
+  }
+  await $.prompt.fill({ text: `Open my "${d.title}" session`, mode: 'replace' }).catch(() => undefined)
+  $.ui.toast(a?.surface === 'cli' ? 'A plain terminal session: switch to its terminal window' : "Couldn't open it directly; the prompt asks for it instead")
+}
 
 // Open a pinned desktop session: ask the app to show it (ccd_window open_session_in, focus). Only an answer that says
 // it did counts; an error, a timeout, an empty answer or a refusal without an error fills the prompt as before and
@@ -1181,7 +1201,7 @@ export function todayRows(doc: NowDoc | null | undefined, nowMs: number): { top:
 export function tabCounts(s: ChiefStatus | null, floor: FloorState | null, doc: NowDoc | null | undefined, nowMs: number): Record<TabId, number> {
   const today = todayRows(doc, nowMs)
   const inbox = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
-  return { needs: needsYou(s, floor).length + accessRows(s).length, inbox, sessions: (Array.isArray(s?.desktop) ? s!.desktop!.length : 0) + caseOnlyRows(s).length + agentRows(s, floor, nowMs).length,
+  return { needs: needsYou(s, floor).length + accessRows(s).length, inbox, sessions: (Array.isArray(s?.desktop) ? s!.desktop!.length : 0) + caseOnlyRows(s).length + agentRows(s, floor).length,
            today: today.top.length + today.items.length + suggestedRows(doc).length, all: 0, team: teamCount(doc), health: healthProblems(s, doc) }
 }
 
@@ -1200,7 +1220,7 @@ async function pickTab($: Dollar, id: TabId, counts: Record<TabId, number>, stat
 export function sessionStates(s: ChiefStatus | null, floor: FloorState | null, tldrs: Record<string, ChiefTldr> | null): Record<string, ChiefCardState> {
   const asking = new Set(needsYou(s, floor).map(n => n.d.cli_session_id))
   const out: Record<string, ChiefCardState> = {}
-  for (const d of floorRows(s)) {
+  for (const d of [...floorRows(s), ...agentRows(s, floor)]) {
     const st = cardState(tldrs?.[d.cli_session_id], asking.has(d.cli_session_id))
     if (st) out[d.cli_session_id] = st
   }
@@ -1564,7 +1584,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
     // one coral pill per card: Archive on a done one, else the first reply chip when there is one, else Open; this
     // session's card has no Open
     const replies = t && !isDone ? chipActs($, t.chips, d).length : 0
-    const openBtn = active ? null : <Button key={'open:' + cli} variant={replies || isDone ? 'secondary' : 'primary'} onPress={press(() => openPinned($, d))}>Open</Button>
+    const openBtn = active ? null : <Button key={'open:' + cli} variant={replies || isDone ? 'secondary' : 'primary'} onPress={press(() => openRow($, d))}>Open</Button>
     const doneBtns = isDone ? [
       <Button key={'archive:' + cli} variant="primary" onPress={press(() => archiveDone($, bin, d))}>Archive</Button>,
       <Button key={'keep:' + cli} onPress={press(() => markAndReload($, bin, cli, 'done-keep'))}>Keep</Button>] : []
@@ -1762,18 +1782,8 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   }
   const pinned = sessionOrder(Array.isArray(s.desktop) ? s.desktop : [], asking, nowMs, states)
   const caseOnly = sessionOrder(caseOnlyRows(s), asking, nowMs, states)   // case sessions that are not pinned: listed under Cases
-  // terminal, dev3 and Codex sessions that wrote their own card (hooks/floor.ts agentRows): what each is on, read-only
-  const agents = agentRows(s, floor, nowMs)
-  const agentCard = ({ card, d }: { card: FloorCard; d: ChiefDesktop }) => {
-    const id = 'agent:' + card.session_id
-    const said = oneLine((card.recap ?? '').split('\n')[0], 200)
-    const waits = card.asks ? `asks: ${oneLine(card.question, 160)}` : card.waiting_on ? `waiting on ${oneLine(card.waiting_on, 80)}` : ''
-    return <Box key={id} flexDirection="column">
-      <Text key={id + ':title'} wrap="truncate-end">{d.title}</Text>
-      <Text key={id + ':meta'} dimColor wrap="truncate-end">{[ago(card.at, nowMs) === 'now' ? 'just now' : `${ago(card.at, nowMs)} ago`, waits].filter(Boolean).join(' · ')}</Text>
-      {said ? <Text key={id + ':said'} dimColor wrap="wrap">{said}</Text> : null}
-    </Box>
-  }
+  // sessions nobody pinned that wrote their own card (hooks/floor.ts agentRows): drawn as a pinned card is
+  const agents = sessionOrder(agentRows(s, floor), asking, nowMs, states)
   // a session whose state is not the one it had when the Sessions tab was last opened or left: the tab is marked
   const seenStates = ctx.tabs?.states
   const sessionsFresh = !!seenStates && Object.entries(states).some(([cli, st]) => cli in seenStates && seenStates[cli] !== st)
@@ -1799,7 +1809,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       caseOnly.length ? subHeading(ui, 'cases-heading', `Cases ${caseOnly.length}`) : null,
       ...caseOnly.map(pinnedCard),
       agents.length ? subHeading(ui, 'agents-heading', `Other agents ${agents.length}`) : null,
-      ...agents.map(agentCard)] },
+      ...agents.map(pinnedCard)] },
     { id: 'today', label: 'Today', count: counts.today, section: h => todaySection($, ui, bin, ctx.doc, nowMs, ctx, h, suggestedSection($, ui, bin, ctx.doc, nowMs, drafts, ctx)) },
     { id: 'team', label: 'Team', count: counts.team, section: h => teamSection($, ui, bin, ctx.doc, nowMs, drafts, ctx, h) },
     { id: 'health', label: 'Health', text: 'Health', count: healthProblems(s, ctx.doc, ctx.health?.dismissed), alert: healthProblems(s, ctx.doc, ctx.health?.dismissed) > 0,
