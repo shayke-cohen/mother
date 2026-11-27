@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import { SNOOZES, age, ago, askPrompt, isUrl, motherBin, motherVerb, oneLine, openSession, safe, todaysTop } from './shared'
-import { askFloor, askIdOf, forgetWrapUp, heldCount, holdAsk, isPinned, loadHeld, markAnswered, markCard, needsYou, noteWrapUp, ownAsks, parseFloor, prLinks, readCards, recommendationLabel,
+import { agentRows, askFloor, askIdOf, forgetWrapUp, heldCount, holdAsk, isPinned, loadHeld, markAnswered, markCard, needsYou, noteWrapUp, ownAsks, parseFloor, prLinks, readCards, recommendationLabel,
          recommendedOption, reloadFloor, storeCard, takeWrapUp, FLOOR_TAIL_MAX, NO_ASK } from './floor'
 import type { FloorReply } from './floor'
 import { askDeliver, caseBrief, caseMeta, caseOnlyRows, caseRows, claimCase, firstCase, floorRows, holdsClaim, noteTurn, relayIsOn, relayPass, relaySwitch, relayText, resetCos,
@@ -1181,7 +1181,7 @@ export function todayRows(doc: NowDoc | null | undefined, nowMs: number): { top:
 export function tabCounts(s: ChiefStatus | null, floor: FloorState | null, doc: NowDoc | null | undefined, nowMs: number): Record<TabId, number> {
   const today = todayRows(doc, nowMs)
   const inbox = typeof s?.inbox_count === 'number' ? s.inbox_count : Array.isArray(s?.inbox) ? s!.inbox!.length : 0
-  return { needs: needsYou(s, floor).length + accessRows(s).length, inbox, sessions: (Array.isArray(s?.desktop) ? s!.desktop!.length : 0) + caseOnlyRows(s).length,
+  return { needs: needsYou(s, floor).length + accessRows(s).length, inbox, sessions: (Array.isArray(s?.desktop) ? s!.desktop!.length : 0) + caseOnlyRows(s).length + agentRows(s, floor, nowMs).length,
            today: today.top.length + today.items.length + suggestedRows(doc).length, all: 0, team: teamCount(doc), health: healthProblems(s, doc) }
 }
 
@@ -1762,6 +1762,18 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   }
   const pinned = sessionOrder(Array.isArray(s.desktop) ? s.desktop : [], asking, nowMs, states)
   const caseOnly = sessionOrder(caseOnlyRows(s), asking, nowMs, states)   // case sessions that are not pinned: listed under Cases
+  // terminal, dev3 and Codex sessions that wrote their own card (hooks/floor.ts agentRows): what each is on, read-only
+  const agents = agentRows(s, floor, nowMs)
+  const agentCard = ({ card, d }: { card: FloorCard; d: ChiefDesktop }) => {
+    const id = 'agent:' + card.session_id
+    const said = oneLine((card.recap ?? '').split('\n')[0], 200)
+    const waits = card.asks ? `asks: ${oneLine(card.question, 160)}` : card.waiting_on ? `waiting on ${oneLine(card.waiting_on, 80)}` : ''
+    return <Box key={id} flexDirection="column">
+      <Text key={id + ':title'} wrap="truncate-end">{d.title}</Text>
+      <Text key={id + ':meta'} dimColor wrap="truncate-end">{[ago(card.at, nowMs) === 'now' ? 'just now' : `${ago(card.at, nowMs)} ago`, waits].filter(Boolean).join(' · ')}</Text>
+      {said ? <Text key={id + ':said'} dimColor wrap="wrap">{said}</Text> : null}
+    </Box>
+  }
   // a session whose state is not the one it had when the Sessions tab was last opened or left: the tab is marked
   const seenStates = ctx.tabs?.states
   const sessionsFresh = !!seenStates && Object.entries(states).some(([cli, st]) => cli in seenStates && seenStates[cli] !== st)
@@ -1785,7 +1797,9 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
       pinned.length ? (h ? sectionHeading(ui, 'pinned-heading', `Pinned ${pinned.length}`) : null) : emptyLine(ui, 'pinned-empty', 'No pinned sessions'),
       ...pinned.map(pinnedCard),
       caseOnly.length ? subHeading(ui, 'cases-heading', `Cases ${caseOnly.length}`) : null,
-      ...caseOnly.map(pinnedCard)] },
+      ...caseOnly.map(pinnedCard),
+      agents.length ? subHeading(ui, 'agents-heading', `Other agents ${agents.length}`) : null,
+      ...agents.map(agentCard)] },
     { id: 'today', label: 'Today', count: counts.today, section: h => todaySection($, ui, bin, ctx.doc, nowMs, ctx, h, suggestedSection($, ui, bin, ctx.doc, nowMs, drafts, ctx)) },
     { id: 'team', label: 'Team', count: counts.team, section: h => teamSection($, ui, bin, ctx.doc, nowMs, drafts, ctx, h) },
     { id: 'health', label: 'Health', text: 'Health', count: healthProblems(s, ctx.doc, ctx.health?.dismissed), alert: healthProblems(s, ctx.doc, ctx.health?.dismissed) > 0,
@@ -1794,7 +1808,7 @@ function paneTree($: Dollar, ui: Ui, bin: string, s: ChiefStatus | null, error: 
   const shown = shownTab(ctx.tabs?.picked, tabs)
   const drawn = shown === 'all' ? tabs : tabs.filter(t => t.id === shown)
   const strip = { needs: needs.length, inbox: typeof s.inbox_count === 'number' ? s.inbox_count : (s.inbox ?? []).length,
-                  sessions: pinned.length + caseOnly.length, spent: s.budget?.spent, limit: s.budget?.limit,
+                  sessions: pinned.length + caseOnly.length + agents.length, spent: s.budget?.spent, limit: s.budget?.limit,
                   overBudget: !!(s.budget?.over || s.budget?.unreadable), lead: leadPill(s, self, nowMs), beat,
                   portrait: ctx.portrait ?? null, surface: ctx.surface ?? 'terminal', guard: guardState(s) /* the one read the Health tab's Guard row shows */,
                   event: shownEvent(ctx.event, nowMs),

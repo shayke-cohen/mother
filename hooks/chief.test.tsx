@@ -985,6 +985,20 @@ test('test_needs_you_shows_a_codex_card_with_no_pinned_row', async ($, on) => {
   await ui.unmount()
 })
 
+test('test_sessions_tab_lists_terminal_and_dev3_agents_but_not_old_or_desktop_cards', async ($, on) => {
+  const { clock } = await bootFloor($, on, { cards: () => [
+    { ...asking({ session_id: CLI_B, agent: 'claude', surface: 'dev3', title: '#12 Fix login' }), asks: false, question: '', options: [], recap: 'Tests pass, opening the PR' },
+    { ...asking({ session_id: 'old-cli', agent: 'claude', surface: 'cli', repo: 'acme/old' }), asks: false, question: '', options: [], at: '2000-01-01T00:00:00Z' },
+    { ...asking({ session_id: 'desk-x', agent: 'claude', surface: 'desktop', repo: 'acme/desk' }), asks: false, question: '', options: [] }] })
+  const ui = await shown($, clock)
+  const all = await texts(ui)
+  expect(all).toContain('Other agents 1')
+  expect(all.some(x => x.includes('[Claude · dev3] #12 Fix login'))).toBe(true)
+  expect(all).toContain('Tests pass, opening the PR')
+  expect(all.some(x => x.includes('acme/old') || x.includes('acme/desk'))).toBe(false)
+  await ui.unmount()
+})
+
 test('test_pane_draws_needs_you_and_an_option_sends_and_hides_the_card', async ($, on) => {
   // CLI_B asks too, but no pinned row carries it: not shown
   const { clock, out, t } = await bootFloor($, on, { cards: () => [asking(), asking({ session_id: CLI_B, question: 'Unpinned asks?' })] })

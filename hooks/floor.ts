@@ -271,6 +271,24 @@ export function agentRow(card: FloorCard): ChiefDesktop | null {
            last_activity_at: card.at, last_report: card.recap ?? '', open_link: null }
 }
 
+// The sessions that are not pinned but wrote a card of their own (a Claude terminal, dev3, Codex): listed under the
+// Sessions tab so the manager sees what each is on, newest first. Desktop cards are left out (the pinned rows carry
+// those), and so is a card older than AGENT_ROW_HOURS: a terminal closed without a goodbye leaves its last card behind.
+export const AGENT_ROW_HOURS = 12
+export function agentRows(s: ChiefStatus | null, floor: FloorState | null, nowMs: number): { card: FloorCard; d: ChiefDesktop }[] {
+  if (!floor) return []
+  const pinned = floorRows(s)
+  const out: { card: FloorCard; d: ChiefDesktop }[] = []
+  for (const card of floor.cards) {
+    if (card.surface === 'desktop' || card.session_id === floor.self || pinned.some(p => p.cli_session_id === card.session_id)) continue
+    const at = Date.parse(card.at)
+    if (!at || nowMs - at > AGENT_ROW_HOURS * 3600_000) continue
+    const d = agentRow(card)
+    if (d) out.push({ card, d })
+  }
+  return out.sort((a, b) => (Date.parse(b.card.at) || 0) - (Date.parse(a.card.at) || 0))
+}
+
 // The cards to draw, oldest first: asking, not this session's own, not just answered, not on hold, and of a pinned
 // session or one that holds a live case (hooks/cos.ts); a card with no such row is not shown.
 export function needsYou(s: ChiefStatus | null, floor: FloorState | null): { card: FloorCard; d: ChiefDesktop }[] {
