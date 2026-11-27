@@ -451,6 +451,30 @@ def _uuid_lines(path, limit=None):
                 return
 
 
+UUID_KEY = re.compile(rb'"uuid"\s*:\s*"([^"]+)"')
+
+
+def _lead_uuids(path, n=FORK_PROBE):
+    """The first `n` uuids of a transcript, cheaply (bytes, no JSON): the last `"uuid"` key in a line's tail, where
+    the top-level one sits after the message. A nested match can only add a false candidate, which `fork_index` then
+    reads properly; a miss only falls back to the sessionId check."""
+    out = []
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            m = None
+            for m in UUID_KEY.finditer(line, max(0, len(line) - 2048)):
+                pass
+            if m:
+                out.append(m.group(1).decode("utf-8", "replace"))
+                if len(out) >= n:
+                    break
+    return out
+
+
 def _birth(path):
     try:
         st = os.stat(path)
@@ -470,7 +494,7 @@ def fork_index(files):
     then the one created first, then path order."""
     first = collections.defaultdict(set)
     for p in files:
-        for u, _, _, _ in _uuid_lines(p, FORK_PROBE):
+        for u in _lead_uuids(p):
             first[u].add(p)
     cand = sorted({p for ps in first.values() if len(ps) > 1 for p in ps})
     if not cand:
