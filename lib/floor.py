@@ -20,8 +20,18 @@ USAGE = """usage: mother floor <verb>
   list --json      every card not older than 7 days: {version: 1, cards: [...]}
   mark --stdin     {session_id, mark}: checked (a re-check was sent; refused within 24 h of the last), keep (no chase
                    for 3 days), drop (no chase for this wait), done-keep (no Done card until the session moves)
+  codex-hook       a Codex hook event on stdin (SessionStart, UserPromptSubmit, PermissionRequest, PostToolUse, Stop,
+                   SessionEnd): the Codex session's card. Prints nothing and always exits 0, so it never blocks Codex
+  codex-setup [--print]   add those hooks to ~/.codex/config.toml (idempotent); --print shows them instead
+  send --stdin     {session_id, text}: type the text into the session's tmux pane and press Enter. For sessions the
+                   desktop app can't message (Codex, a CLI in tmux, dev3); refused when the card names no live pane
+
+A card may also carry who the session is: `identify: true` on `card --stdin` reads it from the environment the
+session runs in (TMUX_PANE and TMUX, DEV3_TASK_ID with that task's title and overview from `dev3 task show`), and
+`agent` (claude, codex) and `surface` (desktop, cli, tmux, dev3) say what it is. `ask_from_waiting: true` makes a
+`Waiting on: the manager — <what>` line the card's question, for sessions no model call reads.
 """
-VERBS = ("card", "list", "mark")
+VERBS = ("card", "list", "mark", "codex-hook", "codex-setup", "send")
 SESSION_ID_RE = re.compile(r"^[0-9a-f-]{36}$")
 KEEP = timedelta(days=7)
 QUESTION_MAX = 200
@@ -44,6 +54,12 @@ WAITING_TEXT_MAX = 2000
 _WAITING_RE = re.compile(r"^\W{0,3}Waiting on:\s*(.+?)\s*(?:—|–|--|-)\s*(.*?)\W{0,3}$", re.IGNORECASE)
 _UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 _REPO_URL = re.compile(r"^https://[\w.-]+/[\w.-]+/[\w.-]+$")
+AGENTS = ("claude", "codex")
+SURFACES = ("desktop", "cli", "tmux", "dev3")
+TITLE_MAX = 100
+TEXT_MAX = 2000
+_PANE = re.compile(r"^%\d{1,6}$")
+_TASK = re.compile(r"^[\w-]{1,64}$")
 _REMOTE = re.compile(r"^(?:[a-z+]+://)?(?:[^@/\s]+@)?([\w.-]+)[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
 
 
@@ -83,7 +99,7 @@ def waiting_line(text) -> Optional[dict]:
     low = who.lower()
     if low in ("nothing", "nobody", "no one"):
         return {"state": "done", "on": None, "what": what}
-    if low in ("the manager", "manager", "you"):
+    if low in ("the manager", "manager", "you", "the user", "user"):
         return {"state": "waiting_manager", "on": None, "what": what}
     return {"state": "waiting_other", "on": who, "what": what}
 
@@ -213,6 +229,9 @@ def clean(doc) -> Optional[dict]:
                      why_manager=_line(doc.get("why_manager"), WHY_MANAGER_MAX),
                      repo=_line(doc.get("repo"), REPO_MAX), branch=_line(doc.get("branch"), BRANCH_MAX),
                      repo_url=url if isinstance(url, str) and _REPO_URL.match(url) else "")
+    elif doc.get("agent") in AGENTS:   # an identified session's card shows on the overview, asking or not
+        extra.update(repo=_line(doc.get("repo"), REPO_MAX), branch=_line(doc.get("branch"), BRANCH_MAX))
+    extra.update(identity(doc))
     if doc.get("source") in SOURCES:
         extra["source"] = doc["source"]
     extra["waiting"] = clean_waiting(doc.get("waiting"))
@@ -221,12 +240,85 @@ def clean(doc) -> Optional[dict]:
     return card
 
 
+def identity(doc) -> dict:
+    """Who the session is, from untrusted input: {agent, surface, title, tmux, dev3_task}, each only when well-formed."""
+    out = {}
+    if doc.get("agent") in AGENTS:
+        out["agent"] = doc["agent"]
+    if doc.get("surface") in SURFACES:
+        out["surface"] = doc["surface"]
+    title = _safe_line(doc.get("title"), TITLE_MAX)
+    if title:
+        out["title"] = title
+    t = doc.get("tmux")
+    if isinstance(t, dict) and isinstance(t.get("pane"), str) and _PANE.match(t["pane"]):
+        sock = t.get("socket")
+        out["tmux"] = dict({"pane": t["pane"]}, **({"socket": sock} if isinstance(sock, str) and sock.startswith("/")
+                                                   and len(sock) <= 300 and not _UNSAFE.search(sock) else {}))
+    task = doc.get("dev3_task")
+    if isinstance(task, str) and _TASK.match(task):
+        out["dev3_task"] = task
+    return out
+
+
+def _dev3_task(task_id: str, cwd) -> dict:
+    """{title, overview} of a dev3 task from `dev3 task show --json`; {} when dev3 is missing, slow or says nothing."""
+    import shutil
+    import subprocess
+    exe = shutil.which("dev3") or os.path.expanduser("~/.dev3.0/bin/dev3")
+    if not os.path.isfile(exe):
+        return {}
+    try:
+        ran = subprocess.run([exe, "task", "show", "--task", task_id, "--json"], capture_output=True, text=True, timeout=4,
+                             cwd=cwd if isinstance(cwd, str) and os.path.isdir(cwd) else None)
+        d = json.loads(ran.stdout) if ran.returncode == 0 else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    seq = d.get("seq")
+    title = _safe_line(d.get("title"), TITLE_MAX - 6)
+    return {"title": ("#%s %s" % (seq, title) if isinstance(seq, (int, str)) and str(seq).isdigit() and title else title),
+            "overview": _safe_line(d.get("overview"), RECAP_MAX)}
+
+
+def identify_env(env=None, cwd=None) -> dict:
+    """Who the calling session is, read from the environment it runs in: a tmux pane and socket, a dev3 task (with its
+    title, and its overview as the recap). `surface` is dev3, tmux or cli; the desktop app says desktop itself."""
+    env = os.environ if env is None else env
+    out = {"surface": "cli"}
+    pane = env.get("TMUX_PANE", "")
+    if _PANE.match(pane):
+        out["tmux"] = {"pane": pane}
+        sock = env.get("TMUX", "").split(",")[0]
+        if sock.startswith("/"):
+            out["tmux"]["socket"] = sock
+        out["surface"] = "tmux"
+    task = env.get("DEV3_TASK_ID", "")
+    if _TASK.match(task):
+        out.update(surface="dev3", dev3_task=task)
+        facts = _dev3_task(task, cwd)
+        if facts.get("title"):
+            out["title"] = facts["title"]
+        if facts.get("overview"):
+            out["recap"] = facts["overview"]
+    return out
+
+
 def write_card(ws: Path, at: datetime, doc) -> Optional[dict]:
     """Store the card atomically (temp file, then rename); None when it is refused. `cwd` is not kept: it says which
     checkout the repo and branch are read from. The same question, still asked on the card it replaces, keeps that
     card's `at` and so its `ask_id`: a refresh that writes it again doesn't make it a new question."""
     if isinstance(doc, dict):
         doc = {k: v for k, v in doc.items() if k not in ("waiting", "done_kept")}   # those are the file's, never the caller's
+        if doc.get("identify") is True:
+            found = identify_env(cwd=doc.get("cwd"))
+            if doc.get("surface") == "desktop":
+                found["surface"] = "desktop"
+            doc = dict(found, **{k: v for k, v in doc.items()
+                                 if k not in ("surface", "tmux", "dev3_task") and not (k in ("title", "recap") and not v)})
+            if found.get("recap"):   # a dev3 task's overview is the better TLDR than a turn's last lines
+                doc["recap"] = found["recap"]
     card = clean(dict(doc, **repo_facts(doc.get("cwd"))) if isinstance(doc, dict) else doc)
     if card is None:
         return None
@@ -247,6 +339,11 @@ def write_card(ws: Path, at: datetime, doc) -> Optional[dict]:
     wait = merged_wait(old.get("waiting"), new, at) if new is not None else clean_waiting(old.get("waiting"))
     if wait:
         card["waiting"] = wait
+    if doc.get("ask_from_waiting") is True and not card["asks"] and wait and wait.get("kind") == "manager" \
+            and new is not None and wait.get("what"):
+        card.update(asks=True, question=_line(wait["what"], QUESTION_MAX), options=[], waiting_on=None)
+        if old.get("asks") is True and old.get("question") == card["question"]:
+            since = _parse(old.get("at")) or at
     card["at"] = _iso(since)
     if card["asks"]:
         card["ask_id"] = ask_id(card["question"], card["at"])
@@ -355,6 +452,117 @@ def mark(ws: Path, at: datetime, doc) -> dict:
     return {"ok": True, "session_id": sid, "mark": what}
 
 
+# ---- Codex: its hooks feed the same cards ----
+CODEX_EVENTS = ("SessionStart", "UserPromptSubmit", "PermissionRequest", "PostToolUse", "Stop", "SessionEnd")
+CODEX_MARK = "# mother floor: Codex sessions on the floor (mother floor codex-setup)"
+
+
+def _codex_ask(doc) -> str:
+    """A PermissionRequest as one line: the tool and what it would run."""
+    tool = _safe_line(doc.get("tool_name"), 40) or "a tool"
+    ti = doc.get("tool_input")
+    what = ti.get("command") or ti.get("file_path") or ti.get("path") if isinstance(ti, dict) else ti
+    if isinstance(what, list):
+        what = " ".join(str(x) for x in what)
+    what = _safe_line(what, 140)
+    return ("Approve %s: %s" % (tool, what) if what else "Approve %s" % tool)[:QUESTION_MAX]
+
+
+def codex_event(ws: Path, at: datetime, doc) -> Optional[dict]:
+    """One Codex hook event into its session's card; None when nothing was written. Codex's payload is Claude Code's
+    shape: session_id, cwd, hook_event_name, plus last_assistant_message on Stop, tool_name and tool_input on
+    PermissionRequest."""
+    if not isinstance(doc, dict) or doc.get("hook_event_name") not in CODEX_EVENTS:
+        return None
+    sid, ev = doc.get("session_id"), doc["hook_event_name"]
+    if not isinstance(sid, str) or not SESSION_ID_RE.match(sid):
+        return None
+    path = floor_dir(ws) / (sid + ".json")
+    if ev == "SessionEnd":
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    base = {"session_id": sid, "agent": "codex", "identify": True, "cwd": doc.get("cwd"),
+            "asks": False, "question": "", "options": [], "waiting_on": None}
+    if ev == "PostToolUse":   # an approval was given in Codex itself: the approval card is answered
+        try:
+            old = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if not (isinstance(old, dict) and old.get("asks") is True and str(old.get("question", "")).startswith("Approve ")):
+            return None
+        return write_card(ws, at, base)
+    if ev == "PermissionRequest":
+        return write_card(ws, at, dict(base, asks=True, question=_codex_ask(doc), waiting_on="approval in Codex",
+                                       why_manager="Codex asks before it runs this"))
+    if ev == "Stop":
+        text = doc.get("last_assistant_message") if isinstance(doc.get("last_assistant_message"), str) else ""
+        last = [l for l in text.splitlines() if l.strip() and not _WAITING_RE.match(l.strip())]
+        return write_card(ws, at, dict(base, waiting_text=text[-WAITING_TEXT_MAX:], ask_from_waiting=True,
+                                       recap=_line(" ".join(last[:3]), RECAP_MAX)))
+    return write_card(ws, at, base)   # SessionStart, UserPromptSubmit: on the floor, not asking
+
+
+def codex_hooks_toml(bin_path: str) -> str:
+    cmd = '%s floor codex-hook' % bin_path
+    rows = [CODEX_MARK]
+    for ev in CODEX_EVENTS:
+        rows += ["[[hooks.%s]]" % ev, "[[hooks.%s.hooks]]" % ev, 'type = "command"',
+                 "command = %s" % json.dumps(cmd), "timeout = 5", ""]
+    return "\n".join(rows)
+
+
+def codex_setup(bin_path: str, config: Path, print_only: bool) -> str:
+    """Append the hooks once. Codex runs a new or changed hook only after the user reviews it there (/hooks)."""
+    block = codex_hooks_toml(bin_path)
+    if print_only:
+        return block
+    text = config.read_text() if config.is_file() else ""
+    if CODEX_MARK in text:
+        return "already set up in %s" % config
+    if not re.search(r"(?m)^\s*hooks\s*=\s*true", text):
+        block = "# needs [features] hooks = true\n" + block
+    config.parent.mkdir(parents=True, exist_ok=True)
+    with open(config, "a") as f:
+        f.write(("\n" if text and not text.endswith("\n") else "") + "\n" + block + "\n")
+    return "added Codex hooks to %s; review them in Codex (/hooks) before they run" % config
+
+
+def send(ws: Path, doc, run=None) -> dict:
+    """Type `text` into the session's tmux pane, then Enter. ValueError when refused: no card, no pane, a pane that
+    is gone, or empty text. The text is one line: a newline would submit early."""
+    import subprocess
+    run = run or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=5))
+    sid = doc.get("session_id") if isinstance(doc, dict) else None
+    if not (isinstance(sid, str) and SESSION_ID_RE.match(sid)):
+        raise ValueError("session_id must be a 36-character session id")
+    text = _safe_line(doc.get("text"), TEXT_MAX)
+    if not text:
+        raise ValueError("nothing to send")
+    try:
+        card = json.loads((floor_dir(ws) / (sid + ".json")).read_text())
+    except (OSError, ValueError):
+        raise ValueError("no card for that session")
+    t = identity(card if isinstance(card, dict) else {}).get("tmux")
+    if not t:
+        raise ValueError("that session has no tmux pane to type into; open it instead")
+    base = ["tmux"] + (["-S", t["socket"]] if t.get("socket") else [])
+    seen = run(base + ["display-message", "-p", "-t", t["pane"], "#{pane_id}"])
+    if seen.returncode != 0 or seen.stdout.strip() != t["pane"]:
+        raise ValueError("that session's tmux pane is gone")
+    if run(base + ["send-keys", "-t", t["pane"], "-l", "--", text]).returncode != 0 or \
+            run(base + ["send-keys", "-t", t["pane"], "Enter"]).returncode != 0:
+        raise ValueError("tmux would not take the keys")
+    return {"sent": True, "session_id": sid, "pane": t["pane"]}
+
+
+def _bin_path() -> str:
+    import shutil
+    return shutil.which("mother") or str(Path(__file__).resolve().parent.parent / "bin" / "mother")
+
+
 def main(args, ws, cfg, at=None) -> int:
     at = at or datetime.now(timezone.utc)
     if args[:1] in ([], ["help"], ["-h"], ["--help"]):
@@ -386,6 +594,22 @@ def main(args, ws, cfg, at=None) -> int:
         return 0
     if args == ["list", "--json"]:
         print(json.dumps({"version": 1, "cards": list_cards(ws, at)}, ensure_ascii=False))
+        return 0
+    if args == ["codex-hook"]:
+        try:
+            codex_event(ws, at, json.loads(sys.stdin.read() or "null"))
+        except Exception:   # never block or break a Codex turn
+            pass
+        return 0
+    if args[:1] == ["codex-setup"] and args[1:] in ([], ["--print"]):
+        print(codex_setup(_bin_path(), Path.home() / ".codex" / "config.toml", args[1:] == ["--print"]))
+        return 0
+    if args == ["send", "--stdin"]:
+        try:
+            print(json.dumps(send(ws, json.loads(sys.stdin.read()))))
+        except ValueError as e:
+            print("mother floor send: %s" % e, file=sys.stderr)
+            return 1
         return 0
     print(USAGE.strip(), file=sys.stderr)
     return 2

@@ -165,8 +165,10 @@ async function floorCli($: Dollar, bin: string, args: string[], stdin?: string):
 // `mother floor card --stdin`: this session's card. True when the CLI took it. `cwd` says which checkout the card's repo
 // and branch are read from.
 // `waitingText` (the end of the turn's final message) carries its `Waiting on:` line, which the CLI reads in code.
-export async function storeCard($: Dollar, bin: string, sessionId: string, reply: FloorReply, cwd?: string, waitingText?: string): Promise<boolean> {
-  return (await floorCli($, bin, ['card', '--stdin'], JSON.stringify({ session_id: sessionId, ...reply, ...(cwd ? { cwd } : {}),
+// `who` says who the session is when it is not a pinned one (agent, surface, identify, ask_from_waiting).
+export async function storeCard($: Dollar, bin: string, sessionId: string, reply: FloorReply, cwd?: string, waitingText?: string,
+                                who?: Record<string, unknown>): Promise<boolean> {
+  return (await floorCli($, bin, ['card', '--stdin'], JSON.stringify({ session_id: sessionId, ...reply, ...(who ?? {}), ...(cwd ? { cwd } : {}),
     ...(typeof waitingText === 'string' ? { waiting_text: waitingText.slice(-WAITING_TEXT_MAX) } : {}) }))) !== null
 }
 
@@ -252,18 +254,32 @@ const isHeld = (floor: FloorState, card: FloorCard): boolean => floor.held?.[car
 // How many asking cards the manager put on hold: the Needs you tab says so, so an empty tab isn't a false all-clear.
 export function heldCount(s: ChiefStatus | null, floor: FloorState | null): number {
   const rows = floorRows(s)
-  return floor ? floor.cards.filter(c => c.asks && c.session_id !== floor.self && isHeld(floor, c) && rows.some(r => r.cli_session_id === c.session_id)).length : 0
+  return floor ? floor.cards.filter(c => c.asks && c.session_id !== floor.self && isHeld(floor, c) && (rows.some(r => r.cli_session_id === c.session_id) || !!agentRow(c))).length : 0
+}
+
+// A card from a session that is not pinned (Codex, a CLI, dev3): its own row, drawn from what the card says of it. Only
+// cards that say which agent wrote them; the title carries the tool, so the manager can tell a Codex card at a glance.
+const AGENT_NAME: Record<string, string> = { codex: 'Codex', claude: 'Claude' }
+const SURFACE_NAME: Record<string, string> = { dev3: 'dev3', tmux: 'terminal', cli: 'terminal', desktop: 'desktop' }
+export function agentRow(card: FloorCard): ChiefDesktop | null {
+  const agent = card.agent ? AGENT_NAME[card.agent] : undefined
+  if (!agent) return null
+  const where = card.surface ? SURFACE_NAME[card.surface] : ''
+  const tag = where && where !== 'desktop' && !(card.agent === 'claude' && where === 'terminal') ? `${agent} · ${where}` : agent
+  const name = card.title || [card.repo, card.branch].filter(Boolean).join(' · ') || 'a session'
+  return { session_id: '', cli_session_id: card.session_id, title: oneLine(`[${tag}] ${name}`, 120), cwd: '', repo: card.repo ?? '',
+           last_activity_at: card.at, last_report: card.recap ?? '', open_link: null }
 }
 
 // The cards to draw, oldest first: asking, not this session's own, not just answered, not on hold, and of a pinned
 // session or one that holds a live case (hooks/cos.ts); a card with no such row is not shown.
 export function needsYou(s: ChiefStatus | null, floor: FloorState | null): { card: FloorCard; d: ChiefDesktop }[] {
   const pinned = floorRows(s)
-  if (!floor || !pinned.length) return []
+  if (!floor) return []
   const out: { card: FloorCard; d: ChiefDesktop }[] = []
   for (const card of floor.cards) {
     if (!card.asks || card.session_id === floor.self || floor.answered.includes(card.session_id) || isHeld(floor, card)) continue
-    const d = pinned.find(p => p.cli_session_id === card.session_id)
+    const d = pinned.find(p => p.cli_session_id === card.session_id) ?? agentRow(card)
     if (d && !out.some(o => o.d.cli_session_id === d.cli_session_id)) out.push({ card, d })
   }
   return out.sort((a, b) => (Date.parse(a.card.at) || 0) - (Date.parse(b.card.at) || 0))

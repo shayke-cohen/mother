@@ -106,6 +106,8 @@ const firstLine = (text: string): string => text.split('\n').find(l => l.trim())
 let passError: string | null = null
 // The last status read: the budget and the pinned sessions, for the model calls made between reads.
 let lastStatus: ChiefStatus | null = null
+// The mother CLI the last pass used: a pane send falls back to `mother floor send` (tmux) through it.
+let lastBin: string | null = null
 
 // `mother chief status --json`. A failure keeps the last good status and sets chiefError. Returns this read's status,
 // or null when this read failed (the last good one is not returned: a caller deciding from it must read fresh).
@@ -389,8 +391,20 @@ async function sendPinned($: Dollar, cliId: string, value: string): Promise<bool
   } catch (err) {
     said = `not delivered: ${(err as Error).message ?? String(err)}`
   }
+  // A session the app can't message (Codex, a CLI in tmux, dev3): type into its tmux pane, the card's last-known one.
+  if (said !== 'delivered' && lastBin) said = (await tmuxSend($, lastBin, cliId, value)) ?? said
   await update($, chiefSentAtom, prev => ({ ...(prev ?? {}), [cliId]: said }))
   return said === 'delivered'
+}
+
+// `mother floor send --stdin`: 'delivered', or null when the session has no live pane (the caller keeps its own reason).
+async function tmuxSend($: Dollar, bin: string, cliId: string, value: string): Promise<string | null> {
+  try {
+    const ran = await $.process.run(['python3', bin, 'floor', 'send', '--stdin'], { timeoutMs: 15_000, stdin: JSON.stringify({ session_id: cliId, text: value }) })
+    return ran.exitCode === 0 ? 'delivered' : null
+  } catch {
+    return null
+  }
 }
 
 // An Inbox card's action: an item whose key has a live case session gets the action's prompt sent to that session (as
@@ -1829,8 +1843,9 @@ async function floorCard($: Dollar, configured: string, answer: string | null, s
   if (answer !== null) cardsWriting += 1
   try {
     const id = await $.session.id()
-    if (!isPinned(lastStatus, id) && !holdsClaim(lastStatus, id)) return
     const bin = await motherBin($, configured)
+    lastBin = bin
+    if (!isPinned(lastStatus, id) && !holdsClaim(lastStatus, id)) { await otherCard($, bin, id, answer, said); return }
     if (answer === null) { await storeCard($, bin, id, NO_ASK); return }
     let cwd: string | undefined
     try { cwd = await $.session.cwd() } catch { /* the card goes without its repo and branch */ }
@@ -1844,6 +1859,19 @@ async function floorCard($: Dollar, configured: string, answer: string | null, s
   } finally {
     if (answer !== null) cardsWriting -= 1
   }
+}
+
+// Any other Claude session (a CLI, dev3, an unpinned desktop one) is on the floor too, but never costs a model call: its
+// card comes from its wrap_up call or its `Waiting on: the user — …` line, and says who it is (lib/floor.py identify).
+async function otherCard($: Dollar, bin: string, id: string, answer: string | null, said: FloorReply | null): Promise<void> {
+  if (floorOff) return
+  let cwd: string | undefined
+  try { cwd = await $.session.cwd() } catch { /* no repo and branch */ }
+  let desktop = false
+  try { desktop = (await $.session.surfaces()).includes('desktop') } catch { /* a terminal */ }
+  const who = { agent: 'claude', identify: true, ...(desktop ? { surface: 'desktop' } : {}), ask_from_waiting: true }
+  const reply = answer === null ? NO_ASK : (said ?? NO_ASK)
+  await storeCard($, bin, id, reply, cwd, answer === null ? undefined : String(answer), who)
 }
 
 // The first prompt of a session that starts from a case brief claims the item's key for this session, then re-reads

@@ -902,7 +902,6 @@ test('test_floor_pinned_turn_end_writes_its_card', async ($, on) => {
 {
   const spent = { exitCode: 0, stdout: JSON.stringify(status({ budget: { spent: 20, limit: 20, over: true }, desktop: [PINNED] })) }
   const cases: [string, Parameters<typeof bootFloor>[2], Record<string, unknown>][] = [
-    ['unpinned', {}, {}],                                                        // this session is sess-1, not a pinned row
     ['subagent', { sessionId: CLI_A }, { agentId: 'a1' }],
     ['aborted', { sessionId: CLI_A }, { reason: 'aborted', isAborted: true }],
     ['error', { sessionId: CLI_A }, { reason: 'error' }],
@@ -954,14 +953,37 @@ test('test_floor_the_managers_prompt_clears_the_card', async ($, on) => {
   expect(f.waitTexts).toEqual([undefined])                                       // a typed prompt carries no Waiting on: text
 })
 
-test('test_floor_an_unpinned_sessions_prompt_writes_nothing', async ($, on) => {
+const OTHER_CARD = { session_id: 'sess-1', asks: false, question: '', options: [], waiting_on: null, agent: 'claude', identify: true, surface: 'desktop', ask_from_waiting: true }
+
+// Any session that is not pinned is on the floor too, with who it is and no model call: its card comes from its wrap_up
+// call or its `Waiting on: the user` line (lib/floor.py ask_from_waiting).
+test('test_floor_an_unpinned_session_writes_its_card_with_no_model_call', async ($, on) => {
+  const { clock, f } = await bootFloor($, on)
+  await $.turn.complete(turnEnd())
+  await clock.settle()
+  expect([f.floorAsks.length, f.cards]).toEqual([0, [OTHER_CARD]])
+})
+
+test('test_floor_an_unpinned_sessions_prompt_clears_its_card', async ($, on) => {
   const { clock, f } = await bootFloor($, on)
   await $.prompt.submit({ text: 'hello' })
   await clock.settle()
-  expect(f.cards).toEqual([])
+  expect([f.floorAsks.length, f.cards]).toEqual([0, [OTHER_CARD]])
 })
 
 const asking = (over: Record<string, unknown> = {}) => ({ session_id: CLI_A, ...ASK, at: '2026-11-02T09:50:00Z', ...over })
+
+test('test_needs_you_shows_a_codex_card_with_no_pinned_row', async ($, on) => {
+  const { clock, t } = await bootFloor($, on, { cards: () => [asking({ session_id: CLI_B, question: 'Approve Bash: git push', agent: 'codex', surface: 'dev3',
+                                                                          title: '#46 Plan Nano', tmux: { pane: '%7' } })] })
+  const ui = await shown($, clock)
+  const all = await texts(ui)
+  expect(all).toContain('Needs you 1')
+  expect(all.some(x => x.includes('[Codex · dev3] #46 Plan Nano'))).toBe(true)
+  await ui.press({ key: `need:${CLI_B}:0` })
+  expect(JSON.stringify(t.sends[0]?.to ?? '')).toContain(CLI_B)                 // the app's send first; tmux only when it can't deliver
+  await ui.unmount()
+})
 
 test('test_pane_draws_needs_you_and_an_option_sends_and_hides_the_card', async ($, on) => {
   // CLI_B asks too, but no pinned row carries it: not shown
@@ -2140,7 +2162,7 @@ test('test_an_unpinned_claimed_session_writes_floor_cards', async ($, on) => {
   const { clock, f } = await bootCase($, on, { cases: () => (claimed ? [CASE] : []) })
   await $.turn.complete(turnEnd())
   await clock.settle()
-  expect(f.cards).toEqual([])                                                          // not pinned, no claim: not on the floor
+  expect(f.cards.map((c: any) => [c.asks, c.agent])).toEqual([[false, 'claude']])    // not pinned, no claim: an identity card, no model call
   claimed = true
   await $.prompt.submit({ text: 'go on' })                                             // (not its first prompt's claim: the status is what counts)
   await clock.advance(60_000)
@@ -2157,6 +2179,7 @@ test('test_the_claim_puts_the_session_on_the_floor_before_its_turn_ends', async 
   await $.prompt.submit({ text: caseBrief(ITEM) })
   await clock.settle()
   expect(c.claims.length).toBe(1)
+  f.cards.length = 0                                                                   // the brief's own prompt may clear an identity card first
   await $.turn.complete(turnEnd())
   await clock.settle()
   expect(f.cards).toEqual([{ session_id: CLI_B, ...ASK }])

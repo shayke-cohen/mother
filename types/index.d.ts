@@ -194,6 +194,11 @@ export type FloorCard = {
   repo_url?: string                  // when known and on a host where `#123` can be made a link
   waiting?: FloorWaiting             // the session's last `Waiting on:` line, read in code (lib/floor.py)
   done_kept?: string                 // Keep on its Done card, at this card `at`: no Done card until the session moves
+  agent?: 'claude' | 'codex'         // set for sessions that are not pinned: which tool wrote the card
+  surface?: 'desktop' | 'cli' | 'tmux' | 'dev3'
+  title?: string                     // a dev3 task's title, when known
+  tmux?: { pane: string; socket?: string }   // where `mother floor send` types an answer
+  dev3_task?: string
 }
 // A session's wait: `since` holds while the same who and what repeat; the rest is what the manager pressed on it.
 export type FloorWaiting = {
