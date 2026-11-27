@@ -68,6 +68,18 @@ you cannot catch it by watching. **Draft is the only reliable brake.** Keep a PR
 After a merge, confirm it on the remote: `gh pr view <n> --json state,mergeCommit` says `MERGED`, and
 `git fetch` then `git merge-base --is-ancestor <mergeCommit> origin/<default>` succeeds.
 
+## After a merge: stop watching it
+
+Once a PR is verified `MERGED`, turn off everything that would wake the session for it:
+
+- the desktop app's Auto-fix / PR monitor for that PR (`set_monitor` off, or `unbind_pr`, where the app's PR tools
+  exist);
+- any background `gh pr checks --watch`, Monitor or scheduled wake-up armed for it.
+
+A late CI or Auto-fix event for a merged PR gets at most one line ("#41 is merged; ignoring"), never a fresh
+investigation. Each wake-up re-reads the whole context: one long session spent 19 replies saying "nothing to do"
+to 37 events after its PRs had merged.
+
 ## Heartbeat
 
 While watches or sub-agents run, post one line to the session every 30-60 minutes, woken by a timed wake-up
@@ -127,3 +139,4 @@ Until then the session keeps landing. Never answer "done" from the current workt
 | Opening the report with what merged | Lead with Not landed and Stranded; a merged-first list reads as done |
 | "It's on main" from the local checkout | Verify with `merge-base` against `origin/<default>` |
 | Merging because the PR looks ready | Only inside the manager's approval or standing instructions |
+| Leaving the PR monitor and watches armed after the merge | Turn them off once `MERGED` is verified; answer late events in one line |
