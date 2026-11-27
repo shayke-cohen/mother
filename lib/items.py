@@ -10,6 +10,8 @@ reach the brief only through this check, so two rules hold in code rather than i
 Commands (JSON out):
   check [--file F] [--max N]   stdin (or F) = a reader's reply, prose and ```json fences allowed
                                -> {source, coverage, items, counts, dropped, truncated, warning}
+                               `coverage.retry_after` / `coverage.retry`: kept on a partial (a rate-limited
+                               chat reader), seconds capped at RETRY_AFTER_CAP
                                `counts`: `state: noise` summaries ("16 stale issues") whose evidence is the
                                search that reproduces them, not one link; a count is never a finding
                                exit 0 = usable (even if coverage is couldnt_check); 2 = malformed
@@ -24,6 +26,10 @@ STATUSES = ("ok", "partial", "couldnt_check")
 SOURCES = ("calendar", "mail", "chat", "tracker", "code")
 MAX_ITEMS = 25
 NOTE_MAX = 200
+# A chat reader stopped by a 429 can't wait: it hands back the seconds to wait and the one call that failed,
+# and the routine waits (never longer than this) and retries that call once (skills/routine "Chat reads").
+RETRY_AFTER_CAP = 60
+RETRY_MAX = 1000  # characters of JSON for the failed call's arguments
 
 URL = re.compile(r"https?://[^\s<>()\]\"'`]+")
 TICKET = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d+\b")
@@ -120,6 +126,22 @@ def couldnt(source, reason):
             "warning": "⚠️ %s: couldn't check — %s" % (source or "a source", reason)}
 
 
+def retry_fields(cov):
+    """`retry_after` (int seconds, capped) and `retry` ({tool, args}) from a partial coverage, junk dropped."""
+    out = {}
+    if cov.get("status") != "partial":
+        return out
+    ra = cov.get("retry_after")
+    if isinstance(ra, int) and not isinstance(ra, bool) and ra >= 0:
+        out["retry_after"] = min(ra, RETRY_AFTER_CAP)
+    call = cov.get("retry")
+    if isinstance(call, dict) and isinstance(call.get("tool"), str) and call["tool"].strip():
+        args = call.get("args", {})
+        if isinstance(args, dict) and len(json.dumps(args)) <= RETRY_MAX:
+            out["retry"] = {"tool": call["tool"].strip()[:NOTE_MAX], "args": args}
+    return out
+
+
 def check(raw, max_items=MAX_ITEMS):
     """Returns (code, normalized). code 2 = malformed; the normalized result is then a couldnt_check."""
     try:
@@ -140,6 +162,7 @@ def check(raw, max_items=MAX_ITEMS):
     for k in ("opened", "unopened"):
         if isinstance(cov.get(k), int) and not isinstance(cov.get(k), bool):
             coverage[k] = cov[k]
+    coverage.update(retry_fields(cov))
     kept, counts, seen, dropped = [], [], set(), 0
     for it in items:
         if (isinstance(it, dict) and it.get("state") == "noise" and str(it.get("title") or "").strip()

@@ -54,6 +54,31 @@ class TestCheck(unittest.TestCase):
         self.assertEqual(r["coverage"]["opened"], 8)
         self.assertIn("partial — opened 8 of 22", r["warning"])
 
+    def test_rate_limited_chat_keeps_retry_after_and_the_call(self):
+        call = {"tool": "mcp__slack__get_thread_replies", "args": {"channel_id": "C1", "thread_ts": "1.2"}}
+        code, r = items.check(reply(source="chat", status="partial", reason="rate-limited", retry_after=30,
+                                    retry=call, its=[it("https://chat.example.com/archives/C1/p1")]))
+        self.assertEqual(code, 0)
+        self.assertEqual(r["coverage"]["retry_after"], 30)
+        self.assertEqual(r["coverage"]["retry"], call)
+        self.assertIn("partial — rate-limited", r["warning"])
+
+    def test_retry_after_is_capped_and_junk_is_dropped(self):
+        _, r = items.check(reply(source="chat", status="partial", reason="rate-limited", retry_after=900))
+        self.assertEqual(r["coverage"]["retry_after"], items.RETRY_AFTER_CAP)
+        for bad in (-1, True, "30", None):
+            _, r = items.check(reply(source="chat", status="partial", reason="rate-limited", retry_after=bad))
+            self.assertNotIn("retry_after", r["coverage"], bad)
+        for bad in ("get_history", {"tool": ""}, {"tool": "x", "args": "a=1"}, {"args": {}},
+                    {"tool": "x", "args": {"q": "y" * 5000}}):
+            _, r = items.check(reply(source="chat", status="partial", reason="rate-limited", retry=bad))
+            self.assertNotIn("retry", r["coverage"], bad)
+
+    def test_retry_is_only_kept_on_a_partial(self):
+        _, r = items.check(reply(source="chat", retry_after=10, retry={"tool": "x", "args": {}}))
+        self.assertNotIn("retry", r["coverage"])
+        self.assertNotIn("retry_after", r["coverage"])
+
     def test_all_uncited_is_not_quiet(self):
         code, r = items.check(reply(its=[it("somewhere"), it("")]))
         self.assertEqual(code, 0)

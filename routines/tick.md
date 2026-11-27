@@ -82,7 +82,9 @@ Signal names below are used verbatim; they are the keys `mother now merge` knows
 
 3. **Delta.** Dispatch **one `mother:reader` per source** whose read capability is `ok` in
    `capabilities.json` and that has at least one enabled signal this tick (chat, tracker, mail, calendar,
-   code), **in parallel**, in a single message. Give each reader: the `source`, how to reach it (the
+   code), **in parallel**, in a single message — but at most one chat reader, and no chat reads of your own
+   while it runs; a `rate-limited` chat reader is waited out and retried once as in `mother:routine` → "Chat
+   reads: one call at a time". Give each reader: the `source`, how to reach it (the
    `capabilities.json` server or `gh`/`glab`), a page size (explicit; a single tracker result is "possibly
    truncated"), the limits, the window, and the signal rules below for that source only.
    - **Window.** Fast tick: since the previous document's `generated_at` (no previous document = since the

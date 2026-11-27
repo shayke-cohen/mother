@@ -92,6 +92,8 @@ sprint move.
 
 ## 2. Gather — per team, in parallel
 
+Chat is the exception: its reads go one call at a time, never in parallel, and a 429 is waited out and retried once (`mother:routine` → "Chat reads: one call at a time"). With several teams, read the teams' chat channels one after another, not team by team in parallel.
+
 **Tracker** (skip if no `tracker.project`) — items in the open sprint (or the team's active cycle/board
 if the tracker has no sprints) **transitioned or created** in the window, and in-sprint items with **no
 transition for 3+ working days**. Explicit page size and field list; check truncation flags and never

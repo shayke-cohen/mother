@@ -34,6 +34,8 @@ looks back `lookback_days`, because an item becomes overdue days after it was se
 
 ## 1. Gather — in parallel
 
+Chat is the exception: its reads go one call at a time, never in parallel, and a 429 is waited out and retried once (`mother:routine` → "Chat reads: one call at a time").
+
 | Kind | Where | What counts |
 |---|---|---|
 | **Made by the manager** | Sent mail; the manager's own messages in their DMs and configured channels; meeting notes in `teams/*/meetings/` | A first-person promise with an object: "I'll send…", "let me check and get back to you", "I'll intro you to…", "I'll review it tomorrow" |
