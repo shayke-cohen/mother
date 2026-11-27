@@ -125,6 +125,10 @@
     "doctor": {
       "at": "07:00",
       "days": "all"
+    },
+    "retro": {
+      "at": "17:30",
+      "days": "Thu"
     }
   },
   "whatsapp": {

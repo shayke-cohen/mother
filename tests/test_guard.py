@@ -595,6 +595,18 @@ class TestSubagent(GuardCase):
         self.assertEqual(self.reader("Write", {"file_path": os.path.join(self.ws, "x.md")}, "mother:critic"),
                          "deny")
 
+    def test_retro_reader_reads_files_only(self):
+        transcript = os.path.join(os.path.expanduser("~"), ".claude", "projects", "p", "s.jsonl")
+        for agent in ("mother:retro-reader", "retro-reader"):
+            self.assertEqual(self.reader("Read", {"file_path": transcript}, agent), "none")
+            self.assertEqual(self.reader("Grep", {"pattern": "is_error", "path": transcript}, agent), "none")
+            self.assertEqual(self.reader(CHAT + "post_message", {"channel_id": DM, "text": "x"}, agent), "deny")
+            self.assertEqual(self.reader(CHAT + "get_channel_history", {"channel_id": TEAM}, agent), "deny")
+            self.assertEqual(self.reader("Bash", {"command": "gh pr list"}, agent), "deny")
+            self.assertEqual(self.reader("Write", {"file_path": os.path.join(self.ws, "retro", "x.md")}, agent), "deny")
+            self.assertEqual(self.reader("Agent", {"prompt": "x"}, agent), "deny")
+            self.assertEqual(self.reader("WebFetch", {"url": "https://example.com"}, agent), "deny")
+
     def test_other_subagents_keep_the_normal_rules(self):
         self.assertEqual(self.reader(CHAT + "post_message", {"channel_id": DM, "text": "x"}, "Explore"), "allow")
         self.assertEqual(self.reader(CHAT + "post_message", {"channel_id": TEAM, "text": "x"}, "general-purpose"),

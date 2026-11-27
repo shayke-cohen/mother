@@ -9,7 +9,7 @@ Every part of v0 is built against this file. Change it first, then the code.
 ```
 .claude-plugin/plugin.json, marketplace.json   plugin.json also names `types` and the Now panel's userConfig
                            `mother_bin` (empty default = `${plugin root}/bin/mother`; a leading `~` is $HOME)
-bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now
+bin/mother                 CLI (Python 3, stdlib only): init, join, sync, scan, home, status, register, runs, items, eval, now, retro
 hooks/hooks.json           `modules: ["./register.tsx"]` (the Now panel); PreToolUse → hooks/guard.py (every other tool
                            via hooks/guard_fast.py); Stop + SessionEnd → `mother sync --quiet`. A panel module that fails to
                            load leaves the command hooks running
@@ -17,9 +17,10 @@ hooks/guard.py             approval guard (see §5)
 hooks/guard_fast.py        the guard's fast path: every tool the main matcher doesn't take; escalates to guard.py for
                            channel roles, MOTHER's sub-agents, hub and hub-fed sessions and the grant key (see §5)
 skills/<name>/SKILL.md     user- and routine-facing skills, invoked as `mother:<name>`
-agents/<name>.md           read-only sub-agents MOTHER dispatches: `mother:reader`, `mother:critic` (see §5c)
+agents/<name>.md           read-only sub-agents MOTHER dispatches: `mother:reader`, `mother:critic`, `mother:retro-reader` (see §5c)
 routines/<id>.md           routine definitions: what a scheduled run does (reads config, calls skills)
-lib/                       channels.py (§5b), items.py (reader evidence check), evals.py (A/B harness), now.py (tick's Now list)
+lib/                       channels.py (§5b), items.py (reader evidence check), evals.py (A/B harness), now.py (tick's Now list),
+                           retro_signals.py (the session retro's model-free stage, §5c)
 assets/deck/               meeting deck template.html + build.py
 rules/                     default policy text skills cite: outbound.md, privacy.md, memory.md, todos.md, projects.md, teams.md
 templates/workspace/       files `mother init` copies into a new workspace
@@ -45,6 +46,8 @@ projects/<slug>/PROJECT.md + files/     indexed by projects/PROJECTS.md
 teams/<slug>/TEAM.md, roadmap.md, sprints/, meetings/, repos/<owner>__<repo>.md, intake.md, metrics.md, runs.md   indexed by teams/TEAMS.md
 people/<slug>.md           work items only, never assessments
 one-on-ones/<slug>/        next.md (queued topics) + YYYY-MM-DD.md (prep, then notes: topics and commitments only)
+retro/<date>.md, retro/suggestions.jsonl   the weekly session retro's report and decision ledger (append-only), when
+                           there is no `projects/session-retro/` (then its `files/` holds them); raw signals stay in `~/.mother/retro/`
 journal/YYYY-MM-DD.md      nightly reflection; journal/dots/YYYY-MM-DD.md for connect-the-dots; journal/commitments/YYYY-MM-DD.md for the commitment tracker; journal/brief/YYYY-MM-DD.md for the brief's triage list
 runs.md                    one line per routine run: `- <ISO> <routine> <ok|partial|failed|skipped> — <note>` (`skipped` = not the home machine, not a scheduled day, paused); `mother runs` checks it against the schedule (a slot with no line after 2h = `missed`)
 .mother/                   machine-local state, gitignored: grants.json, ledger.json, ledger.lock, health.lock, guard.log, last-sync, PAUSED, eval/ (A/B pairs), tick-register.json (the offset the tick cron was built with, §2),
@@ -113,6 +116,7 @@ See `templates/workspace/config.example.json` for a full example. Required keys:
 | `routines.brief.draft_replies` | bool, optional | default false; true = the brief routine saves mail **drafts** for To-respond mail it triaged as `prep` (never sends) |
 | `routines.commitments` | map, optional | `at`, `days`, `no_reply_days` (1-30, default 3), `lookback_days` (1-60, default 14), `draft_nudges` (bool, default false: mail drafts for no-reply asks only on the manager's `nudge <n>`) |
 | `routines.tick` | map, optional | the hourly pulse behind the Now list (`mother now`); absent = off. `every` (minutes, one of 30, 60, 120, 180, 240; default 60), `active_hours` (`"HH:MM-HH:MM"`, start before end, default `"06:00-22:00"`, in `manager.timezone`; no tick runs outside it), `days` (`workdays` / `all` / a day / list of days; not `monthly:`), `thresholds` (map signal -> `Nh`, `Nd` or `0`, counted in working time; default per signal), `signals` (map signal -> `true`/`false`; all on by default, and a signal whose source connector is `none` is off), `notify` (`none` default, or `dm` = one DM to `manager.chat_dm` for a new on-you item; never while `now.json.quiet`), `slow_every` (integer 1-6, default 3: every Nth slot scans every signal, the others only the on-you signals and `default_branch_red`), `max_age_days` (integer 0-365, default 30: work whose `since` is older is left off the list, except workspace signals; `0` = no cap). Default thresholds: `review_requested` 4h, `unanswered_mention` 2h, `decision_open` 1d, `mail_needs_reply` 4h, `pr_no_reviewer` 1d, `pr_approved_unmerged` 2d, `pr_changes_silent` 3d, `default_branch_red` 2h, `ticket_stalled` 3d, `bug_unowned` 1d, `blocker_cleared` 1d, `outside_question` 4h, `action_item_no_ticket` 1d, the rest 0. Signals: on you `review_requested`, `unanswered_mention`, `decision_open`, `ticket_waiting_on_you`, `mail_needs_reply`, `invite_unanswered`, `promise_due`, `suggestion_waiting`; neglected `pr_no_reviewer`, `pr_approved_unmerged`, `pr_changes_silent`, `default_branch_red`, `ticket_stalled`, `bug_unowned`, `blocker_cleared`, `sprint_at_risk`, `outside_question`, `action_item_no_ticket`, `one_on_one_drift`. Unknown keys or signals fail `mother status`. |
+| `routines.retro` | map, optional | the weekly session retro (`routines/retro.md`): `at`, `days` (example: `17:30`, `Thu`), `window_days` (1-31, default 7: how far back `mother retro signals` reads), `min_kb` (0-100000, default 50: a session's transcripts, sub-agents included, must add up to this), `max_areas` (1-8, default 4: how many areas get a reader), `areas` (map from a derived repository name to an area name, to merge or rename areas; default none) |
 | `routines.channels` | map, optional | reply-loop knobs, no `at`: `poll_seconds` 60, `idle_poll_seconds` 180, `model`, `thread_ttl_hours` 48, `draft_ttl_hours` 72, `session_timeout_minutes` 20 |
 | `whatsapp` | map, optional | WhatsApp read and send from the manager's own number (§5d). `enabled` (bool), `self_jid` (the manager's own JID, `<digits>@s.whatsapp.net`; required when `enabled`), `max_per_day` (1-50, default 20), `min_gap_seconds` (>= 0, default 5), `read`, `send` (bool). Other unknown keys fail. The keys of the earlier design, `allow`, `approve_via` and `max_prompts_per_day`, are accepted with any value and ignored; `mother whatsapp setup` drops them the next time it writes the block, and they are removed one release after WhatsApp ships. The block is written by `mother whatsapp setup`, run by the manager in their own terminal (§5d); the agent never edits it. JIDs are phone numbers: they live in `config.json` and tool output only, never in memory, journal or people files. |
 | `hub` | map, optional | The watcher and hub (§5e). `enabled` (bool, default false), `every_seconds` (int 30-3600, default 120: the watcher's interval in active hours), `idle_every_seconds` (int 0-86400, default 3600; 0 = no polling outside active hours), `model` (str or null: the hub session's model), `max_cards_per_wake` (int 1-3, default 3), `sweep_minutes` (int 10-240, default 30), `update_ttl_hours` (int 1-168, default 24, counted in working hours), `pacing` (map, all optional ints: `hot_seconds` 30-3600, `warm_seconds` 60-7200, `cold_seconds` 300-14400, `dm_max_seconds` 60-3600, `away_seconds` 120-7200, `hot_mine_minutes` 1-1440, `hot_any_minutes` 1-1440, `warm_hours` 1-168, `away_idle_minutes` 1-240, `away_quiet_minutes` 1-240, `backoff_seconds` 10-1800, `outage_minutes` 1-240, `slow_seconds` 300-14400, `max_calls` 4-200, `lookback_seconds` 120-14400, `search_retry_seconds` 600-86400, `limited_seconds` 60-3600, `limited_calls` 1-50: the chat source's per-conversation tiers, away mode, 429 backoff and what it still reads while backing off, search-first discovery and call budget, §5e), `connections` (map from capability `chat|mail|tracker|calendar|code|whatsapp` to `{command: str, args: [str], env: {str: str}}` or `{cli: "gh"}`; one of `command` or `cli` is required; the `whatsapp` capability takes only `{local: "whatsapp"}`, the local database, and no other capability may use `local`), `watch` (`chat.channels` [id], `chat.discovery` `"search"` (default) or `"poll"`, `chat.read_all` [id], `chat.poll` [id] (§5e Discovery), `mail.ignore_senders` [str], `mail.ignore_labels` [str], `tracker.projects` [str], `tracker.extra_jql` str or null, `calendar.lead_minutes` int, `code.repos` [str], `whatsapp.groups` [group JID]; and for every source `every_seconds` (int 30-86400) and `idle_every_seconds` (int 0-86400; 0 = only during working hours), which override the global intervals for that source alone, under `chat|mail|tracker|calendar|code|whatsapp`: e.g. `mail` 3600, `calendar` 900, `tracker` 600, `code` 600, `chat` and `whatsapp` on the defaults. `chat.every_seconds` also paces the pick-up of notes typed in the self-DM inbox and of DMs with people (they are read by the chat source). The hub-lag and stale thresholds (2x the watcher's `every_seconds`) scale with the wake interval, which is the shortest source interval: with every source slow, the hub is judged against that slower beat. None is needed, so `config.example.json` sets none. A calendar checked less often than `calendar.lead_minutes` is allowed; `mother hub check` / `status` only warn). Unknown keys fail `mother status`. |
@@ -316,7 +320,7 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
     input (`<`) source gets the same path checks as an operand, hidden-path rule included.
   - **Programs.** `mother` (bare, the plugin's `bin/mother` by path or `${CLAUDE_PLUGIN_ROOT}`, or `python3` +
     that path) with a verb from `path version help status runs scan sync now hub health items memory speak
-    channels whatsapp grant home eval register inbox`, except `grant` other than `remove|list|help` (→ `grants`,
+    channels whatsapp grant home eval register inbox retro`, except `grant` other than `remove|list|help` (→ `grants`,
     `op: cli`), `hub install|uninstall`, `home` other than `check|show`, `eval` with `--plugin-dir` or
     `--skip-permissions`, and `register` with any argument; any other verb (`init`, `join`, `link`, `tts`, …)
     asks. `claude mcp list` (exactly). `python3 <plugin>/assets/plan/build.py …` and `…/assets/deck/build.py …`
@@ -709,8 +713,39 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   `glab repo view`, `glab release list|view`, `glab api …`; never with `--hostname`, `-H`/`--header`, `--web`,
   `--input`, `-f`/`-F`/`--field`/`--raw-field`, `-X`/`--method`, an argument holding `://`, or a `--repo`/`-R`
   that is not `owner/repo`. A reader may also use `ToolSearch` (it loads a deferred MCP tool's schema). A critic
-  gets no MCP tools. Other sub-agents
+  gets no MCP tools. `mother:retro-reader` (the `retro` routine's, one per area) reads session transcripts with
+  `Read`, `Grep`, `Glob` and `LS` only, like a critic: no Bash, no MCP tools, no writes. It returns a JSON array of
+  suggestions `[{title, category velocity|quality|automation|workflow|skill|cost, target, change, evidence, impact,
+  confidence high|medium|low, metric?{area, key}}]`. Other sub-agents
   (not MOTHER's) keep the normal rules.
+- **`mother retro signals [--days N] [--min-kb K] [--max-areas N] [--out DIR] [--projects DIR]`** (`lib/retro_signals.py`,
+  no model, no network) reads every Claude Code transcript under `~/.claude/projects` (or `--projects`) modified in
+  the last N days (`routines.retro.window_days`, default 7), one row per session whose transcripts add up to
+  `min_kb`. A sub-agent's transcript (`<project>/<session>/subagents/**/*.jsonl`) counts under its parent session
+  (`sub_files`, `sub_tok_weighted_m`, `sub_tool_calls`, `sub_tool_errors`; never as the manager's turns). Lines
+  under another `sessionId` in a session's own file are a fork's replay of its parent and are skipped
+  (`forked_from`). Only events timestamped inside the window count. A human turn is a user line that is not a
+  sub-agent's, a tool result, a hook, skill or command expansion (`origin.kind` when present). Per session:
+  `human_turns`, `status_pings` (a message made only of pings that asks: `?`, `status?`, `are we progressing? what
+  next?`), `nudges` (`.`, `continue`, `go on`, `try again`), `corrections`, `interrupts`, `tool_errors`, `denials`,
+  `api_errors`, `compactions`, `stop_blocks`, `wait_cmds`, `repeats`, `tok_weighted_m` (input-equivalent
+  millions: input 1x, cache read 0.1x, cache write 1.25x, output 5x), `ctx_max`, `wall_min`, and `friction` =
+  3 pings + nudges + 2 corrections + 2 interrupts + 2 denials + tool errors + 2 stop blocks + API errors +
+  min(repeats, 30) + min(wait commands, 30) / 3. The **area** is the repository folder name from the session's cwd,
+  with `<repo>/.claude/worktrees/<x>`, `<repo>/.dev3/worktrees/<x>`, `~/.dev3.0/worktrees/<encoded repo
+  path>/<hash>/worktree` and a linked worktree's `.git` file collapsed onto the repository, `home` for the home
+  folder, then `routines.retro.areas` applied. Writes `<state>/retro/<date>/sessions.jsonl` and `summary.json`
+  (state = `$MOTHER_STATE_DIR` or `~/.mother`; outside git, atomic) and prints the summary: `areas` (totals,
+  biggest token volume first), `readers` (the `max_areas` biggest), `areas_top.<area>.friction|tokens` (top 10
+  each), `error_tools`, `repeated_commands`, `top_*` lists, `previous` (the newest earlier summary) and `delta`
+  (`{area: {key: {was, now}}}`), and `report` / `ledger`: `projects/session-retro/files/<date>-retro.md` and
+  `suggestions.jsonl` when that project exists, else `retro/<date>.md` and `retro/suggestions.jsonl`.
+- **`mother retro ledger <file> [--weeks N]`** folds the decision ledger (JSON Lines; fields `run, item, title,
+  status proposed|queued|in_progress|pr|applied|merged|rejected, decided, note, measure_next_run`, optional
+  `metric {area, key}`; a later line for the same `run` + `item` is merged over the earlier one) into `suppress`
+  (rejected, or applied/merged within N weeks, default 8), `open` (queued, in_progress, pr), `proposed` and
+  `measure` (applied/merged within N weeks; with a `metric`, `was` from `<state>/retro/<run>/summary.json` and
+  `now` from the newest summary). Exit 2 for usage. Both verbs pass the guard unasked (§5).
 - `mother items check` turns a reader's reply into the only input a skill may use. Items without a link
   (URL, ticket key, `owner/repo#N`, workspace path) are dropped. A `state: noise` tally cited by the query that reproduces it is kept as a count, never a finding. A reader whose items were all uncited
   counts as `couldnt_check`, and so does unreadable output (exit 2). Never treat it as a quiet source.

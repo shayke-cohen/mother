@@ -65,7 +65,7 @@ def disarm_deadline():
     if hasattr(signal, "setitimer"):
         signal.setitimer(signal.ITIMER_REAL, 0)
 KEY_TOOLS = ("Read", "Grep", "Glob", "LS")
-SUBAGENTS = ("reader", "critic")  # guard.SUBAGENT_TOOLS (tests check the two agree)
+SUBAGENTS = ("reader", "critic", "retro-reader")  # guard.SUBAGENT_TOOLS (tests check the two agree)
 HUB_FILES = ("hub-session.json", "sessions.json", "fed-sessions.json")  # the hub session and hub-fed sessions
 
 

@@ -65,6 +65,7 @@
 - [doctor](routines/doctor.md): daily connector check
 - [meeting-prep](routines/meeting-prep.md), [meeting-recap](routines/meeting-recap.md): around each weekly meeting
 - [weekly-snapshot](routines/weekly-snapshot.md), [monthly-refresh](routines/monthly-refresh.md): sprint snapshot, monthly notes refresh
+- [retro](routines/retro.md): weekly session retro
 
 ## Code
 

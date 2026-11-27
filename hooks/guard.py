@@ -3082,7 +3082,8 @@ def sl_hidden_paths(words, cwd, ws, plugin):
 
 
 MOTHER_VERBS = {"path", "version", "help", "-h", "--help", "status", "runs", "scan", "sync", "now", "hub", "health",
-                "items", "memory", "speak", "channels", "whatsapp", "grant", "home", "eval", "register", "inbox"}
+                "items", "memory", "speak", "channels", "whatsapp", "grant", "home", "eval", "register", "inbox",
+                "retro"}
 
 
 def _sl_mother(args):
@@ -4352,7 +4353,8 @@ def channel_session(tool, inp, cwd, ctx, role):
 # agents/*.md. Plugin agents can't carry their own hooks, so this is where their limits live. Hooks run inside
 # sub-agents, and the payload names the agent in `agent_type`, scoped ("mother:reader") or bare.
 # ToolSearch only loads the schema of a deferred MCP tool: the reader needs it to reach its source.
-SUBAGENT_TOOLS = {"reader": {"Read", "Grep", "Glob", "LS", "Bash", "ToolSearch"}, "critic": {"Read", "Grep", "Glob", "LS"}}
+SUBAGENT_TOOLS = {"reader": {"Read", "Grep", "Glob", "LS", "Bash", "ToolSearch"}, "critic": {"Read", "Grep", "Glob", "LS"},
+                  "retro-reader": {"Read", "Grep", "Glob", "LS"}}
 DRY_RUN_ENV = "MOTHER_DRY_RUN"
 
 
@@ -4451,7 +4453,7 @@ def subagent_session(kind, tool, inp, cwd, ctx):
     if tool in IN_APP_SESSION_TOOLS:
         return "deny", "%s can't use %s: it reaches the manager's sessions." % (who, tool)
     if tool.startswith("mcp__"):
-        if kind == "critic":
+        if kind != "reader":
             return "deny", "%s reads only the files it is given, not %s." % (who, tool)
         a = classify(tool, inp, cwd, ctx)
         if a is not None:

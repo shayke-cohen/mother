@@ -101,7 +101,7 @@ flowchart TD
 | `hooks/shared.ts` | Helpers both panes use: the `mother` binary path, text cleaning (`safe`, `oneLine`), ages, the prompt-fill helpers, `SNOOZES` | |
 | `hooks/guard.py` | **Approval guard**: allow / ask / deny for every outbound call; `.mother/GUARD_OFF` (`mother guard off`) turns every rule off, `.mother/PAUSED` denies everything outbound and wins | Recognises tools by capability, not server name. Fails closed. |
 | `hooks/guard_fast.py` | The fast path for tools the guard has no every-session rule for (Read, Grep, Glob, …): hands the call to `hooks/guard.py` only for sub-agents, channel sessions, hub and hub-fed sessions | Never decides by itself. CONTRACT §5 |
-| `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, `guard off\|on\|status`, register, runs watchdog, speak/tts | Dispatches `channels`, `whatsapp`, `hub`, `chief`, `floor`, `inbox`, `grant`, `items`, `now`, `eval`, `health` to `lib/`. `VERSION` lives here and in `.claude-plugin/plugin.json` |
+| `bin/mother` | The CLI: workspace lifecycle, sync, scan, home machine, status, `guard off\|on\|status`, register, runs watchdog, speak/tts | Dispatches `channels`, `whatsapp`, `hub`, `chief`, `floor`, `inbox`, `grant`, `items`, `now`, `eval`, `retro`, `health` to `lib/`. `VERSION` lives here and in `.claude-plugin/plugin.json` |
 | `lib/health.py` | Per-server connector health (`mother health`): record, pick a server, classify an error, merge the doctor's result, once-a-day alerts | **The only writer of `capabilities.json`** (file lock, atomic write); appends `health.md`. CONTRACT §4 |
 | `lib/channels.py` | Reply-mode engine behind `mother:channels` | The skill does chat I/O; this decides who, when, and what. CONTRACT §5b |
 | `lib/whatsapp.py` | `mother whatsapp`: chats and read from the local WhatsApp database, send through the bridge, setup and link | Home machine only; the guard asks before each send to someone else. CONTRACT §5d |
@@ -117,10 +117,11 @@ flowchart TD
 | `lib/chief.py` | `mother chief tick\|triage\|why\|lines\|context\|status\|pinned\|tail\|tldr\|spend\|portrait\|report\|claim\|watch-key\|close-case\|mention\|ask\|dots-detail\|relays\|relay\|act-log\|habits\|pause\|resume`: the leading desktop session's pass (heartbeat and leader rule, muted lines logged, judge lines decided in code from a triage model's verdicts), the names-only triage context, the pane's status, pinned sessions, session cards, the daily model spend, sign-in detection, case claims and the relay queue, all under `.mother/chief/` | The model never writes a decision: `triage --stdin --decide` does. What the layer removed in 0.18.0 left on disk is ignored. CONTRACT §5g |
 | `lib/habits.py` | `mother chief act-log\|habits`: the log of what the manager did with each card (`.mother/chief/actions.jsonl`, labels and titles only), the per-bucket counts made from it, the quiet rule triage applies, and the quieted list | Machine-local. Only per-bucket counts reach a triage prompt (CONTRACT §5g "Habits"). |
 | `lib/evals.py` | Blind A/B harness for a routine change (`mother eval`) | Both runs dry (`MOTHER_DRY_RUN=1`) |
+| `lib/retro_signals.py` | `mother retro signals\|ledger`: the weekly session retro's model-free stage. Per-session friction and token signals from Claude Code transcripts (sub-agents counted under their parent, fork replays skipped), areas from the session's repository, and the decision ledger folded into what not to propose again and what to measure | Raw rows in `~/.mother/retro/<date>/`, never in git. CONTRACT §5c |
 | `lib/tts_kokoro.py` | Optional neural voice for the spoken brief | Runs in its own venv under `~/.mother/tts` |
 | `skills/<name>/SKILL.md` | What the model does for a request, invoked as `mother:<name>` | `templates/` beside a skill = files it creates in the workspace |
 | `routines/<id>.md` | What one scheduled run does | Frontmatter: `id`, `needs`, `writes`, `sends`, `config`, `default` |
-| `agents/` | Read-only sub-agents: `reader` (one source → cited JSON), `critic` (draft → PASS/FIX) | Read-only is enforced by the guard, not the frontmatter alone |
+| `agents/` | Read-only sub-agents: `reader` (one source → cited JSON), `critic` (draft → PASS/FIX), `retro-reader` (one area's session transcripts → suggestions JSON) | Read-only is enforced by the guard, not the frontmatter alone |
 | `rules/` | Policy text the skills cite: outbound, privacy, memory, todos, projects, teams | When `outbound.md` and the guard disagree, the guard wins |
 | `assets/deck/`, `assets/plan/` | Self-contained HTML templates + `build.py` (JSON in → HTML out) | Meeting deck with meeting mode; sprint plan page |
 | `assets/art/` | The bundled portrait the Chief pane's header draws (`mother chief portrait`) | A workspace's own `.mother/portrait.png` replaces it |
@@ -132,7 +133,7 @@ Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `d
 `one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`, `cos`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
-`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
+`meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`, `retro`.
 
 ## How a scheduled run flows
 

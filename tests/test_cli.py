@@ -789,15 +789,16 @@ class CliTest(unittest.TestCase):
         r = run(["runs", "--json"], env)
         self.assertEqual(r.returncode, 2, r.stderr)
         state = {row["id"]: row["state"] for row in json.loads(r.stdout)}
-        self.assertEqual(state, {"brief": "ok", "digest": "failed", "dots": "missed", "one-on-one": "missed", "commitments": "missed", "reflect": "partial", "doctor": "ok", "tick": "pending"})
+        self.assertEqual(state, {"brief": "ok", "digest": "failed", "dots": "missed", "one-on-one": "missed", "commitments": "missed", "reflect": "partial", "doctor": "ok", "tick": "pending", "retro": "missed"})
         r = run(["status"], env)
         self.assertEqual(r.returncode, 0)
-        self.assertIn("routines:    digest failed; dots missed; one-on-one missed; commitments missed", r.stdout)
+        self.assertIn("routines:    digest failed; dots missed; one-on-one missed; commitments missed; retro missed", r.stdout)
         # just after a slot, the previous slot is judged: reflect is due at 21:30 but has 2h grace
         with open(self.ws / "runs.md", "a") as f:
             f.write("- 2026-10-23T13:02Z dots ok — 3 links\n- 2026-10-23T09:30:00Z digest ok — rerun\n"
                     "- 2026-10-23T07:31:00Z one-on-one ok — 1 prepped, 0 drifting; DM sent\n"
-                    "- 2026-10-23T16:31:00Z commitments ok — 2 made, 1 owed, 0 no-reply; DM sent\n")
+                    "- 2026-10-23T16:31:00Z commitments ok — 2 made, 1 owed, 0 no-reply; DM sent\n"
+                    "- 2026-10-22T17:31:00Z retro ok — 40 sessions, 3 readers, 6 suggestions; DM sent\n")
         env["MOTHER_NOW"] = "2026-10-25T22:00:00Z"
         r = run(["runs"], env)
         self.assertEqual(r.returncode, 0, r.stdout)
@@ -822,6 +823,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(by_id["mother-meeting-recap-platform"]["cronExpression"], "0 12 * * 1")
         self.assertEqual(by_id["mother-doctor"]["cronExpression"], "0 7 * * *")
         self.assertEqual(by_id["mother-commitments"]["cronExpression"], "30 16 * * 1,2,3,4,5")
+        self.assertEqual(by_id["mother-retro"]["cronExpression"], "30 17 * * 4")
         for t in out["tasks"]:
             self.assertIn("mother:routine", t["prompt"])
             self.assertIn(str(self.ws.resolve()), t["prompt"])
