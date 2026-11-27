@@ -128,6 +128,155 @@ class Signals(Tmp):
         self.assertEqual(sorted(run("0")), sorted(run("999")))
 
 
+PARENT, FORK = "s-zz-parent", "s-aa-fork"    # the fork sorts first, so path order alone would pick it as owner
+
+
+def _line(uuid, parent, sid, ts, kind, content=None, **extra):
+    o = {"type": kind, "uuid": uuid, "parentUuid": parent, "sessionId": sid, "timestamp": ts,
+         "cwd": "/home/agnes/src/web"}
+    if content is not None:
+        o["message"] = content
+    o.update(extra)
+    return o
+
+
+def _parent_lines():
+    return [
+        _line("p1", None, PARENT, "2026-11-25T09:00:00.000Z", "user", {"role": "user", "content": "Fix the build"}),
+        _line("p2", "p1", PARENT, "2026-11-25T09:00:05.000Z", "assistant",
+              {"id": "pm1", "role": "assistant", "usage": {"input_tokens": 1000000, "output_tokens": 0},
+               "content": [{"type": "tool_use", "id": "pt1", "name": "Bash", "input": {"command": "make"}}]}),
+        _line("p3", "p2", PARENT, "2026-11-25T09:00:09.000Z", "user",
+              {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "pt1", "is_error": True,
+                                            "content": "exit 2"}]}),
+        {"type": "cost-state", "sessionId": PARENT, "totalLinesAdded": 40},
+        _line("p4", "p3", PARENT, "2026-11-25T09:30:00.000Z", "user", {"role": "user", "content": "?"}),
+        _line("p5", "p4", PARENT, "2026-11-25T09:30:05.000Z", "assistant",
+              {"id": "pm2", "role": "assistant", "usage": {"input_tokens": 0, "output_tokens": 100000},
+               "content": []}),
+        _line("p6", "p5", PARENT, "2026-11-25T09:31:00.000Z", "user",
+              {"role": "user", "content": "no, that's wrong"}),
+    ]
+
+
+def _fork_own_lines(marker=False):
+    extra = {"forkedFrom": {"sessionId": PARENT, "messageUuid": "p6"}} if marker else {}
+    return [
+        _line("f1", "p6", FORK, "2026-11-26T08:00:00.000Z", "user", {"role": "user", "content": "add a test"},
+              **extra),
+        _line("f2", "f1", FORK, "2026-11-26T08:00:05.000Z", "assistant",
+              {"id": "fm1", "role": "assistant", "usage": {"input_tokens": 2000, "output_tokens": 200},
+               "content": [{"type": "tool_use", "id": "ft1", "name": "Bash", "input": {"command": "make test"}}]},
+              **extra),
+        _line("f3", "f2", FORK, "2026-11-26T08:00:09.000Z", "user",
+              {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "ft1", "is_error": True,
+                                            "content": "1 failed"}]}, **extra),
+        {"type": "cost-state", "sessionId": FORK, "totalLinesAdded": 55},
+    ]
+
+
+class ForkReplay(unittest.TestCase):
+    """A fork replays its parent's lines, with their uuids, then adds its own. Only its own count."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.projects = Path(self.tmp.name) / "projects"
+        self.d = self.projects / "-home-agnes-src-web"
+        self.d.mkdir(parents=True)
+        self.write(PARENT, _parent_lines())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, lines, sub=None):
+        p = self.d / (name + ".jsonl") if sub is None else self.d / name / "subagents" / (sub + ".jsonl")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(json.dumps(o) + "\n" for o in lines))
+        recent = (NOW - dt.timedelta(hours=1)).timestamp()
+        os.utime(str(p), (recent, recent))
+        return p
+
+    def fork(self, replay_sid, marker=False, drop_first=False):
+        replay = [dict(o, sessionId=replay_sid) for o in _parent_lines()]
+        if drop_first:      # the fork opens with a summary instead of the parent's first line
+            replay = [{"type": "summary", "summary": "Fixing the build", "leafUuid": "p6"}] + replay[1:]
+        self.write(FORK, replay + _fork_own_lines(marker))
+
+    def scan(self):
+        rows, _ = rs.scan(self.projects, 7, min_kb=0, now=NOW, home=HOME, parallel=False)
+        return {r["session"]: r for r in rows}
+
+    def assert_fork_counts_only_its_own(self, f):
+        self.assertEqual(f["forked_from"], PARENT)
+        self.assertEqual((f["human_turns"], f["status_pings"], f["corrections"]), (1, 0, 0))
+        self.assertEqual((f["tool_calls"], f["tool_errors"]), (1, 1))
+        self.assertEqual(f["tok_weighted_m"], 0.003)           # 2000 in + 5 x 200 out, not the parent's 1.5M
+        self.assertEqual(f["start"], "2026-11-26T08:00:00.000Z")
+        self.assertEqual(f["first_prompt"], "add a test")
+        self.assertEqual(f["lines_added"], 15)                  # 55 at the end, 40 of them the parent's
+        self.assertEqual(f["friction"], 1)
+
+    def assert_parent_unchanged(self, rows):
+        p = rows[PARENT]
+        self.assertEqual(p["forked_from"], "")
+        self.assertEqual((p["human_turns"], p["status_pings"], p["corrections"], p["tool_errors"]), (3, 1, 1, 1))
+        self.assertEqual(p["tok_weighted_m"], 1.5)
+        self.assertEqual((p["lines_added"], p["replayed"]), (40, 0))
+
+    def test_replay_under_the_parents_session_id(self):
+        # the layout every real fork has shown so far
+        self.fork(PARENT)
+        rows = self.scan()
+        self.assert_fork_counts_only_its_own(rows[FORK])
+        self.assert_parent_unchanged(rows)
+
+    def test_replay_under_the_forks_own_session_id_with_a_marker(self):
+        self.fork(FORK, marker=True)
+        rows = self.scan()
+        self.assert_fork_counts_only_its_own(rows[FORK])
+        self.assertEqual(rows[FORK]["replayed"], 6)
+        self.assert_parent_unchanged(rows)
+
+    def test_replay_under_the_forks_own_session_id_after_a_summary(self):
+        self.fork(FORK, drop_first=True)       # no marker: the parent's earlier first event decides
+        rows = self.scan()
+        f = rows[FORK]
+        self.assert_fork_counts_only_its_own(f)
+        self.assertEqual(f["replayed"], 5)
+        self.assert_parent_unchanged(rows)
+
+    def test_the_parent_is_the_same_with_or_without_its_fork(self):
+        alone = self.scan()[PARENT]
+        self.fork(FORK, marker=True)
+        with_fork = self.scan()[PARENT]
+        self.assertEqual(alone, with_fork)
+
+    def test_a_forks_copy_of_a_parent_subagent_is_not_counted(self):
+        agent = [_line("a1", None, PARENT, "2026-11-25T09:10:00.000Z", "assistant",
+                       {"id": "am1", "role": "assistant", "usage": {"input_tokens": 400000, "output_tokens": 0},
+                        "content": [{"type": "tool_use", "id": "at1", "name": "Grep", "input": {}}]},
+                       isSidechain=True)]
+        mine = [_line("b1", None, FORK, "2026-11-26T08:10:00.000Z", "assistant",
+                      {"id": "bm1", "role": "assistant", "usage": {"input_tokens": 3000, "output_tokens": 0},
+                       "content": []}, isSidechain=True)]
+        self.write(PARENT, agent, sub="agent-x")
+        self.fork(PARENT)
+        self.write(FORK, agent, sub="agent-x")                 # the verbatim copy a fork carries
+        self.write(FORK, mine, sub="agent-y")
+        rows = self.scan()
+        f, p = rows[FORK], rows[PARENT]
+        self.assertEqual((f["sub_files"], f["sub_tool_calls"], f["sub_tok_weighted_m"]), (1, 0, 0.003))
+        self.assertEqual((p["sub_files"], p["sub_tool_calls"], p["sub_tok_weighted_m"]), (1, 1, 0.4))
+
+    def test_fork_index_attributes_shared_uuids_to_the_parent(self):
+        self.fork(FORK, marker=True)
+        fp, pp = str(self.d / (FORK + ".jsonl")), str(self.d / (PARENT + ".jsonl"))
+        idx = rs.fork_index({fp: FORK, pp: PARENT})
+        self.assertEqual(sorted(idx), [fp])
+        self.assertEqual(idx[fp], {u: PARENT for u in ("p1", "p2", "p3", "p4", "p5", "p6")})
+        self.assertEqual(rs.fork_index({pp: PARENT}), {})
+
+
 class Areas(unittest.TestCase):
     def test_worktree_paths_collapse_onto_the_repo(self):
         for cwd, want in (("/home/agnes/src/web", "web"),
