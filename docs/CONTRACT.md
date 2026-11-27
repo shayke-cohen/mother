@@ -722,9 +722,12 @@ Port of the reference deployment's `guard-outbound.py`, made config-driven:
   no model, no network) reads every Claude Code transcript under `~/.claude/projects` (or `--projects`) modified in
   the last N days (`routines.retro.window_days`, default 7), one row per session whose transcripts add up to
   `min_kb`. A sub-agent's transcript (`<project>/<session>/subagents/**/*.jsonl`) counts under its parent session
-  (`sub_files`, `sub_tok_weighted_m`, `sub_tool_calls`, `sub_tool_errors`; never as the manager's turns). Lines
-  under another `sessionId` in a session's own file are a fork's replay of its parent and are skipped
-  (`forked_from`). Only events timestamped inside the window count. A human turn is a user line that is not a
+  (`sub_files`, `sub_tok_weighted_m`, `sub_tool_calls`, `sub_tool_errors`; never as the manager's turns). A fork
+  replays its parent's history and copies its sub-agent files, so a line is skipped (`replayed`, `forked_from`)
+  when it carries another `sessionId`, or when its `uuid` also appears in another scanned transcript that owns it:
+  the one whose session matches the line's `sessionId`, else the one without a `forkedFrom` marker, with the
+  earliest first event, created first. `lines_added` starts from the replay's running total. Only events
+  timestamped inside the window count. A human turn is a user line that is not a
   sub-agent's, a tool result, a hook, skill or command expansion (`origin.kind` when present). Per session:
   `human_turns`, `status_pings` (a message made only of pings that asks: `?`, `status?`, `are we progressing? what
   next?`), `nudges` (`.`, `continue`, `go on`, `try again`), `corrections`, `interrupts`, `tool_errors`, `denials`,

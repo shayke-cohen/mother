@@ -4,8 +4,12 @@
 days and records, per session, where time, tokens and friction went: human turns, status pings ("?", "status?",
 "are we progressing?"), corrections, interrupts, tool errors, permission denials, API errors, compactions, Stop-hook
 blocks, wait and poll commands, repeated commands and in-window token volume. A sub-agent's transcript
-(`<session>/subagents/*.jsonl`) is counted under the session that started it. A fork replays its parent's lines under
-the parent's sessionId; those lines are skipped, so the parent's work is never counted twice.
+(`<session>/subagents/*.jsonl`) is counted under the session that started it.
+
+A fork's transcript starts with a replay of its parent's history, and its `subagents/` folder holds verbatim copies of
+the parent's sub-agent files. Neither may count twice, so a line is skipped when it carries another session's
+sessionId, or when its `uuid` also appears in another scanned transcript that owns it (see `fork_index`). The session
+row records the parent in `forked_from`.
 
 Raw rows stay outside git: `<state>/retro/<date>/sessions.jsonl` and `summary.json` (state = $MOTHER_STATE_DIR or
 ~/.mother). Transcripts can hold anything the manager pasted, so only the routine's distilled findings reach the
@@ -193,6 +197,7 @@ def new_record():
             "human_turns": 0, "corrections": 0, "status_pings": 0, "nudges": 0, "interrupts": 0, "tool_calls": 0,
             "tool_errors": 0, "denials": 0, "api_errors": 0, "compactions": 0, "stop_blocks": 0,
             "subagent_calls": 0, "wait_cmds": 0, "lines_added": 0, "first_prompt": "", "forked_from": "",
+            "replayed": 0, "fork_marker": "", "lines_base": 0,
             "tok": [0, 0, 0, 0], "sub_tok": [0, 0, 0, 0], "ctx_max": 0, "sub_files": 0, "sub_tool_calls": 0,
             "sub_tool_errors": 0, "tools": collections.Counter(), "error_tools": collections.Counter(),
             "cmds": collections.Counter(), "foreign": collections.Counter()}
@@ -211,12 +216,23 @@ def _stamp(s, ts):
         s["end"] = ts
 
 
-def parse_file(path, s, own, cutoff_iso, sub=False):
-    """Fold one transcript into the session record `s`. `own` is the session id; in the main file a line under
-    another sessionId is a fork's replay of its parent and is skipped. A sub-agent file (`sub`) adds its tokens and
-    tool calls to the sub_* counters and never counts as the manager's turns."""
+def _marker(o):
+    """The parent session a line's explicit `forkedFrom` marker names, or ""."""
+    f = o.get("forkedFrom")
+    if isinstance(f, dict):
+        f = f.get("sessionId")
+    return f if isinstance(f, str) else ""
+
+
+def parse_file(path, s, own, cutoff_iso, sub=False, skip=None):
+    """Fold one transcript into the session record `s`. `own` is the session id. A line under another sessionId is
+    a fork's replay of its parent (or, in a sub-agent file, a copy of the parent's sub-agent) and is skipped, and so
+    is a line whose uuid is in `skip` ({uuid: owning session}, from `fork_index`). A sub-agent file (`sub`) adds its
+    tokens and tool calls to the sub_* counters and never counts as the manager's turns."""
     pending = {}
     seen_msg = set()
+    skip = skip or {}
+    in_replay = own_started = False
     try:
         fh = open(path, errors="replace")
     except OSError:
@@ -231,9 +247,23 @@ def parse_file(path, s, own, cutoff_iso, sub=False):
                 continue
             t = o.get("type")
             sid = o.get("sessionId")
-            if not sub and sid and sid != own:
-                s["foreign"][sid] += 1
+            owner = skip.get(o.get("uuid")) if skip and isinstance(o.get("uuid"), str) else None
+            if not owner and sid and sid != own:
+                owner = sid
+            # Running totals inside the replay are the parent's as of the fork point: the fork's own count starts there.
+            if t == "cost-state" and not sub and (owner or (in_replay and not own_started)):
+                s["lines_base"] = o.get("totalLinesAdded") or 0
+            if owner:
+                s["foreign"][owner] += 1
+                s["replayed"] += 1
+                in_replay = True
                 continue
+            if t == "cost-state" and not sub and in_replay and not own_started:
+                continue
+            if isinstance(o.get("uuid"), str):
+                own_started = True
+            if not sub and not s["fork_marker"] and _marker(o):
+                s["fork_marker"] = _marker(o)
             ts = o.get("timestamp") if isinstance(o.get("timestamp"), str) else None
             old = bool(ts) and ts < cutoff_iso     # long-lived sessions: only events inside the window count
             if old and t != "assistant":
@@ -245,7 +275,9 @@ def parse_file(path, s, own, cutoff_iso, sub=False):
             if t == "custom-title" and not sub:
                 s["title"] = str(o.get("customTitle") or "")[:100]
             elif t == "cost-state" and not sub:
-                s["lines_added"] = o.get("totalLinesAdded") or 0
+                n = o.get("totalLinesAdded") or 0
+                base = s["lines_base"] if isinstance(s["lines_base"], int) else 0
+                s["lines_added"] = max(0, n - base) if isinstance(n, int) else 0
             elif t == "system" and not sub:
                 st = o.get("subtype")
                 if st == "api_error":
@@ -334,6 +366,8 @@ def finish(s, areas=None, home=None):
     s["area"] = area_of(s["cwd"], areas, home)
     if s["foreign"]:
         s["forked_from"] = s["foreign"].most_common(1)[0][0]
+    elif s["fork_marker"]:
+        s["forked_from"] = s["fork_marker"]
     s["main_tok_weighted_m"] = weighted_m(s["tok"])
     s["sub_tok_weighted_m"] = weighted_m(s["sub_tok"])
     s["tok_weighted_m"] = round(s["main_tok_weighted_m"] + s["sub_tok_weighted_m"], 3)
@@ -352,7 +386,7 @@ def finish(s, areas=None, home=None):
                      + min(s["wait_cmds"], 30) // 3)
     s["tools"] = dict(s["tools"].most_common(8))
     s["error_tools"] = dict(s["error_tools"].most_common(8))
-    for k in ("cmds", "foreign", "tok", "sub_tok"):
+    for k in ("cmds", "foreign", "tok", "sub_tok", "fork_marker", "lines_base"):
         del s[k]
     return s
 
@@ -390,6 +424,104 @@ def find_sessions(projects, cutoff_ts):
     return out
 
 
+FORK_PROBE = 8      # leading uuids per transcript compared to find a fork and its parent
+
+
+def _uuid_lines(path, limit=None):
+    """Yield (uuid, sessionId, timestamp, forkedFrom marker) for each line with a uuid; stop after `limit`."""
+    n = 0
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            if '"uuid"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict) or not isinstance(o.get("uuid"), str):
+                continue
+            ts = o.get("timestamp") if isinstance(o.get("timestamp"), str) else ""
+            yield o["uuid"], o.get("sessionId") or "", ts, _marker(o)
+            n += 1
+            if limit and n >= limit:
+                return
+
+
+UUID_KEY = re.compile(rb'"uuid"\s*:\s*"([^"]+)"')
+
+
+def _lead_uuids(path, n=FORK_PROBE):
+    """The first `n` uuids of a transcript, cheaply (bytes, no JSON): the last `"uuid"` key in a line's tail, where
+    the top-level one sits after the message. A nested match can only add a false candidate, which `fork_index` then
+    reads properly; a miss only falls back to the sessionId check."""
+    out = []
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            m = None
+            for m in UUID_KEY.finditer(line, max(0, len(line) - 2048)):
+                pass
+            if m:
+                out.append(m.group(1).decode("utf-8", "replace"))
+                if len(out) >= n:
+                    break
+    return out
+
+
+def _birth(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return float("inf")
+    return getattr(st, "st_birthtime", None) or float("inf")
+
+
+def fork_index(files):
+    """Which lines of which transcript belong to another one. `files` maps a transcript path to the session it
+    counts under (a sub-agent file counts under its parent session). Returns {path: {uuid: owning session}}.
+
+    A fork's replay starts at its first line and copies the parent's lines with their uuids (and, in every fork
+    seen so far, the parent's sessionId too). Transcripts whose first FORK_PROBE uuids overlap are read in full, and
+    each uuid found in more than one is owned by one of them: the only file whose session matches the line's
+    sessionId; else the file that does not carry a `forkedFrom` marker, then the one whose first event is earliest,
+    then the one created first, then path order."""
+    first = collections.defaultdict(set)
+    for p in files:
+        for u in _lead_uuids(p):
+            first[u].add(p)
+    cand = sorted({p for ps in first.values() if len(ps) > 1 for p in ps})
+    if not cand:
+        return {}
+    info, holders = {}, collections.defaultdict(list)
+    for p in cand:
+        uu, start, marked = {}, "", False
+        for u, sid, ts, mk in _uuid_lines(p):
+            uu.setdefault(u, sid)
+            if ts and (not start or ts < start):
+                start = ts
+            marked = marked or bool(mk)
+        info[p] = {"own": files[p], "uuids": uu, "rank": (marked, start or "~", _birth(p), p)}
+        for u in uu:
+            holders[u].append(p)
+    out = {}
+    for u, ps in holders.items():
+        if len(ps) < 2:
+            continue
+        match = [p for p in ps if info[p]["uuids"][u] == info[p]["own"]]
+        owner = match[0] if len(match) == 1 else min(match or ps, key=lambda p: info[p]["rank"])
+        for p in ps:
+            if p != owner and info[p]["own"] != info[owner]["own"]:
+                out.setdefault(p, {})[u] = info[owner]["own"]
+    return out
+
+
 def scan(projects, days=DEFAULT_DAYS, min_kb=DEFAULT_MIN_KB, now=None, areas=None, home=None, parallel=True):
     """One row per session with an event in the last `days` days whose transcripts (its own file plus its
     sub-agents') add up to at least `min_kb`. Returns (rows, files_scanned)."""
@@ -397,8 +529,19 @@ def scan(projects, days=DEFAULT_DAYS, min_kb=DEFAULT_MIN_KB, now=None, areas=Non
     cutoff = now - dt.timedelta(days=days)
     cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
     found = find_sessions(projects, cutoff.timestamp())
-    jobs = [(d, sid, e, cutoff_iso, areas, home) for (d, sid), e in sorted(found.items()) if e["bytes"] >= min_kb * 1024]
-    files = sum((1 if e["main"] else 0) + len(e["subs"]) for _, _, e, _, _, _ in jobs)
+    owners = {}
+    for (d, sid), e in found.items():     # every moved transcript, so a parent under --min-kb still owns its lines
+        if e["main"]:
+            owners[e["main"]] = sid
+        for f in e["subs"]:
+            owners[f] = sid
+    replays = fork_index(owners)
+    jobs = []
+    for (d, sid), e in sorted(found.items()):
+        if e["bytes"] >= min_kb * 1024:
+            mine = [p for p in [e["main"]] + e["subs"] if p in replays]
+            jobs.append((d, sid, e, cutoff_iso, areas, home, {p: replays[p] for p in mine}))
+    files = sum((1 if j[2]["main"] else 0) + len(j[2]["subs"]) for j in jobs)
     results = None
     workers = max(1, min(8, (os.cpu_count() or 2) - 1))
     try:   # tests lower it to exercise the pool on a small fixture
@@ -418,17 +561,17 @@ def scan(projects, days=DEFAULT_DAYS, min_kb=DEFAULT_MIN_KB, now=None, areas=Non
 
 
 def _scan_one(job):
-    d, sid, e, cutoff_iso, areas, home = job
+    d, sid, e, cutoff_iso, areas, home, replays = job
     s = new_record()
     s["session"] = sid
     if e["main"]:
         s["file"] = e["main"]
-        parse_file(e["main"], s, sid, cutoff_iso)
+        parse_file(e["main"], s, sid, cutoff_iso, skip=replays.get(e["main"]))
     if e["subs"]:
         s["subagents_dir"] = os.path.join(d, sid, "subagents")
         for f in sorted(e["subs"]):
             before = (s["sub_tok"][:], s["sub_tool_calls"])
-            parse_file(f, s, sid, cutoff_iso, sub=True)
+            parse_file(f, s, sid, cutoff_iso, sub=True, skip=replays.get(f))
             if (s["sub_tok"], s["sub_tool_calls"]) != before:
                 s["sub_files"] += 1
         if not s["file"]:
