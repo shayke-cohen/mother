@@ -53,6 +53,12 @@ export async function readStatusFile($: Dollar, ws: string): Promise<ChiefStatus
   return doc && typeof doc === 'object' && doc.version === 1 ? (doc as ChiefStatus) : null
 }
 
+// A status saved by a session that runs an older Mother has no `agents` (added in 0.28.3): the rows this pane last
+// read are kept, so the Other agents group does not blink out each time an old session saves.
+export function keepAgents(saved: ChiefStatus, last: ChiefStatus | null): ChiefStatus {
+  return Array.isArray(saved.agents) || !Array.isArray(last?.agents) ? saved : { ...saved, agents: last!.agents }
+}
+
 // The status with the heartbeat file's word on who leads: the heartbeat moves every pass of the leader, the saved
 // status only when some session's minute pass writes it.
 export function withBeat(s: ChiefStatus, beat: any, nowMs: number): ChiefStatus {
