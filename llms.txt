@@ -48,6 +48,7 @@
 - [meeting](skills/meeting/SKILL.md): sprint plan, deck, meeting mode, recap
 - [now](skills/now/SKILL.md): the tick's Now list
 - [cos](skills/cos/SKILL.md): the contract for a session that owns one case
+- [land](skills/land/SKILL.md): drive a session's PRs to merged in any repo, heartbeat, the "are we done?" report
 - [hub](skills/hub/SKILL.md): decide the inbox from a terminal session
 - [channels](skills/channels/SKILL.md): the team-channel reply loop
 - [whatsapp](skills/whatsapp/SKILL.md): read and send WhatsApp

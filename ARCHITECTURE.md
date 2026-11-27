@@ -129,7 +129,7 @@ flowchart TD
 | `docs/` | CONTRACT (spec), DESIGN (why), ROADMAP (stages), GUIDE (how to operate it), `docs/assets/` (the README's mock images) | `docs/drafts/`, `docs/superpowers/` are untracked personal notes |
 
 Skills: `setup`, `doctor`, `routine` (the dispatcher), `brief`, `now`, `hub`, `digest`, `dots`, `commitments`,
-`one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`, `cos`.
+`one-on-one`, `meeting`, `channels`, `reflect`, `todo`, `project`, `team`, `remember`, `whatsapp`, `cos`, `land`.
 
 Routines: `brief` (+ `brief-ab`), `digest`, `dots`, `tick`, `commitments`, `one-on-one`, `meeting-prep`,
 `meeting-recap`, `reflect`, `doctor`, `weekly-snapshot`, `monthly-refresh`.
