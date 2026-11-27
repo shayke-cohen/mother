@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"s-old-0004","timestamp":"2026-11-01T09:00:00.000Z","cwd":"/home/agnes/src/web","message":{"role":"user","content":"an old session, all of it before the window"}}
+{"type":"assistant","sessionId":"s-old-0004","timestamp":"2026-11-01T09:00:05.000Z","message":{"id":"o1","role":"assistant","usage":{"input_tokens":1000,"output_tokens":100},"content":[]}}

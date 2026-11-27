@@ -1,0 +1,4 @@
+{"type":"user","isSidechain":true,"agentId":"a1","sessionId":"s-main-0001","timestamp":"2026-11-25T11:00:01.000Z","cwd":"/home/agnes/src/web/.claude/worktrees/feat-x","message":{"role":"user","content":"Find where the login form posts"}}
+{"type":"assistant","isSidechain":true,"agentId":"a1","sessionId":"s-main-0001","timestamp":"2026-11-25T11:00:05.000Z","message":{"id":"sm1","role":"assistant","usage":{"input_tokens":100000,"output_tokens":100000},"content":[{"type":"tool_use","id":"u1","name":"Grep","input":{"pattern":"login"}}]}}
+{"type":"user","isSidechain":true,"agentId":"a1","sessionId":"s-main-0001","timestamp":"2026-11-25T11:00:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"u1","is_error":true,"content":"path not found"}]}}
+{"type":"user","isSidechain":true,"agentId":"a1","sessionId":"s-main-0001","timestamp":"2026-11-25T11:00:07.000Z","message":{"role":"user","content":"?"}}

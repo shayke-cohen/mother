@@ -1,0 +1,5 @@
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:00:00.000Z","cwd":"/home/agnes/src/web","message":{"role":"user","content":"Fix the login bug on the settings page"}}
+{"type":"assistant","sessionId":"s-main-0001","timestamp":"2026-11-25T09:00:10.000Z","message":{"id":"m1","role":"assistant","usage":{"input_tokens":5000000,"output_tokens":5000000},"content":[]}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:30:00.000Z","message":{"role":"user","content":"?"}}
+{"type":"user","sessionId":"s-fork-0002","timestamp":"2026-11-26T08:00:00.000Z","cwd":"/home/agnes/src/web","message":{"role":"user","content":"btw, which file holds the session cookie name?"}}
+{"type":"assistant","sessionId":"s-fork-0002","timestamp":"2026-11-26T08:00:05.000Z","message":{"id":"f1","role":"assistant","usage":{"input_tokens":2000,"output_tokens":200},"content":[]}}

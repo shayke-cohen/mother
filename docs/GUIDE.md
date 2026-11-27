@@ -430,6 +430,7 @@ In your own terminal, after `mother link`. `mother <command> help` prints more f
 | `mother whatsapp status\|link\|unlink\|install\|stop` | The bridge's state and lifecycle |
 | `mother speak`, `mother tts setup` | Render the spoken brief; install the optional Kokoro neural voice (~330 MB in `~/.mother/tts`, English only) |
 | `mother eval brief\|verdict\|report` | A/B the brief's gather mode on the same inputs |
+| `mother retro signals [--days N]`, `mother retro ledger <file>` | The weekly session retro's model-free pass over your Claude Code transcripts (raw rows in `~/.mother/retro/`, never in git); fold the retro's decision ledger |
 
 ### `mother chief`
 

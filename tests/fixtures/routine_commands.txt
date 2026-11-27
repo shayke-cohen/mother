@@ -137,3 +137,9 @@ python3 "${CLAUDE_PLUGIN_ROOT}/bin/mother" channels approvals <<'APPROVALS'
 APPROVALS
 ----
 cd memory && ls
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" retro signals
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" retro ledger projects/session-retro/files/suggestions.jsonl
+----
+"${CLAUDE_PLUGIN_ROOT}/bin/mother" retro ledger retro/suggestions.jsonl

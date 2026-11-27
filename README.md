@@ -229,7 +229,7 @@ Call one by asking in plain words, or as `/mother:<name>`.
 | `hub` | `/mother:hub` | Decides the inbox from a terminal session when no desktop session leads |
 | `routine` | (scheduled tasks only) | The dispatcher every scheduled run enters through |
 
-Two read-only sub-agents back them: `reader` (one source, cited items) and `critic` (checks a draft before you see it).
+Three read-only sub-agents back them: `reader` (one source, cited items), `critic` (checks a draft before you see it) and `retro-reader` (reads session transcripts for the weekly retro).
 
 ## Routines
 
@@ -248,6 +248,7 @@ Scheduled tasks in the desktop app, in your timezone. Defaults; change them in `
 | `meeting-prep`, `meeting-recap` | around each team's weekly meeting | The deck, then a recap draft |
 | `weekly-snapshot` | 16:00 workdays | After a sprint rolls over: a snapshot and a metrics row. Silent |
 | `monthly-refresh` | 1st of the month, 10:00 | Refreshes per-repo notes, flags roadmap drift |
+| `retro` | Thursday 17:30 | Where your agent sessions lost time and tokens, a ranked list to decide on, and whether last time's fixes worked |
 | `brief-ab` | off by default | A/B test of how the brief gathers its sources |
 
 Routines report to your own DM; the few that act beyond it use a bounded grant. `mother runs` shows missed slots.

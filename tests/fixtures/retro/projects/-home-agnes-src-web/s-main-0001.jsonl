@@ -1,0 +1,20 @@
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-10T09:00:00.000Z","cwd":"/home/agnes/src/web/.claude/worktrees/feat-x","message":{"role":"user","content":"status?"}}
+{"type":"assistant","sessionId":"s-main-0001","timestamp":"2026-11-10T09:00:05.000Z","message":{"id":"m0","role":"assistant","usage":{"input_tokens":900000,"output_tokens":900000},"content":[{"type":"tool_use","id":"t0","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"custom-title","sessionId":"s-main-0001","customTitle":"Fix the login flow"}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:00:00.000Z","cwd":"/home/agnes/src/web/.claude/worktrees/feat-x","message":{"role":"user","content":"Fix the login bug on the settings page"}}
+{"type":"assistant","sessionId":"s-main-0001","timestamp":"2026-11-25T09:00:10.000Z","message":{"id":"m1","role":"assistant","usage":{"input_tokens":1000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":2000,"output_tokens":500},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 30; gh pr checks 7"}}]}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:00:40.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"exit 1: boom"}]}}
+{"type":"assistant","sessionId":"s-main-0001","timestamp":"2026-11-25T09:00:41.000Z","message":{"id":"m1","role":"assistant","usage":{"input_tokens":1000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":2000,"output_tokens":500},"content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/home/agnes/src/web/a.ts"}}]}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:00:50.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:30:00.000Z","message":{"role":"user","content":"?"}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:40:00.000Z","message":{"role":"user","content":"are we progressing? what next?"}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T09:50:00.000Z","message":{"role":"user","content":"continue"}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T10:00:00.000Z","message":{"role":"user","content":"no, that's the wrong file, use the other one"}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T10:05:00.000Z","message":{"role":"user","content":"Stop hook feedback:\nCommitted unvalidated files"}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T10:06:00.000Z","isSidechain":true,"message":{"role":"user","content":"a sidechain prompt, not the manager"}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T10:07:00.000Z","message":{"role":"user","content":"<command-name>/compact</command-name>"}}
+{"type":"user","sessionId":"s-main-0001","timestamp":"2026-11-25T10:08:00.000Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+{"type":"system","sessionId":"s-main-0001","timestamp":"2026-11-25T10:09:00.000Z","subtype":"compact_boundary"}
+{"type":"system","sessionId":"s-main-0001","timestamp":"2026-11-25T10:10:00.000Z","subtype":"api_error"}
+{"type":"assistant","sessionId":"s-main-0001","timestamp":"2026-11-25T11:00:00.000Z","message":{"id":"m2","role":"assistant","usage":{"input_tokens":0,"output_tokens":200},"content":[{"type":"tool_use","id":"t3","name":"Agent","input":{"description":"look"}}]}}
+not json at all
