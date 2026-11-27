@@ -63,7 +63,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.28.0"
+VERSION = "0.28.1"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -1554,10 +1554,9 @@ def cmd_inbox(args):
 def cmd_floor(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import floor
-    if args == ["codex-hook"]:   # from Codex: never blocks or fails a Codex turn, workspace or not
+    if args == ["codex-hook"]:   # from Codex, inside its sandbox: spools the event, needs no workspace, never fails
         try:
-            ws = workspace()
-            floor.main(args, ws, load_config(ws), _now())
+            floor.main(args, None, {}, _now())
         except BaseException:
             pass
         sys.exit(0)
