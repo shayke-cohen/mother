@@ -60,7 +60,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.27.0"
+VERSION = "0.28.0"
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = PLUGIN_ROOT / "templates" / "workspace"
 
@@ -1540,8 +1540,16 @@ def cmd_inbox(args):
 def cmd_floor(args):
     sys.path.insert(0, str(PLUGIN_ROOT / "lib"))
     import floor
-    if args[:1] in ([], ["help"], ["-h"], ["--help"]) or args not in (["card", "--stdin"], ["list", "--json"], ["mark", "--stdin"]):
-        sys.exit(floor.main(args, None, {}))  # no workspace needed: help and usage errors
+    if args == ["codex-hook"]:   # from Codex: never blocks or fails a Codex turn, workspace or not
+        try:
+            ws = workspace()
+            floor.main(args, ws, load_config(ws), _now())
+        except BaseException:
+            pass
+        sys.exit(0)
+    if args[:1] in ([], ["help"], ["-h"], ["--help"]) or args not in (["card", "--stdin"], ["list", "--json"], ["mark", "--stdin"],
+                                                                     ["send", "--stdin"]):
+        sys.exit(floor.main(args, None, {}))  # no workspace needed: help, usage errors and codex-setup
     ws = workspace()
     sys.exit(floor.main(args, ws, load_config(ws), _now()))
 
