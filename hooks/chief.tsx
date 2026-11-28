@@ -806,7 +806,10 @@ async function openRow($: Dollar, d: ChiefDesktop): Promise<void> {
   const run = async (argv: string[]) => {
     try { return (await $.process.run(argv, { timeoutMs: DEFAULT_TIMEOUT_MS })).exitCode === 0 } catch { return false }
   }
-  if (a?.dev3_task && await run(['dev3', 'task', 'open', '--task', a.dev3_task])) { $.ui.toast(`Opened "${d.title}" in dev3`); return }
+  // dev3 installs to ~/.dev3.0/bin, which the desktop app's PATH may not hold
+  const dev3Open = async (task: string) => await run(['dev3', 'task', 'open', '--task', task]) ||
+    await run([((await $.env.get('HOME')) ?? '') + '/.dev3.0/bin/dev3', 'task', 'open', '--task', task])
+  if (a?.dev3_task && await dev3Open(a.dev3_task)) { $.ui.toast(`Opened "${d.title}" in dev3`); return }
   if (a?.tmux?.pane) {
     const sock = a.tmux.socket ? ['-S', a.tmux.socket] : []
     if (await run(['tmux', ...sock, 'select-window', '-t', a.tmux.pane]) && await run(['tmux', ...sock, 'select-pane', '-t', a.tmux.pane])) {

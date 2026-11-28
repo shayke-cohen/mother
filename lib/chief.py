@@ -1444,7 +1444,143 @@ def _scheduled_names(app_dir: Path) -> set:
     return names
 
 
-def agent_status(ws: Path, at: datetime, app_dir: Optional[Path] = None, pinned: Optional[List[dict]] = None) -> List[dict]:
+TERMINAL_SID_RE = re.compile(r"--(?:session-id|resume)[ =]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
+TERMINAL_ENV = ("DEV3_TASK_ID", "TMUX_PANE", "TMUX")
+TERMINAL_SCAN_SKEW_S = 600
+
+
+def _claude_procs() -> List[dict]:
+    """The interactive Claude processes running now, as {pid, args, env, cwd}: a `claude` binary started without
+    `-p`/`--print` and without `--output-format` (the desktop app's and the print runs' mark). `env` holds only
+    TERMINAL_ENV, read with `ps -E` (this user's own processes); `cwd` comes from one `lsof` call."""
+    import subprocess
+    try:
+        ran = subprocess.run(["ps", "-ww", "-axo", "pid=,args="], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    procs = []
+    for line in ran.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        args = parts[1]
+        words = args.split()
+        if os.path.basename(words[0]) != "claude" or "--output-format" in words or "-p" in words or "--print" in words:
+            continue
+        procs.append({"pid": int(parts[0]), "args": args, "env": {}, "cwd": ""})
+    if not procs:
+        return []
+    pids = ",".join(str(p["pid"]) for p in procs)
+    try:
+        envs = subprocess.run(["ps", "-Eww", "-o", "pid=,command=", "-p", pids], capture_output=True, text=True, timeout=5).stdout
+        cwds = subprocess.run(["lsof", "-a", "-p", pids, "-d", "cwd", "-Fpn"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    by = {p["pid"]: p for p in procs}
+    for line in envs.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in by:
+            for word in parts[1].split():
+                k, _, v = word.partition("=")
+                if k in TERMINAL_ENV and v:
+                    by[int(parts[0])]["env"][k] = v
+    pid = None
+    for line in cwds.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid in by:
+            by[pid]["cwd"] = line[1:]
+    return [p for p in procs if p["cwd"].startswith("/")]
+
+
+TERMINAL_TITLE_RE = re.compile(rb'"(customTitle|aiTitle)":\s*"((?:[^"\\]|\\.){1,300})"')
+TERMINAL_TITLE_BYTES = 256 * 1024
+
+
+def _transcript_title(path: Path) -> str:
+    """The session's own name from its transcript: the last custom title the manager gave it, else the last AI title,
+    looked for in its last and first 256 KB. Empty when it has neither."""
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            f.seek(max(0, size - TERMINAL_TITLE_BYTES))
+            chunks = [f.read(TERMINAL_TITLE_BYTES)]
+            if size > TERMINAL_TITLE_BYTES:
+                f.seek(0)
+                chunks.append(f.read(TERMINAL_TITLE_BYTES))
+    except OSError:
+        return ""
+    for chunk in chunks:
+        found = {}
+        for m in TERMINAL_TITLE_RE.finditer(chunk):
+            found[m.group(1)] = m.group(2)
+        raw = found.get(b"customTitle") or found.get(b"aiTitle")
+        if raw:
+            try:
+                return safe_line(json.loads(b'"' + raw + b'"'), 200)
+            except ValueError:
+                return ""
+    return ""
+
+
+def live_terminals(ws: Path, home: Path, procs: Optional[List[dict]] = None) -> List[dict]:
+    """The Claude terminals running now (a CLI, tmux, dev3) as card-like dicts {session_id, agent, surface, cwd, at,
+    repo?, branch?, title?, recap?, dev3_task?, tmux?}: what a session started before its Mother mod wrote cards (or
+    with none at all) says of itself. The session id is the `--session-id`/`--resume` argument, else the newest
+    transcript in its folder's project dir; `at` is that transcript's mtime. A dev3 task's title and overview are
+    asked once per session id (cached in chief/terminals.json)."""
+    procs = _claude_procs() if procs is None else procs
+    cache_path = chief_dir(ws) / "terminals.json"
+    before = _read_obj(cache_path)
+    cache, out, seen = {}, [], set()
+    for p in procs:
+        folder = Path(home) / ".claude" / "projects" / project_slug(p["cwd"])
+        m = TERMINAL_SID_RE.search(p["args"])
+        path = folder / (m.group(1) + ".jsonl") if m else None
+        if path is None or not path.is_file():
+            try:
+                path = max(folder.glob("*.jsonl"), key=lambda f: f.stat().st_mtime)
+            except (OSError, ValueError):
+                continue
+        sid = path.name[:-6]
+        if sid in seen or not CLI_ID_RE.fullmatch(sid):
+            continue
+        seen.add(sid)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        old = before.get(sid) if isinstance(before.get(sid), dict) else None
+        if old is not None and old.get("pid") == p["pid"]:
+            who = {k: v for k, v in old.items() if k != "pid"}
+        else:
+            who = floormod.identify_env(env=dict(p["env"]), cwd=p["cwd"])
+        if not who.get("title"):
+            who = dict(who, title=_transcript_title(path) or "Terminal · " + (os.path.basename(p["cwd"].rstrip("/")) or "/"))
+        cache[sid] = dict(who, pid=p["pid"])
+        card = dict(who, session_id=sid, agent="claude", cwd=p["cwd"],
+                    at=hub._iso(datetime.fromtimestamp(mtime, timezone.utc)))
+        card.update(floormod.repo_facts(p["cwd"]))
+        out.append(card)
+    if cache != before:
+        try:
+            _write_atomic(cache_path, json.dumps(cache) + "\n")
+        except OSError:
+            pass
+    return out
+
+
+def _scan_terminals(ws: Path, at: datetime, home: Optional[Path] = None) -> List[dict]:
+    """live_terminals for a status read made now; a read for another moment (a test's fixed clock) scans nothing."""
+    if os.environ.get("MOTHER_TERMINAL_SCAN") == "0":
+        return []
+    if abs(datetime.now(timezone.utc).timestamp() - at.timestamp()) > TERMINAL_SCAN_SKEW_S:
+        return []
+    return live_terminals(ws, Path(home or os.path.expanduser("~")))
+
+
+def agent_status(ws: Path, at: datetime, app_dir: Optional[Path] = None, pinned: Optional[List[dict]] = None,
+                 terminals: Optional[List[dict]] = None) -> List[dict]:
     """The pane's Other agents rows: each session that is not pinned and wrote a floor card with an `agent` in the
     last AGENT_ROW_HOURS (a desktop session nobody pinned, a Claude terminal, dev3, Codex), newest first. Shaped as
     `desktop_status` rows plus {agent, surface, dev3_task?, tmux?}. A desktop session is matched to its app file by
@@ -1460,6 +1596,11 @@ def agent_status(ws: Path, at: datetime, app_dir: Optional[Path] = None, pinned:
         when = hub._parse_at(c.get("at"))
         if c.get("agent") and c["session_id"] not in skip and when is not None and when >= cutoff:
             cards.append((when, c))
+    have = {c["session_id"] for _, c in cards}
+    for c in (_scan_terminals(ws, at) if terminals is None else terminals):
+        when = hub._parse_at(c.get("at"))
+        if c["session_id"] not in skip | have and when is not None and when >= cutoff:
+            cards.append((when, c))   # a running terminal with no card of its own
     if not cards:
         return []
     cache_path = chief_dir(ws) / "agent-cache.json"
@@ -1677,7 +1818,8 @@ def _live_sessions(ws: Path, home: Path, app_dir: Optional[Path], at: Optional[d
             got = _tail_for(home, [str(ws)], cli)
             if got:
                 row(cli, "case", got)
-    for a in agent_status(ws, at or datetime.now(timezone.utc), app_dir):
+    when = at or datetime.now(timezone.utc)
+    for a in agent_status(ws, when, app_dir, terminals=_scan_terminals(ws, when, home)):
         cli = a["cli_session_id"]
         if cli in seen:
             continue

@@ -126,6 +126,65 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class LiveTerminalsTest(unittest.TestCase):
+    """lib/chief.py live_terminals: Claude terminals that run now but wrote no card (started before their mod did)."""
+    def setUp(self):
+        import chief
+        self.chief = chief
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.ws, self.home = self.root / "ws", self.root / "home"
+        spool = mock.patch.dict(os.environ, {"MOTHER_FLOOR_SPOOL": str(self.root / "no-spool")})
+        spool.start()
+        self.addCleanup(spool.stop)
+
+    def transcript(self, cwd, sid, lines=()):
+        folder = self.home / ".claude" / "projects" / self.chief.project_slug(cwd)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / (sid + ".jsonl")).write_text("".join(json.dumps(x) + "\n" for x in lines) or "{}\n")
+
+    def test_ids_titles_dev3_and_rows(self):
+        a, b, c = ("%08d-0000-4000-8000-000000000000" % n for n in range(3))
+        self.transcript("/w/dev3", a)
+        self.transcript("/w/home", b, [{"type": "ai-title", "aiTitle": "Old name"}, {"type": "custom-title", "customTitle": "Plan \"x\""}])
+        self.transcript("/w/bare", c)
+        procs = [{"pid": 1, "args": "claude --session-id %s --model m" % a, "cwd": "/w/dev3",
+                  "env": {"DEV3_TASK_ID": "215bca19-6f44-4cce-b6e7-957692f9327c", "TMUX_PANE": "%7", "TMUX": "/tmp/tmux-501/dev3,1,2"}},
+                 {"pid": 2, "args": "claude", "cwd": "/w/home", "env": {}},          # no id: its folder's newest transcript
+                 {"pid": 3, "args": "claude --resume %s" % c, "cwd": "/w/bare", "env": {}},
+                 {"pid": 4, "args": "claude --session-id %s" % a, "cwd": "/w/dev3", "env": {}}]   # the same session twice
+        with mock.patch.object(floor, "_dev3_task", return_value={"title": "#170 Nano lane", "overview": "Fixing tabs"}) as asked:
+            got = {t["session_id"]: t for t in self.chief.live_terminals(self.ws, self.home, procs)}
+            again = self.chief.live_terminals(self.ws, self.home, procs)
+        self.assertEqual(asked.call_count, 1)                     # cached per session while its pid holds
+        self.assertEqual(len(again), 3)
+        self.assertEqual(sorted(got), [a, b, c])
+        self.assertEqual((got[a]["surface"], got[a]["dev3_task"], got[a]["title"], got[a]["recap"]),
+                         ("dev3", "215bca19-6f44-4cce-b6e7-957692f9327c", "#170 Nano lane", "Fixing tabs"))
+        self.assertEqual(got[a]["tmux"], {"pane": "%7", "socket": "/tmp/tmux-501/dev3"})
+        self.assertEqual(got[b]["title"], 'Plan "x"')             # the custom title beats the AI one
+        self.assertEqual(got[c]["title"], "Terminal · bare")
+        now = datetime.now(timezone.utc)
+        rows = self.chief.agent_status(self.ws, now, self.root / "app", pinned=[{"cli_session_id": c}], terminals=list(got.values()))
+        by = {r["cli_session_id"]: r for r in rows}
+        self.assertEqual(sorted(by), [a, b])                      # a pinned one is drawn as pinned, not here
+        self.assertEqual((by[a]["surface"], by[a]["dev3_task"], by[a]["last_report"]), ("dev3", got[a]["dev3_task"], "Fixing tabs"))
+
+    def test_a_card_wins_and_a_fixed_clock_scans_nothing(self):
+        a = "%08d-0000-4000-8000-000000000000" % 7
+        folder = floor.floor_dir(self.ws)
+        folder.mkdir(parents=True, exist_ok=True)
+        iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (folder / (a + ".json")).write_text(json.dumps({"session_id": a, "asks": False, "question": "", "options": [],
+                                                        "waiting_on": None, "at": iso, "agent": "claude", "title": "From card"}))
+        term = {"session_id": a, "agent": "claude", "surface": "cli", "cwd": "/w", "at": iso, "title": "From scan"}
+        rows = self.chief.agent_status(self.ws, datetime.now(timezone.utc), self.root / "app", pinned=[], terminals=[term])
+        self.assertEqual([r["title"] for r in rows], ["From card"])
+        with mock.patch.object(self.chief, "live_terminals", side_effect=AssertionError("scanned")):
+            self.assertEqual(self.chief._scan_terminals(self.ws, datetime(2020, 1, 1, tzinfo=timezone.utc)), [])
+
+
 class AgentStatusTest(unittest.TestCase):
     """lib/chief.py agent_status: the Sessions tab's Other agents rows."""
     def setUp(self):
@@ -136,7 +195,8 @@ class AgentStatusTest(unittest.TestCase):
         self.ws = Path(self._tmp.name) / "ws"
         self.app = Path(self._tmp.name) / "app" / "acct" / "org"
         self.app.mkdir(parents=True)
-        spool = mock.patch.dict(os.environ, {"MOTHER_FLOOR_SPOOL": str(Path(self._tmp.name) / "no-spool")})
+        spool = mock.patch.dict(os.environ, {"MOTHER_FLOOR_SPOOL": str(Path(self._tmp.name) / "no-spool"),
+                                             "MOTHER_TERMINAL_SCAN": "0"})   # this machine's own terminals stay out
         spool.start()
         self.addCleanup(spool.stop)
 
