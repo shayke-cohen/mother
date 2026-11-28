@@ -3,7 +3,7 @@ import { EVENT_PRIORITY, EVENT_SHOW_MS, WARN_COOLDOWN_MS, changes, pickEvent, sn
 import type { Snapshot } from './events'
 import { NOTIFIED_KEY, NOTIFY_OFF_KEY, NOTIFY_PER_PASS, chaseNotice, noticesOf, planNotices } from './notify'
 import { accessRows, accessTitle } from './access'
-import { changed, withBeat, NO_SIGS } from './fastloop'
+import { changed, keepAgents, withBeat, NO_SIGS } from './fastloop'
 
 // The infrastructure half of the chief batch: desktop notifications once per thing, the "what just changed" line,
 // sign-in and network cards with Retry, and the pane's fast refresh. (The watcher's rate-limit fallback is tested in
@@ -360,6 +360,11 @@ test('test_fast_helpers', async () => {
   expect(withBeat(s, beat, NOW).led_by).toBe('sess-9')
   expect(withBeat(s, beat, NOW + 5 * 60_000).led_by).toBeNull()   // an old heartbeat leads nobody
   expect(withBeat(s, { junk: 1 }, NOW)).toBe(s)
+  // a status saved by an older Mother has no agents: the last ones read stay; a newer one's own list (even empty) wins
+  const rows = [{ cli_session_id: 'x' }]
+  expect(keepAgents(s, { ...s, agents: rows } as any).agents).toEqual(rows)
+  expect(keepAgents({ ...s, agents: [] } as any, { ...s, agents: rows } as any).agents).toEqual([])
+  expect(keepAgents(s, null)).toBe(s)
 })
 
 test('test_fast_loop_redraws_on_change_only_and_stops_when_hidden', async ($, on) => {

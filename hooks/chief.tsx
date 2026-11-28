@@ -34,7 +34,7 @@ import type { ChiefEvent } from '../types'
 import { observeEvents, resetEvents, shownEvent } from './events'
 import { chaseNotice, notifyOnce, notifyPass, notifyStatusText, setNotify } from './notify'
 import { accessCards, accessRows } from './access'
-import { FAST_MS, NO_SIGS, changed, readBeat, readSigs, readStatusFile, withBeat } from './fastloop'
+import { FAST_MS, NO_SIGS, changed, readBeat, readSigs, keepAgents, readStatusFile, withBeat } from './fastloop'
 import { mentionPass, resetMentionSearch } from './mention_search'
 import type { Sigs } from './fastloop'
 
@@ -2016,7 +2016,7 @@ async function fastPass($: Dollar, configured: string): Promise<void> {
     if (what.status || what.beat) {
       const saved = what.status ? await readStatusFile($, fastWs) : null
       // never back in time: this session's own minute read may be newer than what another session last saved
-      const base = saved && !(lastStatus && Date.parse(saved.at) < Date.parse(lastStatus.at)) ? saved : lastStatus
+      const base = saved && !(lastStatus && Date.parse(saved.at) < Date.parse(lastStatus.at)) ? keepAgents(saved, lastStatus) : lastStatus
       if (base) {
         const next = withBeat(base, await readBeat($, fastWs), await $.clock.now())
         if (JSON.stringify(next) !== JSON.stringify(lastStatus)) {
