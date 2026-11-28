@@ -41,7 +41,7 @@ there is nowhere to log: print the error and stop.
 | Remote set, and the routine isn't `sync: false`: `git pull --rebase --autostash -q` | Continue on the local copy; note `pull failed` |
 | `mother status` validates `config.json` | `failed — config invalid: <first error>`, stop |
 | `config.json` has `routines.<id>` | `failed — routine not configured (disabled?)`, stop |
-| Today is in `routines.<id>.days` in `manager.timezone` (`workdays` = `manager.workdays`, `all`) | `ok — not a scheduled day`, stop |
+| Today is in `routines.<id>.days` in `manager.timezone` (`workdays` = `manager.workdays`, `all`) — or, on any other day, the run is a catch-up or a Run now: `mother runs --json` shows this routine `missed` (its last slot has no run), or the manager asked for this run in the session ("run the retro now") | Off day and the last slot already ran: `ok — not a scheduled day (last slot ran <date>; ask "run the <id> now" to force)`, stop. Off day and it proceeds: note `off-day run (catch-up of <slot> \| asked)` in the runs.md line |
 | `${CLAUDE_PLUGIN_ROOT}/routines/<id>.md` exists | `failed — unknown routine <id>`, stop |
 | The routine has `active_hours` (`routines.<id>.active_hours`, else the routine file's default) and local now in `manager.timezone` is outside it | `skipped — outside active hours`, stop |
 
